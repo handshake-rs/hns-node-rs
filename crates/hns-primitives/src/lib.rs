@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+mod legacy_hash;
+
+pub use legacy_hash::{hash160, hash256, ripemd160, sha1, sha256};
+
 use blake2::{
     digest::{Update, VariableOutput},
     Blake2b512, Blake2bVar, Digest,
@@ -733,7 +737,24 @@ pub struct Outpoint {
     pub index: u32,
 }
 
+impl Default for Outpoint {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
 impl Outpoint {
+    pub const fn null() -> Self {
+        Self {
+            txid: Txid::ZERO,
+            index: u32::MAX,
+        }
+    }
+
+    pub const fn is_null(&self) -> bool {
+        self.index == u32::MAX && self.txid == Txid::ZERO
+    }
+
     pub fn read_from(reader: &mut Reader<'_>) -> Result<Self, PrimitiveError> {
         Ok(Self {
             txid: Txid::new(reader.read_hash()?),
@@ -1058,29 +1079,99 @@ impl CovenantKind {
     }
 }
 
+/// Consensus name state keyed by `name_hash` in the authenticated name tree.
+///
+/// The serialized value intentionally mirrors `hsd`'s `NameState` payload. The
+/// key is not serialized into the value by hsd, but is retained here so callers
+/// cannot accidentally detach a value from the name hash under which it was
+/// loaded.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NameState {
     pub name_hash: NameHash,
-    pub name: Option<String>,
+    pub name: Vec<u8>,
     pub height: Height,
-    pub state: NameLifecycleState,
+    pub renewal: Height,
+    pub owner: Outpoint,
+    pub value: Amount,
+    pub highest: Amount,
+    pub data: Vec<u8>,
+    pub transfer: Height,
+    pub revoked: Height,
+    pub claimed: Height,
+    pub renewals: u32,
+    pub registered: bool,
+    pub expired: bool,
+    pub weak: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+impl NameState {
+    pub fn null(name_hash: NameHash) -> Self {
+        Self {
+            name_hash,
+            name: Vec::new(),
+            height: 0,
+            renewal: 0,
+            owner: Outpoint::null(),
+            value: 0,
+            highest: 0,
+            data: Vec::new(),
+            transfer: 0,
+            revoked: 0,
+            claimed: 0,
+            renewals: 0,
+            registered: false,
+            expired: false,
+            weak: false,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.height == 0
+            && self.renewal == 0
+            && self.owner.is_null()
+            && self.value == 0
+            && self.highest == 0
+            && self.data.is_empty()
+            && self.transfer == 0
+            && self.revoked == 0
+            && self.claimed == 0
+            && self.renewals == 0
+            && !self.registered
+            && !self.expired
+            && !self.weak
+    }
+
+    pub fn reset(&mut self, height: Height) {
+        self.height = height;
+        self.renewal = height;
+        self.owner = Outpoint::null();
+        self.value = 0;
+        self.highest = 0;
+        self.data.clear();
+        self.transfer = 0;
+        self.revoked = 0;
+        self.claimed = 0;
+        self.renewals = 0;
+        self.registered = false;
+        self.expired = false;
+        self.weak = false;
+    }
+
+    pub fn initialize(&mut self, name: Vec<u8>, height: Height) {
+        self.name = name;
+        self.reset(height);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum NameLifecycleState {
-    Available,
     Opening,
+    Locked,
     Bidding,
     Reveal,
-    Redeem,
-    Registered,
-    Updating,
-    Renewing,
-    Transferring,
-    Finalizing,
+    Closed,
     Revoked,
-    Expired,
-    Reserved,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1496,6 +1587,10 @@ impl Writer {
 
     pub fn write_u8(&mut self, value: u8) {
         self.bytes.push(value);
+    }
+
+    pub fn write_u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     pub fn write_u32(&mut self, value: u32) {

@@ -11,7 +11,9 @@ use hns_primitives::{
 use serde::{Deserialize, Serialize};
 
 mod covenant;
+mod legacy_hash;
 mod locks;
+mod name;
 mod script;
 mod sighash;
 
@@ -21,6 +23,11 @@ pub use covenant::{
 pub use locks::{
     calculate_sequence_locks, verify_locktime_predicate, verify_sequence_locks,
     verify_sequence_predicate, SequenceLock, SequenceLockView,
+};
+pub use name::{
+    has_rollout, is_locked_up, is_name_claimable, is_name_expired, is_reserved,
+    maybe_expire_name, name_lifecycle, rollout_height, verify_and_apply_name_covenant,
+    verify_renewal_commitment, NameContext, NameFlags, NameMutation, NameParams,
 };
 pub use script::{
     verify_witness_program, ScriptError, ScriptFlags, SignatureVerifier,
@@ -132,6 +139,24 @@ impl Network {
                 brontide_port: 44_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 100,
+                names: NameParams {
+                    auction_start: 2_016,
+                    rollout_interval: 1_008,
+                    lockup_period: 4_320,
+                    renewal_window: 105_120,
+                    renewal_period: 26_208,
+                    renewal_maturity: 4_320,
+                    claim_period: 210_240,
+                    alexa_lockup_period: 420_480,
+                    claim_frequency: 288,
+                    bidding_period: 720,
+                    reveal_period: 1_440,
+                    tree_interval: 36,
+                    transfer_lockup: 288,
+                    auction_maturity: 4_176,
+                    no_rollout: false,
+                    no_reserved: false,
+                },
                 pow: PowParams {
                     limit: hex32(
                         "0000000000ffff00000000000000000000000000000000000000000000000000",
@@ -157,6 +182,24 @@ impl Network {
                 brontide_port: 45_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 100,
+                names: NameParams {
+                    auction_start: 36,
+                    rollout_interval: 36,
+                    lockup_period: 36,
+                    renewal_window: 4_320,
+                    renewal_period: 1_008,
+                    renewal_maturity: 144,
+                    claim_period: 12_960,
+                    alexa_lockup_period: 25_920,
+                    claim_frequency: 288,
+                    bidding_period: 144,
+                    reveal_period: 288,
+                    tree_interval: 36,
+                    transfer_lockup: 288,
+                    auction_maturity: 1_008,
+                    no_rollout: false,
+                    no_reserved: false,
+                },
                 pow: PowParams {
                     limit: hex32(
                         "00000000ffff0000000000000000000000000000000000000000000000000000",
@@ -182,6 +225,24 @@ impl Network {
                 brontide_port: 46_806,
                 halving_interval: 2_500,
                 coinbase_maturity: 2,
+                names: NameParams {
+                    auction_start: 0,
+                    rollout_interval: 2,
+                    lockup_period: 2,
+                    renewal_window: 5_000,
+                    renewal_period: 2_500,
+                    renewal_maturity: 50,
+                    claim_period: 250_000,
+                    alexa_lockup_period: 500_000,
+                    claim_frequency: 0,
+                    bidding_period: 5,
+                    reveal_period: 10,
+                    tree_interval: 5,
+                    transfer_lockup: 10,
+                    auction_maturity: 65,
+                    no_rollout: false,
+                    no_reserved: false,
+                },
                 pow: PowParams {
                     limit: hex32(
                         "7fffff0000000000000000000000000000000000000000000000000000000000",
@@ -207,6 +268,24 @@ impl Network {
                 brontide_port: 47_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 6,
+                names: NameParams {
+                    auction_start: 0,
+                    rollout_interval: 1,
+                    lockup_period: 1,
+                    renewal_window: 2_500,
+                    renewal_period: 1_250,
+                    renewal_maturity: 25,
+                    claim_period: 75_000,
+                    alexa_lockup_period: 150_000,
+                    claim_frequency: 0,
+                    bidding_period: 25,
+                    reveal_period: 50,
+                    tree_interval: 2,
+                    transfer_lockup: 5,
+                    auction_maturity: 100,
+                    no_rollout: false,
+                    no_reserved: false,
+                },
                 pow: PowParams {
                     limit: hex32(
                         "7fffff0000000000000000000000000000000000000000000000000000000000",
@@ -250,6 +329,7 @@ pub struct NetworkParams {
     pub brontide_port: u16,
     pub halving_interval: u32,
     pub coinbase_maturity: u32,
+    pub names: NameParams,
     pub pow: PowParams,
     pub genesis_hash: BlockHash,
     pub genesis_time: u64,
@@ -1063,6 +1143,8 @@ pub enum ConsensusError {
     InvalidBlock(&'static str),
     #[error("transaction authorization failed: {0}")]
     Authorization(String),
+    #[error("contextual covenant validation failed: {0}")]
+    ContextualCovenant(String),
 }
 
 #[cfg(test)]

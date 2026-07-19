@@ -3,7 +3,7 @@ use hns_primitives::{
 };
 
 use crate::{
-    is_valid_signature_hash_type, signature_hash, verify_locktime_predicate,
+    is_valid_signature_hash_type, legacy_hash, signature_hash, verify_locktime_predicate,
     verify_sequence_predicate, ConsensusError, TransactionInputVerifier, MAX_MULTISIG_PUBKEYS,
     MAX_SCRIPT_OPS, MAX_SCRIPT_PUSH, MAX_SCRIPT_SIZE,
 };
@@ -565,7 +565,16 @@ fn execute_script(
                 stack.push(digest);
             }
             OP_RIPEMD160 | OP_SHA1 | OP_SHA256 | OP_HASH160 | OP_HASH256 => {
-                return Err(ScriptError::UnsupportedLegacyHashOpcode(instruction.opcode));
+                let item = pop(stack)?;
+                let digest = match instruction.opcode {
+                    OP_RIPEMD160 => legacy_hash::ripemd160(&item).to_vec(),
+                    OP_SHA1 => legacy_hash::sha1(&item).to_vec(),
+                    OP_SHA256 => legacy_hash::sha256(&item).to_vec(),
+                    OP_HASH160 => legacy_hash::hash160(&item).to_vec(),
+                    OP_HASH256 => legacy_hash::hash256(&item).to_vec(),
+                    _ => unreachable!(),
+                };
+                stack.push(digest);
             }
             OP_CODESEPARATOR => last_separator = instruction.end,
             OP_CHECKSIG | OP_CHECKSIGVERIFY => {

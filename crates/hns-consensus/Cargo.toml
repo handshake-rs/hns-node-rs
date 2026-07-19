@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 hns-primitives = { path = "../hns-primitives" }
+hns-secp256k1 = { path = "../hns-secp256k1" }
 serde.workspace = true
 thiserror.workspace = true
 

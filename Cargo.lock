@@ -410,6 +410,7 @@ name = "hns-consensus"
 version = "0.1.0"
 dependencies = [
  "hns-primitives",
+ "hns-secp256k1",
  "serde",
  "serde_json",
  "thiserror",
@@ -489,6 +490,14 @@ dependencies = [
  "hns-primitives",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "hns-secp256k1"
+version = "0.1.0"
+dependencies = [
+ "cc",
  "thiserror",
 ]
 

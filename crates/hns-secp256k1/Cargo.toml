@@ -1,0 +1,14 @@
+[package]
+name = "hns-secp256k1"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+build = "build.rs"
+license = "MIT"
+description = "Small safe verification-only wrapper around the pinned libsecp256k1 used by hsd"
+
+[build-dependencies]
+cc = "1.2"
+
+[dependencies]
+thiserror.workspace = true
