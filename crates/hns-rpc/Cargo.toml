@@ -1,0 +1,13 @@
+[package]
+name = "hns-rpc"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+hns-chain = { path = "../hns-chain" }
+hns-mempool = { path = "../hns-mempool" }
+hns-primitives = { path = "../hns-primitives" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

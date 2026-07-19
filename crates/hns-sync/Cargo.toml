@@ -1,0 +1,12 @@
+[package]
+name = "hns-sync"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+hns-primitives = { path = "../hns-primitives" }
+hns-chain = { path = "../hns-chain" }
+hns-p2p = { path = "../hns-p2p" }
+serde.workspace = true
+thiserror.workspace = true

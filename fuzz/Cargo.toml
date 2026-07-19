@@ -1,0 +1,68 @@
+[package]
+name = "hsrd-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+hns-primitives = { path = "../crates/hns-primitives" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "header_parser"
+path = "fuzz_targets/header_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transaction_parser"
+path = "fuzz_targets/transaction_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_parser"
+path = "fuzz_targets/block_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "covenant_parser"
+path = "fuzz_targets/covenant_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resource_value_parser"
+path = "fuzz_targets/resource_value_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_frame_parser"
+path = "fuzz_targets/p2p_frame_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_request_parser"
+path = "fuzz_targets/rpc_request_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_manifest_parser"
+path = "fuzz_targets/snapshot_manifest_parser.rs"
+test = false
+doc = false
+bench = false

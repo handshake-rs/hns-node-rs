@@ -1,0 +1,14 @@
+{
+  "valid": {
+    "handshake": "3aa2528576f96bd40fcff0bd6b60c44221d73c43b4e42d4b908ed20a93b8d1b6",
+    "hsd": "1adba96cde054383892a08bb53ab627fb2a2842914d53bc5312e4c69f5688de1"
+  },
+  "invalid": [
+    "",
+    "Example",
+    "-bad",
+    "bad-",
+    "local",
+    "name!"
+  ]
+}

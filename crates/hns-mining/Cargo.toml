@@ -1,0 +1,11 @@
+[package]
+name = "hns-mining"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+hns-consensus = { path = "../hns-consensus" }
+hns-primitives = { path = "../hns-primitives" }
+thiserror.workspace = true
+tokio.workspace = true

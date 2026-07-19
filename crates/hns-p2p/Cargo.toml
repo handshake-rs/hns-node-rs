@@ -1,0 +1,12 @@
+[package]
+name = "hns-p2p"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+hns-consensus = { path = "../hns-consensus" }
+hns-primitives = { path = "../hns-primitives" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
