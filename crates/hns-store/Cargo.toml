@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["rocksdb-backend"]
 rocksdb-backend = ["dep:rocksdb"]
 
 [dependencies]

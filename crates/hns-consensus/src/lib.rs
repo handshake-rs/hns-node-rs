@@ -4,11 +4,33 @@ use std::{collections::HashSet, fmt, str::FromStr};
 
 use hns_primitives::{
     blake2b_256, blake2b_256_many, hash_name, Amount, Block, BlockHash, Coin, CompactTarget,
-    CovenantKind, Header, Height, NameHash, NameState, Outpoint, Transaction, Txid, Uint256,
+    CovenantKind, Header, Height, Outpoint, Transaction, Txid, Uint256,
     Witness, Writer, HEADER_SIZE, MAX_BLOCK_WEIGHT, MAX_RESOURCE_SIZE, MAX_SCRIPT_STACK,
     MAX_TX_SIZE,
 };
 use serde::{Deserialize, Serialize};
+
+mod covenant;
+mod locks;
+mod script;
+mod sighash;
+
+pub use covenant::{
+    blind_bid, verify_transaction_covenant_links, CovenantLinkError, CovenantLinkSummary,
+};
+pub use locks::{
+    calculate_sequence_locks, verify_locktime_predicate, verify_sequence_locks,
+    verify_sequence_predicate, SequenceLock, SequenceLockView,
+};
+pub use script::{
+    verify_witness_program, ScriptError, ScriptFlags, SignatureVerifier,
+    UnavailableSignatureVerifier, WitnessProgramVerifier,
+};
+pub use sighash::{
+    is_valid_signature_hash_type, signature_hash, SIGHASH_ALL, SIGHASH_ANYONE_CAN_PAY,
+    SIGHASH_BASE_MASK, SIGHASH_NOINPUT, SIGHASH_NONE, SIGHASH_SINGLE,
+    SIGHASH_SINGLE_REVERSE,
+};
 
 pub const COIN: Amount = 1_000_000;
 pub const MAX_CREATORS: Amount = 102_000_000 * COIN;
@@ -395,36 +417,32 @@ impl ConsensusParams {
     }
 }
 
-pub trait ConsensusView {
-    fn coin(&self, outpoint: &Outpoint) -> Result<Option<Coin>, ConsensusError>;
-
-    fn name_state(&self, name_hash: &NameHash) -> Result<Option<NameState>, ConsensusError>;
-}
-
-pub trait ScriptVerifier {
+pub trait TransactionInputVerifier: Send + Sync {
     fn verify_input(
         &self,
         transaction: &Transaction,
         input_index: usize,
-        view: &dyn ConsensusView,
+        coin: &Coin,
     ) -> Result<(), ConsensusError>;
 }
 
-pub trait ConsensusRules {
-    fn validate_header(
-        &self,
-        header: &Header,
-        view: &dyn ConsensusView,
-    ) -> Result<(), ConsensusError>;
+/// Production-safe default while no audited secp256k1 backend is composed. It
+/// deliberately rejects every non-coinbase spend rather than allowing the UTXO
+/// engine to connect an unauthorized transaction.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RejectUnverifiedInputs;
 
-    fn validate_transaction(
+impl TransactionInputVerifier for RejectUnverifiedInputs {
+    fn verify_input(
         &self,
-        transaction: &Transaction,
-        view: &dyn ConsensusView,
-    ) -> Result<(), ConsensusError>;
-
-    fn validate_block(&self, block: &Block, view: &dyn ConsensusView)
-        -> Result<(), ConsensusError>;
+        _transaction: &Transaction,
+        _input_index: usize,
+        _coin: &Coin,
+    ) -> Result<(), ConsensusError> {
+        Err(ConsensusError::Authorization(
+            "transaction authorization backend is not configured".to_owned(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1025,32 +1043,6 @@ fn varint_size(value: u64) -> usize {
     }
 }
 
-impl ConsensusRules for HeaderConsensus {
-    fn validate_header(
-        &self,
-        _header: &Header,
-        _view: &dyn ConsensusView,
-    ) -> Result<(), ConsensusError> {
-        Ok(())
-    }
-
-    fn validate_transaction(
-        &self,
-        transaction: &Transaction,
-        _view: &dyn ConsensusView,
-    ) -> Result<(), ConsensusError> {
-        self.validate_transaction_sanity(transaction)
-    }
-
-    fn validate_block(
-        &self,
-        block: &Block,
-        _view: &dyn ConsensusView,
-    ) -> Result<(), ConsensusError> {
-        self.validate_block_body(block).map(|_| ())
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error("unknown network `{value}`")]
 pub struct NetworkParseError {
@@ -1069,6 +1061,8 @@ pub enum ConsensusError {
     InvalidTransaction(&'static str),
     #[error("invalid block: {0}")]
     InvalidBlock(&'static str),
+    #[error("transaction authorization failed: {0}")]
+    Authorization(String),
 }
 
 #[cfg(test)]

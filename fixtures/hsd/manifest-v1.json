@@ -1,0 +1,156 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
+  },
+  "cases": [
+    {
+      "id": "milestone1-header",
+      "network": "agnostic",
+      "kind": "header",
+      "path": "headers/milestone1-header.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "milestone1",
+        "codec",
+        "pow"
+      ],
+      "blake2b256": "ebb857c44bdb43d2e0ab796ec3114f12d5bebab668f9f44e3e3fd834698482a4"
+    },
+    {
+      "id": "milestone1-transaction",
+      "network": "agnostic",
+      "kind": "transaction",
+      "path": "transactions/milestone1-transaction.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "milestone1",
+        "codec",
+        "witness"
+      ],
+      "blake2b256": "53c058ae8a6beacc475a5c718d41eaf8effa4899630c8934c874b4cf2be3a928"
+    },
+    {
+      "id": "milestone1-block",
+      "network": "agnostic",
+      "kind": "block",
+      "path": "blocks/milestone1-block.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "milestone1",
+        "codec",
+        "commitments"
+      ],
+      "blake2b256": "f20dcccde245cf462912781c67841191a8fad12b66b7402cc71cf6f0c0c64e6e"
+    },
+    {
+      "id": "milestone1-covenant",
+      "network": "agnostic",
+      "kind": "covenant",
+      "path": "covenants/milestone1-covenant.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "milestone1",
+        "codec"
+      ],
+      "blake2b256": "fa2283df4369a7384ba97a88a316839cb55534ffbf39995eb4ded7903e428929"
+    },
+    {
+      "id": "milestone1-resource",
+      "network": "agnostic",
+      "kind": "resource",
+      "path": "resources/milestone1-resource.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "milestone1",
+        "codec"
+      ],
+      "blake2b256": "0795294b92fa607aad3be66ab99459e7a5d32e52fa1ba4c967cad07ec64cb3f6"
+    },
+    {
+      "id": "milestone1-name-hash",
+      "network": "agnostic",
+      "kind": "name-state",
+      "path": "name-states/milestone1-name-hash.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "milestone1",
+        "names"
+      ],
+      "blake2b256": "b33db142b748b4003d33e0cc5d53d18a4821a86d9944bd4a4c070defca83c92f"
+    },
+    {
+      "id": "milestone1-compact-targets",
+      "network": "agnostic",
+      "kind": "difficulty",
+      "path": "chains/milestone1-compact-targets.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "milestone1",
+        "targets"
+      ],
+      "blake2b256": "ad783bdd3473fee48ec439462d07a781840df208e5977e2018c0df9e8615504c"
+    },
+    {
+      "id": "phase2-sighash-v1",
+      "network": "agnostic",
+      "kind": "script",
+      "path": "scripts/sighash-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "phase2",
+        "sighash",
+        "oracle"
+      ],
+      "blake2b256": "490bba30e1122db1afadabe77b122ce3dbe7d6f6c384adf942013700877f3584"
+    },
+    {
+      "id": "phase2-sequence-locks-v1",
+      "network": "agnostic",
+      "kind": "script",
+      "path": "scripts/sequence-locks-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "phase2",
+        "sequence-locks",
+        "oracle"
+      ],
+      "blake2b256": "ed5c3aea407ba768e043374fa23e5e1c884f9e1063357d1575e9f1cdcad5765b"
+    },
+    {
+      "id": "phase3-covenant-linkage-v1",
+      "network": "regtest",
+      "kind": "covenant",
+      "path": "covenants/linkage-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "phase3",
+        "covenant-linkage",
+        "contextual",
+        "oracle"
+      ],
+      "blake2b256": "af4e86befcc24d6ae1f080b66bfd9b8f5ada25c16aa1e1eadb0d302e23ca2839"
+    }
+  ]
+}

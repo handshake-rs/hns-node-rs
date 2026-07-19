@@ -1,0 +1,127 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
+    "source": "lib/blockchain/chain.js#getLocks/verifyLocks"
+  },
+  "vectors": [
+    {
+      "id": "disabled-sequence",
+      "transactionRaw": "02000000013030303030303030303030303030303030303030303030303030303030303030000000007b0000800101000000000000000014dddddddddddddddddddddddddddddddddddddddd00000000000000",
+      "coinHeights": [
+        10
+      ],
+      "nextHeight": 250,
+      "tipMedianTime": 1249000,
+      "ancestorMedianTimes": {
+        "0": 1000000,
+        "9": 1009000,
+        "10": 1010000,
+        "24": 1024000,
+        "25": 1025000,
+        "99": 1099000,
+        "100": 1100000,
+        "248": 1248000,
+        "249": 1249000
+      },
+      "minimumHeight": -1,
+      "minimumTime": -1,
+      "valid": true
+    },
+    {
+      "id": "height-relative-confirmed",
+      "transactionRaw": "0200000001303030303030303030303030303030303030303030303030303030303030303000000000050000000101000000000000000014dddddddddddddddddddddddddddddddddddddddd00000000000000",
+      "coinHeights": [
+        100
+      ],
+      "nextHeight": 250,
+      "tipMedianTime": 1249000,
+      "ancestorMedianTimes": {
+        "0": 1000000,
+        "9": 1009000,
+        "10": 1010000,
+        "24": 1024000,
+        "25": 1025000,
+        "99": 1099000,
+        "100": 1100000,
+        "248": 1248000,
+        "249": 1249000
+      },
+      "minimumHeight": 104,
+      "minimumTime": -1,
+      "valid": true
+    },
+    {
+      "id": "height-relative-unconfirmed",
+      "transactionRaw": "0200000001303030303030303030303030303030303030303030303030303030303030303000000000020000000101000000000000000014dddddddddddddddddddddddddddddddddddddddd00000000000000",
+      "coinHeights": [
+        -1
+      ],
+      "nextHeight": 250,
+      "tipMedianTime": 1249000,
+      "ancestorMedianTimes": {
+        "0": 1000000,
+        "9": 1009000,
+        "10": 1010000,
+        "24": 1024000,
+        "25": 1025000,
+        "99": 1099000,
+        "100": 1100000,
+        "248": 1248000,
+        "249": 1249000
+      },
+      "minimumHeight": 251,
+      "minimumTime": -1,
+      "valid": false
+    },
+    {
+      "id": "time-relative-confirmed",
+      "transactionRaw": "0200000001303030303030303030303030303030303030303030303030303030303030303000000000030040000101000000000000000014dddddddddddddddddddddddddddddddddddddddd00000000000000",
+      "coinHeights": [
+        25
+      ],
+      "nextHeight": 250,
+      "tipMedianTime": 1249000,
+      "ancestorMedianTimes": {
+        "0": 1000000,
+        "9": 1009000,
+        "10": 1010000,
+        "24": 1024000,
+        "25": 1025000,
+        "99": 1099000,
+        "100": 1100000,
+        "248": 1248000,
+        "249": 1249000
+      },
+      "minimumHeight": -1,
+      "minimumTime": 1025535,
+      "valid": true
+    },
+    {
+      "id": "mixed-maxima",
+      "transactionRaw": "02000000033030303030303030303030303030303030303030303030303030303030303030000000000700000031313131313131313131313131313131313131313131313131313131313131310100000004004000323232323232323232323232323232323232323232323232323232323232323202000000020000000101000000000000000014dddddddddddddddddddddddddddddddddddddddd000000000000000000",
+      "coinHeights": [
+        10,
+        100,
+        24
+      ],
+      "nextHeight": 250,
+      "tipMedianTime": 1249000,
+      "ancestorMedianTimes": {
+        "0": 1000000,
+        "9": 1009000,
+        "10": 1010000,
+        "24": 1024000,
+        "25": 1025000,
+        "99": 1099000,
+        "100": 1100000,
+        "248": 1248000,
+        "249": 1249000
+      },
+      "minimumHeight": 25,
+      "minimumTime": 1101047,
+      "valid": true
+    }
+  ]
+}

@@ -1,14 +1,23 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    fmt,
+    marker::PhantomData,
     path::PathBuf,
+    rc::Rc,
+    str::FromStr,
     sync::{Arc, RwLock},
 };
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 5;
+
+/// Durable database layout/profile identifier. A profile change is an explicit
+/// migration boundary even when the low-level column families remain readable.
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v1";
 
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
 
@@ -17,10 +26,50 @@ pub enum StoreBackend {
     RocksDb,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DurabilityPolicy {
+    /// Keep the RocksDB WAL enabled and fsync the write before returning.
+    #[default]
+    Sync,
+    /// Keep the WAL enabled but allow the operating system to schedule fsync.
+    Wal,
+}
+
+impl DurabilityPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Wal => "wal",
+        }
+    }
+}
+
+impl fmt::Display for DurabilityPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DurabilityPolicy {
+    type Err = StoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "sync" => Ok(Self::Sync),
+            "wal" => Ok(Self::Wal),
+            other => Err(StoreError::Schema(format!(
+                "unknown durability policy `{other}`; expected `sync` or `wal`"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoreConfig {
     pub path: PathBuf,
     pub backend: StoreBackend,
+    pub durability: DurabilityPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -93,14 +142,116 @@ pub trait WriteBatch {
 }
 
 pub trait Store {
-    type Snapshot: ReadSnapshot;
+    type Snapshot<'a>: ReadSnapshot
+    where
+        Self: 'a;
     type Batch: WriteBatch;
 
-    fn snapshot(&self) -> Result<Self::Snapshot, StoreError>;
+    fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError>;
 
     fn batch(&self) -> Self::Batch;
 
     fn commit(&self, batch: Self::Batch) -> Result<(), StoreError>;
+}
+
+/// Read-your-writes overlay for staging one atomic multi-step mutation against
+/// a single immutable base snapshot. The wrapped batch is committed only after
+/// every staged operation has validated successfully.
+#[derive(Clone, Debug, Default)]
+pub struct StagingOverlay {
+    changes: Rc<RefCell<HashMap<StoreKey, Option<Vec<u8>>>>>,
+}
+
+impl StagingOverlay {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn snapshot<'a, S: ReadSnapshot>(&self, base: &'a S) -> StagedSnapshot<'a, S> {
+        StagedSnapshot {
+            base,
+            changes: Rc::clone(&self.changes),
+        }
+    }
+
+    pub fn batch<B: WriteBatch>(&self, inner: B) -> StagedBatch<B> {
+        StagedBatch {
+            inner,
+            changes: Rc::clone(&self.changes),
+        }
+    }
+}
+
+pub struct StagedSnapshot<'a, S: ReadSnapshot> {
+    base: &'a S,
+    changes: Rc<RefCell<HashMap<StoreKey, Option<Vec<u8>>>>>,
+}
+
+impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
+    fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = StoreKey::new(family, key);
+        if let Some(value) = self.changes.borrow().get(&key) {
+            return Ok(value.clone());
+        }
+        self.base.get(family, &key.key)
+    }
+
+    fn scan_prefix(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<Vec<ScanEntry>, StoreError> {
+        let mut entries = self
+            .base
+            .scan_prefix(family, prefix)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+
+        for (key, value) in self.changes.borrow().iter() {
+            if key.family != family || !key.key.starts_with(prefix) {
+                continue;
+            }
+            match value {
+                Some(value) => {
+                    entries.insert(key.key.clone(), value.clone());
+                }
+                None => {
+                    entries.remove(&key.key);
+                }
+            }
+        }
+
+        Ok(entries.into_iter().collect())
+    }
+}
+
+pub struct StagedBatch<B: WriteBatch> {
+    inner: B,
+    changes: Rc<RefCell<HashMap<StoreKey, Option<Vec<u8>>>>>,
+}
+
+impl<B: WriteBatch> StagedBatch<B> {
+    pub fn into_inner(self) -> B {
+        self.inner
+    }
+}
+
+impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
+    fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        self.inner.put(family, key, value)?;
+        self.changes
+            .borrow_mut()
+            .insert(StoreKey::new(family, key), Some(value.to_vec()));
+        Ok(())
+    }
+
+    fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
+        self.inner.delete(family, key)?;
+        self.changes
+            .borrow_mut()
+            .insert(StoreKey::new(family, key), None);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -111,6 +262,8 @@ pub enum MetaKey {
     BestHeaderHash,
     BestBlockHash,
     MiningGeneration,
+    StorageProfile,
+    ChainEpoch,
     CleanShutdown,
 }
 
@@ -123,6 +276,8 @@ impl MetaKey {
             Self::BestHeaderHash => b"best-header-hash",
             Self::BestBlockHash => b"best-block-hash",
             Self::MiningGeneration => b"mining-generation",
+            Self::StorageProfile => b"storage-profile",
+            Self::ChainEpoch => b"chain-epoch",
             Self::CleanShutdown => b"clean-shutdown",
         }
     }
@@ -184,7 +339,8 @@ pub fn open_store(config: &StoreConfig) -> Result<StoreHandle, StoreError> {
         StoreBackend::RocksDb => {
             #[cfg(feature = "rocksdb-backend")]
             {
-                RocksStore::open(&config.path).map(StoreHandle::Rocks)
+                RocksStore::open_with_durability(&config.path, config.durability)
+                    .map(StoreHandle::Rocks)
             }
 
             #[cfg(not(feature = "rocksdb-backend"))]
@@ -207,6 +363,14 @@ impl StoreHandle {
     pub fn memory() -> Self {
         Self::Memory(MemoryStore::new())
     }
+
+    pub const fn durability_policy(&self) -> DurabilityPolicy {
+        match self {
+            Self::Memory(_) => DurabilityPolicy::Sync,
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(store) => store.durability,
+        }
+    }
 }
 
 impl Default for StoreHandle {
@@ -216,12 +380,14 @@ impl Default for StoreHandle {
 }
 
 impl Store for StoreHandle {
-    type Snapshot = StoreHandleSnapshot;
+    type Snapshot<'a> = StoreHandleSnapshot<'a>;
     type Batch = StoreHandleBatch;
 
-    fn snapshot(&self) -> Result<Self::Snapshot, StoreError> {
+    fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
         match self {
-            Self::Memory(store) => store.snapshot().map(StoreHandleSnapshot::Memory),
+            Self::Memory(store) => store
+                .snapshot()
+                .map(|snapshot| StoreHandleSnapshot::Memory(snapshot, PhantomData)),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(store) => store.snapshot().map(StoreHandleSnapshot::Rocks),
         }
@@ -274,17 +440,16 @@ fn commit_rocks_store_handle(
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum StoreHandleSnapshot {
-    Memory(MemorySnapshot),
+pub enum StoreHandleSnapshot<'a> {
+    Memory(MemorySnapshot, PhantomData<&'a ()>),
     #[cfg(feature = "rocksdb-backend")]
-    Rocks(RocksSnapshot),
+    Rocks(RocksSnapshot<'a>),
 }
 
-impl ReadSnapshot for StoreHandleSnapshot {
+impl ReadSnapshot for StoreHandleSnapshot<'_> {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         match self {
-            Self::Memory(snapshot) => snapshot.get(family, key),
+            Self::Memory(snapshot, _) => snapshot.get(family, key),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(snapshot) => snapshot.get(family, key),
         }
@@ -296,7 +461,7 @@ impl ReadSnapshot for StoreHandleSnapshot {
         prefix: &[u8],
     ) -> Result<Vec<ScanEntry>, StoreError> {
         match self {
-            Self::Memory(snapshot) => snapshot.scan_prefix(family, prefix),
+            Self::Memory(snapshot, _) => snapshot.scan_prefix(family, prefix),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(snapshot) => snapshot.scan_prefix(family, prefix),
         }
@@ -340,10 +505,10 @@ impl MemoryStore {
 }
 
 impl Store for MemoryStore {
-    type Snapshot = MemorySnapshot;
+    type Snapshot<'a> = MemorySnapshot;
     type Batch = MemoryBatch;
 
-    fn snapshot(&self) -> Result<Self::Snapshot, StoreError> {
+    fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
         let data = self
             .inner
             .read()
@@ -461,11 +626,19 @@ enum MemoryOperation {
 #[derive(Clone, Debug)]
 pub struct RocksStore {
     db: Arc<rocksdb::DB>,
+    durability: DurabilityPolicy,
 }
 
 #[cfg(feature = "rocksdb-backend")]
 impl RocksStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
+        Self::open_with_durability(path, DurabilityPolicy::Sync)
+    }
+
+    pub fn open_with_durability(
+        path: impl AsRef<std::path::Path>,
+        durability: DurabilityPolicy,
+    ) -> Result<Self, StoreError> {
         use rocksdb::{ColumnFamilyDescriptor, Options};
 
         let mut db_options = Options::default();
@@ -479,7 +652,10 @@ impl RocksStore {
         let db = rocksdb::DB::open_cf_descriptors(&db_options, path, descriptors)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            durability,
+        })
     }
 
     fn cf(db: &rocksdb::DB, family: ColumnFamily) -> Result<&rocksdb::ColumnFamily, StoreError> {
@@ -490,12 +666,14 @@ impl RocksStore {
 
 #[cfg(feature = "rocksdb-backend")]
 impl Store for RocksStore {
-    type Snapshot = RocksSnapshot;
+    type Snapshot<'a> = RocksSnapshot<'a>;
     type Batch = RocksBatch;
 
-    fn snapshot(&self) -> Result<Self::Snapshot, StoreError> {
+    fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+        let db = self.db.as_ref();
         Ok(RocksSnapshot {
-            db: Arc::clone(&self.db),
+            db,
+            snapshot: db.snapshot(),
         })
     }
 
@@ -510,33 +688,37 @@ impl Store for RocksStore {
             match operation {
                 RocksOperation::Put { family, key, value } => {
                     let cf = Self::cf(&self.db, family)?;
-                    write_batch.put_cf(&cf, key, value);
+                    write_batch.put_cf(cf, key, value);
                 }
                 RocksOperation::Delete { family, key } => {
                     let cf = Self::cf(&self.db, family)?;
-                    write_batch.delete_cf(&cf, key);
+                    write_batch.delete_cf(cf, key);
                 }
             }
         }
 
+        let mut options = rocksdb::WriteOptions::default();
+        options.disable_wal(false);
+        options.set_sync(matches!(self.durability, DurabilityPolicy::Sync));
+
         self.db
-            .write(write_batch)
+            .write_opt(write_batch, &options)
             .map_err(|error| StoreError::Backend(error.to_string()))
     }
 }
 
 #[cfg(feature = "rocksdb-backend")]
-#[derive(Clone, Debug)]
-pub struct RocksSnapshot {
-    db: Arc<rocksdb::DB>,
+pub struct RocksSnapshot<'a> {
+    db: &'a rocksdb::DB,
+    snapshot: rocksdb::Snapshot<'a>,
 }
 
 #[cfg(feature = "rocksdb-backend")]
-impl ReadSnapshot for RocksSnapshot {
+impl ReadSnapshot for RocksSnapshot<'_> {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let cf = RocksStore::cf(&self.db, family)?;
-        self.db
-            .get_cf(&cf, key)
+        let cf = RocksStore::cf(self.db, family)?;
+        self.snapshot
+            .get_cf(cf, key)
             .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
@@ -547,12 +729,12 @@ impl ReadSnapshot for RocksSnapshot {
     ) -> Result<Vec<ScanEntry>, StoreError> {
         use rocksdb::{Direction, IteratorMode};
 
-        let cf = RocksStore::cf(&self.db, family)?;
+        let cf = RocksStore::cf(self.db, family)?;
         let mut entries = Vec::new();
 
         for item in self
-            .db
-            .iterator_cf(&cf, IteratorMode::From(prefix, Direction::Forward))
+            .snapshot
+            .iterator_cf(cf, IteratorMode::From(prefix, Direction::Forward))
         {
             let (key, value) = item.map_err(|error| StoreError::Backend(error.to_string()))?;
 
@@ -698,6 +880,104 @@ mod tests {
     }
 
     #[test]
+    fn staging_overlay_reads_its_own_writes_without_committing() {
+        let store = MemoryStore::new();
+        let mut initial = store.batch();
+        initial
+            .put(ColumnFamily::Headers, b"b/1", b"old")
+            .expect("put initial");
+        store.commit(initial).expect("commit initial");
+
+        let base = store.snapshot().expect("base snapshot");
+        let overlay = StagingOverlay::new();
+        let staged_snapshot = overlay.snapshot(&base);
+        let mut staged_batch = overlay.batch(store.batch());
+        staged_batch
+            .put(ColumnFamily::Headers, b"b/1", b"new")
+            .expect("replace");
+        staged_batch
+            .put(ColumnFamily::Headers, b"b/2", b"two")
+            .expect("insert");
+        staged_batch
+            .delete(ColumnFamily::Headers, b"b/3")
+            .expect("delete absent");
+
+        assert_eq!(
+            staged_snapshot
+                .get(ColumnFamily::Headers, b"b/1")
+                .expect("staged get"),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(
+            staged_snapshot
+                .scan_prefix(ColumnFamily::Headers, b"b/")
+                .expect("staged scan"),
+            vec![
+                (b"b/1".to_vec(), b"new".to_vec()),
+                (b"b/2".to_vec(), b"two".to_vec())
+            ]
+        );
+
+        let live = store.snapshot().expect("live snapshot");
+        assert_eq!(
+            live.get(ColumnFamily::Headers, b"b/1")
+                .expect("live get"),
+            Some(b"old".to_vec())
+        );
+        assert_eq!(
+            live.get(ColumnFamily::Headers, b"b/2")
+                .expect("live get"),
+            None
+        );
+
+        store
+            .commit(staged_batch.into_inner())
+            .expect("commit staged batch");
+        let committed = store.snapshot().expect("committed snapshot");
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Headers, b"b/1")
+                .expect("committed get"),
+            Some(b"new".to_vec())
+        );
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Headers, b"b/2")
+                .expect("committed get"),
+            Some(b"two".to_vec())
+        );
+    }
+
+    #[test]
+    fn dropping_staged_batch_discards_every_staged_write() {
+        let store = MemoryStore::new();
+        let base = store.snapshot().expect("base snapshot");
+        let overlay = StagingOverlay::new();
+        let staged_snapshot = overlay.snapshot(&base);
+        {
+            let mut staged_batch = overlay.batch(store.batch());
+            staged_batch
+                .put(ColumnFamily::Meta, b"temporary", b"value")
+                .expect("put");
+            assert_eq!(
+                staged_snapshot
+                    .get(ColumnFamily::Meta, b"temporary")
+                    .expect("staged get"),
+                Some(b"value".to_vec())
+            );
+        }
+
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("live snapshot")
+                .get(ColumnFamily::Meta, b"temporary")
+                .expect("live get"),
+            None
+        );
+    }
+
+    #[test]
     fn initialize_schema_writes_and_checks_version() {
         let store = MemoryStore::new();
         initialize_schema(&store).expect("initialize schema");
@@ -717,6 +997,15 @@ mod tests {
         assert_eq!(encoded, [8, 7, 6, 5, 4, 3, 2, 1]);
         assert_eq!(decode_u64(&encoded).expect("decode"), 0x0102_0304_0506_0708);
         assert!(decode_u64(&encoded[..7]).is_err());
+    }
+
+    #[test]
+    fn durability_policy_is_explicit_and_strictly_parsed() {
+        assert_eq!("sync".parse::<DurabilityPolicy>().expect("sync"), DurabilityPolicy::Sync);
+        assert_eq!("wal".parse::<DurabilityPolicy>().expect("wal"), DurabilityPolicy::Wal);
+        assert!("none".parse::<DurabilityPolicy>().is_err());
+        assert_eq!(DurabilityPolicy::Sync.to_string(), "sync");
+        assert_eq!(DurabilityPolicy::Wal.to_string(), "wal");
     }
 
     #[test]
@@ -764,6 +1053,62 @@ mod tests {
             initialize_schema(&store).expect("schema still valid");
         }
 
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_store_exposes_selected_wal_durability_policy() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-rocks-durability-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let store = RocksStore::open_with_durability(&path, DurabilityPolicy::Wal)
+            .expect("open rocksdb");
+        assert_eq!(store.durability, DurabilityPolicy::Wal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_snapshot_is_sequence_consistent() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-rocks-snapshot-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let store = RocksStore::open(&path).expect("open rocksdb");
+
+        let mut initial = store.batch();
+        initial
+            .put(ColumnFamily::Meta, b"key", b"old")
+            .expect("put initial");
+        store.commit(initial).expect("commit initial");
+
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut replacement = store.batch();
+        replacement
+            .put(ColumnFamily::Meta, b"key", b"new")
+            .expect("put replacement");
+        store.commit(replacement).expect("commit replacement");
+
+        assert_eq!(
+            snapshot.get(ColumnFamily::Meta, b"key").expect("get"),
+            Some(b"old".to_vec())
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("new snapshot")
+                .get(ColumnFamily::Meta, b"key")
+                .expect("get"),
+            Some(b"new".to_vec())
+        );
+
+        drop(snapshot);
+        drop(store);
         let _ = std::fs::remove_dir_all(&path);
     }
 }

@@ -1,66 +1,114 @@
-# Storage Schema
+# Storage schema
 
-`hns-store` owns persistence. Runtime crates use typed traits and do not issue raw RocksDB calls directly. All consensus-critical writes use atomic write batches.
+`hns-store` owns persistence. Runtime crates use typed `Store`, `ReadSnapshot`,
+and `WriteBatch` traits and do not issue raw RocksDB calls directly. All
+consensus-critical writes use atomic batches.
 
-## Backend
+## Current schema boundary
+
+The current persistent schema version is **5**. Version 5 changes both the
+encoded block-status bit assignments and the UTXO `Coin` payload by persisting
+the spent output address required for script authorization. Existing
+pre-authority databases must be reindexed; the node intentionally refuses an
+implicit migration.
+
+Durable identity also binds:
+
+- network ID;
+- genesis hash;
+- storage profile `hsrd-mining-v1`;
+- schema version;
+- chain epoch.
+
+A mismatch fails closed.
+
+## Backend and durability
 
 - Default backend: RocksDB.
-- Required features: column families, atomic write batches, read snapshots, prefix iteration, configurable block cache, compaction tuning, and crash recovery.
-- Non-goal: SQLite for chain, block, UTXO, name-state, undo, or tx-index data.
+- Durability policies:
+  - `sync`: WAL enabled and fsync before commit returns;
+  - `wal`: WAL enabled, operating system schedules fsync.
+- Required features: column families, atomic batches, true read snapshots,
+  prefix iteration, cache/compaction tuning, and crash recovery.
+- The in-memory backend exists for deterministic tests.
+- SQLite is not a consensus-state backend.
 
-## Column Families
+A `RocksSnapshot` contains a real `rocksdb::Snapshot` tied to one sequence
+number. It is not a clone of the live database handle.
 
-- `meta`: schema version, network, genesis hash, best header hash, best block hash, finalized checkpoint, assume-valid hash, snapshot manifest hash, prune horizon, mining generation, and clean shutdown marker.
-- `headers`: `header_hash -> HeaderRecord { raw_header, height, chainwork, prev_hash, time, bits, tree_root, status }`; chainwork is stored as an unsigned 256-bit big-endian integer.
+## Column families
+
+- `meta`: schema version, network, genesis hash, storage profile, best header,
+  best block, mining generation, chain epoch, and future recovery metadata.
+- `headers`: `header_hash -> HeaderRecord` including header bytes, height,
+  unsigned 256-bit chainwork, and granular status.
 - `height_index`: `height -> canonical_header_hash`.
-- `block_index`: `block_hash -> BlockIndexRecord { height, prev_hash, chainwork, status, tx_count, raw_block_present, undo_present, validated_at }`; chainwork uses the same unsigned 256-bit big-endian encoding.
-- `blocks`: `block_hash -> RawBlock { bytes, compression, source, checksum }`.
-- `tx_index`: optional bounded differential/debug index; disabled in the lean production profile.
-- `utxo`: `outpoint -> Coin { height, coinbase, value, address_or_script, covenant }`.
-- `name_state`: `name_hash -> NameStateRecord { name, state, owner, value, renewal, transfer, revoked, height, weak }`.
-- `undo`: `block_hash -> BlockUndo { spent_coins, previous_name_states, removed_names, metadata }`.
-- `peers`: `network_group/address -> PeerRecord { services, last_height, score, last_success, last_failure, banned_until }`.
-- `orphans`: `block_hash -> OrphanBlockRecord { raw_block, prev_hash, received_at, peer_id }`.
-- `mempool_persist`: optional fee estimator, recent reject filters, and rebroadcast metadata. The mempool itself remains in memory.
-- `snapshots`: snapshot manifest, chunk hashes, signatures, imported height, state roots, and trusted/untrusted mode.
+- `block_index`: `block_hash -> BlockIndexRecord` including height, parent,
+  chainwork, status, transaction count, and validation timestamp.
+- `blocks`: hash-addressed raw block records with source/checksum metadata.
+- `tx_index`: bounded differential/debug transaction index; not required in a
+  future lean production profile.
+- `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
+- `name_state`: typed name-state records; currently not consensus-complete.
+- `undo`: block UTXO/name undo records.
+- `peers`, `orphans`, `mempool_persist`, `snapshots`: reserved operational
+  records as their subsystems mature.
 
-## Block Status
+## Block status bit layout
 
-Block index status should be bitflags:
+Version 5 stores a `u32` bitset:
 
-- `header_valid`: header PoW, linkage, difficulty, and checkpoint rules passed.
-- `body_present`: raw block is stored.
-- `body_valid`: merkle/witness/tree commitments and block-level syntax passed.
-- `tx_valid`: transaction and covenant consensus checks passed.
-- `scripts_valid`: script verification completed or explicitly deferred under assume-valid policy.
-- `state_connected`: UTXO and name state are connected to the active chain.
-- `undo_present`: disconnect data is stored.
-- `failed`: permanently invalid block data was observed.
+| Bit | Field | Meaning |
+|---:|---|---|
+| 0 | `header_context_valid` | PoW, parent, difficulty, and time context passed |
+| 1 | `checkpoint_valid` | checkpoint policy passed |
+| 2 | `deployment_state_valid` | activation/deployment context passed |
+| 3 | `body_present` | raw body is durable |
+| 4 | `body_syntax_valid` | block/transaction syntax and commitments passed |
+| 5 | `absolute_finality_valid` | height/time locktime passed |
+| 6 | `relative_locks_valid` | relative sequence locks passed |
+| 7 | `scripts_valid` | witness/script authorization passed |
+| 8 | `covenant_links_valid` | non-coinbase input/output linkage passed |
+| 9 | `covenants_context_valid` | full contextual covenant/name rules passed |
+| 10 | `claims_and_airdrops_valid` | claim/airdrop proof and accounting passed |
+| 11 | `utxo_connected` | UTXO mutation is connected |
+| 12 | `name_state_connected` | name-state mutation is connected |
+| 13 | `tree_root_valid` | resulting Urkel root equals the header root |
+| 14 | `undo_present` | disconnect data is durable |
+| 15 | `active_chain` | record belongs to the canonical chain |
+| 16 | `failed` | permanent invalidity was observed |
 
-## Atomic Connect
+The fields are deliberately non-overlapping. In particular,
+`covenant_links_valid` must not be promoted to contextual/name-state validity.
 
-Connecting a block writes one batch:
+## Atomic connect and disconnect
 
-- update `block_index` validation and active-chain status;
-- insert or delete `utxo` entries;
-- insert, update, or delete `name_state` entries;
-- write `undo`;
-- update `height_index`;
-- update `meta.best_block_hash`;
-- optionally write `tx_index` entries;
-- prune consumed orphan records.
+A direct connect writes one batch containing the validated state mutation,
+undo, indexes, canonical height, best block, mining generation, and chain epoch.
+A direct disconnect writes the inverse batch.
 
-Disconnecting a block writes the inverse batch using `undo`. Reorgs are composed as a sequence of disconnect batches followed by connect batches.
+A multi-block reorganization uses:
 
-## Cache Policy
+1. one immutable base snapshot;
+2. one `StagingOverlay` that provides read-your-writes semantics;
+3. one underlying store batch;
+4. staged disconnects and connects;
+5. final best-work and tip consistency checks;
+6. one commit.
 
-- UTXO cache and name-state cache are configurable independently.
-- Dirty cache entries flush by size, block count, elapsed time, or shutdown.
-- Flush order preserves recoverability: raw block and undo before active-chain promotion.
-- Store snapshots are used for mining and bounded diagnostic reads so neither holds validation locks.
+The overlay records pending puts/deletes without exposing them to other readers.
+On failure, dropping the batch leaves every durable key unchanged. Intermediate
+reorganization tips are never committed.
 
-## Snapshots
+## Fixture integrity
 
-Snapshot manifests are stored separately from consensus state. A manifest includes network, height, block hash, header chain commitment, external UTXO root, external name-state root, chunk hashes, producer identity, signatures, and mode.
+The HSD fixture manifest is itself versioned. Each entry contains a relative
+path and exact BLAKE2b-256 digest. Both the Rust loader and the static CI check
+verify the bytes before a fixture is trusted by tests.
 
-Untrusted snapshot mode imports state for fast boot, then schedules background replay to verify it. Trusted snapshot mode skips background replay only when the operator explicitly enables it.
+## Future snapshots
+
+Fast-sync snapshot manifests remain separate from consensus state. A production
+manifest must bind network, height, block hash, header-chain commitment, UTXO
+root, name-tree root, chunk hashes, producer identity, signatures, and trust
+mode. Import and background replay are not yet implemented.

@@ -1,0 +1,804 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
+    "hsdVersion": "8.99.0"
+  },
+  "scope": "non-coinbase covenant linkage only; name-state transitions are not covered",
+  "cases": [
+    {
+      "id": "none-to-none",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001303030303030303030303030303030303030303030303030303030303030303000000000ffffffff01e8030000000000000014101010101010101010101010101010101010101000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3030303030303030303030303030303030303030303030303030303030303030",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ]
+    },
+    {
+      "id": "none-to-open",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001313131313131313131313131313131313131313131313131313131313131313100000000ffffffff01e80300000000000000141010101010101010101010101010101010101010020320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af040000000005616c7068610000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3131313131313131313131313131313131313131313131313131313131313131",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ]
+    },
+    {
+      "id": "redeem-to-bid",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001323232323232323232323232323232323232323232323232323232323232323200000000ffffffff01bc0200000000000000141010101010101010101010101010101010101010030420271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af046400000005616c70686120c82876caf7bfa613c5b64bd421bbc35f8f0654bc645b340a56b0df0c09668f810000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3232323232323232323232323232323232323232323232323232323232323232",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 5,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "none-to-update-rejected",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001333333333333333333333333333333333333333333333333333333333333333300000000ffffffff01e80300000000000000141010101010101010101010101010101010101010070320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af0464000000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3333333333333333333333333333333333333333333333333333333333333333",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ]
+    },
+    {
+      "id": "unlinked-none-input-with-shorter-output-vector",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000002404040404040404040404040404040404040404040404040404040404040404000000000ffffffff414141414141414141414141414141414141414141414141414141414141414100000000ffffffff018403000000000000001410101010101010101010101010101010101010100000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4040404040404040404040404040404040404040404040404040404040404040",
+          "outpointIndex": 0,
+          "value": 600,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 0,
+          "covenantItems": []
+        },
+        {
+          "outpointTxid": "4141414141414141414141414141414141414141414141414141414141414141",
+          "outpointIndex": 0,
+          "value": 400,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ]
+    },
+    {
+      "id": "multi-input-linked-output-index-alignment",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000002424242424242424242424242424242424242424242424242424242424242424200000000ffffffff434343434343434343434343434343434343434343434343434343434343434300000000ffffffff025802000000000000001410101010101010101010101010101010101010100000900100000000000000141010101010101010101010101010101010101010070320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af046400000000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4242424242424242424242424242424242424242424242424242424242424242",
+          "outpointIndex": 0,
+          "value": 600,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 0,
+          "covenantItems": []
+        },
+        {
+          "outpointTxid": "4343434343434343434343434343434343434343434343434343434343434343",
+          "outpointIndex": 0,
+          "value": 400,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 6,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "",
+            "8282828282828282828282828282828282828282828282828282828282828282"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "multi-input-name-link-missing-at-own-index",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000002424242424242424242424242424242424242424242424242424242424242424200000000ffffffff434343434343434343434343434343434343434343434343434343434343434300000000ffffffff015802000000000000001410101010101010101010101010101010101010100000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4242424242424242424242424242424242424242424242424242424242424242",
+          "outpointIndex": 0,
+          "value": 600,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 0,
+          "covenantItems": []
+        },
+        {
+          "outpointTxid": "4343434343434343434343434343434343434343434343434343434343434343",
+          "outpointIndex": 0,
+          "value": 400,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 6,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "",
+            "8282828282828282828282828282828282828282828282828282828282828282"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bid-to-reveal",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001373737373737373737373737373737373737373737373737373737373737373700000000ffffffff01bc0200000000000000141010101010101010101010101010101010101010040320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04640000002021212121212121212121212121212121212121212121212121212121212121210000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3737373737373737373737373737373737373737373737373737373737373737",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 3,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "c82876caf7bfa613c5b64bd421bbc35f8f0654bc645b340a56b0df0c09668f81"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bid-missing-linked-output",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001383838383838383838383838383838383838383838383838383838383838383800000000ffffffff000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3838383838383838383838383838383838383838383838383838383838383838",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 3,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "c82876caf7bfa613c5b64bd421bbc35f8f0654bc645b340a56b0df0c09668f81"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bid-to-wrong-covenant",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001393939393939393939393939393939393939393939393939393939393939393900000000ffffffff01bc0200000000000000141010101010101010101010101010101010101010050220271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04640000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3939393939393939393939393939393939393939393939393939393939393939",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 3,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "c82876caf7bfa613c5b64bd421bbc35f8f0654bc645b340a56b0df0c09668f81"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bid-name-mismatch",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "01000000013a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a00000000ffffffff01bc0200000000000000141010101010101010101010101010101010101010040320860a44c15b639f3d4814bb39611b0c91a87153d719b83a2b575e4af2097bdaf404650000002021212121212121212121212121212121212121212121212121212121212121210000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 3,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "c82876caf7bfa613c5b64bd421bbc35f8f0654bc645b340a56b0df0c09668f81"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bid-height-mismatch",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "01000000013b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b00000000ffffffff01bc0200000000000000141010101010101010101010101010101010101010040320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04650000002021212121212121212121212121212121212121212121212121212121212121210000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 3,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "c82876caf7bfa613c5b64bd421bbc35f8f0654bc645b340a56b0df0c09668f81"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bid-blind-mismatch",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "01000000013c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c00000000ffffffff01bc0200000000000000141010101010101010101010101010101010101010040320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04640000002022222222222222222222222222222222222222222222222222222222222222220000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 3,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "c82876caf7bfa613c5b64bd421bbc35f8f0654bc645b340a56b0df0c09668f81"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bid-value-inflation",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "01000000013d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d00000000ffffffff01b00400000000000000141010101010101010101010101010101010101010040320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04640000002021212121212121212121212121212121212121212121212121212121212121210000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 3,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "a62d8757175b61bb189092bb22e4678ac1b94e1eef23d0f72288ba46e46623b4"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reveal-to-register",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "01000000013e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e00000000ffffffff01f40100000000000000141010101010101010101010101010101010101010060420271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af0464000000002082828282828282828282828282828282828282828282828282828282828282820000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 4,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "2121212121212121212121212121212121212121212121212121212121212121"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reveal-to-redeem",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "01000000013f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f00000000ffffffff01f40100000000000000141010101010101010101010101010101010101010050220271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04640000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 4,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "2121212121212121212121212121212121212121212121212121212121212121"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "claim-to-register",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001404040404040404040404040404040404040404040404040404040404040404000000000ffffffff01e80300000000000000141010101010101010101010101010101010101010060420271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af0464000000002082828282828282828282828282828282828282828282828282828282828282820000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4040404040404040404040404040404040404040404040404040404040404040",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 1,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "00",
+            "8181818181818181818181818181818181818181818181818181818181818181",
+            "01000000"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "claim-to-redeem-rejected",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001414141414141414141414141414141414141414141414141414141414141414100000000ffffffff01e80300000000000000141010101010101010101010101010101010101010050220271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04640000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4141414141414141414141414141414141414141414141414141414141414141",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 1,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "00",
+            "8181818181818181818181818181818181818181818181818181818181818181",
+            "01000000"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reveal-register-address-mismatch",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001424242424242424242424242424242424242424242424242424242424242424200000000ffffffff01e80300000000000000141111111111111111111111111111111111111111060420271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af0464000000002082828282828282828282828282828282828282828282828282828282828282820000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4242424242424242424242424242424242424242424242424242424242424242",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 4,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "2121212121212121212121212121212121212121212121212121212121212121"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "register-to-update",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001434343434343434343434343434343434343434343434343434343434343434300000000ffffffff01e80300000000000000141010101010101010101010101010101010101010070320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af0464000000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4343434343434343434343434343434343434343434343434343434343434343",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 6,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "",
+            "8282828282828282828282828282828282828282828282828282828282828282"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "update-to-renew",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001444444444444444444444444444444444444444444444444444444444444444400000000ffffffff01e80300000000000000141010101010101010101010101010101010101010080320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04640000002083838383838383838383838383838383838383838383838383838383838383830000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4444444444444444444444444444444444444444444444444444444444444444",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 7,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            ""
+          ]
+        }
+      ]
+    },
+    {
+      "id": "renew-to-transfer",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001454545454545454545454545454545454545454545454545454545454545454500000000ffffffff01e80300000000000000141010101010101010101010101010101010101010090420271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af046400000001002012121212121212121212121212121212121212121212121212121212121212120000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4545454545454545454545454545454545454545454545454545454545454545",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 8,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "8383838383838383838383838383838383838383838383838383838383838383"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "finalize-to-revoke",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "0100000001464646464646464646464646464646464646464646464646464646464646464600000000ffffffff01e803000000000000001410101010101010101010101010101010101010100b0220271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af04640000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4646464646464646464646464646464646464646464646464646464646464646",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 10,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "616c706861",
+            "00",
+            "01000000",
+            "02000000",
+            "8484848484848484848484848484848484848484848484848484848484848484"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "register-value-mismatch",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001474747474747474747474747474747474747474747474747474747474747474700000000ffffffff01e70300000000000000141010101010101010101010101010101010101010070320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af0464000000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4747474747474747474747474747474747474747474747474747474747474747",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 6,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "",
+            "8282828282828282828282828282828282828282828282828282828282828282"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "register-address-mismatch",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001484848484848484848484848484848484848484848484848484848484848484800000000ffffffff01e80300000000000000141111111111111111111111111111111111111111070320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af0464000000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4848484848484848484848484848484848484848484848484848484848484848",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 6,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "",
+            "8282828282828282828282828282828282828282828282828282828282828282"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "register-name-mismatch",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001494949494949494949494949494949494949494949494949494949494949494900000000ffffffff01e80300000000000000141010101010101010101010101010101010101010070320860a44c15b639f3d4814bb39611b0c91a87153d719b83a2b575e4af2097bdaf40465000000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4949494949494949494949494949494949494949494949494949494949494949",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 6,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "",
+            "8282828282828282828282828282828282828282828282828282828282828282"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "register-to-none-rejected",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "01000000014a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a00000000ffffffff01e8030000000000000014101010101010101010101010101010101010101000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 6,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "",
+            "8282828282828282828282828282828282828282828282828282828282828282"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transfer-to-finalize",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "01000000014b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b00000000ffffffff01e803000000000000002012121212121212121212121212121212121212121212121212121212121212120a0720271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af046400000005616c7068610100040100000004020000002084848484848484848484848484848484848484848484848484848484848484840000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 9,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "00",
+            "1212121212121212121212121212121212121212121212121212121212121212"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transfer-to-update",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "01000000014c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c00000000ffffffff01e80300000000000000141010101010101010101010101010101010101010070320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af0464000000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 9,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "00",
+            "1212121212121212121212121212121212121212121212121212121212121212"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "transfer-finalize-target-mismatch",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "01000000014d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d00000000ffffffff01e803000000000000001411111111111111111111111111111111111111110a0720271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af046400000005616c7068610100040100000004020000002084848484848484848484848484848484848484848484848484848484848484840000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 9,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000",
+            "00",
+            "1212121212121212121212121212121212121212121212121212121212121212"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "revoke-is-unspendable",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "01000000014e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e00000000ffffffff01e8030000000000000014101010101010101010101010101010101010101000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e4e",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 11,
+          "covenantItems": [
+            "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+            "64000000"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "unknown-to-none",
+      "accepted": true,
+      "oracleResult": 0,
+      "transactionRaw": "01000000014f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f00000000ffffffff01e8030000000000000014101010101010101010101010101010101010101000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 99,
+          "covenantItems": []
+        }
+      ]
+    },
+    {
+      "id": "unknown-to-name-rejected",
+      "accepted": false,
+      "oracleResult": -1,
+      "transactionRaw": "0100000001505050505050505050505050505050505050505050505050505050505050505000000000ffffffff01e80300000000000000141010101010101010101010101010101010101010020320271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af040000000005616c7068610000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "5050505050505050505050505050505050505050505050505050505050505050",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "1010101010101010101010101010101010101010",
+          "covenantType": 99,
+          "covenantItems": []
+        }
+      ]
+    }
+  ]
+}

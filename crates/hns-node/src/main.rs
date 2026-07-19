@@ -4,7 +4,10 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
 use hns_consensus::Network;
-use hns_node::{init_logging, NodeConfig, NodeService, ShutdownSignal};
+use hns_store::DurabilityPolicy;
+use hns_node::{
+    init_logging, validate_node_config, AuthorityMode, NodeConfig, NodeService, ShutdownSignal,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "hsrd", about = "Lean Handshake consensus and mining full node")]
@@ -27,6 +30,15 @@ struct Cli {
     #[arg(long, env = "HSRD_LOG", default_value = "info")]
     log_filter: String,
 
+    #[arg(long, value_enum, default_value_t = AuthorityMode::Shadow)]
+    authority_mode: AuthorityMode,
+
+    #[arg(long)]
+    acknowledge_incomplete_consensus: bool,
+
+    #[arg(long, default_value_t = DurabilityPolicy::Sync)]
+    storage_durability: DurabilityPolicy,
+
     #[arg(long)]
     check_config: bool,
 }
@@ -40,6 +52,9 @@ impl Cli {
             rpc_bind: self.rpc_bind,
             metrics_bind: self.metrics_bind,
             log_filter: self.log_filter,
+            authority_mode: self.authority_mode,
+            acknowledge_incomplete_consensus: self.acknowledge_incomplete_consensus,
+            storage_durability: self.storage_durability,
         }
     }
 }
@@ -70,9 +85,15 @@ async fn main() -> anyhow::Result<()> {
     let config = cli.into_config();
 
     init_logging(&config.log_filter)?;
+    validate_node_config(&config)?;
 
     if check_config {
-        tracing::info!(network = %config.network, "configuration parsed successfully");
+        tracing::info!(
+            network = %config.network,
+            authority_mode = config.authority_mode.as_str(),
+            storage_durability = %config.storage_durability,
+            "configuration parsed successfully"
+        );
         return Ok(());
     }
 

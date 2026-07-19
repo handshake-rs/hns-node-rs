@@ -5,7 +5,7 @@ use blake2::{
     Blake2b512, Blake2bVar, Digest,
 };
 use serde::{Deserialize, Serialize};
-use sha3::Sha3_256;
+use sha3::{Keccak256, Sha3_256};
 use std::fmt;
 
 pub const HEADER_SIZE: usize = 236;
@@ -599,6 +599,19 @@ pub struct Output {
 }
 
 impl Output {
+    pub fn decode(raw: &[u8]) -> Result<Self, PrimitiveError> {
+        let mut reader = Reader::new(raw, MAX_TX_SIZE)?;
+        let output = Self::read_from(&mut reader)?;
+        reader.ensure_finished()?;
+        Ok(output)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        self.write_to(&mut writer);
+        writer.finish()
+    }
+
     pub fn read_from(reader: &mut Reader<'_>) -> Result<Self, PrimitiveError> {
         Ok(Self {
             value: reader.read_u64()?,
@@ -740,6 +753,7 @@ pub struct Coin {
     pub value: Amount,
     pub height: Height,
     pub coinbase: bool,
+    pub address: Address,
     pub covenant: Covenant,
 }
 
@@ -769,6 +783,24 @@ pub struct Covenant {
 }
 
 impl Covenant {
+    pub fn item(&self, index: usize) -> Option<&[u8]> {
+        self.items.get(index).map(Vec::as_slice)
+    }
+
+    pub fn item_u8(&self, index: usize) -> Option<u8> {
+        let item = self.item(index)?;
+        (item.len() == 1).then_some(item[0])
+    }
+
+    pub fn item_u32(&self, index: usize) -> Option<u32> {
+        let item: [u8; 4] = self.item(index)?.try_into().ok()?;
+        Some(u32::from_le_bytes(item))
+    }
+
+    pub fn item_hash(&self, index: usize) -> Option<[u8; 32]> {
+        self.item(index)?.try_into().ok()
+    }
+
     pub fn decode(raw: &[u8]) -> Result<Self, PrimitiveError> {
         let mut reader = Reader::new(raw, MAX_TX_SIZE)?;
         let covenant = Self::read_from(&mut reader)?;
@@ -954,6 +986,41 @@ pub enum CovenantKind {
 }
 
 impl CovenantKind {
+    pub const fn is_name(self) -> bool {
+        matches!(
+            self,
+            Self::Claim
+                | Self::Open
+                | Self::Bid
+                | Self::Reveal
+                | Self::Redeem
+                | Self::Register
+                | Self::Update
+                | Self::Renew
+                | Self::Transfer
+                | Self::Finalize
+                | Self::Revoke
+        )
+    }
+
+    pub const fn is_linked(self) -> bool {
+        matches!(
+            self,
+            Self::Reveal
+                | Self::Redeem
+                | Self::Register
+                | Self::Update
+                | Self::Renew
+                | Self::Transfer
+                | Self::Finalize
+                | Self::Revoke
+        )
+    }
+
+    pub const fn is_unspendable(self) -> bool {
+        matches!(self, Self::Revoke)
+    }
+
     pub const fn from_u8(value: u8) -> Self {
         match value {
             0 => Self::None,
@@ -1149,6 +1216,16 @@ pub fn hash_name(name: &str) -> Result<NameHash, PrimitiveError> {
     Ok(NameHash::new(sha3_256(name.as_bytes())))
 }
 
+pub fn blake2b_160(bytes: &[u8]) -> [u8; 20] {
+    let mut hasher = Blake2bVar::new(20).expect("valid blake2b output size");
+    hasher.update(bytes);
+    let mut output = [0; 20];
+    hasher
+        .finalize_variable(&mut output)
+        .expect("valid blake2b output buffer");
+    output
+}
+
 pub fn blake2b_256(bytes: &[u8]) -> [u8; 32] {
     blake2b_256_many([bytes])
 }
@@ -1184,6 +1261,12 @@ pub fn sha3_256_many<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> [u8; 32] 
         Digest::update(&mut hasher, part);
     }
 
+    hasher.finalize().into()
+}
+
+pub fn keccak_256(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    Digest::update(&mut hasher, bytes);
     hasher.finalize().into()
 }
 

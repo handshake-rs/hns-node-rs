@@ -54,9 +54,16 @@ pub enum ChainEvent {
         committed_generation: MiningGeneration,
         candidate: HeaderSummary,
     },
-    BlockValidated {
+    BlockSyntaxValidated {
         committed_generation: MiningGeneration,
         block: HeaderSummary,
+    },
+    /// The local pre-authority state engine committed this generation, but it
+    /// has not passed every release-gated Handshake consensus check and is not
+    /// available through the authoritative mining snapshot channel.
+    TipStaged {
+        previous_generation: MiningGeneration,
+        snapshot: Option<Arc<MiningSnapshot>>,
     },
     TipCommitted {
         previous_generation: MiningGeneration,
@@ -158,11 +165,43 @@ impl MiningEventHub {
         });
     }
 
-    pub fn block_validated(&self, block: HeaderSummary) {
-        let _ = self.events.send(ChainEvent::BlockValidated {
+    pub fn block_syntax_validated(&self, block: HeaderSummary) {
+        let _ = self.events.send(ChainEvent::BlockSyntaxValidated {
             committed_generation: self.committed_generation(),
             block,
         });
+    }
+
+    /// Advance the durable generation without authorizing mining. This is the
+    /// normal shadow/pre-authority path until the parity gates pass.
+    pub fn tip_staged(
+        &self,
+        snapshot: Option<Arc<MiningSnapshot>>,
+        generation: MiningGeneration,
+    ) -> Result<(), MiningError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_generation = state.generation;
+        if generation <= previous_generation || generation == 0 {
+            return Err(MiningError::InvalidGeneration);
+        }
+        if snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.generation != generation)
+        {
+            return Err(MiningError::InvalidGeneration);
+        }
+
+        state.generation = generation;
+        state.snapshot = None;
+        self.latest_snapshot.send_replace(None);
+        let _ = self.events.send(ChainEvent::TipStaged {
+            previous_generation,
+            snapshot,
+        });
+        Ok(())
     }
 
     pub fn tip_committed(&self, snapshot: Arc<MiningSnapshot>) -> Result<(), MiningError> {
@@ -633,7 +672,7 @@ mod tests {
         };
         let summary = HeaderSummary::from_block(&block, 2);
         hub.candidate_tip_seen(summary.clone());
-        hub.block_validated(summary.clone());
+        hub.block_syntax_validated(summary.clone());
         let committed = Arc::new(snapshot(1, 2));
         hub.tip_committed(Arc::clone(&committed)).unwrap();
 
@@ -643,7 +682,7 @@ mod tests {
         ));
         assert!(matches!(
             subscription.events.recv().await.unwrap(),
-            ChainEvent::BlockValidated { .. }
+            ChainEvent::BlockSyntaxValidated { .. }
         ));
         assert!(matches!(
             subscription.events.recv().await.unwrap(),
@@ -653,6 +692,29 @@ mod tests {
             subscription.latest_snapshot.borrow().as_ref(),
             Some(&committed)
         );
+    }
+
+    #[tokio::test]
+    async fn staged_tip_advances_generation_without_authorizing_mining() {
+        let hub = MiningEventHub::new(None).unwrap();
+        let mut subscription = hub.subscribe();
+        let staged = Arc::new(snapshot(1, 2));
+
+        hub.tip_staged(Some(Arc::clone(&staged)), 1).unwrap();
+
+        match subscription.events.recv().await.unwrap() {
+            ChainEvent::TipStaged {
+                previous_generation,
+                snapshot,
+            } => {
+                assert_eq!(previous_generation, 0);
+                assert_eq!(snapshot.as_ref(), Some(&staged));
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+        assert_eq!(hub.committed_generation(), 1);
+        assert!(hub.snapshot().is_none());
+        assert!(subscription.latest_snapshot.borrow().is_none());
     }
 
     #[tokio::test]

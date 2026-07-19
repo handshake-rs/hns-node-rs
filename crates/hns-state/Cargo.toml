@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+hns-consensus = { path = "../hns-consensus" }
 hns-primitives = { path = "../hns-primitives" }
 hns-store = { path = "../hns-store" }
 serde.workspace = true

@@ -1,17 +1,27 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
+use hns_consensus::{
+    verify_transaction_covenant_links, CovenantLinkError, RejectUnverifiedInputs,
+    TransactionInputVerifier,
+};
 use hns_primitives::{
-    Amount, Block, BlockHash, Coin, Covenant, Height, NameHash, NameLifecycleState, NameState,
-    Outpoint, PrimitiveError, Reader, Writer, MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_TX_SIZE,
+    Address, Amount, Block, BlockHash, Coin, Covenant, Height, NameHash, NameLifecycleState,
+    NameState, Outpoint, PrimitiveError, Reader, Writer, MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT,
+    MAX_NAME_SIZE, MAX_TX_SIZE,
 };
 use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreError, WriteBatch};
 use serde::{Deserialize, Serialize};
 
-const BLOCK_UNDO_VERSION: u32 = 1;
+const BLOCK_UNDO_VERSION: u32 = 2;
 const OUTPOINT_KEY_SIZE: usize = 36;
-const COIN_CODEC_MAX: usize = OUTPOINT_KEY_SIZE + 8 + 4 + 1 + MAX_TX_SIZE + 9;
+const ADDRESS_CODEC_MAX: usize = 2 + MAX_ADDRESS_HASH_SIZE;
+const COIN_CODEC_MAX: usize = OUTPOINT_KEY_SIZE + 8 + 4 + 1 + ADDRESS_CODEC_MAX + MAX_TX_SIZE + 9;
 const NAME_STATE_CODEC_MAX: usize = 32 + 1 + MAX_NAME_SIZE + 9 + 4 + 1;
 const NAME_UNDO_CODEC_MAX: usize = 32 + 1 + NAME_STATE_CODEC_MAX + 9;
 const BLOCK_UNDO_CODEC_MAX: usize = MAX_BLOCK_WEIGHT * 8;
@@ -139,19 +149,46 @@ pub trait StateEngine {
     fn disconnect_block(&mut self, request: DisconnectBlock) -> Result<StateSummary, StateError>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StoredStateEngine<S: Store> {
     store: S,
+    input_verifier: Arc<dyn TransactionInputVerifier>,
+}
+
+impl<S: Store> fmt::Debug for StoredStateEngine<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredStateEngine")
+            .field("store", &"<store>")
+            .field("input_verifier", &"<transaction-input-verifier>")
+            .finish()
+    }
 }
 
 impl<S: Store> StoredStateEngine<S> {
+    /// Construct a state engine that fails closed on every non-coinbase input
+    /// until a consensus-complete authorization verifier is explicitly wired.
     pub fn new(store: S) -> Result<Self, StateError> {
+        Self::with_input_verifier(store, Arc::new(RejectUnverifiedInputs))
+    }
+
+    pub fn with_input_verifier(
+        store: S,
+        input_verifier: Arc<dyn TransactionInputVerifier>,
+    ) -> Result<Self, StateError> {
         hns_store::initialize_schema(&store)?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            input_verifier,
+        })
     }
 
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    pub fn input_verifier(&self) -> &dyn TransactionInputVerifier {
+        self.input_verifier.as_ref()
     }
 
     pub fn load_undo(&self, block_hash: &BlockHash) -> Result<Option<BlockUndo>, StateError> {
@@ -185,7 +222,12 @@ impl<S: Store> StateEngine for StoredStateEngine<S> {
     fn connect_block(&mut self, request: ConnectBlock<'_>) -> Result<StateSummary, StateError> {
         let snapshot = self.store.snapshot()?;
         let mut batch = self.store.batch();
-        let summary = connect_block_to_batch(&snapshot, &mut batch, request)?;
+        let summary = connect_block_to_batch_with_verifier(
+            &snapshot,
+            &mut batch,
+            request,
+            self.input_verifier(),
+        )?;
         self.store.commit(batch)?;
         Ok(summary)
     }
@@ -206,6 +248,20 @@ pub fn connect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
     snapshot: &T,
     batch: &mut B,
     request: ConnectBlock<'_>,
+) -> Result<StateSummary, StateError> {
+    connect_block_to_batch_with_verifier(
+        snapshot,
+        batch,
+        request,
+        &RejectUnverifiedInputs,
+    )
+}
+
+pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    request: ConnectBlock<'_>,
+    input_verifier: &dyn TransactionInputVerifier,
 ) -> Result<StateSummary, StateError> {
     if request.block_hash != request.block.hash() {
         return Err(StateError::BlockHashMismatch {
@@ -232,31 +288,26 @@ pub fn connect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
 
     for (transaction_index, transaction) in request.block.transactions.iter().enumerate() {
         if transaction_index != 0 {
-            let mut input_value = 0u64;
-            for input in &transaction.inputs {
-                if !spent_outpoints.insert(input.previous_output.clone()) {
-                    return Err(StateError::DuplicateSpend(input.previous_output.clone()));
-                }
-                if let Some(coin) = pending_created.remove(&input.previous_output) {
-                    check_coinbase_maturity(&coin, request.height, request.coinbase_maturity)?;
-                    input_value = input_value
-                        .checked_add(coin.value)
-                        .ok_or(StateError::InputValueOverflow)?;
-                    batch.delete(
-                        ColumnFamily::Utxo,
-                        &encode_outpoint_key(&input.previous_output),
-                    )?;
-                    created_coins.retain(|outpoint| outpoint != &input.previous_output);
-                    continue;
-                }
+            let resolved = resolve_transaction_inputs(
+                snapshot,
+                &pending_created,
+                &mut spent_outpoints,
+                transaction,
+                request.height,
+                request.coinbase_maturity,
+                input_verifier,
+            )?;
+            let input_coins = resolved
+                .iter()
+                .map(|resolved| resolved.coin.clone())
+                .collect::<Vec<_>>();
+            verify_transaction_covenant_links(transaction, &input_coins)?;
 
-                let coin =
-                    spend_existing_coin(snapshot, batch, &input.previous_output, &mut spent_coins)?;
-                check_coinbase_maturity(&coin, request.height, request.coinbase_maturity)?;
-                input_value = input_value
+            let input_value = input_coins.iter().try_fold(0u64, |total, coin| {
+                total
                     .checked_add(coin.value)
-                    .ok_or(StateError::InputValueOverflow)?;
-            }
+                    .ok_or(StateError::InputValueOverflow)
+            })?;
             let output_value = transaction_output_value(transaction)?;
             if input_value < output_value {
                 return Err(StateError::InputValueBelowOutput {
@@ -264,6 +315,14 @@ pub fn connect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
                     output: output_value,
                 });
             }
+
+            stage_transaction_spends(
+                batch,
+                &mut pending_created,
+                &mut created_coins,
+                &mut spent_coins,
+                resolved,
+            )?;
             total_fees = total_fees
                 .checked_add(input_value - output_value)
                 .ok_or(StateError::FeeValueOverflow)?;
@@ -294,6 +353,7 @@ pub fn connect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
                 value: output.value,
                 height: request.height,
                 coinbase: transaction_index == 0,
+                address: output.address.clone(),
                 covenant: output.covenant.clone(),
             };
             batch.put(
@@ -337,6 +397,74 @@ pub fn connect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedCoinSource {
+    Pending,
+    Existing,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedInput {
+    coin: Coin,
+    source: ResolvedCoinSource,
+}
+
+fn resolve_transaction_inputs<T: ReadSnapshot>(
+    snapshot: &T,
+    pending_created: &HashMap<Outpoint, Coin>,
+    spent_outpoints: &mut HashSet<Outpoint>,
+    transaction: &hns_primitives::Transaction,
+    spend_height: Height,
+    coinbase_maturity: u32,
+    input_verifier: &dyn TransactionInputVerifier,
+) -> Result<Vec<ResolvedInput>, StateError> {
+    let mut resolved = Vec::with_capacity(transaction.inputs.len());
+
+    for (input_index, input) in transaction.inputs.iter().enumerate() {
+        if !spent_outpoints.insert(input.previous_output.clone()) {
+            return Err(StateError::DuplicateSpend(input.previous_output.clone()));
+        }
+
+        let (coin, source) = match pending_created.get(&input.previous_output) {
+            Some(coin) => (coin.clone(), ResolvedCoinSource::Pending),
+            None => (
+                load_existing_coin(snapshot, &input.previous_output)?,
+                ResolvedCoinSource::Existing,
+            ),
+        };
+        check_coinbase_maturity(&coin, spend_height, coinbase_maturity)?;
+        verify_input_authorization(input_verifier, transaction, input_index, &coin)?;
+        resolved.push(ResolvedInput { coin, source });
+    }
+
+    Ok(resolved)
+}
+
+fn stage_transaction_spends<B: WriteBatch>(
+    batch: &mut B,
+    pending_created: &mut HashMap<Outpoint, Coin>,
+    created_coins: &mut Vec<Outpoint>,
+    spent_coins: &mut Vec<Coin>,
+    resolved: Vec<ResolvedInput>,
+) -> Result<(), StateError> {
+    for input in resolved {
+        match input.source {
+            ResolvedCoinSource::Pending => {
+                pending_created.remove(&input.coin.outpoint);
+                batch.delete(
+                    ColumnFamily::Utxo,
+                    &encode_outpoint_key(&input.coin.outpoint),
+                )?;
+                created_coins.retain(|outpoint| outpoint != &input.coin.outpoint);
+            }
+            ResolvedCoinSource::Existing => {
+                stage_existing_coin_spend(batch, &input.coin, spent_coins)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn transaction_output_value(
     transaction: &hns_primitives::Transaction,
 ) -> Result<Amount, StateError> {
@@ -347,11 +475,9 @@ fn transaction_output_value(
     })
 }
 
-fn spend_existing_coin<T: ReadSnapshot, B: WriteBatch>(
+fn load_existing_coin<T: ReadSnapshot>(
     snapshot: &T,
-    batch: &mut B,
     outpoint: &Outpoint,
-    spent_coins: &mut Vec<Coin>,
 ) -> Result<Coin, StateError> {
     let Some(bytes) = snapshot.get(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))? else {
         return Err(StateError::MissingCoin(outpoint.clone()));
@@ -362,9 +488,34 @@ fn spend_existing_coin<T: ReadSnapshot, B: WriteBatch>(
             "coin payload does not match its UTXO key".to_owned(),
         ));
     }
-    batch.delete(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))?;
-    spent_coins.push(coin.clone());
     Ok(coin)
+}
+
+fn verify_input_authorization(
+    verifier: &dyn TransactionInputVerifier,
+    transaction: &hns_primitives::Transaction,
+    input_index: usize,
+    coin: &Coin,
+) -> Result<(), StateError> {
+    verifier
+        .verify_input(transaction, input_index, coin)
+        .map_err(|error| StateError::InputAuthorization {
+            input_index,
+            reason: error.to_string(),
+        })
+}
+
+fn stage_existing_coin_spend<B: WriteBatch>(
+    batch: &mut B,
+    coin: &Coin,
+    spent_coins: &mut Vec<Coin>,
+) -> Result<(), StateError> {
+    batch.delete(
+        ColumnFamily::Utxo,
+        &encode_outpoint_key(&coin.outpoint),
+    )?;
+    spent_coins.push(coin.clone());
+    Ok(())
 }
 
 fn check_coinbase_maturity(
@@ -466,6 +617,7 @@ pub fn encode_coin(coin: &Coin) -> Vec<u8> {
     writer.write_u64(coin.value);
     writer.write_u32(coin.height);
     writer.write_u8(u8::from(coin.coinbase));
+    coin.address.write_to(&mut writer);
     writer.write_varbytes(&coin.covenant.encode());
     writer.finish()
 }
@@ -480,6 +632,7 @@ pub fn decode_coin(bytes: &[u8]) -> Result<Coin, StateError> {
         1 => true,
         value => return Err(StateError::Codec(format!("invalid coinbase flag {value}"))),
     };
+    let address = Address::read_from(&mut reader)?;
     let covenant = Covenant::decode(&reader.read_varbytes(MAX_TX_SIZE, "coin covenant")?)?;
     reader.ensure_finished()?;
 
@@ -488,6 +641,7 @@ pub fn decode_coin(bytes: &[u8]) -> Result<Coin, StateError> {
         value,
         height,
         coinbase,
+        address,
         covenant,
     })
 }
@@ -623,6 +777,10 @@ pub enum StateError {
     MissingCoin(Outpoint),
     #[error("duplicate spend for outpoint {0:?}")]
     DuplicateSpend(Outpoint),
+    #[error("transaction input {input_index} authorization failed: {reason}")]
+    InputAuthorization { input_index: usize, reason: String },
+    #[error("transaction covenant linkage failed: {0}")]
+    CovenantLink(#[from] CovenantLinkError),
     #[error("duplicate created coin for outpoint {0:?}")]
     DuplicateCoin(Outpoint),
     #[error("block has no coinbase transaction")]
@@ -677,11 +835,34 @@ impl From<PrimitiveError> for StateError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use hns_consensus::ConsensusError;
+
     use super::*;
     use hns_primitives::{
         Address, CovenantKind, Header, Input, Output, Transaction, Txid, Witness,
     };
     use hns_store::{MemoryStore, Store};
+
+    #[derive(Clone, Copy, Debug)]
+    struct AllowAllInputVerifier;
+
+    impl TransactionInputVerifier for AllowAllInputVerifier {
+        fn verify_input(
+            &self,
+            _transaction: &hns_primitives::Transaction,
+            _input_index: usize,
+            _coin: &Coin,
+        ) -> Result<(), ConsensusError> {
+            Ok(())
+        }
+    }
+
+    fn authorized_engine(store: MemoryStore) -> StoredStateEngine<MemoryStore> {
+        StoredStateEngine::with_input_verifier(store, Arc::new(AllowAllInputVerifier))
+            .expect("authorized test engine")
+    }
 
     fn covenant() -> Covenant {
         Covenant {
@@ -695,6 +876,13 @@ mod tests {
             value,
             address: Address::new(0, vec![0; 20]).expect("address"),
             covenant: covenant(),
+        }
+    }
+
+    fn name_covenant(kind: CovenantKind, name_hash: [u8; 32], start: u32) -> Covenant {
+        Covenant {
+            kind,
+            items: vec![name_hash.to_vec(), start.to_le_bytes().to_vec()],
         }
     }
 
@@ -740,6 +928,7 @@ mod tests {
             value: 42,
             height: 3,
             coinbase: true,
+            address: address(),
             covenant: covenant(),
         };
 
@@ -764,7 +953,7 @@ mod tests {
     #[test]
     fn connect_and_disconnect_block_updates_utxo_with_undo() {
         let store = MemoryStore::new();
-        let mut engine = StoredStateEngine::new(store.clone()).expect("engine");
+        let mut engine = authorized_engine(store.clone());
         let first_tx = coinbase(vec![output(100)]);
         let first_outpoint = Outpoint {
             txid: first_tx.txid(),
@@ -846,7 +1035,7 @@ mod tests {
     #[test]
     fn connect_rejects_immature_and_value_creating_spends_without_mutation() {
         let store = MemoryStore::new();
-        let mut engine = StoredStateEngine::new(store).expect("engine");
+        let mut engine = authorized_engine(store);
         let first_tx = coinbase(vec![output(100)]);
         let first_outpoint = Outpoint {
             txid: first_tx.txid(),
@@ -908,7 +1097,7 @@ mod tests {
     #[test]
     fn connect_enforces_subsidy_plus_fees_and_is_atomic_on_overpayment() {
         let store = MemoryStore::new();
-        let mut engine = StoredStateEngine::new(store).expect("engine");
+        let mut engine = authorized_engine(store);
         let funding = coinbase(vec![output(100)]);
         let funding_outpoint = Outpoint {
             txid: funding.txid(),
@@ -966,6 +1155,129 @@ mod tests {
             .expect("fees may be paid to the miner");
         assert!(engine.coin(&funding_outpoint).unwrap().is_none());
         assert!(engine.coin(&paid_outpoint).unwrap().is_some());
+    }
+
+    #[test]
+    fn default_engine_rejects_unauthorized_spends_without_mutation() {
+        let store = MemoryStore::new();
+        let mut engine = StoredStateEngine::new(store).expect("engine");
+        let funding = coinbase(vec![output(100)]);
+        let funding_outpoint = Outpoint {
+            txid: funding.txid(),
+            index: 0,
+        };
+        let funding_block = block(30, vec![funding]);
+        engine
+            .connect_block(ConnectBlock {
+                block_hash: funding_block.hash(),
+                height: 0,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &funding_block,
+            })
+            .expect("connect funding block");
+
+        let unauthorized = block(
+            31,
+            vec![
+                coinbase(Vec::new()),
+                spend(funding_outpoint.clone(), vec![output(90)]),
+            ],
+        );
+        assert!(matches!(
+            engine.connect_block(ConnectBlock {
+                block_hash: unauthorized.hash(),
+                height: 1,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &unauthorized,
+            }),
+            Err(StateError::InputAuthorization { input_index: 0, .. })
+        ));
+        assert!(engine.coin(&funding_outpoint).unwrap().is_some());
+        assert!(engine.load_undo(&unauthorized.hash()).unwrap().is_none());
+    }
+
+    #[test]
+    fn covenant_linkage_rejects_invalid_transition_before_utxo_mutation() {
+        let store = MemoryStore::new();
+        let funding_outpoint = Outpoint {
+            txid: Txid::new([44; 32]),
+            index: 0,
+        };
+        let owner = Address::new(0, vec![45; 20]).expect("owner address");
+        let name_hash = [46; 32];
+        let funding_coin = Coin {
+            outpoint: funding_outpoint.clone(),
+            value: 50,
+            height: 1,
+            coinbase: false,
+            address: owner.clone(),
+            covenant: name_covenant(CovenantKind::Register, name_hash, 7),
+        };
+        let mut funding_batch = store.batch();
+        write_coin_to_batch(&mut funding_batch, &funding_coin).expect("stage funding coin");
+        store.commit(funding_batch).expect("commit funding coin");
+
+        let mut engine = authorized_engine(store);
+        let invalid_spend = spend(
+            funding_outpoint.clone(),
+            vec![Output {
+                value: 50,
+                address: owner.clone(),
+                covenant: covenant(),
+            }],
+        );
+        let invalid_outpoint = Outpoint {
+            txid: invalid_spend.txid(),
+            index: 0,
+        };
+        let invalid_block = block(40, vec![coinbase(Vec::new()), invalid_spend]);
+
+        assert!(matches!(
+            engine.connect_block(ConnectBlock {
+                block_hash: invalid_block.hash(),
+                height: 2,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &invalid_block,
+            }),
+            Err(StateError::CovenantLink(
+                CovenantLinkError::InvalidTransition {
+                    input_index: 0,
+                    from: CovenantKind::Register,
+                    to: CovenantKind::None,
+                }
+            ))
+        ));
+        assert!(engine.coin(&funding_outpoint).unwrap().is_some());
+        assert!(engine.coin(&invalid_outpoint).unwrap().is_none());
+        assert!(engine.load_undo(&invalid_block.hash()).unwrap().is_none());
+
+        let valid_spend = spend(
+            funding_outpoint.clone(),
+            vec![Output {
+                value: 50,
+                address: owner,
+                covenant: name_covenant(CovenantKind::Update, name_hash, 7),
+            }],
+        );
+        let valid_outpoint = Outpoint {
+            txid: valid_spend.txid(),
+            index: 0,
+        };
+        let valid_block = block(41, vec![coinbase(Vec::new()), valid_spend]);
+        engine
+            .connect_block(ConnectBlock {
+                block_hash: valid_block.hash(),
+                height: 2,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &valid_block,
+            })
+            .expect("REGISTER to UPDATE linkage");
+        assert!(engine.coin(&funding_outpoint).unwrap().is_none());
+        assert!(engine.coin(&valid_outpoint).unwrap().is_some());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use hns_chain::{BlockIndexRecord, ChainTip, HeaderRecord};
+use hns_chain::{BlockIndexRecord, BlockStatus, ChainTip, HeaderRecord};
 use hns_mempool::{MempoolEntry, MempoolInfo};
 use hns_primitives::{hex_encode, Block, BlockHash, Coin, Height, NameState, Txid};
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,9 @@ pub enum RpcMethod {
     GetNameInfo,
     GetNameResource,
     GetNameByHash,
+    GetHsrdStatus,
+    GetAuthorityInfo,
+    GetParityInfo,
 }
 
 impl RpcMethod {
@@ -74,13 +77,145 @@ impl RpcMethod {
             "getnameinfo" => Some(Self::GetNameInfo),
             "getnameresource" => Some(Self::GetNameResource),
             "getnamebyhash" => Some(Self::GetNameByHash),
+            "gethsrdstatus" => Some(Self::GetHsrdStatus),
+            "getauthorityinfo" => Some(Self::GetAuthorityInfo),
+            "getparityinfo" => Some(Self::GetParityInfo),
             _ => None,
         }
     }
 }
 
-pub trait RpcService {
+pub trait RpcService: Send + Sync {
     fn handle(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse, RpcError>;
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcConsensusReadiness {
+    pub header_pow_difficulty: bool,
+    pub checkpoints_and_deployments: bool,
+    pub block_syntax: bool,
+    pub absolute_finality: bool,
+    /// Exact hsd-compatible signature-hash primitives are implemented and
+    /// pinned to oracle vectors. This does not imply script authorization.
+    pub sighash_primitives: bool,
+    /// Relative-lock calculation and opcode predicates are implemented as
+    /// reusable primitives. This does not imply block-connect integration.
+    pub relative_lock_primitives: bool,
+    /// A fail-closed version-zero witness/script foundation exists. It remains
+    /// non-authoritative until every opcode and an audited signature backend
+    /// are composed and differential-tested.
+    pub witness_program_foundation: bool,
+    pub signature_backend: bool,
+    pub input_authorization_fail_closed: bool,
+    pub relative_sequence_locks: bool,
+    pub scripts: bool,
+    /// Exact non-coinbase input/output covenant linkage and local commitment
+    /// checks are implemented independently of name-state transitions.
+    pub covenant_linkage: bool,
+    pub contextual_covenants: bool,
+    pub claims_and_airdrops: bool,
+    pub name_state: bool,
+    pub urkel_roots: bool,
+    /// Store reads are backed by immutable, sequence-consistent snapshots.
+    pub sequence_consistent_snapshots: bool,
+    /// Network, genesis, schema, and storage-profile bindings are durable.
+    pub durable_store_identity: bool,
+    /// Validated non-active block bodies and indexes are retained by hash.
+    pub side_chain_storage: bool,
+    /// Equal-work branches preserve the first-seen tip; only strictly greater
+    /// chainwork can trigger best-chain activation.
+    pub best_work_fork_choice: bool,
+    /// Stored disconnect/connect plans are checked for canonical linkage,
+    /// ancestry, body availability, and monotonic work before application.
+    pub validated_reorg_planning: bool,
+    /// Complete multi-block reorganizations commit in one write batch.
+    pub atomic_reorganizations: bool,
+    /// RocksDB writes retain WAL protection and expose an explicit sync policy.
+    pub wal_durability: bool,
+    pub historical_replay: bool,
+    pub invalid_corpus: bool,
+    pub live_shadow: bool,
+}
+
+impl RpcConsensusReadiness {
+    pub fn complete(&self) -> bool {
+        self.header_pow_difficulty
+            && self.checkpoints_and_deployments
+            && self.block_syntax
+            && self.absolute_finality
+            && self.sighash_primitives
+            && self.relative_lock_primitives
+            && self.witness_program_foundation
+            && self.signature_backend
+            && self.input_authorization_fail_closed
+            && self.relative_sequence_locks
+            && self.scripts
+            && self.covenant_linkage
+            && self.contextual_covenants
+            && self.claims_and_airdrops
+            && self.name_state
+            && self.urkel_roots
+            && self.sequence_consistent_snapshots
+            && self.durable_store_identity
+            && self.side_chain_storage
+            && self.best_work_fork_choice
+            && self.validated_reorg_planning
+            && self.atomic_reorganizations
+            && self.wal_durability
+            && self.historical_replay
+            && self.invalid_corpus
+            && self.live_shadow
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcAuthorityInfo {
+    pub mode: String,
+    pub experimental_feature_enabled: bool,
+    pub experimental_bypass_active: bool,
+    pub incomplete_consensus_acknowledged: bool,
+    pub consensus_complete: bool,
+    pub can_authorize_mining_templates: bool,
+    pub can_accept_mining_candidates: bool,
+    pub blockers: Vec<String>,
+    pub readiness: RpcConsensusReadiness,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcParityInfo {
+    pub oracle: String,
+    pub oracle_revision: String,
+    pub state: String,
+    pub configured: bool,
+    pub historical_replay_complete: bool,
+    pub invalid_corpus_complete: bool,
+    pub live_shadow_active: bool,
+    pub last_compared_height: Option<Height>,
+    pub last_matching_block: Option<BlockHash>,
+    pub divergence: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcNodeStatus {
+    pub api_version: u32,
+    pub release_stage: String,
+    pub schema_version: u32,
+    pub network: String,
+    pub storage_profile: String,
+    pub storage_durability: String,
+    pub best_header_hash: Option<BlockHash>,
+    pub best_header_height: Option<Height>,
+    pub best_block_hash: Option<BlockHash>,
+    pub height: Option<Height>,
+    pub chain_epoch: u64,
+    pub mining_generation: u64,
+    pub alternate_block_count: usize,
+    pub pending_best_chain_activation: bool,
+    pub staged_chain_tip: bool,
+    pub authoritative_mining_tip: bool,
+    pub tip_validation: Option<BlockStatus>,
+    pub authority: RpcAuthorityInfo,
+    pub parity: RpcParityInfo,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -95,6 +230,7 @@ pub struct RpcSnapshot {
     pub mempool_info: MempoolInfo,
     pub mempool_entries: Vec<MempoolEntry>,
     pub peer_count: usize,
+    pub node_status: RpcNodeStatus,
 }
 
 impl RpcSnapshot {
@@ -311,6 +447,12 @@ impl BasicRpcService {
             RpcMethod::GetNameInfo => self.get_name_info(params),
             RpcMethod::GetNameResource => self.get_name_resource(params),
             RpcMethod::GetNameByHash => self.get_name_by_hash(params),
+            RpcMethod::GetHsrdStatus => serde_json::to_value(&self.snapshot.node_status)
+                .map_err(|error| RpcCallError::new(-32603, error.to_string())),
+            RpcMethod::GetAuthorityInfo => serde_json::to_value(&self.snapshot.node_status.authority)
+                .map_err(|error| RpcCallError::new(-32603, error.to_string())),
+            RpcMethod::GetParityInfo => serde_json::to_value(&self.snapshot.node_status.parity)
+                .map_err(|error| RpcCallError::new(-32603, error.to_string())),
         }
     }
 
@@ -510,6 +652,8 @@ pub enum RpcError {
     Unimplemented,
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    #[error("rpc internal error: {0}")]
+    Internal(String),
 }
 
 #[cfg(test)]
@@ -621,7 +765,7 @@ mod tests {
             chainwork: 1u64.into(),
             header: block.header.clone(),
             status: BlockStatus {
-                header_valid: true,
+                header_context_valid: true,
                 ..BlockStatus::default()
             },
         };
@@ -636,6 +780,7 @@ mod tests {
             value: transaction.outputs[0].value,
             height: 0,
             coinbase: true,
+            address: transaction.outputs[0].address.clone(),
             covenant: transaction.outputs[0].covenant.clone(),
         };
         let name_hash = NameHash::new([7; 32]);
@@ -664,6 +809,7 @@ mod tests {
             mempool_info: MempoolInfo::default(),
             mempool_entries: Vec::new(),
             peer_count: 0,
+            node_status: RpcNodeStatus::default(),
         }
     }
 
@@ -750,4 +896,45 @@ mod tests {
             .expect("rpc response");
         assert_eq!(info.result.expect("info")["state"], "registered");
     }
+    #[test]
+    fn basic_rpc_exposes_hsrd_authority_and_parity_diagnostics() {
+        let snapshot = RpcSnapshot {
+            node_status: RpcNodeStatus {
+                api_version: 1,
+                release_stage: "pre-authority".to_owned(),
+                schema_version: 3,
+                network: "regtest".to_owned(),
+                authority: RpcAuthorityInfo {
+                    mode: "shadow".to_owned(),
+                    blockers: vec!["script and witness authorization".to_owned()],
+                    ..RpcAuthorityInfo::default()
+                },
+                parity: RpcParityInfo {
+                    oracle: "handshake-org/hsd".to_owned(),
+                    state: "not-configured".to_owned(),
+                    ..RpcParityInfo::default()
+                },
+                ..RpcNodeStatus::default()
+            },
+            ..RpcSnapshot::default()
+        };
+        let service = BasicRpcService::new(snapshot);
+
+        for (method, field, expected) in [
+            ("gethsrdstatus", "release_stage", json!("pre-authority")),
+            ("getauthorityinfo", "mode", json!("shadow")),
+            ("getparityinfo", "state", json!("not-configured")),
+        ] {
+            let response = service
+                .handle(JsonRpcRequest {
+                    jsonrpc: Some("2.0".to_owned()),
+                    method: method.to_owned(),
+                    params: Value::Null,
+                    id: Some(json!(1)),
+                })
+                .expect("diagnostic response");
+            assert_eq!(response.result.expect("result")[field], expected);
+        }
+    }
+
 }

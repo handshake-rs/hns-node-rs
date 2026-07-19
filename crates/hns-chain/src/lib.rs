@@ -18,49 +18,141 @@ pub struct ChainTip {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockStatus {
-    pub header_valid: bool,
+    pub header_context_valid: bool,
+    pub checkpoint_valid: bool,
+    pub deployment_state_valid: bool,
     pub body_present: bool,
-    pub body_valid: bool,
-    pub tx_valid: bool,
+    pub body_syntax_valid: bool,
+    pub absolute_finality_valid: bool,
+    pub relative_locks_valid: bool,
     pub scripts_valid: bool,
-    pub state_connected: bool,
+    /// Input/output covenant linkage and local commitment checks have passed.
+    /// This is narrower than full name-state contextual validation.
+    pub covenant_links_valid: bool,
+    pub covenants_context_valid: bool,
+    pub claims_and_airdrops_valid: bool,
+    pub utxo_connected: bool,
+    pub name_state_connected: bool,
+    pub tree_root_valid: bool,
     pub undo_present: bool,
+    pub active_chain: bool,
     pub failed: bool,
 }
 
 impl BlockStatus {
-    const HEADER_VALID: u16 = 1 << 0;
-    const BODY_PRESENT: u16 = 1 << 1;
-    const BODY_VALID: u16 = 1 << 2;
-    const TX_VALID: u16 = 1 << 3;
-    const SCRIPTS_VALID: u16 = 1 << 4;
-    const STATE_CONNECTED: u16 = 1 << 5;
-    const UNDO_PRESENT: u16 = 1 << 6;
-    const FAILED: u16 = 1 << 7;
+    const HEADER_CONTEXT_VALID: u32 = 1 << 0;
+    const CHECKPOINT_VALID: u32 = 1 << 1;
+    const DEPLOYMENT_STATE_VALID: u32 = 1 << 2;
+    const BODY_PRESENT: u32 = 1 << 3;
+    const BODY_SYNTAX_VALID: u32 = 1 << 4;
+    const ABSOLUTE_FINALITY_VALID: u32 = 1 << 5;
+    const RELATIVE_LOCKS_VALID: u32 = 1 << 6;
+    const SCRIPTS_VALID: u32 = 1 << 7;
+    const COVENANT_LINKS_VALID: u32 = 1 << 8;
+    const COVENANTS_CONTEXT_VALID: u32 = 1 << 9;
+    const CLAIMS_AND_AIRDROPS_VALID: u32 = 1 << 10;
+    const UTXO_CONNECTED: u32 = 1 << 11;
+    const NAME_STATE_CONNECTED: u32 = 1 << 12;
+    const TREE_ROOT_VALID: u32 = 1 << 13;
+    const UNDO_PRESENT: u32 = 1 << 14;
+    const ACTIVE_CHAIN: u32 = 1 << 15;
+    const FAILED: u32 = 1 << 16;
 
-    pub fn to_bits(&self) -> u16 {
+    /// Every consensus validation stage represented by the durable status
+    /// schema has completed. Persistence and active-chain membership are kept
+    /// separate so side-chain validation remains representable.
+    pub fn is_consensus_valid(&self) -> bool {
+        self.header_context_valid
+            && self.checkpoint_valid
+            && self.deployment_state_valid
+            && self.body_present
+            && self.body_syntax_valid
+            && self.absolute_finality_valid
+            && self.relative_locks_valid
+            && self.scripts_valid
+            && self.covenant_links_valid
+            && self.covenants_context_valid
+            && self.claims_and_airdrops_valid
+            && self.tree_root_valid
+            && !self.failed
+    }
+
+    /// A committed block can authorize mining only when complete consensus
+    /// validation, state connection, undo durability, and active-chain status
+    /// all agree.
+    pub fn is_mining_authoritative(&self) -> bool {
+        self.is_consensus_valid()
+            && self.utxo_connected
+            && self.name_state_connected
+            && self.undo_present
+            && self.active_chain
+    }
+
+    /// The current pre-authority engine has committed the subset of state that
+    /// it presently knows how to derive. This state is useful for diagnostics
+    /// and differential development, never for production mining authority.
+    pub fn is_staged_state(&self) -> bool {
+        self.header_context_valid
+            && self.body_present
+            && self.body_syntax_valid
+            && self.absolute_finality_valid
+            && self.covenant_links_valid
+            && self.utxo_connected
+            && self.undo_present
+            && self.active_chain
+            && !self.failed
+    }
+
+    pub fn to_bits(&self) -> u32 {
         let mut bits = 0;
 
-        if self.header_valid {
-            bits |= Self::HEADER_VALID;
+        if self.header_context_valid {
+            bits |= Self::HEADER_CONTEXT_VALID;
+        }
+        if self.checkpoint_valid {
+            bits |= Self::CHECKPOINT_VALID;
+        }
+        if self.deployment_state_valid {
+            bits |= Self::DEPLOYMENT_STATE_VALID;
         }
         if self.body_present {
             bits |= Self::BODY_PRESENT;
         }
-        if self.body_valid {
-            bits |= Self::BODY_VALID;
+        if self.body_syntax_valid {
+            bits |= Self::BODY_SYNTAX_VALID;
         }
-        if self.tx_valid {
-            bits |= Self::TX_VALID;
+        if self.absolute_finality_valid {
+            bits |= Self::ABSOLUTE_FINALITY_VALID;
+        }
+        if self.relative_locks_valid {
+            bits |= Self::RELATIVE_LOCKS_VALID;
         }
         if self.scripts_valid {
             bits |= Self::SCRIPTS_VALID;
         }
-        if self.state_connected {
-            bits |= Self::STATE_CONNECTED;
+        if self.covenant_links_valid {
+            bits |= Self::COVENANT_LINKS_VALID;
+        }
+        if self.covenants_context_valid {
+            bits |= Self::COVENANTS_CONTEXT_VALID;
+        }
+        if self.claims_and_airdrops_valid {
+            bits |= Self::CLAIMS_AND_AIRDROPS_VALID;
+        }
+        if self.utxo_connected {
+            bits |= Self::UTXO_CONNECTED;
+        }
+        if self.name_state_connected {
+            bits |= Self::NAME_STATE_CONNECTED;
+        }
+        if self.tree_root_valid {
+            bits |= Self::TREE_ROOT_VALID;
         }
         if self.undo_present {
             bits |= Self::UNDO_PRESENT;
+        }
+        if self.active_chain {
+            bits |= Self::ACTIVE_CHAIN;
         }
         if self.failed {
             bits |= Self::FAILED;
@@ -69,15 +161,24 @@ impl BlockStatus {
         bits
     }
 
-    pub fn from_bits(bits: u16) -> Self {
+    pub fn from_bits(bits: u32) -> Self {
         Self {
-            header_valid: bits & Self::HEADER_VALID != 0,
+            header_context_valid: bits & Self::HEADER_CONTEXT_VALID != 0,
+            checkpoint_valid: bits & Self::CHECKPOINT_VALID != 0,
+            deployment_state_valid: bits & Self::DEPLOYMENT_STATE_VALID != 0,
             body_present: bits & Self::BODY_PRESENT != 0,
-            body_valid: bits & Self::BODY_VALID != 0,
-            tx_valid: bits & Self::TX_VALID != 0,
+            body_syntax_valid: bits & Self::BODY_SYNTAX_VALID != 0,
+            absolute_finality_valid: bits & Self::ABSOLUTE_FINALITY_VALID != 0,
+            relative_locks_valid: bits & Self::RELATIVE_LOCKS_VALID != 0,
             scripts_valid: bits & Self::SCRIPTS_VALID != 0,
-            state_connected: bits & Self::STATE_CONNECTED != 0,
+            covenant_links_valid: bits & Self::COVENANT_LINKS_VALID != 0,
+            covenants_context_valid: bits & Self::COVENANTS_CONTEXT_VALID != 0,
+            claims_and_airdrops_valid: bits & Self::CLAIMS_AND_AIRDROPS_VALID != 0,
+            utxo_connected: bits & Self::UTXO_CONNECTED != 0,
+            name_state_connected: bits & Self::NAME_STATE_CONNECTED != 0,
+            tree_root_valid: bits & Self::TREE_ROOT_VALID != 0,
             undo_present: bits & Self::UNDO_PRESENT != 0,
+            active_chain: bits & Self::ACTIVE_CHAIN != 0,
             failed: bits & Self::FAILED != 0,
         }
     }
@@ -339,7 +440,7 @@ impl BlockIndexRecord {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(32 + 4 + 32 + 32 + 2 + 4 + 8);
+        let mut writer = Writer::with_capacity(32 + 4 + 32 + 32 + 4 + 4 + 8);
         writer.write_bytes(self.hash.as_bytes());
         writer.write_u32(self.height);
         writer.write_bytes(self.prev_hash.as_bytes());
@@ -351,7 +452,7 @@ impl BlockIndexRecord {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ChainError> {
-        let mut reader = Reader::new(bytes, 32 + 4 + 32 + 32 + 2 + 4 + 8)
+        let mut reader = Reader::new(bytes, 32 + 4 + 32 + 32 + 4 + 4 + 8)
             .map_err(|error| ChainError::Codec(error.to_string()))?;
         let hash = BlockHash::new(
             reader
@@ -367,7 +468,7 @@ impl BlockIndexRecord {
                 .map_err(|error| ChainError::Codec(error.to_string()))?,
         );
         let chainwork = Uint256::from_be_bytes(read_array::<32>(&mut reader)?);
-        let status = BlockStatus::from_bits(u16::from_le_bytes(read_array::<2>(&mut reader)?));
+        let status = BlockStatus::from_bits(u32::from_le_bytes(read_array::<4>(&mut reader)?));
         let tx_count = reader
             .read_u32()
             .map_err(|error| ChainError::Codec(error.to_string()))?;
@@ -396,7 +497,7 @@ impl BlockIndexRecord {
 
 impl HeaderRecord {
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::with_capacity(32 + 4 + 32 + 2 + HEADER_SIZE);
+        let mut writer = Writer::with_capacity(32 + 4 + 32 + 4 + HEADER_SIZE);
         writer.write_bytes(self.hash.as_bytes());
         writer.write_u32(self.height);
         writer.write_bytes(self.chainwork.as_be_bytes());
@@ -406,7 +507,7 @@ impl HeaderRecord {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, ChainError> {
-        let mut reader = Reader::new(bytes, 32 + 4 + 32 + 2 + HEADER_SIZE)
+        let mut reader = Reader::new(bytes, 32 + 4 + 32 + 4 + HEADER_SIZE)
             .map_err(|error| ChainError::Codec(error.to_string()))?;
         let hash = BlockHash::new(
             reader
@@ -417,7 +518,7 @@ impl HeaderRecord {
             .read_u32()
             .map_err(|error| ChainError::Codec(error.to_string()))?;
         let chainwork = Uint256::from_be_bytes(read_array::<32>(&mut reader)?);
-        let status = BlockStatus::from_bits(u16::from_le_bytes(read_array::<2>(&mut reader)?));
+        let status = BlockStatus::from_bits(u32::from_le_bytes(read_array::<4>(&mut reader)?));
         let header =
             Header::read_from(&mut reader).map_err(|error| ChainError::Codec(error.to_string()))?;
         reader
@@ -455,6 +556,12 @@ pub trait HeaderIndex {
     fn canonical_hash(&self, height: Height) -> Result<Option<BlockHash>, ChainError>;
 
     fn plan_reorg(&self, candidate: &BlockHash) -> Result<ReorgPlan, ChainError>;
+
+    fn plan_reorg_between(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+    ) -> Result<ReorgPlan, ChainError>;
 }
 
 pub trait BlockIndex {
@@ -533,7 +640,7 @@ impl MemoryHeaderIndex {
                 .ok_or_else(|| ChainError::Codec("chainwork overflow".to_owned()))?,
             header,
             status: BlockStatus {
-                header_valid: true,
+                header_context_valid: true,
                 ..BlockStatus::default()
             },
         };
@@ -551,12 +658,36 @@ impl MemoryHeaderIndex {
     pub fn from_records(
         records: impl IntoIterator<Item = HeaderRecord>,
     ) -> Result<Self, ChainError> {
+        Self::from_records_with_best(records, None)
+    }
+
+    pub fn from_records_with_best(
+        records: impl IntoIterator<Item = HeaderRecord>,
+        persisted_best: Option<BlockHash>,
+    ) -> Result<Self, ChainError> {
         let mut index = Self::new();
         let mut records = records.into_iter().collect::<Vec<_>>();
         records.sort_by_key(|record| (record.height, record.chainwork, record.hash));
 
         for record in records {
             index.records.insert(record.hash, record);
+        }
+
+        if let Some(best_hash) = persisted_best {
+            let best_record = index
+                .records
+                .get(&best_hash)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(best_hash))?;
+            if index
+                .records
+                .values()
+                .any(|record| record.chainwork > best_record.chainwork)
+            {
+                return Err(ChainError::InconsistentBestHeader(best_hash));
+            }
+            index.promote(&best_record)?;
+            return Ok(index);
         }
 
         let mut candidates = index.records.values().cloned().collect::<Vec<_>>();
@@ -583,16 +714,17 @@ impl MemoryHeaderIndex {
         let should_promote = self
             .best
             .as_ref()
-            .map(|best| {
-                record.chainwork > best.chainwork
-                    || (record.chainwork == best.chainwork && record.height > best.height)
-            })
+            .map(|best| record.chainwork > best.chainwork)
             .unwrap_or(true);
 
-        if !should_promote {
-            return Ok(());
+        if should_promote {
+            self.promote(record)?;
         }
 
+        Ok(())
+    }
+
+    fn promote(&mut self, record: &HeaderRecord) -> Result<(), ChainError> {
         let path = self.path_to_genesis(record.hash)?;
         self.canonical.clear();
 
@@ -671,23 +803,15 @@ impl<S: Store> StoredHeaderIndex<S> {
             .map(|tip| tip.hash == record.hash)
             .unwrap_or(false)
         {
-            for (height, hash) in self.memory.canonical_entries() {
-                write_canonical_height_to_batch(&mut batch, height, hash)?;
-            }
             batch.put(
                 ColumnFamily::Meta,
                 MetaKey::BestHeaderHash.as_bytes(),
                 record.hash.as_bytes(),
             )?;
-        } else if self
-            .memory
-            .canonical_hash(record.height)?
-            .map(|hash| hash == record.hash)
-            .unwrap_or(false)
-        {
-            write_canonical_height_to_batch(&mut batch, record.height, record.hash)?;
         }
 
+        // HeightIndex is the connected active-block chain. Header-only imports
+        // must never rewrite it merely because they carry more work.
         self.store.commit(batch)?;
         Ok(())
     }
@@ -712,7 +836,16 @@ fn load_header_index<S: Store>(store: &S) -> Result<MemoryHeaderIndex, ChainErro
         .into_iter()
         .map(|(_, bytes)| HeaderRecord::decode(&bytes))
         .collect::<Result<Vec<_>, _>>()?;
-    MemoryHeaderIndex::from_records(records)
+    let persisted_best = snapshot
+        .get(ColumnFamily::Meta, MetaKey::BestHeaderHash.as_bytes())?
+        .map(|bytes| decode_block_hash(&bytes))
+        .transpose()?;
+
+    if !records.is_empty() && persisted_best.is_none() {
+        return Err(ChainError::MissingBestHeaderBinding);
+    }
+
+    MemoryHeaderIndex::from_records_with_best(records, persisted_best)
 }
 
 impl<S: Store> HeaderIndex for StoredHeaderIndex<S> {
@@ -730,6 +863,14 @@ impl<S: Store> HeaderIndex for StoredHeaderIndex<S> {
 
     fn plan_reorg(&self, candidate: &BlockHash) -> Result<ReorgPlan, ChainError> {
         self.memory.plan_reorg(candidate)
+    }
+
+    fn plan_reorg_between(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+    ) -> Result<ReorgPlan, ChainError> {
+        self.memory.plan_reorg_between(current, candidate)
     }
 }
 
@@ -1027,35 +1168,82 @@ impl HeaderIndex for MemoryHeaderIndex {
 
     fn plan_reorg(&self, candidate: &BlockHash) -> Result<ReorgPlan, ChainError> {
         let Some(best) = &self.best else {
+            let mut connect = self.path_to_genesis(*candidate)?;
+            connect.reverse();
             return Ok(ReorgPlan {
                 disconnect: Vec::new(),
-                connect: self.path_to_genesis(*candidate)?,
+                connect,
             });
         };
 
-        if best.hash == *candidate {
+        self.plan_reorg_between(&best.hash, candidate)
+    }
+
+    fn plan_reorg_between(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+    ) -> Result<ReorgPlan, ChainError> {
+        if current == candidate {
             return Ok(ReorgPlan::default());
         }
 
-        let mut old_path = self.path_to_genesis(best.hash)?;
-        let mut new_path = self.path_to_genesis(*candidate)?;
+        let mut old = self
+            .records
+            .get(current)
+            .cloned()
+            .ok_or(ChainError::MissingHeader(*current))?;
+        let mut new = self
+            .records
+            .get(candidate)
+            .cloned()
+            .ok_or(ChainError::MissingHeader(*candidate))?;
+        let mut disconnect = Vec::new();
+        let mut connect_reverse = Vec::new();
 
-        old_path.reverse();
-        new_path.reverse();
+        while old.height > new.height {
+            disconnect.push(old.hash);
+            old = self
+                .records
+                .get(&old.header.prev_block)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(old.header.prev_block))?;
+        }
 
-        let common_len = old_path
-            .iter()
-            .zip(&new_path)
-            .take_while(|(old_hash, new_hash)| old_hash == new_hash)
-            .count();
+        while new.height > old.height {
+            connect_reverse.push(new.hash);
+            new = self
+                .records
+                .get(&new.header.prev_block)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(new.header.prev_block))?;
+        }
 
-        let mut disconnect = old_path[common_len..].to_vec();
-        disconnect.reverse();
-        let connect = new_path[common_len..].to_vec();
+        while old.hash != new.hash {
+            if old.height == 0 || new.height == 0 {
+                return Err(ChainError::NoCommonAncestor {
+                    current: *current,
+                    candidate: *candidate,
+                });
+            }
+            disconnect.push(old.hash);
+            connect_reverse.push(new.hash);
+            old = self
+                .records
+                .get(&old.header.prev_block)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(old.header.prev_block))?;
+            new = self
+                .records
+                .get(&new.header.prev_block)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(new.header.prev_block))?;
+        }
 
+        connect_reverse.reverse();
         Ok(ReorgPlan {
             disconnect,
-            connect,
+            connect: connect_reverse,
         })
     }
 }
@@ -1072,6 +1260,15 @@ pub enum ChainError {
     MissingParent(BlockHash),
     #[error("missing header {0:?}")]
     MissingHeader(BlockHash),
+    #[error("stored headers exist without a persisted best-header binding")]
+    MissingBestHeaderBinding,
+    #[error("persisted best header {0:?} is inconsistent with stored chainwork")]
+    InconsistentBestHeader(BlockHash),
+    #[error("chains {current:?} and {candidate:?} do not share a stored ancestor")]
+    NoCommonAncestor {
+        current: BlockHash,
+        candidate: BlockHash,
+    },
     #[error("invalid header: {0}")]
     InvalidHeader(&'static str),
 }
@@ -1080,6 +1277,14 @@ impl From<StoreError> for ChainError {
     fn from(value: StoreError) -> Self {
         Self::Store(value.to_string())
     }
+}
+
+
+fn decode_block_hash(bytes: &[u8]) -> Result<BlockHash, ChainError> {
+    let hash: [u8; 32] = bytes.try_into().map_err(|_| {
+        ChainError::Codec(format!("expected 32-byte block hash, got {}", bytes.len()))
+    })?;
+    Ok(BlockHash::new(hash))
 }
 
 fn read_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[u8; N], ChainError> {
@@ -1151,6 +1356,64 @@ mod tests {
     }
 
     #[test]
+    fn block_status_codec_preserves_every_validation_stage() {
+        let status = BlockStatus {
+            header_context_valid: true,
+            checkpoint_valid: true,
+            deployment_state_valid: true,
+            body_present: true,
+            body_syntax_valid: true,
+            absolute_finality_valid: true,
+            relative_locks_valid: true,
+            scripts_valid: true,
+            covenant_links_valid: true,
+            covenants_context_valid: true,
+            claims_and_airdrops_valid: true,
+            utxo_connected: true,
+            name_state_connected: true,
+            tree_root_valid: true,
+            undo_present: true,
+            active_chain: true,
+            failed: true,
+        };
+
+        assert_eq!(BlockStatus::from_bits(status.to_bits()), status);
+        assert_eq!(status.to_bits(), (1u32 << 17) - 1);
+    }
+
+    #[test]
+    fn mining_authority_requires_complete_consensus_and_durable_state() {
+        let mut status = BlockStatus {
+            header_context_valid: true,
+            checkpoint_valid: true,
+            deployment_state_valid: true,
+            body_present: true,
+            body_syntax_valid: true,
+            absolute_finality_valid: true,
+            relative_locks_valid: true,
+            scripts_valid: true,
+            covenant_links_valid: true,
+            covenants_context_valid: true,
+            claims_and_airdrops_valid: true,
+            tree_root_valid: true,
+            ..BlockStatus::default()
+        };
+
+        assert!(status.is_consensus_valid());
+        assert!(!status.is_mining_authoritative());
+
+        status.utxo_connected = true;
+        status.name_state_connected = true;
+        status.undo_present = true;
+        status.active_chain = true;
+        assert!(status.is_mining_authoritative());
+
+        status.scripts_valid = false;
+        assert!(!status.is_consensus_valid());
+        assert!(!status.is_mining_authoritative());
+    }
+
+    #[test]
     fn memory_index_promotes_best_chain() {
         let mut index = MemoryHeaderIndex::new();
         let genesis = index
@@ -1175,6 +1438,32 @@ mod tests {
     }
 
     #[test]
+    fn equal_work_header_preserves_first_seen_best_tip() {
+        let mut index = MemoryHeaderIndex::new();
+        let genesis = index
+            .insert_header(header(BlockHash::ZERO, 1), 0)
+            .expect("genesis");
+        let first = index
+            .insert_header(header(genesis.hash, 2), 1)
+            .expect("first");
+        let alternate_header = header(genesis.hash, 3);
+        let alternate = HeaderRecord {
+            hash: alternate_header.hash(),
+            height: 1,
+            chainwork: first.chainwork,
+            header: alternate_header,
+            status: BlockStatus {
+                header_context_valid: true,
+                ..BlockStatus::default()
+            },
+        };
+
+        index.insert_record(alternate).expect("alternate");
+        assert_eq!(index.best_tip().expect("tip").expect("best").hash, first.hash);
+        assert_eq!(index.canonical_hash(1).expect("canonical"), Some(first.hash));
+    }
+
+    #[test]
     fn memory_index_plans_reorg() {
         let mut index = MemoryHeaderIndex::new();
         let genesis = index
@@ -1189,7 +1478,7 @@ mod tests {
             chainwork: old_tip.chainwork,
             header: header(genesis.hash, 3),
             status: BlockStatus {
-                header_valid: true,
+                header_context_valid: true,
                 ..BlockStatus::default()
             },
         };
@@ -1209,7 +1498,7 @@ mod tests {
             chainwork: 99u64.into(),
             header: header(BlockHash::ZERO, 10),
             status: BlockStatus {
-                header_valid: true,
+                header_context_valid: true,
                 body_present: true,
                 failed: false,
                 ..BlockStatus::default()
@@ -1229,7 +1518,7 @@ mod tests {
             transactions: Vec::new(),
         };
         let mut record = BlockIndexRecord::from_block(&block, 8, 21u64.into()).expect("record");
-        record.status.body_valid = true;
+        record.status.body_syntax_valid = true;
         record.validated_at = Some(123);
 
         assert_eq!(
@@ -1304,8 +1593,9 @@ mod tests {
 
         let snapshot = store.snapshot().expect("snapshot");
         assert_eq!(
-            read_canonical_hash(&snapshot, 0).expect("height"),
-            Some(record.hash)
+            read_canonical_hash(&snapshot, 0).expect("active height"),
+            None,
+            "header-only imports must not mutate the active block height index"
         );
         assert_eq!(
             snapshot
