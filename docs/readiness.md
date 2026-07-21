@@ -115,7 +115,8 @@ Implemented:
 - process-local self-connection detection, service checks, timeouts, ping/pong,
   and priority outbound lanes;
 - bounded peer registration, scoring, disconnect, diagnostics, and reconnect;
-- headers-first acquisition and best-work header retention;
+- headers-first acquisition, 64-header durable cancellation slices, and
+  best-work header retention;
 - bounded pending/inflight/per-peer block scheduling with retry and timeout;
 - bounded known-header orphan handling;
 - parallel stateless body validation with ordered results;
@@ -125,7 +126,9 @@ Implemented:
 - durable non-active body retention and restartable sync checkpoints;
 - explicitly acknowledged bounded active-state batches through the single
   contextual state/reorganization pipeline, including restart resumption,
-  exact contextual-invalid ancestry, and fail-closed local-fault separation;
+  eight-block shutdown-responsive direct slices, full-bound atomic
+  reorganizations, exact contextual-invalid ancestry, and fail-closed
+  local-fault separation;
 - API-v8 post-tip root material plus a pinned-source, race-safe external HSD
   block/root comparator with checksummed bounded evidence and explicit
   restart/reorganization accounting;

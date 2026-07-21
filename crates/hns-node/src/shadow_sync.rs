@@ -56,6 +56,8 @@ const MAX_SHADOW_SYNC_VALIDATION_QUEUE: usize = 8_192;
 const MAX_SHADOW_SYNC_ORPHAN_BLOCKS: usize = 8_192;
 const MAX_SHADOW_SYNC_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
+pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 8;
+const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = 64;
 const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -591,17 +593,25 @@ impl NodeService {
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
                     };
-                    if let Err(error) = handle_peer_event(
-                        event,
-                        &node,
-                        &peers,
-                        &validation,
-                        &mut scheduler,
-                        &mut reconnects,
-                        &diagnostics,
-                    )
-                    .await
-                    {
+                    // Header batches yield after each durable import slice.
+                    // Race that cooperative work against shutdown so an HSD
+                    // peer cannot keep SIGINT behind a full 2,000-header batch.
+                    let handled = tokio::select! {
+                        _ = &mut shutdown_wait => None,
+                        result = handle_peer_event(
+                            event,
+                            &node,
+                            &peers,
+                            &validation,
+                            &mut scheduler,
+                            &mut reconnects,
+                            &diagnostics,
+                        ) => Some(result),
+                    };
+                    let Some(handled) = handled else {
+                        break;
+                    };
+                    if let Err(error) = handled {
                         record_error(&diagnostics, error.to_string()).await;
                     }
                     refresh_diagnostics(
@@ -871,10 +881,16 @@ impl NodeService {
         if active_tip.as_ref() == Some(&stored_tip) {
             return Ok(ActiveStateConnectOutcome::default());
         }
+        // Direct IBD progress does not require a reorganization-sized atomic
+        // transaction. Keep each supervisor slice small enough to return to
+        // the shutdown/network select loop promptly. A divergent best-work
+        // branch still uses the operator's full configured bound below so its
+        // disconnect/connect transition remains one atomic commit.
+        let direct_connect_limit = maximum_connect.min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
 
         let candidate_hash = match active_tip.as_ref() {
             None => {
-                let connect_count = maximum_connect.min(stored_tip.height as usize + 1);
+                let connect_count = direct_connect_limit.min(stored_tip.height as usize + 1);
                 let height = Height::try_from(connect_count.saturating_sub(1))?;
                 self.state
                     .chain
@@ -898,7 +914,8 @@ impl NodeService {
                     if stored_tip.height <= active.height {
                         return Ok(ActiveStateConnectOutcome::default());
                     }
-                    let advance = maximum_connect.min((stored_tip.height - active.height) as usize);
+                    let advance =
+                        direct_connect_limit.min((stored_tip.height - active.height) as usize);
                     let height = active
                         .height
                         .checked_add(Height::try_from(advance)?)
@@ -1376,10 +1393,7 @@ async fn handle_peer_event(
                 // supplied batch is invalid. Otherwise a malicious peer can
                 // pin the header-request slot until the timeout fires.
                 scheduler.note_headers_response(peer, header_count);
-                let imported = {
-                    let mut node = node.lock().await;
-                    node.shadow_sync_import_headers(headers)
-                };
+                let imported = import_headers_cooperatively(node, headers).await;
                 let imported = match imported {
                     Ok(imported) => imported,
                     Err(error) => {
@@ -1684,6 +1698,33 @@ async fn handle_peer_event(
         },
     }
     Ok(())
+}
+
+async fn import_headers_cooperatively(
+    node: &Arc<Mutex<NodeService>>,
+    headers: Vec<Header>,
+) -> Result<Vec<HeaderRecord>> {
+    if headers.len() > hns_p2p::MAX_HEADERS {
+        anyhow::bail!("peer sent too many headers: {}", headers.len());
+    }
+
+    let mut pending = headers.into_iter();
+    let mut imported = Vec::with_capacity(pending.len());
+    while pending.len() != 0 {
+        let slice = pending
+            .by_ref()
+            .take(MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE)
+            .collect::<Vec<_>>();
+        let records = {
+            let mut node = node.lock().await;
+            node.shadow_sync_import_headers(slice)?
+        };
+        imported.extend(records);
+        if pending.len() != 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    Ok(imported)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2370,6 +2411,57 @@ mod tests {
                 .expect_err("mismatched body response")
                 .kind,
             ValidationFailureKind::InvalidResponse
+        );
+    }
+
+    #[tokio::test]
+    async fn cooperative_header_import_cancels_at_a_durable_slice_boundary() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis");
+        let params = Network::Regtest.params();
+        let mut previous = genesis.header;
+        let mut headers = Vec::new();
+        for _ in 0..MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE * 2 {
+            let mut header = Header {
+                prev_block: previous.hash(),
+                time: previous.time + 1,
+                bits: params.pow.bits,
+                ..Header::default()
+            };
+            while !header.verify_pow() {
+                header.nonce = header.nonce.checked_add(1).expect("regtest nonce space");
+            }
+            previous = header.clone();
+            headers.push(header);
+        }
+        let node = Arc::new(Mutex::new(service));
+
+        {
+            let import = import_headers_cooperatively(&node, headers);
+            tokio::pin!(import);
+            let shutdown = async { tokio::task::yield_now().await };
+            tokio::pin!(shutdown);
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {}
+                result = &mut import => {
+                    panic!("header import completed before cancellation: {result:?}")
+                }
+            }
+        }
+
+        let node = node.lock().await;
+        assert_eq!(
+            node.shadow_sync_best_header_tip()
+                .expect("best header")
+                .expect("durable imported tip")
+                .height as usize,
+            MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE
         );
     }
 

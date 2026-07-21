@@ -104,8 +104,9 @@
 - Live inbound/outbound plaintext peers with handshake, service, self-connect,
   timeout, ping/pong, and priority-queue controls.
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
-- Headers-first synchronization with bounded pending/inflight/per-peer body
-  requests, retry, timeout, and reassignment.
+- Headers-first synchronization with 64-header durable shutdown slices plus
+  bounded pending/inflight/per-peer body requests, retry, timeout, and
+  reassignment.
 - Bounded orphan retention only for statelessly valid bodies with known header
   context; unknown-context bodies are dropped after requesting headers.
 - Blocking validation workers with ordered result delivery.
@@ -116,7 +117,8 @@
   and validator-worker failure is not attributed to a peer or branch.
 - Explicitly acknowledged bounded active-state connection through the single
   contextual state/reorg pipeline, with restart resumption, exact failed-root
-  attribution, and local-fault separation.
+  attribution, local-fault separation, shutdown-responsive eight-block direct
+  slices, and full-configured-bound atomic reorganizations.
 - API-v8 post-tip root diagnostics and a pinned-source external HSD comparator
   with coherent-tip retries, provisional/confirmed root labels, and bounded
   checksummed restart/reorganization evidence.

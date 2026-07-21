@@ -143,9 +143,11 @@ Valid headers are persisted individually. The next in-memory header-index view
 is published only after its matching durable batch commits. If a later header
 in one peer batch is invalid, any valid durable prefix remains accepted, the
 scheduler refreshes from durable state, and the sender is disconnected. The
-durable best header may advance ahead of block-body availability. Equal-work
-branches preserve first-seen selection according to the existing chain-index
-rules.
+runtime imports at most 64 headers before yielding back to the supervisor; a
+shutdown may cancel the unprocessed suffix only after that durable boundary,
+and restart resumes from the accepted prefix. The durable best header may
+advance ahead of block-body availability. Equal-work branches preserve
+first-seen selection according to the existing chain-index rules.
 
 ## Block-body synchronization
 
@@ -191,8 +193,10 @@ a score of 100. Local orphan re-submission is never penalized as a network peer.
 
 The active-state mode is opt-in while historical and live parity gates remain
 open. It requires the explicit incomplete-consensus acknowledgement and is
-bounded to 288 connected blocks per atomic batch by default, matching mainnet's
-retained reorganization window (hard maximum 1,024).
+bounded to 288 connected blocks per atomic reorganization by default, matching
+mainnet's retained reorganization window (hard maximum 1,024). Straight-line
+IBD progress is additionally limited to eight connected blocks per supervisor
+slice so RPC, peer work, and shutdown are polled between small atomic commits.
 Each batch uses the node's existing deployment, script, sequence-lock,
 claim/airdrop, covenant, UTXO, name-state, Urkel-root, undo, and reorganization
 pipeline; no second consensus implementation exists in the sync runtime.
@@ -205,11 +209,15 @@ cargo run --locked -p hns-node -- \
 ```
 
 On restart and every supervisor tick, the connector compares the active tip
-with the highest contiguous stored canonical body. Direct progress is batched;
-a best-work fork is disconnected and connected atomically once its bounded
-replacement prefix exceeds active chainwork. Deep replacements that cannot
-exceed the active tip within the configured batch fail closed and require an
-operator-selected larger bound.
+with the highest contiguous stored canonical body. Direct progress advances in
+at-most-eight-block atomic slices even when the configured bound is larger. A
+best-work fork is disconnected and connected atomically once its bounded
+replacement prefix exceeds active chainwork; it may use the full configured
+bound because yielding partway through a reorganization would violate the
+single-commit invariant. Shutdown therefore returns between direct slices but
+waits for an already staged reorganization commit. Deep replacements that
+cannot exceed the active tip within the configured batch fail closed and
+require an operator-selected larger bound.
 
 Candidate-derived contextual failures carry the exact failing block back out of
 the staged reorganization. That root and every known descendant are durably

@@ -129,12 +129,15 @@ Current evidence includes:
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,
   `noRelay`, ASCII handling, inventory, locators, headers, blocks, and rejects;
+- cooperative 64-header import slicing with cancellation only after a durable
+  prefix;
 - durable invalid/invalid-child propagation, best-header fallback across
   restart, body/header mismatch retry, and non-attribution of validator-worker
   failures;
-- bounded active-state restart resumption, direct and forked connection,
-  contextual-invalid ancestor persistence, and proof that local state faults do
-  not poison stored branches or grant shadow mining authority;
+- bounded active-state restart resumption, eight-block cooperative direct
+  slices, full-bound atomic fork connection, contextual-invalid ancestor
+  persistence, and proof that local state faults do not poison stored branches
+  or grant shadow mining authority;
 - API-v8 post-tip root material, opaque runtime-instance exposure, and the
   external HSD comparison self-test covering confirmed/provisional roots,
   divergence, restart/reorganization counters, hash normalization, and

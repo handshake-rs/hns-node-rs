@@ -6105,6 +6105,56 @@ mod tests {
         assert!(!status.authority.can_authorize_mining_templates);
     }
 
+    #[test]
+    fn shadow_active_state_direct_progress_yields_between_small_atomic_slices() {
+        let mut node = NodeService::new(active_state_shadow_config());
+        let mut previous = BlockHash::ZERO;
+        let mut records = Vec::new();
+        for height in 0..10 {
+            let mut block = block_with_commitments(vec![coinbase_transaction_with_tag(height, 50)]);
+            block.header.prev_block = previous;
+            let record = store_fixture_alternate(
+                &mut node,
+                block,
+                height,
+                u64::from(height).saturating_add(1),
+            );
+            previous = record.hash;
+            records.push(record);
+        }
+
+        let first = node
+            .shadow_sync_connect_stored_state(64)
+            .expect("first direct connector slice");
+        assert_eq!(
+            first.connected,
+            shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE
+        );
+        assert_eq!(first.disconnected, 0);
+        assert_eq!(
+            node.state()
+                .best_block_tip()
+                .expect("active tip")
+                .expect("first slice tip")
+                .hash,
+            records[shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE - 1].hash
+        );
+
+        let second = node
+            .shadow_sync_connect_stored_state(64)
+            .expect("second direct connector slice");
+        assert_eq!(second.connected, 2);
+        assert_eq!(second.disconnected, 0);
+        assert_eq!(
+            node.state()
+                .best_block_tip()
+                .expect("active tip")
+                .expect("second slice tip")
+                .hash,
+            records.last().expect("stored tip").hash
+        );
+    }
+
     #[tokio::test]
     async fn shadow_active_state_runtime_updates_scheduler_and_diagnostics() {
         let config = active_state_shadow_config();
@@ -6232,6 +6282,51 @@ mod tests {
                 .expect("old record")
                 .status
                 .active_chain
+        );
+    }
+
+    #[test]
+    fn shadow_active_state_reorg_keeps_the_full_configured_atomic_bound() {
+        let mut node = NodeService::new(active_state_shadow_config());
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_tag(200, 50)]);
+        let genesis = node
+            .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("active genesis");
+        let mut active = block_with_commitments(vec![coinbase_transaction_with_tag(201, 50)]);
+        active.header.prev_block = genesis.hash;
+        node.connect_block(NodeBlockImport::fixture(active, 1, 3))
+            .expect("active child");
+
+        let mut previous = genesis.hash;
+        let mut side = Vec::new();
+        for offset in 0..10u32 {
+            let height = offset + 1;
+            let mut block =
+                block_with_commitments(vec![coinbase_transaction_with_tag(202 + offset, 50)]);
+            block.header.prev_block = previous;
+            let chainwork = if offset == 0 {
+                2
+            } else {
+                u64::from(offset) + 3
+            };
+            let record = store_fixture_alternate(&mut node, block, height, chainwork);
+            previous = record.hash;
+            side.push(record);
+        }
+
+        assert!(side.len() > shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+        let outcome = node
+            .shadow_sync_connect_stored_state(64)
+            .expect("deep stored reorganization");
+        assert_eq!(outcome.connected, side.len());
+        assert_eq!(outcome.disconnected, 1);
+        assert_eq!(
+            node.state()
+                .best_block_tip()
+                .expect("active tip")
+                .expect("side tip")
+                .hash,
+            side.last().expect("side tip record").hash
         );
     }
 
