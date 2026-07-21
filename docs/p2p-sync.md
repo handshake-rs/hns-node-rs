@@ -2,15 +2,16 @@
 
 ## Scope
 
-The shadow-sync runtime gives `hsrd` a live, bounded Handshake network path while preserving
-its pre-authority status. The runtime can discover chain progress from explicit
-peers, validate and retain headers and block bodies, serve retained data, and
-resume from a durable checkpoint after restart.
+The shadow-sync runtime gives `hsrd` a live, bounded Handshake network path while
+preserving its pre-authority status. The runtime can discover chain progress
+from explicit peers, validate and retain headers and block bodies, serve
+retained data, and resume from a durable checkpoint after restart.
 
-It is an **observation-only shadow path**. It does not connect downloaded blocks
-to active UTXO/name state, authorize mining templates, or publish ASIC jobs.
-That separation is deliberate: network availability evidence must not bypass
-unfinished consensus and historical-parity gates.
+The default remains an **observation-only shadow path**. An explicit
+`--shadow-sync-active-state --acknowledge-incomplete-consensus` mode additionally
+connects stored bodies to active UTXO/name state in bounded atomic batches. Both
+modes are non-authoritative: shadow state cannot authorize mining templates,
+publish ASIC jobs, or mint the private mining capability.
 
 ## Runtime flow
 
@@ -40,6 +41,9 @@ explicit outbound peers / optional listener
                     |
                     v
        durable non-active shadow block storage
+                    |
+                    v
+ optional bounded contextual state connector
                     |
                     v
         restartable sync checkpoint + diagnostics
@@ -111,6 +115,7 @@ The shadow-sync runtime rejects configurations outside hard ceilings:
 | Validation input/results queue | 8,192 |
 | Retained orphan blocks | 8,192 |
 | Retained orphan bytes | 1 GiB |
+| Active-state blocks per atomic batch | 1,024 |
 | Polling interval | at least 10 ms |
 
 Default operational bounds are intentionally lower. Each peer also has
@@ -182,6 +187,38 @@ queued work for every affected descendant, the failed branch remains excluded
 after restart, its orphan descendants are discarded, and the remote peer earns
 a score of 100. Local orphan re-submission is never penalized as a network peer.
 
+## Optional active-state connector
+
+The active-state mode is opt-in while historical and live parity gates remain
+open. It requires the explicit incomplete-consensus acknowledgement and is
+bounded to 288 connected blocks per atomic batch by default, matching mainnet's
+retained reorganization window (hard maximum 1,024).
+Each batch uses the node's existing deployment, script, sequence-lock,
+claim/airdrop, covenant, UTXO, name-state, Urkel-root, undo, and reorganization
+pipeline; no second consensus implementation exists in the sync runtime.
+
+```bash
+cargo run --locked -p hns-node -- \
+  --shadow-sync --connect 127.0.0.1:12038 \
+  --shadow-sync-active-state --acknowledge-incomplete-consensus \
+  --active-state-connect-batch 288
+```
+
+On restart and every supervisor tick, the connector compares the active tip
+with the highest contiguous stored canonical body. Direct progress is batched;
+a best-work fork is disconnected and connected atomically once its bounded
+replacement prefix exceeds active chainwork. Deep replacements that cannot
+exceed the active tip within the configured batch fail closed and require an
+operator-selected larger bound.
+
+Candidate-derived contextual failures carry the exact failing block back out of
+the staged reorganization. That root and every known descendant are durably
+failed before best-header fallback. Storage, authenticated-tree, verifier
+backend, chain-view, and undo failures are local faults: they terminate active
+sync without marking any peer branch invalid. Because an older stored block may
+be identified only when a later tip triggers reorganization, the connector does
+not guess a peer attribution for delayed contextual failures.
+
 ## Restart and checkpoint semantics
 
 A versioned sync checkpoint (retained by the current schema 13/profile `hsrd-mining-v9`) contains:
@@ -198,6 +235,10 @@ Startup never trusts the checkpoint blindly. It reloads durable chain state,
 verifies canonical body continuity, and recomputes the stored-body tip. Missing
 canonical bodies are requeued. A `Validating` checkpoint resumes as `Blocks`
 because in-memory validation jobs are not durable.
+
+When active-state mode is enabled, stored-but-unconnected canonical bodies are
+also resumed through the bounded connector before normal polling. The active tip
+and advertised local height advance only after the complete state batch commits.
 
 The supervisor writes clean-shutdown metadata only if shutdown was requested
 normally and both the RPC server and optional P2P listener terminate
@@ -237,11 +278,13 @@ GET /api/v1/shadow-sync
 Diagnostics include configured endpoints, reconnect attempts, live peer
 snapshots, synchronization stage, best/active/stored tips, queue depths, orphan
 usage, received/served counts, durably failed-body count, checkpoint sequence,
-and the last supervisor error. API-v6 node status separately counts valid
-non-active blocks and durably failed blocks.
+active-state connection/reorganization counts, contextual-failure count, and
+the last supervisor error. API-v7 node status separately counts valid non-active
+blocks and durably failed blocks.
 
-`observation_only` is always true. The parity state explicitly says that no live
-HSD oracle is configured.
+`observation_only` is true in the default retention mode and false only when the
+explicit active-state connector is enabled. `active_state` reports that choice.
+Neither value changes the authority mode or claims a live HSD oracle.
 
 ## Known limitations
 
@@ -252,10 +295,9 @@ The shadow-sync runtime does not yet provide:
 - durable peer scoring or bans;
 - transaction and mempool relay;
 - compact-block reconstruction;
-- active-state ordered block connection;
 - historical mainnet replay qualification;
 - a live HSD state/root comparison feed;
-- pruning-aware IBD;
+- pruning-aware and sustained-reorganization IBD qualification;
 - solved-block fan-out;
 - mining authority.
 

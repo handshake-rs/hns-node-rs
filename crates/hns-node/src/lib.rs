@@ -59,7 +59,7 @@ use hns_state::{
     disconnect_block_to_batch, load_name_tree_snapshot_pins, stage_name_tree_node_compaction,
     validate_persisted_name_tree, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
     BlockUndo, ConnectBlock, DisconnectBlock, NameTreeCompactionSummary, NameTreeSnapshotPin,
-    StateServices, StoredStateEngine,
+    StateError, StateServices, StoredStateEngine,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_clean_shutdown, mark_unclean_start, open_store,
@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 6;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 7;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 
 const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
@@ -340,6 +340,12 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
                 );
             }
         }
+    }
+
+    if config.shadow_sync.connect_active_state && !config.acknowledge_incomplete_consensus {
+        anyhow::bail!(
+            "active-state synchronization requires --acknowledge-incomplete-consensus until historical and live parity gates pass"
+        );
     }
 
     config.name_tree_compaction.validate()?;
@@ -658,9 +664,9 @@ impl NodeService {
 
         // Production authority remains disabled. On the explicitly gated
         // regtest/simnet experimental path, recover a fully stored higher-work
-        // branch before exposing any mining generation. Shadow mode is
-        // observation-only and therefore never mutates the active chain at
-        // startup.
+        // branch before exposing any mining generation. Shadow active-state
+        // recovery is driven by the bounded sync coordinator so it cannot
+        // bypass contextual-failure handling or the configured batch limit.
         if authority_can_mine(&config) {
             state.recover_best_stored_chain()?;
         }
@@ -1097,6 +1103,8 @@ impl NodeService {
             mining_generation: durable.generation,
             alternate_block_count,
             failed_block_count,
+            active_state_sync_enabled: self.config.shadow_sync.connect_active_state,
+            active_state_connect_batch: self.config.shadow_sync.active_state_connect_batch,
             pending_best_chain_activation,
             staged_chain_tip: durable.snapshot.is_some(),
             authoritative_mining_tip: self.mining_events.snapshot().is_some(),
@@ -1360,6 +1368,53 @@ struct StoredBlockMutation {
 struct FailedBlockMutation {
     record: BlockIndexRecord,
     affected: Vec<BlockHash>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailedBlockStage {
+    BodySyntax,
+    ContextualState,
+}
+
+#[derive(Debug)]
+struct StateConnectError(StateError);
+
+impl std::fmt::Display for StateConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "failed to stage state update: {}", self.0)
+    }
+}
+
+impl std::error::Error for StateConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[derive(Debug)]
+struct ContextualActivationFailure {
+    request: NodeBlockImport,
+    error: anyhow::Error,
+}
+
+#[derive(Debug)]
+enum ChainActivationFailure {
+    ContextualInvalid(Box<ContextualActivationFailure>),
+    Internal(anyhow::Error),
+}
+
+impl ChainActivationFailure {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::ContextualInvalid(failure) => anyhow::anyhow!(
+                "contextual validation failed for block {} at height {}: {:#}",
+                failure.request.block.hash().to_hex(),
+                failure.request.height,
+                failure.error
+            ),
+            Self::Internal(error) => error,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2016,7 +2071,11 @@ impl NodeState {
         })
     }
 
-    fn store_failed_block(&mut self, request: NodeBlockImport) -> Result<FailedBlockMutation> {
+    fn store_failed_block(
+        &mut self,
+        request: NodeBlockImport,
+        stage: FailedBlockStage,
+    ) -> Result<FailedBlockMutation> {
         let block_hash = request.block.hash();
         let snapshot = self.store.snapshot()?;
         let header = load_header_record(&snapshot, &block_hash)?.ok_or_else(|| {
@@ -2035,10 +2094,17 @@ impl NodeState {
         let existing = load_block_index_record(&snapshot, &block_hash)?;
         if existing
             .as_ref()
-            .is_some_and(|record| !record.status.failed)
+            .is_some_and(|record| record.status.active_chain)
+        {
+            anyhow::bail!("cannot mark active block {} failed", block_hash.to_hex());
+        }
+        if stage == FailedBlockStage::BodySyntax
+            && existing
+                .as_ref()
+                .is_some_and(|record| !record.status.failed)
         {
             anyhow::bail!(
-                "cannot mark previously accepted block {} failed",
+                "cannot mark previously body-validated block {} syntax-invalid",
                 block_hash.to_hex()
             );
         }
@@ -2063,7 +2129,21 @@ impl NodeState {
             .find(|record| record.hash == block_hash)
             .ok_or_else(|| anyhow::anyhow!("invalid branch plan omitted its root"))?;
         target_header.status.body_present = true;
-        target_header.status.body_syntax_valid = false;
+        match stage {
+            FailedBlockStage::BodySyntax => {
+                target_header.status.body_syntax_valid = false;
+            }
+            FailedBlockStage::ContextualState => {
+                if !target_header.status.body_syntax_valid
+                    || !target_header.status.absolute_finality_valid
+                {
+                    anyhow::bail!(
+                        "contextual failure root {} lacks prior body/finality validation",
+                        block_hash.to_hex()
+                    );
+                }
+            }
+        }
 
         let mut target = existing.unwrap_or(
             BlockIndexRecord::from_block(&request.block, request.height, header.chainwork)
@@ -2596,7 +2676,7 @@ impl NodeState {
             },
             services,
         )
-        .map_err(|error| anyhow::anyhow!("failed to stage state update: {error}"))?;
+        .map_err(StateConnectError)?;
 
         write_deployment_state(batch, block_hash, request.height, deployments)?;
 
@@ -2762,76 +2842,147 @@ impl NodeState {
     }
 
     fn apply_reorg(&mut self, request: NodeReorg) -> Result<NodeReorgMutation> {
+        self.apply_reorg_classified(request)
+            .map_err(ChainActivationFailure::into_anyhow)
+    }
+
+    fn apply_reorg_classified(
+        &mut self,
+        request: NodeReorg,
+    ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
         if request.disconnect.is_empty() && request.connect.is_empty() {
             return Ok(NodeReorgMutation {
                 summary: NodeReorgSummary::default(),
-                mining: self.durable_mining_state()?,
+                mining: self
+                    .durable_mining_state()
+                    .map_err(ChainActivationFailure::Internal)?,
             });
         }
         if request.connect.is_empty() {
-            anyhow::bail!("a best-chain reorganization must connect a replacement tip");
+            return Err(ChainActivationFailure::Internal(anyhow::anyhow!(
+                "a best-chain reorganization must connect a replacement tip"
+            )));
         }
 
-        let base = self.store.snapshot()?;
-        let original_tip = best_block_tip_from_snapshot(&base)?;
-        validate_reorg_request_shape(&base, &request, original_tip.as_ref())?;
+        let base = self
+            .store
+            .snapshot()
+            .map_err(anyhow::Error::from)
+            .map_err(ChainActivationFailure::Internal)?;
+        let original_tip =
+            best_block_tip_from_snapshot(&base).map_err(ChainActivationFailure::Internal)?;
+        validate_reorg_request_shape(&base, &request, original_tip.as_ref())
+            .map_err(ChainActivationFailure::Internal)?;
 
-        let generation = next_mining_generation(&base)?;
-        let chain_epoch = next_chain_epoch(&base)?;
+        let generation = next_mining_generation(&base).map_err(ChainActivationFailure::Internal)?;
+        let chain_epoch = next_chain_epoch(&base).map_err(ChainActivationFailure::Internal)?;
         let overlay = StagingOverlay::new();
         let staged = overlay.snapshot(&base);
         let mut batch = overlay.batch(self.store.batch());
         let mut summary = NodeReorgSummary::default();
 
         for disconnect in request.disconnect {
-            let record = self.stage_disconnect(&staged, &mut batch, disconnect)?;
+            let record = self
+                .stage_disconnect(&staged, &mut batch, disconnect)
+                .map_err(ChainActivationFailure::Internal)?;
             summary.disconnected.push(record);
         }
 
         for connect in request.connect {
-            let validated = self.validate_import_against(&staged, &connect)?;
-            let record = self.stage_connect(&staged, &mut batch, &connect, validated)?;
+            let hash = connect.block.hash();
+            let validated = self
+                .validate_import_against(&staged, &connect)
+                .with_context(|| {
+                    format!(
+                        "failed to revalidate stored block {} at height {}",
+                        hash.to_hex(),
+                        connect.height
+                    )
+                })
+                .map_err(ChainActivationFailure::Internal)?;
+            let record = match self.stage_connect(&staged, &mut batch, &connect, validated) {
+                Ok(record) => record,
+                Err(error)
+                    if error
+                        .downcast_ref::<StateConnectError>()
+                        .is_some_and(|error| error.0.is_consensus_invalid()) =>
+                {
+                    return Err(ChainActivationFailure::ContextualInvalid(Box::new(
+                        ContextualActivationFailure {
+                            request: connect,
+                            error,
+                        },
+                    )));
+                }
+                Err(error) => {
+                    return Err(ChainActivationFailure::Internal(error.context(format!(
+                        "failed to connect stored block {} at height {}",
+                        hash.to_hex(),
+                        connect.height
+                    ))));
+                }
+            };
             summary.connected.push(record);
         }
 
-        let final_tip = best_block_tip_from_snapshot(&staged)?
-            .ok_or_else(|| anyhow::anyhow!("reorganization produced an empty active chain"))?;
+        let final_tip = best_block_tip_from_snapshot(&staged)
+            .map_err(ChainActivationFailure::Internal)?
+            .ok_or_else(|| {
+                ChainActivationFailure::Internal(anyhow::anyhow!(
+                    "reorganization produced an empty active chain"
+                ))
+            })?;
         if let Some(original_tip) = &original_tip {
             if final_tip.chainwork <= original_tip.chainwork {
-                anyhow::bail!(
+                return Err(ChainActivationFailure::Internal(anyhow::anyhow!(
                     "replacement tip chainwork {} does not exceed active tip chainwork {}",
                     final_tip.chainwork.to_fixed_hex(),
                     original_tip.chainwork.to_fixed_hex()
-                );
+                )));
             }
         }
-        let connected_tip = summary
-            .connected
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("reorganization connected no replacement block"))?;
+        let connected_tip = summary.connected.last().ok_or_else(|| {
+            ChainActivationFailure::Internal(anyhow::anyhow!(
+                "reorganization connected no replacement block"
+            ))
+        })?;
         if connected_tip.hash != final_tip.hash {
-            anyhow::bail!("reorganization final tip does not match its last connected block");
+            return Err(ChainActivationFailure::Internal(anyhow::anyhow!(
+                "reorganization final tip does not match its last connected block"
+            )));
         }
 
-        batch.put(
-            ColumnFamily::Meta,
-            MetaKey::MiningGeneration.as_bytes(),
-            &encode_u64(generation),
-        )?;
-        batch.put(
-            ColumnFamily::Meta,
-            MetaKey::ChainEpoch.as_bytes(),
-            &encode_u64(chain_epoch),
-        )?;
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::MiningGeneration.as_bytes(),
+                &encode_u64(generation),
+            )
+            .map_err(anyhow::Error::from)
+            .map_err(ChainActivationFailure::Internal)?;
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::ChainEpoch.as_bytes(),
+                &encode_u64(chain_epoch),
+            )
+            .map_err(anyhow::Error::from)
+            .map_err(ChainActivationFailure::Internal)?;
         let batch = batch.into_inner();
         drop(staged);
         drop(base);
-        self.store.commit(batch)?;
-        self.refresh_indexes()?;
+        self.store
+            .commit(batch)
+            .map_err(anyhow::Error::from)
+            .map_err(ChainActivationFailure::Internal)?;
+        self.refresh_indexes()
+            .map_err(ChainActivationFailure::Internal)?;
 
         Ok(NodeReorgMutation {
             summary,
-            mining: self.durable_mining_state()?,
+            mining: self
+                .durable_mining_state()
+                .map_err(ChainActivationFailure::Internal)?,
         })
     }
 
@@ -4192,6 +4343,37 @@ mod tests {
             acknowledge_incomplete_consensus: true,
             ..NodeConfig::default()
         }
+    }
+
+    fn active_state_shadow_config() -> NodeConfig {
+        NodeConfig {
+            network: Network::Regtest,
+            acknowledge_incomplete_consensus: true,
+            shadow_sync: ShadowSyncConfig {
+                enabled: true,
+                connect_active_state: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..ShadowSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        }
+    }
+
+    fn store_fixture_alternate(
+        node: &mut NodeService,
+        block: Block,
+        height: Height,
+        chainwork: u64,
+    ) -> BlockIndexRecord {
+        let request = NodeBlockImport::fixture(block, height, chainwork);
+        let validated = node
+            .state()
+            .validate_import(&request)
+            .expect("validate alternate");
+        node.state_mut()
+            .store_validated_alternate(request, validated)
+            .expect("store alternate")
+            .record
     }
 
     #[test]
@@ -5754,7 +5936,10 @@ mod tests {
 
         let mutation = node
             .state_mut()
-            .store_failed_block(NodeBlockImport::fixture(invalid.clone(), 1, 2))
+            .store_failed_block(
+                NodeBlockImport::fixture(invalid.clone(), 1, 2),
+                FailedBlockStage::BodySyntax,
+            )
             .expect("persist invalid branch");
         assert_eq!(mutation.record.hash, invalid_hash);
         assert_eq!(
@@ -5841,6 +6026,325 @@ mod tests {
                 .expect("tip")
                 .hash,
             fallback.hash
+        );
+    }
+
+    #[test]
+    fn shadow_active_state_connector_resumes_in_bounded_batches_without_authority() {
+        let store = StoreHandle::memory();
+        let config = active_state_shadow_config();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initial state");
+        let mut node = NodeService::try_with_state(config.clone(), state).expect("shadow node");
+
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_address(90, 50)]);
+        let genesis = store_fixture_alternate(&mut node, genesis, 0, 1);
+        let mut child = block_with_commitments(vec![coinbase_transaction_with_address(91, 50)]);
+        child.header.prev_block = genesis.hash;
+        let child = store_fixture_alternate(&mut node, child, 1, 2);
+        assert!(node.state().best_block_tip().expect("active tip").is_none());
+        drop(node);
+
+        let state = NodeState::from_store_for_network(store, Network::Regtest).expect("restart");
+        let mut restarted = NodeService::try_with_state(config, state).expect("restarted shadow");
+        assert!(restarted
+            .state()
+            .best_block_tip()
+            .expect("active tip")
+            .is_none());
+
+        let first = restarted
+            .shadow_sync_connect_stored_state(1)
+            .expect("first connector batch");
+        assert_eq!(first.connected, 1);
+        assert_eq!(first.disconnected, 0);
+        assert_eq!(
+            restarted
+                .state()
+                .best_block_tip()
+                .expect("active tip")
+                .expect("genesis")
+                .hash,
+            genesis.hash
+        );
+        let second = restarted
+            .shadow_sync_connect_stored_state(1)
+            .expect("second connector batch");
+        assert_eq!(second.connected, 1);
+        assert_eq!(
+            restarted
+                .state()
+                .best_block_tip()
+                .expect("active tip")
+                .expect("child")
+                .hash,
+            child.hash
+        );
+        assert!(restarted.subscribe_mining_events().is_err());
+        let rpc = restarted.rpc_service().expect("rpc");
+        let status = &rpc.snapshot().node_status;
+        assert!(status.active_state_sync_enabled);
+        assert_eq!(status.active_state_connect_batch, 288);
+        assert!(!status.authority.can_authorize_mining_templates);
+    }
+
+    #[tokio::test]
+    async fn shadow_active_state_runtime_updates_scheduler_and_diagnostics() {
+        let config = active_state_shadow_config();
+        let mut node = NodeService::new(config.clone());
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_address(102, 50)]);
+        let genesis = store_fixture_alternate(&mut node, genesis, 0, 1);
+        let node = Arc::new(tokio::sync::Mutex::new(node));
+        let (peers, _events) =
+            hns_p2p::LivePeerManager::new(hns_p2p::LivePeerConfig::for_network(Network::Regtest))
+                .expect("peers");
+        let mut scheduler = hns_sync::SyncScheduler::new(
+            hns_sync::SyncLimits::default(),
+            std::time::Instant::now(),
+        )
+        .expect("scheduler");
+        let mut orphans = hns_sync::BoundedOrphanPool::new(hns_sync::OrphanLimits {
+            maximum_blocks: 8,
+            maximum_bytes: 1_024 * 1_024,
+        })
+        .expect("orphans");
+        let diagnostics = Arc::new(tokio::sync::RwLock::new(ShadowSyncDiagnostics {
+            enabled: true,
+            observation_only: false,
+            active_state: true,
+            ..ShadowSyncDiagnostics::default()
+        }));
+
+        shadow_sync::connect_stored_active_state(
+            &node,
+            &peers,
+            &mut scheduler,
+            &mut orphans,
+            &diagnostics,
+            config.shadow_sync.active_state_connect_batch,
+        )
+        .await
+        .expect("runtime connector");
+
+        assert_eq!(
+            scheduler
+                .snapshot()
+                .active_tip
+                .expect("scheduler active tip")
+                .hash,
+            genesis.hash
+        );
+        let diagnostics = diagnostics.read().await;
+        assert_eq!(diagnostics.connected_blocks, 1);
+        assert!(!diagnostics.observation_only);
+        assert!(diagnostics.active_state);
+        assert_eq!(
+            diagnostics
+                .sync
+                .active_tip
+                .as_ref()
+                .expect("diagnostic tip")
+                .hash,
+            genesis.hash
+        );
+    }
+
+    #[test]
+    fn shadow_active_state_connector_reorganizes_a_stored_best_branch() {
+        let mut node = NodeService::new(active_state_shadow_config());
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_address(92, 50)]);
+        let genesis = node
+            .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("active genesis");
+        let mut active = block_with_commitments(vec![coinbase_transaction_with_address(93, 50)]);
+        active.header.prev_block = genesis.hash;
+        let active = node
+            .connect_block(NodeBlockImport::fixture(active, 1, 3))
+            .expect("active child");
+
+        let mut side_one = block_with_commitments(vec![coinbase_transaction_with_address(94, 50)]);
+        side_one.header.prev_block = genesis.hash;
+        let side_one = store_fixture_alternate(&mut node, side_one, 1, 2);
+        let mut side_two = block_with_commitments(vec![coinbase_transaction_with_address(95, 50)]);
+        side_two.header.prev_block = side_one.hash;
+        let side_two = store_fixture_alternate(&mut node, side_two, 2, 4);
+
+        let bounded_error = node
+            .shadow_sync_connect_stored_state(1)
+            .expect_err("insufficient atomic reorg batch must fail closed");
+        assert!(bounded_error
+            .to_string()
+            .contains("needs more than 1 replacement blocks"));
+        assert_eq!(
+            node.state()
+                .best_block_tip()
+                .expect("unchanged active tip")
+                .expect("active child")
+                .hash,
+            active.hash
+        );
+        assert!(
+            !node
+                .state()
+                .load_block_record(&side_one.hash)
+                .expect("side one")
+                .expect("side one record")
+                .status
+                .failed
+        );
+
+        let outcome = node
+            .shadow_sync_connect_stored_state(64)
+            .expect("stored branch activation");
+        assert_eq!(outcome.connected, 2);
+        assert_eq!(outcome.disconnected, 1);
+        assert!(outcome.contextual_failure.is_none());
+        assert_eq!(
+            node.state()
+                .best_block_tip()
+                .expect("active tip")
+                .expect("side tip")
+                .hash,
+            side_two.hash
+        );
+        assert!(
+            !node
+                .state()
+                .load_block_record(&active.hash)
+                .expect("old active")
+                .expect("old record")
+                .status
+                .active_chain
+        );
+    }
+
+    #[test]
+    fn contextual_invalid_ancestor_is_durable_and_exact() {
+        let config = active_state_shadow_config();
+        let mut node = NodeService::new(config.clone());
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_address(96, 50)]);
+        let genesis = node
+            .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("active genesis");
+        let mut active = block_with_commitments(vec![coinbase_transaction_with_address(97, 50)]);
+        active.header.prev_block = genesis.hash;
+        let active = node
+            .connect_block(NodeBlockImport::fixture(active, 1, 3))
+            .expect("active child");
+
+        let mut invalid = block_with_commitments(vec![
+            coinbase_transaction_with_address(98, 50),
+            transaction(),
+        ]);
+        invalid.header.prev_block = genesis.hash;
+        let invalid = store_fixture_alternate(&mut node, invalid, 1, 2);
+        let mut descendant =
+            block_with_commitments(vec![coinbase_transaction_with_address(99, 50)]);
+        descendant.header.prev_block = invalid.hash;
+        let descendant = store_fixture_alternate(&mut node, descendant, 2, 4);
+
+        let outcome = node
+            .shadow_sync_connect_stored_state(64)
+            .expect("contextual failure classification");
+        let failure = outcome.contextual_failure.expect("failed branch");
+        assert_eq!(failure.record.hash, invalid.hash);
+        assert_eq!(
+            failure.affected.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([invalid.hash, descendant.hash])
+        );
+        assert!(failure.record.status.failed);
+        assert!(failure.record.status.body_syntax_valid);
+        assert!(failure.record.status.absolute_finality_valid);
+        assert_eq!(
+            node.state()
+                .best_block_tip()
+                .expect("active tip")
+                .expect("active child")
+                .hash,
+            active.hash
+        );
+        assert_eq!(
+            node.state()
+                .chain
+                .best_tip()
+                .expect("best header")
+                .expect("fallback")
+                .hash,
+            active.hash
+        );
+        assert!(
+            node.state()
+                .load_block_record(&descendant.hash)
+                .expect("descendant")
+                .expect("descendant record")
+                .status
+                .failed
+        );
+
+        let store = node.state().store.clone();
+        drop(node);
+        let state = NodeState::from_store_for_network(store, Network::Regtest).expect("restart");
+        let mut restarted = NodeService::try_with_state(config, state).expect("restarted shadow");
+        assert_eq!(
+            restarted
+                .state()
+                .best_block_tip()
+                .expect("active tip")
+                .expect("active child")
+                .hash,
+            active.hash
+        );
+        assert!(restarted
+            .shadow_sync_connect_stored_state(64)
+            .expect("idempotent connector")
+            .contextual_failure
+            .is_none());
+    }
+
+    #[test]
+    fn local_state_fault_does_not_poison_a_stored_branch() {
+        let mut node = NodeService::new(active_state_shadow_config());
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_address(100, 50)]);
+        let genesis = node
+            .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("active genesis");
+        let mut candidate =
+            block_with_commitments(vec![coinbase_transaction_with_address(101, 50)]);
+        candidate.header.prev_block = genesis.hash;
+        let candidate = store_fixture_alternate(&mut node, candidate, 1, 2);
+
+        let mut batch = node.state().store.batch();
+        batch
+            .delete(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())
+            .expect("stage local fault");
+        node.state()
+            .store
+            .commit(batch)
+            .expect("commit local fault");
+
+        let error = node
+            .shadow_sync_connect_stored_state(64)
+            .expect_err("missing local state root must stop the connector");
+        assert!(
+            format!("{error:#}").contains("durable name-tree-root metadata is missing"),
+            "{error:#}"
+        );
+        let record = node
+            .state()
+            .load_block_record(&candidate.hash)
+            .expect("candidate")
+            .expect("candidate record");
+        assert!(!record.status.failed);
+        assert!(!record.status.active_chain);
+        assert!(
+            !node
+                .state()
+                .chain
+                .load_record(&candidate.hash)
+                .expect("candidate header")
+                .expect("header")
+                .status
+                .failed
         );
     }
 
@@ -6133,6 +6637,9 @@ mod tests {
             ..NodeConfig::default()
         })
         .is_err());
+        let mut unacknowledged_active_sync = active_state_shadow_config();
+        unacknowledged_active_sync.acknowledge_incomplete_consensus = false;
+        assert!(validate_node_config(&unacknowledged_active_sync).is_err());
 
         let mut experimental = NodeService::new(experimental_authority_config());
         assert!(experimental.subscribe_mining_events().is_err());

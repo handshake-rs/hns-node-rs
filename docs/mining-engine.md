@@ -178,7 +178,7 @@ remain release-blocking:
 - complete contextual name-state parity;
 - deployment-scale Urkel compaction performance/priority qualification and
   RocksDB mid-commit process-crash/fault injection;
-- active-state IBD and live HSD state comparison;
+- qualified full-mainnet active-state IBD and live HSD state comparison;
 - contextually complete peer transaction admission;
 - measured production template and solved-block latency;
 - native mainnet authority qualification.

@@ -2444,6 +2444,40 @@ pub enum StateError {
     },
 }
 
+impl StateError {
+    /// Whether this error proves the candidate block invalid against an
+    /// otherwise valid parent-state snapshot. Storage, authenticated-tree,
+    /// backend, chain-view, and undo failures are deliberately excluded so a
+    /// local fault can never poison a peer branch.
+    pub fn is_consensus_invalid(&self) -> bool {
+        matches!(
+            self,
+            Self::HeaderTreeRootMismatch { .. }
+                | Self::Consensus(_)
+                | Self::MissingCoin(_)
+                | Self::DuplicateSpend(_)
+                | Self::InputAuthorization { .. }
+                | Self::RelativeLocks
+                | Self::CovenantLink(_)
+                | Self::ContextualCovenant(_)
+                | Self::DuplicateCoin(_)
+                | Self::MissingCoinbase
+                | Self::AirdropVerification(_)
+                | Self::ClaimVerification(_)
+                | Self::AirdropPositionOutOfRange(_)
+                | Self::AirdropAlreadySpent(_)
+                | Self::InputValueOverflow
+                | Self::OutputValueOverflow
+                | Self::FeeValueOverflow
+                | Self::CoinbaseRewardOverflow
+                | Self::CoinbaseValueExceedsReward { .. }
+                | Self::InputValueBelowOutput { .. }
+                | Self::PrematureCoinbaseSpend { .. }
+                | Self::BlockHashMismatch { .. }
+        )
+    }
+}
+
 impl From<PrimitiveError> for StateError {
     fn from(value: PrimitiveError) -> Self {
         Self::Codec(value.to_string())
@@ -2471,6 +2505,24 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     struct AllowAllInputVerifier;
+
+    #[test]
+    fn consensus_invalid_classifier_excludes_local_state_faults() {
+        assert!(StateError::MissingCoin(Outpoint::null()).is_consensus_invalid());
+        assert!(StateError::HeaderTreeRootMismatch {
+            committed: TreeRoot::new([1; 32]),
+            inherited: TreeRoot::new([2; 32]),
+        }
+        .is_consensus_invalid());
+        assert!(!StateError::MissingStoredTreeRoot.is_consensus_invalid());
+        assert!(
+            !StateError::ChainView("missing historical context".to_owned()).is_consensus_invalid()
+        );
+        assert!(
+            !StateError::InputAuthorizationBackend("backend unavailable".to_owned())
+                .is_consensus_invalid()
+        );
+    }
 
     struct NoNameStateScanSnapshot<S> {
         inner: S,

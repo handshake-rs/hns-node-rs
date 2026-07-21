@@ -83,7 +83,7 @@ Implemented:
 - Validated mark-and-sweep compaction retaining the current, undo, and pinned
   root union, including idempotence and failed-commit atomicity evidence.
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
-  atomic checksummed last-run checkpoint, API-v6 diagnostics, and unclean
+  atomic checksummed last-run checkpoint, API-v7 diagnostics, and unclean
   RocksDB reopen evidence.
 - Exact HSD undo-retention horizons with opt-in atomic retirement, bounded
   startup catch-up, pruning-aware pin/compaction validation, and deep-reorg
@@ -120,6 +120,9 @@ Implemented:
   fallback, restart recovery, and separate retry paths for uncommitted body
   mismatches and validator-worker failures;
 - durable non-active body retention and restartable sync checkpoints;
+- explicitly acknowledged bounded active-state batches through the single
+  contextual state/reorganization pipeline, including restart resumption,
+  exact contextual-invalid ancestry, and fail-closed local-fault separation;
 - bounded read-only header, inventory, block, and transaction serving;
 - reserved critical-lane parallel fan-out used by the mining publication path.
 
@@ -127,11 +130,13 @@ Remaining:
 
 - Brontide and address-manager/DNS-seed discovery;
 - durable bans/reputation and broader adversarial network qualification;
-- active-state ordered block connection and pruning-aware IBD;
+- full-mainnet replay and pruning-aware qualification of active-state IBD;
 - compact blocks and production-complete contextual transaction relay;
 - live HSD state/root comparison and sustained shadow agreement.
 
-This networking path remains observation-only and cannot grant mining authority.
+This networking path remains non-authoritative. Active-state mode mutates the
+validated state only after an atomic batch commits and still cannot grant mining
+authority.
 
 ## Mining engine — bounded foundation implemented
 
@@ -155,7 +160,7 @@ Remaining:
 
 - production-complete contextual mempool admission and peer transaction relay;
 - disconnected-transaction re-admission after reorganizations;
-- active-state IBD and live HSD state/root qualification;
+- full-mainnet active-state IBD and live HSD state/root qualification;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
 - native mainnet authority qualification.
 

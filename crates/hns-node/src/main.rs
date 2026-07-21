@@ -48,9 +48,18 @@ struct Cli {
     #[arg(long)]
     prune_undo_history: bool,
 
-    /// Enable live, observation-only P2P and shadow synchronization.
+    /// Enable live, non-authoritative P2P and shadow synchronization.
     #[arg(long)]
     shadow_sync: bool,
+
+    /// Connect downloaded bodies to active state without granting mining authority.
+    /// Requires --acknowledge-incomplete-consensus while parity gates remain open.
+    #[arg(long)]
+    shadow_sync_active_state: bool,
+
+    /// Maximum stored blocks connected in one atomic active-state batch.
+    #[arg(long, default_value_t = 288)]
+    active_state_connect_batch: usize,
 
     /// Bind an inbound plaintext Handshake P2P listener.
     #[arg(long)]
@@ -140,6 +149,8 @@ impl Cli {
             },
             shadow_sync: ShadowSyncConfig {
                 enabled: self.shadow_sync,
+                connect_active_state: self.shadow_sync_active_state,
+                active_state_connect_batch: self.active_state_connect_batch,
                 listen: self.p2p_listen,
                 connect: self.p2p_connect,
                 maximum_inbound: self.maximum_inbound,
@@ -206,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
             name_tree_compaction_interval = config.name_tree_compaction.startup_interval,
             prune_undo_history = config.undo_retention.prune_history,
             shadow_sync = config.shadow_sync.enabled,
+            shadow_sync_active_state = config.shadow_sync.connect_active_state,
             mining_engine = config.mining_engine.enabled,
             transaction_relay = config.mining_engine.transaction_relay,
             "configuration parsed successfully"

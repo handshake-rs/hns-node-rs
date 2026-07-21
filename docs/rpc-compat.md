@@ -19,12 +19,17 @@ snapshots only.
   `/api/v1/authority`, `/api/v1/parity`, and `/api/v1/mining-engine`; the live
   shadow runtime also exposes `/api/v1/peers`, `/api/v1/sync`, and
   `/api/v1/shadow-sync`.
-- API-v6 node status reports whether startup name-tree compaction is enabled,
+- API-v7 node status reports whether startup name-tree compaction is enabled,
   its height interval, and the last checkpoint's height, tip, retained roots,
   and before/retained/deleted node counts. It also reports whether undo
   retirement is enabled, the exact network `pruneAfterHeight` and `keepBlocks`
   values, and the last checksummed pruning boundary/block/count. Valid
-  non-active blocks and durably failed blocks have separate counts.
+  non-active blocks and durably failed blocks have separate counts. It exposes
+  whether the active-state connector is enabled and its bounded per-pass batch
+  size without presenting that non-authoritative mode as mining readiness.
+- Shadow-sync diagnostics distinguish default observation-only retention from
+  explicitly enabled non-authoritative active-state connection and report
+  committed blocks, reorganizations, and contextual-invalid bodies.
 - Unsupported mutations fail explicitly. No current control endpoint claims to
   authenticate or perform a mutation.
 

@@ -92,7 +92,7 @@ reserved low-latency paths.
   and network-interval pins, with restart, malformed-pin, idempotence, and
   failed-commit atomicity coverage.
 - Opt-in HSD-shaped startup compaction scheduling, a checksummed atomic
-  last-run checkpoint, forced coordinator maintenance, API-v6 diagnostics, and
+  last-run checkpoint, forced coordinator maintenance, API-v7 diagnostics, and
   unclean RocksDB reopen evidence.
 - Opt-in HSD-horizon undo retirement with atomic checkpoints, bounded startup
   catch-up, pruning-aware pinned roots, and fail-closed deep-reorg handling.
@@ -106,6 +106,9 @@ reserved low-latency paths.
 - Parallel stateless validation with ordered delivery.
 - Durable invalid/invalid-child branch status with atomic best-header fallback;
   bad body responses and failed workers remain retryable without branch poison.
+- Explicitly acknowledged bounded active-state batches through the existing
+  contextual state/reorg pipeline, with restart resumption and exact
+  contextual-invalid ancestry that excludes local fault classes.
 - Durable non-active shadow bodies and restartable checkpoints.
 - Bounded read-only header/body/transaction serving and diagnostics.
 - Reserved critical outbound queues and parallel fan-out.
@@ -148,10 +151,9 @@ reserved low-latency paths.
    interval-pin/retained-root compactor and complete RocksDB mid-commit
    process-crash/fault qualification while preserving qualified incremental
    roots, historical reachability, and exact proof bytes.
-4. **Active-state IBD** — connect downloaded bodies through the one consensus
-   pipeline, extend durable invalid-branch handling through contextual
-   connection, and qualify pruning/reorganizations without changing the
-   authority boundary.
+4. **Active-state IBD** — qualify the implemented bounded connector through full
+   mainnet replay, pruning, sustained reorganizations, and live state/root
+   comparison without changing the authority boundary.
 5. **Network hardening** — Brontide, address management/discovery, durable
    bans/reputation, peer diversity, compact blocks, and adversarial WAN tests.
 6. **Mempool admission closure** — compose complete active-chain views,

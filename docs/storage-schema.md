@@ -115,7 +115,10 @@ cannot promote a block or grant authority.
   Shadow-network downloads are retained as non-active records. A body whose
   authenticated commitments prove permanent invalidity is retained with a
   failed block/header status; known descendants inherit failure atomically with
-  best-header fallback. Uncommitted body mismatches are not branch evidence.
+  best-header fallback. The opt-in state connector may likewise promote an
+  exact candidate-derived contextual failure from a body-valid alternate to
+  failed status. Uncommitted body mismatches and classified local state faults
+  are not branch evidence.
 - `tx_index`: bounded differential/debug transaction index; not required in a
   future lean production profile.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
@@ -296,7 +299,7 @@ coordinator.
 The node coordinator exposes forced maintenance and HSD-shaped opt-in startup
 scheduling. A nonzero height interval (10,000 by default) prevents repeated
 work at the same tip. The deletion set and checksummed height/tip/count
-checkpoint commit in one batch; malformed checkpoints fail startup. API-v6
+checkpoint commit in one batch; malformed checkpoints fail startup. API-v7
 status reports the configured policy and last result. Unclean RocksDB reopen
 tests verify that the checkpoint and compacted node set remain synchronized.
 

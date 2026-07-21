@@ -21,8 +21,10 @@ synchronization stage is presented as complete Handshake consensus.
 The current tree contains hardened authority, storage, transaction, covenant,
 and name-state foundations, a live P2P/shadow-synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication
-foundation. Network data remains observation-only, and the mining engine cannot authorize jobs or
-publish solved blocks without the private authority capability.
+foundation. Network data remains non-authoritative, and the mining engine cannot
+authorize jobs or publish solved blocks without the private authority capability. An explicitly
+acknowledged active-state sync mode can now connect downloaded bodies through
+the same atomic consensus pipeline, but it remains non-authoritative.
 
 ## Authority, storage, and reorganization safety
 
@@ -175,7 +177,7 @@ Implemented:
   commits leave all records unchanged.
 - HSD-shaped opt-in startup scheduling with a nonzero block-height interval
   (10,000 by default), a checksummed last-run checkpoint committed in the same
-  batch as deletions, manual serialized maintenance, and API-v6 status counts.
+  batch as deletions, manual serialized maintenance, and API-v7 status counts.
 - Optional HSD-shaped undo retirement preserves heights through
   `pruneAfterHeight` and the newest `keepBlocks`, advances a checksummed
   checkpoint in the same batch as each status/undo deletion, preserves
@@ -233,22 +235,29 @@ Implemented:
   neither poison branches nor affect peer-failure accounting.
 - Durable best-header and contiguous stored-body progress plus a versioned,
   checksummed restart checkpoint that is cross-checked against durable state.
+- Explicitly acknowledged, bounded active-state batches that resume stored work
+  after restart and use the same contextual state/reorganization pipeline as
+  local blocks. Contextual-invalid roots and known descendants are durably
+  failed with atomic header fallback; local storage/backend faults stop sync
+  without poisoning the branch.
 - Read-only bounded serving of headers, block inventory, retained bodies, empty
   address responses, and empty mempool inventory responses.
 - Read-only peer and synchronization diagnostics.
-- Observation-only storage: downloaded bodies remain non-active records and do
-  not connect UTXO/name state or authorize mining work.
+- Default observation-only storage plus an opt-in non-authoritative active-state
+  connector. Neither mode can authorize mining work in `shadow` authority mode.
 
 Still release-blocking:
 
 - Brontide transport, DNS seed/address-manager discovery, durable bans, and
   long-lived peer reputation;
 - contextually complete transaction admission and compact-block reconstruction;
-- complete contextual active-state block connection during IBD;
+- production qualification of contextual active-state IBD across full mainnet
+  replay and sustained reorganizations;
 - pruning-aware synchronization, invalid-branch pruning policy, and production
   Urkel lifecycle qualification;
 - live HSD state/root comparison and sustained shadow agreement;
-- active-state IBD, live HSD comparison, and native mainnet mining authority.
+- qualified active-state IBD, live HSD comparison, and native mainnet mining
+  authority.
 
 ## Bounded mempool, templates, and solved-block publication
 
@@ -278,7 +287,8 @@ Still release-blocking:
 
 - production-complete contextual peer transaction admission;
 - disconnected-transaction re-admission after reorganizations;
-- active-state IBD and the incremental production Urkel lifecycle;
+- qualified full-mainnet active-state IBD and the incremental production Urkel
+  lifecycle;
 - live HSD state/root comparison and sustained shadow agreement;
 - measured template/job and solved-block publication latency;
 - native mainnet authority.

@@ -16,8 +16,8 @@ checks:
 - authorization, covenant, name-transition, and spend-staging order;
 - correct pre-state root validation before transaction mutation;
 - null-state deletion and durable root binding;
-- observation-only network wiring, resource ceilings, frame limits, peer/sync
-  modules, and CLI configuration;
+- non-authoritative network wiring, active-state acknowledgement/batch bounds,
+  resource ceilings, frame limits, peer/sync modules, and CLI configuration;
 - mempool/template/publication bounds, fixture wiring, local-first
   publication ordering, authority checks, and schema/profile coordination.
 
@@ -119,7 +119,7 @@ Current evidence includes:
 - malformed-pin and failed-compaction-commit cases that leave the complete node
   set unchanged, followed by an idempotent successful retry;
 - startup compaction due/not-due scheduling, nonzero interval validation,
-  forced coordinator maintenance, checksummed checkpoint rejection, API-v6
+  forced coordinator maintenance, checksummed checkpoint rejection, API-v7
   status, and unclean RocksDB reopen with exact checkpoint/node-set agreement;
 - exact HSD undo-retention constants, steady/startup retirement, protected and
   retained windows, non-empty pinned-root compaction after undo expiry,
@@ -132,6 +132,9 @@ Current evidence includes:
 - durable invalid/invalid-child propagation, best-header fallback across
   restart, body/header mismatch retry, and non-attribution of validator-worker
   failures;
+- bounded active-state restart resumption, direct and forked connection,
+  contextual-invalid ancestor persistence, and proof that local state faults do
+  not poison stored branches or grant shadow mining authority;
 - HSD subsidy boundaries and deterministic mining-template coinbase bytes.
 
 ## Native secp256k1 smoke gate

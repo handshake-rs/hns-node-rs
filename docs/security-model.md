@@ -68,9 +68,13 @@ verification must be selected explicitly. Successful configured script/name
 checks do not imply global mainnet authority; historical and live evidence
 remain separate gates.
 
-Shadow-network input is observation-only. Downloaded bodies remain non-active,
-do not mutate UTXO/name state, and cannot produce a mining authority capability.
-The mining engine may build diagnostic future templates from a durable active snapshot,
+Shadow-network input is non-authoritative. Downloaded bodies remain non-active
+by default. The explicitly acknowledged active-state mode may connect them to
+UTXO/name state through bounded atomic consensus batches, but neither mode can
+produce a mining authority capability. Candidate-derived contextual failures
+may poison the exact durable branch; local store/tree/backend/chain-view faults
+instead stop synchronization without changing branch validity. The mining
+engine may build diagnostic future templates from a durable active snapshot,
 but peer transaction admission remains fail closed and solved-block staging,
 connection, and publication require the same private authority capability as
 the existing authoritative mining boundary.
@@ -86,7 +90,8 @@ The following remain untrusted and release-blocking:
   deterministic all-family transition corpus;
 - deployment-scale compaction performance/priority qualification and RocksDB
   mid-commit process-crash/fault injection;
-- active-state IBD, pruning, and complete alternate-chain/reorganization parity;
+- full-mainnet active-state IBD, pruning, and sustained
+  alternate-chain/reorganization qualification;
 - Brontide, durable peer reputation, discovery, compact blocks, and
   production-complete contextual transaction relay;
 - disconnected-transaction re-admission, production template qualification,

@@ -40,8 +40,9 @@ use tokio::{
 };
 
 use super::{
-    current_unix_time, json_rpc_error, load_header_record, AuthorityMode, NodeBlockImport,
-    NodeService, ShutdownSignal,
+    current_unix_time, json_rpc_error, load_header_record, AuthorityMode, ChainActivationFailure,
+    FailedBlockMutation, FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
+    ShutdownSignal,
 };
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
@@ -54,11 +55,14 @@ const MAX_SHADOW_SYNC_VALIDATION_WORKERS: usize = 128;
 const MAX_SHADOW_SYNC_VALIDATION_QUEUE: usize = 8_192;
 const MAX_SHADOW_SYNC_ORPHAN_BLOCKS: usize = 8_192;
 const MAX_SHADOW_SYNC_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
 const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShadowSyncConfig {
     pub enabled: bool,
+    pub connect_active_state: bool,
+    pub active_state_connect_batch: usize,
     pub listen: Option<SocketAddr>,
     pub connect: Vec<SocketAddr>,
     pub maximum_inbound: usize,
@@ -74,6 +78,8 @@ impl Default for ShadowSyncConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            connect_active_state: false,
+            active_state_connect_batch: 288,
             listen: None,
             connect: Vec::new(),
             maximum_inbound: 32,
@@ -89,6 +95,9 @@ impl Default for ShadowSyncConfig {
 
 impl ShadowSyncConfig {
     pub fn validate(&self, authority_mode: AuthorityMode) -> Result<()> {
+        if self.connect_active_state && !self.enabled {
+            anyhow::bail!("active-state synchronization requires shadow sync to be enabled");
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -97,7 +106,15 @@ impl ShadowSyncConfig {
             AuthorityMode::Disabled | AuthorityMode::Shadow
         ) {
             anyhow::bail!(
-                "Shadow sync live P2P is observation-only and requires disabled or shadow authority mode"
+                "Shadow sync live P2P is non-authoritative and requires disabled or shadow authority mode"
+            );
+        }
+        if self.active_state_connect_batch == 0
+            || self.active_state_connect_batch > MAX_ACTIVE_STATE_CONNECT_BATCH
+        {
+            anyhow::bail!(
+                "active-state connector batch {} must be within 1..={MAX_ACTIVE_STATE_CONNECT_BATCH}",
+                self.active_state_connect_batch
             );
         }
         if self.listen.is_none() && self.connect.is_empty() {
@@ -185,6 +202,7 @@ impl ShadowSyncConfig {
 pub struct ShadowSyncDiagnostics {
     pub enabled: bool,
     pub observation_only: bool,
+    pub active_state: bool,
     pub listen: Option<SocketAddr>,
     pub configured_outbound: Vec<SocketAddr>,
     pub outbound_connected: usize,
@@ -201,6 +219,9 @@ pub struct ShadowSyncDiagnostics {
     pub received_blocks: u64,
     pub stored_bodies: u64,
     pub stored_failed_bodies: u64,
+    pub connected_blocks: u64,
+    pub reorganizations: u64,
+    pub contextual_failed_bodies: u64,
     pub received_transactions: u64,
     pub served_transactions: u64,
     pub rejected_transactions: u64,
@@ -212,6 +233,13 @@ pub struct ShadowSyncDiagnostics {
 #[derive(Clone, Debug)]
 struct HnsBodyValidator {
     consensus: HeaderConsensus,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ActiveStateConnectOutcome {
+    pub(super) connected: usize,
+    pub(super) disconnected: usize,
+    pub(super) contextual_failure: Option<FailedBlockMutation>,
 }
 
 impl HnsBodyValidator {
@@ -369,7 +397,8 @@ impl NodeService {
             .map_or(0, |checkpoint| checkpoint.sequence);
         let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
             enabled: true,
-            observation_only: true,
+            observation_only: !shadow_sync_config.connect_active_state,
+            active_state: shadow_sync_config.connect_active_state,
             listen: shadow_sync_config.listen,
             configured_outbound: shadow_sync_config.connect.clone(),
             started_at: unix_time(),
@@ -378,6 +407,19 @@ impl NodeService {
             checkpoint_sequence: initial_sequence,
             ..ShadowSyncDiagnostics::default()
         }));
+
+        if shadow_sync_config.connect_active_state {
+            connect_stored_active_state(
+                &node,
+                &peers,
+                &mut scheduler,
+                &mut orphan_pool,
+                &diagnostics,
+                shadow_sync_config.active_state_connect_batch,
+            )
+            .await
+            .context("failed to resume active-state synchronization")?;
+        }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let rpc_listener = TcpListener::bind(rpc_bind)
@@ -445,6 +487,24 @@ impl NodeService {
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
+                    }
+
+                    if shadow_sync_config.connect_active_state {
+                        if let Err(error) = connect_stored_active_state(
+                            &node,
+                            &peers,
+                            &mut scheduler,
+                            &mut orphan_pool,
+                            &diagnostics,
+                            shadow_sync_config.active_state_connect_batch,
+                        )
+                        .await
+                        {
+                            let error = error.context("active-state synchronization failed");
+                            record_error(&diagnostics, error.to_string()).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
                     }
 
                     let queue_result = {
@@ -784,8 +844,152 @@ impl NodeService {
         block: Block,
         height: Height,
     ) -> Result<super::FailedBlockMutation> {
-        self.state
-            .store_failed_block(NodeBlockImport::from_peer(block, height))
+        self.state.store_failed_block(
+            NodeBlockImport::from_peer(block, height),
+            FailedBlockStage::BodySyntax,
+        )
+    }
+
+    pub(super) fn shadow_sync_connect_stored_state(
+        &mut self,
+        maximum_connect: usize,
+    ) -> Result<ActiveStateConnectOutcome> {
+        if maximum_connect == 0 || maximum_connect > MAX_ACTIVE_STATE_CONNECT_BATCH {
+            anyhow::bail!(
+                "active-state connector batch {maximum_connect} is outside 1..={MAX_ACTIVE_STATE_CONNECT_BATCH}"
+            );
+        }
+
+        let Some(stored_tip) = self.shadow_sync_contiguous_body_tip(None)? else {
+            return Ok(ActiveStateConnectOutcome::default());
+        };
+        let active_tip = self.shadow_sync_active_tip()?;
+        if active_tip.as_ref() == Some(&stored_tip) {
+            return Ok(ActiveStateConnectOutcome::default());
+        }
+
+        let candidate_hash = match active_tip.as_ref() {
+            None => {
+                let connect_count = maximum_connect.min(stored_tip.height as usize + 1);
+                let height = Height::try_from(connect_count.saturating_sub(1))?;
+                self.state
+                    .chain
+                    .canonical_hash(height)
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to read initial connector target: {error}")
+                    })?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("initial connector target height {height} is missing")
+                    })?
+            }
+            Some(active) => {
+                let canonical_active =
+                    self.state
+                        .chain
+                        .canonical_hash(active.height)
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to compare active and header chains: {error}")
+                        })?;
+                if canonical_active == Some(active.hash) {
+                    if stored_tip.height <= active.height {
+                        return Ok(ActiveStateConnectOutcome::default());
+                    }
+                    let advance = maximum_connect.min((stored_tip.height - active.height) as usize);
+                    let height = active
+                        .height
+                        .checked_add(Height::try_from(advance)?)
+                        .ok_or_else(|| anyhow::anyhow!("active-state connector height overflow"))?;
+                    self.state
+                        .chain
+                        .canonical_hash(height)
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to read connector target: {error}")
+                        })?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("connector target height {height} is missing")
+                        })?
+                } else {
+                    stored_tip.hash
+                }
+            }
+        };
+
+        let Some(mut activation) = self.state.best_chain_activation_plan(candidate_hash)? else {
+            return Ok(ActiveStateConnectOutcome::default());
+        };
+        if activation.connect.len() > maximum_connect {
+            activation.connect.truncate(maximum_connect);
+            let candidate = activation
+                .connect
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("bounded connector plan has no candidate"))?;
+            let candidate_record = self
+                .state
+                .load_block_record(&candidate.block.hash())?
+                .ok_or_else(|| anyhow::anyhow!("bounded connector candidate index is missing"))?;
+            if active_tip
+                .as_ref()
+                .is_some_and(|active| candidate_record.chainwork <= active.chainwork)
+            {
+                anyhow::bail!(
+                    "active-state reorganization needs more than {maximum_connect} replacement blocks before exceeding the active tip"
+                );
+            }
+        }
+
+        for connect in &activation.connect {
+            let summary = HeaderSummary::from_block(&connect.block, connect.height);
+            self.mining_events.candidate_tip_seen(summary.clone());
+            self.mining_events.block_syntax_validated(summary);
+        }
+
+        let is_reorg = !activation.disconnect.is_empty();
+        if is_reorg {
+            self.mining_events
+                .reorg_started(activation.disconnect.len(), activation.connect.len());
+        }
+        match self.state.apply_reorg_classified(NodeReorg {
+            disconnect: activation.disconnect,
+            connect: activation.connect,
+        }) {
+            Ok(reorg) => {
+                let mempool_generation = self.mining_engine_clear_mempool_for_chain_transition();
+                self.publish_durable_mining_state(&reorg.mining)?;
+                self.mining_engine_publish_mempool_reconciled(
+                    reorg.mining.generation,
+                    mempool_generation,
+                )?;
+                Ok(ActiveStateConnectOutcome {
+                    connected: reorg.summary.connected.len(),
+                    disconnected: reorg.summary.disconnected.len(),
+                    contextual_failure: None,
+                })
+            }
+            Err(ChainActivationFailure::ContextualInvalid(failure)) => {
+                if is_reorg {
+                    self.mining_events.reorg_aborted();
+                }
+                tracing::warn!(
+                    block = %failure.request.block.hash().to_hex(),
+                    height = failure.request.height,
+                    reason = %failure.error,
+                    "durably rejecting contextual-invalid shadow branch"
+                );
+                let failed = self
+                    .state
+                    .store_failed_block(failure.request, FailedBlockStage::ContextualState)?;
+                Ok(ActiveStateConnectOutcome {
+                    contextual_failure: Some(failed),
+                    ..ActiveStateConnectOutcome::default()
+                })
+            }
+            Err(ChainActivationFailure::Internal(error)) => {
+                if is_reorg {
+                    self.mining_events.reorg_aborted();
+                }
+                Err(error.context("active-state connector failed without block-invalid evidence"))
+            }
+        }
     }
 
     fn shadow_sync_contiguous_body_tip(&self, hint: Option<&ChainTip>) -> Result<Option<ChainTip>> {
@@ -1804,6 +2008,65 @@ async fn handle_validation_result(
     Ok(())
 }
 
+pub(super) async fn connect_stored_active_state(
+    node: &Arc<Mutex<NodeService>>,
+    peers: &LivePeerManager,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut BoundedOrphanPool,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    maximum_connect: usize,
+) -> Result<()> {
+    let outcome = {
+        let mut node = node.lock().await;
+        node.shadow_sync_connect_stored_state(maximum_connect)?
+    };
+
+    if let Some(failed) = &outcome.contextual_failure {
+        for hash in &failed.affected {
+            scheduler.reject_block(None, *hash, false, StdInstant::now());
+        }
+        discard_orphan_descendants(failed.record.hash, orphans);
+    }
+
+    let (best_header, active_tip, stored_tip) = {
+        let node = node.lock().await;
+        let best_header = node.shadow_sync_best_header_tip()?;
+        let active_tip = node.shadow_sync_active_tip()?;
+        let stored_tip = node.shadow_sync_contiguous_body_tip(scheduler.stored_tip())?;
+        (best_header, active_tip, stored_tip)
+    };
+    scheduler.set_best_header(best_header);
+    scheduler.set_active_tip(active_tip.clone());
+    scheduler.set_stored_tip(stored_tip);
+    {
+        let node = node.lock().await;
+        node.shadow_sync_queue_missing_canonical_bodies(scheduler)?;
+    }
+    peers.set_local_height(active_tip.as_ref().map_or(0, |tip| tip.height));
+
+    if outcome.connected != 0 || outcome.disconnected != 0 || outcome.contextual_failure.is_some() {
+        let sync_snapshot = scheduler.snapshot();
+        let orphan_snapshot = orphans.snapshot();
+        update_diagnostics(diagnostics, |state| {
+            state.sync = sync_snapshot;
+            state.orphans = orphan_snapshot;
+            state.connected_blocks = state
+                .connected_blocks
+                .saturating_add(outcome.connected as u64);
+            if outcome.disconnected != 0 {
+                state.reorganizations = state.reorganizations.saturating_add(1);
+            }
+            if outcome.contextual_failure.is_some() {
+                state.contextual_failed_bodies = state.contextual_failed_bodies.saturating_add(1);
+                state.stored_failed_bodies = state.stored_failed_bodies.saturating_add(1);
+                state.rejected_messages = state.rejected_messages.saturating_add(1);
+            }
+        })
+        .await;
+    }
+    Ok(())
+}
+
 fn discard_orphan_descendants(root: BlockHash, orphans: &mut BoundedOrphanPool) {
     let mut pending = vec![root];
     while let Some(parent) = pending.pop() {
@@ -2053,6 +2316,14 @@ mod tests {
             ..ShadowSyncConfig::default()
         };
         assert!(config.validate(AuthorityMode::Shadow).is_err());
+
+        let active_without_network = ShadowSyncConfig {
+            connect_active_state: true,
+            ..ShadowSyncConfig::default()
+        };
+        assert!(active_without_network
+            .validate(AuthorityMode::Shadow)
+            .is_err());
     }
 
     #[test]
@@ -2107,6 +2378,22 @@ mod tests {
             ..too_many_peers
         };
         assert!(too_fast.validate(AuthorityMode::Shadow).is_err());
+
+        let zero_connector_batch = ShadowSyncConfig {
+            active_state_connect_batch: 0,
+            ..too_fast
+        };
+        assert!(zero_connector_batch
+            .validate(AuthorityMode::Shadow)
+            .is_err());
+
+        let oversized_connector_batch = ShadowSyncConfig {
+            active_state_connect_batch: MAX_ACTIVE_STATE_CONNECT_BATCH + 1,
+            ..zero_connector_batch
+        };
+        assert!(oversized_connector_batch
+            .validate(AuthorityMode::Shadow)
+            .is_err());
     }
 
     #[tokio::test]
@@ -2149,6 +2436,12 @@ mod tests {
             let (_, body) = response.split_once("\r\n\r\n").expect("body split");
             let json: serde_json::Value = serde_json::from_str(body).expect("json response");
             assert!(json.is_object(), "{json}");
+            if path == "/api/v1/shadow-sync" {
+                assert_eq!(json["observation_only"], true);
+                assert_eq!(json["active_state"], false);
+                assert_eq!(json["connected_blocks"], 0);
+                assert_eq!(json["contextual_failed_bodies"], 0);
+            }
         }
 
         shutdown_tx.send(true).expect("shutdown");
