@@ -69,6 +69,8 @@ Implemented:
   name-state snapshots and stable across later commits and engine restart.
 - Durable content-addressed authenticated nodes, path-local exact proof reads,
   startup/transition validation, and RocksDB reopen evidence.
+- Path-local immutable mutation with HSD incremental-root parity, independent
+  rebuild checks, retained historical proofs, and multi-step overlay undo.
 - Correct pre-state root validation and durable post-state root binding.
 - Previous/resulting roots in undo and atomic root restoration.
 - True store snapshots and one-batch multi-block reorganizations.
@@ -78,8 +80,8 @@ Implemented:
 
 Remaining:
 
-- incremental Urkel mutation/root construction, interval snapshots, retained
-  node compaction, and production crash/fault qualification;
+- Urkel interval snapshots, retained-node compaction, and production crash/fault
+  qualification;
 - complete historical contextual claim/airdrop behavior;
 - pruning and RocksDB crash/fault qualification;
 - complete mainnet reorganization/root replay.

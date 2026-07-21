@@ -140,6 +140,9 @@ Implemented:
 - Canonical content-addressed node records keyed by their exact HSD/Urkel node
   hash, staged atomically with each name-state/root transition and retained
   across later roots.
+- Immutable path-local inserts, replacements, and removals that construct only
+  changed ancestors, read freshly staged nodes across one-batch reorganizations,
+  and match the independent rebuild oracle and pinned HSD incremental roots.
 - Path-local durable inclusion/non-inclusion proof reads that rehash every
   loaded record and reproduce the pinned HSD proof bytes after engine and
   RocksDB restart.
@@ -163,8 +166,8 @@ Still release-blocking:
 - current/live production-valid claim-proof evidence and complete historical
   claim replay beyond the pinned initial/replacement histories;
 - full contextual covenant parity across mainnet history;
-- incremental Urkel mutation/root construction, interval snapshots, retained
-  node compaction, and production crash/fault qualification;
+- interval snapshots, retained-node compaction, and production crash/fault
+  qualification for the incremental Urkel lifecycle;
 - complete historical root, undo, and reorganization replay.
 
 ## Live P2P and restartable shadow synchronization

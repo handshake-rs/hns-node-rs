@@ -50,6 +50,9 @@
 - Canonical content-addressed nodes written atomically with authenticated state,
   path-local proofs that rehash loaded records, and restart/corruption evidence
   for both memory and RocksDB stores.
+- Path-local immutable insert/replace/remove, exact HSD incremental-root parity,
+  independent materialized rebuild checks, retained historical proofs, and
+  read-your-writes multi-block undo coverage.
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
 - Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,
@@ -143,8 +146,8 @@ These are substantial foundations, not a production full node.
   implemented.
 - Complete contextual covenant/name behavior across mainnet history; all
   non-claim families now have deterministic HSD differential coverage.
-- Incremental Urkel mutation/root construction, interval snapshots, retained
-  node compaction, and production crash/fault qualification.
+- Urkel interval snapshots, retained-node compaction, and production crash/fault
+  qualification.
 
 ### Chain and network qualification
 

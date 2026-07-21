@@ -248,17 +248,20 @@ previous database.
 
 ## Persistent Urkel status
 
-The current root path rebuilds the authenticated tree from all durable
-`NameState` records. This prioritizes correctness and oracle parity over
-performance. Each transition now also stages every previously unseen reachable
-node as a canonical content-addressed `name_tree_nodes` record in the same
-atomic batch. Proof reads traverse only the requested durable path, rehash every
-record before use, and reproduce the exact pinned HSD proof bytes across engine
-and RocksDB restart. Startup and state transitions validate the persisted tree
-against the bound root; materialized `NameState` remains an independent root
-check.
+Steady-state inserts, replacements, and removals now traverse only affected
+content-addressed paths from the bound root. They construct changed ancestors,
+stage previously unseen records with the `NameState` and root changes in the
+same atomic batch, and retain old nodes for historical roots and undo. The
+staging overlay exposes newly built records to later steps of a one-batch
+reorganization. Proof reads likewise traverse only the requested path and
+rehash every loaded record.
 
-Production closure still requires incremental mutation/root construction in
-place of the O(N) rebuild, interval snapshots, retained-node compaction, and
-crash/fault qualification. Any replacement root algorithm must preserve the
-qualified exact roots and canonical proof bytes under differential replay.
+Startup still performs the independent O(N) rebuild from materialized
+`NameState` and validates every node reachable from the bound root. The rebuild
+also remains a differential-test oracle; it is no longer the steady-state root
+construction path. Pinned HSD incremental roots and canonical proof bytes match
+the path-local implementation, including multi-name history and reverse undo.
+
+Production closure still requires interval snapshots, retained-node compaction,
+and crash/fault qualification without weakening historical-root reachability or
+the startup oracle.

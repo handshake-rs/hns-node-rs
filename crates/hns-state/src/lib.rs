@@ -26,8 +26,8 @@ use hns_store::{
     ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES,
 };
 use hns_urkel::{
-    prove_hsd_from_records, validate_record_tree, MemoryUrkel, NameTreeSnapshot, TreeRoot,
-    UrkelError, UrkelProof,
+    prove_hsd_from_records, update_record_tree, validate_record_root, validate_record_tree,
+    MemoryUrkel, NameTreeSnapshot, TreeRoot, UrkelError, UrkelProof,
 };
 use serde::{Deserialize, Serialize};
 
@@ -696,8 +696,8 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     // inherited from its parent. The current block's covenant transitions are
     // applied only after this comparison and produce the root committed by the
     // following block.
-    let inherited_tree_root = verify_stored_name_tree_root(snapshot)?;
-    validate_persisted_name_tree(snapshot, inherited_tree_root)?;
+    let inherited_tree_root = load_stored_name_tree_root(snapshot)?;
+    validate_persisted_name_tree_root(snapshot, inherited_tree_root)?;
     let committed_tree_root = TreeRoot::new(request.block.header.tree_root);
     if committed_tree_root != inherited_tree_root {
         return Err(StateError::HeaderTreeRootMismatch {
@@ -876,7 +876,8 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         name_overrides.insert(*name_hash, (!state.is_null()).then_some(state.clone()));
     }
 
-    let resulting_tree_root = stage_name_tree_with_overrides(snapshot, batch, &name_overrides)?;
+    let resulting_tree_root =
+        stage_name_tree_with_overrides(snapshot, batch, inherited_tree_root, &name_overrides)?;
     batch.put(
         ColumnFamily::Meta,
         MetaKey::NameTreeRoot.as_bytes(),
@@ -1466,8 +1467,8 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
         });
     }
 
-    let current_tree_root = verify_stored_name_tree_root(snapshot)?;
-    validate_persisted_name_tree(snapshot, current_tree_root)?;
+    let current_tree_root = load_stored_name_tree_root(snapshot)?;
+    validate_persisted_name_tree_root(snapshot, current_tree_root)?;
     if current_tree_root != undo.resulting_tree_root {
         return Err(StateError::UndoResultingTreeRootMismatch {
             expected: undo.resulting_tree_root,
@@ -1501,7 +1502,8 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
                 .cloned(),
         );
     }
-    let restored_tree_root = stage_name_tree_with_overrides(snapshot, batch, &name_overrides)?;
+    let restored_tree_root =
+        stage_name_tree_with_overrides(snapshot, batch, current_tree_root, &name_overrides)?;
     if restored_tree_root != undo.previous_tree_root {
         return Err(StateError::UndoPreviousTreeRootMismatch {
             expected: undo.previous_tree_root,
@@ -1561,17 +1563,16 @@ pub fn write_name_state_to_batch<B: WriteBatch>(
 }
 
 /// Rebuild the exact authenticated name-tree root from the durable NameState
-/// column family using the pinned HSD/Urkel hashing rules. This is a
-/// correctness-first oracle path: it is intentionally O(number of names) and
-/// does not replace the future persistent incremental tree, interval snapshots,
-/// or reorganization injection semantics.
+/// column family using the pinned HSD/Urkel hashing rules. This intentionally
+/// O(number of names) path is the independent startup and differential-test
+/// oracle; steady-state transitions use path-local content-addressed mutation.
 pub fn rebuild_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot, StateError> {
     rebuild_name_tree_root_with_overrides(snapshot, &BTreeMap::new())
 }
 
 /// Materialize the exact authenticated tree represented by one immutable
 /// durable snapshot. This correctness-first path remains O(number of names)
-/// and does not claim persistent incremental-Urkel qualification.
+/// and independent from steady-state incremental mutation.
 pub fn materialize_name_tree<T: ReadSnapshot>(snapshot: &T) -> Result<MemoryUrkel, StateError> {
     materialize_name_tree_with_overrides(snapshot, &BTreeMap::new())
 }
@@ -1628,26 +1629,45 @@ fn materialize_name_tree_with_overrides<T: ReadSnapshot>(
     MemoryUrkel::from_entries(entries).map_err(StateError::NameTree)
 }
 
-/// Stage every previously unseen content-addressed record reachable from the
-/// next root in the same state batch. Existing records must be byte-identical;
-/// conflicting bytes under an authenticated key are durable corruption.
+/// Mutate only affected paths from `root` and stage newly constructed
+/// content-addressed records in the same state batch. Existing records must be
+/// byte-identical; conflicting bytes under an authenticated key are durable
+/// corruption.
 fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
     snapshot: &T,
     batch: &mut B,
+    root: TreeRoot,
     overrides: &BTreeMap<NameHash, Option<NameState>>,
 ) -> Result<TreeRoot, StateError> {
-    let tree = materialize_name_tree_with_overrides(snapshot, overrides)?;
-    let root = tree.root();
-    for (node_root, raw) in tree.node_records()? {
+    let mut mutations = Vec::with_capacity(overrides.len());
+    for (name_hash, state) in overrides {
+        let value = match state {
+            Some(state) if !state.is_null() => {
+                if state.name_hash != *name_hash {
+                    return Err(StateError::Codec(
+                        "name-tree override key does not match its state".to_owned(),
+                    ));
+                }
+                Some(encode_name_state(state)?)
+            }
+            Some(_) | None => None,
+        };
+        mutations.push((*name_hash, value));
+    }
+
+    let update = update_record_tree(root, mutations, |node_root| {
+        load_persisted_node(snapshot, node_root)
+    })?;
+    for (node_root, raw) in update.records() {
         match snapshot.get(ColumnFamily::NameTreeNodes, node_root.as_bytes())? {
-            Some(existing) if existing != raw => {
-                return Err(StateError::PersistedNodeConflict(node_root));
+            Some(existing) if existing != *raw => {
+                return Err(StateError::PersistedNodeConflict(*node_root));
             }
             Some(_) => {}
-            None => batch.put(ColumnFamily::NameTreeNodes, node_root.as_bytes(), &raw)?,
+            None => batch.put(ColumnFamily::NameTreeNodes, node_root.as_bytes(), raw)?,
         }
     }
-    Ok(root)
+    Ok(update.root())
 }
 
 fn load_persisted_node<T: ReadSnapshot>(
@@ -1667,6 +1687,17 @@ pub fn validate_persisted_name_tree<T: ReadSnapshot>(
     root: TreeRoot,
 ) -> Result<usize, StateError> {
     validate_record_tree(root, |node_root| load_persisted_node(snapshot, node_root))
+        .map_err(StateError::NameTree)
+}
+
+/// Validate only the content-addressed record directly bound by the current
+/// root. This keeps steady-state transitions path-local; node startup performs
+/// the full materialized-state and reachable-record validation.
+pub fn validate_persisted_name_tree_root<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+) -> Result<(), StateError> {
+    validate_record_root(root, |node_root| load_persisted_node(snapshot, node_root))
         .map_err(StateError::NameTree)
 }
 
@@ -2030,7 +2061,7 @@ pub enum StateError {
         inherited: TreeRoot,
     },
     #[error(
-        "undo expects current name-tree root {expected:?}, but materialized state is {actual:?}"
+        "undo expects current name-tree root {expected:?}, but the bound state root is {actual:?}"
     )]
     UndoResultingTreeRootMismatch {
         expected: TreeRoot,
@@ -2129,19 +2160,47 @@ impl From<PrimitiveError> for StateError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{cell::Cell, sync::Arc};
 
     use hns_chain::{write_canonical_height_to_batch, BlockStatus, HeaderRecord};
     use hns_consensus::{reserved_name, ConsensusError, ThresholdState};
     use hns_primitives::{
         hash_name, Address, CovenantKind, Header, Input, Output, Txid, Uint256, Witness,
     };
-    use hns_store::{MemoryStore, Store};
+    use hns_store::{MemoryStore, StagingOverlay, Store};
 
     use super::*;
 
     #[derive(Clone, Copy, Debug)]
     struct AllowAllInputVerifier;
+
+    struct NoNameStateScanSnapshot<S> {
+        inner: S,
+        name_node_reads: Cell<usize>,
+    }
+
+    impl<S: ReadSnapshot> ReadSnapshot for NoNameStateScanSnapshot<S> {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            if family == ColumnFamily::NameTreeNodes {
+                self.name_node_reads
+                    .set(self.name_node_reads.get().saturating_add(1));
+            }
+            self.inner.get(family, key)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<Vec<hns_store::ScanEntry>, StoreError> {
+            if family == ColumnFamily::NameState {
+                return Err(StoreError::Io(
+                    "incremental name-tree mutation scanned NameState".to_owned(),
+                ));
+            }
+            self.inner.scan_prefix(family, prefix)
+        }
+    }
 
     impl TransactionInputVerifier for AllowAllInputVerifier {
         fn verify_input(
@@ -2602,8 +2661,9 @@ mod tests {
             .enumerate()
         {
             let snapshot = store.snapshot().expect("pre-state snapshot");
+            let inherited_root = verify_stored_name_tree_root(&snapshot).expect("pre-state root");
             assert_eq!(
-                verify_stored_name_tree_root(&snapshot).expect("pre-state root"),
+                inherited_root,
                 TreeRoot::new(decode_hash(&expected.header_root))
             );
 
@@ -2614,7 +2674,8 @@ mod tests {
             write_name_state_to_batch(&mut batch, &decoded).expect("write state");
             let overrides = BTreeMap::from([(name_hash, Some(decoded))]);
             let staged_root =
-                stage_name_tree_with_overrides(&snapshot, &mut batch, &overrides).expect("stage");
+                stage_name_tree_with_overrides(&snapshot, &mut batch, inherited_root, &overrides)
+                    .expect("stage");
             assert_eq!(
                 staged_root,
                 TreeRoot::new(decode_hash(&expected.resulting_root))
@@ -2650,6 +2711,213 @@ mod tests {
                 Some(encoded)
             );
         }
+    }
+
+    #[test]
+    fn staged_name_tree_mutation_is_path_local_and_matches_rebuild_oracle() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let mut states = Vec::new();
+        let mut tree_entries = Vec::new();
+        for index in 0..64u32 {
+            let name = format!("incrementalstate{index}").into_bytes();
+            let name_hash = NameHash::new(hns_primitives::sha3_256(&name));
+            let mut state = NameState::null(name_hash);
+            state.initialize(name, 100 + index);
+            tree_entries.push((name_hash, encode_name_state(&state).expect("encode state")));
+            states.push(state);
+        }
+        let tree = MemoryUrkel::from_entries(tree_entries).expect("materialized tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("node records");
+
+        let mut initial = store.batch();
+        for state in &states {
+            write_name_state_to_batch(&mut initial, state).expect("write state");
+        }
+        for (node_root, raw) in &records {
+            initial
+                .put(ColumnFamily::NameTreeNodes, node_root.as_bytes(), raw)
+                .expect("write node");
+        }
+        initial
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                root.as_bytes(),
+            )
+            .expect("bind root");
+        store.commit(initial).expect("commit initial tree");
+
+        let mut replacement = states[31].clone();
+        replacement.height += 1;
+        let overrides = BTreeMap::from([(replacement.name_hash, Some(replacement))]);
+        let base = store.snapshot().expect("base snapshot");
+        let expected =
+            rebuild_name_tree_root_with_overrides(&base, &overrides).expect("rebuild oracle");
+        let guarded = NoNameStateScanSnapshot {
+            inner: base,
+            name_node_reads: Cell::new(0),
+        };
+        let mut batch = store.batch();
+        let actual = stage_name_tree_with_overrides(&guarded, &mut batch, root, &overrides)
+            .expect("path-local mutation");
+
+        assert_eq!(actual, expected);
+        assert!(guarded.name_node_reads.get() < records.len());
+    }
+
+    #[test]
+    fn multi_step_overlay_reads_incremental_nodes_and_retains_historical_roots() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let input_verifier = AllowAllInputVerifier;
+        let issuance_verifier = RejectSpecialCoinbaseIssuance;
+        let services = StateServices {
+            network: Network::Regtest,
+            name_flags: NameFlags::NONE,
+            name_flags_valid: true,
+            input_verifier: &input_verifier,
+            issuance_verifier: &issuance_verifier,
+        };
+
+        let mut first = block(120, vec![coinbase(vec![open_output(b"overlayalpha")])]);
+        first.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let first_hash = first.hash();
+        let base = store.snapshot().expect("base snapshot");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&base);
+        let mut batch = overlay.batch(store.batch());
+        let first_summary = connect_block_to_batch_with_services(
+            &staged,
+            &mut batch,
+            ConnectBlock {
+                block_hash: first_hash,
+                height: 120,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &first,
+            },
+            services,
+        )
+        .expect("stage first block");
+
+        let mut second = block(121, vec![coinbase(vec![open_output(b"overlaybeta")])]);
+        second.header.tree_root = *first_summary.resulting_tree_root.as_bytes();
+        let second_hash = second.hash();
+        let second_summary = connect_block_to_batch_with_services(
+            &staged,
+            &mut batch,
+            ConnectBlock {
+                block_hash: second_hash,
+                height: 121,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &second,
+            },
+            services,
+        )
+        .expect("stage second block from overlay nodes");
+        assert_ne!(
+            second_summary.resulting_tree_root,
+            first_summary.resulting_tree_root
+        );
+        drop(staged);
+        drop(base);
+        store.commit(batch.into_inner()).expect("commit two blocks");
+
+        let historical_root = second_summary.resulting_tree_root;
+        let alpha_hash = hash_name("overlayalpha").expect("alpha hash");
+        let beta_hash = hash_name("overlaybeta").expect("beta hash");
+        let snapshot = store.snapshot().expect("connected snapshot");
+        assert_eq!(
+            verify_stored_name_tree_root(&snapshot).expect("connected root"),
+            historical_root
+        );
+        let alpha_value = prove_persisted_name_tree(&snapshot, historical_root, alpha_hash)
+            .expect("alpha proof")
+            .verify_value(historical_root)
+            .expect("verify alpha")
+            .expect("alpha value");
+        let beta_value = prove_persisted_name_tree(&snapshot, historical_root, beta_hash)
+            .expect("beta proof")
+            .verify_value(historical_root)
+            .expect("verify beta")
+            .expect("beta value");
+        let first_undo = BlockUndo::decode(
+            &snapshot
+                .get(ColumnFamily::Undo, first_hash.as_bytes())
+                .expect("first undo read")
+                .expect("first undo"),
+        )
+        .expect("decode first undo");
+        let second_undo = BlockUndo::decode(
+            &snapshot
+                .get(ColumnFamily::Undo, second_hash.as_bytes())
+                .expect("second undo read")
+                .expect("second undo"),
+        )
+        .expect("decode second undo");
+        drop(snapshot);
+
+        let base = store.snapshot().expect("disconnect base");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&base);
+        let mut batch = overlay.batch(store.batch());
+        let second_disconnect = disconnect_block_to_batch(
+            &staged,
+            &mut batch,
+            DisconnectBlock {
+                block_hash: second_hash,
+                height: 121,
+            },
+            &second_undo,
+        )
+        .expect("disconnect second through overlay");
+        assert_eq!(
+            second_disconnect.resulting_tree_root,
+            first_summary.resulting_tree_root
+        );
+        let first_disconnect = disconnect_block_to_batch(
+            &staged,
+            &mut batch,
+            DisconnectBlock {
+                block_hash: first_hash,
+                height: 120,
+            },
+            &first_undo,
+        )
+        .expect("disconnect first through overlay");
+        assert_eq!(first_disconnect.resulting_tree_root, TreeRoot::ZERO);
+        drop(staged);
+        drop(base);
+        store
+            .commit(batch.into_inner())
+            .expect("commit two disconnects");
+
+        let snapshot = store.snapshot().expect("disconnected snapshot");
+        assert_eq!(
+            verify_stored_name_tree_root(&snapshot).expect("empty current root"),
+            TreeRoot::ZERO
+        );
+        assert!(snapshot
+            .scan_prefix(ColumnFamily::NameState, b"")
+            .expect("current names")
+            .is_empty());
+        assert_eq!(
+            prove_persisted_name_tree(&snapshot, historical_root, alpha_hash)
+                .expect("historical alpha proof")
+                .verify_value(historical_root)
+                .expect("verify historical alpha"),
+            Some(alpha_value)
+        );
+        assert_eq!(
+            prove_persisted_name_tree(&snapshot, historical_root, beta_hash)
+                .expect("historical beta proof")
+                .verify_value(historical_root)
+                .expect("verify historical beta"),
+            Some(beta_value)
+        );
     }
 
     #[test]
@@ -2961,7 +3229,8 @@ mod tests {
                 block_hash: opening_hash,
                 height: 100,
             }),
-            Err(StateError::StoredTreeRootMismatch { .. })
+            Err(StateError::UndoResultingTreeRootMismatch { expected, actual })
+                if expected == summary.resulting_tree_root && actual == TreeRoot::ZERO
         ));
 
         let snapshot = store

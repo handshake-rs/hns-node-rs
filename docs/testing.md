@@ -106,6 +106,10 @@ Current evidence includes:
 - content-addressed node-record parity against every pinned HSD proof, path-local
   durable inclusion/non-inclusion reads, memory/RocksDB reopen stability, and
   fail-closed missing/corrupt-node handling at proof, transition, and startup;
+- path-local immutable insert/replace/remove parity against pinned HSD
+  incremental roots and a 1,000-step deterministic mixed-mutation rebuild
+  oracle, plus retained historical proofs and read-your-writes multi-step
+  connect/disconnect;
 - reserved-name and lockup dataset checks;
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,

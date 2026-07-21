@@ -674,6 +674,298 @@ impl UrkelNodeRecord {
     }
 }
 
+/// Result of applying path-local immutable mutations to a content-addressed
+/// tree. `records` contains only nodes constructed by the mutation; unchanged
+/// subtrees remain referenced by their existing authenticated hashes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UrkelRecordUpdate {
+    root: TreeRoot,
+    records: BTreeMap<TreeRoot, Vec<u8>>,
+}
+
+impl UrkelRecordUpdate {
+    pub const fn root(&self) -> TreeRoot {
+        self.root
+    }
+
+    pub fn records(&self) -> &BTreeMap<TreeRoot, Vec<u8>> {
+        &self.records
+    }
+
+    pub fn into_records(self) -> BTreeMap<TreeRoot, Vec<u8>> {
+        self.records
+    }
+}
+
+/// Apply inserts/replacements (`Some(value)`) and removals (`None`) by loading
+/// only affected paths from an immutable content-addressed root. Newly built
+/// nodes are returned for atomic persistence; old nodes remain valid for
+/// historical roots and undo.
+pub fn update_record_tree<F, I>(
+    root: TreeRoot,
+    updates: I,
+    load: F,
+) -> Result<UrkelRecordUpdate, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
+{
+    let mut context = RecordMutationContext {
+        load,
+        loaded: BTreeMap::new(),
+        records: BTreeMap::new(),
+    };
+    if root != TreeRoot::ZERO {
+        context.load_record(root)?;
+    }
+
+    let mut current = root;
+    for (key, value) in updates {
+        current = match value {
+            Some(value) => {
+                validate_value_size(value.len())?;
+                context.insert(current, key, value, 0)?.0
+            }
+            None => context.remove(current, key, 0)?.0,
+        };
+    }
+
+    Ok(UrkelRecordUpdate {
+        root: current,
+        records: context.records,
+    })
+}
+
+struct RecordMutationContext<F> {
+    load: F,
+    loaded: BTreeMap<TreeRoot, UrkelNodeRecord>,
+    records: BTreeMap<TreeRoot, Vec<u8>>,
+}
+
+impl<F> RecordMutationContext<F>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    fn load_record(&mut self, root: TreeRoot) -> Result<UrkelNodeRecord, UrkelError> {
+        if root == TreeRoot::ZERO {
+            return Err(UrkelError::InvalidNode(
+                "attempted to load the empty Urkel root as a record".to_owned(),
+            ));
+        }
+        if let Some(record) = self.loaded.get(&root) {
+            return Ok(record.clone());
+        }
+        let record = load_verified_record(root, &mut self.load)?;
+        self.loaded.insert(root, record.clone());
+        Ok(record)
+    }
+
+    fn intern(&mut self, record: UrkelNodeRecord) -> Result<TreeRoot, UrkelError> {
+        let root = record.root();
+        let raw = record.encode()?;
+        if let Some(existing) = self.records.insert(root, raw.clone()) {
+            if existing != raw {
+                return Err(UrkelError::NodeHashCollision(root));
+            }
+        }
+        self.loaded.insert(root, record);
+        Ok(root)
+    }
+
+    fn insert(
+        &mut self,
+        root: TreeRoot,
+        key: NameHash,
+        value: Vec<u8>,
+        depth: usize,
+    ) -> Result<(TreeRoot, bool), UrkelError> {
+        if root == TreeRoot::ZERO {
+            let root = self.intern(UrkelNodeRecord::Leaf { key, value })?;
+            return Ok((root, true));
+        }
+
+        match self.load_record(root)? {
+            UrkelNodeRecord::Leaf {
+                key: existing_key,
+                value: existing_value,
+            } => {
+                if existing_key == key {
+                    if existing_value == value {
+                        return Ok((root, false));
+                    }
+                    let next = self.intern(UrkelNodeRecord::Leaf { key, value })?;
+                    return Ok((next, next != root));
+                }
+                if depth >= URKEL_BITS {
+                    return Err(UrkelError::InvalidNode(
+                        "distinct Urkel leaves collide beyond the key boundary".to_owned(),
+                    ));
+                }
+                let shared = common_key_bits(existing_key.as_bytes(), key.as_bytes(), depth);
+                let branch_depth = depth.checked_add(shared).ok_or_else(|| {
+                    UrkelError::InvalidNode("Urkel insertion depth overflowed".to_owned())
+                })?;
+                if branch_depth >= URKEL_BITS {
+                    return Err(UrkelError::InvalidNode(
+                        "distinct Urkel leaves have no divergent key bit".to_owned(),
+                    ));
+                }
+                let prefix = BitPrefix::from_key_range(key.as_bytes(), depth, shared);
+                let leaf = self.intern(UrkelNodeRecord::Leaf { key, value })?;
+                let branch = key_bit(key.as_bytes(), branch_depth);
+                let (left, right) = if branch == 0 {
+                    (leaf, root)
+                } else {
+                    (root, leaf)
+                };
+                let next = self.intern(UrkelNodeRecord::Internal {
+                    prefix,
+                    left,
+                    right,
+                })?;
+                Ok((next, true))
+            }
+            UrkelNodeRecord::Internal {
+                prefix,
+                left,
+                right,
+            } => {
+                let branch_depth = checked_branch_depth(&prefix, depth)?;
+                let shared = prefix.count_key(key.as_bytes(), depth);
+                if shared != prefix.bit_len() {
+                    let (front, back) = prefix.split(shared);
+                    let existing = self.intern(UrkelNodeRecord::Internal {
+                        prefix: back,
+                        left,
+                        right,
+                    })?;
+                    let leaf = self.intern(UrkelNodeRecord::Leaf { key, value })?;
+                    let branch = key_bit(key.as_bytes(), depth + shared);
+                    let (left, right) = if branch == 0 {
+                        (leaf, existing)
+                    } else {
+                        (existing, leaf)
+                    };
+                    let next = self.intern(UrkelNodeRecord::Internal {
+                        prefix: front,
+                        left,
+                        right,
+                    })?;
+                    return Ok((next, true));
+                }
+
+                let branch = key_bit(key.as_bytes(), branch_depth);
+                let (child, changed) = if branch == 0 {
+                    self.insert(left, key, value, branch_depth + 1)?
+                } else {
+                    self.insert(right, key, value, branch_depth + 1)?
+                };
+                if !changed {
+                    return Ok((root, false));
+                }
+                let (left, right) = if branch == 0 {
+                    (child, right)
+                } else {
+                    (left, child)
+                };
+                let next = self.intern(UrkelNodeRecord::Internal {
+                    prefix,
+                    left,
+                    right,
+                })?;
+                Ok((next, next != root))
+            }
+        }
+    }
+
+    fn remove(
+        &mut self,
+        root: TreeRoot,
+        key: NameHash,
+        depth: usize,
+    ) -> Result<(TreeRoot, bool), UrkelError> {
+        if root == TreeRoot::ZERO {
+            return Ok((root, false));
+        }
+
+        match self.load_record(root)? {
+            UrkelNodeRecord::Leaf {
+                key: existing_key, ..
+            } => {
+                if existing_key == key {
+                    Ok((TreeRoot::ZERO, true))
+                } else {
+                    Ok((root, false))
+                }
+            }
+            UrkelNodeRecord::Internal {
+                prefix,
+                left,
+                right,
+            } => {
+                let branch_depth = checked_branch_depth(&prefix, depth)?;
+                if !prefix.matches_key(key.as_bytes(), depth) {
+                    return Ok((root, false));
+                }
+                let branch = key_bit(key.as_bytes(), branch_depth);
+                let (next_child, changed) = if branch == 0 {
+                    self.remove(left, key, branch_depth + 1)?
+                } else {
+                    self.remove(right, key, branch_depth + 1)?
+                };
+                if !changed {
+                    return Ok((root, false));
+                }
+
+                let sibling = if branch == 0 { right } else { left };
+                if next_child == TreeRoot::ZERO {
+                    return match self.load_record(sibling)? {
+                        UrkelNodeRecord::Leaf { .. } => Ok((sibling, true)),
+                        UrkelNodeRecord::Internal {
+                            prefix: sibling_prefix,
+                            left,
+                            right,
+                        } => {
+                            let joined = prefix.join(&sibling_prefix, branch ^ 1)?;
+                            checked_branch_depth(&joined, depth)?;
+                            let next = self.intern(UrkelNodeRecord::Internal {
+                                prefix: joined,
+                                left,
+                                right,
+                            })?;
+                            Ok((next, true))
+                        }
+                    };
+                }
+
+                let (left, right) = if branch == 0 {
+                    (next_child, right)
+                } else {
+                    (left, next_child)
+                };
+                let next = self.intern(UrkelNodeRecord::Internal {
+                    prefix,
+                    left,
+                    right,
+                })?;
+                Ok((next, true))
+            }
+        }
+    }
+}
+
+fn checked_branch_depth(prefix: &BitPrefix, depth: usize) -> Result<usize, UrkelError> {
+    let branch_depth = depth
+        .checked_add(prefix.bit_len())
+        .ok_or_else(|| UrkelError::InvalidNode("Urkel path depth overflowed".to_owned()))?;
+    if branch_depth >= URKEL_BITS {
+        return Err(UrkelError::InvalidNode(
+            "Urkel internal path exceeds the key".to_owned(),
+        ));
+    }
+    Ok(branch_depth)
+}
+
 /// Produce an exact HSD proof by loading only the records on the requested
 /// path. Each content-addressed record is decoded canonically and rehashed
 /// before it is trusted.
@@ -801,12 +1093,29 @@ where
     Ok(seen_nodes.len())
 }
 
+/// Validate the record directly bound by `root` without traversing unrelated
+/// descendants. State transitions use this constant-work guard before header
+/// comparison; startup performs the full reachable-tree validation above.
+pub fn validate_record_root<F>(root: TreeRoot, mut load: F) -> Result<(), UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    if root != TreeRoot::ZERO {
+        load_verified_record(root, &mut load)?;
+    }
+    Ok(())
+}
+
 fn load_verified_record<F>(expected: TreeRoot, load: &mut F) -> Result<UrkelNodeRecord, UrkelError>
 where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
 {
     let raw = load(expected)?.ok_or(UrkelError::MissingNode(expected))?;
-    let record = UrkelNodeRecord::decode(&raw)?;
+    decode_verified_record(expected, &raw)
+}
+
+fn decode_verified_record(expected: TreeRoot, raw: &[u8]) -> Result<UrkelNodeRecord, UrkelError> {
+    let record = UrkelNodeRecord::decode(raw)?;
     let actual = record.root();
     if actual != expected {
         return Err(UrkelError::NodeHashMismatch { expected, actual });
@@ -1073,6 +1382,41 @@ impl BitPrefix {
                 bytes: back,
             },
         )
+    }
+
+    fn join(&self, suffix: &Self, branch: u8) -> Result<Self, UrkelError> {
+        self.validate()?;
+        suffix.validate()?;
+        if branch > 1 {
+            return Err(UrkelError::InvalidNode(
+                "compressed-prefix branch bit exceeds one".to_owned(),
+            ));
+        }
+        let bit_len = self
+            .bit_len()
+            .checked_add(1)
+            .and_then(|size| size.checked_add(suffix.bit_len()))
+            .ok_or_else(|| {
+                UrkelError::InvalidNode("compressed-prefix join overflowed".to_owned())
+            })?;
+        if bit_len > URKEL_BITS {
+            return Err(UrkelError::InvalidNode(
+                "compressed-prefix join exceeds 256 bits".to_owned(),
+            ));
+        }
+
+        let mut bytes = vec![0u8; bit_len.div_ceil(8)];
+        for index in 0..self.bit_len() {
+            set_packed_bit(&mut bytes, index, self.bit(index));
+        }
+        set_packed_bit(&mut bytes, self.bit_len(), branch);
+        for index in 0..suffix.bit_len() {
+            set_packed_bit(&mut bytes, self.bit_len() + 1 + index, suffix.bit(index));
+        }
+        Ok(Self {
+            bit_len: bit_len as u16,
+            bytes,
+        })
     }
 
     fn validate(&self) -> Result<(), UrkelError> {
@@ -1692,13 +2036,158 @@ mod tests {
         assert_eq!(fixture.states.len(), fixture.incremental_roots.len());
 
         let mut tree = MemoryUrkel::new();
+        let mut record_root = TreeRoot::ZERO;
+        let mut records = BTreeMap::new();
         for (state, expected) in fixture.states.iter().zip(&fixture.incremental_roots) {
-            tree.insert(
-                NameHash::new(decode_hex_32(&state.name_hash)),
-                decode_hex(&state.encoded),
-            )
-            .expect("insert");
-            assert_eq!(tree.root(), TreeRoot::new(decode_hex_32(&expected.root)));
+            let name_hash = NameHash::new(decode_hex_32(&state.name_hash));
+            let value = decode_hex(&state.encoded);
+            tree.insert(name_hash, value.clone()).expect("insert");
+            let update = update_record_tree(record_root, [(name_hash, Some(value))], |hash| {
+                Ok(records.get(&hash).cloned())
+            })
+            .expect("incremental record update");
+            record_root = update.root();
+            records.extend(update.into_records());
+            let expected = TreeRoot::new(decode_hex_32(&expected.root));
+            assert_eq!(tree.root(), expected);
+            assert_eq!(record_root, expected);
+        }
+
+        let reachable = tree.node_records().expect("materialized records");
+        for (hash, raw) in &reachable {
+            assert_eq!(records.get(hash), Some(raw));
+        }
+        assert_eq!(
+            validate_record_tree(record_root, |hash| Ok(records.get(&hash).cloned()))
+                .expect("incremental record tree"),
+            reachable.len()
+        );
+    }
+
+    #[test]
+    fn record_updates_and_removals_are_path_local_and_history_independent() {
+        let mut tree = MemoryUrkel::from_entries(
+            (0..64).map(|index| (key(index), format!("value-{index}").into_bytes())),
+        )
+        .expect("tree");
+        let mut root = tree.root();
+        let mut records = tree.node_records().expect("records");
+        let total_records = records.len();
+        let historical_root = root;
+        let historical_proof = prove_hsd_from_records(historical_root, key(31), |hash| {
+            Ok(records.get(&hash).cloned())
+        })
+        .expect("historical proof");
+
+        let replacement = b"replacement-value".to_vec();
+        let mut loaded = BTreeSet::new();
+        let update = update_record_tree(root, [(key(31), Some(replacement.clone()))], |hash| {
+            loaded.insert(hash);
+            Ok(records.get(&hash).cloned())
+        })
+        .expect("path-local replacement");
+        tree.insert(key(31), replacement).expect("replace oracle");
+        assert_eq!(update.root(), tree.root());
+        assert!(loaded.len() < total_records);
+        assert!(update.records().len() < total_records);
+        root = update.root();
+        records.extend(update.into_records());
+
+        let unchanged = update_record_tree(
+            root,
+            [(key(31), Some(b"replacement-value".to_vec()))],
+            |hash| Ok(records.get(&hash).cloned()),
+        )
+        .expect("unchanged replacement");
+        assert_eq!(unchanged.root(), root);
+        assert!(unchanged.records().is_empty());
+
+        let mut removal_order = (0..64).step_by(2).collect::<Vec<_>>();
+        removal_order.extend((1..64).step_by(2));
+        for index in removal_order {
+            let update = update_record_tree(root, [(key(index), None)], |hash| {
+                Ok(records.get(&hash).cloned())
+            })
+            .expect("path-local removal");
+            assert!(tree.remove(&key(index)).is_some());
+            assert_eq!(update.root(), tree.root(), "remove key {index}");
+            root = update.root();
+            records.extend(update.into_records());
+        }
+        assert_eq!(root, TreeRoot::ZERO);
+        assert_eq!(
+            prove_hsd_from_records(historical_root, key(31), |hash| {
+                Ok(records.get(&hash).cloned())
+            })
+            .expect("retained historical proof")
+            .raw,
+            historical_proof.raw
+        );
+
+        let unchanged =
+            update_record_tree(root, [(key(99), None)], |_| Ok(None)).expect("absent removal");
+        assert_eq!(unchanged.root(), TreeRoot::ZERO);
+        assert!(unchanged.records().is_empty());
+    }
+
+    #[test]
+    fn deterministic_mixed_record_mutations_match_rebuild_oracle() {
+        fn next(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+
+        fn mixed_key(index: u64) -> NameHash {
+            NameHash::new(blake2b_256(&index.to_le_bytes()))
+        }
+
+        let mut seed = 0x6d65_7368_6d69_6e65u64;
+        let mut tree = MemoryUrkel::new();
+        let mut root = TreeRoot::ZERO;
+        let mut records = BTreeMap::new();
+        for step in 0..1_000u64 {
+            let index = next(&mut seed) % 128;
+            let name_hash = mixed_key(index);
+            let value = if next(&mut seed) % 4 == 0 {
+                None
+            } else {
+                Some(format!("mixed-{index}-{step}").into_bytes())
+            };
+            let update = update_record_tree(root, [(name_hash, value.clone())], |hash| {
+                Ok(records.get(&hash).cloned())
+            })
+            .expect("mixed incremental mutation");
+            match value {
+                Some(value) => {
+                    tree.insert(name_hash, value).expect("oracle insert");
+                }
+                None => {
+                    tree.remove(&name_hash);
+                }
+            }
+            assert_eq!(update.root(), tree.root(), "mixed step {step}");
+            root = update.root();
+            records.extend(update.into_records());
+
+            let probe = mixed_key(next(&mut seed) % 128);
+            assert_eq!(
+                prove_hsd_from_records(root, probe, |hash| Ok(records.get(&hash).cloned()))
+                    .expect("mixed proof")
+                    .verify_value(root)
+                    .expect("verify mixed proof"),
+                tree.get(&probe).map(ToOwned::to_owned),
+                "mixed proof step {step}"
+            );
+            if step % 50 == 0 {
+                let expected_nodes = tree.len().saturating_mul(2).saturating_sub(1);
+                assert_eq!(
+                    validate_record_tree(root, |hash| Ok(records.get(&hash).cloned()))
+                        .expect("mixed record tree"),
+                    expected_nodes
+                );
+            }
         }
     }
 
@@ -1713,6 +2202,25 @@ mod tests {
         let empty = MemoryUrkel::new();
         let empty_records = BTreeMap::new();
         let populated_records = populated.node_records().expect("node records");
+        let mut incremental_root = TreeRoot::ZERO;
+        let mut incremental_records = BTreeMap::new();
+        for entry in &fixture.entries {
+            let update = update_record_tree(
+                incremental_root,
+                [(
+                    NameHash::new(decode_hex_32(&entry.key)),
+                    Some(decode_hex(&entry.value)),
+                )],
+                |hash| Ok(incremental_records.get(&hash).cloned()),
+            )
+            .expect("incremental fixture insert");
+            incremental_root = update.root();
+            incremental_records.extend(update.into_records());
+        }
+        assert_eq!(incremental_root, populated.root());
+        for (hash, raw) in &populated_records {
+            assert_eq!(incremental_records.get(hash), Some(raw));
+        }
         assert_eq!(populated_records.len(), fixture.entries.len() * 2 - 1);
         assert_eq!(
             validate_record_tree(populated.root(), |hash| {
@@ -1780,7 +2288,7 @@ mod tests {
             let records = if root == TreeRoot::ZERO {
                 &empty_records
             } else {
-                &populated_records
+                &incremental_records
             };
             assert_eq!(
                 prove_hsd_from_records(root, key, |hash| Ok(records.get(&hash).cloned()))
@@ -1866,12 +2374,41 @@ mod tests {
             prove_hsd_from_records(root, key(7), |hash| Ok(missing.get(&hash).cloned())),
             Err(UrkelError::MissingNode(hash)) if hash == root
         ));
+        assert!(matches!(
+            update_record_tree(root, [(key(7), Some(b"changed".to_vec()))], |hash| {
+                Ok(missing.get(&hash).cloned())
+            }),
+            Err(UrkelError::MissingNode(hash)) if hash == root
+        ));
+
+        let mut path = Vec::new();
+        prove_hsd_from_records(root, key(7), |hash| {
+            path.push(hash);
+            Ok(records.get(&hash).cloned())
+        })
+        .expect("proof path");
+        let missing_path_root = *path.last().expect("path leaf");
+        assert_ne!(missing_path_root, root);
+        let mut missing_path = records.clone();
+        missing_path.remove(&missing_path_root);
+        assert!(matches!(
+            update_record_tree(root, [(key(7), Some(b"changed".to_vec()))], |hash| {
+                Ok(missing_path.get(&hash).cloned())
+            }),
+            Err(UrkelError::MissingNode(hash)) if hash == missing_path_root
+        ));
 
         let mut corrupt = records.clone();
         let root_record = corrupt.get_mut(&root).expect("root record");
         *root_record.last_mut().expect("record byte") ^= 1;
         assert!(matches!(
             validate_record_tree(root, |hash| Ok(corrupt.get(&hash).cloned())),
+            Err(UrkelError::NodeHashMismatch { expected, .. }) if expected == root
+        ));
+        assert!(matches!(
+            update_record_tree(root, [(key(7), Some(b"changed".to_vec()))], |hash| {
+                Ok(corrupt.get(&hash).cloned())
+            }),
             Err(UrkelError::NodeHashMismatch { expected, .. }) if expected == root
         ));
 

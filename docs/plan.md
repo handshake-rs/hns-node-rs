@@ -77,6 +77,9 @@ reserved low-latency paths.
 - Canonical content-addressed authenticated nodes staged atomically with state,
   path-local exact proof reads, startup/transition validation, and RocksDB
   restart evidence.
+- Path-local immutable insert/replace/remove with HSD incremental-root parity,
+  independent rebuild checks, retained historical proofs, and read-your-writes
+  multi-step reorganization coverage.
 - Correct pre-state header commitment and durable resulting-root semantics.
 
 ### Live shadow networking
@@ -119,9 +122,9 @@ reserved low-latency paths.
    duplicate prevention/undo are implemented.
 2. **Contextual covenant closure** — extend the complete deterministic HSD
    transition-family corpus into mainnet history and historical exceptions.
-3. **Persistent Urkel closure** — incremental mutation/root construction,
-   interval snapshots, retained-node compaction, and crash/fault qualification
-   while preserving the qualified exact roots and proof bytes.
+3. **Persistent Urkel closure** — interval snapshots, retained-node compaction,
+   and crash/fault qualification while preserving qualified incremental roots,
+   historical reachability, and exact proof bytes.
 4. **Active-state IBD** — connect downloaded bodies through the one consensus
    pipeline, persist invalid branches, recover from restart, and qualify
    pruning/reorganizations without changing the authority boundary.

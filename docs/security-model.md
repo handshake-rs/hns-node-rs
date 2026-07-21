@@ -40,8 +40,11 @@ The current foundation verifies or records evidence for:
 - root-checked immutable proof views rebuilt from sequence-consistent durable
   name-state snapshots, with corruption rejected before proof exposure;
 - content-addressed authenticated nodes committed with state, path-local proof
-  reads that rehash each record, and full reachable-tree validation at startup
-  and transition boundaries;
+  reads that rehash each record, bound-root/touched-path validation at
+  transition boundaries, and full reachable-tree validation at startup;
+- immutable path-local mutation that verifies every touched record, retains old
+  roots, and uses the materialized O(N) rebuild as an independent startup and
+  differential-test oracle;
 - atomic single- and multi-block database mutations;
 - sequence-consistent snapshots;
 - bounded HNS framing, peer lifecycle, header synchronization, body scheduling,
@@ -74,8 +77,8 @@ The following remain untrusted and release-blocking:
   the pinned initial/replacement histories;
 - complete contextual name consensus over mainnet historical cases beyond the
   deterministic all-family transition corpus;
-- incremental Urkel mutation/root construction, interval snapshots, retained
-  node compaction, and production crash/fault qualification;
+- Urkel interval snapshots, retained-node compaction, and production crash/fault
+  qualification;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;
 - Brontide, durable peer reputation, discovery, compact blocks, and
   production-complete contextual transaction relay;
