@@ -84,6 +84,9 @@ reserved low-latency paths.
 - Validated retained-root compaction over the current root, every undo root,
   and network-interval pins, with restart, malformed-pin, idempotence, and
   failed-commit atomicity coverage.
+- Opt-in HSD-shaped startup compaction scheduling, a checksummed atomic
+  last-run checkpoint, forced coordinator maintenance, API-v4 diagnostics, and
+  unclean RocksDB reopen evidence.
 - Correct pre-state header commitment and durable resulting-root semantics.
 
 ### Live shadow networking
@@ -126,10 +129,10 @@ reserved low-latency paths.
    duplicate prevention/undo are implemented.
 2. **Contextual covenant closure** — extend the complete deterministic HSD
    transition-family corpus into mainnet history and historical exceptions.
-3. **Persistent Urkel closure** — schedule and scale the implemented
-   interval-pin/retained-root compactor and complete RocksDB process-crash/fault
-   qualification while preserving qualified incremental roots, historical
-   reachability, and exact proof bytes.
+3. **Persistent Urkel closure** — scale and priority-qualify the scheduled
+   interval-pin/retained-root compactor and complete RocksDB mid-commit
+   process-crash/fault qualification while preserving qualified incremental
+   roots, historical reachability, and exact proof bytes.
 4. **Active-state IBD** — connect downloaded bodies through the one consensus
    pipeline, persist invalid branches, recover from restart, and qualify
    pruning/reorganizations without changing the authority boundary.

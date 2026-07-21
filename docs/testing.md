@@ -115,6 +115,9 @@ Current evidence includes:
   while deleting only unreachable records;
 - malformed-pin and failed-compaction-commit cases that leave the complete node
   set unchanged, followed by an idempotent successful retry;
+- startup compaction due/not-due scheduling, nonzero interval validation,
+  forced coordinator maintenance, checksummed checkpoint rejection, API-v4
+  status, and unclean RocksDB reopen with exact checkpoint/node-set agreement;
 - reserved-name and lockup dataset checks;
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,
@@ -165,6 +168,8 @@ Tests must cover:
 - interval-pin lifecycle and startup validation;
 - compaction reachability, malformed metadata, idempotence, and atomic commit
   failure;
+- scheduled and forced compaction checkpoint agreement across unclean RocksDB
+  reopen;
 - equal-work branch stability and greater-work activation;
 - header-index memory publication only after durable commit;
 - failure before commit leaving every durable key unchanged;

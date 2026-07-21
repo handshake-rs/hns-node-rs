@@ -6,8 +6,9 @@ use clap::{Parser, ValueEnum};
 use hns_consensus::Network;
 use hns_mempool::MempoolLimits;
 use hns_node::{
-    init_logging, validate_node_config, AuthorityMode, MiningEngineConfig, NodeConfig, NodeService,
-    ShadowSyncConfig, ShutdownSignal,
+    init_logging, validate_node_config, AuthorityMode, MiningEngineConfig,
+    NameTreeCompactionConfig, NodeConfig, NodeService, ShadowSyncConfig, ShutdownSignal,
+    DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
 };
 use hns_store::DurabilityPolicy;
 
@@ -34,6 +35,14 @@ struct Cli {
 
     #[arg(long, default_value_t = DurabilityPolicy::Sync)]
     storage_durability: DurabilityPolicy,
+
+    /// Compact retained durable name-tree nodes when the startup height is due.
+    #[arg(long)]
+    compact_name_tree_on_startup: bool,
+
+    /// Minimum active-chain height advance between startup compactions.
+    #[arg(long, default_value_t = DEFAULT_NAME_TREE_COMPACTION_INTERVAL)]
+    name_tree_compaction_interval: u32,
 
     /// Enable live, observation-only P2P and shadow synchronization.
     #[arg(long)]
@@ -118,6 +127,10 @@ impl Cli {
             authority_mode: self.authority_mode,
             acknowledge_incomplete_consensus: self.acknowledge_incomplete_consensus,
             storage_durability: self.storage_durability,
+            name_tree_compaction: NameTreeCompactionConfig {
+                compact_on_startup: self.compact_name_tree_on_startup,
+                startup_interval: self.name_tree_compaction_interval,
+            },
             shadow_sync: ShadowSyncConfig {
                 enabled: self.shadow_sync,
                 listen: self.p2p_listen,
@@ -182,6 +195,8 @@ async fn main() -> anyhow::Result<()> {
             network = %config.network,
             authority_mode = config.authority_mode.as_str(),
             storage_durability = %config.storage_durability,
+            compact_name_tree_on_startup = config.name_tree_compaction.compact_on_startup,
+            name_tree_compaction_interval = config.name_tree_compaction.startup_interval,
             shadow_sync = config.shadow_sync.enabled,
             mining_engine = config.mining_engine.enabled,
             transaction_relay = config.mining_engine.transaction_relay,

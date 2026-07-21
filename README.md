@@ -160,6 +160,9 @@ Implemented:
   from the current root, every retained undo root, and every interval pin
   before atomically deleting anything else; malformed metadata and failed
   commits leave all records unchanged.
+- HSD-shaped opt-in startup scheduling with a nonzero block-height interval
+  (10,000 by default), a checksummed last-run checkpoint committed in the same
+  batch as deletions, manual serialized maintenance, and API-v4 status counts.
 - Atomic name-state and durable-root writes on connect, disconnect, and
   multi-block reorganization.
 - Authenticated CLAIM name-state creation/replacement with active-chain commit,
@@ -174,8 +177,8 @@ Still release-blocking:
 - current/live production-valid claim-proof evidence and complete historical
   claim replay beyond the pinned initial/replacement histories;
 - full contextual covenant parity across mainnet history;
-- production compaction scheduling/scale qualification and RocksDB
-  process-crash/fault qualification for the incremental Urkel lifecycle;
+- deployment-scale compaction performance/priority qualification and RocksDB
+  mid-commit process-crash/fault injection for the incremental Urkel lifecycle;
 - complete historical root, undo, and reorganization replay.
 
 ## Live P2P and restartable shadow synchronization

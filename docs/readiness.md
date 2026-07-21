@@ -75,6 +75,9 @@ Implemented:
   restart, and corruption cases.
 - Validated mark-and-sweep compaction retaining the current, undo, and pinned
   root union, including idempotence and failed-commit atomicity evidence.
+- Opt-in interval-gated startup scheduling, forced serialized maintenance, an
+  atomic checksummed last-run checkpoint, API-v4 diagnostics, and unclean
+  RocksDB reopen evidence.
 - Correct pre-state root validation and durable post-state root binding.
 - Previous/resulting roots in undo and atomic root restoration.
 - True store snapshots and one-batch multi-block reorganizations.
@@ -84,8 +87,8 @@ Implemented:
 
 Remaining:
 
-- production compaction scheduling/scale qualification and RocksDB
-  process-crash/fault qualification;
+- deployment-scale compaction performance/priority qualification and RocksDB
+  mid-commit process-crash/fault injection;
 - complete historical contextual claim/airdrop behavior;
 - pruning and RocksDB crash/fault qualification;
 - complete mainnet reorganization/root replay.

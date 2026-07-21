@@ -58,6 +58,9 @@
   validation, plus validated mark-and-sweep compaction over the current, undo,
   and pinned-root reachable union. Malformed pins and failed commits preserve
   every node.
+- Opt-in height-gated startup scheduling and forced serialized maintenance with
+  an atomic checksummed last-run checkpoint, API-v4 status, and unclean RocksDB
+  reopen evidence.
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
 - Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,
@@ -151,8 +154,8 @@ These are substantial foundations, not a production full node.
   implemented.
 - Complete contextual covenant/name behavior across mainnet history; all
   non-claim families now have deterministic HSD differential coverage.
-- Production Urkel compaction scheduling/scale qualification and RocksDB
-  process-crash/fault qualification.
+- Deployment-scale Urkel compaction performance/priority qualification and
+  RocksDB mid-commit process-crash/fault injection.
 
 ### Chain and network qualification
 

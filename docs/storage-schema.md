@@ -37,7 +37,9 @@ durable interval-root retention metadata:
   `deployment-state/v1/<block-hash>` in the `snapshots` column family. Each
   value binds the block height and all four HSD threshold states; active-chain
   startup recomputes period transitions and rejects missing or inconsistent
-  entries.
+  entries;
+- an optional versioned, checksummed `name-tree-compaction/v1` checkpoint that
+  binds the last compacted active height/tip and exact retained/deleted counts.
 
 A schema/profile mismatch, nonempty unversioned database, missing/malformed
 root or airdrop-field binding, or network/genesis mismatch fails closed. The
@@ -124,7 +126,8 @@ cannot promote a block or grant authority.
   `publication/v1/<block-hash>` namespace for solved-block publication intents.
   Each intent commits to its mining generation, job ID, block hash, creation
   time, and exact raw block and is checksummed on decode. State persistence uses
-  `name-tree-snapshot/v1/<height-be>` for network-interval root pins.
+  `name-tree-snapshot/v1/<height-be>` for network-interval root pins and
+  `name-tree-compaction/v1` for the atomically published last compaction result.
 - `peers`, `orphans`, `mempool_persist`: reserved operational records as those
   subsystems mature. Current peer scores, reconnect state, orphan bodies, and
   the mining-engine mempool/template cache are process-local and bounded
@@ -282,6 +285,13 @@ missing/corrupt reachable nodes, and failed commits leave the durable node set
 unchanged. State transitions and compaction must be serialized by the node
 coordinator.
 
-Production closure still requires compaction scheduling and deployment-scale
-performance qualification plus RocksDB process-crash/fault injection without
-weakening historical-root reachability or the startup oracle.
+The node coordinator exposes forced maintenance and HSD-shaped opt-in startup
+scheduling. A nonzero height interval (10,000 by default) prevents repeated
+work at the same tip. The deletion set and checksummed height/tip/count
+checkpoint commit in one batch; malformed checkpoints fail startup. API-v4
+status reports the configured policy and last result. Unclean RocksDB reopen
+tests verify that the checkpoint and compacted node set remain synchronized.
+
+Production closure still requires deployment-scale performance and priority
+isolation plus RocksDB mid-commit process-kill/fault injection without weakening
+historical-root reachability or the startup oracle.

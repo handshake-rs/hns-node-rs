@@ -214,6 +214,18 @@ pub struct RpcMiningEngineInfo {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcNameTreeCompactionInfo {
+    pub compact_on_startup: bool,
+    pub startup_interval: Height,
+    pub last_height: Option<Height>,
+    pub last_tip: Option<BlockHash>,
+    pub last_retained_roots: Option<usize>,
+    pub last_nodes_before: Option<usize>,
+    pub last_nodes_retained: Option<usize>,
+    pub last_nodes_deleted: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcNodeStatus {
     pub api_version: u32,
     pub release_stage: String,
@@ -232,6 +244,7 @@ pub struct RpcNodeStatus {
     pub staged_chain_tip: bool,
     pub authoritative_mining_tip: bool,
     pub tip_validation: Option<BlockStatus>,
+    pub name_tree_compaction: RpcNameTreeCompactionInfo,
     pub authority: RpcAuthorityInfo,
     pub parity: RpcParityInfo,
 }

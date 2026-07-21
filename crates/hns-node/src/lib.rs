@@ -44,17 +44,22 @@ use hns_mining::{
     HeaderSummary, MiningEventHub, MiningGeneration, MiningSnapshot, MiningSubscriptions,
     SolvedMiningCandidate, TemplateCoordinator,
 };
-use hns_primitives::{Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState, Uint256};
+use hns_primitives::{
+    blake2b_256, Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState, Reader,
+    Uint256, Writer,
+};
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
-    RpcConsensusReadiness, RpcErrorObject, RpcHeaderEntry, RpcMiningEngineInfo, RpcNodeStatus,
-    RpcParityInfo, RpcService, RpcSnapshot, RpcTransactionEntry,
+    RpcConsensusReadiness, RpcErrorObject, RpcHeaderEntry, RpcMiningEngineInfo,
+    RpcNameTreeCompactionInfo, RpcNodeStatus, RpcParityInfo, RpcService, RpcSnapshot,
+    RpcTransactionEntry,
 };
 use hns_state::{
     connect_block_to_batch_with_services, decode_coin, decode_name_state,
-    disconnect_block_to_batch, load_name_tree_snapshot_pins, validate_persisted_name_tree,
-    verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock,
-    DisconnectBlock, NameTreeSnapshotPin, StateServices, StoredStateEngine,
+    disconnect_block_to_batch, load_name_tree_snapshot_pins, stage_name_tree_node_compaction,
+    validate_persisted_name_tree, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
+    BlockUndo, ConnectBlock, DisconnectBlock, NameTreeCompactionSummary, NameTreeSnapshotPin,
+    StateServices, StoredStateEngine,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_clean_shutdown, mark_unclean_start, open_store,
@@ -65,12 +70,17 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 3;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 4;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 
 const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
 const DEPLOYMENT_STATE_CACHE_VERSION: u8 = 1;
 const DEPLOYMENT_STATE_CACHE_SIZE: usize = 1 + 4 + 4;
+const NAME_TREE_COMPACTION_CHECKPOINT_KEY: &[u8] = b"name-tree-compaction/v1";
+const NAME_TREE_COMPACTION_CHECKPOINT_VERSION: u32 = 1;
+const NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE: usize = 4 + 4 + 32 + (4 * 8);
+const NAME_TREE_COMPACTION_CHECKPOINT_SIZE: usize = NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE + 32;
+pub const DEFAULT_NAME_TREE_COMPACTION_INTERVAL: Height = 10_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -81,6 +91,107 @@ pub enum AuthorityMode {
     Shadow,
     HsdVerified,
     NativeExperimental,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NameTreeCompactionConfig {
+    pub compact_on_startup: bool,
+    pub startup_interval: Height,
+}
+
+impl Default for NameTreeCompactionConfig {
+    fn default() -> Self {
+        Self {
+            compact_on_startup: false,
+            startup_interval: DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
+        }
+    }
+}
+
+impl NameTreeCompactionConfig {
+    fn validate(self) -> Result<()> {
+        if self.startup_interval == 0 {
+            anyhow::bail!("name-tree compaction startup interval must be non-zero");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameTreeCompactionCheckpoint {
+    pub height: Height,
+    pub tip: BlockHash,
+    pub summary: NameTreeCompactionSummary,
+}
+
+impl NameTreeCompactionCheckpoint {
+    fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut writer = Writer::with_capacity(NAME_TREE_COMPACTION_CHECKPOINT_SIZE);
+        writer.write_u32(NAME_TREE_COMPACTION_CHECKPOINT_VERSION);
+        writer.write_u32(self.height);
+        writer.write_bytes(self.tip.as_bytes());
+        writer.write_u64(u64::try_from(self.summary.retained_roots)?);
+        writer.write_u64(u64::try_from(self.summary.nodes_before)?);
+        writer.write_u64(u64::try_from(self.summary.nodes_retained)?);
+        writer.write_u64(u64::try_from(self.summary.nodes_deleted)?);
+        let mut raw = writer.finish();
+        debug_assert_eq!(raw.len(), NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE);
+        raw.extend_from_slice(&blake2b_256(&raw));
+        Ok(raw)
+    }
+
+    fn decode(raw: &[u8]) -> Result<Self> {
+        if raw.len() != NAME_TREE_COMPACTION_CHECKPOINT_SIZE {
+            anyhow::bail!(
+                "name-tree compaction checkpoint contains {} bytes; expected {NAME_TREE_COMPACTION_CHECKPOINT_SIZE}",
+                raw.len()
+            );
+        }
+        let (body, checksum) = raw.split_at(NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE);
+        if checksum != blake2b_256(body) {
+            anyhow::bail!("name-tree compaction checkpoint checksum mismatch");
+        }
+        let mut reader = Reader::new(body, NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE)?;
+        let version = reader.read_u32()?;
+        if version != NAME_TREE_COMPACTION_CHECKPOINT_VERSION {
+            anyhow::bail!("unsupported name-tree compaction checkpoint version {version}");
+        }
+        let height = reader.read_u32()?;
+        let tip = BlockHash::new(reader.read_hash()?);
+        let retained_roots = usize::try_from(reader.read_u64()?)?;
+        let nodes_before = usize::try_from(reader.read_u64()?)?;
+        let nodes_retained = usize::try_from(reader.read_u64()?)?;
+        let nodes_deleted = usize::try_from(reader.read_u64()?)?;
+        reader.ensure_finished()?;
+        let checkpoint = Self {
+            height,
+            tip,
+            summary: NameTreeCompactionSummary {
+                retained_roots,
+                nodes_before,
+                nodes_retained,
+                nodes_deleted,
+            },
+        };
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.summary.retained_roots == 0 {
+            anyhow::bail!("name-tree compaction checkpoint retained no roots");
+        }
+        if self
+            .summary
+            .nodes_retained
+            .checked_add(self.summary.nodes_deleted)
+            != Some(self.summary.nodes_before)
+        {
+            anyhow::bail!("name-tree compaction checkpoint node counts are inconsistent");
+        }
+        Ok(())
+    }
 }
 
 impl AuthorityMode {
@@ -103,6 +214,7 @@ pub struct NodeConfig {
     pub authority_mode: AuthorityMode,
     pub acknowledge_incomplete_consensus: bool,
     pub storage_durability: DurabilityPolicy,
+    pub name_tree_compaction: NameTreeCompactionConfig,
     pub shadow_sync: ShadowSyncConfig,
     pub mining_engine: MiningEngineConfig,
 }
@@ -117,6 +229,7 @@ impl Default for NodeConfig {
             authority_mode: AuthorityMode::Shadow,
             acknowledge_incomplete_consensus: false,
             storage_durability: DurabilityPolicy::Sync,
+            name_tree_compaction: NameTreeCompactionConfig::default(),
             shadow_sync: ShadowSyncConfig::default(),
             mining_engine: MiningEngineConfig::default(),
         }
@@ -148,6 +261,7 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         }
     }
 
+    config.name_tree_compaction.validate()?;
     config.shadow_sync.validate(config.authority_mode)?;
     config
         .mining_engine
@@ -457,6 +571,21 @@ impl NodeService {
             state.recover_best_stored_chain()?;
         }
 
+        if config.name_tree_compaction.compact_on_startup {
+            if let Some(checkpoint) = state
+                .compact_name_tree_nodes_if_due(config.name_tree_compaction.startup_interval)?
+            {
+                tracing::info!(
+                    height = checkpoint.height,
+                    tip = %checkpoint.tip.to_hex(),
+                    nodes_before = checkpoint.summary.nodes_before,
+                    nodes_retained = checkpoint.summary.nodes_retained,
+                    nodes_deleted = checkpoint.summary.nodes_deleted,
+                    "compacted durable name tree during startup"
+                );
+            }
+        }
+
         let previous_shutdown_clean = was_clean_shutdown(&state.store)
             .map_err(|error| anyhow::anyhow!("failed to read shutdown marker: {error}"))?;
         if !previous_shutdown_clean {
@@ -500,6 +629,17 @@ impl NodeService {
 
     pub fn state_mut(&mut self) -> &mut NodeState {
         &mut self.state
+    }
+
+    /// Run name-tree maintenance under the node's mutable coordinator. The
+    /// compaction checkpoint and all record deletions share one atomic batch.
+    pub fn compact_name_tree_nodes(&mut self) -> Result<NameTreeCompactionCheckpoint> {
+        self.state.compact_name_tree_nodes()
+    }
+
+    pub fn name_tree_compaction_checkpoint(&self) -> Result<Option<NameTreeCompactionCheckpoint>> {
+        let snapshot = self.state.store.snapshot()?;
+        load_name_tree_compaction_checkpoint(&snapshot)
     }
 
     pub fn mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
@@ -784,6 +924,7 @@ impl NodeService {
             .into_iter()
             .filter(|record| !record.status.active_chain)
             .count();
+        let name_tree_compaction_checkpoint = load_name_tree_compaction_checkpoint(&metadata)?;
         let pending_best_chain_activation = match (&best_header, &chain_tip) {
             (Some(header), Some(active)) => {
                 header.hash != active.hash && header.chainwork > active.chainwork
@@ -795,6 +936,28 @@ impl NodeService {
 
         let authority = authority_info(&self.config, &durable);
         let parity = parity_info();
+        let name_tree_compaction = RpcNameTreeCompactionInfo {
+            compact_on_startup: self.config.name_tree_compaction.compact_on_startup,
+            startup_interval: self.config.name_tree_compaction.startup_interval,
+            last_height: name_tree_compaction_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.height),
+            last_tip: name_tree_compaction_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.tip),
+            last_retained_roots: name_tree_compaction_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.summary.retained_roots),
+            last_nodes_before: name_tree_compaction_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.summary.nodes_before),
+            last_nodes_retained: name_tree_compaction_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.summary.nodes_retained),
+            last_nodes_deleted: name_tree_compaction_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.summary.nodes_deleted),
+        };
         let node_status = RpcNodeStatus {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
             release_stage: "pre-authority".to_owned(),
@@ -813,6 +976,7 @@ impl NodeService {
             staged_chain_tip: durable.snapshot.is_some(),
             authoritative_mining_tip: self.mining_events.snapshot().is_some(),
             tip_validation,
+            name_tree_compaction,
             authority,
             parity,
         };
@@ -1130,6 +1294,21 @@ impl NodeState {
 
     fn validate_durable_chain_invariants(&self) -> Result<()> {
         let snapshot = self.store.snapshot()?;
+        if let Some(checkpoint) = load_name_tree_compaction_checkpoint(&snapshot)? {
+            let record = load_block_index_record(&snapshot, &checkpoint.tip)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "name-tree compaction checkpoint tip {} is missing its block index",
+                    checkpoint.tip.to_hex()
+                )
+            })?;
+            if record.height != checkpoint.height {
+                anyhow::bail!(
+                    "name-tree compaction checkpoint height {} disagrees with tip index height {}",
+                    checkpoint.height,
+                    record.height
+                );
+            }
+        }
         let durable_name_tree_root = verify_stored_name_tree_root(&snapshot)
             .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?;
         validate_persisted_name_tree(&snapshot, durable_name_tree_root).map_err(|error| {
@@ -2292,6 +2471,61 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to refresh block index: {error}"))?;
         Ok(())
     }
+
+    pub fn compact_name_tree_nodes(&mut self) -> Result<NameTreeCompactionCheckpoint> {
+        self.compact_name_tree_nodes_with_interval(None)?
+            .ok_or_else(|| anyhow::anyhow!("name-tree compaction requires an active block tip"))
+    }
+
+    fn compact_name_tree_nodes_if_due(
+        &mut self,
+        interval: Height,
+    ) -> Result<Option<NameTreeCompactionCheckpoint>> {
+        if interval == 0 {
+            anyhow::bail!("name-tree compaction startup interval must be non-zero");
+        }
+        self.compact_name_tree_nodes_with_interval(Some(interval))
+    }
+
+    fn compact_name_tree_nodes_with_interval(
+        &mut self,
+        interval: Option<Height>,
+    ) -> Result<Option<NameTreeCompactionCheckpoint>> {
+        let snapshot = self.store.snapshot()?;
+        let Some(tip) = best_block_tip_from_snapshot(&snapshot)? else {
+            return Ok(None);
+        };
+        if let Some(interval) = interval {
+            let previous = load_name_tree_compaction_checkpoint(&snapshot)?;
+            let due = match previous {
+                Some(previous) if tip.height >= previous.height => {
+                    tip.height - previous.height >= interval
+                }
+                Some(_) => true,
+                None => tip.height >= interval,
+            };
+            if !due {
+                return Ok(None);
+            }
+        }
+
+        let mut batch = self.store.batch();
+        let summary = stage_name_tree_node_compaction(&snapshot, &mut batch)
+            .map_err(|error| anyhow::anyhow!("failed to compact durable name tree: {error}"))?;
+        let checkpoint = NameTreeCompactionCheckpoint {
+            height: tip.height,
+            tip: tip.hash,
+            summary,
+        };
+        batch.put(
+            ColumnFamily::Snapshots,
+            NAME_TREE_COMPACTION_CHECKPOINT_KEY,
+            &checkpoint.encode()?,
+        )?;
+        drop(snapshot);
+        self.store.commit(batch)?;
+        Ok(Some(checkpoint))
+    }
 }
 
 impl Default for NodeState {
@@ -2354,6 +2588,16 @@ fn load_block_undo(snapshot: &impl ReadSnapshot, hash: &BlockHash) -> Result<Opt
     BlockUndo::decode(&bytes)
         .map(Some)
         .map_err(|error| anyhow::anyhow!("failed to decode block undo: {error}"))
+}
+
+pub fn load_name_tree_compaction_checkpoint(
+    snapshot: &impl ReadSnapshot,
+) -> Result<Option<NameTreeCompactionCheckpoint>> {
+    snapshot
+        .get(ColumnFamily::Snapshots, NAME_TREE_COMPACTION_CHECKPOINT_KEY)
+        .context("failed to read name-tree compaction checkpoint")?
+        .map(|raw| NameTreeCompactionCheckpoint::decode(&raw))
+        .transpose()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3203,6 +3447,31 @@ mod tests {
         block
     }
 
+    fn connect_empty_chain_to_height_one(node: &mut NodeService) -> BlockIndexRecord {
+        let first = block_with_commitments(vec![coinbase_transaction_with_address(60, 50)]);
+        let first = node
+            .connect_block(NodeBlockImport::fixture(first, 0, 1))
+            .expect("connect first block");
+        let mut second = block_with_commitments(vec![coinbase_transaction_with_address(61, 50)]);
+        second.header.prev_block = first.hash;
+        node.connect_block(NodeBlockImport::fixture(second, 1, 2))
+            .expect("connect second block")
+    }
+
+    fn put_unreachable_name_node(store: &StoreHandle, byte: u8) -> [u8; 32] {
+        let key = [byte; 32];
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::NameTreeNodes,
+                &key,
+                b"deliberately unreachable node",
+            )
+            .expect("stage unreachable node");
+        store.commit(batch).expect("commit unreachable node");
+        key
+    }
+
     #[derive(serde::Deserialize)]
     struct AirdropFixture {
         faucet: AirdropFixtureProof,
@@ -3724,6 +3993,107 @@ mod tests {
     }
 
     #[test]
+    fn startup_name_tree_compaction_is_due_bounded_and_checksummed() {
+        assert!(validate_node_config(&NodeConfig {
+            name_tree_compaction: NameTreeCompactionConfig {
+                compact_on_startup: true,
+                startup_interval: 0,
+            },
+            ..NodeConfig::default()
+        })
+        .is_err());
+
+        let store = StoreHandle::memory();
+        let base_config = NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        };
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let mut node = NodeService::try_with_state(base_config.clone(), state).expect("node");
+        let tip = connect_empty_chain_to_height_one(&mut node);
+        let first_orphan = put_unreachable_name_node(&store, 0x71);
+        drop(node);
+
+        let startup_config = NodeConfig {
+            name_tree_compaction: NameTreeCompactionConfig {
+                compact_on_startup: true,
+                startup_interval: 1,
+            },
+            ..base_config
+        };
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("restart");
+        let mut node =
+            NodeService::try_with_state(startup_config.clone(), state).expect("compact startup");
+        assert!(store
+            .snapshot()
+            .expect("compacted snapshot")
+            .get(ColumnFamily::NameTreeNodes, &first_orphan)
+            .expect("first orphan read")
+            .is_none());
+        let first_checkpoint = node
+            .name_tree_compaction_checkpoint()
+            .expect("checkpoint read")
+            .expect("checkpoint");
+        assert_eq!(first_checkpoint.height, 1);
+        assert_eq!(first_checkpoint.tip, tip.hash);
+        assert_eq!(first_checkpoint.summary.nodes_deleted, 1);
+
+        let second_orphan = put_unreachable_name_node(&store, 0x72);
+        drop(node);
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("restart");
+        node = NodeService::try_with_state(startup_config, state).expect("not-due startup");
+        assert!(store
+            .snapshot()
+            .expect("not-due snapshot")
+            .get(ColumnFamily::NameTreeNodes, &second_orphan)
+            .expect("second orphan read")
+            .is_some());
+        assert_eq!(
+            node.name_tree_compaction_checkpoint()
+                .expect("unchanged checkpoint")
+                .expect("checkpoint"),
+            first_checkpoint
+        );
+
+        let forced = node.compact_name_tree_nodes().expect("manual compaction");
+        assert_eq!(forced.height, 1);
+        assert_eq!(forced.summary.nodes_deleted, 1);
+        assert!(store
+            .snapshot()
+            .expect("forced snapshot")
+            .get(ColumnFamily::NameTreeNodes, &second_orphan)
+            .expect("second orphan after force")
+            .is_none());
+        drop(node);
+
+        let snapshot = store.snapshot().expect("checkpoint snapshot");
+        let mut raw = snapshot
+            .get(ColumnFamily::Snapshots, NAME_TREE_COMPACTION_CHECKPOINT_KEY)
+            .expect("checkpoint bytes")
+            .expect("checkpoint bytes");
+        drop(snapshot);
+        *raw.last_mut().expect("checksum byte") ^= 1;
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                NAME_TREE_COMPACTION_CHECKPOINT_KEY,
+                &raw,
+            )
+            .expect("corrupt checkpoint");
+        store.commit(batch).expect("commit corrupt checkpoint");
+        let error = NodeState::from_store_for_network(store, Network::Regtest)
+            .expect_err("corrupt compaction checkpoint");
+        assert!(
+            error.to_string().contains("compaction checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn startup_rejects_active_tip_undo_root_drift() {
         let store = StoreHandle::memory();
         let config = NodeConfig {
@@ -3969,6 +4339,87 @@ mod tests {
                 .verify_value(root)
                 .expect("verify reopened proof")
                 .is_some());
+        }
+
+        std::fs::remove_dir_all(&path).expect("remove test store");
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn startup_name_tree_compaction_survives_unclean_rocksdb_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-compaction-reopen-{}-{}",
+            std::process::id(),
+            current_unix_time().expect("time")
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let store_config = StoreConfig {
+            path: path.clone(),
+            backend: StoreBackend::RocksDb,
+            durability: DurabilityPolicy::Sync,
+        };
+        let node_config = NodeConfig {
+            network: Network::Regtest,
+            name_tree_compaction: NameTreeCompactionConfig {
+                compact_on_startup: true,
+                startup_interval: 1,
+            },
+            ..NodeConfig::default()
+        };
+        let orphan = [0x73; 32];
+        let expected_tip;
+
+        {
+            let store = open_store(&store_config).expect("open store");
+            let state =
+                NodeState::from_store_for_network(store, Network::Regtest).expect("initial state");
+            let mut node = NodeService::try_with_state(
+                NodeConfig {
+                    name_tree_compaction: NameTreeCompactionConfig::default(),
+                    ..node_config.clone()
+                },
+                state,
+            )
+            .expect("initial node");
+            expected_tip = connect_empty_chain_to_height_one(&mut node).hash;
+            put_unreachable_name_node(&node.state().store, orphan[0]);
+            assert!(!was_clean_shutdown(&node.state().store).expect("unclean marker"));
+        }
+
+        {
+            let store = open_store(&store_config).expect("first reopen");
+            let state =
+                NodeState::from_store_for_network(store, Network::Regtest).expect("reopened state");
+            let node = NodeService::try_with_state(node_config.clone(), state)
+                .expect("startup compaction");
+            let snapshot = node.state().store.snapshot().expect("compacted snapshot");
+            assert!(snapshot
+                .get(ColumnFamily::NameTreeNodes, &orphan)
+                .expect("orphan read")
+                .is_none());
+            drop(snapshot);
+            let checkpoint = node
+                .name_tree_compaction_checkpoint()
+                .expect("checkpoint read")
+                .expect("checkpoint");
+            assert_eq!(checkpoint.height, 1);
+            assert_eq!(checkpoint.tip, expected_tip);
+            assert_eq!(checkpoint.summary.nodes_deleted, 1);
+            assert!(!was_clean_shutdown(&node.state().store).expect("still unclean"));
+        }
+
+        {
+            let store = open_store(&store_config).expect("second reopen");
+            let state = NodeState::from_store_for_network(store, Network::Regtest)
+                .expect("second reopened state");
+            let node = NodeService::try_with_state(node_config, state).expect("idempotent startup");
+            let checkpoint = node
+                .name_tree_compaction_checkpoint()
+                .expect("checkpoint read")
+                .expect("checkpoint");
+            assert_eq!(checkpoint.height, 1);
+            assert_eq!(checkpoint.tip, expected_tip);
+            assert_eq!(checkpoint.summary.nodes_deleted, 1);
         }
 
         std::fs::remove_dir_all(&path).expect("remove test store");
@@ -4704,6 +5155,12 @@ mod tests {
         assert_eq!(json["release_stage"], "pre-authority");
         assert_eq!(json["authority"]["mode"], "shadow");
         assert_eq!(json["parity"]["oracle_revision"], HSD_ORACLE_REVISION);
+        assert_eq!(json["name_tree_compaction"]["compact_on_startup"], false);
+        assert_eq!(
+            json["name_tree_compaction"]["startup_interval"],
+            DEFAULT_NAME_TREE_COMPACTION_INTERVAL
+        );
+        assert!(json["name_tree_compaction"]["last_height"].is_null());
 
         let request = format!(
             "GET /api/v1/mining-engine HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"

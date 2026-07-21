@@ -49,6 +49,9 @@ The current foundation verifies or records evidence for:
   plus startup validation of every pinned reachable tree;
 - explicit mark-and-sweep compaction that validates the complete retained-root
   union before staging deletions and commits the deletion batch atomically;
+- opt-in height-gated startup scheduling under the mutable node coordinator,
+  with a checksummed last-run checkpoint in the deletion batch and unclean
+  RocksDB reopen validation;
 - atomic single- and multi-block database mutations;
 - sequence-consistent snapshots;
 - bounded HNS framing, peer lifecycle, header synchronization, body scheduling,
@@ -81,8 +84,8 @@ The following remain untrusted and release-blocking:
   the pinned initial/replacement histories;
 - complete contextual name consensus over mainnet historical cases beyond the
   deterministic all-family transition corpus;
-- production compaction scheduling/scale qualification and RocksDB
-  process-crash/fault qualification;
+- deployment-scale compaction performance/priority qualification and RocksDB
+  mid-commit process-crash/fault injection;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;
 - Brontide, durable peer reputation, discovery, compact blocks, and
   production-complete contextual transaction relay;
