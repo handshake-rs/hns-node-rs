@@ -16,6 +16,7 @@ use crate::SyncError;
 pub struct ValidationRequest {
     pub peer: PeerId,
     pub height: Height,
+    pub attempt: u8,
     pub block: Block,
 }
 
@@ -32,14 +33,45 @@ pub struct ValidationFailure {
     pub sequence: u64,
     pub peer: PeerId,
     pub height: Height,
+    pub attempt: u8,
     pub block: Block,
+    pub kind: ValidationFailureKind,
     pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationFailureKind {
+    InvalidBlock,
+    InvalidResponse,
+    WorkerFailure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationRejection {
+    pub kind: ValidationFailureKind,
+    pub reason: String,
+}
+
+impl ValidationRejection {
+    pub fn invalid_block(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ValidationFailureKind::InvalidBlock,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn invalid_response(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ValidationFailureKind::InvalidResponse,
+            reason: reason.into(),
+        }
+    }
 }
 
 pub type OrderedValidationResult = Result<ValidatedBlock, ValidationFailure>;
 
 pub trait StatelessBlockValidator: Send + Sync + 'static {
-    fn validate(&self, block: &Block, height: Height) -> Result<(), String>;
+    fn validate(&self, block: &Block, height: Height) -> Result<(), ValidationRejection>;
 }
 
 #[derive(Clone, Debug)]
@@ -82,7 +114,7 @@ pub fn spawn_validation_pipeline<V>(
     queue_capacity: usize,
 ) -> Result<(ValidationSubmitter, mpsc::Receiver<OrderedValidationResult>), SyncError>
 where
-    V: StatelessBlockValidator,
+    V: StatelessBlockValidator + ?Sized,
 {
     if workers == 0 || queue_capacity == 0 {
         return Err(SyncError::Configuration(
@@ -109,6 +141,7 @@ where
                 tokio::spawn(async move {
                     let peer = request.peer;
                     let height = request.height;
+                    let attempt = request.attempt;
                     let block = request.block;
                     let validation_block = block.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
@@ -122,18 +155,22 @@ where
                             height,
                             block,
                         }),
-                        Ok(Err(reason)) => Err(ValidationFailure {
+                        Ok(Err(rejection)) => Err(ValidationFailure {
                             sequence,
                             peer,
                             height,
+                            attempt,
                             block,
-                            reason,
+                            kind: rejection.kind,
+                            reason: rejection.reason,
                         }),
                         Err(error) => Err(ValidationFailure {
                             sequence,
                             peer,
                             height,
+                            attempt,
                             block,
+                            kind: ValidationFailureKind::WorkerFailure,
                             reason: format!("validation worker failed: {error}"),
                         }),
                     };
@@ -179,10 +216,41 @@ mod tests {
     struct DelayedValidator;
 
     impl StatelessBlockValidator for DelayedValidator {
-        fn validate(&self, block: &Block, _height: Height) -> Result<(), String> {
+        fn validate(&self, block: &Block, _height: Height) -> Result<(), ValidationRejection> {
             let delay = 3u64.saturating_sub(u64::from(block.header.nonce));
             thread::sleep(Duration::from_millis(delay * 10));
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct RejectingValidator;
+
+    impl StatelessBlockValidator for RejectingValidator {
+        fn validate(&self, _block: &Block, _height: Height) -> Result<(), ValidationRejection> {
+            Err(ValidationRejection::invalid_block(
+                "deterministic rejection",
+            ))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct PanickingValidator;
+
+    impl StatelessBlockValidator for PanickingValidator {
+        fn validate(&self, _block: &Block, _height: Height) -> Result<(), ValidationRejection> {
+            panic!("validator panic")
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ResponseRejectingValidator;
+
+    impl StatelessBlockValidator for ResponseRejectingValidator {
+        fn validate(&self, _block: &Block, _height: Height) -> Result<(), ValidationRejection> {
+            Err(ValidationRejection::invalid_response(
+                "body/header mismatch",
+            ))
         }
     }
 
@@ -199,6 +267,7 @@ mod tests {
                 .submit(ValidationRequest {
                     peer: PeerId(1),
                     height: nonce,
+                    attempt: 1,
                     block: Block {
                         header,
                         transactions: Vec::new(),
@@ -219,5 +288,41 @@ mod tests {
             );
         }
         assert_eq!(sequences, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn validation_distinguishes_consensus_rejection_from_worker_failure() {
+        for (validator, expected) in [
+            (
+                Arc::new(RejectingValidator) as Arc<dyn StatelessBlockValidator>,
+                ValidationFailureKind::InvalidBlock,
+            ),
+            (
+                Arc::new(PanickingValidator) as Arc<dyn StatelessBlockValidator>,
+                ValidationFailureKind::WorkerFailure,
+            ),
+            (
+                Arc::new(ResponseRejectingValidator) as Arc<dyn StatelessBlockValidator>,
+                ValidationFailureKind::InvalidResponse,
+            ),
+        ] {
+            let (submitter, mut output) =
+                spawn_validation_pipeline(validator, 1, 1).expect("validation pipeline");
+            submitter
+                .submit(ValidationRequest {
+                    peer: PeerId(7),
+                    height: 9,
+                    attempt: 3,
+                    block: Block {
+                        header: Header::default(),
+                        transactions: Vec::new(),
+                    },
+                })
+                .await
+                .expect("submit");
+            let failure = output.recv().await.expect("result").expect_err("failure");
+            assert_eq!(failure.kind, expected);
+            assert_eq!(failure.attempt, 3);
+        }
     }
 }

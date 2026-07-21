@@ -83,7 +83,7 @@ Implemented:
 - Validated mark-and-sweep compaction retaining the current, undo, and pinned
   root union, including idempotence and failed-commit atomicity evidence.
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
-  atomic checksummed last-run checkpoint, API-v5 diagnostics, and unclean
+  atomic checksummed last-run checkpoint, API-v6 diagnostics, and unclean
   RocksDB reopen evidence.
 - Exact HSD undo-retention horizons with opt-in atomic retirement, bounded
   startup catch-up, pruning-aware pin/compaction validation, and deep-reorg
@@ -116,6 +116,9 @@ Implemented:
 - bounded pending/inflight/per-peer block scheduling with retry and timeout;
 - bounded known-header orphan handling;
 - parallel stateless body validation with ordered results;
+- durable permanent-invalid and invalid-child status, atomic best-header
+  fallback, restart recovery, and separate retry paths for uncommitted body
+  mismatches and validator-worker failures;
 - durable non-active body retention and restartable sync checkpoints;
 - bounded read-only header, inventory, block, and transaction serving;
 - reserved critical-lane parallel fan-out used by the mining publication path.

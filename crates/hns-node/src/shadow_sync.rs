@@ -14,7 +14,8 @@ use axum::{
 };
 use hns_chain::{BlockIndexRecord, ChainTip, HeaderImport, HeaderIndex, HeaderRecord};
 use hns_consensus::{
-    ConsensusParams, HeaderConsensus, HeaderParent, HeaderValidationContext, MAX_FUTURE_BLOCK_TIME,
+    block_merkle_root, block_witness_root, ConsensusParams, HeaderConsensus, HeaderParent,
+    HeaderValidationContext, MAX_FUTURE_BLOCK_TIME,
 };
 use hns_mempool::Admission;
 use hns_p2p::{
@@ -27,7 +28,8 @@ use hns_store::{mark_clean_shutdown, Store};
 use hns_sync::{
     spawn_validation_pipeline, BoundedOrphanPool, OrderedValidationResult, OrphanLimits,
     OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction, SyncCheckpoint,
-    SyncLimits, SyncScheduler, SyncSnapshot, ValidationRequest, ValidationSubmitter,
+    SyncLimits, SyncScheduler, SyncSnapshot, ValidationFailureKind, ValidationRejection,
+    ValidationRequest, ValidationSubmitter,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -198,6 +200,7 @@ pub struct ShadowSyncDiagnostics {
     pub received_headers: u64,
     pub received_blocks: u64,
     pub stored_bodies: u64,
+    pub stored_failed_bodies: u64,
     pub received_transactions: u64,
     pub served_transactions: u64,
     pub rejected_transactions: u64,
@@ -220,11 +223,25 @@ impl HnsBodyValidator {
 }
 
 impl StatelessBlockValidator for HnsBodyValidator {
-    fn validate(&self, block: &Block, _height: Height) -> std::result::Result<(), String> {
+    fn validate(
+        &self,
+        block: &Block,
+        _height: Height,
+    ) -> std::result::Result<(), ValidationRejection> {
+        if block_merkle_root(block) != block.header.merkle_root {
+            return Err(ValidationRejection::invalid_response(
+                "body does not match the header merkle root",
+            ));
+        }
+        if block_witness_root(block) != block.header.witness_root {
+            return Err(ValidationRejection::invalid_response(
+                "body does not match the header witness root",
+            ));
+        }
         self.consensus
             .validate_block_body(block)
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| ValidationRejection::invalid_block(error.to_string()))
     }
 }
 
@@ -760,6 +777,15 @@ impl NodeService {
         let validated = self.state.validate_import(&request)?;
         let stored = self.state.store_validated_alternate(request, validated)?;
         Ok(stored.record)
+    }
+
+    fn shadow_sync_store_failed_block(
+        &mut self,
+        block: Block,
+        height: Height,
+    ) -> Result<super::FailedBlockMutation> {
+        self.state
+            .store_failed_block(NodeBlockImport::from_peer(block, height))
     }
 
     fn shadow_sync_contiguous_body_tip(&self, hint: Option<&ChainTip>) -> Result<Option<ChainTip>> {
@@ -1462,17 +1488,20 @@ async fn accept_peer_block(
     scheduler: &mut SyncScheduler,
 ) -> Result<()> {
     let hash = block.hash();
-    {
+    let mut record = {
         let node = node.lock().await;
+        let record = node.shadow_sync_header_record(&hash)?;
+        if record.as_ref().is_some_and(|record| record.status.failed) {
+            drop(node);
+            scheduler.reject_block(Some(peer), hash, false, StdInstant::now());
+            penalize_peer(peers, peer, 100, "known invalid block branch").await?;
+            anyhow::bail!("peer {:?} sent known invalid block {}", peer, hash.to_hex());
+        }
         if node.shadow_sync_has_block(&hash)? {
             scheduler.complete_block(hash);
             return Ok(());
         }
-    }
-
-    let mut record = {
-        let node = node.lock().await;
-        node.shadow_sync_header_record(&hash)?
+        record
     };
     if record.is_none() {
         let parent_known = {
@@ -1518,18 +1547,28 @@ async fn accept_peer_block(
     }
 
     let record = record.ok_or_else(|| anyhow::anyhow!("imported block header has no record"))?;
+    if record.status.failed {
+        scheduler.reject_block(Some(peer), hash, false, StdInstant::now());
+        penalize_peer(peers, peer, 100, "invalid-branch descendant").await?;
+        anyhow::bail!(
+            "peer {:?} sent descendant {} of a failed branch",
+            peer,
+            hash.to_hex()
+        );
+    }
     if !scheduler.is_queued_or_inflight(&hash) {
         scheduler
             .announce_block(peer, hash, record.height)
             .map_err(|error| anyhow::anyhow!("failed to queue delivered block: {error}"))?;
     }
-    scheduler
+    let request = scheduler
         .receive_block(peer, hash, StdInstant::now())
         .map_err(|error| anyhow::anyhow!("peer block was not eligible: {error}"))?;
     if let Err(error) = validation
         .submit(ValidationRequest {
             peer,
             height: record.height,
+            attempt: request.attempt,
             block,
         })
         .await
@@ -1599,6 +1638,7 @@ async fn submit_released_orphans(
             .submit(ValidationRequest {
                 peer: LOCAL_ORPHAN_PEER,
                 height: record.height,
+                attempt: 0,
                 block,
             })
             .await
@@ -1668,7 +1708,77 @@ async fn handle_validation_result(
         }
         Err(failure) => {
             let hash = failure.block.hash();
-            scheduler.reject_block(Some(failure.peer), hash, false, StdInstant::now());
+            match failure.kind {
+                ValidationFailureKind::WorkerFailure => {
+                    scheduler.retry_validation_failure(
+                        hash,
+                        failure.height,
+                        failure.attempt,
+                        None,
+                        StdInstant::now(),
+                    );
+                    anyhow::bail!(
+                        "stateless block validation worker failed at {}: {}",
+                        failure.height,
+                        failure.reason
+                    );
+                }
+                ValidationFailureKind::InvalidResponse => {
+                    scheduler.retry_validation_failure(
+                        hash,
+                        failure.height,
+                        failure.attempt,
+                        (failure.peer != LOCAL_ORPHAN_PEER).then_some(failure.peer),
+                        StdInstant::now(),
+                    );
+                    if failure.peer != LOCAL_ORPHAN_PEER {
+                        penalize_peer(
+                            peers,
+                            failure.peer,
+                            100,
+                            "block body did not match its header",
+                        )
+                        .await?;
+                    }
+                    update_diagnostics(diagnostics, |state| {
+                        state.rejected_messages = state.rejected_messages.saturating_add(1);
+                    })
+                    .await;
+                    anyhow::bail!(
+                        "peer body response failed header commitments at {}: {}",
+                        failure.height,
+                        failure.reason
+                    );
+                }
+                ValidationFailureKind::InvalidBlock => {}
+            }
+
+            let stored = {
+                let mut node = node.lock().await;
+                node.shadow_sync_store_failed_block(failure.block, failure.height)
+            };
+            let stored = match stored {
+                Ok(stored) => stored,
+                Err(error) => {
+                    scheduler.retry_validation_failure(
+                        hash,
+                        failure.height,
+                        failure.attempt,
+                        (failure.peer != LOCAL_ORPHAN_PEER).then_some(failure.peer),
+                        StdInstant::now(),
+                    );
+                    return Err(error.context("failed to persist invalid block branch"));
+                }
+            };
+            for affected in &stored.affected {
+                scheduler.reject_block(
+                    (*affected == hash).then_some(failure.peer),
+                    *affected,
+                    false,
+                    StdInstant::now(),
+                );
+            }
+            discard_orphan_descendants(hash, orphans);
             if failure.peer != LOCAL_ORPHAN_PEER {
                 penalize_peer(
                     peers,
@@ -1680,16 +1790,27 @@ async fn handle_validation_result(
             }
             update_diagnostics(diagnostics, |state| {
                 state.rejected_messages = state.rejected_messages.saturating_add(1);
+                state.stored_failed_bodies = state.stored_failed_bodies.saturating_add(1);
             })
             .await;
             anyhow::bail!(
-                "stateless block validation failed at {}: {}",
+                "stateless block validation failed and block {} was durably marked failed at {}: {}",
+                stored.record.hash.to_hex(),
                 failure.height,
                 failure.reason
             );
         }
     }
     Ok(())
+}
+
+fn discard_orphan_descendants(root: BlockHash, orphans: &mut BoundedOrphanPool) {
+    let mut pending = vec![root];
+    while let Some(parent) = pending.pop() {
+        for child in orphans.take_children(parent) {
+            pending.push(child.hash());
+        }
+    }
 }
 
 async fn penalize_peer(
@@ -1939,6 +2060,34 @@ mod tests {
         assert_eq!(reconnect_delay(1), Duration::from_secs(1));
         assert_eq!(reconnect_delay(2), Duration::from_secs(2));
         assert_eq!(reconnect_delay(20), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn body_validator_only_marks_header_committed_invalidity_permanent() {
+        let validator = HnsBodyValidator::new(Network::Regtest);
+        let mut committed_invalid = Block {
+            header: Header::default(),
+            transactions: Vec::new(),
+        };
+        committed_invalid.header.merkle_root = block_merkle_root(&committed_invalid);
+        committed_invalid.header.witness_root = block_witness_root(&committed_invalid);
+        assert_eq!(
+            validator
+                .validate(&committed_invalid, 1)
+                .expect_err("committed invalid block")
+                .kind,
+            ValidationFailureKind::InvalidBlock
+        );
+
+        let mut mismatched_response = committed_invalid;
+        mismatched_response.header.merkle_root = [0x55; 32];
+        assert_eq!(
+            validator
+                .validate(&mismatched_response, 1)
+                .expect_err("mismatched body response")
+                .kind,
+            ValidationFailureKind::InvalidResponse
+        );
     }
 
     #[test]

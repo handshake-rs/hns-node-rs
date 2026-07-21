@@ -175,7 +175,7 @@ Implemented:
   commits leave all records unchanged.
 - HSD-shaped opt-in startup scheduling with a nonzero block-height interval
   (10,000 by default), a checksummed last-run checkpoint committed in the same
-  batch as deletions, manual serialized maintenance, and API-v5 status counts.
+  batch as deletions, manual serialized maintenance, and API-v6 status counts.
 - Optional HSD-shaped undo retirement preserves heights through
   `pruneAfterHeight` and the newest `keepBlocks`, advances a checksummed
   checkpoint in the same batch as each status/undo deletion, preserves
@@ -226,6 +226,11 @@ Implemented:
   context are dropped after requesting headers.
 - CPU-heavy stateless body validation through blocking workers and ordered
   result delivery.
+- Header-committed permanent invalidity is atomically retained in durable
+  header/block status, propagated to known descendants, and excluded from
+  best-header selection across restart. Body/header mismatches remain retryable
+  peer failures, while validator-worker failures are immediately requeued and
+  neither poison branches nor affect peer-failure accounting.
 - Durable best-header and contiguous stored-body progress plus a versioned,
   checksummed restart checkpoint that is cross-checked against durable state.
 - Read-only bounded serving of headers, block inventory, retained bodies, empty
@@ -240,7 +245,8 @@ Still release-blocking:
   long-lived peer reputation;
 - contextually complete transaction admission and compact-block reconstruction;
 - complete contextual active-state block connection during IBD;
-- pruning-aware synchronization and production Urkel lifecycle qualification;
+- pruning-aware synchronization, invalid-branch pruning policy, and production
+  Urkel lifecycle qualification;
 - live HSD state/root comparison and sustained shadow agreement;
 - active-state IBD, live HSD comparison, and native mainnet mining authority.
 

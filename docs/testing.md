@@ -119,7 +119,7 @@ Current evidence includes:
 - malformed-pin and failed-compaction-commit cases that leave the complete node
   set unchanged, followed by an idempotent successful retry;
 - startup compaction due/not-due scheduling, nonzero interval validation,
-  forced coordinator maintenance, checksummed checkpoint rejection, API-v5
+  forced coordinator maintenance, checksummed checkpoint rejection, API-v6
   status, and unclean RocksDB reopen with exact checkpoint/node-set agreement;
 - exact HSD undo-retention constants, steady/startup retirement, protected and
   retained windows, non-empty pinned-root compaction after undo expiry,
@@ -129,6 +129,9 @@ Current evidence includes:
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,
   `noRelay`, ASCII handling, inventory, locators, headers, blocks, and rejects;
+- durable invalid/invalid-child propagation, best-header fallback across
+  restart, body/header mismatch retry, and non-attribution of validator-worker
+  failures;
 - HSD subsidy boundaries and deterministic mining-template coinbase bytes.
 
 ## Native secp256k1 smoke gate

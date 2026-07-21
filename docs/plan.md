@@ -92,7 +92,7 @@ reserved low-latency paths.
   and network-interval pins, with restart, malformed-pin, idempotence, and
   failed-commit atomicity coverage.
 - Opt-in HSD-shaped startup compaction scheduling, a checksummed atomic
-  last-run checkpoint, forced coordinator maintenance, API-v5 diagnostics, and
+  last-run checkpoint, forced coordinator maintenance, API-v6 diagnostics, and
   unclean RocksDB reopen evidence.
 - Opt-in HSD-horizon undo retirement with atomic checkpoints, bounded startup
   catch-up, pruning-aware pinned roots, and fail-closed deep-reorg handling.
@@ -104,6 +104,8 @@ reserved low-latency paths.
 - Bounded inbound/outbound peers, handshake/timeouts, scoring, and reconnect.
 - Headers-first download scheduling and bounded body queues.
 - Parallel stateless validation with ordered delivery.
+- Durable invalid/invalid-child branch status with atomic best-header fallback;
+  bad body responses and failed workers remain retryable without branch poison.
 - Durable non-active shadow bodies and restartable checkpoints.
 - Bounded read-only header/body/transaction serving and diagnostics.
 - Reserved critical outbound queues and parallel fan-out.
@@ -147,8 +149,9 @@ reserved low-latency paths.
    process-crash/fault qualification while preserving qualified incremental
    roots, historical reachability, and exact proof bytes.
 4. **Active-state IBD** — connect downloaded bodies through the one consensus
-   pipeline, persist invalid branches, recover from restart, and qualify
-   pruning/reorganizations without changing the authority boundary.
+   pipeline, extend durable invalid-branch handling through contextual
+   connection, and qualify pruning/reorganizations without changing the
+   authority boundary.
 5. **Network hardening** — Brontide, address management/discovery, durable
    bans/reputation, peer diversity, compact blocks, and adversarial WAN tests.
 6. **Mempool admission closure** — compose complete active-chain views,

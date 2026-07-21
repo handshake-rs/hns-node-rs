@@ -524,27 +524,61 @@ impl SyncScheduler {
         now: Instant,
     ) {
         let inflight = self.inflight.remove(&hash);
+        let pending = self.pending.remove(&hash);
         if let Some(inflight) = &inflight {
             if let Some(peer) = inflight.request.peer {
                 if let Some(state) = self.peers.get_mut(&peer) {
                     state.inflight.remove(&hash);
-                    state.failures = state.failures.saturating_add(1);
                 }
+            }
+        }
+        if let Some(peer) = peer {
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.failures = state.failures.saturating_add(1);
             }
         }
         self.failed_blocks = self.failed_blocks.saturating_add(1);
         if retryable {
-            if let Some(inflight) = inflight {
-                let retry_backoff =
-                    peer.map(|peer| self.retry_backoff(peer, inflight.attempts, now));
-                self.requeue(
+            let retry = inflight.map(|inflight| {
+                (
                     inflight.request.hash,
                     inflight.request.height,
                     inflight.attempts,
-                    retry_backoff,
-                );
+                )
+            });
+            let retry = retry.or_else(|| {
+                pending.map(|pending| (pending.hash, pending.height, pending.attempts))
+            });
+            if let Some((hash, height, attempts)) = retry {
+                let retry_backoff = peer.map(|peer| self.retry_backoff(peer, attempts, now));
+                self.requeue(hash, height, attempts, retry_backoff);
             }
         }
+        self.update_stage();
+        self.bump_sequence();
+    }
+
+    /// Requeue a body after validation has consumed its inflight request.
+    ///
+    /// `failed_peer` is present only when the peer supplied bad data. Local
+    /// worker failures retry immediately without affecting peer selection or
+    /// the failed-block counter.
+    pub fn retry_validation_failure(
+        &mut self,
+        hash: BlockHash,
+        height: Height,
+        attempts: u8,
+        failed_peer: Option<PeerId>,
+        now: Instant,
+    ) {
+        if let Some(peer) = failed_peer {
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.failures = state.failures.saturating_add(1);
+            }
+            self.failed_blocks = self.failed_blocks.saturating_add(1);
+        }
+        let retry_backoff = failed_peer.map(|peer| self.retry_backoff(peer, attempts, now));
+        self.requeue(hash, height, attempts, retry_backoff);
         self.update_stage();
         self.bump_sequence();
     }
@@ -1150,5 +1184,100 @@ mod tests {
         scheduler.remove_peer(PeerId(1));
         assert_eq!(scheduler.snapshot().pending_blocks, 1);
         assert_eq!(scheduler.snapshot().inflight_blocks, 0);
+    }
+
+    #[test]
+    fn local_validation_failure_retries_without_blaming_peer() {
+        let now = Instant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        scheduler
+            .register_peer(PeerId(1), SERVICE_NETWORK, 5)
+            .expect("peer");
+        let hash = BlockHash::new([11; 32]);
+        scheduler.announce_block(PeerId(1), hash, 5).expect("queue");
+        let request = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) if request.hash == hash => Some(request),
+                _ => None,
+            })
+            .expect("request");
+        scheduler
+            .receive_block(PeerId(1), hash, now)
+            .expect("receive");
+
+        scheduler.retry_validation_failure(hash, request.height, request.attempt, None, now);
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.failed_blocks, 0);
+        assert_eq!(snapshot.peers[0].failures, 0);
+        assert!(scheduler.poll(now, &[]).iter().any(|action| matches!(
+            action,
+            SyncAction::RequestBlock(request)
+                if request.hash == hash
+                    && request.peer == Some(PeerId(1))
+                    && request.attempt == 2
+        )));
+    }
+
+    #[test]
+    fn permanent_rejection_removes_pending_descendant() {
+        let now = Instant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        let hash = BlockHash::new([12; 32]);
+        scheduler.queue_block(hash, 5).expect("queue");
+
+        scheduler.reject_block(None, hash, false, now);
+
+        assert!(!scheduler.is_queued_or_inflight(&hash));
+        assert_eq!(scheduler.snapshot().pending_blocks, 0);
+        assert_eq!(scheduler.snapshot().failed_blocks, 1);
+    }
+
+    #[test]
+    fn bad_validation_response_fails_over_and_blames_only_its_peer() {
+        let now = Instant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        for peer in [PeerId(1), PeerId(2)] {
+            scheduler
+                .register_peer(peer, SERVICE_NETWORK, 5)
+                .expect("peer");
+        }
+        let hash = BlockHash::new([13; 32]);
+        scheduler.announce_block(PeerId(1), hash, 5).expect("queue");
+        let request = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) if request.hash == hash => Some(request),
+                _ => None,
+            })
+            .expect("request");
+        assert_eq!(request.peer, Some(PeerId(1)));
+        scheduler
+            .receive_block(PeerId(1), hash, now)
+            .expect("receive");
+
+        scheduler.retry_validation_failure(
+            hash,
+            request.height,
+            request.attempt,
+            Some(PeerId(1)),
+            now,
+        );
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.failed_blocks, 1);
+        assert_eq!(snapshot.peers[0].failures, 1);
+        assert_eq!(snapshot.peers[1].failures, 0);
+        assert!(scheduler.poll(now, &[]).iter().any(|action| matches!(
+            action,
+            SyncAction::RequestBlock(request)
+                if request.hash == hash
+                    && request.peer == Some(PeerId(2))
+                    && request.attempt == 2
+        )));
     }
 }

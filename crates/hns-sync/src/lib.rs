@@ -22,7 +22,8 @@ pub use orphan::{BoundedOrphanPool, OrphanInsertOutcome, OrphanLimits, OrphanSna
 pub use scheduler::{PeerSyncSnapshot, SyncAction, SyncLimits, SyncScheduler, SyncSnapshot};
 pub use validation::{
     spawn_validation_pipeline, OrderedValidationResult, StatelessBlockValidator, ValidatedBlock,
-    ValidationFailure, ValidationRequest, ValidationSubmitter,
+    ValidationFailure, ValidationFailureKind, ValidationRejection, ValidationRequest,
+    ValidationSubmitter,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]

@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 5;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 6;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 
 const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
@@ -1015,17 +1015,22 @@ impl NodeService {
         let metadata = self.state.store.snapshot()?;
         let best_header = best_header_tip_from_snapshot(&metadata)?;
         let chain_epoch = chain_epoch_from_snapshot(&metadata)?;
-        let alternate_block_count = metadata
+        let stored_block_records = metadata
             .scan_prefix(ColumnFamily::BlockIndex, b"")
-            .context("failed to scan alternate block count")?
+            .context("failed to scan durable block statuses")?
             .into_iter()
             .map(|(_, bytes)| {
                 BlockIndexRecord::decode(&bytes)
                     .map_err(|error| anyhow::anyhow!("failed to decode block index: {error}"))
             })
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Result<Vec<_>>>()?;
+        let alternate_block_count = stored_block_records
+            .iter()
+            .filter(|record| !record.status.active_chain && !record.status.failed)
+            .count();
+        let failed_block_count = stored_block_records
             .into_iter()
-            .filter(|record| !record.status.active_chain)
+            .filter(|record| record.status.failed)
             .count();
         let name_tree_compaction_checkpoint = load_name_tree_compaction_checkpoint(&metadata)?;
         let undo_pruning_checkpoint = load_undo_pruning_checkpoint(&metadata)?;
@@ -1091,6 +1096,7 @@ impl NodeService {
             chain_epoch,
             mining_generation: durable.generation,
             alternate_block_count,
+            failed_block_count,
             pending_best_chain_activation,
             staged_chain_tip: durable.snapshot.is_some(),
             authoritative_mining_tip: self.mining_events.snapshot().is_some(),
@@ -1348,6 +1354,12 @@ struct NodeBlockMutation {
 struct StoredBlockMutation {
     record: BlockIndexRecord,
     already_known: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FailedBlockMutation {
+    record: BlockIndexRecord,
+    affected: Vec<BlockHash>,
 }
 
 #[derive(Clone, Debug)]
@@ -2001,6 +2013,114 @@ impl NodeState {
         Ok(StoredBlockMutation {
             record,
             already_known: false,
+        })
+    }
+
+    fn store_failed_block(&mut self, request: NodeBlockImport) -> Result<FailedBlockMutation> {
+        let block_hash = request.block.hash();
+        let snapshot = self.store.snapshot()?;
+        let header = load_header_record(&snapshot, &block_hash)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot persist failed block {} without its validated header",
+                block_hash.to_hex()
+            )
+        })?;
+        if header.height != request.height || header.header != request.block.header {
+            anyhow::bail!(
+                "failed block {} disagrees with its durable header context",
+                block_hash.to_hex()
+            );
+        }
+
+        let existing = load_block_index_record(&snapshot, &block_hash)?;
+        if existing
+            .as_ref()
+            .is_some_and(|record| !record.status.failed)
+        {
+            anyhow::bail!(
+                "cannot mark previously accepted block {} failed",
+                block_hash.to_hex()
+            );
+        }
+        if let Some(raw) = snapshot.get(ColumnFamily::Blocks, block_hash.as_bytes())? {
+            let raw = RawBlockRecord::decode(&raw)
+                .map_err(|error| anyhow::anyhow!("failed block body is corrupt: {error}"))?;
+            if raw.bytes != request.block.encode() {
+                anyhow::bail!(
+                    "failed block {} has conflicting durable bytes",
+                    block_hash.to_hex()
+                );
+            }
+        }
+
+        let mut failure_plan = self
+            .chain
+            .plan_failed_branch(block_hash)
+            .map_err(|error| anyhow::anyhow!("failed to plan invalid branch: {error}"))?;
+        let target_header = failure_plan
+            .affected
+            .iter_mut()
+            .find(|record| record.hash == block_hash)
+            .ok_or_else(|| anyhow::anyhow!("invalid branch plan omitted its root"))?;
+        target_header.status.body_present = true;
+        target_header.status.body_syntax_valid = false;
+
+        let mut target = existing.unwrap_or(
+            BlockIndexRecord::from_block(&request.block, request.height, header.chainwork)
+                .map_err(|error| anyhow::anyhow!("failed to build invalid block index: {error}"))?,
+        );
+        target.status = target_header.status.clone();
+        target.status.utxo_connected = false;
+        target.status.name_state_connected = false;
+        target.status.tree_root_valid = false;
+        target.status.undo_present = false;
+        target.status.active_chain = false;
+        target.status.failed = true;
+        target.validated_at = Some(current_unix_time()?);
+
+        let mut batch = self.store.batch();
+        for failed_header in &failure_plan.affected {
+            write_record_to_batch(&mut batch, failed_header)
+                .map_err(|error| anyhow::anyhow!("failed to stage invalid header: {error}"))?;
+            if failed_header.hash == block_hash {
+                continue;
+            }
+            if let Some(mut descendant) = load_block_index_record(&snapshot, &failed_header.hash)? {
+                if descendant.status.active_chain {
+                    anyhow::bail!(
+                        "cannot invalidate active descendant {}",
+                        descendant.hash.to_hex()
+                    );
+                }
+                descendant.status.failed = true;
+                write_block_index_to_batch(&mut batch, &descendant).map_err(|error| {
+                    anyhow::anyhow!("failed to stage invalid descendant block: {error}")
+                })?;
+            }
+        }
+        write_block_index_to_batch(&mut batch, &target)
+            .map_err(|error| anyhow::anyhow!("failed to stage invalid block index: {error}"))?;
+        write_raw_block_to_batch(
+            &mut batch,
+            &RawBlockRecord::from_block(&request.block, request.source),
+        )
+        .map_err(|error| anyhow::anyhow!("failed to stage invalid block body: {error}"))?;
+        batch.put(
+            ColumnFamily::Meta,
+            MetaKey::BestHeaderHash.as_bytes(),
+            failure_plan.best.hash.as_bytes(),
+        )?;
+        drop(snapshot);
+        let affected = failure_plan
+            .affected
+            .iter()
+            .map(|record| record.hash)
+            .collect();
+        self.store.commit(batch)?;
+        self.refresh_indexes()?;
+        Ok(FailedBlockMutation {
+            record: target,
+            affected,
         })
     }
 
@@ -5555,6 +5675,172 @@ mod tests {
                 .expect("best header"),
             Some(active_record.hash.as_bytes().to_vec()),
             "equal-work candidates must not replace the first-seen best header"
+        );
+    }
+
+    #[test]
+    fn invalid_branch_is_durable_falls_back_and_taints_descendants() {
+        let config = NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        };
+        let mut node = NodeService::new(config.clone());
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_address(80, 50)]);
+        let genesis = node
+            .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("active genesis");
+
+        let mut fallback = block_with_commitments(vec![coinbase_transaction_with_address(81, 50)]);
+        fallback.header.prev_block = genesis.hash;
+        fallback.header.bits = Network::Regtest.params().pow.bits;
+        let fallback = node
+            .state_mut()
+            .chain
+            .import_header(HeaderImport {
+                header: fallback.header,
+                height: 1,
+                verify_pow: false,
+                checkpoint_valid: true,
+            })
+            .expect("fallback header");
+
+        let mut invalid = block_with_commitments(vec![coinbase_transaction_with_address(82, 50)]);
+        invalid.header.prev_block = genesis.hash;
+        invalid.header.bits = Network::Regtest.params().pow.bits;
+        invalid
+            .transactions
+            .push(coinbase_transaction_with_address(85, 1));
+        invalid.header.merkle_root = block_merkle_root(&invalid);
+        invalid.header.witness_root = block_witness_root(&invalid);
+        assert!(
+            HeaderConsensus::new(ConsensusParams::for_network(Network::Regtest))
+                .validate_block_body(&invalid)
+                .is_err()
+        );
+        let invalid_hash = invalid.hash();
+        node.state_mut()
+            .chain
+            .import_header(HeaderImport {
+                header: invalid.header.clone(),
+                height: 1,
+                verify_pow: false,
+                checkpoint_valid: true,
+            })
+            .expect("invalid branch header");
+
+        let mut descendant =
+            block_with_commitments(vec![coinbase_transaction_with_address(83, 50)]);
+        descendant.header.prev_block = invalid_hash;
+        descendant.header.bits = Network::Regtest.params().pow.bits;
+        let descendant = node
+            .state_mut()
+            .chain
+            .import_header(HeaderImport {
+                header: descendant.header,
+                height: 2,
+                verify_pow: false,
+                checkpoint_valid: true,
+            })
+            .expect("invalid branch descendant");
+        assert_eq!(
+            node.state()
+                .chain
+                .best_tip()
+                .expect("best")
+                .expect("tip")
+                .hash,
+            descendant.hash
+        );
+
+        let mutation = node
+            .state_mut()
+            .store_failed_block(NodeBlockImport::fixture(invalid.clone(), 1, 2))
+            .expect("persist invalid branch");
+        assert_eq!(mutation.record.hash, invalid_hash);
+        assert_eq!(
+            mutation.affected.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([invalid_hash, descendant.hash])
+        );
+        assert_eq!(
+            node.state()
+                .chain
+                .best_tip()
+                .expect("best")
+                .expect("tip")
+                .hash,
+            fallback.hash
+        );
+        let invalid_record = node
+            .state()
+            .blocks
+            .load_block_record(&invalid_hash)
+            .expect("invalid block index")
+            .expect("invalid block");
+        assert!(invalid_record.status.failed);
+        assert!(invalid_record.status.body_present);
+        assert!(!invalid_record.status.body_syntax_valid);
+        assert_eq!(
+            node.state()
+                .blocks
+                .load_block(&invalid_hash)
+                .expect("invalid body"),
+            Some(invalid)
+        );
+        assert!(
+            node.state()
+                .chain
+                .load_record(&descendant.hash)
+                .expect("descendant header")
+                .expect("descendant")
+                .status
+                .failed
+        );
+
+        let store = node.state().store.clone();
+        drop(node);
+        let restarted =
+            NodeState::from_store_for_network(store, Network::Regtest).expect("restart");
+        assert_eq!(
+            restarted.chain.best_tip().expect("best").expect("tip").hash,
+            fallback.hash
+        );
+        assert!(
+            restarted
+                .blocks
+                .load_block_record(&invalid_hash)
+                .expect("invalid block index")
+                .expect("invalid block")
+                .status
+                .failed
+        );
+        let mut restarted = NodeService::with_state(config, restarted);
+        let rpc = restarted.rpc_service().expect("rpc");
+        assert_eq!(rpc.snapshot().node_status.failed_block_count, 1);
+        assert_eq!(rpc.snapshot().node_status.alternate_block_count, 0);
+
+        let mut later = block_with_commitments(vec![coinbase_transaction_with_address(84, 50)]);
+        later.header.prev_block = descendant.hash;
+        later.header.bits = Network::Regtest.params().pow.bits;
+        let later = restarted
+            .state_mut()
+            .chain
+            .import_header(HeaderImport {
+                header: later.header,
+                height: 3,
+                verify_pow: false,
+                checkpoint_valid: true,
+            })
+            .expect("later invalid descendant");
+        assert!(later.status.failed);
+        assert_eq!(
+            restarted
+                .state()
+                .chain
+                .best_tip()
+                .expect("best")
+                .expect("tip")
+                .hash,
+            fallback.hash
         );
     }
 

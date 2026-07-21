@@ -36,6 +36,9 @@ explicit outbound peers / optional listener
          ordered validation-result sequencer
                     |
                     v
+  authenticated invalid / invalid-child classification
+                    |
+                    v
        durable non-active shadow block storage
                     |
                     v
@@ -162,16 +165,22 @@ its parent body is not yet available, the body is statelessly validated before
 entering the bounded orphan pool. Orphans are evicted oldest-first when limits
 are reached.
 
-The stateless validation worker verifies block-body syntax and commitments. A
-valid body is then revalidated through the node's strict import path and stored
-as a non-active block/index record. The shadow-sync path explicitly clears UTXO,
-name-state, tree-root, undo, and active-chain status bits. Retaining an orphan
-completes the temporary validation stage without advancing the contiguous stored
-body tip.
+The stateless validation worker first authenticates both body roots against the
+known header, then verifies block-body syntax. A valid body is revalidated
+through the node's strict import path and stored as a non-active block/index
+record. The shadow-sync path explicitly clears UTXO, name-state, tree-root,
+undo, and active-chain status bits. Retaining an orphan completes the temporary
+validation stage without advancing the contiguous stored-body tip.
 
-A permanently invalid body earns a score of 100 and disconnects the remote
-peer. Local orphan re-submission uses a synthetic local peer identifier and is
-never penalized as a network peer.
+A body that does not match its header is a retryable bad peer response, not
+proof that the header branch is invalid. A worker crash is also retryable and
+is requeued without changing peer-failure accounting. Only a body whose merkle
+and witness roots match the header but still fails deterministic validation is
+permanent: its durable header/block status and every known descendant are
+marked failed in the same batch as best-header fallback. The scheduler removes
+queued work for every affected descendant, the failed branch remains excluded
+after restart, its orphan descendants are discarded, and the remote peer earns
+a score of 100. Local orphan re-submission is never penalized as a network peer.
 
 ## Restart and checkpoint semantics
 
@@ -227,8 +236,9 @@ GET /api/v1/shadow-sync
 
 Diagnostics include configured endpoints, reconnect attempts, live peer
 snapshots, synchronization stage, best/active/stored tips, queue depths, orphan
-usage, received/served counts, checkpoint sequence, and the last supervisor
-error.
+usage, received/served counts, durably failed-body count, checkpoint sequence,
+and the last supervisor error. API-v6 node status separately counts valid
+non-active blocks and durably failed blocks.
 
 `observation_only` is always true. The parity state explicitly says that no live
 HSD oracle is configured.

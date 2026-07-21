@@ -60,7 +60,7 @@
   and pinned-root reachable union. Malformed pins and failed commits preserve
   every node.
 - Opt-in height-gated startup scheduling and forced serialized maintenance with
-  an atomic checksummed last-run checkpoint, API-v5 status, and unclean RocksDB
+  an atomic checksummed last-run checkpoint, API-v6 status, and unclean RocksDB
   reopen evidence.
 - Exact HSD `pruneAfterHeight`/`keepBlocks` constants and opt-in atomic undo
   retirement, including startup catch-up, pruning-aware pinned-root compaction,
@@ -110,6 +110,9 @@
 - Blocking validation workers with ordered result delivery.
 - Durable non-active body retention, contiguous-body recovery, restart
   checkpointing, and bounded read-only serving.
+- Durable failed-body and failed-child propagation with atomic best-header
+  fallback and restart recovery. Uncommitted body/header mismatches are retried,
+  and validator-worker failure is not attributed to a peer or branch.
 - Observation-only diagnostics; network data cannot grant authority.
 
 ### Mempool, template, and publication foundation
@@ -171,8 +174,8 @@ These are substantial foundations, not a production full node.
 ### Chain and network qualification
 
 - Active-state ordered connection of downloaded blocks and full restartable IBD.
-- Invalid-branch persistence policy, pruning interactions, historical
-  reorganizations, and RocksDB fault evidence.
+- Failed-branch pruning/retention policy, historical reorganizations, and
+  RocksDB fault evidence.
 - Brontide, address-manager/DNS-seed discovery, durable bans/reputation, and
   broader peer-diversity controls.
 - Compact-block reconstruction and pruning-aware synchronization.

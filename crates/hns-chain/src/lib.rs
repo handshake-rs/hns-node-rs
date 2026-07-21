@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use hns_primitives::{
     blake2b_256, Block, BlockHash, CompactTarget, Header, Height, Reader, Transaction, Txid,
@@ -551,6 +551,12 @@ pub struct HeaderImport {
     pub checkpoint_valid: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailedHeaderPlan {
+    pub affected: Vec<HeaderRecord>,
+    pub best: ChainTip,
+}
+
 pub trait HeaderIndex {
     fn best_tip(&self) -> Result<Option<ChainTip>, ChainError>;
 
@@ -622,13 +628,14 @@ impl MemoryHeaderIndex {
         height: Height,
     ) -> Result<HeaderRecord, ChainError> {
         let hash = header.hash();
-        let parent_work = if height == 0 {
-            Uint256::ZERO
+        let (parent_work, failed) = if height == 0 {
+            (Uint256::ZERO, false)
         } else {
-            self.records
+            let parent = self
+                .records
                 .get(&header.prev_block)
-                .map(|record| record.chainwork)
-                .ok_or(ChainError::MissingParent(header.prev_block))?
+                .ok_or(ChainError::MissingParent(header.prev_block))?;
+            (parent.chainwork, parent.status.failed)
         };
 
         let record = HeaderRecord {
@@ -644,6 +651,7 @@ impl MemoryHeaderIndex {
             header,
             status: BlockStatus {
                 header_context_valid: true,
+                failed,
                 ..BlockStatus::default()
             },
         };
@@ -654,6 +662,18 @@ impl MemoryHeaderIndex {
     }
 
     pub fn insert_record(&mut self, record: HeaderRecord) -> Result<(), ChainError> {
+        if record.height == 0 && record.status.failed {
+            return Err(ChainError::FailedGenesis(record.hash));
+        }
+        if record.height != 0 {
+            let parent = self
+                .records
+                .get(&record.header.prev_block)
+                .ok_or(ChainError::MissingParent(record.header.prev_block))?;
+            if parent.status.failed && !record.status.failed {
+                return Err(ChainError::InconsistentFailureAncestry(record.hash));
+            }
+        }
         self.records.insert(record.hash, record.clone());
         self.promote_if_best(&record)
     }
@@ -676,16 +696,35 @@ impl MemoryHeaderIndex {
             index.records.insert(record.hash, record);
         }
 
+        for record in index.records.values() {
+            if record.height == 0 {
+                if record.status.failed {
+                    return Err(ChainError::FailedGenesis(record.hash));
+                }
+                continue;
+            }
+            let parent = index
+                .records
+                .get(&record.header.prev_block)
+                .ok_or(ChainError::MissingParent(record.header.prev_block))?;
+            if parent.status.failed && !record.status.failed {
+                return Err(ChainError::InconsistentFailureAncestry(record.hash));
+            }
+        }
+
         if let Some(best_hash) = persisted_best {
             let best_record = index
                 .records
                 .get(&best_hash)
                 .cloned()
                 .ok_or(ChainError::MissingHeader(best_hash))?;
+            if best_record.status.failed {
+                return Err(ChainError::FailedBestHeader(best_hash));
+            }
             if index
                 .records
                 .values()
-                .any(|record| record.chainwork > best_record.chainwork)
+                .any(|record| !record.status.failed && record.chainwork > best_record.chainwork)
             {
                 return Err(ChainError::InconsistentBestHeader(best_hash));
             }
@@ -693,7 +732,12 @@ impl MemoryHeaderIndex {
             return Ok(index);
         }
 
-        let mut candidates = index.records.values().cloned().collect::<Vec<_>>();
+        let mut candidates = index
+            .records
+            .values()
+            .filter(|record| !record.status.failed)
+            .cloned()
+            .collect::<Vec<_>>();
         candidates.sort_by_key(|record| (record.chainwork, record.height, record.hash));
 
         for record in candidates {
@@ -714,6 +758,9 @@ impl MemoryHeaderIndex {
     }
 
     fn promote_if_best(&mut self, record: &HeaderRecord) -> Result<(), ChainError> {
+        if record.status.failed {
+            return Ok(());
+        }
         let should_promote = self
             .best
             .as_ref()
@@ -728,6 +775,9 @@ impl MemoryHeaderIndex {
     }
 
     fn promote(&mut self, record: &HeaderRecord) -> Result<(), ChainError> {
+        if record.status.failed {
+            return Err(ChainError::FailedBestHeader(record.hash));
+        }
         let path = self.path_to_genesis(record.hash)?;
         self.canonical.clear();
 
@@ -736,6 +786,9 @@ impl MemoryHeaderIndex {
                 .records
                 .get(&hash)
                 .ok_or(ChainError::MissingHeader(hash))?;
+            if path_record.status.failed {
+                return Err(ChainError::InconsistentFailureAncestry(record.hash));
+            }
             self.canonical.insert(path_record.height, hash);
         }
 
@@ -746,6 +799,78 @@ impl MemoryHeaderIndex {
         });
 
         Ok(())
+    }
+
+    fn fail_branch(&mut self, root: BlockHash) -> Result<Vec<HeaderRecord>, ChainError> {
+        let root_record = self
+            .records
+            .get(&root)
+            .ok_or(ChainError::MissingHeader(root))?;
+        if root_record.height == 0 {
+            return Err(ChainError::FailedGenesis(root));
+        }
+
+        let mut children = HashMap::<BlockHash, Vec<BlockHash>>::new();
+        for record in self.records.values() {
+            if record.height != 0 {
+                children
+                    .entry(record.header.prev_block)
+                    .or_default()
+                    .push(record.hash);
+            }
+        }
+
+        let mut affected_hashes = HashSet::new();
+        let mut queue = VecDeque::from([root]);
+        while let Some(hash) = queue.pop_front() {
+            if !affected_hashes.insert(hash) {
+                continue;
+            }
+            if let Some(descendants) = children.get(&hash) {
+                queue.extend(descendants.iter().copied());
+            }
+        }
+
+        if affected_hashes.iter().any(|hash| {
+            self.records
+                .get(hash)
+                .is_some_and(|record| record.status.active_chain)
+        }) {
+            return Err(ChainError::FailedActiveHeader(root));
+        }
+
+        for hash in &affected_hashes {
+            let record = self
+                .records
+                .get_mut(hash)
+                .ok_or(ChainError::MissingHeader(*hash))?;
+            record.status.failed = true;
+        }
+
+        self.best = None;
+        self.canonical.clear();
+        let mut candidates = self
+            .records
+            .values()
+            .filter(|record| !record.status.failed)
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|record| (record.chainwork, record.height, record.hash));
+        for candidate in candidates {
+            self.promote_if_best(&candidate)?;
+        }
+
+        let mut affected = affected_hashes
+            .into_iter()
+            .map(|hash| {
+                self.records
+                    .get(&hash)
+                    .cloned()
+                    .ok_or(ChainError::MissingHeader(hash))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        affected.sort_by_key(|record| (record.height, record.hash));
+        Ok(affected)
     }
 
     fn path_to_genesis(&self, tip: BlockHash) -> Result<Vec<BlockHash>, ChainError> {
@@ -843,6 +968,15 @@ impl<S: Store> StoredHeaderIndex<S> {
 
     pub fn cache_record(&mut self, record: HeaderRecord) -> Result<(), ChainError> {
         self.memory.insert_record(record)
+    }
+
+    pub fn plan_failed_branch(&self, root: BlockHash) -> Result<FailedHeaderPlan, ChainError> {
+        let mut next = self.memory.clone();
+        let affected = next.fail_branch(root)?;
+        let best = next
+            .best_tip()?
+            .ok_or(ChainError::MissingBestHeaderBinding)?;
+        Ok(FailedHeaderPlan { affected, best })
     }
 }
 
@@ -1279,6 +1413,14 @@ pub enum ChainError {
     MissingBestHeaderBinding,
     #[error("persisted best header {0:?} is inconsistent with stored chainwork")]
     InconsistentBestHeader(BlockHash),
+    #[error("genesis header {0:?} cannot be marked failed")]
+    FailedGenesis(BlockHash),
+    #[error("persisted best header {0:?} is marked failed")]
+    FailedBestHeader(BlockHash),
+    #[error("header {0:?} is not marked failed despite a failed ancestor")]
+    InconsistentFailureAncestry(BlockHash),
+    #[error("cannot mark active header branch {0:?} failed")]
+    FailedActiveHeader(BlockHash),
     #[error("chains {current:?} and {candidate:?} do not share a stored ancestor")]
     NoCommonAncestor {
         current: BlockHash,
@@ -1481,6 +1623,91 @@ mod tests {
             index.canonical_hash(1).expect("canonical"),
             Some(first.hash)
         );
+    }
+
+    #[test]
+    fn failed_header_branch_falls_back_and_taints_descendants() {
+        let mut index = MemoryHeaderIndex::new();
+        let genesis = index
+            .insert_header(header(BlockHash::ZERO, 1), 0)
+            .expect("genesis");
+        let failed_root = index
+            .insert_header(header(genesis.hash, 2), 1)
+            .expect("failed root");
+        let failed_tip = index
+            .insert_header(header(failed_root.hash, 3), 2)
+            .expect("failed tip");
+        let fallback = index
+            .insert_header(header(genesis.hash, 4), 1)
+            .expect("fallback");
+        assert_eq!(
+            index.best_tip().expect("best").expect("tip").hash,
+            failed_tip.hash
+        );
+
+        let affected = index.fail_branch(failed_root.hash).expect("fail branch");
+        assert_eq!(
+            affected
+                .iter()
+                .map(|record| record.hash)
+                .collect::<HashSet<_>>(),
+            HashSet::from([failed_root.hash, failed_tip.hash])
+        );
+        assert!(affected.iter().all(|record| record.status.failed));
+        assert_eq!(
+            index.best_tip().expect("best").expect("fallback tip").hash,
+            fallback.hash
+        );
+        assert_eq!(
+            index.canonical_hash(1).expect("canonical"),
+            Some(fallback.hash)
+        );
+        assert_eq!(index.canonical_hash(2).expect("canonical"), None);
+
+        let failed_child = index
+            .insert_header(header(failed_tip.hash, 5), 3)
+            .expect("failed descendant");
+        assert!(failed_child.status.failed);
+        assert_eq!(
+            index.best_tip().expect("best").expect("fallback tip").hash,
+            fallback.hash
+        );
+    }
+
+    #[test]
+    fn header_index_rejects_nontransitive_failure_state() {
+        let genesis_header = header(BlockHash::ZERO, 1);
+        let genesis = HeaderRecord {
+            hash: genesis_header.hash(),
+            height: 0,
+            chainwork: Uint256::ONE,
+            header: genesis_header,
+            status: BlockStatus::default(),
+        };
+        let parent_header = header(genesis.hash, 2);
+        let parent = HeaderRecord {
+            hash: parent_header.hash(),
+            height: 1,
+            chainwork: 2u64.into(),
+            header: parent_header,
+            status: BlockStatus {
+                failed: true,
+                ..BlockStatus::default()
+            },
+        };
+        let child_header = header(parent.hash, 3);
+        let child = HeaderRecord {
+            hash: child_header.hash(),
+            height: 2,
+            chainwork: 3u64.into(),
+            header: child_header,
+            status: BlockStatus::default(),
+        };
+
+        assert!(matches!(
+            MemoryHeaderIndex::from_records([genesis, parent, child]),
+            Err(ChainError::InconsistentFailureAncestry(_))
+        ));
     }
 
     #[test]
