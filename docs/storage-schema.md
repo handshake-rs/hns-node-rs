@@ -299,7 +299,7 @@ coordinator.
 The node coordinator exposes forced maintenance and HSD-shaped opt-in startup
 scheduling. A nonzero height interval (10,000 by default) prevents repeated
 work at the same tip. The deletion set and checksummed height/tip/count
-checkpoint commit in one batch; malformed checkpoints fail startup. API-v7
+checkpoint commit in one batch; malformed checkpoints fail startup. API-v8
 status reports the configured policy and last result. Unclean RocksDB reopen
 tests verify that the checkpoint and compacted node set remain synchronized.
 

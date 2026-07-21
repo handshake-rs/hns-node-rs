@@ -203,6 +203,9 @@ pub struct ShadowSyncDiagnostics {
     pub enabled: bool,
     pub observation_only: bool,
     pub active_state: bool,
+    /// Opaque process-local identifier used only to correlate qualification
+    /// observations across runtime restarts.
+    pub runtime_instance: String,
     pub listen: Option<SocketAddr>,
     pub configured_outbound: Vec<SocketAddr>,
     pub outbound_connected: usize,
@@ -399,6 +402,7 @@ impl NodeService {
             enabled: true,
             observation_only: !shadow_sync_config.connect_active_state,
             active_state: shadow_sync_config.connect_active_state,
+            runtime_instance: runtime_instance_id(),
             listen: shadow_sync_config.listen,
             configured_outbound: shadow_sync_config.connect.clone(),
             started_at: unix_time(),
@@ -2285,6 +2289,14 @@ fn unix_time() -> u64 {
         .as_secs()
 }
 
+fn runtime_instance_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{nanos:032x}-{:08x}", std::process::id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2407,6 +2419,7 @@ mod tests {
         let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
             enabled: true,
             observation_only: true,
+            runtime_instance: "test-runtime".to_owned(),
             ..ShadowSyncDiagnostics::default()
         }));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2439,6 +2452,7 @@ mod tests {
             if path == "/api/v1/shadow-sync" {
                 assert_eq!(json["observation_only"], true);
                 assert_eq!(json["active_state"], false);
+                assert_eq!(json["runtime_instance"], "test-runtime");
                 assert_eq!(json["connected_blocks"], 0);
                 assert_eq!(json["contextual_failed_bodies"], 0);
             }

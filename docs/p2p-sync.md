@@ -279,12 +279,23 @@ Diagnostics include configured endpoints, reconnect attempts, live peer
 snapshots, synchronization stage, best/active/stored tips, queue depths, orphan
 usage, received/served counts, durably failed-body count, checkpoint sequence,
 active-state connection/reorganization counts, contextual-failure count, and
-the last supervisor error. API-v7 node status separately counts valid non-active
-blocks and durably failed blocks.
+the last supervisor error. API-v8 node status separately counts valid non-active
+blocks and durably failed blocks and exposes the active tip's resulting
+authenticated root/height. The shadow endpoint includes an opaque runtime
+instance so external evidence can distinguish observations across restarts.
 
 `observation_only` is true in the default retention mode and false only when the
 explicit active-state connector is enabled. `active_state` reports that choice.
 Neither value changes the authority mode or claims a live HSD oracle.
+
+`scripts/compare-hsrd-hsd-shadow.py` consumes those diagnostics and a pinned
+operator-selected `hsd-cli`. It compares the canonical block at height `H` and
+the post-`H` hsrd root against HSD's header at `H+1`; at the live tip it labels
+HSD's next-template root provisional until a later header confirms it. The
+runner rereads both tips around every bounded probe, records coherent
+divergence separately from unavailable/racing observations, and can maintain a
+checksummed bounded restart/reorganization evidence checkpoint. See
+[`live-shadow-parity.md`](live-shadow-parity.md).
 
 ## Known limitations
 
@@ -296,11 +307,10 @@ The shadow-sync runtime does not yet provide:
 - transaction and mempool relay;
 - compact-block reconstruction;
 - historical mainnet replay qualification;
-- a live HSD state/root comparison feed;
 - pruning-aware and sustained-reorganization IBD qualification;
 - solved-block fan-out;
 - mining authority.
 
-Those omissions are reported rather than hidden. The next authority-relevant
-step is not merely more networking: it is complete consensus connection and
-sustained HSD shadow agreement over the downloaded chain.
+Those omissions are reported rather than hidden. The comparison runner supplies
+the live observation mechanism, not the full-mainnet duration, pruning, or
+reorganization coverage required for sustained HSD shadow agreement.

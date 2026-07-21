@@ -83,7 +83,7 @@ Implemented:
 - Validated mark-and-sweep compaction retaining the current, undo, and pinned
   root union, including idempotence and failed-commit atomicity evidence.
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
-  atomic checksummed last-run checkpoint, API-v7 diagnostics, and unclean
+  atomic checksummed last-run checkpoint, API-v8 diagnostics, and unclean
   RocksDB reopen evidence.
 - Exact HSD undo-retention horizons with opt-in atomic retirement, bounded
   startup catch-up, pruning-aware pin/compaction validation, and deep-reorg
@@ -123,6 +123,9 @@ Implemented:
 - explicitly acknowledged bounded active-state batches through the single
   contextual state/reorganization pipeline, including restart resumption,
   exact contextual-invalid ancestry, and fail-closed local-fault separation;
+- API-v8 post-tip root material plus a pinned-source, race-safe external HSD
+  block/root comparator with checksummed bounded evidence and explicit
+  restart/reorganization accounting;
 - bounded read-only header, inventory, block, and transaction serving;
 - reserved critical-lane parallel fan-out used by the mining publication path.
 
@@ -132,7 +135,8 @@ Remaining:
 - durable bans/reputation and broader adversarial network qualification;
 - full-mainnet replay and pruning-aware qualification of active-state IBD;
 - compact blocks and production-complete contextual transaction relay;
-- live HSD state/root comparison and sustained shadow agreement.
+- sustained live HSD comparison campaigns across restarts, partitions, and
+  real reorganizations.
 
 This networking path remains non-authoritative. Active-state mode mutates the
 validated state only after an atomic batch commits and still cannot grant mining
@@ -209,12 +213,16 @@ Implemented:
   reserved/lockup/renewal policy, incremental Urkel roots, P2P wire bytes,
   subsidy, and deterministic coinbase behavior;
 - static integrity checks, native secp256k1 smoke verification, and exact
-  vendored-Goosig source comparison against HSD's pinned dependency.
+  vendored-Goosig source comparison against HSD's pinned dependency;
+- a self-tested live comparison runner that verifies an operator-selected clean
+  HSD source revision, canonical block identity, and post-tip authenticated
+  root while keeping HSD outside hsrd's consensus/authority path.
 
 Remaining:
 
 - complete mainnet replay and invalid corpora at every state boundary;
-- live shadow comparison through restarts, partitions, and reorganizations;
+- long-duration live shadow comparison evidence through restarts, partitions,
+  and reorganizations;
 - production mempool/template/publication differential and latency evidence.
 
 ## Authority and HSD removal — blocked by design

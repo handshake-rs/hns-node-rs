@@ -45,8 +45,8 @@ use hns_mining::{
     SolvedMiningCandidate, TemplateCoordinator,
 };
 use hns_primitives::{
-    blake2b_256, Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState, Reader,
-    Uint256, Writer,
+    blake2b_256, hex_encode, Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState,
+    Reader, Uint256, Writer,
 };
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 7;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 8;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 
 const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
@@ -1099,6 +1099,14 @@ impl NodeService {
             best_header_height: best_header.as_ref().map(|tip| tip.height),
             best_block_hash: chain_tip.as_ref().map(|tip| tip.hash),
             height: chain_tip.as_ref().map(|tip| tip.height),
+            active_state_resulting_root: durable
+                .snapshot
+                .as_ref()
+                .map(|snapshot| hex_encode(&snapshot.next_tree_root)),
+            active_state_resulting_root_height: durable
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.tip.height),
             chain_epoch,
             mining_generation: durable.generation,
             alternate_block_count,
@@ -6085,6 +6093,15 @@ mod tests {
         let status = &rpc.snapshot().node_status;
         assert!(status.active_state_sync_enabled);
         assert_eq!(status.active_state_connect_batch, 288);
+        assert_eq!(status.active_state_resulting_root_height, Some(1));
+        assert_eq!(
+            status
+                .active_state_resulting_root
+                .as_ref()
+                .expect("resulting root")
+                .len(),
+            64
+        );
         assert!(!status.authority.can_authorize_mining_templates);
     }
 
@@ -6835,6 +6852,8 @@ mod tests {
         assert_eq!(json["undo_retention"]["prune_after_height"], 1_000);
         assert_eq!(json["undo_retention"]["keep_blocks"], 10_000);
         assert!(json["undo_retention"]["pruned_through"].is_null());
+        assert!(json["active_state_resulting_root"].is_null());
+        assert!(json["active_state_resulting_root_height"].is_null());
 
         let request = format!(
             "GET /api/v1/mining-engine HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"

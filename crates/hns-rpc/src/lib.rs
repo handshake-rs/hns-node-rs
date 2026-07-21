@@ -247,6 +247,10 @@ pub struct RpcNodeStatus {
     pub best_header_height: Option<Height>,
     pub best_block_hash: Option<BlockHash>,
     pub height: Option<Height>,
+    /// Authenticated name-tree root resulting from the active tip. The next
+    /// block must commit this value in its header.
+    pub active_state_resulting_root: Option<String>,
+    pub active_state_resulting_root_height: Option<Height>,
     pub chain_epoch: u64,
     pub mining_generation: u64,
     pub alternate_block_count: usize,

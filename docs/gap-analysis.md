@@ -60,7 +60,7 @@
   and pinned-root reachable union. Malformed pins and failed commits preserve
   every node.
 - Opt-in height-gated startup scheduling and forced serialized maintenance with
-  an atomic checksummed last-run checkpoint, API-v7 status, and unclean RocksDB
+  an atomic checksummed last-run checkpoint, API-v8 status, and unclean RocksDB
   reopen evidence.
 - Exact HSD `pruneAfterHeight`/`keepBlocks` constants and opt-in atomic undo
   retirement, including startup catch-up, pruning-aware pinned-root compaction,
@@ -116,6 +116,9 @@
 - Explicitly acknowledged bounded active-state connection through the single
   contextual state/reorg pipeline, with restart resumption, exact failed-root
   attribution, and local-fault separation.
+- API-v8 post-tip root diagnostics and a pinned-source external HSD comparator
+  with coherent-tip retries, provisional/confirmed root labels, and bounded
+  checksummed restart/reorganization evidence.
 - Non-authoritative diagnostics; network data cannot grant mining authority.
 
 ### Mempool, template, and publication foundation
@@ -198,8 +201,9 @@ These are substantial foundations, not a production full node.
 - Positive and negative invalid corpora for every rule family.
 - Byte-for-byte UTXO, name-state, Urkel-root, deployment, undo, and
   reorganization parity.
-- Sustained live HSD shadow agreement through restarts, partitions, tip races,
-  and real reorganizations.
+- Sustained live HSD shadow agreement evidence through restarts, partitions,
+  tip races, and real reorganizations; the comparison mechanism exists, but
+  the production-duration campaign does not.
 - Measured P50/P95/P99/maximum tip-to-job, candidate-validation, local-connect,
   and first-peer-acceptance latency.
 - Reproducible builds, external review, fuzzing, and published latency/recovery

@@ -24,7 +24,10 @@ bounded mempool, future-template, and durable solved-block publication
 foundation. Network data remains non-authoritative, and the mining engine cannot
 authorize jobs or publish solved blocks without the private authority capability. An explicitly
 acknowledged active-state sync mode can now connect downloaded bodies through
-the same atomic consensus pipeline, but it remains non-authoritative.
+the same atomic consensus pipeline, but it remains non-authoritative. API-v8
+exposes the exact post-tip authenticated root, and the external comparison
+runner can check it against a pinned live HSD node without feeding oracle data
+back into consensus.
 
 ## Authority, storage, and reorganization safety
 
@@ -177,7 +180,7 @@ Implemented:
   commits leave all records unchanged.
 - HSD-shaped opt-in startup scheduling with a nonzero block-height interval
   (10,000 by default), a checksummed last-run checkpoint committed in the same
-  batch as deletions, manual serialized maintenance, and API-v7 status counts.
+  batch as deletions, manual serialized maintenance, and API-v8 status counts.
 - Optional HSD-shaped undo retirement preserves heights through
   `pruneAfterHeight` and the newest `keepBlocks`, advances a checksummed
   checkpoint in the same batch as each status/undo deletion, preserves
@@ -245,6 +248,10 @@ Implemented:
 - Read-only peer and synchronization diagnostics.
 - Default observation-only storage plus an opt-in non-authoritative active-state
   connector. Neither mode can authorize mining work in `shadow` authority mode.
+- A fail-closed external live HSD comparison runner for canonical block hashes
+  and post-tip authenticated roots, with race retries, pinned-source checks,
+  provisional-versus-confirmed root labeling, and a checksummed bounded
+  restart/reorganization evidence checkpoint.
 
 Still release-blocking:
 
@@ -255,7 +262,8 @@ Still release-blocking:
   replay and sustained reorganizations;
 - pruning-aware synchronization, invalid-branch pruning policy, and production
   Urkel lifecycle qualification;
-- live HSD state/root comparison and sustained shadow agreement;
+- sustained live HSD state/root agreement campaigns using the comparison
+  runner across restarts, partitions, and real reorganizations;
 - qualified active-state IBD, live HSD comparison, and native mainnet mining
   authority.
 
@@ -289,7 +297,8 @@ Still release-blocking:
 - disconnected-transaction re-admission after reorganizations;
 - qualified full-mainnet active-state IBD and the incremental production Urkel
   lifecycle;
-- live HSD state/root comparison and sustained shadow agreement;
+- sustained live HSD comparison evidence across restarts, partitions, and real
+  reorganizations;
 - measured template/job and solved-block publication latency;
 - native mainnet authority.
 
@@ -308,6 +317,7 @@ See:
 - [`docs/readiness.md`](docs/readiness.md)
 - [`docs/gap-analysis.md`](docs/gap-analysis.md)
 - [`docs/p2p-sync.md`](docs/p2p-sync.md)
+- [`docs/live-shadow-parity.md`](docs/live-shadow-parity.md)
 - [`docs/mining-engine.md`](docs/mining-engine.md)
 - [`docs/storage-schema.md`](docs/storage-schema.md)
 - [`docs/hsd-decomposition.md`](docs/hsd-decomposition.md)
@@ -326,6 +336,7 @@ The individual fixture and native-dependency checks include:
 ```bash
 python3 scripts/validate-hsrd-static.py
 python3 scripts/validate-hsrd-source-handoff.py
+scripts/compare-hsrd-hsd-shadow.py --self-test
 npm run hsrd-script-fixtures --prefix hsd-oracle
 npm run hsrd-deployment-fixtures --prefix hsd-oracle
 npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
