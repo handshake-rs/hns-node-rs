@@ -52,6 +52,7 @@ npm run hsrd-deployment-fixtures --prefix hsd-oracle
 npm run hsrd-airdrop-fixtures --prefix hsd-oracle
 npm run hsrd-claim-fixtures --prefix hsd-oracle
 npm run hsrd-mainnet-claim-history --prefix hsd-oracle
+npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
@@ -76,6 +77,10 @@ Current evidence includes:
 - checkpoint-linked canonical mainnet block 62,517 with two real DNSSEC claim
   witnesses, full raw body metrics, exact parent-header-time context, native
   proof mutation/hardening rejection, and claim coinbase connect/disconnect;
+- checkpoint-linked mainnet replacement history spanning seven predecessor
+  blocks at heights 39,086-39,101 and the ten-claim replacement block 76,722,
+  with exact value preservation, commit advancement, native state replay, and
+  reverse disconnect;
 - build-checked libFuzzer targets for bounded Claim/TXT/ownership-proof and
   airdrop key/proof decoding plus their derived hash, sanity, and Merkle paths;
 - signature-type encoding validity;
@@ -283,7 +288,29 @@ NODE_BACKEND=js npm run refresh-hsrd-mainnet-claim-history \
   --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
 ```
 
-This is one canonical block and coinbase-state replay case, not complete
+The bounded replacement history is checked independently:
+
+```bash
+NODE_BACKEND=js npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
+```
+
+It pins all eight full raw blocks, checkpoint-linked parent-time contexts,
+height-1 and height-2 commit headers, 66 initial claims, and the ten exact
+initial-to-replacement mappings. Native replay connects the seven predecessor
+coinbases, verifies every replacement against its prior coin and `NameState`,
+then disconnects the sequence back to an empty authenticated tree. The
+mixed-size `.zone` DNSKEY RRset is a regression for RFC 4034/HSD canonical
+RDATA ordering.
+
+Refresh uses the same synchronized local HSD/header-chain requirement and
+bounded archival endpoint:
+
+```bash
+NODE_BACKEND=js npm run refresh-hsrd-mainnet-claim-replacements \
+  --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
+```
+
+These are bounded canonical initial and replacement histories, not complete
 historical claim, UTXO, covenant, name-root, or reorganization replay.
 
 For every mainnet block and mutation-corpus case, compare:

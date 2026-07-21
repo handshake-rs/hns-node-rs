@@ -62,6 +62,10 @@
   tests validate the complete raw body and both proofs, reject median-time-past
   in place of HSD's exact parent-header time, and connect/disconnect the exact
   claim coinbase through the proof-capable state service.
+- Seven canonical initial-claim blocks at heights 39,086-39,101 and the full
+  ten-claim replacement block 76,722 are pinned with checkpoint-linked parent
+  contexts. Native replay preserves predecessor values, advances commit height
+  1 to 2, applies post-deflation replacement accounting, and reverses all state.
 
 ### Network and synchronization foundation
 
@@ -124,7 +128,7 @@ These are substantial foundations, not a production full node.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
 - Current/live valid claim-proof evidence, remaining historical datasets, and
-  complete replay beyond the pinned block 62,517 claim case. Claim DNSSEC
+  complete replay beyond the pinned initial/replacement claim histories. Claim DNSSEC
   algorithms and DS digests, the full upstream historical proof corpus,
   deflation accounting, complete airdrop-key verification, active-node
   deployment composition, and airdrop duplicate/conjured-value accounting are

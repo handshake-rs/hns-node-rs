@@ -36,6 +36,9 @@ Implemented:
 - Checkpoint-linked canonical mainnet block 62,517 with two real claims,
   complete raw body/proof verification, exact parent-header-time parity, and
   native claim coinbase connect/disconnect evidence.
+- Checkpoint-linked canonical replacement history from seven initial-claim
+  blocks at 39,086-39,101 through all ten replacements in block 76,722, with
+  retained-value/commit advancement checks and full connect/disconnect replay.
 - Native RSA/SHA-256, compact P-256, Ed25519, direct-address, and pinned
   Goosig 0.11.0 airdrop verification, including an upstream production-root
   GooSig proof through active block connection and durable duplicate rejection.
@@ -46,7 +49,7 @@ Remaining:
 - non-script historical exceptions and broader independent invalid/fuzz
   corpora;
 - current/live claim-proof evidence and complete historical claim replay beyond
-  the pinned block 62,517 case;
+  the pinned initial/replacement histories;
 - full contextual transition replay and invalid corpus.
 
 ## State and reorganization engine — hardened foundation

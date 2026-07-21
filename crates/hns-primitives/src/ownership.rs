@@ -948,12 +948,16 @@ fn signature_data(signature: &DnsRrsig, rrset: &[&DnsRecord]) -> Option<Vec<u8>>
         record
             .write(&mut writer, true, signature.original_ttl, Some(&owner))
             .ok()?;
-        records.push(writer.finish());
+        // HSD/bns follows RFC 4034 section 6.3 and sorts an RRset by
+        // canonical RDATA. Sorting the complete wire record is observably
+        // different when two DNSKEYs have different RDLENGTH values because
+        // that length field precedes the RDATA.
+        records.push((record.encode_rdata(true).ok()?, writer.finish()));
     }
-    records.sort();
-    records.dedup();
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    records.dedup_by(|left, right| left.1 == right.1);
     let mut data = signature.tbs().ok()?;
-    for record in records {
+    for (_, record) in records {
         data.extend_from_slice(&record);
     }
     Some(data)

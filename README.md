@@ -96,6 +96,12 @@ Implemented:
   block/body validation, and native claim coinbase connect/disconnect. The
   fixture demonstrates why HSD's claim RRSIG clock is the exact parent block
   time rather than median-time-past.
+- A second checkpoint-linked history replays seven initial-claim coinbases at
+  heights 39,086-39,101 and all ten canonical replacement claims at height
+  76,722. It exercises height-1 to height-2 commit advancement, exact retained
+  output values, post-deflation accounting, claim-frequency eligibility,
+  authenticated name-state replacement, and reverse disconnect. The mixed-size
+  `.zone` DNSKEY RRset also pins HSD's canonical RDATA sort order.
 - Native verification for all five HSD airdrop key types: direct address
   allocations, RSA/SHA-256, compact P-256 ECDSA, Ed25519, and the exact pinned
   Goosig 0.11.0 verifier. HSD-generated vectors cover valid and mutated
@@ -139,7 +145,7 @@ Implemented:
 Still release-blocking:
 
 - current/live production-valid claim-proof evidence and complete historical
-  claim replay beyond the pinned block 62,517 case;
+  claim replay beyond the pinned initial/replacement histories;
 - full contextual covenant parity across mainnet history;
 - a production persistent incremental Urkel node store and exact HSD proof-wire
   codec;
@@ -253,6 +259,7 @@ npm run hsrd-script-fixtures --prefix hsd-oracle
 npm run hsrd-deployment-fixtures --prefix hsd-oracle
 npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
 npm run hsrd-mainnet-claim-history --prefix hsd-oracle
+npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle

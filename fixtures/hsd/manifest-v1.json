@@ -105,6 +105,26 @@
       "blake2b256": "d337401c58f220ce220742b86ca8791386f8f7da68369b76efb13fad052b96f0"
     },
     {
+      "id": "mainnet-claim-replacements-v1",
+      "network": "main",
+      "kind": "claim",
+      "path": "claims/mainnet-replacements-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "oracle",
+        "mainnet",
+        "historical",
+        "ownership",
+        "dnssec",
+        "coinbase",
+        "replacement",
+        "state"
+      ],
+      "blake2b256": "7d0b6a54b5ab552a2cb33e312827375750108d5c8b8b0fd4c6e733c83f6c818b"
+    },
+    {
       "id": "covenant-codec-v1",
       "network": "agnostic",
       "kind": "covenant",

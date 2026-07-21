@@ -30,6 +30,9 @@ The current foundation verifies or records evidence for:
 - checkpoint-linked block 62,517 claim evidence validating two real mainnet
   proofs and their state transition against HSD's exact parent-header-time
   rule;
+- checkpoint-linked predecessor/replacement evidence spanning seven initial
+  coinbases and all ten replacements in block 76,722, including retained-value,
+  commit-advance, and reverse-disconnect behavior;
 - correctness-first exact Urkel roots;
 - atomic single- and multi-block database mutations;
 - sequence-consistent snapshots;
@@ -60,7 +63,7 @@ The following remain untrusted and release-blocking:
 - independent script fuzz/invalid evidence beyond the complete pinned HSD
   upstream corpus;
 - current/live claim-proof evidence and complete historical claim replay beyond
-  the pinned block 62,517 case;
+  the pinned initial/replacement histories;
 - complete contextual name consensus over all historical cases;
 - persistent production Urkel nodes and HSD proof-wire parity;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;

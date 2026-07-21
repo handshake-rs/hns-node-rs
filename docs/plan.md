@@ -61,6 +61,10 @@ reserved low-latency paths.
 - A checkpoint-linked canonical mainnet claim case at height 62,517: full raw
   block/body validation, both real DNSSEC witnesses, HSD's exact parent-header
   timestamp rule, and exact coinbase connect/disconnect through native state.
+- A checkpoint-linked replacement history covering seven canonical initial
+  coinbases and all ten replacements at height 76,722, including exact
+  predecessor coin values, height-1/height-2 commit ancestry, post-deflation
+  accounting, authenticated state replacement, and reverse disconnect.
 - Reserved/lockup datasets and renewal-policy fixtures.
 - Exact `NameState` encoding and undo.
 - Correctness-first exact Urkel roots and internal proofs.
@@ -95,8 +99,9 @@ reserved low-latency paths.
 
 1. **Claim and airdrop validation** — capture current/live valid claim evidence
    and replay the proof-capable active-node service across the rest of mainnet
-   history. Height 62,517 now supplies a checkpoint-linked real two-claim case
-   with exact parent-time and coinbase state replay. Exact Claim/DNSSEC/TXT
+   history. Heights 62,517 and 39,086-39,101 -> 76,722 now supply bounded
+   checkpoint-linked initial and replacement cases with exact parent-time and
+   coinbase state replay. Exact Claim/DNSSEC/TXT
    codecs, all HSD DS digests including GOST94, the complete upstream
    historical ownership-proof corpus, ICANN-rooted signature verification,
    parent-derived deployment composition, claim deflation and name-state

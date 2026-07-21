@@ -2150,7 +2150,30 @@ mod tests {
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
+    struct MainnetClaimReplacementHistoryFixture {
+        canonical_context: MainnetClaimReplacementContextFixture,
+        history: Vec<MainnetClaimReplacementFixture>,
+        blocks: Vec<MainnetClaimReplacementBlockFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct MainnetClaimContextFixture {
+        context_headers: Vec<MainnetClaimHeaderFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimReplacementContextFixture {
+        commit_headers: Vec<MainnetClaimHeaderFixture>,
+        blocks: Vec<MainnetClaimReplacementBlockContextFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimReplacementBlockContextFixture {
+        block_height: u32,
+        parent_time: u64,
         context_headers: Vec<MainnetClaimHeaderFixture>,
     }
 
@@ -2171,10 +2194,40 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct MainnetClaimStateFixture {
+        output_index: usize,
         name: String,
         weak: bool,
         commit_height: u32,
+        output_value: u64,
         conjured: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimReplacementBlockFixture {
+        role: String,
+        height: u32,
+        raw: String,
+        claims: Vec<MainnetClaimStateFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimReplacementFixture {
+        name: String,
+        name_hash: String,
+        initial: MainnetClaimReplacementPointFixture,
+        replacement: MainnetClaimReplacementPointFixture,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimReplacementPointFixture {
+        block_height: u32,
+        coinbase_txid: String,
+        output_index: u32,
+        output_value: u64,
+        commit_height: u32,
     }
 
     fn decode_fixture_bytes(value: &str) -> Vec<u8> {
@@ -2216,6 +2269,92 @@ mod tests {
                 .expect("mainnet canonical header");
         }
         store.commit(batch).expect("mainnet context headers");
+    }
+
+    fn seed_mainnet_claim_replacement_headers(
+        store: &MemoryStore,
+        context: &MainnetClaimReplacementContextFixture,
+    ) {
+        let mut batch = store.batch();
+        for expected in context.commit_headers.iter().chain(
+            context
+                .blocks
+                .iter()
+                .flat_map(|block| &block.context_headers),
+        ) {
+            let header = Header::decode(&decode_fixture_bytes(&expected.raw))
+                .expect("mainnet replacement context header");
+            let hash = header.hash();
+            assert_eq!(hash.to_hex(), expected.hash);
+            batch
+                .put(
+                    ColumnFamily::Headers,
+                    hash.as_bytes(),
+                    &HeaderRecord {
+                        hash,
+                        height: expected.height,
+                        chainwork: Uint256::ONE,
+                        header,
+                        status: BlockStatus::default(),
+                    }
+                    .encode(),
+                )
+                .expect("mainnet replacement context header");
+            write_canonical_height_to_batch(&mut batch, expected.height, hash)
+                .expect("mainnet replacement canonical header");
+        }
+        store
+            .commit(batch)
+            .expect("mainnet replacement context headers");
+    }
+
+    fn connect_mainnet_claim_fixture_block(
+        engine: &mut StoredStateEngine<MemoryStore>,
+        expected: &MainnetClaimReplacementBlockFixture,
+        context: &MainnetClaimReplacementBlockContextFixture,
+    ) -> (Block, StateSummary) {
+        assert_eq!(context.block_height, expected.height);
+        let historical = Block::decode(&decode_fixture_bytes(&expected.raw))
+            .expect("canonical mainnet claim-history block");
+        let coinbase = historical.transactions[0].clone();
+        assert_eq!(coinbase.locktime, expected.height);
+        let issuance = engine
+            .issuance_verifier()
+            .verify_coinbase(
+                &coinbase,
+                expected.height,
+                context.parent_time,
+                Network::Mainnet,
+            )
+            .expect("canonical mainnet claim issuance");
+        assert_eq!(issuance.claims.len(), expected.claims.len());
+
+        let output_value = coinbase
+            .outputs
+            .iter()
+            .try_fold(0u64, |total, output| total.checked_add(output.value))
+            .expect("coinbase output value");
+        let ordinary_reward_and_fees = output_value
+            .checked_sub(issuance.conjured)
+            .expect("ordinary coinbase component");
+        let inherited_tree_root = {
+            let snapshot = engine.store().snapshot().expect("pre-claim snapshot");
+            verify_stored_name_tree_root(&snapshot).expect("pre-claim tree root")
+        };
+        let mut candidate = block(expected.height, vec![coinbase]);
+        candidate.header.tree_root = *inherited_tree_root.as_bytes();
+        let summary = engine
+            .connect_block(ConnectBlock {
+                block_hash: candidate.hash(),
+                height: expected.height,
+                coinbase_maturity: 100,
+                block_reward: ordinary_reward_and_fees,
+                block: &candidate,
+            })
+            .expect("canonical mainnet claim-history coinbase");
+        assert_eq!(summary.names_changed, expected.claims.len());
+        assert!(summary.validation.claims_and_airdrops_valid);
+        (candidate, summary)
     }
 
     #[test]
@@ -2920,5 +3059,165 @@ mod tests {
                 .expect("restored name state read")
                 .is_none());
         }
+    }
+
+    #[test]
+    fn canonical_mainnet_replacement_claims_replay_exact_predecessors() {
+        let fixture: MainnetClaimReplacementHistoryFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-replacements-v1.json"
+        ))
+        .expect("mainnet claim replacement fixture");
+        assert_eq!(fixture.history.len(), 10);
+
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        seed_mainnet_claim_replacement_headers(&store, &fixture.canonical_context);
+        let mut engine = StoredStateEngine::with_services(
+            store,
+            Network::Mainnet,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(
+                AirdropCoinbaseIssuanceVerifier::native(DeploymentState::from_states(
+                    [ThresholdState::Defined; 4],
+                ))
+                .expect("native issuance verifier"),
+            ),
+        )
+        .expect("mainnet replacement state engine");
+
+        let mut connected_initial = Vec::new();
+        for expected in fixture
+            .blocks
+            .iter()
+            .filter(|block| block.role == "initial")
+        {
+            let context = fixture
+                .canonical_context
+                .blocks
+                .iter()
+                .find(|context| context.block_height == expected.height)
+                .expect("initial claim context");
+            let (candidate, summary) =
+                connect_mainnet_claim_fixture_block(&mut engine, expected, context);
+            assert_eq!(
+                summary.coins_created,
+                candidate.transactions[0].outputs.len()
+            );
+            for claim in &expected.claims {
+                assert_eq!(
+                    candidate.transactions[0].outputs[claim.output_index].value,
+                    claim.output_value
+                );
+                assert_eq!(claim.commit_height, 1);
+                assert!(claim.conjured >= claim.output_value);
+            }
+            connected_initial.push((candidate, expected.height));
+        }
+
+        for expected in &fixture.history {
+            let name_hash = hash_name(&expected.name).expect("replacement name hash");
+            assert_eq!(name_hash.to_hex(), expected.name_hash);
+            let state = engine
+                .name_state(&name_hash)
+                .expect("initial claimed name read")
+                .expect("initial claimed name");
+            assert_eq!(state.height, expected.initial.block_height);
+            assert_eq!(state.renewal, expected.initial.block_height);
+            assert_eq!(state.claimed, expected.initial.commit_height);
+            assert_eq!(state.owner.txid.to_hex(), expected.initial.coinbase_txid);
+            assert_eq!(state.owner.index, expected.initial.output_index);
+            let coin = engine
+                .coin(&state.owner)
+                .expect("initial claim coin read")
+                .expect("initial claim coin");
+            assert_eq!(coin.value, expected.initial.output_value);
+        }
+
+        let replacement = fixture
+            .blocks
+            .iter()
+            .find(|block| block.role == "replacement")
+            .expect("replacement block");
+        let replacement_context = fixture
+            .canonical_context
+            .blocks
+            .iter()
+            .find(|context| context.block_height == replacement.height)
+            .expect("replacement block context");
+        let (replacement_candidate, replacement_summary) =
+            connect_mainnet_claim_fixture_block(&mut engine, replacement, replacement_context);
+        assert_eq!(replacement_summary.names_changed, fixture.history.len());
+        assert_eq!(replacement.claims.len(), fixture.history.len());
+        for claim in &replacement.claims {
+            assert_eq!(claim.commit_height, 2);
+            assert_eq!(claim.conjured, claim.output_value);
+        }
+
+        for expected in &fixture.history {
+            let name_hash = hash_name(&expected.name).expect("replacement name hash");
+            let state = engine
+                .name_state(&name_hash)
+                .expect("replacement name read")
+                .expect("replacement name");
+            assert_eq!(state.height, expected.replacement.block_height);
+            assert_eq!(state.renewal, expected.replacement.block_height);
+            assert_eq!(state.claimed, expected.replacement.commit_height);
+            assert_eq!(
+                state.owner.txid.to_hex(),
+                expected.replacement.coinbase_txid
+            );
+            assert_eq!(state.owner.index, expected.replacement.output_index);
+            let coin = engine
+                .coin(&state.owner)
+                .expect("replacement coin read")
+                .expect("replacement coin");
+            assert_eq!(coin.value, expected.replacement.output_value);
+        }
+
+        engine
+            .disconnect_block(DisconnectBlock {
+                block_hash: replacement_candidate.hash(),
+                height: replacement.height,
+            })
+            .expect("replacement claim disconnect");
+        for expected in &fixture.history {
+            let name_hash = hash_name(&expected.name).expect("restored initial name hash");
+            let state = engine
+                .name_state(&name_hash)
+                .expect("restored initial name read")
+                .expect("restored initial name");
+            assert_eq!(state.height, expected.initial.block_height);
+            assert_eq!(state.claimed, expected.initial.commit_height);
+            assert_eq!(state.owner.txid.to_hex(), expected.initial.coinbase_txid);
+            assert_eq!(state.owner.index, expected.initial.output_index);
+        }
+
+        for (candidate, height) in connected_initial.iter().rev() {
+            engine
+                .disconnect_block(DisconnectBlock {
+                    block_hash: candidate.hash(),
+                    height: *height,
+                })
+                .expect("initial claim disconnect");
+        }
+        for expected in fixture
+            .blocks
+            .iter()
+            .filter(|block| block.role == "initial")
+            .flat_map(|block| &block.claims)
+        {
+            let name_hash = hash_name(&expected.name).expect("disconnected initial name hash");
+            assert!(engine
+                .name_state(&name_hash)
+                .expect("disconnected initial name read")
+                .is_none());
+        }
+        let snapshot = engine.store().snapshot().expect("final claim snapshot");
+        assert_eq!(
+            verify_stored_name_tree_root(&snapshot).expect("final claim tree root"),
+            TreeRoot::ZERO
+        );
     }
 }

@@ -409,6 +409,26 @@ mod tests {
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
+    struct MainnetReplacementFixture {
+        canonical_context: MainnetReplacementContextFixture,
+        blocks: Vec<MainnetBlockFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetReplacementContextFixture {
+        blocks: Vec<MainnetReplacementBlockContextFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetReplacementBlockContextFixture {
+        block_height: u32,
+        parent_time: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct MainnetContextFixture {
         parent_time: u64,
         parent_median_time: u64,
@@ -417,6 +437,8 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct MainnetBlockFixture {
+        #[serde(default)]
+        role: String,
         height: u32,
         hash: String,
         raw: String,
@@ -456,6 +478,13 @@ mod tests {
             "../../../fixtures/hsd/claims/mainnet-history-v1.json"
         ))
         .expect("HSD canonical mainnet claim fixture")
+    }
+
+    fn mainnet_replacement_fixture() -> MainnetReplacementFixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-replacements-v1.json"
+        ))
+        .expect("HSD canonical mainnet replacement fixture")
     }
 
     fn decode_hex(value: &str) -> Vec<u8> {
@@ -663,6 +692,70 @@ mod tests {
                 ),
                 Err(ClaimConsensusError::InvalidSignatures)
             ));
+        }
+    }
+
+    #[test]
+    fn native_claim_validation_matches_canonical_mainnet_replacements() {
+        let fixture = mainnet_replacement_fixture();
+        let expected = fixture
+            .blocks
+            .into_iter()
+            .find(|block| block.role == "replacement")
+            .expect("replacement block");
+        let context = fixture
+            .canonical_context
+            .blocks
+            .into_iter()
+            .find(|context| context.block_height == expected.height)
+            .expect("replacement context");
+        let block = Block::decode(&decode_hex(&expected.raw)).expect("replacement block");
+        assert_eq!(block.encode(), decode_hex(&expected.raw));
+        assert_eq!(block.hash().to_hex(), expected.hash);
+        assert_eq!(block.transactions.len(), expected.transaction_count);
+        let validation = crate::validate_block_body(&block).expect("replacement block body");
+        assert_eq!(validation.base_size, expected.base_size);
+        assert_eq!(validation.weight, expected.weight);
+        assert_eq!(block.encode().len(), expected.size);
+
+        let coinbase = &block.transactions[0];
+        assert_eq!(coinbase.locktime, expected.height);
+        assert_eq!(expected.claims.len(), 10);
+        for claim in expected.claims {
+            let proof_raw = &coinbase.inputs[claim.output_index].witness.items[0];
+            let output = &coinbase.outputs[claim.output_index];
+            assert_eq!(proof_raw, &decode_hex(&claim.proof_raw));
+            assert_eq!(output.value, claim.output_value);
+
+            let verified = verify_claim_output(
+                proof_raw,
+                output,
+                expected.height,
+                context.parent_time,
+                Network::Mainnet,
+                ClaimFlags { hardened: false },
+                &OpenSslDnssecVerifier,
+            )
+            .expect("canonical replacement claim");
+            assert_eq!(verified.name, claim.name.as_bytes());
+            assert_eq!(verified.name_hash.to_hex(), claim.name_hash);
+            assert_eq!(verified.weak, claim.weak);
+            assert_eq!(
+                verified.commit_hash.to_vec(),
+                decode_hex(&claim.commit_hash)
+            );
+            assert_eq!(verified.commit_height, 2);
+            assert_eq!(verified.value, claim.reserved_value);
+            assert_eq!(verified.fee, claim.fee);
+            assert_eq!(verified.conjured, claim.output_value);
+            assert_eq!(claim.conjured, claim.output_value);
+            assert_eq!(output.address.version, claim.version);
+            assert_eq!(output.address.hash, decode_hex(&claim.address));
+            let proof = OwnershipProof::decode(proof_raw).expect("replacement ownership proof");
+            assert_eq!(
+                proof.target().expect("replacement target").to_ascii_fqdn(),
+                Some(claim.target)
+            );
         }
     }
 }
