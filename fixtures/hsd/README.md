@@ -9,8 +9,9 @@ golden cases can be added without changing testkit paths.
   complete valid faucet proof from the pinned upstream corpus.
 - `claims`: HSD Claim envelope/hash vectors, checksummed ownership TXT payloads
   for all four network prefixes, the complete four-proof upstream historical
-  DNSKEY/DS/TXT/RRSIG corpus, and a canonical mainnet block containing two real
-  CLAIM outputs with checkpoint-linked header/time context.
+  DNSKEY/DS/TXT/RRSIG corpus, checkpoint-linked canonical mainnet claim blocks,
+  a complete commit-height 1→2→3 replacement lineage, the final accepted claim
+  at height 210,237, and the height-210,240 claim-period boundary.
 - `transactions`: serialized transactions.
 - `scripts`: signature hashes, sequence locks, and HSD execution/error vectors.
 - `covenants`: covenant cases and name-operation vectors.

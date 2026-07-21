@@ -43,6 +43,10 @@ Implemented:
 - Checkpoint-linked canonical replacement history from seven initial-claim
   blocks at 39,086-39,101 through all ten replacements in block 76,722, with
   retained-value/commit advancement checks and full connect/disconnect replay.
+- Checkpoint-linked three-generation `mylinksfree` replay at heights 55,798,
+  177,097, and 178,235 with exact commit-height 1→2→3 advancement, value/
+  frequency enforcement, and predecessor restoration, plus the final accepted
+  `vcel` claim at 210,237 and exact height-210,240 claim-period rejection.
 - Native RSA/SHA-256, compact P-256, Ed25519, direct-address, and pinned
   Goosig 0.11.0 airdrop verification, including an upstream production-root
   GooSig proof through active block connection and durable duplicate rejection.
@@ -52,8 +56,10 @@ Remaining:
 - historical replay qualification;
 - non-script historical exceptions and broader independent invalid/fuzz
   corpora;
-- current/live claim-proof evidence and complete historical claim replay beyond
-  the pinned initial/replacement histories;
+- independently sourced live DNSSEC-proof evidence for historical-policy
+  qualification and complete historical claim replay beyond the pinned
+  initial, multi-generation, and terminal histories; mainnet's claim period
+  ended at height 210,240;
 - mainnet historical contextual replay and broader invalid corpus.
 
 ## State and reorganization engine — hardened foundation
@@ -188,6 +194,8 @@ Implemented:
   periods through height 338,688 with next-block versions, airdrop proofs,
   Claim/TXT/DNSSEC ownership-proof codecs and all four
   upstream signed proof chains under SHA-256/GOST94 historical anchors,
+  terminal mainnet claim-period behavior and a complete three-generation claim
+  lineage,
   covenant linkage, all-family contextual name transitions with 15 accepted
   and 13 rejected exact state cases, name-state codec,
   reserved/lockup/renewal policy, incremental Urkel roots, P2P wire bytes,

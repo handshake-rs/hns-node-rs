@@ -185,14 +185,22 @@ Implemented:
 - Authenticated CLAIM name-state creation/replacement with active-chain commit,
   hardening, frequency/value, and atomic disconnect/undo checks at the state
   service boundary.
+- Checkpoint-linked `mylinksfree` replay across its complete claim-height
+  1→2→3 lineage at blocks 55,798, 177,097, and 178,235, including two
+  post-deflation replacements with identical retained value and reverse
+  authenticated-state restoration. Block 210,237 pins `vcel`, the final
+  accepted mainnet claim, while the canonical height-210,240 header/coinbase
+  and a mutated terminal proof pin the exact claim-period rejection boundary.
 - Stored-root versus materialized-state corruption detection.
 - Durable non-active header/index/body storage and validated atomic activation
   of a strictly greater-work replacement branch.
 
 Still release-blocking:
 
-- current/live production-valid claim-proof evidence and complete historical
-  claim replay beyond the pinned initial/replacement histories;
+- independently sourced live DNSSEC-proof evidence for historical-policy
+  qualification and complete claim replay beyond the pinned initial,
+  multi-generation, and terminal histories (new on-chain claims are impossible
+  after mainnet's height-210,240 claim-period boundary);
 - full contextual covenant parity across mainnet history;
 - deployment-scale compaction performance/priority qualification and RocksDB
   mid-commit process-crash/fault injection for the incremental Urkel lifecycle;

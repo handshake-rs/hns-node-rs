@@ -358,7 +358,7 @@ fn verify_digest(
 #[cfg(test)]
 mod tests {
     use hns_primitives::{
-        Block, DnsRecord, DnsRecordData, DnssecAnchor, OwnershipProof, DNS_TYPE_TXT,
+        Block, DnsRecord, DnsRecordData, DnssecAnchor, OwnershipProof, Transaction, DNS_TYPE_TXT,
     };
     use serde::Deserialize;
 
@@ -410,8 +410,62 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct MainnetReplacementFixture {
+        schema: u32,
         canonical_context: MainnetReplacementContextFixture,
+        lifecycle: MainnetClaimLifecycleFixture,
         blocks: Vec<MainnetBlockFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimLifecycleFixture {
+        claim_period_height: u32,
+        lineage: MainnetClaimLineageFixture,
+        terminal: MainnetTerminalClaimFixture,
+        boundary: MainnetClaimBoundaryFixture,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimLineageFixture {
+        name: String,
+        name_hash: String,
+        points: Vec<MainnetClaimPointFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetTerminalClaimFixture {
+        name: String,
+        name_hash: String,
+        blocks_before_claim_period: u32,
+        point: MainnetClaimPointFixture,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimBoundaryFixture {
+        block_height: u32,
+        block_hash: String,
+        parent_time: u64,
+        coinbase_txid: String,
+        coinbase_raw: String,
+        claim_count: usize,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimPointFixture {
+        block_height: u32,
+        coinbase_txid: String,
+        output_index: usize,
+        output_value: u64,
+        reserved_value: u64,
+        fee: u64,
+        commit_hash: String,
+        commit_height: u32,
+        weak: bool,
+        conjured: u64,
     }
 
     #[derive(Deserialize)]
@@ -757,5 +811,154 @@ mod tests {
                 Some(claim.target)
             );
         }
+    }
+
+    #[test]
+    fn native_claim_validation_matches_terminal_and_third_generation_history() {
+        let fixture = mainnet_replacement_fixture();
+        assert_eq!(fixture.schema, 2);
+        assert_eq!(
+            fixture.lifecycle.claim_period_height,
+            Network::Mainnet.params().names.claim_period
+        );
+        assert_eq!(fixture.lifecycle.lineage.name, "mylinksfree");
+        assert_eq!(fixture.lifecycle.lineage.points.len(), 3);
+        assert_eq!(
+            fixture
+                .lifecycle
+                .lineage
+                .points
+                .iter()
+                .map(|point| point.commit_height)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let verify_point = |name: &str, name_hash: &str, point: &MainnetClaimPointFixture| {
+            let expected_block = fixture
+                .blocks
+                .iter()
+                .find(|block| block.height == point.block_height)
+                .expect("claim lifecycle block");
+            let context = fixture
+                .canonical_context
+                .blocks
+                .iter()
+                .find(|context| context.block_height == point.block_height)
+                .expect("claim lifecycle context");
+            let expected_claim = expected_block
+                .claims
+                .iter()
+                .find(|claim| claim.output_index == point.output_index && claim.name == name)
+                .expect("claim lifecycle output");
+            let block =
+                Block::decode(&decode_hex(&expected_block.raw)).expect("claim lifecycle block");
+            assert_eq!(block.hash().to_hex(), expected_block.hash);
+            assert_eq!(block.transactions.len(), expected_block.transaction_count);
+            let validation = crate::validate_block_body(&block).expect("claim lifecycle body");
+            assert_eq!(validation.base_size, expected_block.base_size);
+            assert_eq!(validation.weight, expected_block.weight);
+            assert_eq!(block.encode().len(), expected_block.size);
+
+            let coinbase = &block.transactions[0];
+            assert_eq!(coinbase.locktime, point.block_height);
+            assert_eq!(coinbase.txid().to_hex(), point.coinbase_txid);
+            let proof_raw = &coinbase.inputs[point.output_index].witness.items[0];
+            let output = &coinbase.outputs[point.output_index];
+            assert_eq!(proof_raw, &decode_hex(&expected_claim.proof_raw));
+            assert_eq!(output.value, point.output_value);
+            assert_eq!(point.output_value, expected_claim.output_value);
+            assert_eq!(point.reserved_value, expected_claim.reserved_value);
+            assert_eq!(point.fee, expected_claim.fee);
+            assert_eq!(point.commit_hash, expected_claim.commit_hash);
+            assert_eq!(point.commit_height, expected_claim.commit_height);
+            assert_eq!(point.weak, expected_claim.weak);
+            assert_eq!(point.conjured, expected_claim.conjured);
+
+            let verified = verify_claim_output(
+                proof_raw,
+                output,
+                point.block_height,
+                context.parent_time,
+                Network::Mainnet,
+                ClaimFlags { hardened: false },
+                &OpenSslDnssecVerifier,
+            )
+            .expect("canonical lifecycle claim");
+            assert_eq!(verified.name, name.as_bytes());
+            assert_eq!(verified.name_hash.to_hex(), expected_claim.name_hash);
+            assert_eq!(verified.name_hash.to_hex(), name_hash);
+            assert_eq!(
+                verified.commit_hash.to_vec(),
+                decode_hex(&point.commit_hash)
+            );
+            assert_eq!(verified.commit_height, point.commit_height);
+            assert_eq!(verified.value, point.reserved_value);
+            assert_eq!(verified.fee, point.fee);
+            assert_eq!(verified.conjured, point.conjured);
+        };
+
+        for point in &fixture.lifecycle.lineage.points {
+            verify_point(
+                &fixture.lifecycle.lineage.name,
+                &fixture.lifecycle.lineage.name_hash,
+                point,
+            );
+        }
+        assert!(fixture.lifecycle.lineage.points[1..]
+            .iter()
+            .all(|point| point.output_value == fixture.lifecycle.lineage.points[0].output_value));
+        assert!(fixture.lifecycle.lineage.points[1..]
+            .iter()
+            .all(|point| point.conjured == point.output_value));
+
+        let terminal = &fixture.lifecycle.terminal;
+        assert_eq!(terminal.name, "vcel");
+        assert_eq!(terminal.blocks_before_claim_period, 3);
+        assert_eq!(
+            terminal.point.block_height + terminal.blocks_before_claim_period,
+            fixture.lifecycle.claim_period_height
+        );
+        verify_point(&terminal.name, &terminal.name_hash, &terminal.point);
+
+        let terminal_block = fixture
+            .blocks
+            .iter()
+            .find(|block| block.height == terminal.point.block_height)
+            .expect("terminal claim block");
+        let terminal_decoded =
+            Block::decode(&decode_hex(&terminal_block.raw)).expect("terminal claim block");
+        let proof_raw = &terminal_decoded.transactions[0].inputs[terminal.point.output_index]
+            .witness
+            .items[0];
+        let mut output =
+            terminal_decoded.transactions[0].outputs[terminal.point.output_index].clone();
+        output.covenant.items[1] = fixture.lifecycle.claim_period_height.to_le_bytes().to_vec();
+        assert!(matches!(
+            verify_claim_output(
+                proof_raw,
+                &output,
+                fixture.lifecycle.claim_period_height,
+                fixture.lifecycle.boundary.parent_time,
+                Network::Mainnet,
+                ClaimFlags { hardened: false },
+                &OpenSslDnssecVerifier,
+            ),
+            Err(ClaimConsensusError::NotReserved)
+        ));
+
+        let boundary = &fixture.lifecycle.boundary;
+        assert_eq!(boundary.block_height, fixture.lifecycle.claim_period_height);
+        assert_eq!(boundary.claim_count, 0);
+        let boundary_coinbase =
+            Transaction::decode(&decode_hex(&boundary.coinbase_raw)).expect("boundary coinbase");
+        assert_eq!(boundary_coinbase.locktime, boundary.block_height);
+        assert_eq!(boundary_coinbase.txid().to_hex(), boundary.coinbase_txid);
+        assert!(boundary_coinbase
+            .outputs
+            .iter()
+            .all(|output| output.covenant.kind != CovenantKind::Claim));
+        assert_eq!(terminal.name_hash, terminal_block.claims[0].name_hash);
+        assert_eq!(boundary.block_hash.len(), 64);
     }
 }

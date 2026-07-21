@@ -2775,9 +2775,59 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct MainnetClaimReplacementHistoryFixture {
+        schema: u32,
         canonical_context: MainnetClaimReplacementContextFixture,
         history: Vec<MainnetClaimReplacementFixture>,
+        lifecycle: MainnetClaimLifecycleFixture,
         blocks: Vec<MainnetClaimReplacementBlockFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimLifecycleFixture {
+        claim_period_height: u32,
+        lineage: MainnetClaimLineageFixture,
+        terminal: MainnetTerminalClaimFixture,
+        boundary: MainnetClaimBoundaryFixture,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimLineageFixture {
+        name: String,
+        name_hash: String,
+        points: Vec<MainnetClaimPointFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetTerminalClaimFixture {
+        name: String,
+        name_hash: String,
+        blocks_before_claim_period: u32,
+        point: MainnetClaimPointFixture,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimBoundaryFixture {
+        block_height: u32,
+        parent_time: u64,
+        claim_count: usize,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimPointFixture {
+        block_height: u32,
+        coinbase_txid: String,
+        output_index: u32,
+        output_value: u64,
+        reserved_value: u64,
+        fee: u64,
+        commit_height: u32,
+        weak: bool,
+        conjured: u64,
     }
 
     #[derive(Deserialize)]
@@ -2822,6 +2872,8 @@ mod tests {
         name: String,
         weak: bool,
         commit_height: u32,
+        reserved_value: u64,
+        fee: u64,
         output_value: u64,
         conjured: u64,
     }
@@ -4692,6 +4744,212 @@ mod tests {
         let snapshot = engine.store().snapshot().expect("final claim snapshot");
         assert_eq!(
             verify_stored_name_tree_root(&snapshot).expect("final claim tree root"),
+            TreeRoot::ZERO
+        );
+    }
+
+    #[test]
+    fn canonical_mainnet_terminal_and_third_generation_claims_replay() {
+        let fixture: MainnetClaimReplacementHistoryFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-replacements-v1.json"
+        ))
+        .expect("mainnet claim lifecycle fixture");
+        assert_eq!(fixture.schema, 2);
+        assert_eq!(
+            fixture.lifecycle.claim_period_height,
+            Network::Mainnet.params().names.claim_period
+        );
+        assert_eq!(fixture.lifecycle.lineage.name, "mylinksfree");
+        assert_eq!(fixture.lifecycle.lineage.points.len(), 3);
+
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        seed_mainnet_claim_replacement_headers(&store, &fixture.canonical_context);
+        let mut engine = StoredStateEngine::with_services(
+            store,
+            Network::Mainnet,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(
+                AirdropCoinbaseIssuanceVerifier::native(DeploymentState::from_states(
+                    [ThresholdState::Defined; 4],
+                ))
+                .expect("native issuance verifier"),
+            ),
+        )
+        .expect("mainnet claim lifecycle state engine");
+
+        let lineage_hash =
+            hash_name(&fixture.lifecycle.lineage.name).expect("claim lineage name hash");
+        assert_eq!(lineage_hash.to_hex(), fixture.lifecycle.lineage.name_hash);
+        let mut connected = Vec::new();
+        for (index, point) in fixture.lifecycle.lineage.points.iter().enumerate() {
+            let expected = fixture
+                .blocks
+                .iter()
+                .find(|block| block.height == point.block_height)
+                .expect("claim lifecycle block");
+            let context = fixture
+                .canonical_context
+                .blocks
+                .iter()
+                .find(|context| context.block_height == point.block_height)
+                .expect("claim lifecycle context");
+            let expected_claim = expected
+                .claims
+                .iter()
+                .find(|claim| {
+                    claim.name == fixture.lifecycle.lineage.name
+                        && claim.output_index == point.output_index as usize
+                })
+                .expect("claim lifecycle output");
+            assert_eq!(expected_claim.output_value, point.output_value);
+            assert_eq!(expected_claim.reserved_value, point.reserved_value);
+            assert_eq!(expected_claim.fee, point.fee);
+            assert_eq!(expected_claim.commit_height, point.commit_height);
+            assert_eq!(expected_claim.weak, point.weak);
+            assert_eq!(expected_claim.conjured, point.conjured);
+
+            let (candidate, summary) =
+                connect_mainnet_claim_fixture_block(&mut engine, expected, context);
+            assert!(summary.validation.claims_and_airdrops_valid);
+            assert_eq!(
+                candidate.transactions[0].txid().to_hex(),
+                point.coinbase_txid
+            );
+            assert_eq!(
+                candidate.transactions[0].outputs[point.output_index as usize].value,
+                point.output_value
+            );
+
+            let state = engine
+                .name_state(&lineage_hash)
+                .expect("claim lineage state read")
+                .expect("claim lineage state");
+            assert_eq!(state.height, point.block_height);
+            assert_eq!(state.renewal, point.block_height);
+            assert_eq!(state.claimed, point.commit_height);
+            assert_eq!(state.owner.txid.to_hex(), point.coinbase_txid);
+            assert_eq!(state.owner.index, point.output_index);
+            assert_eq!(state.weak, point.weak);
+            let coin = engine
+                .coin(&state.owner)
+                .expect("claim lineage coin read")
+                .expect("claim lineage coin");
+            assert_eq!(coin.value, point.output_value);
+            if index == 0 {
+                assert_eq!(point.conjured, point.reserved_value);
+                assert_eq!(point.reserved_value - point.fee, point.output_value);
+            } else {
+                assert_eq!(point.conjured, point.output_value);
+                assert_eq!(
+                    point.output_value,
+                    fixture.lifecycle.lineage.points[0].output_value
+                );
+            }
+            connected.push(candidate);
+        }
+        assert!(
+            fixture.lifecycle.lineage.points[2].block_height
+                - fixture.lifecycle.lineage.points[1].block_height
+                >= Network::Mainnet.params().names.claim_frequency
+        );
+
+        for index in (0..connected.len()).rev() {
+            let point = &fixture.lifecycle.lineage.points[index];
+            engine
+                .disconnect_block(DisconnectBlock {
+                    block_hash: connected[index].hash(),
+                    height: point.block_height,
+                })
+                .expect("claim lifecycle disconnect");
+            let restored = engine
+                .name_state(&lineage_hash)
+                .expect("restored claim lineage state");
+            if index == 0 {
+                assert!(restored.is_none());
+            } else {
+                let previous = &fixture.lifecycle.lineage.points[index - 1];
+                let restored = restored.expect("prior claim generation");
+                assert_eq!(restored.height, previous.block_height);
+                assert_eq!(restored.claimed, previous.commit_height);
+                assert_eq!(restored.owner.txid.to_hex(), previous.coinbase_txid);
+                assert_eq!(restored.owner.index, previous.output_index);
+            }
+        }
+
+        let terminal = &fixture.lifecycle.terminal;
+        assert_eq!(terminal.name, "vcel");
+        assert_eq!(terminal.blocks_before_claim_period, 3);
+        assert_eq!(
+            terminal.point.block_height + terminal.blocks_before_claim_period,
+            fixture.lifecycle.claim_period_height
+        );
+        let terminal_hash = hash_name(&terminal.name).expect("terminal claim name hash");
+        assert_eq!(terminal_hash.to_hex(), terminal.name_hash);
+        let terminal_block = fixture
+            .blocks
+            .iter()
+            .find(|block| block.height == terminal.point.block_height)
+            .expect("terminal claim block");
+        let terminal_context = fixture
+            .canonical_context
+            .blocks
+            .iter()
+            .find(|context| context.block_height == terminal.point.block_height)
+            .expect("terminal claim context");
+        let (terminal_candidate, terminal_summary) =
+            connect_mainnet_claim_fixture_block(&mut engine, terminal_block, terminal_context);
+        assert!(terminal_summary.validation.claims_and_airdrops_valid);
+        let terminal_state = engine
+            .name_state(&terminal_hash)
+            .expect("terminal claim state read")
+            .expect("terminal claim state");
+        assert_eq!(terminal_state.height, terminal.point.block_height);
+        assert_eq!(terminal_state.claimed, terminal.point.commit_height);
+        assert_eq!(
+            terminal_state.owner.txid.to_hex(),
+            terminal.point.coinbase_txid
+        );
+        assert_eq!(terminal_state.owner.index, terminal.point.output_index);
+
+        let historical = Block::decode(&decode_fixture_bytes(&terminal_block.raw))
+            .expect("terminal canonical block");
+        let mut ended_coinbase = historical.transactions[0].clone();
+        ended_coinbase.locktime = fixture.lifecycle.claim_period_height;
+        ended_coinbase.outputs[terminal.point.output_index as usize]
+            .covenant
+            .items[1] = fixture.lifecycle.claim_period_height.to_le_bytes().to_vec();
+        let ended = engine.issuance_verifier().verify_coinbase(
+            &ended_coinbase,
+            fixture.lifecycle.claim_period_height,
+            fixture.lifecycle.boundary.parent_time,
+            Network::Mainnet,
+        );
+        assert!(ended
+            .expect_err("claim-period boundary must reject claims")
+            .to_string()
+            .contains("not claimable"));
+        assert_eq!(
+            fixture.lifecycle.boundary.block_height,
+            fixture.lifecycle.claim_period_height
+        );
+        assert_eq!(fixture.lifecycle.boundary.claim_count, 0);
+
+        engine
+            .disconnect_block(DisconnectBlock {
+                block_hash: terminal_candidate.hash(),
+                height: terminal.point.block_height,
+            })
+            .expect("terminal claim disconnect");
+        assert!(engine
+            .name_state(&terminal_hash)
+            .expect("disconnected terminal state")
+            .is_none());
+        let snapshot = engine.store().snapshot().expect("final lifecycle snapshot");
+        assert_eq!(
+            verify_stored_name_tree_root(&snapshot).expect("final lifecycle tree root"),
             TreeRoot::ZERO
         );
     }

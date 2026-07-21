@@ -89,6 +89,12 @@
   ten-claim replacement block 76,722 are pinned with checkpoint-linked parent
   contexts. Native replay preserves predecessor values, advances commit height
   1 to 2, applies post-deflation replacement accounting, and reverses all state.
+- A complete three-generation `mylinksfree` lineage at heights 55,798,
+  177,097, and 178,235 advances commit height 1→2→3, preserves exact
+  post-deflation value and claim-frequency rules, and disconnects through both
+  predecessors. The final accepted claim (`vcel`, height 210,237), canonical
+  claim-period header/coinbase at 210,240, and a boundary mutation pin HSD's
+  terminal accept/reject behavior through native consensus and state services.
 
 ### Network and synchronization foundation
 
@@ -150,12 +156,13 @@ These are substantial foundations, not a production full node.
   historical exceptions.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
-- Current/live valid claim-proof evidence, remaining historical datasets, and
-  complete replay beyond the pinned initial/replacement claim histories. Claim DNSSEC
-  algorithms and DS digests, the full upstream historical proof corpus,
-  deflation accounting, complete airdrop-key verification, active-node
-  deployment composition, and airdrop duplicate/conjured-value accounting are
-  implemented.
+- Independently sourced live DNSSEC-proof evidence for historical-policy
+  qualification, remaining historical datasets, and complete replay beyond the
+  pinned initial, multi-generation, and terminal claim histories. Mainnet no
+  longer accepts new claims after height 210,240. Claim DNSSEC algorithms and
+  DS digests, the full upstream historical proof corpus, deflation accounting,
+  complete airdrop-key verification, active-node deployment composition, and
+  airdrop duplicate/conjured-value accounting are implemented.
 - Complete contextual covenant/name behavior across mainnet history; all
   non-claim families now have deterministic HSD differential coverage.
 - Deployment-scale Urkel compaction performance/priority qualification and

@@ -82,6 +82,9 @@ Current evidence includes:
   blocks at heights 39,086-39,101 and the ten-claim replacement block 76,722,
   with exact value preservation, commit advancement, native state replay, and
   reverse disconnect;
+- checkpoint-linked `mylinksfree` claim-height 1→2→3 replay at blocks 55,798,
+  177,097, and 178,235, terminal `vcel` acceptance at 210,237, and exact
+  claim-period rejection at the canonical height-210,240 boundary;
 - build-checked libFuzzer targets for bounded Claim/TXT/ownership-proof and
   airdrop key/proof decoding plus their derived hash, sanity, and Merkle paths;
 - signature-type encoding validity;
@@ -331,11 +334,13 @@ The bounded replacement history is checked independently:
 NODE_BACKEND=js npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
 ```
 
-It pins all eight full raw blocks, checkpoint-linked parent-time contexts,
-height-1 and height-2 commit headers, 66 initial claims, and the ten exact
-initial-to-replacement mappings. Native replay connects the seven predecessor
-coinbases, verifies every replacement against its prior coin and `NameState`,
-then disconnects the sequence back to an empty authenticated tree. The
+It pins 12 full raw claim blocks, the compact canonical boundary
+header/coinbase, checkpoint-linked parent-time contexts, commit headers 1/2/3,
+the existing 66 initial and ten replacement claims, the complete `mylinksfree`
+1→2→3 lineage, and terminal `vcel`. Native replay connects the seven original
+predecessor coinbases, verifies every replacement against its prior coin and
+`NameState`, replays and reverses both later `mylinksfree` generations, and
+proves the height-210,240 boundary rejects a mutated terminal proof. The
 mixed-size `.zone` DNSKEY RRset is a regression for RFC 4034/HSD canonical
 RDATA ordering.
 
@@ -347,8 +352,9 @@ NODE_BACKEND=js npm run refresh-hsrd-mainnet-claim-replacements \
   --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
 ```
 
-These are bounded canonical initial and replacement histories, not complete
-historical claim, UTXO, covenant, name-root, or reorganization replay.
+These are bounded canonical initial, multi-generation, and terminal histories,
+not complete historical claim, UTXO, covenant, name-root, or reorganization
+replay.
 
 The contextual name-transition fixture is generated directly through the
 pinned HSD `Chain.verifyCovenants` implementation. Each case records the exact

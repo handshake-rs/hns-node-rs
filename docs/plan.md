@@ -71,6 +71,11 @@ reserved low-latency paths.
   coinbases and all ten replacements at height 76,722, including exact
   predecessor coin values, height-1/height-2 commit ancestry, post-deflation
   accounting, authenticated state replacement, and reverse disconnect.
+- A checkpoint-linked complete `mylinksfree` claim lineage at heights 55,798,
+  177,097, and 178,235 advances commit height 1→2→3, enforces identical
+  retained value and claim frequency, and restores both predecessors on
+  disconnect. The final accepted mainnet claim (`vcel`, height 210,237) and the
+  canonical height-210,240 header/coinbase pin the claim-period boundary.
 - Reserved/lockup datasets and renewal-policy fixtures.
 - Exact `NameState` encoding and undo.
 - Correctness-first exact Urkel roots plus byte-for-byte canonical HSD
@@ -120,11 +125,15 @@ reserved low-latency paths.
 
 ## Remaining implementation order
 
-1. **Claim and airdrop validation** — capture current/live valid claim evidence
-   and replay the proof-capable active-node service across the rest of mainnet
-   history. Heights 62,517 and 39,086-39,101 -> 76,722 now supply bounded
-   checkpoint-linked initial and replacement cases with exact parent-time and
-   coinbase state replay. Exact Claim/DNSSEC/TXT
+1. **Claim and airdrop validation** — capture independently sourced live DNSSEC
+   proof evidence under explicit historical policy and replay the proof-capable
+   active-node service across the rest of mainnet history. Heights 62,517 and
+   39,086-39,101 -> 76,722 supply bounded checkpoint-linked initial and
+   replacement cases with exact parent-time and coinbase state replay; heights
+   55,798 -> 177,097 -> 178,235 add a complete third-generation lineage, and
+   210,237 -> 210,240 pins the final accepted claim and terminal rejection.
+   Mainnet's claim period has ended, so remaining live evidence cannot be a new
+   on-chain claim. Exact Claim/DNSSEC/TXT
    codecs, all HSD DS digests including GOST94, the complete upstream
    historical ownership-proof corpus, ICANN-rooted signature verification,
    parent-derived deployment composition, claim deflation and name-state

@@ -120,9 +120,11 @@
         "dnssec",
         "coinbase",
         "replacement",
+        "lifecycle",
+        "terminal-boundary",
         "state"
       ],
-      "blake2b256": "7d0b6a54b5ab552a2cb33e312827375750108d5c8b8b0fd4c6e733c83f6c818b"
+      "blake2b256": "42361a49966c62ce3cb0eb4259692909cc4d970eceebf4bad731a6395ed517f9"
     },
     {
       "id": "covenant-codec-v1",
