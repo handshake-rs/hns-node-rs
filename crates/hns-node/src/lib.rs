@@ -10,7 +10,7 @@ pub use mining_engine::{
 pub use shadow_sync::{ShadowSyncConfig, ShadowSyncDiagnostics};
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     future::Future,
     net::SocketAddr,
     path::PathBuf,
@@ -52,9 +52,9 @@ use hns_rpc::{
 };
 use hns_state::{
     connect_block_to_batch_with_services, decode_coin, decode_name_state,
-    disconnect_block_to_batch, validate_persisted_name_tree, verify_stored_name_tree_root,
-    AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock, StateServices,
-    StoredStateEngine,
+    disconnect_block_to_batch, load_name_tree_snapshot_pins, validate_persisted_name_tree,
+    verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock,
+    DisconnectBlock, NameTreeSnapshotPin, StateServices, StoredStateEngine,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_clean_shutdown, mark_unclean_start, open_store,
@@ -1141,6 +1141,20 @@ impl NodeState {
             .scan_prefix(ColumnFamily::HeightIndex, b"")
             .context("failed to scan active height index")?;
         heights.sort_by(|left, right| left.0.cmp(&right.0));
+        let tree_interval = self.network.params().names.tree_interval;
+        if tree_interval == 0 {
+            anyhow::bail!("network name-tree snapshot interval is zero");
+        }
+        let pins = load_name_tree_snapshot_pins(&snapshot)
+            .map_err(|error| anyhow::anyhow!("durable name-tree snapshot pin failed: {error}"))?;
+        let pin_count = pins.len();
+        let mut name_tree_pins = pins
+            .into_iter()
+            .map(|pin| (pin.height, pin))
+            .collect::<BTreeMap<_, NameTreeSnapshotPin>>();
+        if name_tree_pins.len() != pin_count {
+            anyhow::bail!("durable name-tree snapshot pins contain duplicate heights");
+        }
 
         match active_tip.as_ref() {
             None if !heights.is_empty() => {
@@ -1152,6 +1166,9 @@ impl NodeState {
                         "empty active chain has non-empty durable name-tree root {:?}",
                         durable_name_tree_root
                     );
+                }
+                if !name_tree_pins.is_empty() {
+                    anyhow::bail!("empty active chain has durable name-tree snapshot pins");
                 }
             }
             Some(tip) => {
@@ -1249,6 +1266,23 @@ impl NodeState {
                             hash.to_hex()
                         );
                     }
+                    if height % tree_interval == 0 {
+                        let pin = name_tree_pins.remove(&height).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "active interval height {height} is missing its name-tree snapshot pin"
+                            )
+                        })?;
+                        if pin.block_hash != hash || pin.root != undo.resulting_tree_root {
+                            anyhow::bail!(
+                                "active interval height {height} has an inconsistent name-tree snapshot pin"
+                            );
+                        }
+                        validate_persisted_name_tree(&snapshot, pin.root).map_err(|error| {
+                            anyhow::anyhow!(
+                                "durable name-tree snapshot at height {height} is invalid: {error}"
+                            )
+                        })?;
+                    }
                     if *undo.previous_tree_root.as_bytes() != expected_previous_tree_root {
                         anyhow::bail!(
                             "active block {} breaks name-tree root continuity",
@@ -1276,6 +1310,9 @@ impl NodeState {
                     );
                 }
             }
+        }
+        if !name_tree_pins.is_empty() {
+            anyhow::bail!("durable name-tree snapshot pins are not on active interval heights");
         }
 
         match (best_header.as_ref(), active_tip.as_ref()) {
@@ -3080,7 +3117,7 @@ mod tests {
         Witness,
     };
     use hns_rpc::{JsonRpcRequest, RpcService};
-    use hns_state::{StateEngine, StateView};
+    use hns_state::{name_tree_snapshot_pin_key, StateEngine, StateView};
     use hns_store::ReadSnapshot;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3764,6 +3801,51 @@ mod tests {
     }
 
     #[test]
+    fn startup_rejects_missing_or_corrupt_name_tree_snapshot_pin() {
+        for missing in [true, false] {
+            let store = StoreHandle::memory();
+            let state =
+                NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+            let mut node = NodeService::try_with_state(
+                NodeConfig {
+                    network: Network::Regtest,
+                    ..NodeConfig::default()
+                },
+                state,
+            )
+            .expect("node");
+            let block = block_with_commitments(vec![coinbase_transaction()]);
+            node.connect_block(NodeBlockImport::fixture(block, 0, 1))
+                .expect("connect interval block");
+            drop(node);
+
+            let key = name_tree_snapshot_pin_key(0);
+            let snapshot = store.snapshot().expect("snapshot");
+            let mut raw = snapshot
+                .get(ColumnFamily::Snapshots, &key)
+                .expect("pin read")
+                .expect("pin");
+            drop(snapshot);
+            let mut batch = store.batch();
+            if missing {
+                batch
+                    .delete(ColumnFamily::Snapshots, &key)
+                    .expect("delete pin");
+            } else {
+                *raw.last_mut().expect("checksum byte") ^= 1;
+                batch
+                    .put(ColumnFamily::Snapshots, &key, &raw)
+                    .expect("corrupt pin");
+            }
+            store.commit(batch).expect("commit pin fault");
+
+            let error = NodeState::from_store_for_network(store, Network::Regtest)
+                .expect_err("snapshot pin corruption");
+            assert!(error.to_string().contains("snapshot pin"), "{error}");
+        }
+    }
+
+    #[test]
     fn startup_rejects_missing_or_corrupt_content_addressed_name_nodes() {
         for missing in [true, false] {
             let store = StoreHandle::memory();
@@ -3793,7 +3875,7 @@ mod tests {
             proof_state
                 .connect_block(ConnectBlock {
                     block_hash: name_block.hash(),
-                    height: 200,
+                    height: 201,
                     coinbase_maturity: 0,
                     block_reward: 50,
                     block: &name_block,

@@ -45,6 +45,10 @@ The current foundation verifies or records evidence for:
 - immutable path-local mutation that verifies every touched record, retains old
   roots, and uses the materialized O(N) rebuild as an independent startup and
   differential-test oracle;
+- checksummed network-interval root pins bound to active block/undo history,
+  plus startup validation of every pinned reachable tree;
+- explicit mark-and-sweep compaction that validates the complete retained-root
+  union before staging deletions and commits the deletion batch atomically;
 - atomic single- and multi-block database mutations;
 - sequence-consistent snapshots;
 - bounded HNS framing, peer lifecycle, header synchronization, body scheduling,
@@ -77,8 +81,8 @@ The following remain untrusted and release-blocking:
   the pinned initial/replacement histories;
 - complete contextual name consensus over mainnet historical cases beyond the
   deterministic all-family transition corpus;
-- Urkel interval snapshots, retained-node compaction, and production crash/fault
-  qualification;
+- production compaction scheduling/scale qualification and RocksDB
+  process-crash/fault qualification;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;
 - Brontide, durable peer reputation, discovery, compact blocks, and
   production-complete contextual transaction relay;

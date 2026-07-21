@@ -71,6 +71,10 @@ Implemented:
   startup/transition validation, and RocksDB reopen evidence.
 - Path-local immutable mutation with HSD incremental-root parity, independent
   rebuild checks, retained historical proofs, and multi-step overlay undo.
+- Checksummed network-interval root pins validated across connect, disconnect,
+  restart, and corruption cases.
+- Validated mark-and-sweep compaction retaining the current, undo, and pinned
+  root union, including idempotence and failed-commit atomicity evidence.
 - Correct pre-state root validation and durable post-state root binding.
 - Previous/resulting roots in undo and atomic root restoration.
 - True store snapshots and one-batch multi-block reorganizations.
@@ -80,8 +84,8 @@ Implemented:
 
 Remaining:
 
-- Urkel interval snapshots, retained-node compaction, and production crash/fault
-  qualification;
+- production compaction scheduling/scale qualification and RocksDB
+  process-crash/fault qualification;
 - complete historical contextual claim/airdrop behavior;
 - pruning and RocksDB crash/fault qualification;
 - complete mainnet reorganization/root replay.

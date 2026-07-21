@@ -170,8 +170,8 @@ remain release-blocking:
   pinned initial/replacement histories for the active deployment-composed
   proof/accounting service;
 - complete contextual name-state parity;
-- Urkel interval-snapshot, retained-node-compaction, and production crash/fault
-  qualification;
+- production Urkel compaction scheduling/scale qualification and RocksDB
+  process-crash/fault qualification;
 - active-state IBD and live HSD state comparison;
 - contextually complete peer transaction admission;
 - measured production template and solved-block latency;

@@ -42,9 +42,10 @@ Implemented:
 - Separate durable best-header and active-best-block bindings.
 - Strict greater-work activation; equal-work branches preserve the existing
   first-seen tip.
-- Schema version **12**, storage profile **`hsrd-mining-v8`**, explicit clean
+- Schema version **13**, storage profile **`hsrd-mining-v9`**, explicit clean
   reindex behavior, durable name-tree-root/content-addressed-node and HSD
-  airdrop-field bindings, hash-keyed deployment-state caches, and a checksummed
+  airdrop-field bindings, versioned checksummed network-interval name-tree
+  snapshot pins, hash-keyed deployment-state caches, and a checksummed
   synchronization checkpoint.
 - Startup checks that compare durable name-tree-root metadata against the
   materialized name-state column family.
@@ -152,6 +153,13 @@ Implemented:
 - Correct Handshake root timing: block `H` commits to the inherited pre-state
   root; applying block `H` produces the root that block `H+1` must commit to.
 - Durable previous/resulting roots in block undo records.
+- Versioned, checksummed root pins written at each network `treeInterval`,
+  removed with their active block on disconnect, and exhaustively checked at
+  startup against active indexes, undo, and reachable authenticated records.
+- Explicit mark-and-sweep node compaction that validates the union reachable
+  from the current root, every retained undo root, and every interval pin
+  before atomically deleting anything else; malformed metadata and failed
+  commits leave all records unchanged.
 - Atomic name-state and durable-root writes on connect, disconnect, and
   multi-block reorganization.
 - Authenticated CLAIM name-state creation/replacement with active-chain commit,
@@ -166,8 +174,8 @@ Still release-blocking:
 - current/live production-valid claim-proof evidence and complete historical
   claim replay beyond the pinned initial/replacement histories;
 - full contextual covenant parity across mainnet history;
-- interval snapshots, retained-node compaction, and production crash/fault
-  qualification for the incremental Urkel lifecycle;
+- production compaction scheduling/scale qualification and RocksDB
+  process-crash/fault qualification for the incremental Urkel lifecycle;
 - complete historical root, undo, and reorganization replay.
 
 ## Live P2P and restartable shadow synchronization
@@ -318,7 +326,8 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 
 ## Storage migration
 
-Schema version 12 and storage profile `hsrd-mining-v8` add content-addressed
-authenticated name-tree nodes and path-local proof reads to schema 11's
-deployment-state caches. Existing pre-authority databases must be reindexed.
-No implicit in-place migration is attempted.
+Schema version 13 and storage profile `hsrd-mining-v9` add checksummed
+network-interval name-tree snapshot pins and retained-root node compaction to
+schema 12's content-addressed authenticated nodes and path-local proof reads.
+Existing pre-authority databases must be reindexed. No implicit in-place
+migration is attempted.

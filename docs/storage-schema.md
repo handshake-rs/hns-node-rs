@@ -7,12 +7,13 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **12** and the storage profile is
-**`hsrd-mining-v8`**. This is an intentional clean-reindex boundary.
+The current persistent schema version is **13** and the storage profile is
+**`hsrd-mining-v9`**. This is an intentional clean-reindex boundary.
 
-Version 12 contains the authority, state, shadow-synchronization, and mining
+Version 13 contains the authority, state, shadow-synchronization, and mining
 publication schema, durable HSD airdrop duplicate prevention, active-chain
-deployment-state persistence, and content-addressed authenticated name nodes:
+deployment-state persistence, content-addressed authenticated name nodes, and
+durable interval-root retention metadata:
 
 - granular block-status bit assignments;
 - spent output address in the UTXO `Coin` codec;
@@ -22,13 +23,16 @@ deployment-state persistence, and content-addressed authenticated name nodes:
 - mandatory 32-byte `name-tree-root` metadata binding;
 - canonical content-addressed `name_tree_nodes` records keyed by their exact
   HSD/Urkel node hash and staged atomically with name-state/root changes;
+- versioned, checksummed `name-tree-snapshot/v1/<height-be>` records written in
+  the `snapshots` column family at each network name-tree interval; each value
+  binds its active block hash and resulting root;
 - mandatory 27,195-byte MSB-first `airdrop-field` metadata binding for all
   217,557 HSD airdrop and faucet allocation positions;
 - separate best-header and active-best-block bindings;
 - chain-epoch and mining-generation metadata;
 - a versioned, checksummed `sync-checkpoint` metadata record;
 - versioned and checksummed solved-block publication intents stored under
-  `publication/v1/<block-hash>` in the `snapshots` column family.
+  `publication/v1/<block-hash>` in the `snapshots` column family;
 - versioned deployment-state records stored under
   `deployment-state/v1/<block-hash>` in the `snapshots` column family. Each
   value binds the block height and all four HSD threshold states; active-chain
@@ -112,13 +116,15 @@ cannot promote a block or grant authority.
   32-byte name hash.
 - `name_tree_nodes`: canonical leaf/internal node records keyed by their exact
   authenticated root. Historical records are retained for undo and snapshot
-  reachability; compaction remains a separately qualified future boundary.
+  reachability. Explicit compaction validates every retained root before
+  atomically deleting unreachable records.
 - `undo`: block UTXO/name/airdrop undo records, including pre-state and
   post-state roots.
 - `snapshots`: operational durable records. The mining engine uses the bounded
   `publication/v1/<block-hash>` namespace for solved-block publication intents.
   Each intent commits to its mining generation, job ID, block hash, creation
-  time, and exact raw block and is checksummed on decode.
+  time, and exact raw block and is checksummed on decode. State persistence uses
+  `name-tree-snapshot/v1/<height-be>` for network-interval root pins.
 - `peers`, `orphans`, `mempool_persist`: reserved operational records as those
   subsystems mature. Current peer scores, reconnect state, orphan bodies, and
   the mining-engine mempool/template cache are process-local and bounded
@@ -147,7 +153,7 @@ path. The queue is bounded by configuration and by a hard maximum.
 
 ## Block status bit layout
 
-Schema version 12 preserves the existing `u32` status layout:
+Schema version 13 preserves the existing `u32` status layout:
 
 | Bit | Field | Meaning |
 |---:|---|---|
@@ -241,7 +247,7 @@ exact bytes before fixture use.
 
 ## Migration policy
 
-Schema 12/profile `hsrd-mining-v8` requires an explicit clean reindex from every
+Schema 13/profile `hsrd-mining-v9` requires an explicit clean reindex from every
 prior handoff. No automatic in-place migration is attempted while `hsrd`
 remains pre-authority. A failed or interrupted reindex must not modify the
 previous database.
@@ -262,6 +268,20 @@ also remains a differential-test oracle; it is no longer the steady-state root
 construction path. Pinned HSD incremental roots and canonical proof bytes match
 the path-local implementation, including multi-name history and reverse undo.
 
-Production closure still requires interval snapshots, retained-node compaction,
-and crash/fault qualification without weakening historical-root reachability or
-the startup oracle.
+Active connects now write a versioned, checksummed root pin whenever the height
+is divisible by the network's HSD `treeInterval`; disconnect removes the exact
+matching pin. Startup requires every active interval height to have a matching
+block/undo/root pin, rejects pins outside the active interval path, and fully
+validates each pinned reachable tree.
+
+The explicit compactor first validates and unions all nodes reachable from the
+current bound root, every previous/resulting root in retained undo, and every
+interval pin. It validates all stored node keys before staging any deletion,
+then atomically removes only records outside that union. Malformed pins,
+missing/corrupt reachable nodes, and failed commits leave the durable node set
+unchanged. State transitions and compaction must be serialized by the node
+coordinator.
+
+Production closure still requires compaction scheduling and deployment-scale
+performance qualification plus RocksDB process-crash/fault injection without
+weakening historical-root reachability or the startup oracle.

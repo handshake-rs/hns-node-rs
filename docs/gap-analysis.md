@@ -9,10 +9,11 @@
 - Exact unsigned 256-bit chainwork and durable header/block/raw-body indexes.
 - Memory and RocksDB stores behind typed traits, atomic batches, true RocksDB
   snapshots, and a read-your-writes reorganization overlay.
-- Schema version 12, profile `hsrd-mining-v8`, network, genesis, epoch,
+- Schema version 13, profile `hsrd-mining-v9`, network, genesis, epoch,
   mandatory name-tree-root/content-addressed-node and HSD airdrop-field
-  bindings, hash-keyed deployment-state caches, checksummed sync checkpoint,
-  and a bounded checksummed solved-block publication namespace.
+  bindings, checksummed network-interval root pins, hash-keyed deployment-state
+  caches, checksummed sync checkpoint, and a bounded checksummed solved-block
+  publication namespace.
 - Durable alternate branches, separate best-header and active-block bindings,
   equal-work stability, strict greater-work activation, and one-batch
   replacement after ancestry/body/status/work/root checks.
@@ -53,6 +54,10 @@
 - Path-local immutable insert/replace/remove, exact HSD incremental-root parity,
   independent materialized rebuild checks, retained historical proofs, and
   read-your-writes multi-block undo coverage.
+- Network-parameter interval root pins with connect/disconnect and startup
+  validation, plus validated mark-and-sweep compaction over the current, undo,
+  and pinned-root reachable union. Malformed pins and failed commits preserve
+  every node.
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
 - Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,
@@ -146,8 +151,8 @@ These are substantial foundations, not a production full node.
   implemented.
 - Complete contextual covenant/name behavior across mainnet history; all
   non-claim families now have deterministic HSD differential coverage.
-- Urkel interval snapshots, retained-node compaction, and production crash/fault
-  qualification.
+- Production Urkel compaction scheduling/scale qualification and RocksDB
+  process-crash/fault qualification.
 
 ### Chain and network qualification
 

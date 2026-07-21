@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{btree_map::Entry, BTreeMap, HashMap, HashSet},
+    collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     sync::Arc,
 };
@@ -17,21 +17,26 @@ use hns_consensus::{
     MEDIAN_TIMESPAN,
 };
 use hns_primitives::{
-    Address, AirdropSignatureVerifier, Amount, Block, BlockHash, Coin, Covenant, CovenantKind,
-    DnssecVerifier, Height, NameHash, NameLifecycleState, NameState, Outpoint, PrimitiveError,
-    Reader, Transaction, UnavailableAirdropSignatureVerifier, Writer, AIRDROP_TREE_LEAVES,
-    MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_TX_SIZE,
+    blake2b_256, Address, AirdropSignatureVerifier, Amount, Block, BlockHash, Coin, Covenant,
+    CovenantKind, DnssecVerifier, Height, NameHash, NameLifecycleState, NameState, Outpoint,
+    PrimitiveError, Reader, Transaction, UnavailableAirdropSignatureVerifier, Writer,
+    AIRDROP_TREE_LEAVES, MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE,
+    MAX_TX_SIZE,
 };
 use hns_store::{
     ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES,
 };
 use hns_urkel::{
-    prove_hsd_from_records, update_record_tree, validate_record_root, validate_record_tree,
-    MemoryUrkel, NameTreeSnapshot, TreeRoot, UrkelError, UrkelProof,
+    prove_hsd_from_records, reachable_record_roots, update_record_tree, validate_record_root,
+    validate_record_tree, MemoryUrkel, NameTreeSnapshot, TreeRoot, UrkelError, UrkelProof,
 };
 use serde::{Deserialize, Serialize};
 
 const BLOCK_UNDO_VERSION: u32 = 5;
+const NAME_TREE_SNAPSHOT_PIN_VERSION: u32 = 1;
+pub const NAME_TREE_SNAPSHOT_PIN_PREFIX: &[u8] = b"name-tree-snapshot/v1/";
+const NAME_TREE_SNAPSHOT_PIN_BODY_SIZE: usize = 4 + 4 + 32 + 32;
+const NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE: usize = NAME_TREE_SNAPSHOT_PIN_BODY_SIZE + 32;
 const OUTPOINT_KEY_SIZE: usize = 36;
 const ADDRESS_CODEC_MAX: usize = 2 + MAX_ADDRESS_HASH_SIZE;
 const COIN_CODEC_MAX: usize = OUTPOINT_KEY_SIZE + 8 + 4 + 1 + ADDRESS_CODEC_MAX + MAX_TX_SIZE + 9;
@@ -192,6 +197,69 @@ impl BlockUndo {
             previous_name_states,
         })
     }
+}
+
+/// Durable interval commitment for one active-chain post-state root. Pins are
+/// checksummed and height-keyed so a replacement branch atomically removes the
+/// old interval binding before installing its own.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameTreeSnapshotPin {
+    pub height: Height,
+    pub block_hash: BlockHash,
+    pub root: TreeRoot,
+}
+
+impl NameTreeSnapshotPin {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::with_capacity(NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE);
+        writer.write_u32(NAME_TREE_SNAPSHOT_PIN_VERSION);
+        writer.write_u32(self.height);
+        writer.write_bytes(self.block_hash.as_bytes());
+        writer.write_bytes(self.root.as_bytes());
+        let mut raw = writer.finish();
+        debug_assert_eq!(raw.len(), NAME_TREE_SNAPSHOT_PIN_BODY_SIZE);
+        raw.extend_from_slice(&blake2b_256(&raw));
+        raw
+    }
+
+    pub fn decode(raw: &[u8]) -> Result<Self, StateError> {
+        if raw.len() != NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE {
+            return Err(StateError::Codec(format!(
+                "name-tree snapshot pin contains {} bytes; expected {NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE}",
+                raw.len()
+            )));
+        }
+        let (body, checksum) = raw.split_at(NAME_TREE_SNAPSHOT_PIN_BODY_SIZE);
+        if checksum != blake2b_256(body) {
+            return Err(StateError::Codec(
+                "name-tree snapshot pin checksum mismatch".to_owned(),
+            ));
+        }
+        let mut reader = Reader::new(body, NAME_TREE_SNAPSHOT_PIN_BODY_SIZE)?;
+        let version = reader.read_u32()?;
+        if version != NAME_TREE_SNAPSHOT_PIN_VERSION {
+            return Err(StateError::Codec(format!(
+                "unsupported name-tree snapshot pin version {version}"
+            )));
+        }
+        let height = reader.read_u32()?;
+        let block_hash = BlockHash::new(reader.read_hash()?);
+        let root = TreeRoot::new(reader.read_hash()?);
+        reader.ensure_finished()?;
+        Ok(Self {
+            height,
+            block_hash,
+            root,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameTreeCompactionSummary {
+    pub retained_roots: usize,
+    pub nodes_before: usize,
+    pub nodes_retained: usize,
+    pub nodes_deleted: usize,
 }
 
 pub trait StateView {
@@ -598,6 +666,19 @@ impl<S: Store> StoredStateEngine<S> {
         let proof = prove_persisted_name_tree(&snapshot, root, name_hash)?;
         Ok((root, proof))
     }
+
+    /// Atomically remove content-addressed records that are unreachable from
+    /// the current root, active undo history, or durable interval pins. Node
+    /// coordination must serialize this maintenance operation with state
+    /// transitions, just like connect/disconnect.
+    pub fn compact_name_tree_nodes(&mut self) -> Result<NameTreeCompactionSummary, StateError> {
+        let snapshot = self.store.snapshot()?;
+        let mut batch = self.store.batch();
+        let summary = stage_name_tree_node_compaction(&snapshot, &mut batch)?;
+        drop(snapshot);
+        self.store.commit(batch)?;
+        Ok(summary)
+    }
 }
 
 impl<S: Store> StateView for StoredStateEngine<S> {
@@ -907,6 +988,23 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         request.block_hash.as_bytes(),
         &undo.encode()?,
     )?;
+    let tree_interval = services.network.params().names.tree_interval;
+    if tree_interval == 0 {
+        return Err(StateError::Codec(
+            "network name-tree snapshot interval is zero".to_owned(),
+        ));
+    }
+    if request.height % tree_interval == 0 {
+        stage_name_tree_snapshot_pin(
+            snapshot,
+            batch,
+            &NameTreeSnapshotPin {
+                height: request.height,
+                block_hash: request.block_hash,
+                root: resulting_tree_root,
+            },
+        )?;
+    }
 
     Ok(StateSummary {
         coins_created: undo.created_coins.len(),
@@ -1515,6 +1613,7 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
         MetaKey::NameTreeRoot.as_bytes(),
         restored_tree_root.as_bytes(),
     )?;
+    stage_remove_name_tree_snapshot_pin(snapshot, batch, undo)?;
     batch.delete(ColumnFamily::Undo, request.block_hash.as_bytes())?;
 
     Ok(StateSummary {
@@ -1712,6 +1811,151 @@ pub fn prove_persisted_name_tree<T: ReadSnapshot>(
         load_persisted_node(snapshot, node_root)
     })
     .map_err(StateError::NameTree)
+}
+
+pub fn name_tree_snapshot_pin_key(height: Height) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NAME_TREE_SNAPSHOT_PIN_PREFIX.len() + 4);
+    key.extend_from_slice(NAME_TREE_SNAPSHOT_PIN_PREFIX);
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+pub fn load_name_tree_snapshot_pins<T: ReadSnapshot>(
+    snapshot: &T,
+) -> Result<Vec<NameTreeSnapshotPin>, StateError> {
+    let entries = snapshot.scan_prefix(ColumnFamily::Snapshots, NAME_TREE_SNAPSHOT_PIN_PREFIX)?;
+    let mut pins = Vec::with_capacity(entries.len());
+    for (key, raw) in entries {
+        let pin = NameTreeSnapshotPin::decode(&raw)?;
+        if key != name_tree_snapshot_pin_key(pin.height) {
+            return Err(StateError::NameTreeSnapshotPinInvariant {
+                height: pin.height,
+                reason: "snapshot key does not match its encoded height".to_owned(),
+            });
+        }
+        pins.push(pin);
+    }
+    Ok(pins)
+}
+
+fn stage_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    pin: &NameTreeSnapshotPin,
+) -> Result<(), StateError> {
+    let key = name_tree_snapshot_pin_key(pin.height);
+    let raw = pin.encode();
+    match snapshot.get(ColumnFamily::Snapshots, &key)? {
+        Some(existing) if existing != raw => {
+            return Err(StateError::NameTreeSnapshotPinConflict { height: pin.height });
+        }
+        Some(_) => {}
+        None => batch.put(ColumnFamily::Snapshots, &key, &raw)?,
+    }
+    Ok(())
+}
+
+fn stage_remove_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    undo: &BlockUndo,
+) -> Result<(), StateError> {
+    let key = name_tree_snapshot_pin_key(undo.height);
+    let Some(raw) = snapshot.get(ColumnFamily::Snapshots, &key)? else {
+        return Ok(());
+    };
+    let pin = NameTreeSnapshotPin::decode(&raw)?;
+    if pin.height != undo.height
+        || pin.block_hash != undo.block_hash
+        || pin.root != undo.resulting_tree_root
+    {
+        return Err(StateError::NameTreeSnapshotPinInvariant {
+            height: undo.height,
+            reason: "disconnect target does not match the durable interval pin".to_owned(),
+        });
+    }
+    batch.delete(ColumnFamily::Snapshots, &key)?;
+    Ok(())
+}
+
+fn retained_name_tree_roots<T: ReadSnapshot>(
+    snapshot: &T,
+) -> Result<BTreeSet<TreeRoot>, StateError> {
+    let mut roots = BTreeSet::from([load_stored_name_tree_root(snapshot)?]);
+    let mut undos = BTreeMap::new();
+    for (key, raw) in snapshot.scan_prefix(ColumnFamily::Undo, b"")? {
+        let undo = BlockUndo::decode(&raw)?;
+        if key.as_slice() != undo.block_hash.as_bytes() {
+            return Err(StateError::Codec(
+                "block undo key does not match its encoded block hash".to_owned(),
+            ));
+        }
+        roots.insert(undo.previous_tree_root);
+        roots.insert(undo.resulting_tree_root);
+        undos.insert(undo.block_hash, undo);
+    }
+
+    for pin in load_name_tree_snapshot_pins(snapshot)? {
+        let Some(undo) = undos.get(&pin.block_hash) else {
+            return Err(StateError::NameTreeSnapshotPinInvariant {
+                height: pin.height,
+                reason: "pinned block undo is missing".to_owned(),
+            });
+        };
+        if undo.height != pin.height || undo.resulting_tree_root != pin.root {
+            return Err(StateError::NameTreeSnapshotPinInvariant {
+                height: pin.height,
+                reason: "pin disagrees with its block undo".to_owned(),
+            });
+        }
+        roots.insert(pin.root);
+    }
+    Ok(roots)
+}
+
+/// Validate every retained root before staging any deletion, then remove all
+/// content-addressed records outside their reachable union. Callers commit the
+/// supplied batch atomically with no concurrent state transition.
+pub fn stage_name_tree_node_compaction<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+) -> Result<NameTreeCompactionSummary, StateError> {
+    let retained_roots = retained_name_tree_roots(snapshot)?;
+    let reachable = reachable_record_roots(retained_roots.iter().copied(), |node_root| {
+        load_persisted_node(snapshot, node_root)
+    })?;
+    let entries = snapshot.scan_prefix(ColumnFamily::NameTreeNodes, b"")?;
+    let mut stored = Vec::with_capacity(entries.len());
+    for (key, _) in &entries {
+        let root: [u8; 32] = key.as_slice().try_into().map_err(|_| {
+            StateError::Codec(format!(
+                "name-tree node key contains {} bytes; expected 32",
+                key.len()
+            ))
+        })?;
+        stored.push((key, TreeRoot::new(root)));
+    }
+
+    let mut nodes_deleted = 0usize;
+    for (key, root) in stored {
+        if !reachable.contains(&root) {
+            batch.delete(ColumnFamily::NameTreeNodes, key)?;
+            nodes_deleted += 1;
+        }
+    }
+    let nodes_retained = entries.len().saturating_sub(nodes_deleted);
+    if nodes_retained != reachable.len() {
+        return Err(StateError::Codec(format!(
+            "retained name-tree node count {nodes_retained} does not match reachable count {}",
+            reachable.len()
+        )));
+    }
+    Ok(NameTreeCompactionSummary {
+        retained_roots: retained_roots.len(),
+        nodes_before: entries.len(),
+        nodes_retained,
+        nodes_deleted,
+    })
 }
 
 /// Immutable exact-proof view rebuilt from one durable store snapshot after
@@ -2053,6 +2297,10 @@ pub enum StateError {
     StoredTreeRootMismatch { stored: TreeRoot, actual: TreeRoot },
     #[error("durable urkel node key {0:?} maps to conflicting record bytes")]
     PersistedNodeConflict(TreeRoot),
+    #[error("name-tree snapshot pin at height {height} conflicts with the durable active pin")]
+    NameTreeSnapshotPinConflict { height: Height },
+    #[error("name-tree snapshot pin at height {height} violates its invariant: {reason}")]
+    NameTreeSnapshotPinInvariant { height: Height, reason: String },
     #[error(
         "block header commits to name-tree root {committed:?}, but inherited state root is {inherited:?}"
     )]
@@ -2160,14 +2408,20 @@ impl From<PrimitiveError> for StateError {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, sync::Arc};
+    use std::{
+        cell::Cell,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
 
     use hns_chain::{write_canonical_height_to_batch, BlockStatus, HeaderRecord};
     use hns_consensus::{reserved_name, ConsensusError, ThresholdState};
     use hns_primitives::{
         hash_name, Address, CovenantKind, Header, Input, Output, Txid, Uint256, Witness,
     };
-    use hns_store::{MemoryStore, StagingOverlay, Store};
+    use hns_store::{MemoryBatch, MemorySnapshot, MemoryStore, StagingOverlay, Store};
 
     use super::*;
 
@@ -2177,6 +2431,45 @@ mod tests {
     struct NoNameStateScanSnapshot<S> {
         inner: S,
         name_node_reads: Cell<usize>,
+    }
+
+    #[derive(Clone)]
+    struct FailingCommitStore {
+        inner: MemoryStore,
+        fail_next_commit: Arc<AtomicBool>,
+    }
+
+    impl FailingCommitStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_next_commit: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_commit(&self) {
+            self.fail_next_commit.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Store for FailingCommitStore {
+        type Snapshot<'a> = MemorySnapshot;
+        type Batch = MemoryBatch;
+
+        fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+            self.inner.snapshot()
+        }
+
+        fn batch(&self) -> Self::Batch {
+            self.inner.batch()
+        }
+
+        fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
+            if self.fail_next_commit.swap(false, Ordering::SeqCst) {
+                return Err(StoreError::Io("injected compaction failure".to_owned()));
+            }
+            self.inner.commit(batch)
+        }
     }
 
     impl<S: ReadSnapshot> ReadSnapshot for NoNameStateScanSnapshot<S> {
@@ -2645,6 +2938,42 @@ mod tests {
     }
 
     #[test]
+    fn name_tree_snapshot_pin_codec_is_versioned_and_checksummed() {
+        let pin = NameTreeSnapshotPin {
+            height: 144,
+            block_hash: BlockHash::new([3; 32]),
+            root: TreeRoot::new([7; 32]),
+        };
+        let encoded = pin.encode();
+        assert_eq!(encoded.len(), NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE);
+        assert_eq!(NameTreeSnapshotPin::decode(&encoded).expect("decode"), pin);
+
+        let mut corrupt = encoded.clone();
+        *corrupt.last_mut().expect("checksum byte") ^= 1;
+        assert!(matches!(
+            NameTreeSnapshotPin::decode(&corrupt),
+            Err(StateError::Codec(message)) if message.contains("checksum")
+        ));
+
+        let mut unknown = encoded;
+        unknown[..4].copy_from_slice(&2u32.to_le_bytes());
+        let body_checksum = blake2b_256(&unknown[..NAME_TREE_SNAPSHOT_PIN_BODY_SIZE]);
+        unknown[NAME_TREE_SNAPSHOT_PIN_BODY_SIZE..].copy_from_slice(&body_checksum);
+        assert!(matches!(
+            NameTreeSnapshotPin::decode(&unknown),
+            Err(StateError::Codec(message)) if message.contains("version 2")
+        ));
+        assert_eq!(
+            name_tree_snapshot_pin_key(pin.height),
+            [
+                NAME_TREE_SNAPSHOT_PIN_PREFIX,
+                pin.height.to_be_bytes().as_slice()
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
     fn rebuilt_name_tree_root_matches_incremental_hsd_roots() {
         let fixture: NameTreeFixture = serde_json::from_str(include_str!(
             "../../../fixtures/hsd/name-states/state-urkel-v1.json"
@@ -2918,6 +3247,257 @@ mod tests {
                 .expect("verify historical beta"),
             Some(beta_value)
         );
+    }
+
+    #[test]
+    fn interval_pins_and_compaction_preserve_only_retained_proof_roots() {
+        let store = MemoryStore::new();
+        let mut state = engine(store.clone());
+
+        let mut first = block(130, vec![coinbase(vec![open_output(b"compactalpha")])]);
+        first.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let first_hash = first.hash();
+        let first_summary = state
+            .connect_block(ConnectBlock {
+                block_hash: first_hash,
+                height: 100,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &first,
+            })
+            .expect("connect first interval block");
+
+        let mut second = block(131, vec![coinbase(vec![open_output(b"compactbeta")])]);
+        second.header.tree_root = *first_summary.resulting_tree_root.as_bytes();
+        let second_hash = second.hash();
+        let second_summary = state
+            .connect_block(ConnectBlock {
+                block_hash: second_hash,
+                height: 101,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &second,
+            })
+            .expect("connect second block");
+
+        let mut third = block(132, vec![coinbase(vec![open_output(b"compactgamma")])]);
+        third.header.tree_root = *second_summary.resulting_tree_root.as_bytes();
+        let third_hash = third.hash();
+        let third_summary = state
+            .connect_block(ConnectBlock {
+                block_hash: third_hash,
+                height: 105,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &third,
+            })
+            .expect("connect third interval block");
+
+        let alpha_hash = hash_name("compactalpha").expect("alpha hash");
+        let beta_hash = hash_name("compactbeta").expect("beta hash");
+        let alpha_proof;
+        let beta_proof;
+        {
+            let snapshot = store.snapshot().expect("connected snapshot");
+            assert_eq!(
+                load_name_tree_snapshot_pins(&snapshot)
+                    .expect("interval pins")
+                    .iter()
+                    .map(|pin| pin.height)
+                    .collect::<Vec<_>>(),
+                vec![100, 105]
+            );
+            alpha_proof =
+                prove_persisted_name_tree(&snapshot, first_summary.resulting_tree_root, alpha_hash)
+                    .expect("first-root proof")
+                    .raw;
+            beta_proof =
+                prove_persisted_name_tree(&snapshot, second_summary.resulting_tree_root, beta_hash)
+                    .expect("second-root proof")
+                    .raw;
+        }
+
+        state
+            .disconnect_block(DisconnectBlock {
+                block_hash: third_hash,
+                height: 105,
+            })
+            .expect("disconnect third block");
+        let before = store
+            .snapshot()
+            .expect("pre-compaction snapshot")
+            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+            .expect("pre-compaction nodes")
+            .len();
+        let summary = state.compact_name_tree_nodes().expect("compact nodes");
+        assert_eq!(summary.nodes_before, before);
+        assert!(summary.nodes_deleted > 0);
+        assert_eq!(
+            summary.nodes_before,
+            summary.nodes_retained + summary.nodes_deleted
+        );
+
+        let snapshot = store.snapshot().expect("compacted snapshot");
+        assert_eq!(
+            load_name_tree_snapshot_pins(&snapshot)
+                .expect("remaining pins")
+                .iter()
+                .map(|pin| pin.height)
+                .collect::<Vec<_>>(),
+            vec![100]
+        );
+        assert_eq!(
+            prove_persisted_name_tree(&snapshot, first_summary.resulting_tree_root, alpha_hash,)
+                .expect("retained first proof")
+                .raw,
+            alpha_proof
+        );
+        assert_eq!(
+            prove_persisted_name_tree(&snapshot, second_summary.resulting_tree_root, beta_hash,)
+                .expect("retained second proof")
+                .raw,
+            beta_proof
+        );
+        assert!(matches!(
+            prove_persisted_name_tree(
+                &snapshot,
+                third_summary.resulting_tree_root,
+                hash_name("compactgamma").expect("gamma hash"),
+            ),
+            Err(StateError::NameTree(UrkelError::MissingNode(root)))
+                if root == third_summary.resulting_tree_root
+        ));
+        drop(snapshot);
+        drop(state);
+
+        let mut reopened = engine(store);
+        assert_eq!(
+            reopened
+                .name_proof(beta_hash)
+                .expect("reopened current proof")
+                .1
+                .raw,
+            beta_proof
+        );
+        assert_eq!(
+            reopened
+                .compact_name_tree_nodes()
+                .expect("idempotent compaction")
+                .nodes_deleted,
+            0
+        );
+    }
+
+    #[test]
+    fn malformed_snapshot_pin_aborts_compaction_without_deleting_nodes() {
+        let store = MemoryStore::new();
+        let mut state = engine(store.clone());
+        let mut opening = block(133, vec![coinbase(vec![open_output(b"compactfault")])]);
+        opening.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let opening_hash = opening.hash();
+        let summary = state
+            .connect_block(ConnectBlock {
+                block_hash: opening_hash,
+                height: 101,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &opening,
+            })
+            .expect("connect opening");
+
+        let mut corrupt = NameTreeSnapshotPin {
+            height: 100,
+            block_hash: opening_hash,
+            root: summary.resulting_tree_root,
+        }
+        .encode();
+        *corrupt.last_mut().expect("checksum byte") ^= 1;
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                &name_tree_snapshot_pin_key(100),
+                &corrupt,
+            )
+            .expect("write corrupt pin");
+        store.commit(batch).expect("commit corrupt pin");
+        let before = store
+            .snapshot()
+            .expect("before snapshot")
+            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+            .expect("before nodes");
+
+        assert!(matches!(
+            state.compact_name_tree_nodes(),
+            Err(StateError::Codec(message)) if message.contains("checksum")
+        ));
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("after snapshot")
+                .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+                .expect("after nodes"),
+            before
+        );
+    }
+
+    #[test]
+    fn failed_compaction_commit_preserves_all_nodes() {
+        let store = FailingCommitStore::new();
+        let mut state = StoredStateEngine::with_services(
+            store.clone(),
+            Network::Regtest,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+        .expect("test engine");
+        let tree = MemoryUrkel::from_entries([(
+            hash_name("orphanedcompactnode").expect("orphan hash"),
+            b"orphaned compact value".to_vec(),
+        )])
+        .expect("orphan tree");
+        let records = tree.node_records().expect("orphan records");
+        let mut batch = store.batch();
+        for (root, raw) in &records {
+            batch
+                .put(ColumnFamily::NameTreeNodes, root.as_bytes(), raw)
+                .expect("stage orphan node");
+        }
+        store.commit(batch).expect("commit orphan nodes");
+        let before = store
+            .snapshot()
+            .expect("before snapshot")
+            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+            .expect("before nodes");
+        assert_eq!(before.len(), records.len());
+
+        store.fail_next_commit();
+        assert!(matches!(
+            state.compact_name_tree_nodes(),
+            Err(StateError::Store(StoreError::Io(message)))
+                if message == "injected compaction failure"
+        ));
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("failed snapshot")
+                .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+                .expect("nodes after failed commit"),
+            before
+        );
+
+        let summary = state
+            .compact_name_tree_nodes()
+            .expect("successful compaction retry");
+        assert_eq!(summary.nodes_deleted, records.len());
+        assert!(store
+            .snapshot()
+            .expect("compacted snapshot")
+            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+            .expect("compacted nodes")
+            .is_empty());
     }
 
     #[test]

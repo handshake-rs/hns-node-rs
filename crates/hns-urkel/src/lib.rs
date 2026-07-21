@@ -1056,12 +1056,24 @@ pub fn validate_record_tree<F>(root: TreeRoot, mut load: F) -> Result<usize, Urk
 where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
 {
-    if root == TreeRoot::ZERO {
-        return Ok(0);
-    }
+    reachable_record_roots([root], &mut load).map(|roots| roots.len())
+}
+
+/// Validate and collect the union of all content-addressed nodes reachable
+/// from one or more retained roots. Shared historical subtrees are returned
+/// once while depth-sensitive validation is preserved for every distinct path.
+pub fn reachable_record_roots<F, I>(roots: I, mut load: F) -> Result<BTreeSet<TreeRoot>, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    I: IntoIterator<Item = TreeRoot>,
+{
     let mut seen_nodes = BTreeSet::new();
     let mut seen_paths = BTreeSet::new();
-    let mut pending = vec![(root, 0usize)];
+    let mut pending = roots
+        .into_iter()
+        .filter(|root| *root != TreeRoot::ZERO)
+        .map(|root| (root, 0usize))
+        .collect::<Vec<_>>();
     while let Some((current, depth)) = pending.pop() {
         if !seen_paths.insert((current, depth)) {
             continue;
@@ -1090,7 +1102,7 @@ where
             }
         }
     }
-    Ok(seen_nodes.len())
+    Ok(seen_nodes)
 }
 
 /// Validate the record directly bound by `root` without traversing unrelated

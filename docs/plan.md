@@ -37,10 +37,11 @@ reserved low-latency paths.
 - Sequence-consistent RocksDB snapshots.
 - Atomic read-your-writes multi-block reorganizations.
 - Separate best-header and active-block bindings.
-- Schema 12/profile `hsrd-mining-v8`, durable name-tree-root,
+- Schema 13/profile `hsrd-mining-v9`, durable name-tree-root,
   content-addressed authenticated nodes, and HSD airdrop-field bindings,
-  hash-keyed deployment-state caches, a checksummed synchronization checkpoint,
-  and a versioned solved-block publication namespace.
+  checksummed network-interval root pins, hash-keyed deployment-state caches, a
+  checksummed synchronization checkpoint, and a versioned solved-block
+  publication namespace.
 - Root/materialized-state verification at connect, disconnect, reorganization,
   and startup.
 
@@ -80,6 +81,9 @@ reserved low-latency paths.
 - Path-local immutable insert/replace/remove with HSD incremental-root parity,
   independent rebuild checks, retained historical proofs, and read-your-writes
   multi-step reorganization coverage.
+- Validated retained-root compaction over the current root, every undo root,
+  and network-interval pins, with restart, malformed-pin, idempotence, and
+  failed-commit atomicity coverage.
 - Correct pre-state header commitment and durable resulting-root semantics.
 
 ### Live shadow networking
@@ -122,9 +126,10 @@ reserved low-latency paths.
    duplicate prevention/undo are implemented.
 2. **Contextual covenant closure** — extend the complete deterministic HSD
    transition-family corpus into mainnet history and historical exceptions.
-3. **Persistent Urkel closure** — interval snapshots, retained-node compaction,
-   and crash/fault qualification while preserving qualified incremental roots,
-   historical reachability, and exact proof bytes.
+3. **Persistent Urkel closure** — schedule and scale the implemented
+   interval-pin/retained-root compactor and complete RocksDB process-crash/fault
+   qualification while preserving qualified incremental roots, historical
+   reachability, and exact proof bytes.
 4. **Active-state IBD** — connect downloaded bodies through the one consensus
    pipeline, persist invalid branches, recover from restart, and qualify
    pruning/reorganizations without changing the authority boundary.
