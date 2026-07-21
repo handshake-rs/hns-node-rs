@@ -21,7 +21,7 @@ hns-p2p = { path = "../hns-p2p" }
 hns-primitives = { path = "../hns-primitives" }
 hns-rpc = { path = "../hns-rpc" }
 hns-state = { path = "../hns-state" }
-hns-store = { path = "../hns-store" }
+hns-store = { path = "../hns-store", default-features = false }
 hns-sync = { path = "../hns-sync" }
 serde.workspace = true
 serde_json.workspace = true

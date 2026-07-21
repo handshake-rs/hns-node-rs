@@ -5,8 +5,13 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+hns-chain = { path = "../hns-chain" }
 hns-consensus = { path = "../hns-consensus" }
 hns-primitives = { path = "../hns-primitives" }
-hns-store = { path = "../hns-store" }
+hns-store = { path = "../hns-store", default-features = false }
+hns-urkel = { path = "../hns-urkel" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

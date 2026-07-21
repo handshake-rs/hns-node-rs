@@ -7,7 +7,7 @@ use serde_json::Value;
 
 #[test]
 fn header_hashes_match_hsd_fixture() {
-    let fixture = load_json(FixtureCategory::Headers, "milestone1-header.json");
+    let fixture = load_json(FixtureCategory::Headers, "codec-v1.json");
     let raw = hex_bytes(fixture["raw"].as_str().expect("raw hex"));
     let header = Header::decode(&raw).expect("header parses");
 
@@ -24,7 +24,7 @@ fn header_hashes_match_hsd_fixture() {
 
 #[test]
 fn transaction_hashes_match_hsd_fixture() {
-    let fixture = load_json(FixtureCategory::Transactions, "milestone1-transaction.json");
+    let fixture = load_json(FixtureCategory::Transactions, "codec-v1.json");
     let raw = hex_bytes(fixture["raw"].as_str().expect("raw hex"));
     let transaction = Transaction::decode(&raw).expect("transaction parses");
 
@@ -37,7 +37,7 @@ fn transaction_hashes_match_hsd_fixture() {
 
 #[test]
 fn block_round_trip_matches_hsd_fixture() {
-    let fixture = load_json(FixtureCategory::Blocks, "milestone1-block.json");
+    let fixture = load_json(FixtureCategory::Blocks, "codec-v1.json");
     let raw = hex_bytes(fixture["raw"].as_str().expect("raw hex"));
     let block = Block::decode(&raw).expect("block parses");
 
@@ -48,7 +48,7 @@ fn block_round_trip_matches_hsd_fixture() {
 
 #[test]
 fn covenant_round_trip_matches_hsd_fixture() {
-    let fixture = load_json(FixtureCategory::Covenants, "milestone1-covenant.json");
+    let fixture = load_json(FixtureCategory::Covenants, "codec-v1.json");
     let raw = hex_bytes(fixture["raw"].as_str().expect("raw hex"));
     let covenant = Covenant::decode(&raw).expect("covenant parses");
 
@@ -60,7 +60,7 @@ fn covenant_round_trip_matches_hsd_fixture() {
 
 #[test]
 fn resource_scanner_matches_hsd_fixture() {
-    let fixture = load_json(FixtureCategory::Resources, "milestone1-resource.json");
+    let fixture = load_json(FixtureCategory::Resources, "codec-v1.json");
     let raw = hex_bytes(fixture["raw"].as_str().expect("raw hex"));
     let resource = Resource::decode(&raw).expect("resource parses");
 
@@ -71,7 +71,7 @@ fn resource_scanner_matches_hsd_fixture() {
 
 #[test]
 fn name_hashes_match_hsd_fixture() {
-    let fixture = load_json(FixtureCategory::NameStates, "milestone1-name-hash.json");
+    let fixture = load_json(FixtureCategory::NameStates, "name-hash-v1.json");
     let valid = fixture["valid"].as_object().expect("valid names");
 
     for (name, expected) in valid {
@@ -89,7 +89,7 @@ fn name_hashes_match_hsd_fixture() {
 
 #[test]
 fn compact_targets_match_hsd_fixture() {
-    let fixture = load_json(FixtureCategory::Chains, "milestone1-compact-targets.json");
+    let fixture = load_json(FixtureCategory::Chains, "compact-targets-v1.json");
 
     for item in fixture.as_array().expect("compact target list") {
         let bits = item["bits"].as_u64().expect("bits") as u32;

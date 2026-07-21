@@ -751,7 +751,7 @@ impl Outpoint {
         }
     }
 
-    pub const fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         self.index == u32::MAX && self.txid == Txid::ZERO
     }
 

@@ -1,0 +1,330 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
+  },
+  "network": "main",
+  "parameters": {
+    "claimPeriod": 210240,
+    "alexaLockupPeriod": 420480,
+    "renewalMaturity": 4320,
+    "renewalPeriod": 26208
+  },
+  "datasets": {
+    "reservedCount": 90043,
+    "lockedCount": 11554,
+    "namesDbBlake2b256": "7e1e7fe4f51704c8f11a576840d1049b213d54073534a4dd8d73ab6ff727b5d1",
+    "lockupDbBlake2b256": "a733b96a2e652fc2e839776f4b7e497371e7bb53f831b5fca9b4b42e014d1780"
+  },
+  "verifyRenewalSourceBlake2b256": "d97bf1fef8ea1848a5f29543ea6eec1518c1c15e68de795ca3a2a20118c943b5",
+  "renewalCommitmentCases": [
+    {
+      "height": 4319,
+      "committedHeight": null,
+      "accepted": true
+    },
+    {
+      "height": 4319,
+      "committedHeight": 0,
+      "accepted": true
+    },
+    {
+      "height": 4320,
+      "committedHeight": null,
+      "accepted": false
+    },
+    {
+      "height": 4320,
+      "committedHeight": 0,
+      "accepted": true
+    },
+    {
+      "height": 4320,
+      "committedHeight": 1,
+      "accepted": false
+    },
+    {
+      "height": 4321,
+      "committedHeight": null,
+      "accepted": false
+    },
+    {
+      "height": 4321,
+      "committedHeight": 0,
+      "accepted": true
+    },
+    {
+      "height": 4321,
+      "committedHeight": 1,
+      "accepted": true
+    },
+    {
+      "height": 4321,
+      "committedHeight": 2,
+      "accepted": false
+    },
+    {
+      "height": 26208,
+      "committedHeight": null,
+      "accepted": false
+    },
+    {
+      "height": 26208,
+      "committedHeight": 0,
+      "accepted": true
+    },
+    {
+      "height": 26208,
+      "committedHeight": 21888,
+      "accepted": true
+    },
+    {
+      "height": 26208,
+      "committedHeight": 21889,
+      "accepted": false
+    },
+    {
+      "height": 30528,
+      "committedHeight": null,
+      "accepted": false
+    },
+    {
+      "height": 30528,
+      "committedHeight": 0,
+      "accepted": false
+    },
+    {
+      "height": 30528,
+      "committedHeight": 4319,
+      "accepted": false
+    },
+    {
+      "height": 30528,
+      "committedHeight": 4320,
+      "accepted": true
+    },
+    {
+      "height": 30528,
+      "committedHeight": 26208,
+      "accepted": true
+    },
+    {
+      "height": 30528,
+      "committedHeight": 26209,
+      "accepted": false
+    }
+  ],
+  "cases": [
+    {
+      "name": "com",
+      "nameHash": "f84185260b0e865f7bafa35aeeed8bb1ffdaaa91ce624092a9b20a27511a161e",
+      "height": 0,
+      "reserved": true,
+      "locked": false
+    },
+    {
+      "name": "com",
+      "nameHash": "f84185260b0e865f7bafa35aeeed8bb1ffdaaa91ce624092a9b20a27511a161e",
+      "height": 210239,
+      "reserved": true,
+      "locked": false
+    },
+    {
+      "name": "com",
+      "nameHash": "f84185260b0e865f7bafa35aeeed8bb1ffdaaa91ce624092a9b20a27511a161e",
+      "height": 210240,
+      "reserved": false,
+      "locked": true
+    },
+    {
+      "name": "com",
+      "nameHash": "f84185260b0e865f7bafa35aeeed8bb1ffdaaa91ce624092a9b20a27511a161e",
+      "height": 420479,
+      "reserved": false,
+      "locked": true
+    },
+    {
+      "name": "com",
+      "nameHash": "f84185260b0e865f7bafa35aeeed8bb1ffdaaa91ce624092a9b20a27511a161e",
+      "height": 420480,
+      "reserved": false,
+      "locked": true
+    },
+    {
+      "name": "google",
+      "nameHash": "6292be73bdfdc4ea12bdf3018c8c553d3022b37601bb2b19153c8804bdf8da15",
+      "height": 0,
+      "reserved": true,
+      "locked": false
+    },
+    {
+      "name": "google",
+      "nameHash": "6292be73bdfdc4ea12bdf3018c8c553d3022b37601bb2b19153c8804bdf8da15",
+      "height": 210239,
+      "reserved": true,
+      "locked": false
+    },
+    {
+      "name": "google",
+      "nameHash": "6292be73bdfdc4ea12bdf3018c8c553d3022b37601bb2b19153c8804bdf8da15",
+      "height": 210240,
+      "reserved": false,
+      "locked": true
+    },
+    {
+      "name": "google",
+      "nameHash": "6292be73bdfdc4ea12bdf3018c8c553d3022b37601bb2b19153c8804bdf8da15",
+      "height": 420479,
+      "reserved": false,
+      "locked": true
+    },
+    {
+      "name": "google",
+      "nameHash": "6292be73bdfdc4ea12bdf3018c8c553d3022b37601bb2b19153c8804bdf8da15",
+      "height": 420480,
+      "reserved": false,
+      "locked": true
+    },
+    {
+      "name": "cloudflare",
+      "nameHash": "18be7e9a05f8d9da6c1e234c1a2541381df8743a61545cd004c408970979755b",
+      "height": 0,
+      "reserved": true,
+      "locked": false
+    },
+    {
+      "name": "cloudflare",
+      "nameHash": "18be7e9a05f8d9da6c1e234c1a2541381df8743a61545cd004c408970979755b",
+      "height": 210239,
+      "reserved": true,
+      "locked": false
+    },
+    {
+      "name": "cloudflare",
+      "nameHash": "18be7e9a05f8d9da6c1e234c1a2541381df8743a61545cd004c408970979755b",
+      "height": 210240,
+      "reserved": false,
+      "locked": true
+    },
+    {
+      "name": "cloudflare",
+      "nameHash": "18be7e9a05f8d9da6c1e234c1a2541381df8743a61545cd004c408970979755b",
+      "height": 420479,
+      "reserved": false,
+      "locked": true
+    },
+    {
+      "name": "cloudflare",
+      "nameHash": "18be7e9a05f8d9da6c1e234c1a2541381df8743a61545cd004c408970979755b",
+      "height": 420480,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "example",
+      "nameHash": "70983d692f648185febe6d6fa607630ae68649f7e6fc45b94680096c06e4fadb",
+      "height": 0,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "example",
+      "nameHash": "70983d692f648185febe6d6fa607630ae68649f7e6fc45b94680096c06e4fadb",
+      "height": 210239,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "example",
+      "nameHash": "70983d692f648185febe6d6fa607630ae68649f7e6fc45b94680096c06e4fadb",
+      "height": 210240,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "example",
+      "nameHash": "70983d692f648185febe6d6fa607630ae68649f7e6fc45b94680096c06e4fadb",
+      "height": 420479,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "example",
+      "nameHash": "70983d692f648185febe6d6fa607630ae68649f7e6fc45b94680096c06e4fadb",
+      "height": 420480,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "test",
+      "nameHash": "36f028580bb02cc8272a9a020f4200e346e276ae664e45ee80745574e2f5ab80",
+      "height": 0,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "test",
+      "nameHash": "36f028580bb02cc8272a9a020f4200e346e276ae664e45ee80745574e2f5ab80",
+      "height": 210239,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "test",
+      "nameHash": "36f028580bb02cc8272a9a020f4200e346e276ae664e45ee80745574e2f5ab80",
+      "height": 210240,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "test",
+      "nameHash": "36f028580bb02cc8272a9a020f4200e346e276ae664e45ee80745574e2f5ab80",
+      "height": 420479,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "test",
+      "nameHash": "36f028580bb02cc8272a9a020f4200e346e276ae664e45ee80745574e2f5ab80",
+      "height": 420480,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "localhost",
+      "nameHash": "75c34565ac2277b8b2df57155c262db4fbf3449f9ed71a44794080d0985600fa",
+      "height": 0,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "localhost",
+      "nameHash": "75c34565ac2277b8b2df57155c262db4fbf3449f9ed71a44794080d0985600fa",
+      "height": 210239,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "localhost",
+      "nameHash": "75c34565ac2277b8b2df57155c262db4fbf3449f9ed71a44794080d0985600fa",
+      "height": 210240,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "localhost",
+      "nameHash": "75c34565ac2277b8b2df57155c262db4fbf3449f9ed71a44794080d0985600fa",
+      "height": 420479,
+      "reserved": false,
+      "locked": false
+    },
+    {
+      "name": "localhost",
+      "nameHash": "75c34565ac2277b8b2df57155c262db4fbf3449f9ed71a44794080d0985600fa",
+      "height": 420480,
+      "reserved": false,
+      "locked": false
+    }
+  ]
+}

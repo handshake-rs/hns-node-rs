@@ -1,30 +1,43 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{btree_map::Entry, BTreeMap, HashMap, HashSet},
     fmt,
     sync::Arc,
 };
 
+use hns_chain::{read_canonical_hash, HeaderRecord};
 use hns_consensus::{
-    verify_transaction_covenant_links, CovenantLinkError, RejectUnverifiedInputs,
-    TransactionInputVerifier,
+    verify_and_apply_name_covenant, verify_sequence_locks, verify_transaction_covenant_links,
+    ConsensusError, CovenantLinkError, NameContext, NameFlags, NativeSignatureVerifier, Network,
+    RejectUnverifiedInputs, SequenceLockView, TransactionInputVerifier, WitnessProgramVerifier,
+    MEDIAN_TIMESPAN,
 };
 use hns_primitives::{
-    Address, Amount, Block, BlockHash, Coin, Covenant, Height, NameHash, NameLifecycleState,
-    NameState, Outpoint, PrimitiveError, Reader, Writer, MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT,
-    MAX_NAME_SIZE, MAX_TX_SIZE,
+    Address, Amount, Block, BlockHash, Coin, Covenant, CovenantKind, Height, NameHash, NameState,
+    Outpoint, PrimitiveError, Reader, Transaction, Writer, MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT,
+    MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_TX_SIZE,
 };
-use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreError, WriteBatch};
+use hns_store::{ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch};
+use hns_urkel::{root_from_entries, TreeRoot, UrkelError};
 use serde::{Deserialize, Serialize};
 
-const BLOCK_UNDO_VERSION: u32 = 2;
+const BLOCK_UNDO_VERSION: u32 = 4;
 const OUTPOINT_KEY_SIZE: usize = 36;
 const ADDRESS_CODEC_MAX: usize = 2 + MAX_ADDRESS_HASH_SIZE;
 const COIN_CODEC_MAX: usize = OUTPOINT_KEY_SIZE + 8 + 4 + 1 + ADDRESS_CODEC_MAX + MAX_TX_SIZE + 9;
-const NAME_STATE_CODEC_MAX: usize = 32 + 1 + MAX_NAME_SIZE + 9 + 4 + 1;
+const NAME_STATE_FIELD_MASK: u16 = (1 << 10) - 1;
+const NAME_STATE_CODEC_MAX: usize =
+    1 + MAX_NAME_SIZE + 2 + MAX_RESOURCE_SIZE + 4 + 4 + 2 + 32 + 9 + 9 + 9 + 4 + 4 + 4 + 9;
 const NAME_UNDO_CODEC_MAX: usize = 32 + 1 + NAME_STATE_CODEC_MAX + 9;
 const BLOCK_UNDO_CODEC_MAX: usize = MAX_BLOCK_WEIGHT * 8;
+
+#[derive(Default)]
+struct NameStateChanges {
+    current: BTreeMap<NameHash, NameState>,
+    previous: BTreeMap<NameHash, Option<NameState>>,
+    changed: HashSet<NameHash>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ConnectBlock<'a> {
@@ -41,11 +54,32 @@ pub struct DisconnectBlock {
     pub height: Height,
 }
 
+/// Explicit state-validation evidence returned to the chain coordinator. These
+/// flags describe only work actually performed by this state transition; they
+/// are intentionally narrower than full block-consensus validity.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StateValidationSummary {
+    pub relative_locks_valid: bool,
+    pub scripts_valid: bool,
+    pub covenant_links_valid: bool,
+    pub covenants_context_valid: bool,
+    pub claims_and_airdrops_valid: bool,
+    pub name_state_connected: bool,
+    pub tree_root_valid: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateSummary {
     pub coins_created: usize,
     pub coins_spent: usize,
     pub names_changed: usize,
+    /// Authenticated name-tree root committed by this block header. Handshake
+    /// commits to the parent/pre-state root, not the resulting post-state root.
+    pub inherited_tree_root: TreeRoot,
+    /// Authenticated name-tree root after this block's name transitions. This is
+    /// the root the next block must commit to.
+    pub resulting_tree_root: TreeRoot,
+    pub validation: StateValidationSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -58,17 +92,21 @@ pub struct NameUndo {
 pub struct BlockUndo {
     pub block_hash: BlockHash,
     pub height: Height,
+    pub previous_tree_root: TreeRoot,
+    pub resulting_tree_root: TreeRoot,
     pub spent_coins: Vec<Coin>,
     pub created_coins: Vec<Outpoint>,
     pub previous_name_states: Vec<NameUndo>,
 }
 
 impl BlockUndo {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Result<Vec<u8>, StateError> {
         let mut writer = Writer::new();
         writer.write_u32(BLOCK_UNDO_VERSION);
         writer.write_bytes(self.block_hash.as_bytes());
         writer.write_u32(self.height);
+        writer.write_bytes(self.previous_tree_root.as_bytes());
+        writer.write_bytes(self.resulting_tree_root.as_bytes());
         writer.write_varint(self.spent_coins.len() as u64);
 
         for coin in &self.spent_coins {
@@ -76,24 +114,21 @@ impl BlockUndo {
         }
 
         writer.write_varint(self.created_coins.len() as u64);
-
         for outpoint in &self.created_coins {
             outpoint.write_to(&mut writer);
         }
 
         writer.write_varint(self.previous_name_states.len() as u64);
-
         for undo in &self.previous_name_states {
-            writer.write_varbytes(&encode_name_undo(undo));
+            writer.write_varbytes(&encode_name_undo(undo)?);
         }
 
-        writer.finish()
+        Ok(writer.finish())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, StateError> {
         let mut reader = Reader::new(bytes, BLOCK_UNDO_CODEC_MAX)?;
         let version = reader.read_u32()?;
-
         if version != BLOCK_UNDO_VERSION {
             return Err(StateError::Codec(format!(
                 "unsupported block undo version {version}"
@@ -102,9 +137,10 @@ impl BlockUndo {
 
         let block_hash = BlockHash::new(reader.read_hash()?);
         let height = reader.read_u32()?;
+        let previous_tree_root = TreeRoot::new(reader.read_hash()?);
+        let resulting_tree_root = TreeRoot::new(reader.read_hash()?);
         let spent_count = reader.read_varint_usize("spent coins")?;
         let mut spent_coins = Vec::with_capacity(spent_count);
-
         for _ in 0..spent_count {
             let bytes = reader.read_varbytes(COIN_CODEC_MAX, "spent coin")?;
             spent_coins.push(decode_coin(&bytes)?);
@@ -112,24 +148,23 @@ impl BlockUndo {
 
         let created_count = reader.read_varint_usize("created coins")?;
         let mut created_coins = Vec::with_capacity(created_count);
-
         for _ in 0..created_count {
             created_coins.push(Outpoint::read_from(&mut reader)?);
         }
 
         let name_count = reader.read_varint_usize("name undo records")?;
         let mut previous_name_states = Vec::with_capacity(name_count);
-
         for _ in 0..name_count {
             let bytes = reader.read_varbytes(NAME_UNDO_CODEC_MAX, "name undo")?;
             previous_name_states.push(decode_name_undo(&bytes)?);
         }
 
         reader.ensure_finished()?;
-
         Ok(Self {
             block_hash,
             height,
+            previous_tree_root,
+            resulting_tree_root,
             spent_coins,
             created_coins,
             previous_name_states,
@@ -139,20 +174,89 @@ impl BlockUndo {
 
 pub trait StateView {
     fn coin(&self, outpoint: &Outpoint) -> Result<Option<Coin>, StateError>;
-
     fn name_state(&self, name_hash: &NameHash) -> Result<Option<NameState>, StateError>;
 }
 
 pub trait StateEngine {
     fn connect_block(&mut self, request: ConnectBlock<'_>) -> Result<StateSummary, StateError>;
-
     fn disconnect_block(&mut self, request: DisconnectBlock) -> Result<StateSummary, StateError>;
+}
+
+/// Result from the dedicated coinbase claim/airdrop boundary. A production
+/// implementation must account for every conjured unit and authenticate every
+/// special input against the historical HNS datasets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoinbaseIssuanceSummary {
+    pub conjured: Amount,
+    pub claims_and_airdrops_valid: bool,
+}
+
+pub trait CoinbaseIssuanceVerifier: Send + Sync {
+    fn verify_coinbase(
+        &self,
+        transaction: &Transaction,
+        height: Height,
+        network: Network,
+    ) -> Result<CoinbaseIssuanceSummary, StateError>;
+}
+
+/// Fail-closed verifier which accepts only an ordinary coinbase with no claim
+/// covenant and no additional claim/airdrop inputs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RejectSpecialCoinbaseIssuance;
+
+impl CoinbaseIssuanceVerifier for RejectSpecialCoinbaseIssuance {
+    fn verify_coinbase(
+        &self,
+        transaction: &Transaction,
+        _height: Height,
+        _network: Network,
+    ) -> Result<CoinbaseIssuanceSummary, StateError> {
+        let special_input = transaction.inputs.len() > 1;
+        let claim_output = transaction
+            .outputs
+            .iter()
+            .any(|output| output.covenant.kind == CovenantKind::Claim);
+        if special_input || claim_output {
+            return Err(StateError::UnsupportedCoinbaseIssuance);
+        }
+        Ok(CoinbaseIssuanceSummary {
+            conjured: 0,
+            claims_and_airdrops_valid: true,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct StateServices<'a> {
+    pub network: Network,
+    pub name_flags: NameFlags,
+    pub name_flags_valid: bool,
+    pub input_verifier: &'a dyn TransactionInputVerifier,
+    pub issuance_verifier: &'a dyn CoinbaseIssuanceVerifier,
+}
+
+impl fmt::Debug for StateServices<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StateServices")
+            .field("network", &self.network)
+            .field("name_flags", &self.name_flags)
+            .field("name_flags_valid", &self.name_flags_valid)
+            .field("input_verifier", &"<transaction-input-verifier>")
+            .field("issuance_verifier", &"<coinbase-issuance-verifier>")
+            .finish()
+    }
 }
 
 #[derive(Clone)]
 pub struct StoredStateEngine<S: Store> {
     store: S,
+    network: Network,
+    name_flags: NameFlags,
+    name_flags_valid: bool,
     input_verifier: Arc<dyn TransactionInputVerifier>,
+    issuance_verifier: Arc<dyn CoinbaseIssuanceVerifier>,
 }
 
 impl<S: Store> fmt::Debug for StoredStateEngine<S> {
@@ -160,26 +264,111 @@ impl<S: Store> fmt::Debug for StoredStateEngine<S> {
         formatter
             .debug_struct("StoredStateEngine")
             .field("store", &"<store>")
+            .field("network", &self.network)
+            .field("name_flags", &self.name_flags)
+            .field("name_flags_valid", &self.name_flags_valid)
             .field("input_verifier", &"<transaction-input-verifier>")
+            .field("issuance_verifier", &"<coinbase-issuance-verifier>")
             .finish()
     }
 }
 
 impl<S: Store> StoredStateEngine<S> {
-    /// Construct a state engine that fails closed on every non-coinbase input
-    /// until a consensus-complete authorization verifier is explicitly wired.
+    /// Construct a deliberately fail-closed engine. This is useful for tests
+    /// and for deployments which want to supply their own explicitly selected verifier.
     pub fn new(store: S) -> Result<Self, StateError> {
-        Self::with_input_verifier(store, Arc::new(RejectUnverifiedInputs))
+        Self::with_services(
+            store,
+            Network::Mainnet,
+            NameFlags::NONE,
+            false,
+            Arc::new(RejectUnverifiedInputs),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+    }
+
+    pub fn for_network(store: S, network: Network) -> Result<Self, StateError> {
+        Self::with_services(
+            store,
+            network,
+            NameFlags::NONE,
+            false,
+            Arc::new(RejectUnverifiedInputs),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+    }
+
+    /// Construct the native shadow-validation engine. Authority remains gated
+    /// elsewhere until deployments, claims/airdrops, persistent Urkel/proof parity,
+    /// and historical replay have independently completed.
+    pub fn with_native_authorization(
+        store: S,
+        network: Network,
+        name_flags: NameFlags,
+    ) -> Result<Self, StateError> {
+        Self::with_native_authorization_inner(store, network, name_flags, false)
+    }
+
+    /// Construct the native verifier with deployment-derived name flags that
+    /// the caller has already validated against the active chain. This
+    /// constructor is deliberately explicit so a static placeholder such as
+    /// `NameFlags::NONE` cannot silently acquire contextual authority.
+    pub fn with_native_authorization_and_verified_name_flags(
+        store: S,
+        network: Network,
+        name_flags: NameFlags,
+    ) -> Result<Self, StateError> {
+        Self::with_native_authorization_inner(store, network, name_flags, true)
+    }
+
+    fn with_native_authorization_inner(
+        store: S,
+        network: Network,
+        name_flags: NameFlags,
+        name_flags_valid: bool,
+    ) -> Result<Self, StateError> {
+        let signatures = NativeSignatureVerifier::new()
+            .map_err(|error| StateError::InputAuthorizationBackend(error.to_string()))?;
+        Self::with_services(
+            store,
+            network,
+            name_flags,
+            name_flags_valid,
+            Arc::new(WitnessProgramVerifier::mandatory(signatures)),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
     }
 
     pub fn with_input_verifier(
         store: S,
         input_verifier: Arc<dyn TransactionInputVerifier>,
     ) -> Result<Self, StateError> {
+        Self::with_services(
+            store,
+            Network::Mainnet,
+            NameFlags::NONE,
+            false,
+            input_verifier,
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+    }
+
+    pub fn with_services(
+        store: S,
+        network: Network,
+        name_flags: NameFlags,
+        name_flags_valid: bool,
+        input_verifier: Arc<dyn TransactionInputVerifier>,
+        issuance_verifier: Arc<dyn CoinbaseIssuanceVerifier>,
+    ) -> Result<Self, StateError> {
         hns_store::initialize_schema(&store)?;
         Ok(Self {
             store,
+            network,
+            name_flags,
+            name_flags_valid,
             input_verifier,
+            issuance_verifier,
         })
     }
 
@@ -187,8 +376,34 @@ impl<S: Store> StoredStateEngine<S> {
         &self.store
     }
 
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    pub fn name_flags(&self) -> NameFlags {
+        self.name_flags
+    }
+
+    pub fn name_flags_valid(&self) -> bool {
+        self.name_flags_valid
+    }
+
     pub fn input_verifier(&self) -> &dyn TransactionInputVerifier {
         self.input_verifier.as_ref()
+    }
+
+    pub fn issuance_verifier(&self) -> &dyn CoinbaseIssuanceVerifier {
+        self.issuance_verifier.as_ref()
+    }
+
+    pub fn services(&self) -> StateServices<'_> {
+        StateServices {
+            network: self.network,
+            name_flags: self.name_flags,
+            name_flags_valid: self.name_flags_valid,
+            input_verifier: self.input_verifier(),
+            issuance_verifier: self.issuance_verifier(),
+        }
     }
 
     pub fn load_undo(&self, block_hash: &BlockHash) -> Result<Option<BlockUndo>, StateError> {
@@ -211,10 +426,7 @@ impl<S: Store> StateView for StoredStateEngine<S> {
 
     fn name_state(&self, name_hash: &NameHash) -> Result<Option<NameState>, StateError> {
         let snapshot = self.store.snapshot()?;
-        let Some(bytes) = snapshot.get(ColumnFamily::NameState, name_hash.as_bytes())? else {
-            return Ok(None);
-        };
-        decode_name_state(&bytes).map(Some)
+        load_name_state(&snapshot, name_hash)
     }
 }
 
@@ -222,23 +434,22 @@ impl<S: Store> StateEngine for StoredStateEngine<S> {
     fn connect_block(&mut self, request: ConnectBlock<'_>) -> Result<StateSummary, StateError> {
         let snapshot = self.store.snapshot()?;
         let mut batch = self.store.batch();
-        let summary = connect_block_to_batch_with_verifier(
-            &snapshot,
-            &mut batch,
-            request,
-            self.input_verifier(),
-        )?;
+        let summary =
+            connect_block_to_batch_with_services(&snapshot, &mut batch, request, self.services())?;
         self.store.commit(batch)?;
         Ok(summary)
     }
 
     fn disconnect_block(&mut self, request: DisconnectBlock) -> Result<StateSummary, StateError> {
-        let undo = self
-            .load_undo(&request.block_hash)?
+        let snapshot = self.store.snapshot()?;
+        let undo = snapshot
+            .get(ColumnFamily::Undo, request.block_hash.as_bytes())?
+            .map(|bytes| BlockUndo::decode(&bytes))
+            .transpose()?
             .ok_or(StateError::MissingUndo(request.block_hash))?;
-
         let mut batch = self.store.batch();
-        let summary = disconnect_block_to_batch(&mut batch, request, &undo)?;
+        let summary = disconnect_block_to_batch(&snapshot, &mut batch, request, &undo)?;
+        drop(snapshot);
         self.store.commit(batch)?;
         Ok(summary)
     }
@@ -249,11 +460,17 @@ pub fn connect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
     batch: &mut B,
     request: ConnectBlock<'_>,
 ) -> Result<StateSummary, StateError> {
-    connect_block_to_batch_with_verifier(
+    connect_block_to_batch_with_services(
         snapshot,
         batch,
         request,
-        &RejectUnverifiedInputs,
+        StateServices {
+            network: Network::Mainnet,
+            name_flags: NameFlags::NONE,
+            name_flags_valid: false,
+            input_verifier: &RejectUnverifiedInputs,
+            issuance_verifier: &RejectSpecialCoinbaseIssuance,
+        },
     )
 }
 
@@ -263,6 +480,26 @@ pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
     request: ConnectBlock<'_>,
     input_verifier: &dyn TransactionInputVerifier,
 ) -> Result<StateSummary, StateError> {
+    connect_block_to_batch_with_services(
+        snapshot,
+        batch,
+        request,
+        StateServices {
+            network: Network::Mainnet,
+            name_flags: NameFlags::NONE,
+            name_flags_valid: false,
+            input_verifier,
+            issuance_verifier: &RejectSpecialCoinbaseIssuance,
+        },
+    )
+}
+
+pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    request: ConnectBlock<'_>,
+    services: StateServices<'_>,
+) -> Result<StateSummary, StateError> {
     if request.block_hash != request.block.hash() {
         return Err(StateError::BlockHashMismatch {
             expected: request.block_hash,
@@ -270,20 +507,38 @@ pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
         });
     }
 
-    let mut spent_coins = Vec::new();
-    let mut spent_outpoints = HashSet::new();
-    let mut created_coins = Vec::new();
-    let mut created_set = HashSet::new();
-    let mut pending_created = HashMap::new();
+    // Handshake commits each block header to the authenticated name-tree root
+    // inherited from its parent. The current block's covenant transitions are
+    // applied only after this comparison and produce the root committed by the
+    // following block.
+    let inherited_tree_root = verify_stored_name_tree_root(snapshot)?;
+    let committed_tree_root = TreeRoot::new(request.block.header.tree_root);
+    if committed_tree_root != inherited_tree_root {
+        return Err(StateError::HeaderTreeRootMismatch {
+            committed: committed_tree_root,
+            inherited: inherited_tree_root,
+        });
+    }
+
     let coinbase = request
         .block
         .transactions
         .first()
         .ok_or(StateError::MissingCoinbase)?;
-    if coinbase.inputs.len() > 1 {
-        return Err(StateError::UnsupportedCoinbaseIssuance);
-    }
+    let issuance =
+        services
+            .issuance_verifier
+            .verify_coinbase(coinbase, request.height, services.network)?;
     let coinbase_value = transaction_output_value(coinbase)?;
+
+    let chain_context = SnapshotChainContext::new(snapshot);
+
+    let mut spent_coins = Vec::new();
+    let mut spent_outpoints = HashSet::new();
+    let mut created_coins = Vec::new();
+    let mut created_set = HashSet::new();
+    let mut pending_created = HashMap::new();
+    let mut name_state_changes = NameStateChanges::default();
     let mut total_fees = 0u64;
 
     for (transaction_index, transaction) in request.block.transactions.iter().enumerate() {
@@ -295,12 +550,19 @@ pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
                 transaction,
                 request.height,
                 request.coinbase_maturity,
-                input_verifier,
             )?;
             let input_coins = resolved
                 .iter()
                 .map(|resolved| resolved.coin.clone())
                 .collect::<Vec<_>>();
+
+            verify_transaction_sequence_locks(
+                transaction,
+                request.height,
+                &input_coins,
+                &chain_context,
+            )?;
+            verify_transaction_inputs(services.input_verifier, transaction, &input_coins)?;
             verify_transaction_covenant_links(transaction, &input_coins)?;
 
             let input_value = input_coins.iter().try_fold(0u64, |total, coin| {
@@ -316,6 +578,15 @@ pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
                 });
             }
 
+            apply_transaction_name_covenants(
+                snapshot,
+                transaction,
+                request.height,
+                services,
+                &chain_context,
+                &mut name_state_changes,
+            )?;
+
             stage_transaction_spends(
                 batch,
                 &mut pending_created,
@@ -326,20 +597,26 @@ pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
             total_fees = total_fees
                 .checked_add(input_value - output_value)
                 .ok_or(StateError::FeeValueOverflow)?;
+        } else {
+            apply_transaction_name_covenants(
+                snapshot,
+                transaction,
+                request.height,
+                services,
+                &chain_context,
+                &mut name_state_changes,
+            )?;
         }
 
         let txid = transaction.txid();
-
         for (output_index, output) in transaction.outputs.iter().enumerate() {
             let index = u32::try_from(output_index).map_err(|_| {
                 StateError::Codec(format!("output index {output_index} exceeds u32"))
             })?;
             let outpoint = Outpoint { txid, index };
-
             if !created_set.insert(outpoint.clone()) {
                 return Err(StateError::DuplicateCoin(outpoint));
             }
-
             if !spent_outpoints.contains(&outpoint)
                 && snapshot
                     .get(ColumnFamily::Utxo, &encode_outpoint_key(&outpoint))?
@@ -369,6 +646,7 @@ pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
     let maximum_coinbase = request
         .block_reward
         .checked_add(total_fees)
+        .and_then(|value| value.checked_add(issuance.conjured))
         .ok_or(StateError::CoinbaseRewardOverflow)?;
     if coinbase_value > maximum_coinbase {
         return Err(StateError::CoinbaseValueExceedsReward {
@@ -377,23 +655,63 @@ pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
         });
     }
 
+    let mut name_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
+    for name_hash in &name_state_changes.changed {
+        let state = name_state_changes.current.get(name_hash).ok_or_else(|| {
+            StateError::Codec("changed name is missing from transaction cache".to_owned())
+        })?;
+        write_name_state_to_batch(batch, state)?;
+        name_overrides.insert(*name_hash, (!state.is_null()).then_some(state.clone()));
+    }
+
+    let resulting_tree_root = rebuild_name_tree_root_with_overrides(snapshot, &name_overrides)?;
+    batch.put(
+        ColumnFamily::Meta,
+        MetaKey::NameTreeRoot.as_bytes(),
+        resulting_tree_root.as_bytes(),
+    )?;
+
+    let previous_name_states = name_state_changes
+        .previous
+        .into_iter()
+        .map(|(name_hash, previous)| NameUndo {
+            name_hash,
+            previous,
+        })
+        .collect::<Vec<_>>();
     let undo = BlockUndo {
         block_hash: request.block_hash,
         height: request.height,
+        previous_tree_root: inherited_tree_root,
+        resulting_tree_root,
         spent_coins,
         created_coins,
-        previous_name_states: Vec::new(),
+        previous_name_states,
     };
     batch.put(
         ColumnFamily::Undo,
         request.block_hash.as_bytes(),
-        &undo.encode(),
+        &undo.encode()?,
     )?;
 
     Ok(StateSummary {
         coins_created: undo.created_coins.len(),
         coins_spent: undo.spent_coins.len(),
         names_changed: undo.previous_name_states.len(),
+        inherited_tree_root,
+        resulting_tree_root,
+        validation: StateValidationSummary {
+            relative_locks_valid: true,
+            // Every non-coinbase input in this block reached the configured
+            // verifier and returned success. Global interpreter completeness is
+            // reported separately by node readiness and remains fail-closed.
+            scripts_valid: true,
+            covenant_links_valid: true,
+            covenants_context_valid: true,
+            claims_and_airdrops_valid: issuance.claims_and_airdrops_valid,
+            name_state_connected: true,
+            tree_root_valid: true,
+        },
     })
 }
 
@@ -413,18 +731,15 @@ fn resolve_transaction_inputs<T: ReadSnapshot>(
     snapshot: &T,
     pending_created: &HashMap<Outpoint, Coin>,
     spent_outpoints: &mut HashSet<Outpoint>,
-    transaction: &hns_primitives::Transaction,
+    transaction: &Transaction,
     spend_height: Height,
     coinbase_maturity: u32,
-    input_verifier: &dyn TransactionInputVerifier,
 ) -> Result<Vec<ResolvedInput>, StateError> {
     let mut resolved = Vec::with_capacity(transaction.inputs.len());
-
-    for (input_index, input) in transaction.inputs.iter().enumerate() {
+    for input in &transaction.inputs {
         if !spent_outpoints.insert(input.previous_output.clone()) {
             return Err(StateError::DuplicateSpend(input.previous_output.clone()));
         }
-
         let (coin, source) = match pending_created.get(&input.previous_output) {
             Some(coin) => (coin.clone(), ResolvedCoinSource::Pending),
             None => (
@@ -433,11 +748,116 @@ fn resolve_transaction_inputs<T: ReadSnapshot>(
             ),
         };
         check_coinbase_maturity(&coin, spend_height, coinbase_maturity)?;
-        verify_input_authorization(input_verifier, transaction, input_index, &coin)?;
         resolved.push(ResolvedInput { coin, source });
     }
-
     Ok(resolved)
+}
+
+fn verify_transaction_sequence_locks<T: ReadSnapshot>(
+    transaction: &Transaction,
+    next_height: Height,
+    coins: &[Coin],
+    chain: &SnapshotChainContext<'_, T>,
+) -> Result<(), StateError> {
+    if transaction
+        .inputs
+        .iter()
+        .all(|input| input.sequence & hns_consensus::SEQUENCE_DISABLE_FLAG != 0)
+    {
+        return Ok(());
+    }
+    let parent_median_time = if next_height == 0 {
+        0
+    } else {
+        chain.median_time_past(next_height - 1)?
+    };
+    let view = TransactionSequenceView::new(coins, chain);
+    if !verify_sequence_locks(transaction, next_height, parent_median_time, &view)? {
+        return Err(StateError::RelativeLocks);
+    }
+    Ok(())
+}
+
+fn verify_transaction_inputs(
+    verifier: &dyn TransactionInputVerifier,
+    transaction: &Transaction,
+    coins: &[Coin],
+) -> Result<(), StateError> {
+    if transaction.inputs.len() != coins.len() {
+        return Err(StateError::Codec(
+            "resolved input count does not match transaction inputs".to_owned(),
+        ));
+    }
+    for (input_index, coin) in coins.iter().enumerate() {
+        verifier
+            .verify_input(transaction, input_index, coin)
+            .map_err(|error| StateError::InputAuthorization {
+                input_index,
+                reason: error.to_string(),
+            })?;
+    }
+    Ok(())
+}
+
+fn apply_transaction_name_covenants<T: ReadSnapshot>(
+    snapshot: &T,
+    transaction: &Transaction,
+    height: Height,
+    services: StateServices<'_>,
+    context: &SnapshotChainContext<'_, T>,
+    changes: &mut NameStateChanges,
+) -> Result<(), StateError> {
+    for (output_index, output) in transaction.outputs.iter().enumerate() {
+        if !output.covenant.kind.is_name() {
+            continue;
+        }
+        if output.covenant.kind == CovenantKind::Claim {
+            return Err(StateError::UnsupportedCoinbaseIssuance);
+        }
+        if !services.name_flags_valid {
+            return Err(StateError::DeploymentStateUnavailable);
+        }
+        if context.is_historical_height(height)
+            && matches!(
+                output.covenant.kind,
+                CovenantKind::Bid | CovenantKind::Redeem
+            )
+        {
+            continue;
+        }
+        let bytes = output
+            .covenant
+            .item(0)
+            .and_then(|item| <[u8; 32]>::try_from(item).ok())
+            .ok_or_else(|| StateError::ContextualCovenant("invalid name hash".to_owned()))?;
+        let name_hash = NameHash::new(bytes);
+
+        if let Entry::Vacant(entry) = changes.current.entry(name_hash) {
+            let loaded = load_name_state(snapshot, &name_hash)?;
+            changes
+                .previous
+                .entry(name_hash)
+                .or_insert_with(|| loaded.clone());
+            entry.insert(loaded.unwrap_or_else(|| NameState::null(name_hash)));
+        }
+        let state = changes
+            .current
+            .get_mut(&name_hash)
+            .ok_or_else(|| StateError::Codec("name cache insertion failed".to_owned()))?;
+        let mutation = verify_and_apply_name_covenant(
+            transaction,
+            output_index,
+            height,
+            services.network.params().names,
+            services.name_flags,
+            state,
+            context,
+        )?;
+        if mutation.changed() {
+            changes.changed.insert(name_hash);
+        }
+    }
+    Ok(())
 }
 
 fn stage_transaction_spends<B: WriteBatch>(
@@ -458,16 +878,18 @@ fn stage_transaction_spends<B: WriteBatch>(
                 created_coins.retain(|outpoint| outpoint != &input.coin.outpoint);
             }
             ResolvedCoinSource::Existing => {
-                stage_existing_coin_spend(batch, &input.coin, spent_coins)?;
+                batch.delete(
+                    ColumnFamily::Utxo,
+                    &encode_outpoint_key(&input.coin.outpoint),
+                )?;
+                spent_coins.push(input.coin);
             }
         }
     }
     Ok(())
 }
 
-fn transaction_output_value(
-    transaction: &hns_primitives::Transaction,
-) -> Result<Amount, StateError> {
+fn transaction_output_value(transaction: &Transaction) -> Result<Amount, StateError> {
     transaction.outputs.iter().try_fold(0u64, |total, output| {
         total
             .checked_add(output.value)
@@ -491,33 +913,6 @@ fn load_existing_coin<T: ReadSnapshot>(
     Ok(coin)
 }
 
-fn verify_input_authorization(
-    verifier: &dyn TransactionInputVerifier,
-    transaction: &hns_primitives::Transaction,
-    input_index: usize,
-    coin: &Coin,
-) -> Result<(), StateError> {
-    verifier
-        .verify_input(transaction, input_index, coin)
-        .map_err(|error| StateError::InputAuthorization {
-            input_index,
-            reason: error.to_string(),
-        })
-}
-
-fn stage_existing_coin_spend<B: WriteBatch>(
-    batch: &mut B,
-    coin: &Coin,
-    spent_coins: &mut Vec<Coin>,
-) -> Result<(), StateError> {
-    batch.delete(
-        ColumnFamily::Utxo,
-        &encode_outpoint_key(&coin.outpoint),
-    )?;
-    spent_coins.push(coin.clone());
-    Ok(())
-}
-
 fn check_coinbase_maturity(
     coin: &Coin,
     spend_height: Height,
@@ -537,7 +932,102 @@ fn check_coinbase_maturity(
     Ok(())
 }
 
-pub fn disconnect_block_to_batch<B: WriteBatch>(
+struct SnapshotChainContext<'a, T: ReadSnapshot> {
+    snapshot: &'a T,
+}
+
+impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
+    const fn new(snapshot: &'a T) -> Self {
+        Self { snapshot }
+    }
+
+    fn header_at(&self, height: Height) -> Result<Option<HeaderRecord>, StateError> {
+        let Some(hash) = read_canonical_hash(self.snapshot, height)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.snapshot.get(ColumnFamily::Headers, hash.as_bytes())? else {
+            return Err(StateError::ChainView(format!(
+                "canonical height {height} points to a missing header"
+            )));
+        };
+        let record = HeaderRecord::decode(&bytes)?;
+        if record.hash != hash || record.height != height {
+            return Err(StateError::ChainView(format!(
+                "canonical header payload disagrees with height {height}"
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    fn median_time_past(&self, height: Height) -> Result<u64, StateError> {
+        let mut times = Vec::with_capacity(MEDIAN_TIMESPAN);
+        let mut cursor = height;
+        for _ in 0..MEDIAN_TIMESPAN {
+            let Some(record) = self.header_at(cursor)? else {
+                break;
+            };
+            times.push(record.header.time);
+            if cursor == 0 {
+                break;
+            }
+            cursor -= 1;
+        }
+        if times.is_empty() {
+            return Err(StateError::ChainView(format!(
+                "cannot calculate median time past at height {height}"
+            )));
+        }
+        times.sort_unstable();
+        Ok(times[times.len() / 2])
+    }
+}
+
+impl<T: ReadSnapshot> NameContext for SnapshotChainContext<'_, T> {
+    fn main_chain_height(&self, hash: &BlockHash) -> Result<Option<Height>, ConsensusError> {
+        let Some(bytes) = self
+            .snapshot
+            .get(ColumnFamily::Headers, hash.as_bytes())
+            .map_err(|error| ConsensusError::View(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let record = HeaderRecord::decode(&bytes)
+            .map_err(|error| ConsensusError::View(error.to_string()))?;
+        let canonical = read_canonical_hash(self.snapshot, record.height)
+            .map_err(|error| ConsensusError::View(error.to_string()))?;
+        Ok((canonical == Some(*hash)).then_some(record.height))
+    }
+}
+
+struct TransactionSequenceView<'a, T: ReadSnapshot> {
+    heights: HashMap<Outpoint, Height>,
+    chain: &'a SnapshotChainContext<'a, T>,
+}
+
+impl<'a, T: ReadSnapshot> TransactionSequenceView<'a, T> {
+    fn new(coins: &[Coin], chain: &'a SnapshotChainContext<'a, T>) -> Self {
+        let heights = coins
+            .iter()
+            .map(|coin| (coin.outpoint.clone(), coin.height))
+            .collect();
+        Self { heights, chain }
+    }
+}
+
+impl<T: ReadSnapshot> SequenceLockView for TransactionSequenceView<'_, T> {
+    fn coin_height(&self, outpoint: &Outpoint) -> Result<Option<Height>, ConsensusError> {
+        Ok(self.heights.get(outpoint).copied())
+    }
+
+    fn median_time_past(&self, height: Height) -> Result<u64, ConsensusError> {
+        self.chain
+            .median_time_past(height)
+            .map_err(|error| ConsensusError::View(error.to_string()))
+    }
+}
+
+pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
     batch: &mut B,
     request: DisconnectBlock,
     undo: &BlockUndo,
@@ -548,7 +1038,6 @@ pub fn disconnect_block_to_batch<B: WriteBatch>(
             actual: undo.block_hash,
         });
     }
-
     if undo.height != request.height {
         return Err(StateError::UndoHeightMismatch {
             expected: request.height,
@@ -556,10 +1045,17 @@ pub fn disconnect_block_to_batch<B: WriteBatch>(
         });
     }
 
+    let current_tree_root = verify_stored_name_tree_root(snapshot)?;
+    if current_tree_root != undo.resulting_tree_root {
+        return Err(StateError::UndoResultingTreeRootMismatch {
+            expected: undo.resulting_tree_root,
+            actual: current_tree_root,
+        });
+    }
+
     for outpoint in &undo.created_coins {
         batch.delete(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))?;
     }
-
     for coin in &undo.spent_coins {
         batch.put(
             ColumnFamily::Utxo,
@@ -567,20 +1063,46 @@ pub fn disconnect_block_to_batch<B: WriteBatch>(
             &encode_coin(coin),
         )?;
     }
-
+    let mut name_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
     for name_undo in &undo.previous_name_states {
         match &name_undo.previous {
             Some(state) => write_name_state_to_batch(batch, state)?,
             None => batch.delete(ColumnFamily::NameState, name_undo.name_hash.as_bytes())?,
         }
+        name_overrides.insert(
+            name_undo.name_hash,
+            name_undo
+                .previous
+                .as_ref()
+                .filter(|state| !state.is_null())
+                .cloned(),
+        );
     }
-
+    let restored_tree_root = rebuild_name_tree_root_with_overrides(snapshot, &name_overrides)?;
+    if restored_tree_root != undo.previous_tree_root {
+        return Err(StateError::UndoPreviousTreeRootMismatch {
+            expected: undo.previous_tree_root,
+            actual: restored_tree_root,
+        });
+    }
+    batch.put(
+        ColumnFamily::Meta,
+        MetaKey::NameTreeRoot.as_bytes(),
+        restored_tree_root.as_bytes(),
+    )?;
     batch.delete(ColumnFamily::Undo, request.block_hash.as_bytes())?;
 
     Ok(StateSummary {
         coins_created: undo.spent_coins.len(),
         coins_spent: undo.created_coins.len(),
         names_changed: undo.previous_name_states.len(),
+        inherited_tree_root: current_tree_root,
+        resulting_tree_root: restored_tree_root,
+        validation: StateValidationSummary {
+            name_state_connected: true,
+            tree_root_valid: true,
+            ..StateValidationSummary::default()
+        },
     })
 }
 
@@ -603,12 +1125,92 @@ pub fn write_name_state_to_batch<B: WriteBatch>(
     batch: &mut B,
     state: &NameState,
 ) -> Result<(), StateError> {
+    if state.is_null() {
+        batch.delete(ColumnFamily::NameState, state.name_hash.as_bytes())?;
+        return Ok(());
+    }
     batch.put(
         ColumnFamily::NameState,
         state.name_hash.as_bytes(),
-        &encode_name_state(state),
+        &encode_name_state(state)?,
     )?;
     Ok(())
+}
+
+/// Rebuild the exact authenticated name-tree root from the durable NameState
+/// column family using the pinned HSD/Urkel hashing rules. This is a
+/// correctness-first oracle path: it is intentionally O(number of names) and
+/// does not replace the future persistent incremental tree, interval snapshots,
+/// or reorganization injection semantics.
+pub fn rebuild_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot, StateError> {
+    rebuild_name_tree_root_with_overrides(snapshot, &BTreeMap::new())
+}
+
+/// Rebuild the authenticated name-tree root from one immutable base snapshot
+/// plus an explicit set of staged name-state replacements. This keeps root
+/// calculation independent of whether a particular WriteBatch implementation
+/// offers read-your-writes semantics.
+pub fn rebuild_name_tree_root_with_overrides<T: ReadSnapshot>(
+    snapshot: &T,
+    overrides: &BTreeMap<NameHash, Option<NameState>>,
+) -> Result<TreeRoot, StateError> {
+    let mut entries = BTreeMap::<NameHash, Vec<u8>>::new();
+    for (key, value) in snapshot.scan_prefix(ColumnFamily::NameState, b"")? {
+        let key: [u8; 32] = key.try_into().map_err(|key: Vec<u8>| {
+            StateError::Codec(format!(
+                "name-state key must contain 32 bytes, got {}",
+                key.len()
+            ))
+        })?;
+        let name_hash = NameHash::new(key);
+        let state = decode_name_state(&name_hash, &value)?;
+        if state.is_null() {
+            return Err(StateError::Codec(
+                "null NameState must not be persisted in the authenticated tree".to_owned(),
+            ));
+        }
+        entries.insert(name_hash, value);
+    }
+
+    for (name_hash, state) in overrides {
+        match state {
+            Some(state) if !state.is_null() => {
+                if state.name_hash != *name_hash {
+                    return Err(StateError::Codec(
+                        "name-tree override key does not match its state".to_owned(),
+                    ));
+                }
+                entries.insert(*name_hash, encode_name_state(state)?);
+            }
+            Some(_) | None => {
+                entries.remove(name_hash);
+            }
+        }
+    }
+
+    root_from_entries(entries).map_err(StateError::NameTree)
+}
+
+/// Load the durable binding for the currently materialized name-state tree.
+pub fn load_stored_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot, StateError> {
+    let bytes = snapshot
+        .get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())?
+        .ok_or(StateError::MissingStoredTreeRoot)?;
+    let root: [u8; 32] = bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| StateError::InvalidStoredTreeRootLength(bytes.len()))?;
+    Ok(TreeRoot::new(root))
+}
+
+/// Verify that durable metadata and the materialized NameState column family
+/// describe exactly the same authenticated root.
+pub fn verify_stored_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot, StateError> {
+    let stored = load_stored_name_tree_root(snapshot)?;
+    let actual = rebuild_name_tree_root(snapshot)?;
+    if stored != actual {
+        return Err(StateError::StoredTreeRootMismatch { stored, actual });
+    }
+    Ok(stored)
 }
 
 pub fn encode_coin(coin: &Coin) -> Vec<u8> {
@@ -635,7 +1237,6 @@ pub fn decode_coin(bytes: &[u8]) -> Result<Coin, StateError> {
     let address = Address::read_from(&mut reader)?;
     let covenant = Covenant::decode(&reader.read_varbytes(MAX_TX_SIZE, "coin covenant")?)?;
     reader.ensure_finished()?;
-
     Ok(Coin {
         outpoint,
         value,
@@ -646,63 +1247,198 @@ pub fn decode_coin(bytes: &[u8]) -> Result<Coin, StateError> {
     })
 }
 
-pub fn encode_name_state(state: &NameState) -> Vec<u8> {
-    let mut writer = Writer::with_capacity(NAME_STATE_CODEC_MAX);
-    writer.write_bytes(state.name_hash.as_bytes());
-
-    match &state.name {
-        Some(name) => {
-            writer.write_u8(1);
-            writer.write_varbytes(name.as_bytes());
-        }
-        None => writer.write_u8(0),
+/// Encode exactly the value payload written by HSD's `NameState.write`. The
+/// name hash is the authenticated-tree key and is deliberately not duplicated
+/// in the value.
+pub fn encode_name_state(state: &NameState) -> Result<Vec<u8>, StateError> {
+    if state.name.len() > MAX_NAME_SIZE || state.name.len() > u8::MAX as usize {
+        return Err(StateError::Codec(
+            "name exceeds HNS name-state limit".to_owned(),
+        ));
+    }
+    if state.data.len() > MAX_RESOURCE_SIZE || state.data.len() > u16::MAX as usize {
+        return Err(StateError::Codec(
+            "name resource exceeds HNS name-state limit".to_owned(),
+        ));
     }
 
+    let mut field = 0u16;
+    if !state.owner.is_null() {
+        field |= 1 << 0;
+    }
+    if state.value != 0 {
+        field |= 1 << 1;
+    }
+    if state.highest != 0 {
+        field |= 1 << 2;
+    }
+    if state.transfer != 0 {
+        field |= 1 << 3;
+    }
+    if state.revoked != 0 {
+        field |= 1 << 4;
+    }
+    if state.claimed != 0 {
+        field |= 1 << 5;
+    }
+    if state.renewals != 0 {
+        field |= 1 << 6;
+    }
+    if state.registered {
+        field |= 1 << 7;
+    }
+    if state.expired {
+        field |= 1 << 8;
+    }
+    if state.weak {
+        field |= 1 << 9;
+    }
+
+    let mut writer = Writer::with_capacity(NAME_STATE_CODEC_MAX);
+    writer.write_u8(state.name.len() as u8);
+    writer.write_bytes(&state.name);
+    writer.write_u16(state.data.len() as u16);
+    writer.write_bytes(&state.data);
     writer.write_u32(state.height);
-    writer.write_u8(name_lifecycle_to_u8(state.state));
-    writer.finish()
+    writer.write_u32(state.renewal);
+    writer.write_u16(field);
+    if !state.owner.is_null() {
+        writer.write_bytes(state.owner.txid.as_bytes());
+        writer.write_varint(u64::from(state.owner.index));
+    }
+    if state.value != 0 {
+        writer.write_varint(state.value);
+    }
+    if state.highest != 0 {
+        writer.write_varint(state.highest);
+    }
+    if state.transfer != 0 {
+        writer.write_u32(state.transfer);
+    }
+    if state.revoked != 0 {
+        writer.write_u32(state.revoked);
+    }
+    if state.claimed != 0 {
+        writer.write_u32(state.claimed);
+    }
+    if state.renewals != 0 {
+        writer.write_varint(u64::from(state.renewals));
+    }
+    Ok(writer.finish())
 }
 
-pub fn decode_name_state(bytes: &[u8]) -> Result<NameState, StateError> {
+pub fn decode_name_state(name_hash: &NameHash, bytes: &[u8]) -> Result<NameState, StateError> {
     let mut reader = Reader::new(bytes, NAME_STATE_CODEC_MAX)?;
-    let name_hash = NameHash::new(reader.read_hash()?);
-    let name = match reader.read_u8()? {
-        0 => None,
-        1 => {
-            let bytes = reader.read_varbytes(MAX_NAME_SIZE, "name")?;
-            Some(String::from_utf8(bytes).map_err(|error| StateError::Codec(error.to_string()))?)
-        }
-        value => {
-            return Err(StateError::Codec(format!(
-                "invalid name-present flag {value}"
-            )))
-        }
-    };
+    let name_length = usize::from(reader.read_u8()?);
+    if name_length > MAX_NAME_SIZE {
+        return Err(StateError::Codec(
+            "encoded name exceeds HNS limit".to_owned(),
+        ));
+    }
+    let name = reader.read_vec(name_length)?;
+    let data_length = usize::from(reader.read_u16()?);
+    if data_length > MAX_RESOURCE_SIZE {
+        return Err(StateError::Codec(
+            "encoded name resource exceeds HNS limit".to_owned(),
+        ));
+    }
+    let data = reader.read_vec(data_length)?;
     let height = reader.read_u32()?;
-    let state = name_lifecycle_from_u8(reader.read_u8()?)?;
+    let renewal = reader.read_u32()?;
+    let field = reader.read_u16()?;
+    if field & !NAME_STATE_FIELD_MASK != 0 {
+        return Err(StateError::Codec(format!(
+            "name-state field contains unknown bits 0x{:04x}",
+            field & !NAME_STATE_FIELD_MASK
+        )));
+    }
+
+    let owner = if field & (1 << 0) != 0 {
+        let txid = hns_primitives::Txid::new(reader.read_hash()?);
+        let index = u32::try_from(reader.read_varint()?)
+            .map_err(|_| StateError::Codec("name owner index exceeds u32".to_owned()))?;
+        Outpoint { txid, index }
+    } else {
+        Outpoint::null()
+    };
+    let value = if field & (1 << 1) != 0 {
+        reader.read_varint()?
+    } else {
+        0
+    };
+    let highest = if field & (1 << 2) != 0 {
+        reader.read_varint()?
+    } else {
+        0
+    };
+    let transfer = if field & (1 << 3) != 0 {
+        reader.read_u32()?
+    } else {
+        0
+    };
+    let revoked = if field & (1 << 4) != 0 {
+        reader.read_u32()?
+    } else {
+        0
+    };
+    let claimed = if field & (1 << 5) != 0 {
+        reader.read_u32()?
+    } else {
+        0
+    };
+    let renewals = if field & (1 << 6) != 0 {
+        u32::try_from(reader.read_varint()?)
+            .map_err(|_| StateError::Codec("name renewal count exceeds u32".to_owned()))?
+    } else {
+        0
+    };
     reader.ensure_finished()?;
 
     Ok(NameState {
-        name_hash,
+        name_hash: *name_hash,
         name,
         height,
-        state,
+        renewal,
+        owner,
+        value,
+        highest,
+        data,
+        transfer,
+        revoked,
+        claimed,
+        renewals,
+        registered: field & (1 << 7) != 0,
+        expired: field & (1 << 8) != 0,
+        weak: field & (1 << 9) != 0,
     })
 }
 
-fn encode_name_undo(undo: &NameUndo) -> Vec<u8> {
+fn load_name_state<T: ReadSnapshot>(
+    snapshot: &T,
+    name_hash: &NameHash,
+) -> Result<Option<NameState>, StateError> {
+    let Some(bytes) = snapshot.get(ColumnFamily::NameState, name_hash.as_bytes())? else {
+        return Ok(None);
+    };
+    decode_name_state(name_hash, &bytes).map(Some)
+}
+
+fn encode_name_undo(undo: &NameUndo) -> Result<Vec<u8>, StateError> {
     let mut writer = Writer::with_capacity(NAME_UNDO_CODEC_MAX);
     writer.write_bytes(undo.name_hash.as_bytes());
-
     match &undo.previous {
         Some(state) => {
+            if state.name_hash != undo.name_hash {
+                return Err(StateError::Codec(
+                    "name undo key does not match previous state".to_owned(),
+                ));
+            }
             writer.write_u8(1);
-            writer.write_varbytes(&encode_name_state(state));
+            writer.write_varbytes(&encode_name_state(state)?);
         }
         None => writer.write_u8(0),
     }
-
-    writer.finish()
+    Ok(writer.finish())
 }
 
 fn decode_name_undo(bytes: &[u8]) -> Result<NameUndo, StateError> {
@@ -712,7 +1448,7 @@ fn decode_name_undo(bytes: &[u8]) -> Result<NameUndo, StateError> {
         0 => None,
         1 => {
             let bytes = reader.read_varbytes(NAME_STATE_CODEC_MAX, "previous name state")?;
-            Some(decode_name_state(&bytes)?)
+            Some(decode_name_state(&name_hash, &bytes)?)
         }
         value => {
             return Err(StateError::Codec(format!(
@@ -721,70 +1457,71 @@ fn decode_name_undo(bytes: &[u8]) -> Result<NameUndo, StateError> {
         }
     };
     reader.ensure_finished()?;
-
     Ok(NameUndo {
         name_hash,
         previous,
     })
 }
 
-const fn name_lifecycle_to_u8(state: NameLifecycleState) -> u8 {
-    match state {
-        NameLifecycleState::Available => 0,
-        NameLifecycleState::Opening => 1,
-        NameLifecycleState::Bidding => 2,
-        NameLifecycleState::Reveal => 3,
-        NameLifecycleState::Redeem => 4,
-        NameLifecycleState::Registered => 5,
-        NameLifecycleState::Updating => 6,
-        NameLifecycleState::Renewing => 7,
-        NameLifecycleState::Transferring => 8,
-        NameLifecycleState::Finalizing => 9,
-        NameLifecycleState::Revoked => 10,
-        NameLifecycleState::Expired => 11,
-        NameLifecycleState::Reserved => 12,
-    }
-}
-
-const fn name_lifecycle_from_u8(value: u8) -> Result<NameLifecycleState, StateError> {
-    match value {
-        0 => Ok(NameLifecycleState::Available),
-        1 => Ok(NameLifecycleState::Opening),
-        2 => Ok(NameLifecycleState::Bidding),
-        3 => Ok(NameLifecycleState::Reveal),
-        4 => Ok(NameLifecycleState::Redeem),
-        5 => Ok(NameLifecycleState::Registered),
-        6 => Ok(NameLifecycleState::Updating),
-        7 => Ok(NameLifecycleState::Renewing),
-        8 => Ok(NameLifecycleState::Transferring),
-        9 => Ok(NameLifecycleState::Finalizing),
-        10 => Ok(NameLifecycleState::Revoked),
-        11 => Ok(NameLifecycleState::Expired),
-        12 => Ok(NameLifecycleState::Reserved),
-        _ => Err(StateError::InvalidNameLifecycle(value)),
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
-    #[error("state engine is not implemented in the scaffold")]
-    Unimplemented,
     #[error("state codec failed: {0}")]
     Codec(String),
     #[error("state store failed: {0}")]
     Store(#[from] StoreError),
+    #[error("authenticated name-tree calculation failed: {0}")]
+    NameTree(#[from] UrkelError),
+    #[error("durable name-tree-root metadata is missing")]
+    MissingStoredTreeRoot,
+    #[error("durable name-tree-root metadata must contain 32 bytes, got {0}")]
+    InvalidStoredTreeRootLength(usize),
+    #[error("durable name-tree root {stored:?} does not match materialized name state {actual:?}")]
+    StoredTreeRootMismatch { stored: TreeRoot, actual: TreeRoot },
+    #[error(
+        "block header commits to name-tree root {committed:?}, but inherited state root is {inherited:?}"
+    )]
+    HeaderTreeRootMismatch {
+        committed: TreeRoot,
+        inherited: TreeRoot,
+    },
+    #[error(
+        "undo expects current name-tree root {expected:?}, but materialized state is {actual:?}"
+    )]
+    UndoResultingTreeRootMismatch {
+        expected: TreeRoot,
+        actual: TreeRoot,
+    },
+    #[error("undo restores name-tree root {actual:?}, but recorded previous root is {expected:?}")]
+    UndoPreviousTreeRootMismatch {
+        expected: TreeRoot,
+        actual: TreeRoot,
+    },
+    #[error("chain index failed: {0}")]
+    Chain(#[from] hns_chain::ChainError),
+    #[error("consensus validation failed: {0}")]
+    Consensus(#[from] ConsensusError),
+    #[error("chain view failed: {0}")]
+    ChainView(String),
+    #[error("input-authorization backend failed to initialize: {0}")]
+    InputAuthorizationBackend(String),
     #[error("missing coin for outpoint {0:?}")]
     MissingCoin(Outpoint),
     #[error("duplicate spend for outpoint {0:?}")]
     DuplicateSpend(Outpoint),
     #[error("transaction input {input_index} authorization failed: {reason}")]
     InputAuthorization { input_index: usize, reason: String },
+    #[error("transaction relative sequence locks are not satisfied")]
+    RelativeLocks,
     #[error("transaction covenant linkage failed: {0}")]
     CovenantLink(#[from] CovenantLinkError),
+    #[error("contextual covenant validation failed: {0}")]
+    ContextualCovenant(String),
     #[error("duplicate created coin for outpoint {0:?}")]
     DuplicateCoin(Outpoint),
     #[error("block has no coinbase transaction")]
     MissingCoinbase,
+    #[error("deployment-derived name flags are unavailable for contextual covenant validation")]
+    DeploymentStateUnavailable,
     #[error(
         "coinbase claim/airdrop issuance is disabled until its proof and historical dataset are verified"
     )]
@@ -795,9 +1532,9 @@ pub enum StateError {
     OutputValueOverflow,
     #[error("block transaction fee total overflow")]
     FeeValueOverflow,
-    #[error("block subsidy plus fees overflow")]
+    #[error("block subsidy, fees, and verified issuance overflow")]
     CoinbaseRewardOverflow,
-    #[error("coinbase value {coinbase} exceeds subsidy-plus-fee maximum {maximum}")]
+    #[error("coinbase value {coinbase} exceeds verified maximum {maximum}")]
     CoinbaseValueExceedsReward { coinbase: Amount, maximum: Amount },
     #[error("transaction input value {input} is below output value {output}")]
     InputValueBelowOutput { input: u64, output: u64 },
@@ -823,8 +1560,6 @@ pub enum StateError {
         expected: BlockHash,
         actual: BlockHash,
     },
-    #[error("invalid name lifecycle value {0}")]
-    InvalidNameLifecycle(u8),
 }
 
 impl From<PrimitiveError> for StateError {
@@ -838,12 +1573,10 @@ mod tests {
     use std::sync::Arc;
 
     use hns_consensus::ConsensusError;
+    use hns_primitives::{hash_name, Address, CovenantKind, Header, Input, Output, Txid, Witness};
+    use hns_store::{MemoryStore, Store};
 
     use super::*;
-    use hns_primitives::{
-        Address, CovenantKind, Header, Input, Output, Transaction, Txid, Witness,
-    };
-    use hns_store::{MemoryStore, Store};
 
     #[derive(Clone, Copy, Debug)]
     struct AllowAllInputVerifier;
@@ -851,7 +1584,7 @@ mod tests {
     impl TransactionInputVerifier for AllowAllInputVerifier {
         fn verify_input(
             &self,
-            _transaction: &hns_primitives::Transaction,
+            _transaction: &Transaction,
             _input_index: usize,
             _coin: &Coin,
         ) -> Result<(), ConsensusError> {
@@ -859,9 +1592,20 @@ mod tests {
         }
     }
 
-    fn authorized_engine(store: MemoryStore) -> StoredStateEngine<MemoryStore> {
-        StoredStateEngine::with_input_verifier(store, Arc::new(AllowAllInputVerifier))
-            .expect("authorized test engine")
+    fn engine(store: MemoryStore) -> StoredStateEngine<MemoryStore> {
+        StoredStateEngine::with_services(
+            store,
+            Network::Regtest,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+        .expect("test engine")
+    }
+
+    fn address() -> Address {
+        Address::new(0, vec![0; 20]).expect("address")
     }
 
     fn covenant() -> Covenant {
@@ -871,36 +1615,36 @@ mod tests {
         }
     }
 
-    fn output(value: u64) -> Output {
+    fn output(value: Amount) -> Output {
         Output {
             value,
-            address: Address::new(0, vec![0; 20]).expect("address"),
+            address: address(),
             covenant: covenant(),
         }
     }
 
-    fn name_covenant(kind: CovenantKind, name_hash: [u8; 32], start: u32) -> Covenant {
-        Covenant {
-            kind,
-            items: vec![name_hash.to_vec(), start.to_le_bytes().to_vec()],
+    fn open_output(name: &[u8]) -> Output {
+        let name_hash = NameHash::new(hns_primitives::sha3_256(name));
+        Output {
+            value: 0,
+            address: address(),
+            covenant: Covenant {
+                kind: CovenantKind::Open,
+                items: vec![
+                    name_hash.as_bytes().to_vec(),
+                    0u32.to_le_bytes().to_vec(),
+                    name.to_vec(),
+                ],
+            },
         }
     }
 
     fn coinbase(outputs: Vec<Output>) -> Transaction {
         Transaction {
             version: 1,
-            inputs: Vec::new(),
-            outputs,
-            locktime: 0,
-        }
-    }
-
-    fn spend(previous_output: Outpoint, outputs: Vec<Output>) -> Transaction {
-        Transaction {
-            version: 1,
             inputs: vec![Input {
-                previous_output,
-                sequence: 0xffff_ffff,
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
                 witness: Witness::default(),
             }],
             outputs,
@@ -918,410 +1662,465 @@ mod tests {
         }
     }
 
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameTreeFixture {
+        states: Vec<NameTreeStateFixture>,
+        incremental_roots: Vec<NameTreeRootFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameTreeStateFixture {
+        name_hash: String,
+        encoded: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameTreeRootFixture {
+        header_root: String,
+        resulting_root: String,
+        root: String,
+    }
+
+    fn decode_fixture_bytes(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    fn decode_hash(value: &str) -> [u8; 32] {
+        decode_fixture_bytes(value)
+            .try_into()
+            .expect("32-byte hash")
+    }
+
     #[test]
-    fn coin_codec_round_trips() {
-        let coin = Coin {
-            outpoint: Outpoint {
-                txid: Txid::new([1; 32]),
+    fn rebuilt_name_tree_root_matches_incremental_hsd_roots() {
+        let fixture: NameTreeFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/name-states/state-urkel-v1.json"
+        ))
+        .expect("fixture");
+        assert_eq!(fixture.states.len(), fixture.incremental_roots.len());
+
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        for (state, expected) in fixture.states.iter().zip(&fixture.incremental_roots) {
+            let snapshot = store.snapshot().expect("pre-state snapshot");
+            assert_eq!(
+                verify_stored_name_tree_root(&snapshot).expect("pre-state root"),
+                TreeRoot::new(decode_hash(&expected.header_root))
+            );
+            drop(snapshot);
+
+            let mut batch = store.batch();
+            batch
+                .put(
+                    ColumnFamily::NameState,
+                    &decode_hash(&state.name_hash),
+                    &decode_fixture_bytes(&state.encoded),
+                )
+                .expect("put");
+            batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::NameTreeRoot.as_bytes(),
+                    &decode_hash(&expected.resulting_root),
+                )
+                .expect("bind resulting root");
+            store.commit(batch).expect("commit");
+            let snapshot = store.snapshot().expect("snapshot");
+            assert_eq!(expected.root, expected.resulting_root);
+            assert_eq!(
+                rebuild_name_tree_root(&snapshot).expect("root"),
+                TreeRoot::new(decode_hash(&expected.resulting_root))
+            );
+            assert_eq!(
+                verify_stored_name_tree_root(&snapshot).expect("bound root"),
+                TreeRoot::new(decode_hash(&expected.resulting_root))
+            );
+        }
+    }
+
+    #[test]
+    fn block_header_commits_pre_state_root_and_disconnect_restores_it() {
+        let store = MemoryStore::new();
+        let mut state = engine(store.clone());
+        let mut opening = block(91, vec![coinbase(vec![open_output(b"hsrdstateroot")])]);
+        opening.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let opening_hash = opening.hash();
+
+        let summary = state
+            .connect_block(ConnectBlock {
+                block_hash: opening_hash,
+                height: 100,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &opening,
+            })
+            .expect("connect OPEN block");
+        assert_eq!(summary.inherited_tree_root, TreeRoot::ZERO);
+        assert_ne!(summary.resulting_tree_root, TreeRoot::ZERO);
+        assert!(summary.validation.tree_root_valid);
+        let snapshot = store.snapshot().expect("post-state snapshot");
+        assert_eq!(
+            verify_stored_name_tree_root(&snapshot).expect("post-state root"),
+            summary.resulting_tree_root
+        );
+        drop(snapshot);
+
+        let fresh_store = MemoryStore::new();
+        let mut fresh_state = engine(fresh_store);
+        let mut incorrectly_committed = opening.clone();
+        incorrectly_committed.header.tree_root = *summary.resulting_tree_root.as_bytes();
+        assert!(matches!(
+            fresh_state.connect_block(ConnectBlock {
+                block_hash: incorrectly_committed.hash(),
+                height: 100,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &incorrectly_committed,
+            }),
+            Err(StateError::HeaderTreeRootMismatch { .. })
+        ));
+
+        let disconnected = state
+            .disconnect_block(DisconnectBlock {
+                block_hash: opening_hash,
+                height: 100,
+            })
+            .expect("disconnect OPEN block");
+        assert_eq!(
+            disconnected.inherited_tree_root,
+            summary.resulting_tree_root
+        );
+        assert_eq!(disconnected.resulting_tree_root, TreeRoot::ZERO);
+        let snapshot = store.snapshot().expect("restored snapshot");
+        assert_eq!(
+            verify_stored_name_tree_root(&snapshot).expect("restored root"),
+            TreeRoot::ZERO
+        );
+        assert!(snapshot
+            .scan_prefix(ColumnFamily::NameState, b"")
+            .expect("name states")
+            .is_empty());
+    }
+
+    #[test]
+    fn disconnect_rejects_corrupt_root_binding_without_mutation() {
+        let store = MemoryStore::new();
+        let mut state = engine(store.clone());
+        let mut opening = block(92, vec![coinbase(vec![open_output(b"hsrdstateroot")])]);
+        opening.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let opening_hash = opening.hash();
+
+        let summary = state
+            .connect_block(ConnectBlock {
+                block_hash: opening_hash,
+                height: 100,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &opening,
+            })
+            .expect("connect OPEN block");
+        assert_ne!(summary.resulting_tree_root, TreeRoot::ZERO);
+
+        let mut corrupt = store.batch();
+        corrupt
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                TreeRoot::ZERO.as_bytes(),
+            )
+            .expect("corrupt root binding");
+        store.commit(corrupt).expect("commit corrupt root binding");
+
+        assert!(matches!(
+            state.disconnect_block(DisconnectBlock {
+                block_hash: opening_hash,
+                height: 100,
+            }),
+            Err(StateError::StoredTreeRootMismatch { .. })
+        ));
+
+        let snapshot = store
+            .snapshot()
+            .expect("snapshot after rejected disconnect");
+        assert!(snapshot
+            .get(ColumnFamily::Undo, opening_hash.as_bytes())
+            .expect("undo lookup")
+            .is_some());
+        assert_eq!(
+            snapshot
+                .scan_prefix(ColumnFamily::NameState, b"")
+                .expect("name states")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn durable_name_tree_binding_detects_materialized_state_corruption() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let hash = hash_name("alpha").expect("name hash");
+        let mut state = NameState::null(hash);
+        state.initialize(b"alpha".to_vec(), 100);
+        let mut batch = store.batch();
+        write_name_state_to_batch(&mut batch, &state).expect("write state");
+        store
+            .commit(batch)
+            .expect("commit corrupt state without root binding");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            verify_stored_name_tree_root(&snapshot),
+            Err(StateError::StoredTreeRootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_hsd_name_state_codec_round_trips() {
+        let hash = hash_name("alpha").expect("name hash");
+        let state = NameState {
+            name_hash: hash,
+            name: b"alpha".to_vec(),
+            height: 10,
+            renewal: 20,
+            owner: Outpoint {
+                txid: Txid::new([3; 32]),
                 index: 7,
             },
-            value: 42,
-            height: 3,
-            coinbase: true,
-            address: address(),
-            covenant: covenant(),
-        };
-
-        assert_eq!(decode_coin(&encode_coin(&coin)).expect("decode"), coin);
-    }
-
-    #[test]
-    fn name_state_codec_round_trips() {
-        let state = NameState {
-            name_hash: NameHash::new([2; 32]),
-            name: Some("example-name".to_owned()),
-            height: 9,
-            state: NameLifecycleState::Registered,
-        };
-
-        assert_eq!(
-            decode_name_state(&encode_name_state(&state)).expect("decode"),
-            state
-        );
-    }
-
-    #[test]
-    fn connect_and_disconnect_block_updates_utxo_with_undo() {
-        let store = MemoryStore::new();
-        let mut engine = authorized_engine(store.clone());
-        let first_tx = coinbase(vec![output(100)]);
-        let first_outpoint = Outpoint {
-            txid: first_tx.txid(),
-            index: 0,
-        };
-        let first_block = block(1, vec![first_tx]);
-
-        let summary = engine
-            .connect_block(ConnectBlock {
-                block_hash: first_block.hash(),
-                height: 0,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &first_block,
-            })
-            .expect("connect first");
-
-        assert_eq!(
-            summary,
-            StateSummary {
-                coins_created: 1,
-                coins_spent: 0,
-                names_changed: 0,
-            }
-        );
-        assert!(engine.coin(&first_outpoint).expect("coin").is_some());
-
-        let spend_tx = spend(first_outpoint.clone(), vec![output(25)]);
-        let spend_outpoint = Outpoint {
-            txid: spend_tx.txid(),
-            index: 0,
-        };
-        let second_block = block(2, vec![coinbase(Vec::new()), spend_tx]);
-        let summary = engine
-            .connect_block(ConnectBlock {
-                block_hash: second_block.hash(),
-                height: 1,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &second_block,
-            })
-            .expect("connect second");
-
-        assert_eq!(summary.coins_created, 1);
-        assert_eq!(summary.coins_spent, 1);
-        assert!(engine.coin(&first_outpoint).expect("old coin").is_none());
-        assert!(engine.coin(&spend_outpoint).expect("new coin").is_some());
-        assert!(engine
-            .load_undo(&second_block.hash())
-            .expect("undo")
-            .is_some());
-
-        let summary = engine
-            .disconnect_block(DisconnectBlock {
-                block_hash: second_block.hash(),
-                height: 1,
-            })
-            .expect("disconnect second");
-
-        assert_eq!(summary.coins_created, 1);
-        assert_eq!(summary.coins_spent, 1);
-        assert!(engine
-            .coin(&first_outpoint)
-            .expect("old restored")
-            .is_some());
-        assert!(engine.coin(&spend_outpoint).expect("new deleted").is_none());
-        assert!(engine
-            .load_undo(&second_block.hash())
-            .expect("undo removed")
-            .is_none());
-
-        let snapshot = store.snapshot().expect("snapshot");
-        assert!(snapshot
-            .get(ColumnFamily::Undo, second_block.hash().as_bytes())
-            .expect("undo cf")
-            .is_none());
-    }
-
-    #[test]
-    fn connect_rejects_immature_and_value_creating_spends_without_mutation() {
-        let store = MemoryStore::new();
-        let mut engine = authorized_engine(store);
-        let first_tx = coinbase(vec![output(100)]);
-        let first_outpoint = Outpoint {
-            txid: first_tx.txid(),
-            index: 0,
-        };
-        let first_block = block(10, vec![first_tx]);
-        engine
-            .connect_block(ConnectBlock {
-                block_hash: first_block.hash(),
-                height: 0,
-                coinbase_maturity: 2,
-                block_reward: 100,
-                block: &first_block,
-            })
-            .expect("connect funding block");
-
-        let immature = block(
-            11,
-            vec![
-                coinbase(Vec::new()),
-                spend(first_outpoint.clone(), vec![output(100)]),
-            ],
-        );
-        assert!(matches!(
-            engine.connect_block(ConnectBlock {
-                block_hash: immature.hash(),
-                height: 1,
-                coinbase_maturity: 2,
-                block_reward: 100,
-                block: &immature,
-            }),
-            Err(StateError::PrematureCoinbaseSpend { .. })
-        ));
-        assert!(engine.coin(&first_outpoint).unwrap().is_some());
-
-        let inflationary = block(
-            12,
-            vec![
-                coinbase(Vec::new()),
-                spend(first_outpoint.clone(), vec![output(101)]),
-            ],
-        );
-        assert!(matches!(
-            engine.connect_block(ConnectBlock {
-                block_hash: inflationary.hash(),
-                height: 2,
-                coinbase_maturity: 2,
-                block_reward: 100,
-                block: &inflationary,
-            }),
-            Err(StateError::InputValueBelowOutput {
-                input: 100,
-                output: 101
-            })
-        ));
-        assert!(engine.coin(&first_outpoint).unwrap().is_some());
-    }
-
-    #[test]
-    fn connect_enforces_subsidy_plus_fees_and_is_atomic_on_overpayment() {
-        let store = MemoryStore::new();
-        let mut engine = authorized_engine(store);
-        let funding = coinbase(vec![output(100)]);
-        let funding_outpoint = Outpoint {
-            txid: funding.txid(),
-            index: 0,
-        };
-        let funding_block = block(20, vec![funding]);
-        engine
-            .connect_block(ConnectBlock {
-                block_hash: funding_block.hash(),
-                height: 0,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &funding_block,
-            })
-            .expect("connect funding block");
-
-        let spend_tx = spend(funding_outpoint.clone(), vec![output(60)]);
-        let overpaid_coinbase = coinbase(vec![output(141)]);
-        let overpaid_outpoint = Outpoint {
-            txid: overpaid_coinbase.txid(),
-            index: 0,
-        };
-        let overpaid = block(21, vec![overpaid_coinbase, spend_tx.clone()]);
-        assert!(matches!(
-            engine.connect_block(ConnectBlock {
-                block_hash: overpaid.hash(),
-                height: 1,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &overpaid,
-            }),
-            Err(StateError::CoinbaseValueExceedsReward {
-                coinbase: 141,
-                maximum: 140
-            })
-        ));
-        assert!(engine.coin(&funding_outpoint).unwrap().is_some());
-        assert!(engine.coin(&overpaid_outpoint).unwrap().is_none());
-        assert!(engine.load_undo(&overpaid.hash()).unwrap().is_none());
-
-        let paid_coinbase = coinbase(vec![output(140)]);
-        let paid_outpoint = Outpoint {
-            txid: paid_coinbase.txid(),
-            index: 0,
-        };
-        let paid = block(22, vec![paid_coinbase, spend_tx]);
-        engine
-            .connect_block(ConnectBlock {
-                block_hash: paid.hash(),
-                height: 1,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &paid,
-            })
-            .expect("fees may be paid to the miner");
-        assert!(engine.coin(&funding_outpoint).unwrap().is_none());
-        assert!(engine.coin(&paid_outpoint).unwrap().is_some());
-    }
-
-    #[test]
-    fn default_engine_rejects_unauthorized_spends_without_mutation() {
-        let store = MemoryStore::new();
-        let mut engine = StoredStateEngine::new(store).expect("engine");
-        let funding = coinbase(vec![output(100)]);
-        let funding_outpoint = Outpoint {
-            txid: funding.txid(),
-            index: 0,
-        };
-        let funding_block = block(30, vec![funding]);
-        engine
-            .connect_block(ConnectBlock {
-                block_hash: funding_block.hash(),
-                height: 0,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &funding_block,
-            })
-            .expect("connect funding block");
-
-        let unauthorized = block(
-            31,
-            vec![
-                coinbase(Vec::new()),
-                spend(funding_outpoint.clone(), vec![output(90)]),
-            ],
-        );
-        assert!(matches!(
-            engine.connect_block(ConnectBlock {
-                block_hash: unauthorized.hash(),
-                height: 1,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &unauthorized,
-            }),
-            Err(StateError::InputAuthorization { input_index: 0, .. })
-        ));
-        assert!(engine.coin(&funding_outpoint).unwrap().is_some());
-        assert!(engine.load_undo(&unauthorized.hash()).unwrap().is_none());
-    }
-
-    #[test]
-    fn covenant_linkage_rejects_invalid_transition_before_utxo_mutation() {
-        let store = MemoryStore::new();
-        let funding_outpoint = Outpoint {
-            txid: Txid::new([44; 32]),
-            index: 0,
-        };
-        let owner = Address::new(0, vec![45; 20]).expect("owner address");
-        let name_hash = [46; 32];
-        let funding_coin = Coin {
-            outpoint: funding_outpoint.clone(),
             value: 50,
-            height: 1,
-            coinbase: false,
-            address: owner.clone(),
-            covenant: name_covenant(CovenantKind::Register, name_hash, 7),
+            highest: 80,
+            data: vec![1, 2, 3],
+            transfer: 30,
+            revoked: 40,
+            claimed: 5,
+            renewals: 9,
+            registered: true,
+            expired: true,
+            weak: true,
         };
-        let mut funding_batch = store.batch();
-        write_coin_to_batch(&mut funding_batch, &funding_coin).expect("stage funding coin");
-        store.commit(funding_batch).expect("commit funding coin");
+        let encoded = encode_name_state(&state).expect("encode");
+        assert_eq!(decode_name_state(&hash, &encoded).expect("decode"), state);
+        assert_eq!(encoded[0], 5);
+        assert_eq!(&encoded[1..6], b"alpha");
+    }
 
-        let mut engine = authorized_engine(store);
-        let invalid_spend = spend(
-            funding_outpoint.clone(),
-            vec![Output {
-                value: 50,
-                address: owner.clone(),
-                covenant: covenant(),
-            }],
-        );
-        let invalid_outpoint = Outpoint {
-            txid: invalid_spend.txid(),
-            index: 0,
-        };
-        let invalid_block = block(40, vec![coinbase(Vec::new()), invalid_spend]);
+    #[derive(Deserialize)]
+    struct NameCodecFixture {
+        vectors: Vec<NameCodecVector>,
+    }
 
-        assert!(matches!(
-            engine.connect_block(ConnectBlock {
-                block_hash: invalid_block.hash(),
-                height: 2,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &invalid_block,
-            }),
-            Err(StateError::CovenantLink(
-                CovenantLinkError::InvalidTransition {
-                    input_index: 0,
-                    from: CovenantKind::Register,
-                    to: CovenantKind::None,
-                }
-            ))
-        ));
-        assert!(engine.coin(&funding_outpoint).unwrap().is_some());
-        assert!(engine.coin(&invalid_outpoint).unwrap().is_none());
-        assert!(engine.load_undo(&invalid_block.hash()).unwrap().is_none());
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameCodecVector {
+        name_hash: String,
+        raw: String,
+        json: NameCodecJson,
+    }
 
-        let valid_spend = spend(
-            funding_outpoint.clone(),
-            vec![Output {
-                value: 50,
-                address: owner,
-                covenant: name_covenant(CovenantKind::Update, name_hash, 7),
-            }],
-        );
-        let valid_outpoint = Outpoint {
-            txid: valid_spend.txid(),
-            index: 0,
-        };
-        let valid_block = block(41, vec![coinbase(Vec::new()), valid_spend]);
-        engine
-            .connect_block(ConnectBlock {
-                block_hash: valid_block.hash(),
-                height: 2,
-                coinbase_maturity: 0,
-                block_reward: 100,
-                block: &valid_block,
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameCodecJson {
+        name: String,
+        height: u32,
+        renewal: u32,
+        owner_hash: String,
+        owner_index: u32,
+        value: u64,
+        highest: u64,
+        data: String,
+        transfer: u32,
+        revoked: u32,
+        claimed: u32,
+        renewals: u32,
+        registered: bool,
+        expired: bool,
+        weak: bool,
+    }
+
+    fn decode_hex<const N: usize>(value: &str) -> [u8; N] {
+        assert_eq!(value.len(), N * 2);
+        let mut bytes = [0u8; N];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .expect("valid fixture hex");
+        }
+        bytes
+    }
+
+    fn decode_hex_vec(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        (0..value.len())
+            .step_by(2)
+            .map(|index| {
+                u8::from_str_radix(&value[index..index + 2], 16).expect("valid fixture hex")
             })
-            .expect("REGISTER to UPDATE linkage");
-        assert!(engine.coin(&funding_outpoint).unwrap().is_none());
-        assert!(engine.coin(&valid_outpoint).unwrap().is_some());
+            .collect()
     }
 
     #[test]
-    fn connect_fails_closed_on_unverified_coinbase_issuance() {
-        let store = MemoryStore::new();
-        let mut engine = StoredStateEngine::new(store).expect("engine");
-        let mut issuance = coinbase(vec![output(100)]);
-        issuance.inputs = vec![
-            Input {
-                previous_output: Outpoint {
-                    txid: Txid::ZERO,
-                    index: u32::MAX,
+    fn name_state_codec_matches_pinned_hsd_vectors() {
+        let fixture: NameCodecFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/name-states/codec-v1.json"
+        ))
+        .expect("fixture");
+
+        for vector in fixture.vectors {
+            let name_hash = NameHash::new(decode_hex::<32>(&vector.name_hash));
+            let raw = decode_hex_vec(&vector.raw);
+            let expected = NameState {
+                name_hash,
+                name: vector.json.name.into_bytes(),
+                height: vector.json.height,
+                renewal: vector.json.renewal,
+                owner: Outpoint {
+                    txid: Txid::new(decode_hex::<32>(&vector.json.owner_hash)),
+                    index: vector.json.owner_index,
                 },
+                value: vector.json.value,
+                highest: vector.json.highest,
+                data: decode_hex_vec(&vector.json.data),
+                transfer: vector.json.transfer,
+                revoked: vector.json.revoked,
+                claimed: vector.json.claimed,
+                renewals: vector.json.renewals,
+                registered: vector.json.registered,
+                expired: vector.json.expired,
+                weak: vector.json.weak,
+            };
+            assert_eq!(
+                decode_name_state(&name_hash, &raw).expect("decode"),
+                expected
+            );
+            assert_eq!(encode_name_state(&expected).expect("encode"), raw);
+        }
+    }
+
+    #[test]
+    fn name_codec_rejects_unknown_field_bits() {
+        let hash = hash_name("alpha").expect("name hash");
+        let mut encoded = encode_name_state(&NameState::null(hash)).expect("encode");
+        let field_offset = 1 + 2 + 4 + 4;
+        encoded[field_offset..field_offset + 2].copy_from_slice(&(1u16 << 15).to_le_bytes());
+        assert!(decode_name_state(&hash, &encoded).is_err());
+    }
+
+    #[test]
+    fn default_engine_rejects_noncoinbase_authorization_without_mutation() {
+        let store = MemoryStore::new();
+        let mut engine = StoredStateEngine::for_network(store, Network::Regtest).expect("engine");
+        let funding = coinbase(vec![output(100)]);
+        let funding_outpoint = Outpoint {
+            txid: funding.txid(),
+            index: 0,
+        };
+        let funding_block = block(1, vec![funding]);
+        engine
+            .connect_block(ConnectBlock {
+                block_hash: funding_block.hash(),
+                height: 0,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &funding_block,
+            })
+            .expect("funding block");
+
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: funding_outpoint.clone(),
                 sequence: u32::MAX,
                 witness: Witness::default(),
-            },
-            Input {
-                previous_output: Outpoint {
-                    txid: Txid::ZERO,
-                    index: u32::MAX,
-                },
-                sequence: u32::MAX,
-                witness: Witness {
-                    items: vec![vec![1]],
-                },
-            },
-        ];
-        let issuance_outpoint = Outpoint {
-            txid: issuance.txid(),
-            index: 0,
+            }],
+            outputs: vec![output(90)],
+            locktime: 0,
         };
-        let issuance_block = block(23, vec![issuance]);
-
+        let candidate = block(2, vec![coinbase(Vec::new()), spend]);
         assert!(matches!(
             engine.connect_block(ConnectBlock {
-                block_hash: issuance_block.hash(),
+                block_hash: candidate.hash(),
                 height: 1,
                 coinbase_maturity: 0,
                 block_reward: 100,
-                block: &issuance_block,
+                block: &candidate,
+            }),
+            Err(StateError::InputAuthorization { .. })
+        ));
+        assert!(engine.coin(&funding_outpoint).expect("coin").is_some());
+        assert!(engine.load_undo(&candidate.hash()).expect("undo").is_none());
+    }
+
+    #[test]
+    fn failed_connect_does_not_commit_partial_utxo_changes() {
+        let store = MemoryStore::new();
+        let mut engine = engine(store);
+        let funding = coinbase(vec![output(100)]);
+        let funding_outpoint = Outpoint {
+            txid: funding.txid(),
+            index: 0,
+        };
+        let funding_block = block(10, vec![funding]);
+        engine
+            .connect_block(ConnectBlock {
+                block_hash: funding_block.hash(),
+                height: 0,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &funding_block,
+            })
+            .expect("funding");
+
+        let inflation = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: funding_outpoint.clone(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![output(101)],
+            locktime: 0,
+        };
+        let candidate = block(11, vec![coinbase(Vec::new()), inflation]);
+        assert!(matches!(
+            engine.connect_block(ConnectBlock {
+                block_hash: candidate.hash(),
+                height: 1,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &candidate,
+            }),
+            Err(StateError::InputValueBelowOutput { .. })
+        ));
+        assert!(engine.coin(&funding_outpoint).expect("coin").is_some());
+    }
+
+    #[test]
+    fn special_coinbase_inputs_fail_closed() {
+        let store = MemoryStore::new();
+        let mut engine = engine(store);
+        let mut special = coinbase(vec![output(100)]);
+        special.inputs.push(Input {
+            previous_output: Outpoint::null(),
+            sequence: u32::MAX,
+            witness: Witness {
+                items: vec![vec![1]],
+            },
+        });
+        let candidate = block(20, vec![special]);
+        assert!(matches!(
+            engine.connect_block(ConnectBlock {
+                block_hash: candidate.hash(),
+                height: 0,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &candidate,
             }),
             Err(StateError::UnsupportedCoinbaseIssuance)
         ));
-        assert!(engine.coin(&issuance_outpoint).unwrap().is_none());
-        assert!(engine.load_undo(&issuance_block.hash()).unwrap().is_none());
     }
 }

@@ -6,6 +6,10 @@ publish.workspace = true
 
 [dependencies]
 hns-consensus = { path = "../hns-consensus" }
+hns-mempool = { path = "../hns-mempool" }
 hns-primitives = { path = "../hns-primitives" }
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

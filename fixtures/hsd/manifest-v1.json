@@ -6,108 +6,108 @@
   },
   "cases": [
     {
-      "id": "milestone1-header",
+      "id": "header-codec-v1",
       "network": "agnostic",
       "kind": "header",
-      "path": "headers/milestone1-header.json",
+      "path": "headers/codec-v1.json",
       "expectation": {
         "outcome": "reference"
       },
       "tags": [
-        "milestone1",
+        "oracle",
         "codec",
         "pow"
       ],
       "blake2b256": "ebb857c44bdb43d2e0ab796ec3114f12d5bebab668f9f44e3e3fd834698482a4"
     },
     {
-      "id": "milestone1-transaction",
+      "id": "transaction-codec-v1",
       "network": "agnostic",
       "kind": "transaction",
-      "path": "transactions/milestone1-transaction.json",
+      "path": "transactions/codec-v1.json",
       "expectation": {
         "outcome": "reference"
       },
       "tags": [
-        "milestone1",
+        "oracle",
         "codec",
         "witness"
       ],
       "blake2b256": "53c058ae8a6beacc475a5c718d41eaf8effa4899630c8934c874b4cf2be3a928"
     },
     {
-      "id": "milestone1-block",
+      "id": "block-codec-v1",
       "network": "agnostic",
       "kind": "block",
-      "path": "blocks/milestone1-block.json",
+      "path": "blocks/codec-v1.json",
       "expectation": {
         "outcome": "reference"
       },
       "tags": [
-        "milestone1",
+        "oracle",
         "codec",
         "commitments"
       ],
       "blake2b256": "f20dcccde245cf462912781c67841191a8fad12b66b7402cc71cf6f0c0c64e6e"
     },
     {
-      "id": "milestone1-covenant",
+      "id": "covenant-codec-v1",
       "network": "agnostic",
       "kind": "covenant",
-      "path": "covenants/milestone1-covenant.json",
+      "path": "covenants/codec-v1.json",
       "expectation": {
         "outcome": "reference"
       },
       "tags": [
-        "milestone1",
+        "oracle",
         "codec"
       ],
       "blake2b256": "fa2283df4369a7384ba97a88a316839cb55534ffbf39995eb4ded7903e428929"
     },
     {
-      "id": "milestone1-resource",
+      "id": "resource-codec-v1",
       "network": "agnostic",
       "kind": "resource",
-      "path": "resources/milestone1-resource.json",
+      "path": "resources/codec-v1.json",
       "expectation": {
         "outcome": "reference"
       },
       "tags": [
-        "milestone1",
+        "oracle",
         "codec"
       ],
       "blake2b256": "0795294b92fa607aad3be66ab99459e7a5d32e52fa1ba4c967cad07ec64cb3f6"
     },
     {
-      "id": "milestone1-name-hash",
+      "id": "name-hash-v1",
       "network": "agnostic",
       "kind": "name-state",
-      "path": "name-states/milestone1-name-hash.json",
+      "path": "name-states/name-hash-v1.json",
       "expectation": {
         "outcome": "reference"
       },
       "tags": [
-        "milestone1",
+        "oracle",
         "names"
       ],
       "blake2b256": "b33db142b748b4003d33e0cc5d53d18a4821a86d9944bd4a4c070defca83c92f"
     },
     {
-      "id": "milestone1-compact-targets",
+      "id": "compact-targets-v1",
       "network": "agnostic",
       "kind": "difficulty",
-      "path": "chains/milestone1-compact-targets.json",
+      "path": "chains/compact-targets-v1.json",
       "expectation": {
         "outcome": "reference"
       },
       "tags": [
-        "milestone1",
+        "oracle",
         "targets"
       ],
       "blake2b256": "ad783bdd3473fee48ec439462d07a781840df208e5977e2018c0df9e8615504c"
     },
     {
-      "id": "phase2-sighash-v1",
+      "id": "sighash-v1",
       "network": "agnostic",
       "kind": "script",
       "path": "scripts/sighash-v1.json",
@@ -115,14 +115,13 @@
         "outcome": "reference"
       },
       "tags": [
-        "phase2",
         "sighash",
         "oracle"
       ],
       "blake2b256": "490bba30e1122db1afadabe77b122ce3dbe7d6f6c384adf942013700877f3584"
     },
     {
-      "id": "phase2-sequence-locks-v1",
+      "id": "sequence-locks-v1",
       "network": "agnostic",
       "kind": "script",
       "path": "scripts/sequence-locks-v1.json",
@@ -130,14 +129,13 @@
         "outcome": "reference"
       },
       "tags": [
-        "phase2",
         "sequence-locks",
         "oracle"
       ],
       "blake2b256": "ed5c3aea407ba768e043374fa23e5e1c884f9e1063357d1575e9f1cdcad5765b"
     },
     {
-      "id": "phase3-covenant-linkage-v1",
+      "id": "covenant-linkage-v1",
       "network": "regtest",
       "kind": "covenant",
       "path": "covenants/linkage-v1.json",
@@ -145,12 +143,89 @@
         "outcome": "reference"
       },
       "tags": [
-        "phase3",
         "covenant-linkage",
         "contextual",
         "oracle"
       ],
       "blake2b256": "af4e86befcc24d6ae1f080b66bfd9b8f5ada25c16aa1e1eadb0d302e23ca2839"
+    },
+    {
+      "id": "name-state-codec-v1",
+      "network": "agnostic",
+      "kind": "name-state",
+      "path": "name-states/codec-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "name-state",
+        "codec",
+        "oracle"
+      ],
+      "blake2b256": "7aa0bcf5bd2b248f304c13f6313a47681db79f251d2d4a6d67e636c714aec62b"
+    },
+    {
+      "id": "name-state-urkel-v1",
+      "network": "regtest",
+      "kind": "name-state",
+      "path": "name-states/state-urkel-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "name-state",
+        "urkel",
+        "root",
+        "oracle"
+      ],
+      "blake2b256": "e7e5bab4d4ee1d12e099f543516e394e6194c8a30da0c027e024de7bd0bacc56"
+    },
+    {
+      "id": "name-policy-v1",
+      "network": "main",
+      "kind": "name-state",
+      "path": "name-states/name-policy-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "name-policy",
+        "reserved",
+        "lockup",
+        "oracle"
+      ],
+      "blake2b256": "58addc15852c72fa28d2a9092b6d333793a2196c0f5be17ede5910666ca78eca"
+    },
+    {
+      "id": "p2p-wire-v1",
+      "network": "all",
+      "kind": "p2p-wire",
+      "path": "p2p/wire-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "p2p",
+        "wire",
+        "oracle"
+      ],
+      "blake2b256": "af2f261ab73e9acbbc9d7978a42d3fb0e04cc593c779690b99975a8841bdbecd"
+    },
+    {
+      "id": "mining-template-v1",
+      "network": "regtest",
+      "kind": "mining-template",
+      "path": "mining/template-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "mining",
+        "template",
+        "coinbase",
+        "oracle"
+      ],
+      "blake2b256": "4bf4ad4ae64939029eb68b469fc9f2880c34dbd3cf77c24900ffec1b17312ae2"
     }
   ]
 }

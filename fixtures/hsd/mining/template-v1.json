@@ -1,0 +1,113 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
+  },
+  "constants": {
+    "baseReward": 2000000000,
+    "maximumCoinbaseWitnessSize": 1000
+  },
+  "subsidyCases": [
+    {
+      "network": "main",
+      "interval": 170000,
+      "height": 0,
+      "reward": 2000000000
+    },
+    {
+      "network": "main",
+      "interval": 170000,
+      "height": 169999,
+      "reward": 2000000000
+    },
+    {
+      "network": "main",
+      "interval": 170000,
+      "height": 170000,
+      "reward": 1000000000
+    },
+    {
+      "network": "main",
+      "interval": 170000,
+      "height": 339999,
+      "reward": 1000000000
+    },
+    {
+      "network": "main",
+      "interval": 170000,
+      "height": 340000,
+      "reward": 500000000
+    },
+    {
+      "network": "main",
+      "interval": 170000,
+      "height": 8670000,
+      "reward": 0
+    },
+    {
+      "network": "main",
+      "interval": 170000,
+      "height": 8840000,
+      "reward": 0
+    },
+    {
+      "network": "regtest",
+      "interval": 2500,
+      "height": 0,
+      "reward": 2000000000
+    },
+    {
+      "network": "regtest",
+      "interval": 2500,
+      "height": 2499,
+      "reward": 2000000000
+    },
+    {
+      "network": "regtest",
+      "interval": 2500,
+      "height": 2500,
+      "reward": 1000000000
+    },
+    {
+      "network": "regtest",
+      "interval": 2500,
+      "height": 4999,
+      "reward": 1000000000
+    },
+    {
+      "network": "regtest",
+      "interval": 2500,
+      "height": 5000,
+      "reward": 500000000
+    },
+    {
+      "network": "regtest",
+      "interval": 2500,
+      "height": 127500,
+      "reward": 0
+    },
+    {
+      "network": "regtest",
+      "interval": 2500,
+      "height": 130000,
+      "reward": 0
+    }
+  ],
+  "deterministicCoinbase": {
+    "network": "regtest",
+    "height": 11,
+    "generationAsSequence": 7,
+    "interval": 2500,
+    "fees": 60,
+    "reward": 2000000060,
+    "coinbaseFlags": "68737264",
+    "payoutAddressHash": "0909090909090909090909090909090909090909",
+    "raw": "00000000010000000000000000000000000000000000000000000000000000000000000000ffffffff07000000013c943577000000000014090909090909090909090909090909090909090900000b000000030468737264080000000000000000080000000000000000",
+    "txid": "34108e299d22a4114526b0d191780ca77f795430b48f1951e3e318731931078a",
+    "witnessHash": "3cd20aa3dd6ede9246e5827cd0c8bd10367dd5da1eb7d29fee04edab473fec4a",
+    "baseSize": 82,
+    "witnessSize": 24,
+    "weight": 352
+  }
+}

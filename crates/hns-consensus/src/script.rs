@@ -1,9 +1,11 @@
 use hns_primitives::{
-    blake2b_160, blake2b_256, keccak_256, sha3_256, Coin, Transaction, MAX_SCRIPT_STACK,
+    blake2b_160, blake2b_256, hash160, hash256, keccak_256, ripemd160, sha1, sha256, sha3_256,
+    Coin, Transaction, MAX_SCRIPT_STACK,
 };
+use hns_secp256k1::{Secp256k1Verifier, SecpError};
 
 use crate::{
-    is_valid_signature_hash_type, legacy_hash, signature_hash, verify_locktime_predicate,
+    is_valid_signature_hash_type, signature_hash, verify_locktime_predicate,
     verify_sequence_predicate, ConsensusError, TransactionInputVerifier, MAX_MULTISIG_PUBKEYS,
     MAX_SCRIPT_OPS, MAX_SCRIPT_PUSH, MAX_SCRIPT_SIZE,
 };
@@ -117,9 +119,8 @@ impl ScriptFlags {
     pub const VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM: Self = Self(1 << 3);
     pub const VERIFY_MINIMAL_IF: Self = Self(1 << 4);
     pub const VERIFY_NULLFAIL: Self = Self(1 << 5);
-    pub const MANDATORY: Self = Self(
-        Self::VERIFY_MINIMAL_DATA.0 | Self::VERIFY_MINIMAL_IF.0 | Self::VERIFY_NULLFAIL.0,
-    );
+    pub const MANDATORY: Self =
+        Self(Self::VERIFY_MINIMAL_DATA.0 | Self::VERIFY_MINIMAL_IF.0 | Self::VERIFY_NULLFAIL.0);
     pub const STANDARD: Self = Self(
         Self::MANDATORY.0
             | Self::VERIFY_DISCOURAGE_UPGRADABLE_NOPS.0
@@ -163,6 +164,50 @@ impl SignatureVerifier for UnavailableSignatureVerifier {
     }
 }
 
+/// Production verification backend backed by the exact libsecp256k1 source
+/// pinned by the repository's HSD oracle. The wrapper itself is stateless;
+/// verification contexts are owned lazily per thread by `hns-secp256k1`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeSignatureVerifier {
+    verifier: Secp256k1Verifier,
+}
+
+impl NativeSignatureVerifier {
+    /// Eagerly create the current thread's verification context. Startup code
+    /// should call this before advertising script-verification readiness.
+    pub fn new() -> Result<Self, ScriptError> {
+        let verifier = Secp256k1Verifier::new().map_err(map_secp_error)?;
+        Ok(Self { verifier })
+    }
+}
+
+impl SignatureVerifier for NativeSignatureVerifier {
+    fn validate_compact_signature(&self, signature: &[u8; 64]) -> Result<(), ScriptError> {
+        self.verifier
+            .validate_compact_signature(signature)
+            .map_err(map_secp_error)
+    }
+
+    fn verify(
+        &self,
+        message: &[u8; 32],
+        signature: &[u8; 64],
+        public_key: &[u8; 33],
+    ) -> Result<bool, ScriptError> {
+        self.verifier
+            .verify(message, signature, public_key)
+            .map_err(map_secp_error)
+    }
+}
+
+fn map_secp_error(error: SecpError) -> ScriptError {
+    match error {
+        SecpError::ContextCreation => ScriptError::SignatureBackendUnavailable,
+        SecpError::InvalidCompactSignature | SecpError::HighS => ScriptError::SignatureEncoding,
+        SecpError::InvalidPublicKey => ScriptError::PublicKeyEncoding,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WitnessProgramVerifier<V> {
     signatures: V,
@@ -186,14 +231,8 @@ impl<V: SignatureVerifier> TransactionInputVerifier for WitnessProgramVerifier<V
         input_index: usize,
         coin: &Coin,
     ) -> Result<(), ConsensusError> {
-        verify_witness_program(
-            transaction,
-            input_index,
-            coin,
-            self.flags,
-            &self.signatures,
-        )
-        .map_err(|error| ConsensusError::Authorization(error.to_string()))
+        verify_witness_program(transaction, input_index, coin, self.flags, &self.signatures)
+            .map_err(|error| ConsensusError::Authorization(error.to_string()))
     }
 }
 
@@ -221,9 +260,7 @@ pub fn verify_witness_program(
     let redeem = if address.version == 0 {
         match address.hash.len() {
             32 => {
-                let witness_script = stack
-                    .pop()
-                    .ok_or(ScriptError::WitnessProgramWitnessEmpty)?;
+                let witness_script = stack.pop().ok_or(ScriptError::WitnessProgramWitnessEmpty)?;
                 if witness_script.len() > MAX_SCRIPT_SIZE {
                     return Err(ScriptError::ScriptSize);
                 }
@@ -295,7 +332,11 @@ fn execute_script(
     let mut last_separator = 0usize;
 
     for instruction in instructions {
-        if instruction.data.as_ref().is_some_and(|data| data.len() > MAX_SCRIPT_PUSH) {
+        if instruction
+            .data
+            .as_ref()
+            .is_some_and(|data| data.len() > MAX_SCRIPT_PUSH)
+        {
             return Err(ScriptError::PushSize);
         }
         if instruction.opcode > OP_16 {
@@ -332,7 +373,9 @@ fn execute_script(
             OP_0 => stack.push(Vec::new()),
             OP_1NEGATE => stack.push(encode_script_number(-1)),
             OP_1..=OP_16 => {
-                stack.push(encode_script_number(i64::from(instruction.opcode - OP_1 + 1)));
+                stack.push(encode_script_number(i64::from(
+                    instruction.opcode - OP_1 + 1,
+                )));
             }
             OP_NOP => {}
             OP_TYPE => {
@@ -402,7 +445,9 @@ fn execute_script(
             OP_RETURN => return Err(ScriptError::OpReturn),
             OP_TOALTSTACK => alt_stack.push(pop(stack)?),
             OP_FROMALTSTACK => {
-                let item = alt_stack.pop().ok_or(ScriptError::InvalidAltStackOperation)?;
+                let item = alt_stack
+                    .pop()
+                    .ok_or(ScriptError::InvalidAltStackOperation)?;
                 stack.push(item);
             }
             OP_2DROP => {
@@ -454,7 +499,8 @@ fn execute_script(
             }
             OP_PICK | OP_ROLL => {
                 let depth = decode_script_number(&pop(stack)?, true, 4)?;
-                let depth = usize::try_from(depth).map_err(|_| ScriptError::InvalidStackOperation)?;
+                let depth =
+                    usize::try_from(depth).map_err(|_| ScriptError::InvalidStackOperation)?;
                 if depth >= stack.len() {
                     return Err(ScriptError::InvalidStackOperation);
                 }
@@ -517,15 +563,29 @@ fn execute_script(
                 .ok_or(ScriptError::NumericOverflow)?;
                 stack.push(encode_script_number(result));
             }
-            OP_ADD | OP_SUB | OP_BOOLAND | OP_BOOLOR | OP_NUMEQUAL | OP_NUMEQUALVERIFY
-            | OP_NUMNOTEQUAL | OP_LESSTHAN | OP_GREATERTHAN | OP_LESSTHANOREQUAL
-            | OP_GREATERTHANOREQUAL | OP_MIN | OP_MAX => {
+            OP_ADD
+            | OP_SUB
+            | OP_BOOLAND
+            | OP_BOOLOR
+            | OP_NUMEQUAL
+            | OP_NUMEQUALVERIFY
+            | OP_NUMNOTEQUAL
+            | OP_LESSTHAN
+            | OP_GREATERTHAN
+            | OP_LESSTHANOREQUAL
+            | OP_GREATERTHANOREQUAL
+            | OP_MIN
+            | OP_MAX => {
                 require_stack(stack, 2)?;
                 let right = decode_script_number(&pop(stack)?, minimal_numbers(flags), 4)?;
                 let left = decode_script_number(&pop(stack)?, minimal_numbers(flags), 4)?;
                 let result = match instruction.opcode {
-                    OP_ADD => left.checked_add(right).ok_or(ScriptError::NumericOverflow)?,
-                    OP_SUB => left.checked_sub(right).ok_or(ScriptError::NumericOverflow)?,
+                    OP_ADD => left
+                        .checked_add(right)
+                        .ok_or(ScriptError::NumericOverflow)?,
+                    OP_SUB => left
+                        .checked_sub(right)
+                        .ok_or(ScriptError::NumericOverflow)?,
                     OP_BOOLAND => i64::from(left != 0 && right != 0),
                     OP_BOOLOR => i64::from(left != 0 || right != 0),
                     OP_NUMEQUAL | OP_NUMEQUALVERIFY => i64::from(left == right),
@@ -567,11 +627,11 @@ fn execute_script(
             OP_RIPEMD160 | OP_SHA1 | OP_SHA256 | OP_HASH160 | OP_HASH256 => {
                 let item = pop(stack)?;
                 let digest = match instruction.opcode {
-                    OP_RIPEMD160 => legacy_hash::ripemd160(&item).to_vec(),
-                    OP_SHA1 => legacy_hash::sha1(&item).to_vec(),
-                    OP_SHA256 => legacy_hash::sha256(&item).to_vec(),
-                    OP_HASH160 => legacy_hash::hash160(&item).to_vec(),
-                    OP_HASH256 => legacy_hash::hash256(&item).to_vec(),
+                    OP_RIPEMD160 => ripemd160(&item).to_vec(),
+                    OP_SHA1 => sha1(&item).to_vec(),
+                    OP_SHA256 => sha256(&item).to_vec(),
+                    OP_HASH160 => hash160(&item).to_vec(),
+                    OP_HASH256 => hash256(&item).to_vec(),
                     _ => unreachable!(),
                 };
                 stack.push(digest);
@@ -591,10 +651,7 @@ fn execute_script(
                     &public_key,
                     signatures,
                 )?;
-                if !valid
-                    && flags.contains(ScriptFlags::VERIFY_NULLFAIL)
-                    && !signature.is_empty()
-                {
+                if !valid && flags.contains(ScriptFlags::VERIFY_NULLFAIL) && !signature.is_empty() {
                     return Err(ScriptError::NullFail);
                 }
                 if instruction.opcode == OP_CHECKSIGVERIFY {
@@ -738,13 +795,13 @@ fn check_multisig(
     }
     valid &= signature_index == candidate_signatures.len();
 
-    if !valid && flags.contains(ScriptFlags::VERIFY_NULLFAIL) {
-        if candidate_signatures
+    if !valid
+        && flags.contains(ScriptFlags::VERIFY_NULLFAIL)
+        && candidate_signatures
             .iter()
             .any(|signature| !signature.is_empty())
-        {
-            return Err(ScriptError::NullFail);
-        }
+    {
+        return Err(ScriptError::NullFail);
     }
     Ok(valid)
 }
@@ -795,7 +852,9 @@ fn parse_script(script: &[u8]) -> Result<Vec<Instruction>, ScriptError> {
 }
 
 fn read_u8(script: &[u8], offset: &mut usize) -> Result<u8, ScriptError> {
-    let value = *script.get(*offset).ok_or(ScriptError::BadOpcode(OP_PUSHDATA1))?;
+    let value = *script
+        .get(*offset)
+        .ok_or(ScriptError::BadOpcode(OP_PUSHDATA1))?;
     *offset += 1;
     Ok(value)
 }
@@ -1014,8 +1073,6 @@ pub enum ScriptError {
     DisabledOpcode(u8),
     #[error("script opcode 0x{0:02x} is not yet implemented")]
     UnsupportedOpcode(u8),
-    #[error("legacy hash opcode 0x{0:02x} is not yet implemented")]
-    UnsupportedLegacyHashOpcode(u8),
     #[error("script operation count exceeds the consensus limit")]
     OperationCount,
     #[error("script push is not minimally encoded")]
@@ -1170,8 +1227,8 @@ mod tests {
     #[test]
     fn pubkey_hash_program_reaches_the_signature_backend() {
         let public_key = [
-            0x02, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            0x02, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
         ];
         let mut signature = vec![0x01; 65];
         signature[64] = 1;
@@ -1193,8 +1250,8 @@ mod tests {
     #[test]
     fn missing_signature_backend_fails_closed() {
         let public_key = [
-            0x02, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-            21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            0x02, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
         ];
         let mut signature = vec![0x01; 65];
         signature[64] = 1;

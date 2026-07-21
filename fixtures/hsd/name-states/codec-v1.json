@@ -1,0 +1,55 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
+    "hsdVersion": "8.99.0"
+  },
+  "scope": "exact NameState value codec; name hash is the external authenticated-tree key",
+  "vectors": [
+    {
+      "id": "minimal",
+      "nameHash": "6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d",
+      "raw": "05616c706861000064000000640000000000",
+      "json": {
+        "name": "alpha",
+        "height": 100,
+        "renewal": 100,
+        "ownerHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "ownerIndex": 4294967295,
+        "value": 0,
+        "highest": 0,
+        "data": "",
+        "transfer": 0,
+        "revoked": 0,
+        "claimed": 0,
+        "renewals": 0,
+        "registered": false,
+        "expired": false,
+        "weak": false
+      }
+    },
+    {
+      "id": "populated",
+      "nameHash": "7070707070707070707070707070707070707070707070707070707070707070",
+      "raw": "0968616e647368616b65070000010203fefdfc4030201080706050ff034242424242424242424242424242424242424242424242424242424242424242fe70110100fe15cd5b07feb168de3ad20400002e16000034230000fd2c01",
+      "json": {
+        "name": "handshake",
+        "height": 270544960,
+        "renewal": 1348497536,
+        "ownerHash": "4242424242424242424242424242424242424242424242424242424242424242",
+        "ownerIndex": 70000,
+        "value": 123456789,
+        "highest": 987654321,
+        "data": "00010203fefdfc",
+        "transfer": 1234,
+        "revoked": 5678,
+        "claimed": 9012,
+        "renewals": 300,
+        "registered": true,
+        "expired": true,
+        "weak": true
+      }
+    }
+  ]
+}

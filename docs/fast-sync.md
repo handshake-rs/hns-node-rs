@@ -2,7 +2,7 @@
 
 Sync is headers-first, block-parallel, and state-ordered. The node should maximize network and disk throughput while preserving hsd-compatible validation behavior.
 
-## Header Phase
+## Header Synchronization
 
 - Maintain many outbound peers with address-group diversity.
 - Start with static seeds, DNS seeds, persisted peers, and optional operator peers.

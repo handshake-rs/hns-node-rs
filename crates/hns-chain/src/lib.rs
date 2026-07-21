@@ -787,17 +787,29 @@ impl<S: Store> StoredHeaderIndex<S> {
             return Err(ChainError::InvalidHeader("proof of work failed"));
         }
 
-        let record = self.memory.insert_header(request.header, request.height)?;
-        self.persist_record(&record)?;
+        // Build the next in-memory view first, but publish it only after the
+        // corresponding durable batch commits. A storage failure must not leave
+        // the live index ahead of the database.
+        let mut next = self.memory.clone();
+        let record = next.insert_header(request.header, request.height)?;
+        self.persist_record_against(&record, &next)?;
+        self.memory = next;
         Ok(record)
     }
 
-    pub fn persist_record(&mut self, record: &HeaderRecord) -> Result<(), ChainError> {
+    pub fn persist_record(&self, record: &HeaderRecord) -> Result<(), ChainError> {
+        self.persist_record_against(record, &self.memory)
+    }
+
+    fn persist_record_against(
+        &self,
+        record: &HeaderRecord,
+        memory: &MemoryHeaderIndex,
+    ) -> Result<(), ChainError> {
         let mut batch = self.store.batch();
         write_record_to_batch(&mut batch, record)?;
 
-        if self
-            .memory
+        if memory
             .best_tip()?
             .as_ref()
             .map(|tip| tip.hash == record.hash)
@@ -1250,8 +1262,6 @@ impl HeaderIndex for MemoryHeaderIndex {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
-    #[error("chain index is not implemented in the scaffold")]
-    Unimplemented,
     #[error("chain store failed: {0}")]
     Store(String),
     #[error("chain codec failed: {0}")]
@@ -1278,7 +1288,6 @@ impl From<StoreError> for ChainError {
         Self::Store(value.to_string())
     }
 }
-
 
 fn decode_block_hash(bytes: &[u8]) -> Result<BlockHash, ChainError> {
     let hash: [u8; 32] = bytes.try_into().map_err(|_| {
@@ -1459,8 +1468,14 @@ mod tests {
         };
 
         index.insert_record(alternate).expect("alternate");
-        assert_eq!(index.best_tip().expect("tip").expect("best").hash, first.hash);
-        assert_eq!(index.canonical_hash(1).expect("canonical"), Some(first.hash));
+        assert_eq!(
+            index.best_tip().expect("tip").expect("best").hash,
+            first.hash
+        );
+        assert_eq!(
+            index.canonical_hash(1).expect("canonical"),
+            Some(first.hash)
+        );
     }
 
     #[test]

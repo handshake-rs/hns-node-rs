@@ -52,12 +52,7 @@ pub fn verify_transaction_covenant_links(
         ..CovenantLinkSummary::default()
     };
 
-    for (input_index, (input, coin)) in transaction
-        .inputs
-        .iter()
-        .zip(input_coins)
-        .enumerate()
-    {
+    for (input_index, (input, coin)) in transaction.inputs.iter().zip(input_coins).enumerate() {
         if input.previous_output != coin.outpoint {
             return Err(CovenantLinkError::CoinOutpointMismatch {
                 input_index,
@@ -168,18 +163,10 @@ pub fn verify_transaction_covenant_links(
                     }
                     CovenantKind::Finalize => {
                         require_name_and_start_match(input_index, spent, &output.covenant)?;
-                        let version = required_u8(
-                            input_index,
-                            spent,
-                            2,
-                            "transfer destination version",
-                        )?;
-                        let hash = required_item(
-                            input_index,
-                            spent,
-                            3,
-                            "transfer destination hash",
-                        )?;
+                        let version =
+                            required_u8(input_index, spent, 2, "transfer destination version")?;
+                        let hash =
+                            required_item(input_index, spent, 3, "transfer destination hash")?;
                         if output.address.version != version
                             || output.address.hash.as_slice() != hash
                         {
@@ -217,11 +204,11 @@ pub fn verify_transaction_covenant_links(
     Ok(summary)
 }
 
-fn require_linked_output<'a>(
+fn require_linked_output(
     input_index: usize,
     from: CovenantKind,
-    output: Option<&'a Output>,
-) -> Result<&'a Output, CovenantLinkError> {
+    output: Option<&Output>,
+) -> Result<&Output, CovenantLinkError> {
     output.ok_or(CovenantLinkError::MissingLinkedOutput { input_index, from })
 }
 
@@ -298,10 +285,7 @@ fn required_item<'a>(
 ) -> Result<&'a [u8], CovenantLinkError> {
     covenant
         .item(item_index)
-        .ok_or(CovenantLinkError::MalformedInputCovenant {
-            input_index,
-            field,
-        })
+        .ok_or(CovenantLinkError::MalformedInputCovenant { input_index, field })
 }
 
 fn required_u8(
@@ -312,10 +296,7 @@ fn required_u8(
 ) -> Result<u8, CovenantLinkError> {
     covenant
         .item_u8(item_index)
-        .ok_or(CovenantLinkError::MalformedInputCovenant {
-            input_index,
-            field,
-        })
+        .ok_or(CovenantLinkError::MalformedInputCovenant { input_index, field })
 }
 
 fn required_u32(
@@ -326,10 +307,7 @@ fn required_u32(
 ) -> Result<u32, CovenantLinkError> {
     covenant
         .item_u32(item_index)
-        .ok_or(CovenantLinkError::MalformedInputCovenant {
-            input_index,
-            field,
-        })
+        .ok_or(CovenantLinkError::MalformedInputCovenant { input_index, field })
 }
 
 fn required_hash(
@@ -340,10 +318,7 @@ fn required_hash(
 ) -> Result<[u8; 32], CovenantLinkError> {
     covenant
         .item_hash(item_index)
-        .ok_or(CovenantLinkError::MalformedInputCovenant {
-            input_index,
-            field,
-        })
+        .ok_or(CovenantLinkError::MalformedInputCovenant { input_index, field })
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -388,9 +363,7 @@ pub enum CovenantLinkError {
     },
     #[error("input {input_index} reveal value and nonce do not match the bid commitment")]
     BlindCommitmentMismatch { input_index: usize },
-    #[error(
-        "input {input_index} reveal value {revealed} exceeds locked bid value {locked}"
-    )]
+    #[error("input {input_index} reveal value {revealed} exceeds locked bid value {locked}")]
     BidValueInflation {
         input_index: usize,
         locked: u64,
@@ -421,9 +394,7 @@ pub enum CovenantLinkError {
 
 #[cfg(test)]
 mod tests {
-    use hns_primitives::{
-        Address, Covenant, Input, Outpoint, Output, Transaction, Txid, Witness,
-    };
+    use hns_primitives::{Address, Covenant, Input, Outpoint, Output, Transaction, Txid, Witness};
 
     use super::*;
 
@@ -500,8 +471,8 @@ mod tests {
             },
         );
 
-        let summary = verify_transaction_covenant_links(&transaction, &[coin])
-            .expect("valid bid reveal");
+        let summary =
+            verify_transaction_covenant_links(&transaction, &[coin]).expect("valid bid reveal");
         assert_eq!(summary.linked_outputs, 1);
         assert_eq!(summary.name_inputs, 1);
     }
@@ -586,11 +557,8 @@ mod tests {
                         value: coin.value,
                         height: coin.height,
                         coinbase: coin.coinbase,
-                        address: Address::new(
-                            coin.address_version,
-                            decode_hex(&coin.address_hash),
-                        )
-                        .expect("fixture address"),
+                        address: Address::new(coin.address_version, decode_hex(&coin.address_hash))
+                            .expect("fixture address"),
                         covenant: Covenant {
                             kind: CovenantKind::from_u8(coin.covenant_type),
                             items: coin
@@ -628,5 +596,4 @@ mod tests {
             _ => None,
         }
     }
-
 }

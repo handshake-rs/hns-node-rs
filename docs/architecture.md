@@ -105,7 +105,7 @@ parity remains a separate qualification gate.
 ## State and storage
 
 `hns-state` is the only UTXO/name-state writer. It resolves and authorizes all
-transaction inputs before staging spends, verifies Phase 3 covenant linkage,
+transaction inputs before staging spends, verifies contextual covenant linkage,
 then stages value changes and undo data. Claim/airdrop and complete name-state
 work remain fail-closed.
 

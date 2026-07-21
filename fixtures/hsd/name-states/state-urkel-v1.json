@@ -1,0 +1,112 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
+  },
+  "network": "regtest",
+  "states": [
+    {
+      "name": "alpha",
+      "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af",
+      "encoded": "05616c70686103000102030a0000000d000000c700010101010101010101010101010101010101010101010101010101010101010101fde903fdd10701"
+    },
+    {
+      "name": "bravo",
+      "nameHash": "860a44c15b639f3d4814bb39611b0c91a87153d719b83a2b575e4af2097bdaf4",
+      "encoded": "05627261766f030002030414000000170000004f02020202020202020202020202020202020202020202020202020202020202020202fdea03fdd2071500000002"
+    },
+    {
+      "name": "charlie",
+      "nameHash": "43e5de25a1102ebf2320e5f07cbc3e4f8b3fb3b1cc3fc4b7f4a4c0b6357cb3f6",
+      "encoded": "07636861726c696503000304051e00000021000000e700030303030303030303030303030303030303030303030303030303030303030303fdeb03fdd3071e00000003"
+    },
+    {
+      "name": "delta",
+      "nameHash": "4b4f53f8d29ee5305a48d360e03cf622ecbc0c300588ed9e63b50499561f875d",
+      "encoded": "0564656c74610300040506280000002b0000004f02040404040404040404040404040404040404040404040404040404040404040404fdec03fdd4072900000004"
+    }
+  ],
+  "incrementalRoots": [
+    {
+      "insertedName": "alpha",
+      "headerRoot": "0000000000000000000000000000000000000000000000000000000000000000",
+      "resultingRoot": "01d1706466867ff845c65dfc3bc20f219439752d5ea50fb300a47af5d18cd516",
+      "root": "01d1706466867ff845c65dfc3bc20f219439752d5ea50fb300a47af5d18cd516"
+    },
+    {
+      "insertedName": "bravo",
+      "headerRoot": "01d1706466867ff845c65dfc3bc20f219439752d5ea50fb300a47af5d18cd516",
+      "resultingRoot": "59225a48484580742b39358be8250e7352ac7beb70d5875584f988d719193343",
+      "root": "59225a48484580742b39358be8250e7352ac7beb70d5875584f988d719193343"
+    },
+    {
+      "insertedName": "charlie",
+      "headerRoot": "59225a48484580742b39358be8250e7352ac7beb70d5875584f988d719193343",
+      "resultingRoot": "6a034b2ea3b11c96fd82e6cd58802577fdb88a4a07d2f821f35f363f8746a628",
+      "root": "6a034b2ea3b11c96fd82e6cd58802577fdb88a4a07d2f821f35f363f8746a628"
+    },
+    {
+      "insertedName": "delta",
+      "headerRoot": "6a034b2ea3b11c96fd82e6cd58802577fdb88a4a07d2f821f35f363f8746a628",
+      "resultingRoot": "ac33122097647872c3392d6d44cff8145540c783d3f94d95b686b1839936b536",
+      "root": "ac33122097647872c3392d6d44cff8145540c783d3f94d95b686b1839936b536"
+    }
+  ],
+  "lifecycle": [
+    {
+      "height": 100,
+      "state": 0,
+      "expired": false
+    },
+    {
+      "height": 105,
+      "state": 0,
+      "expired": false
+    },
+    {
+      "height": 106,
+      "state": 2,
+      "expired": false
+    },
+    {
+      "height": 110,
+      "state": 2,
+      "expired": false
+    },
+    {
+      "height": 111,
+      "state": 3,
+      "expired": false
+    },
+    {
+      "height": 120,
+      "state": 3,
+      "expired": false
+    },
+    {
+      "height": 121,
+      "state": 4,
+      "expired": false
+    }
+  ],
+  "expiredState": {
+    "height": 5001,
+    "encoded": "07666f7874726f7404000102030489130000891300000001",
+    "dataPreserved": "01020304",
+    "expired": true
+  },
+  "parameters": {
+    "auctionStart": 0,
+    "rolloutInterval": 2,
+    "lockupPeriod": 2,
+    "renewalWindow": 5000,
+    "renewalPeriod": 2500,
+    "renewalMaturity": 50,
+    "biddingPeriod": 5,
+    "revealPeriod": 10,
+    "treeInterval": 5,
+    "transferLockup": 10,
+    "auctionMaturity": 65
+  }
+}

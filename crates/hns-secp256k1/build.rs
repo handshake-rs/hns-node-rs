@@ -6,7 +6,10 @@ fn main() {
     let source = root.join("src/secp256k1.c");
 
     println!("cargo:rerun-if-changed={}", source.display());
-    println!("cargo:rerun-if-changed={}", root.join("include/secp256k1.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("include/secp256k1.h").display()
+    );
     println!("cargo:rerun-if-changed={}", root.join("COPYING").display());
 
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();

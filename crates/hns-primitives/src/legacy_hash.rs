@@ -19,11 +19,9 @@ pub fn sha1(input: &[u8]) -> [u8; 20] {
             words[index] = u32::from_be_bytes(chunk.try_into().expect("four-byte chunk"));
         }
         for index in 16..80 {
-            words[index] = (words[index - 3]
-                ^ words[index - 8]
-                ^ words[index - 14]
-                ^ words[index - 16])
-                .rotate_left(1);
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
         }
 
         let [mut a, mut b, mut c, mut d, mut e] = state;
@@ -60,17 +58,70 @@ pub fn sha1(input: &[u8]) -> [u8; 20] {
 /// SHA-256.
 pub fn sha256(input: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
-        0x428a_2f98, 0x7137_4491, 0xb5c0_fbcf, 0xe9b5_dba5, 0x3956_c25b, 0x59f1_11f1,
-        0x923f_82a4, 0xab1c_5ed5, 0xd807_aa98, 0x1283_5b01, 0x2431_85be, 0x550c_7dc3,
-        0x72be_5d74, 0x80de_b1fe, 0x9bdc_06a7, 0xc19b_f174, 0xe49b_69c1, 0xefbe_4786,
-        0x0fc1_9dc6, 0x240c_a1cc, 0x2de9_2c6f, 0x4a74_84aa, 0x5cb0_a9dc, 0x76f9_88da,
-        0x983e_5152, 0xa831_c66d, 0xb003_27c8, 0xbf59_7fc7, 0xc6e0_0bf3, 0xd5a7_9147,
-        0x06ca_6351, 0x1429_2967, 0x27b7_0a85, 0x2e1b_2138, 0x4d2c_6dfc, 0x5338_0d13,
-        0x650a_7354, 0x766a_0abb, 0x81c2_c92e, 0x9272_2c85, 0xa2bf_e8a1, 0xa81a_664b,
-        0xc24b_8b70, 0xc76c_51a3, 0xd192_e819, 0xd699_0624, 0xf40e_3585, 0x106a_a070,
-        0x19a4_c116, 0x1e37_6c08, 0x2748_774c, 0x34b0_bcb5, 0x391c_0cb3, 0x4ed8_aa4a,
-        0x5b9c_ca4f, 0x682e_6ff3, 0x748f_82ee, 0x78a5_636f, 0x84c8_7814, 0x8cc7_0208,
-        0x90be_fffa, 0xa450_6ceb, 0xbef9_a3f7, 0xc671_78f2,
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
     ];
 
     let mut state = [
@@ -125,10 +176,7 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
             a = t1.wrapping_add(t2);
         }
 
-        for (value, addition) in state
-            .iter_mut()
-            .zip([a, b, c, d, e, f, g, h])
-        {
+        for (value, addition) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
             *value = value.wrapping_add(addition);
         }
     }
@@ -139,28 +187,26 @@ pub fn sha256(input: &[u8]) -> [u8; 32] {
 /// RIPEMD-160.
 pub fn ripemd160(input: &[u8]) -> [u8; 20] {
     const R_LEFT: [usize; 80] = [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 7, 4, 13, 1, 10, 6,
-        15, 3, 12, 0, 9, 5, 2, 14, 11, 8, 3, 10, 14, 4, 9, 15, 8, 1, 2, 7, 0, 6, 13,
-        11, 5, 12, 1, 9, 11, 10, 0, 8, 12, 4, 13, 3, 7, 15, 14, 5, 6, 2, 4, 0, 5,
-        9, 7, 12, 2, 10, 14, 1, 3, 8, 11, 6, 15, 13,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 7, 4, 13, 1, 10, 6, 15, 3, 12, 0, 9,
+        5, 2, 14, 11, 8, 3, 10, 14, 4, 9, 15, 8, 1, 2, 7, 0, 6, 13, 11, 5, 12, 1, 9, 11, 10, 0, 8,
+        12, 4, 13, 3, 7, 15, 14, 5, 6, 2, 4, 0, 5, 9, 7, 12, 2, 10, 14, 1, 3, 8, 11, 6, 15, 13,
     ];
     const R_RIGHT: [usize; 80] = [
-        5, 14, 7, 0, 9, 2, 11, 4, 13, 6, 15, 8, 1, 10, 3, 12, 6, 11, 3, 7, 0, 13,
-        5, 10, 14, 15, 8, 12, 4, 9, 1, 2, 15, 5, 1, 3, 7, 14, 6, 9, 11, 8, 12, 2,
-        10, 0, 4, 13, 8, 6, 4, 1, 3, 11, 15, 0, 5, 12, 2, 13, 9, 7, 10, 14, 12,
-        15, 10, 4, 1, 5, 8, 7, 6, 2, 13, 14, 0, 3, 9, 11,
+        5, 14, 7, 0, 9, 2, 11, 4, 13, 6, 15, 8, 1, 10, 3, 12, 6, 11, 3, 7, 0, 13, 5, 10, 14, 15, 8,
+        12, 4, 9, 1, 2, 15, 5, 1, 3, 7, 14, 6, 9, 11, 8, 12, 2, 10, 0, 4, 13, 8, 6, 4, 1, 3, 11,
+        15, 0, 5, 12, 2, 13, 9, 7, 10, 14, 12, 15, 10, 4, 1, 5, 8, 7, 6, 2, 13, 14, 0, 3, 9, 11,
     ];
     const S_LEFT: [u32; 80] = [
-        11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8, 7, 6, 8, 13, 11,
-        9, 7, 15, 7, 12, 15, 9, 11, 7, 13, 12, 11, 13, 6, 7, 14, 9, 13, 15, 14,
-        8, 13, 6, 5, 12, 7, 5, 11, 12, 14, 15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6,
-        5, 12, 9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11, 8, 5, 6,
+        11, 14, 15, 12, 5, 8, 7, 9, 11, 13, 14, 15, 6, 7, 9, 8, 7, 6, 8, 13, 11, 9, 7, 15, 7, 12,
+        15, 9, 11, 7, 13, 12, 11, 13, 6, 7, 14, 9, 13, 15, 14, 8, 13, 6, 5, 12, 7, 5, 11, 12, 14,
+        15, 14, 15, 9, 8, 9, 14, 5, 6, 8, 6, 5, 12, 9, 15, 5, 11, 6, 8, 13, 12, 5, 12, 13, 14, 11,
+        8, 5, 6,
     ];
     const S_RIGHT: [u32; 80] = [
-        8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6, 9, 13, 15, 7, 12,
-        8, 9, 11, 7, 7, 12, 7, 6, 15, 13, 11, 9, 7, 15, 11, 8, 6, 6, 14, 12, 13,
-        5, 14, 13, 13, 7, 5, 15, 5, 8, 11, 14, 14, 6, 14, 6, 9, 12, 9, 12, 5,
-        15, 8, 8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13, 11, 11,
+        8, 9, 9, 11, 13, 15, 15, 5, 7, 7, 8, 11, 14, 14, 12, 6, 9, 13, 15, 7, 12, 8, 9, 11, 7, 7,
+        12, 7, 6, 15, 13, 11, 9, 7, 15, 11, 8, 6, 6, 14, 12, 13, 5, 14, 13, 13, 7, 5, 15, 5, 8, 11,
+        14, 14, 6, 14, 6, 9, 12, 9, 12, 5, 15, 8, 8, 5, 12, 9, 12, 5, 14, 6, 8, 13, 6, 5, 15, 13,
+        11, 11,
     ];
 
     let mut state = [
@@ -272,11 +318,7 @@ fn padded_blocks(input: &[u8], length_endian: LengthEndian) -> Vec<[u8; 64]> {
         .checked_add(1)
         .and_then(|length| length.checked_add(8))
         .expect("hash input length overflow");
-    let padded = total
-        .checked_add(63)
-        .expect("hash padded length overflow")
-        / 64
-        * 64;
+    let padded = total.checked_add(63).expect("hash padded length overflow") / 64 * 64;
     let mut bytes = vec![0u8; padded];
     bytes[..input.len()].copy_from_slice(input);
     bytes[input.len()] = 0x80;
@@ -324,12 +366,62 @@ mod tests {
     #[test]
     fn standard_hash_vectors() {
         assert_eq!(sha1(b""), hex("da39a3ee5e6b4b0d3255bfef95601890afd80709"));
-        assert_eq!(sha1(b"abc"), hex("a9993e364706816aba3e25717850c26c9cd0d89d"));
-        assert_eq!(sha256(b""), hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
-        assert_eq!(sha256(b"abc"), hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
-        assert_eq!(ripemd160(b""), hex("9c1185a5c5e9fc54612808977ee8f548b2258d31"));
-        assert_eq!(ripemd160(b"abc"), hex("8eb208f7e05d987a9b04d6a7f7925b3c919d38d5"));
-        assert_eq!(hash160(b"abc"), hex("bb1be98c142444d7a56aa3981c3942a978e4dc33"));
-        assert_eq!(hash256(b"abc"), hex("4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358"));
+        assert_eq!(
+            sha1(b"abc"),
+            hex("a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
+        assert_eq!(
+            sha256(b""),
+            hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+        );
+        assert_eq!(
+            sha256(b"abc"),
+            hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            ripemd160(b""),
+            hex("9c1185a5c5e9fc54612808977ee8f548b2258d31")
+        );
+        assert_eq!(
+            ripemd160(b"abc"),
+            hex("8eb208f7e05d987a9b044a8e98c6b087f15a0bfc")
+        );
+        assert_eq!(
+            ripemd160(b"a"),
+            hex("0bdc9d2d256b3ee9daae347be6f4dc835a467ffe")
+        );
+        assert_eq!(
+            ripemd160(b"message digest"),
+            hex("5d0689ef49d2fae572b881b123a85ffa21595f36")
+        );
+        assert_eq!(
+            ripemd160(b"abcdefghijklmnopqrstuvwxyz"),
+            hex("f71c27109c692c1b56bbdceb5b9d2865b3708dbc")
+        );
+        assert_eq!(
+            ripemd160(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            hex("12a053384a9c0c88e405a06c27dcf49ada62eb2b")
+        );
+        assert_eq!(
+            hash160(b"abc"),
+            hex("bb1be98c142444d7a56aa3981c3942a978e4dc33")
+        );
+        assert_eq!(
+            hash256(b"abc"),
+            hex("4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358")
+        );
+    }
+
+    #[test]
+    fn ripemd160_padding_boundaries_match_reference() {
+        for (length, expected) in [
+            (55, "0d8a8c9063a48576a7c97e9f95253a6e53ff6765"),
+            (56, "e72334b46c83cc70bef979e15453706c95b888be"),
+            (63, "e640041293fe663b9bf3f8c21ffecac03819e6b2"),
+            (64, "9dfb7d374ad924f3f88de96291c33e9abed53e32"),
+            (65, "99724bb11811e7166af38f671b6a082d8ab4960b"),
+        ] {
+            assert_eq!(ripemd160(&vec![b'a'; length]), hex(expected), "{length}");
+        }
     }
 }

@@ -4,14 +4,12 @@ use std::{collections::HashSet, fmt, str::FromStr};
 
 use hns_primitives::{
     blake2b_256, blake2b_256_many, hash_name, Amount, Block, BlockHash, Coin, CompactTarget,
-    CovenantKind, Header, Height, Outpoint, Transaction, Txid, Uint256,
-    Witness, Writer, HEADER_SIZE, MAX_BLOCK_WEIGHT, MAX_RESOURCE_SIZE, MAX_SCRIPT_STACK,
-    MAX_TX_SIZE,
+    CovenantKind, Header, Height, Outpoint, Transaction, Txid, Uint256, Witness, Writer,
+    HEADER_SIZE, MAX_BLOCK_WEIGHT, MAX_RESOURCE_SIZE, MAX_SCRIPT_STACK, MAX_TX_SIZE,
 };
 use serde::{Deserialize, Serialize};
 
 mod covenant;
-mod legacy_hash;
 mod locks;
 mod name;
 mod script;
@@ -25,18 +23,17 @@ pub use locks::{
     verify_sequence_predicate, SequenceLock, SequenceLockView,
 };
 pub use name::{
-    has_rollout, is_locked_up, is_name_claimable, is_name_expired, is_reserved,
-    maybe_expire_name, name_lifecycle, rollout_height, verify_and_apply_name_covenant,
-    verify_renewal_commitment, NameContext, NameFlags, NameMutation, NameParams,
+    has_rollout, is_locked_up, is_name_claimable, is_name_expired, is_reserved, maybe_expire_name,
+    name_lifecycle, rollout_height, verify_and_apply_name_covenant, verify_renewal_commitment,
+    NameContext, NameFlags, NameMutation, NameParams,
 };
 pub use script::{
-    verify_witness_program, ScriptError, ScriptFlags, SignatureVerifier,
+    verify_witness_program, NativeSignatureVerifier, ScriptError, ScriptFlags, SignatureVerifier,
     UnavailableSignatureVerifier, WitnessProgramVerifier,
 };
 pub use sighash::{
     is_valid_signature_hash_type, signature_hash, SIGHASH_ALL, SIGHASH_ANYONE_CAN_PAY,
-    SIGHASH_BASE_MASK, SIGHASH_NOINPUT, SIGHASH_NONE, SIGHASH_SINGLE,
-    SIGHASH_SINGLE_REVERSE,
+    SIGHASH_BASE_MASK, SIGHASH_NOINPUT, SIGHASH_NONE, SIGHASH_SINGLE, SIGHASH_SINGLE_REVERSE,
 };
 
 pub const COIN: Amount = 1_000_000;
@@ -504,11 +501,17 @@ pub trait TransactionInputVerifier: Send + Sync {
         input_index: usize,
         coin: &Coin,
     ) -> Result<(), ConsensusError>;
+
+    /// Whether this verifier represents a complete production consensus path.
+    /// Fail-closed placeholders and test doubles must retain the default `false`.
+    fn is_consensus_complete(&self) -> bool {
+        false
+    }
 }
 
-/// Production-safe default while no audited secp256k1 backend is composed. It
-/// deliberately rejects every non-coinbase spend rather than allowing the UTXO
-/// engine to connect an unauthorized transaction.
+/// Production-safe default for compositions that have not explicitly installed
+/// the native script verifier. It deliberately rejects every non-coinbase spend
+/// rather than allowing the UTXO engine to connect an unauthorized transaction.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RejectUnverifiedInputs;
 
@@ -1131,8 +1134,6 @@ pub struct NetworkParseError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConsensusError {
-    #[error("consensus validation is not implemented in the scaffold")]
-    Unimplemented,
     #[error("consensus view failed: {0}")]
     View(String),
     #[error("invalid header: {0}")]

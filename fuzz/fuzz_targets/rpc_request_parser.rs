@@ -1,7 +1,10 @@
 #![no_main]
 
+use hns_rpc::{JsonRpcRequest, RpcMethod};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let _ = std::str::from_utf8(data);
+    if let Ok(request) = serde_json::from_slice::<JsonRpcRequest>(data) {
+        let _ = RpcMethod::from_hsd_name(&request.method);
+    }
 });

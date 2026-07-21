@@ -8,8 +8,12 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
+hns-p2p = { path = "../crates/hns-p2p" }
 hns-primitives = { path = "../crates/hns-primitives" }
+hns-rpc = { path = "../crates/hns-rpc" }
+hns-testkit = { path = "../crates/hns-testkit" }
 libfuzzer-sys = "0.4"
+serde_json = "1.0"
 
 [[bin]]
 name = "header_parser"
@@ -61,8 +65,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "snapshot_manifest_parser"
-path = "fuzz_targets/snapshot_manifest_parser.rs"
+name = "fixture_manifest_parser"
+path = "fuzz_targets/fixture_manifest_parser.rs"
 test = false
 doc = false
 bench = false

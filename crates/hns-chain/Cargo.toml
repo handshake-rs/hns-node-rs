@@ -6,6 +6,6 @@ publish.workspace = true
 
 [dependencies]
 hns-primitives = { path = "../hns-primitives" }
-hns-store = { path = "../hns-store" }
+hns-store = { path = "../hns-store", default-features = false }
 serde.workspace = true
 thiserror.workspace = true

@@ -8,5 +8,7 @@ publish.workspace = true
 hns-primitives = { path = "../hns-primitives" }
 hns-chain = { path = "../hns-chain" }
 hns-p2p = { path = "../hns-p2p" }
+hns-store = { path = "../hns-store", default-features = false }
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true

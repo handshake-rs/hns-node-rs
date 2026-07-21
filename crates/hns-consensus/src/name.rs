@@ -1,6 +1,6 @@
 use hns_primitives::{
-    Amount, BlockHash, CovenantKind, Height, NameHash, NameLifecycleState, NameState, Outpoint,
-    Transaction,
+    sha3_256, BlockHash, CovenantKind, Height, NameHash, NameLifecycleState, NameState, Outpoint,
+    Transaction, MAX_NAME_SIZE,
 };
 use serde::{Deserialize, Serialize};
 
@@ -76,11 +76,7 @@ pub trait NameContext {
     }
 }
 
-pub fn name_lifecycle(
-    state: &NameState,
-    height: Height,
-    params: NameParams,
-) -> NameLifecycleState {
+pub fn name_lifecycle(state: &NameState, height: Height, params: NameParams) -> NameLifecycleState {
     if state.revoked != 0 {
         return NameLifecycleState::Revoked;
     }
@@ -140,11 +136,7 @@ pub fn is_name_expired(state: &NameState, height: Height, params: NameParams) ->
     state.owner.is_null()
 }
 
-pub fn maybe_expire_name(
-    state: &mut NameState,
-    height: Height,
-    params: NameParams,
-) -> bool {
+pub fn maybe_expire_name(state: &mut NameState, height: Height, params: NameParams) -> bool {
     if !is_name_expired(state, height, params) {
         return false;
     }
@@ -244,6 +236,14 @@ pub fn verify_and_apply_name_covenant(
         return Ok(NameMutation::Unchanged);
     }
 
+    // HSD checkpoints deliberately skip BID and REDEEM contextual reads because
+    // neither transition changes NameState. Keep this bypass narrow and opt-in.
+    if context.is_historical_height(height)
+        && matches!(covenant.kind, CovenantKind::Bid | CovenantKind::Redeem)
+    {
+        return Ok(NameMutation::Unchanged);
+    }
+
     let name_hash = NameHash::new(required_hash(covenant.item(0), "name hash")?);
     if name_hash != state.name_hash {
         return Err(ConsensusError::ContextualCovenant(
@@ -264,13 +264,16 @@ pub fn verify_and_apply_name_covenant(
                 "non-OPEN covenant references an absent name state".to_owned(),
             ));
         }
-        let name = covenant
-            .item(2)
-            .ok_or_else(|| {
-                ConsensusError::ContextualCovenant("OPEN is missing its name".to_owned())
-            })?
-            .to_vec();
-        state.initialize(name, height);
+        let name = covenant.item(2).ok_or_else(|| {
+            ConsensusError::ContextualCovenant("OPEN is missing its name".to_owned())
+        })?;
+        verify_binary_name(name)?;
+        if sha3_256(name) != *name_hash.as_bytes() {
+            return Err(ConsensusError::ContextualCovenant(
+                "OPEN name does not match its committed name hash".to_owned(),
+            ));
+        }
+        state.initialize(name.to_vec(), height);
     }
 
     let expired = maybe_expire_name(state, height, params);
@@ -314,25 +317,12 @@ pub fn verify_and_apply_name_covenant(
         CovenantKind::Reveal => {
             require_start(start, state.height, "REVEAL")?;
             require_lifecycle(lifecycle, NameLifecycleState::Reveal, "REVEAL")?;
-            let previous_output = transaction
-                .inputs
-                .get(output_index)
-                .ok_or_else(|| {
-                    ConsensusError::ContextualCovenant(
-                        "REVEAL is missing its linked input".to_owned(),
-                    )
-                })?
-                .previous_output
-                .clone();
             let new_owner = Outpoint {
                 txid: transaction.txid(),
                 index: u32::try_from(output_index).map_err(|_| {
-                    ConsensusError::ContextualCovenant(
-                        "REVEAL output index exceeds u32".to_owned(),
-                    )
+                    ConsensusError::ContextualCovenant("REVEAL output index exceeds u32".to_owned())
                 })?,
             };
-            let _ = previous_output;
             if state.owner.is_null() || output.value > state.highest {
                 state.value = state.highest;
                 state.owner = new_owner;
@@ -509,6 +499,39 @@ pub fn verify_and_apply_name_covenant(
     }
 }
 
+fn verify_binary_name(name: &[u8]) -> Result<(), ConsensusError> {
+    if name.is_empty() || name.len() > MAX_NAME_SIZE {
+        return Err(ConsensusError::ContextualCovenant(
+            "OPEN contains an invalid name length".to_owned(),
+        ));
+    }
+
+    for (index, byte) in name.iter().copied().enumerate() {
+        let alpha = byte.is_ascii_lowercase();
+        let digit = byte.is_ascii_digit();
+        let separator = matches!(byte, b'-' | b'_');
+        if !(alpha || digit || separator) {
+            return Err(ConsensusError::ContextualCovenant(
+                "OPEN contains an invalid name character".to_owned(),
+            ));
+        }
+        if separator && (index == 0 || index + 1 == name.len()) {
+            return Err(ConsensusError::ContextualCovenant(
+                "OPEN name begins or ends with a separator".to_owned(),
+            ));
+        }
+    }
+
+    const BLACKLIST: [&[u8]; 5] = [b"example", b"invalid", b"local", b"localhost", b"test"];
+    if BLACKLIST.contains(&name) {
+        return Err(ConsensusError::ContextualCovenant(
+            "OPEN targets a consensus-blacklisted name".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
 fn require_lifecycle(
     actual: NameLifecycleState,
     expected: NameLifecycleState,
@@ -523,7 +546,11 @@ fn require_lifecycle(
     }
 }
 
-fn require_start(actual: Height, expected: Height, operation: &'static str) -> Result<(), ConsensusError> {
+fn require_start(
+    actual: Height,
+    expected: Height,
+    operation: &'static str,
+) -> Result<(), ConsensusError> {
     if actual == expected {
         Ok(())
     } else {
@@ -543,9 +570,7 @@ fn linked_previous_output<'a>(
         .get(output_index)
         .map(|input| &input.previous_output)
         .ok_or_else(|| {
-            ConsensusError::ContextualCovenant(format!(
-                "{operation} is missing its linked input"
-            ))
+            ConsensusError::ContextualCovenant(format!("{operation} is missing its linked input"))
         })
 }
 
@@ -562,24 +587,19 @@ fn transaction_outpoint(
 }
 
 fn required_hash(item: Option<&[u8]>, label: &'static str) -> Result<[u8; 32], ConsensusError> {
-    item.and_then(|item| item.try_into().ok()).ok_or_else(|| {
-        ConsensusError::ContextualCovenant(format!("invalid or missing {label}"))
-    })
+    item.and_then(|item| item.try_into().ok())
+        .ok_or_else(|| ConsensusError::ContextualCovenant(format!("invalid or missing {label}")))
 }
 
 fn required_u32(item: Option<&[u8]>, label: &'static str) -> Result<u32, ConsensusError> {
     item.and_then(|item| item.try_into().ok())
         .map(u32::from_le_bytes)
-        .ok_or_else(|| {
-            ConsensusError::ContextualCovenant(format!("invalid or missing {label}"))
-        })
+        .ok_or_else(|| ConsensusError::ContextualCovenant(format!("invalid or missing {label}")))
 }
 
 fn required_u8(item: Option<&[u8]>, label: &'static str) -> Result<u8, ConsensusError> {
     item.and_then(|item| (item.len() == 1).then_some(item[0]))
-        .ok_or_else(|| {
-            ConsensusError::ContextualCovenant(format!("invalid or missing {label}"))
-        })
+        .ok_or_else(|| ConsensusError::ContextualCovenant(format!("invalid or missing {label}")))
 }
 
 fn mod_buffer(bytes: &[u8], modulus: u32) -> u32 {
@@ -625,9 +645,74 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use hns_primitives::{Address, Covenant, Input, Output, Txid, Witness};
+    use hns_primitives::Amount;
+
+    use hns_primitives::{blake2b_256, Address, Covenant, Input, Output, Txid, Witness};
+    use serde::Deserialize;
 
     use super::*;
+    use crate::Network;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NamePolicyFixture {
+        parameters: NamePolicyParameters,
+        datasets: NamePolicyDatasets,
+        renewal_commitment_cases: Vec<RenewalCommitmentCase>,
+        cases: Vec<NamePolicyCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NamePolicyParameters {
+        claim_period: u32,
+        alexa_lockup_period: u32,
+        renewal_maturity: u32,
+        renewal_period: u32,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NamePolicyDatasets {
+        names_db_blake2b256: String,
+        lockup_db_blake2b256: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NamePolicyCase {
+        name_hash: String,
+        height: u32,
+        reserved: bool,
+        locked: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RenewalCommitmentCase {
+        height: u32,
+        committed_height: Option<u32>,
+        accepted: bool,
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            output.push(TABLE[usize::from(byte >> 4)] as char);
+            output.push(TABLE[usize::from(byte & 0x0f)] as char);
+        }
+        output
+    }
+
+    fn decode_hash(value: &str) -> [u8; 32] {
+        assert_eq!(value.len(), 64);
+        let mut output = [0u8; 32];
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).expect("hex byte");
+        }
+        output
+    }
 
     #[derive(Default)]
     struct Context {
@@ -667,11 +752,20 @@ mod tests {
         Covenant { kind, items }
     }
 
-    fn transaction(kind: CovenantKind, hash: NameHash, start: Height, tail: Vec<Vec<u8>>, value: Amount) -> Transaction {
+    fn transaction(
+        kind: CovenantKind,
+        hash: NameHash,
+        start: Height,
+        tail: Vec<Vec<u8>>,
+        value: Amount,
+    ) -> Transaction {
         Transaction {
             version: 0,
             inputs: vec![Input {
-                previous_output: Outpoint { txid: Txid::new([9; 32]), index: 0 },
+                previous_output: Outpoint {
+                    txid: Txid::new([9; 32]),
+                    index: 0,
+                },
                 sequence: u32::MAX,
                 witness: Witness::default(),
             }],
@@ -703,10 +797,22 @@ mod tests {
             expired: false,
             weak: false,
         };
-        assert_eq!(name_lifecycle(&state, 105, params()), NameLifecycleState::Opening);
-        assert_eq!(name_lifecycle(&state, 106, params()), NameLifecycleState::Bidding);
-        assert_eq!(name_lifecycle(&state, 111, params()), NameLifecycleState::Reveal);
-        assert_eq!(name_lifecycle(&state, 121, params()), NameLifecycleState::Closed);
+        assert_eq!(
+            name_lifecycle(&state, 105, params()),
+            NameLifecycleState::Opening
+        );
+        assert_eq!(
+            name_lifecycle(&state, 106, params()),
+            NameLifecycleState::Bidding
+        );
+        assert_eq!(
+            name_lifecycle(&state, 111, params()),
+            NameLifecycleState::Reveal
+        );
+        assert_eq!(
+            name_lifecycle(&state, 121, params()),
+            NameLifecycleState::Closed
+        );
     }
 
     #[test]
@@ -738,6 +844,64 @@ mod tests {
         context.heights.insert(hash, 1_000);
         assert!(verify_renewal_commitment(&context, &hash, 1_060, params()).unwrap());
         assert!(!verify_renewal_commitment(&context, &hash, 3_600, params()).unwrap());
+    }
+
+    #[test]
+    fn reserved_and_lockup_policy_matches_the_pinned_hsd_oracle() {
+        let fixture: NamePolicyFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/name-states/name-policy-v1.json"
+        ))
+        .expect("fixture");
+        let params = Network::Mainnet.params().names;
+        assert_eq!(params.claim_period, fixture.parameters.claim_period);
+        assert_eq!(
+            params.alexa_lockup_period,
+            fixture.parameters.alexa_lockup_period
+        );
+        assert_eq!(params.renewal_maturity, fixture.parameters.renewal_maturity);
+        assert_eq!(params.renewal_period, fixture.parameters.renewal_period);
+        assert_eq!(
+            hex(&blake2b_256(RESERVED_DB)),
+            fixture.datasets.names_db_blake2b256
+        );
+        assert_eq!(
+            hex(&blake2b_256(LOCKUP_DB)),
+            fixture.datasets.lockup_db_blake2b256
+        );
+
+        for case in fixture.cases {
+            let hash = NameHash::new(decode_hash(&case.name_hash));
+            assert_eq!(
+                is_reserved(&hash, case.height, params),
+                case.reserved,
+                "reserved policy mismatch at height {} for {}",
+                case.height,
+                case.name_hash
+            );
+            assert_eq!(
+                is_locked_up(&hash, case.height, params),
+                case.locked,
+                "lockup policy mismatch at height {} for {}",
+                case.height,
+                case.name_hash
+            );
+        }
+
+        let renewal_hash = BlockHash::new([0x88; 32]);
+        for case in fixture.renewal_commitment_cases {
+            let mut context = Context::default();
+            if let Some(height) = case.committed_height {
+                context.heights.insert(renewal_hash, height);
+            }
+            assert_eq!(
+                verify_renewal_commitment(&context, &renewal_hash, case.height, params)
+                    .expect("renewal commitment"),
+                case.accepted,
+                "renewal commitment mismatch at height {} with committed height {:?}",
+                case.height,
+                case.committed_height
+            );
+        }
     }
 
     #[test]

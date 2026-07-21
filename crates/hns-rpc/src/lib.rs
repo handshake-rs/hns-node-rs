@@ -55,6 +55,7 @@ pub enum RpcMethod {
     GetHsrdStatus,
     GetAuthorityInfo,
     GetParityInfo,
+    GetMiningEngineInfo,
 }
 
 impl RpcMethod {
@@ -80,6 +81,7 @@ impl RpcMethod {
             "gethsrdstatus" => Some(Self::GetHsrdStatus),
             "getauthorityinfo" => Some(Self::GetAuthorityInfo),
             "getparityinfo" => Some(Self::GetParityInfo),
+            "getminingengineinfo" => Some(Self::GetMiningEngineInfo),
             _ => None,
         }
     }
@@ -102,7 +104,7 @@ pub struct RpcConsensusReadiness {
     /// reusable primitives. This does not imply block-connect integration.
     pub relative_lock_primitives: bool,
     /// A fail-closed version-zero witness/script foundation exists. It remains
-    /// non-authoritative until every opcode and an audited signature backend
+    /// non-authoritative until every opcode/flag/historical rule and the native backend
     /// are composed and differential-tested.
     pub witness_program_foundation: bool,
     pub signature_backend: bool,
@@ -196,6 +198,22 @@ pub struct RpcParityInfo {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcMiningEngineInfo {
+    pub enabled: bool,
+    pub observation_only: bool,
+    pub transaction_relay_enabled: bool,
+    pub mempool: MempoolInfo,
+    pub maximum_template_variants: usize,
+    pub cached_template_variants: usize,
+    pub pending_publications: usize,
+    pub maximum_pending_publications: usize,
+    pub publication_retry_interval_ms: u64,
+    pub can_build_shadow_templates: bool,
+    pub can_publish_solved_blocks: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcNodeStatus {
     pub api_version: u32,
     pub release_stage: String,
@@ -229,7 +247,9 @@ pub struct RpcSnapshot {
     pub names: Vec<NameState>,
     pub mempool_info: MempoolInfo,
     pub mempool_entries: Vec<MempoolEntry>,
+    pub network_active: bool,
     pub peer_count: usize,
+    pub mining_engine: RpcMiningEngineInfo,
     pub node_status: RpcNodeStatus,
 }
 
@@ -273,7 +293,7 @@ impl RpcSnapshot {
     fn name_by_name(&self, name: &str) -> Option<&NameState> {
         self.names
             .iter()
-            .find(|state| state.name.as_deref() == Some(name))
+            .find(|state| state.name.as_slice() == name.as_bytes())
     }
 
     fn confirmations(&self, height: Height) -> u32 {
@@ -436,11 +456,14 @@ impl BasicRpcService {
                 -32601,
                 "sendrawtransaction requires a mutable mempool service",
             )),
-            RpcMethod::GetPeerInfo => Ok(json!([])),
+            RpcMethod::GetPeerInfo => Err(RpcCallError::new(
+                -32601,
+                "getpeerinfo requires the live peer diagnostics service",
+            )),
             RpcMethod::GetNetworkInfo => Ok(json!({
                 "version": 0,
                 "subversion": "/hsrd:0.1.0/",
-                "networkactive": true,
+                "networkactive": self.snapshot.network_active,
                 "connections": self.snapshot.peer_count,
             })),
             RpcMethod::GetConnectionCount => Ok(json!(self.snapshot.peer_count)),
@@ -449,9 +472,13 @@ impl BasicRpcService {
             RpcMethod::GetNameByHash => self.get_name_by_hash(params),
             RpcMethod::GetHsrdStatus => serde_json::to_value(&self.snapshot.node_status)
                 .map_err(|error| RpcCallError::new(-32603, error.to_string())),
-            RpcMethod::GetAuthorityInfo => serde_json::to_value(&self.snapshot.node_status.authority)
-                .map_err(|error| RpcCallError::new(-32603, error.to_string())),
+            RpcMethod::GetAuthorityInfo => {
+                serde_json::to_value(&self.snapshot.node_status.authority)
+                    .map_err(|error| RpcCallError::new(-32603, error.to_string()))
+            }
             RpcMethod::GetParityInfo => serde_json::to_value(&self.snapshot.node_status.parity)
+                .map_err(|error| RpcCallError::new(-32603, error.to_string())),
+            RpcMethod::GetMiningEngineInfo => serde_json::to_value(&self.snapshot.mining_engine)
                 .map_err(|error| RpcCallError::new(-32603, error.to_string())),
         }
     }
@@ -581,7 +608,7 @@ impl BasicRpcService {
             .snapshot
             .name_by_hash_hex(&hash)
             .ok_or_else(|| RpcCallError::new(-5, "name not found"))?;
-        Ok(json!(&state.name))
+        Ok(json!(String::from_utf8_lossy(&state.name)))
     }
 }
 
@@ -640,16 +667,28 @@ fn optional_bool(params: &[Value], index: usize, default: bool) -> Result<bool, 
 fn name_state_json(state: &NameState) -> Value {
     json!({
         "nameHash": state.name_hash.to_hex(),
-        "name": &state.name,
+        "name": String::from_utf8_lossy(&state.name),
         "height": state.height,
-        "state": format!("{:?}", state.state).to_lowercase(),
+        "renewal": state.renewal,
+        "owner": {
+            "hash": state.owner.txid.to_hex(),
+            "index": state.owner.index,
+        },
+        "value": state.value,
+        "highest": state.highest,
+        "data": hex_encode(&state.data),
+        "transfer": state.transfer,
+        "revoked": state.revoked,
+        "claimed": state.claimed,
+        "renewals": state.renewals,
+        "registered": state.registered,
+        "expired": state.expired,
+        "weak": state.weak,
     })
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
-    #[error("rpc service is not implemented in the scaffold")]
-    Unimplemented,
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     #[error("rpc internal error: {0}")]
@@ -661,8 +700,8 @@ mod tests {
     use super::*;
     use hns_chain::{BlockIndexRecord, BlockStatus, HeaderRecord};
     use hns_primitives::{
-        Address, Block, BlockHash, Coin, Covenant, CovenantKind, Header, Input, NameHash,
-        NameLifecycleState, Outpoint, Output, Transaction, Txid, Witness,
+        Address, Block, BlockHash, Coin, Covenant, CovenantKind, Header, Input, NameHash, Outpoint,
+        Output, Transaction, Txid, Witness,
     };
 
     #[test]
@@ -678,8 +717,10 @@ mod tests {
                 transaction_count: 2,
                 bytes: 100,
                 total_fee: 3,
+                ..MempoolInfo::default()
             },
             mempool_entries: Vec::new(),
+            network_active: true,
             peer_count: 4,
             ..RpcSnapshot::default()
         });
@@ -697,6 +738,39 @@ mod tests {
         assert_eq!(result["chain"], "regtest");
         assert_eq!(result["blocks"], 7);
         assert_eq!(result["chainwork"], "9");
+    }
+
+    #[test]
+    fn network_rpc_reports_snapshot_state_and_rejects_missing_peer_details() {
+        let service = BasicRpcService::new(RpcSnapshot {
+            network_active: true,
+            peer_count: 4,
+            ..RpcSnapshot::default()
+        });
+
+        let network = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getnetworkinfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!(1)),
+            })
+            .expect("network response")
+            .result
+            .expect("network result");
+        assert_eq!(network["networkactive"], true);
+        assert_eq!(network["connections"], 4);
+
+        let peers = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getpeerinfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!(2)),
+            })
+            .expect("peer response");
+        assert!(peers.result.is_none());
+        assert_eq!(peers.error.expect("peer error").code, -32601);
     }
 
     #[test]
@@ -802,13 +876,26 @@ mod tests {
             coins: vec![coin],
             names: vec![NameState {
                 name_hash,
-                name: Some("handshake".to_owned()),
+                name: b"handshake".to_vec(),
                 height: 0,
-                state: NameLifecycleState::Registered,
+                renewal: 0,
+                owner: Outpoint::null(),
+                value: 0,
+                highest: 0,
+                data: Vec::new(),
+                transfer: 0,
+                revoked: 0,
+                claimed: 0,
+                renewals: 0,
+                registered: true,
+                expired: false,
+                weak: false,
             }],
             mempool_info: MempoolInfo::default(),
             mempool_entries: Vec::new(),
+            network_active: false,
             peer_count: 0,
+            mining_engine: RpcMiningEngineInfo::default(),
             node_status: RpcNodeStatus::default(),
         }
     }
@@ -894,7 +981,9 @@ mod tests {
                 id: Some(json!(2)),
             })
             .expect("rpc response");
-        assert_eq!(info.result.expect("info")["state"], "registered");
+        let info = info.result.expect("info");
+        assert_eq!(info["name"], "handshake");
+        assert_eq!(info["registered"], true);
     }
     #[test]
     fn basic_rpc_exposes_hsrd_authority_and_parity_diagnostics() {
@@ -924,6 +1013,7 @@ mod tests {
             ("gethsrdstatus", "release_stage", json!("pre-authority")),
             ("getauthorityinfo", "mode", json!("shadow")),
             ("getparityinfo", "state", json!("not-configured")),
+            ("getminingengineinfo", "enabled", json!(false)),
         ] {
             let response = service
                 .handle(JsonRpcRequest {
@@ -936,5 +1026,4 @@ mod tests {
             assert_eq!(response.result.expect("result")[field], expected);
         }
     }
-
 }

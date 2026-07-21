@@ -1,11 +1,20 @@
 #![forbid(unsafe_code)]
 
+mod mining_engine;
+mod shadow_sync;
+
+pub use mining_engine::{
+    MiningEngineConfig, MiningEngineDiagnostics, MiningPublicationAttempt, MiningPublicationResult,
+    MiningTemplateRequest,
+};
+pub use shadow_sync::{ShadowSyncConfig, ShadowSyncDiagnostics};
+
 use std::{
     collections::HashSet,
     future::Future,
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -26,38 +35,38 @@ use hns_chain::{
 };
 use hns_consensus::{
     expected_next_bits, validate_block_finality, ConsensusParams, DifficultyPoint, HeaderConsensus,
-    HeaderParent, HeaderValidationContext, Network, MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
+    HeaderParent, HeaderValidationContext, NameFlags, Network, MAX_FUTURE_BLOCK_TIME,
+    MEDIAN_TIMESPAN,
 };
 use hns_mempool::{MemoryMempool, Mempool};
 use hns_mining::{
     HeaderSummary, MiningEventHub, MiningGeneration, MiningSnapshot, MiningSubscriptions,
-    SolvedMiningCandidate,
+    SolvedMiningCandidate, TemplateCoordinator,
 };
-use hns_primitives::{Block, BlockHash, Coin, CompactTarget, Height, NameState, Uint256};
+use hns_primitives::{Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState, Uint256};
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
-    RpcConsensusReadiness, RpcErrorObject, RpcHeaderEntry, RpcNodeStatus, RpcParityInfo,
-    RpcService, RpcSnapshot, RpcTransactionEntry,
+    RpcConsensusReadiness, RpcErrorObject, RpcHeaderEntry, RpcMiningEngineInfo, RpcNodeStatus,
+    RpcParityInfo, RpcService, RpcSnapshot, RpcTransactionEntry,
 };
 use hns_state::{
-    connect_block_to_batch_with_verifier, decode_coin, decode_name_state,
-    disconnect_block_to_batch, BlockUndo, ConnectBlock, DisconnectBlock, StoredStateEngine,
+    connect_block_to_batch_with_services, decode_coin, decode_name_state,
+    disconnect_block_to_batch, verify_stored_name_tree_root, BlockUndo, ConnectBlock,
+    DisconnectBlock, StoredStateEngine,
 };
 use hns_store::{
-    decode_u64, encode_u64, open_store, ColumnFamily, DurabilityPolicy, MetaKey, ReadSnapshot,
-    Store, StoreBackend, StagingOverlay, StoreConfig, StoreHandle, WriteBatch, SCHEMA_VERSION,
-    STORAGE_PROFILE,
+    decode_u64, encode_u64, mark_clean_shutdown, mark_unclean_start, open_store,
+    was_clean_shutdown, ColumnFamily, DurabilityPolicy, MetaKey, ReadSnapshot, StagingOverlay,
+    Store, StoreBackend, StoreConfig, StoreHandle, WriteBatch, SCHEMA_VERSION, STORAGE_PROFILE,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 2;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 3;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 
-#[derive(
-    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum,
-)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[value(rename_all = "kebab-case")]
 pub enum AuthorityMode {
@@ -83,13 +92,13 @@ impl AuthorityMode {
 pub struct NodeConfig {
     pub network: Network,
     pub data_dir: Option<PathBuf>,
-    pub config_file: Option<PathBuf>,
     pub rpc_bind: SocketAddr,
-    pub metrics_bind: Option<SocketAddr>,
     pub log_filter: String,
     pub authority_mode: AuthorityMode,
     pub acknowledge_incomplete_consensus: bool,
     pub storage_durability: DurabilityPolicy,
+    pub shadow_sync: ShadowSyncConfig,
+    pub mining_engine: MiningEngineConfig,
 }
 
 impl Default for NodeConfig {
@@ -97,20 +106,20 @@ impl Default for NodeConfig {
         Self {
             network: Network::Mainnet,
             data_dir: None,
-            config_file: None,
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], 12037)),
-            metrics_bind: None,
             log_filter: "info".to_owned(),
             authority_mode: AuthorityMode::Shadow,
             acknowledge_incomplete_consensus: false,
             storage_durability: DurabilityPolicy::Sync,
+            shadow_sync: ShadowSyncConfig::default(),
+            mining_engine: MiningEngineConfig::default(),
         }
     }
 }
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     match config.authority_mode {
-        AuthorityMode::Disabled | AuthorityMode::Shadow => Ok(()),
+        AuthorityMode::Disabled | AuthorityMode::Shadow => {}
         AuthorityMode::HsdVerified => anyhow::bail!(
             "hsd-verified authority is not composed yet; use shadow mode until the independent verifier boundary exists"
         ),
@@ -130,9 +139,13 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
                     "native experimental authority is restricted to regtest and simnet until every documented parity gate passes"
                 );
             }
-            Ok(())
         }
     }
+
+    config.shadow_sync.validate(config.authority_mode)?;
+    config
+        .mining_engine
+        .validate(&config.shadow_sync, config.authority_mode)
 }
 
 fn authority_can_mine(config: &NodeConfig) -> bool {
@@ -140,8 +153,43 @@ fn authority_can_mine(config: &NodeConfig) -> bool {
         && validate_node_config(config).is_ok()
 }
 
+#[derive(Clone, Debug)]
+struct MiningAuthorityPermit {
+    generation: MiningGeneration,
+    tip: BlockHash,
+    experimental_bypass: bool,
+    _private: (),
+}
+
+fn issue_authority_permit(
+    config: &NodeConfig,
+    durable: &DurableMiningState,
+) -> Option<MiningAuthorityPermit> {
+    if !authority_can_mine(config) {
+        return None;
+    }
+    let snapshot = durable.snapshot.as_ref()?;
+
+    // The only currently composed authority mode is the explicitly gated
+    // regtest/simnet experimental path. Future HSD-verified or native authority
+    // modes must require `durable.authoritative` and issue the same capability.
+    let experimental_bypass = matches!(config.authority_mode, AuthorityMode::NativeExperimental)
+        && matches!(config.network, Network::Regtest | Network::Simnet)
+        && config.acknowledge_incomplete_consensus;
+    if !durable.authoritative && !experimental_bypass {
+        return None;
+    }
+
+    Some(MiningAuthorityPermit {
+        generation: durable.generation,
+        tip: snapshot.tip.hash,
+        experimental_bypass,
+        _private: (),
+    })
+}
+
 fn durable_tip_can_authorize(config: &NodeConfig, durable: &DurableMiningState) -> bool {
-    authority_can_mine(config) && durable.snapshot.is_some()
+    issue_authority_permit(config, durable).is_some()
 }
 
 fn consensus_readiness() -> RpcConsensusReadiness {
@@ -153,9 +201,9 @@ fn consensus_readiness() -> RpcConsensusReadiness {
         sighash_primitives: true,
         relative_lock_primitives: true,
         witness_program_foundation: true,
-        signature_backend: false,
+        signature_backend: true,
         input_authorization_fail_closed: true,
-        relative_sequence_locks: false,
+        relative_sequence_locks: true,
         scripts: false,
         covenant_linkage: true,
         contextual_covenants: false,
@@ -177,7 +225,10 @@ fn consensus_readiness() -> RpcConsensusReadiness {
 
 fn readiness_blockers(readiness: &RpcConsensusReadiness) -> Vec<String> {
     let checks = [
-        (readiness.header_pow_difficulty, "header PoW and difficulty parity"),
+        (
+            readiness.header_pow_difficulty,
+            "header PoW and difficulty parity",
+        ),
         (
             readiness.checkpoints_and_deployments,
             "checkpoints and deployment-state parity",
@@ -193,7 +244,10 @@ fn readiness_blockers(readiness: &RpcConsensusReadiness) -> Vec<String> {
             readiness.witness_program_foundation,
             "fail-closed witness-program foundation",
         ),
-        (readiness.signature_backend, "audited secp256k1 signature backend"),
+        (
+            readiness.signature_backend,
+            "native pinned secp256k1 verification backend",
+        ),
         (
             readiness.input_authorization_fail_closed,
             "fail-closed UTXO input authorization",
@@ -225,34 +279,52 @@ fn readiness_blockers(readiness: &RpcConsensusReadiness) -> Vec<String> {
             readiness.durable_store_identity,
             "durable network/genesis/storage-profile binding",
         ),
-        (readiness.side_chain_storage, "durable side-chain block storage"),
-        (readiness.best_work_fork_choice, "strict best-work fork choice"),
+        (
+            readiness.side_chain_storage,
+            "durable side-chain block storage",
+        ),
+        (
+            readiness.best_work_fork_choice,
+            "strict best-work fork choice",
+        ),
         (
             readiness.validated_reorg_planning,
             "validated reorganization planning",
         ),
-        (readiness.atomic_reorganizations, "atomic reorganization storage"),
-        (readiness.wal_durability, "explicit WAL/sync durability policy"),
+        (
+            readiness.atomic_reorganizations,
+            "atomic reorganization storage",
+        ),
+        (
+            readiness.wal_durability,
+            "explicit WAL/sync durability policy",
+        ),
         (
             readiness.historical_replay,
             "complete historical mainnet replay",
         ),
-        (readiness.invalid_corpus, "invalid and mutated corpus parity"),
+        (
+            readiness.invalid_corpus,
+            "invalid and mutated corpus parity",
+        ),
         (readiness.live_shadow, "sustained live shadow-node parity"),
     ];
 
     checks
         .into_iter()
-        .filter_map(|(ready, label)| (!ready).then(|| label.to_owned()))
+        .filter(|(ready, _)| !*ready)
+        .map(|(_, label)| label.to_owned())
         .collect()
 }
 
 fn authority_info(config: &NodeConfig, durable: &DurableMiningState) -> RpcAuthorityInfo {
     let readiness = consensus_readiness();
     let consensus_complete = readiness.complete();
-    let configured = authority_can_mine(config);
-    let experimental_bypass_active = configured && !consensus_complete;
-    let can_authorize = durable_tip_can_authorize(config, durable);
+    let experimental_bypass_active = issue_authority_permit(config, durable)
+        .is_some_and(|permit| permit.experimental_bypass)
+        && !consensus_complete;
+    let permit = issue_authority_permit(config, durable);
+    let can_authorize = permit.is_some();
     let mut blockers = readiness_blockers(&readiness);
 
     match config.authority_mode {
@@ -266,9 +338,7 @@ fn authority_info(config: &NodeConfig, durable: &DurableMiningState) -> RpcAutho
         {
             blockers.push("experimental-authority feature is not enabled".to_owned())
         }
-        AuthorityMode::NativeExperimental
-            if !config.acknowledge_incomplete_consensus =>
-        {
+        AuthorityMode::NativeExperimental if !config.acknowledge_incomplete_consensus => {
             blockers.push("incomplete consensus has not been acknowledged".to_owned())
         }
         AuthorityMode::NativeExperimental => {}
@@ -294,6 +364,23 @@ fn authority_info(config: &NodeConfig, durable: &DurableMiningState) -> RpcAutho
     }
 }
 
+fn rpc_mining_engine_info(diagnostics: MiningEngineDiagnostics) -> RpcMiningEngineInfo {
+    RpcMiningEngineInfo {
+        enabled: diagnostics.enabled,
+        observation_only: diagnostics.observation_only,
+        transaction_relay_enabled: diagnostics.transaction_relay_enabled,
+        mempool: diagnostics.mempool,
+        maximum_template_variants: diagnostics.maximum_template_variants,
+        cached_template_variants: diagnostics.cached_template_variants,
+        pending_publications: diagnostics.pending_publications,
+        maximum_pending_publications: diagnostics.maximum_pending_publications,
+        publication_retry_interval_ms: diagnostics.publication_retry_interval_ms,
+        can_build_shadow_templates: diagnostics.can_build_shadow_templates,
+        can_publish_solved_blocks: diagnostics.can_publish_solved_blocks,
+        blockers: diagnostics.blockers,
+    }
+}
+
 fn parity_info() -> RpcParityInfo {
     RpcParityInfo {
         oracle: "handshake-org/hsd".to_owned(),
@@ -314,6 +401,7 @@ pub struct NodeService {
     config: NodeConfig,
     state: NodeState,
     mining_events: MiningEventHub,
+    mining_engine_templates: Mutex<TemplateCoordinator>,
 }
 
 impl NodeService {
@@ -342,6 +430,18 @@ impl NodeService {
             );
         }
 
+        let mempool_info = state.mempool.info();
+        if mempool_info.transaction_count == 0 && mempool_info.orphan_count == 0 {
+            state.mempool = MemoryMempool::with_limits(config.mining_engine.mempool_limits.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to configure mining-engine mempool: {error}")
+                })?;
+        } else if state.mempool.limits() != &config.mining_engine.mempool_limits {
+            anyhow::bail!(
+                "non-empty node mempool limits do not match the configured mining-engine limits"
+            );
+        }
+
         // Production authority remains disabled. On the explicitly gated
         // regtest/simnet experimental path, recover a fully stored higher-work
         // branch before exposing any mining generation. Shadow mode is
@@ -351,6 +451,18 @@ impl NodeService {
             state.recover_best_stored_chain()?;
         }
 
+        let previous_shutdown_clean = was_clean_shutdown(&state.store)
+            .map_err(|error| anyhow::anyhow!("failed to read shutdown marker: {error}"))?;
+        if !previous_shutdown_clean {
+            // Durable invariants were checked by NodeState construction. Keep the
+            // signal visible while still allowing deterministic recovery paths.
+            tracing::warn!(
+                "hsrd store was not marked clean at the previous shutdown; durable invariants were revalidated"
+            );
+        }
+        mark_unclean_start(&state.store)
+            .map_err(|error| anyhow::anyhow!("failed to mark running store unclean: {error}"))?;
+
         let durable = state.durable_mining_state()?;
         let initial = if durable_tip_can_authorize(&config, &durable) {
             durable.snapshot.clone()
@@ -359,10 +471,16 @@ impl NodeService {
         };
         let mining_events = MiningEventHub::from_durable(durable.generation, initial)
             .map_err(|error| anyhow::anyhow!("failed to initialize mining events: {error}"))?;
+        let mining_engine_templates = Mutex::new(
+            TemplateCoordinator::new(config.mining_engine.maximum_template_variants).map_err(
+                |error| anyhow::anyhow!("failed to initialize mining-engine templates: {error}"),
+            )?,
+        );
         Ok(Self {
             config,
             state,
             mining_events,
+            mining_engine_templates,
         })
     }
 
@@ -391,12 +509,13 @@ impl NodeService {
     }
 
     pub fn subscribe_mining_events(&self) -> Result<MiningSubscriptions> {
-        if !authority_can_mine(&self.config) {
-            anyhow::bail!(
-                "authoritative mining subscriptions are disabled in {} mode",
+        let durable = self.state.durable_mining_state()?;
+        issue_authority_permit(&self.config, &durable).ok_or_else(|| {
+            anyhow::anyhow!(
+                "authoritative mining subscriptions are disabled or no authority permit is available in {} mode",
                 self.config.authority_mode.as_str()
-            );
-        }
+            )
+        })?;
         Ok(self.mining_events.subscribe())
     }
 
@@ -405,6 +524,7 @@ impl NodeService {
     }
 
     pub fn accept_block(&mut self, request: NodeBlockImport) -> Result<BlockAcceptance> {
+        let active_transactions = request.block.transactions.clone();
         let summary = HeaderSummary::from_block(&request.block, request.height);
         self.mining_events.candidate_tip_seen(summary.clone());
         let validated = self.state.validate_import(&request)?;
@@ -420,7 +540,13 @@ impl NodeService {
             }
         } else if self.state.is_direct_active_extension(&request)? {
             let committed = self.state.commit_staged_block(request, validated)?;
+            let mempool_generation =
+                self.mining_engine_reconcile_connected_transactions(&active_transactions);
             self.publish_durable_mining_state(&committed.mining)?;
+            self.mining_engine_publish_mempool_reconciled(
+                committed.mining.generation,
+                mempool_generation,
+            )?;
             return Ok(BlockAcceptance {
                 record: committed.record,
                 disposition: BlockDisposition::Connected,
@@ -428,10 +554,7 @@ impl NodeService {
         }
 
         let stored = self.state.store_validated_alternate(request, validated)?;
-        let Some(activation) = self
-            .state
-            .best_chain_activation_plan(stored.record.hash)?
-        else {
+        let Some(activation) = self.state.best_chain_activation_plan(stored.record.hash)? else {
             return Ok(BlockAcceptance {
                 record: stored.record.clone(),
                 disposition: if stored.already_known {
@@ -452,13 +575,16 @@ impl NodeService {
 
         match self.state.apply_reorg(activation) {
             Ok(reorg) => {
+                let mempool_generation = self.mining_engine_clear_mempool_for_chain_transition();
                 self.publish_durable_mining_state(&reorg.mining)?;
-                let record = reorg
-                    .summary
-                    .connected
-                    .last()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("best-chain activation connected no blocks"))?;
+                self.mining_engine_publish_mempool_reconciled(
+                    reorg.mining.generation,
+                    mempool_generation,
+                )?;
+                let record =
+                    reorg.summary.connected.last().cloned().ok_or_else(|| {
+                        anyhow::anyhow!("best-chain activation connected no blocks")
+                    })?;
                 let disposition = if is_reorg {
                     BlockDisposition::Reorganized {
                         disconnected: reorg.summary.disconnected.len(),
@@ -482,36 +608,42 @@ impl NodeService {
     }
 
     pub fn connect_block(&mut self, request: NodeBlockImport) -> Result<BlockIndexRecord> {
-        self.accept_block(request).map(|acceptance| acceptance.record)
+        self.accept_block(request)
+            .map(|acceptance| acceptance.record)
     }
 
     pub fn submit_mining_candidate(
         &mut self,
         candidate: SolvedMiningCandidate,
     ) -> Result<BlockIndexRecord> {
-        if !authority_can_mine(&self.config) {
-            anyhow::bail!(
-                "hsrd cannot accept mining candidates in {} mode",
+        let durable = self.state.durable_mining_state()?;
+        let permit = issue_authority_permit(&self.config, &durable).ok_or_else(|| {
+            anyhow::anyhow!(
+                "hsrd cannot accept mining candidates without an authority permit in {} mode",
                 self.config.authority_mode.as_str()
-            );
-        }
-        let snapshot = self
-            .mining_snapshot()
-            .ok_or_else(|| {
-                anyhow::anyhow!("cannot submit a mining candidate without an authoritative tip")
-            })?;
-        if candidate.snapshot_generation() != snapshot.generation
+            )
+        })?;
+        let snapshot = durable.snapshot.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("authority permit exists without a durable mining snapshot")
+        })?;
+        if candidate.snapshot_generation() != permit.generation
             || candidate.parent_height() != snapshot.tip.height
-            || candidate.block().header.prev_block != snapshot.tip.hash
+            || candidate.block().header.prev_block != permit.tip
+            || candidate.block().header.tree_root != snapshot.next_tree_root
         {
-            anyhow::bail!("mining candidate is stale for the committed tip generation");
+            anyhow::bail!("mining candidate is stale for the authority permit");
         }
         self.connect_block(NodeBlockImport::from_mining_candidate(candidate)?)
     }
 
     pub fn disconnect_block(&mut self, request: NodeBlockDisconnect) -> Result<BlockIndexRecord> {
         let disconnected = self.state.disconnect_block(request)?;
+        let mempool_generation = self.mining_engine_clear_mempool_for_chain_transition();
         self.publish_durable_mining_state(&disconnected.mining)?;
+        self.mining_engine_publish_mempool_reconciled(
+            disconnected.mining.generation,
+            mempool_generation,
+        )?;
         Ok(disconnected.record)
     }
 
@@ -533,7 +665,12 @@ impl NodeService {
             .reorg_started(request.disconnect.len(), request.connect.len());
         match self.state.apply_reorg(request) {
             Ok(reorg) => {
+                let mempool_generation = self.mining_engine_clear_mempool_for_chain_transition();
                 self.publish_durable_mining_state(&reorg.mining)?;
+                self.mining_engine_publish_mempool_reconciled(
+                    reorg.mining.generation,
+                    mempool_generation,
+                )?;
                 Ok(reorg.summary)
             }
             Err(error) => {
@@ -549,6 +686,13 @@ impl NodeService {
     fn publish_durable_mining_state(&self, durable: &DurableMiningState) -> Result<()> {
         if durable.generation <= self.mining_events.committed_generation() {
             return Ok(());
+        }
+        if self.config.mining_engine.enabled {
+            let mut templates = self
+                .mining_engine_templates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            templates.clear();
         }
         if durable_tip_can_authorize(&self.config, durable) {
             match &durable.snapshot {
@@ -572,7 +716,15 @@ impl NodeService {
         }
     }
 
-    pub async fn run_until_shutdown(&self, shutdown: ShutdownSignal) -> Result<()> {
+    pub async fn run_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
+        if self.config.shadow_sync.enabled {
+            self.run_shadow_sync_until_shutdown(shutdown).await
+        } else {
+            self.run_rpc_until_shutdown(shutdown).await
+        }
+    }
+
+    pub(crate) async fn run_rpc_until_shutdown(&self, shutdown: ShutdownSignal) -> Result<()> {
         let rpc_service = self.rpc_service()?;
         let listener = TcpListener::bind(self.config.rpc_bind)
             .await
@@ -587,7 +739,13 @@ impl NodeService {
             mempool_size = rpc_service.snapshot().mempool_info.transaction_count,
             "hsrd rpc server started"
         );
-        serve_rpc_listener(listener, rpc_service, shutdown.wait()).await?;
+        let result = serve_rpc_listener(listener, rpc_service, shutdown.wait()).await;
+        if result.is_ok() {
+            mark_clean_shutdown(&self.state.store).map_err(|error| {
+                anyhow::anyhow!("failed to mark node store clean at shutdown: {error}")
+            })?;
+        }
+        result?;
         tracing::info!("hsrd rpc server stopped");
         Ok(())
     }
@@ -663,7 +821,9 @@ impl NodeService {
             names: entries.names,
             mempool_info: self.state.mempool.info(),
             mempool_entries: self.state.mempool.entries(),
+            network_active: false,
             peer_count: 0,
+            mining_engine: rpc_mining_engine_info(self.mining_engine_diagnostics()?),
             node_status,
         })
     }
@@ -700,6 +860,7 @@ where
         .route("/api/v1/status", get(handle_status_http))
         .route("/api/v1/authority", get(handle_authority_http))
         .route("/api/v1/parity", get(handle_parity_http))
+        .route("/api/v1/mining-engine", get(handle_mining_engine_http))
         .with_state(state);
 
     axum::serve(listener, app)
@@ -708,22 +869,23 @@ where
         .context("RPC server failed")
 }
 
-async fn handle_status_http(
-    State(state): State<RpcHttpState>,
-) -> Json<serde_json::Value> {
+async fn handle_status_http(State(state): State<RpcHttpState>) -> Json<serde_json::Value> {
     Json(handle_diagnostic_read(&state.service, "gethsrdstatus"))
 }
 
-async fn handle_authority_http(
-    State(state): State<RpcHttpState>,
-) -> Json<serde_json::Value> {
+async fn handle_authority_http(State(state): State<RpcHttpState>) -> Json<serde_json::Value> {
     Json(handle_diagnostic_read(&state.service, "getauthorityinfo"))
 }
 
-async fn handle_parity_http(
-    State(state): State<RpcHttpState>,
-) -> Json<serde_json::Value> {
+async fn handle_parity_http(State(state): State<RpcHttpState>) -> Json<serde_json::Value> {
     Json(handle_diagnostic_read(&state.service, "getparityinfo"))
+}
+
+async fn handle_mining_engine_http(State(state): State<RpcHttpState>) -> Json<serde_json::Value> {
+    Json(handle_diagnostic_read(
+        &state.service,
+        "getminingengineinfo",
+    ))
 }
 
 fn handle_diagnostic_read(service: &BasicRpcService, method: &str) -> serde_json::Value {
@@ -786,7 +948,9 @@ pub struct NodeBlockImport {
 enum ImportValidationPolicy {
     Strict,
     #[cfg(test)]
-    Fixture { chainwork: Uint256 },
+    Fixture {
+        chainwork: Uint256,
+    },
 }
 
 impl NodeBlockImport {
@@ -854,7 +1018,9 @@ pub struct NodeReorgSummary {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockDisposition {
-    AlreadyKnown { active: bool },
+    AlreadyKnown {
+        active: bool,
+    },
     StoredAlternate,
     Connected,
     Reorganized {
@@ -940,8 +1106,9 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to initialize header index: {error}"))?;
         let blocks = StoredBlockIndex::new(store.clone())
             .map_err(|error| anyhow::anyhow!("failed to initialize block index: {error}"))?;
-        let state_engine = StoredStateEngine::new(store.clone())
-            .map_err(|error| anyhow::anyhow!("failed to initialize state engine: {error}"))?;
+        let state_engine =
+            StoredStateEngine::with_native_authorization(store.clone(), network, NameFlags::NONE)
+                .map_err(|error| anyhow::anyhow!("failed to initialize state engine: {error}"))?;
 
         let state = Self {
             network,
@@ -957,6 +1124,8 @@ impl NodeState {
 
     fn validate_durable_chain_invariants(&self) -> Result<()> {
         let snapshot = self.store.snapshot()?;
+        let durable_name_tree_root = verify_stored_name_tree_root(&snapshot)
+            .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?;
         let active_tip = best_block_tip_from_snapshot(&snapshot)?;
         let best_header = best_header_tip_from_snapshot(&snapshot)?;
         let mut heights = snapshot
@@ -968,7 +1137,14 @@ impl NodeState {
             None if !heights.is_empty() => {
                 anyhow::bail!("active height index exists without a best-block binding")
             }
-            None => {}
+            None => {
+                if durable_name_tree_root.as_bytes() != &[0; 32] {
+                    anyhow::bail!(
+                        "empty active chain has non-empty durable name-tree root {:?}",
+                        durable_name_tree_root
+                    );
+                }
+            }
             Some(tip) => {
                 let expected_len = usize::try_from(tip.height)
                     .ok()
@@ -984,37 +1160,88 @@ impl NodeState {
 
                 let mut previous_hash = BlockHash::ZERO;
                 let mut previous_work = Uint256::ZERO;
+                let mut expected_previous_tree_root = [0u8; 32];
+                let mut active_resulting_tree_root = [0u8; 32];
                 for (position, (height_key, hash_bytes)) in heights.iter().enumerate() {
                     let height = decode_height_key(height_key)?;
                     if usize::try_from(height).ok() != Some(position) {
-                        anyhow::bail!("active height index is not contiguous at position {position}");
+                        anyhow::bail!(
+                            "active height index is not contiguous at position {position}"
+                        );
                     }
                     let hash = block_hash_from_bytes(hash_bytes)?;
                     let record = load_block_index_record(&snapshot, &hash)?.ok_or_else(|| {
                         anyhow::anyhow!("active block index {} is missing", hash.to_hex())
                     })?;
                     if record.height != height || !record.status.active_chain {
-                        anyhow::bail!("active block index {} has inconsistent status", hash.to_hex());
+                        anyhow::bail!(
+                            "active block index {} has inconsistent status",
+                            hash.to_hex()
+                        );
                     }
                     if height == 0 {
                         if record.prev_hash != BlockHash::ZERO {
                             anyhow::bail!("active genesis has a non-zero parent");
                         }
                     } else if record.prev_hash != previous_hash {
-                        anyhow::bail!("active block chain is not parent-contiguous at height {height}");
+                        anyhow::bail!(
+                            "active block chain is not parent-contiguous at height {height}"
+                        );
                     }
                     if record.chainwork <= previous_work {
-                        anyhow::bail!("active chainwork is not strictly increasing at height {height}");
+                        anyhow::bail!(
+                            "active chainwork is not strictly increasing at height {height}"
+                        );
                     }
-                    if load_raw_block_record(&snapshot, &hash)?.is_none() {
-                        anyhow::bail!("active block body {} is missing", hash.to_hex());
+                    let raw = load_raw_block_record(&snapshot, &hash)?.ok_or_else(|| {
+                        anyhow::anyhow!("active block body {} is missing", hash.to_hex())
+                    })?;
+                    let block = raw.decode_block().map_err(|error| {
+                        anyhow::anyhow!("active block body {} is corrupt: {error}", hash.to_hex())
+                    })?;
+                    if block.hash() != hash || block.header.prev_block != record.prev_hash {
+                        anyhow::bail!(
+                            "active block body {} disagrees with its index",
+                            hash.to_hex()
+                        );
                     }
+                    if !record.status.undo_present {
+                        anyhow::bail!("active block {} is missing undo status", hash.to_hex());
+                    }
+                    let undo = load_block_undo(&snapshot, &hash)?.ok_or_else(|| {
+                        anyhow::anyhow!("active block undo {} is missing", hash.to_hex())
+                    })?;
+                    if undo.block_hash != hash || undo.height != height {
+                        anyhow::bail!(
+                            "active block undo {} disagrees with its index",
+                            hash.to_hex()
+                        );
+                    }
+                    if *undo.previous_tree_root.as_bytes() != expected_previous_tree_root {
+                        anyhow::bail!(
+                            "active block {} breaks name-tree root continuity",
+                            hash.to_hex()
+                        );
+                    }
+                    if block.header.tree_root != *undo.previous_tree_root.as_bytes() {
+                        anyhow::bail!(
+                            "active block {} header root disagrees with undo pre-state",
+                            hash.to_hex()
+                        );
+                    }
+                    active_resulting_tree_root = *undo.resulting_tree_root.as_bytes();
+                    expected_previous_tree_root = active_resulting_tree_root;
                     previous_hash = hash;
                     previous_work = record.chainwork;
                 }
 
                 if previous_hash != tip.hash || previous_work != tip.chainwork {
                     anyhow::bail!("best-block binding does not match the active height index tip");
+                }
+                if durable_name_tree_root.as_bytes() != &active_resulting_tree_root {
+                    anyhow::bail!(
+                        "durable name-tree root does not match the active tip's resulting root"
+                    );
                 }
             }
         }
@@ -1133,8 +1360,14 @@ impl NodeState {
             .scan_prefix(ColumnFamily::NameState, b"")
             .context("failed to scan name state")?
             .into_iter()
-            .map(|(_, bytes)| {
-                decode_name_state(&bytes)
+            .map(|(key, bytes)| {
+                let name_hash: [u8; 32] = key.as_slice().try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "name-state key has invalid length {}; expected 32",
+                        key.len()
+                    )
+                })?;
+                decode_name_state(&NameHash::new(name_hash), &bytes)
                     .map_err(|error| anyhow::anyhow!("failed to decode name state: {error}"))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1206,10 +1439,8 @@ impl NodeState {
         let tip = self.best_block_tip()?;
         match tip {
             None => Ok(request.height == 0),
-            Some(tip) => Ok(
-                request.block.header.prev_block == tip.hash
-                    && request.height == tip.height.saturating_add(1),
-            ),
+            Some(tip) => Ok(request.block.header.prev_block == tip.hash
+                && request.height == tip.height.saturating_add(1)),
         }
     }
 
@@ -1226,7 +1457,10 @@ impl NodeState {
                 anyhow::anyhow!("known block {} has no raw body", block_hash.to_hex())
             })?;
             if stored.encode() != request.block.encode() {
-                anyhow::bail!("known block {} has conflicting raw bytes", block_hash.to_hex());
+                anyhow::bail!(
+                    "known block {} has conflicting raw bytes",
+                    block_hash.to_hex()
+                );
             }
             return Ok(StoredBlockMutation {
                 record: existing,
@@ -1243,7 +1477,9 @@ impl NodeState {
 
         let mut record =
             BlockIndexRecord::from_block(&request.block, request.height, validated.chainwork)
-                .map_err(|error| anyhow::anyhow!("failed to build alternate block index: {error}"))?;
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to build alternate block index: {error}")
+                })?;
         record.status = status.clone();
         record.validated_at = Some(current_unix_time()?);
         let header_record = HeaderRecord {
@@ -1261,12 +1497,7 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to stage alternate block index: {error}"))?;
         write_raw_block_to_batch(&mut batch, &raw_record)
             .map_err(|error| anyhow::anyhow!("failed to stage alternate block body: {error}"))?;
-        stage_best_header_if_more_work(
-            &snapshot,
-            &mut batch,
-            block_hash,
-            validated.chainwork,
-        )?;
+        stage_best_header_if_more_work(&snapshot, &mut batch, block_hash, validated.chainwork)?;
         drop(snapshot);
         self.store.commit(batch)?;
         self.refresh_indexes()?;
@@ -1373,13 +1604,14 @@ impl NodeState {
             None
         } else {
             Some(
-                load_header_record(snapshot, &request.block.header.prev_block)?
-                    .ok_or_else(|| {
+                load_header_record(snapshot, &request.block.header.prev_block)?.ok_or_else(
+                    || {
                         anyhow::anyhow!(
                             "missing header parent {}",
                             request.block.header.prev_block.to_hex()
                         )
-                    })?,
+                    },
+                )?,
             )
         };
 
@@ -1390,12 +1622,13 @@ impl NodeState {
 
         let (chainwork, header_context_valid) = match request.validation {
             ImportValidationPolicy::Strict => {
-                let expected_bits = Some(self.expected_bits_for_import(
-                    snapshot,
-                    request,
-                    parent.as_ref(),
-                )?);
+                let expected_bits =
+                    Some(self.expected_bits_for_import(snapshot, request, parent.as_ref())?);
                 let maximum_time = current_unix_time()?.saturating_add(MAX_FUTURE_BLOCK_TIME);
+                let network_params = self.network.params();
+                let is_canonical_genesis = request.height == 0
+                    && request.block.header == network_params.genesis_header()
+                    && request.block.hash() == network_params.genesis_hash;
                 HeaderConsensus::new(ConsensusParams::for_network(self.network))
                     .validate_header(
                         &request.block.header,
@@ -1410,7 +1643,7 @@ impl NodeState {
                             expected_bits,
                             median_time_past,
                             maximum_time: Some(maximum_time),
-                            require_pow: true,
+                            require_pow: !is_canonical_genesis,
                         },
                     )
                     .map_err(|error| anyhow::anyhow!("header validation failed: {error}"))?;
@@ -1441,7 +1674,7 @@ impl NodeState {
         )
         .map_err(|error| anyhow::anyhow!("transaction finality validation failed: {error}"))?;
 
-        validate_branch_extension(snapshot, request, chainwork)?;
+        validate_branch_extension(snapshot, request, chainwork, self.network)?;
 
         Ok(ValidatedImport {
             chainwork,
@@ -1514,11 +1747,7 @@ impl NodeState {
         Ok(y)
     }
 
-    fn median_time_past<T: ReadSnapshot>(
-        &self,
-        snapshot: &T,
-        tip: &HeaderRecord,
-    ) -> Result<u64> {
+    fn median_time_past<T: ReadSnapshot>(&self, snapshot: &T, tip: &HeaderRecord) -> Result<u64> {
         let mut times = Vec::with_capacity(MEDIAN_TIMESPAN);
         let mut record = tip.clone();
         loop {
@@ -1577,12 +1806,7 @@ impl NodeState {
         let generation = next_mining_generation(&snapshot)?;
         let chain_epoch = next_chain_epoch(&snapshot)?;
         let mut batch = self.store.batch();
-        let record = self.stage_connect(
-            &snapshot,
-            &mut batch,
-            &request,
-            validated,
-        )?;
+        let record = self.stage_connect(&snapshot, &mut batch, &request, validated)?;
         batch.put(
             ColumnFamily::Meta,
             MetaKey::MiningGeneration.as_bytes(),
@@ -1616,7 +1840,7 @@ impl NodeState {
         let mut status = validated.status;
         let raw_record = RawBlockRecord::from_block(&request.block, request.source);
 
-        connect_block_to_batch_with_verifier(
+        let state_summary = connect_block_to_batch_with_services(
             snapshot,
             batch,
             ConnectBlock {
@@ -1626,12 +1850,18 @@ impl NodeState {
                 block_reward: self.network.params().block_reward(request.height),
                 block: &request.block,
             },
-            self.state_engine.input_verifier(),
+            self.state_engine.services(),
         )
         .map_err(|error| anyhow::anyhow!("failed to stage state update: {error}"))?;
 
-        status.covenant_links_valid = true;
+        status.relative_locks_valid = state_summary.validation.relative_locks_valid;
+        status.scripts_valid = state_summary.validation.scripts_valid;
+        status.covenant_links_valid = state_summary.validation.covenant_links_valid;
+        status.covenants_context_valid = state_summary.validation.covenants_context_valid;
+        status.claims_and_airdrops_valid = state_summary.validation.claims_and_airdrops_valid;
         status.utxo_connected = true;
+        status.name_state_connected = state_summary.validation.name_state_connected;
+        status.tree_root_valid = state_summary.validation.tree_root_valid;
         status.undo_present = true;
         status.active_chain = true;
 
@@ -1714,20 +1944,15 @@ impl NodeState {
         }
 
         let block = load_block(snapshot, &request.block_hash)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "raw block is missing for {}",
-                request.block_hash.to_hex()
-            )
+            anyhow::anyhow!("raw block is missing for {}", request.block_hash.to_hex())
         })?;
         let undo = load_block_undo(snapshot, &request.block_hash)?.ok_or_else(|| {
             anyhow::anyhow!("undo is missing for {}", request.block_hash.to_hex())
         })?;
-        let mut record = load_block_index_record(snapshot, &request.block_hash)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "block index is missing for {}",
-                request.block_hash.to_hex()
-            )
-        })?;
+        let mut record =
+            load_block_index_record(snapshot, &request.block_hash)?.ok_or_else(|| {
+                anyhow::anyhow!("block index is missing for {}", request.block_hash.to_hex())
+            })?;
 
         if record.height != request.height {
             anyhow::bail!(
@@ -1735,6 +1960,10 @@ impl NodeState {
                 request.height,
                 record.height
             );
+        }
+
+        if block.header.tree_root != *undo.previous_tree_root.as_bytes() {
+            anyhow::bail!("disconnect undo previous root does not match block header commitment");
         }
 
         record.status.utxo_connected = false;
@@ -1751,6 +1980,7 @@ impl NodeState {
         };
 
         disconnect_block_to_batch(
+            snapshot,
             batch,
             DisconnectBlock {
                 block_hash: request.block_hash,
@@ -1914,10 +2144,7 @@ fn load_block(snapshot: &impl ReadSnapshot, hash: &BlockHash) -> Result<Option<B
         .map_err(|error| anyhow::anyhow!("failed to decode raw block: {error}"))
 }
 
-fn load_block_undo(
-    snapshot: &impl ReadSnapshot,
-    hash: &BlockHash,
-) -> Result<Option<BlockUndo>> {
+fn load_block_undo(snapshot: &impl ReadSnapshot, hash: &BlockHash) -> Result<Option<BlockUndo>> {
     let Some(bytes) = snapshot
         .get(ColumnFamily::Undo, hash.as_bytes())
         .context("failed to read block undo")?
@@ -1991,6 +2218,14 @@ fn mining_snapshot_for_hash(
     }
     let block = load_block(snapshot, &hash)?
         .ok_or_else(|| anyhow::anyhow!("mining raw block is missing for {}", hash.to_hex()))?;
+    let raw_tree_root = snapshot
+        .get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())
+        .context("failed to read durable mining name-tree root")?
+        .ok_or_else(|| anyhow::anyhow!("durable mining name-tree root is missing"))?;
+    let next_tree_root: [u8; 32] = raw_tree_root
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("durable mining name-tree root has invalid length"))?;
     let authoritative = record.status.is_mining_authoritative();
 
     Ok((
@@ -1998,6 +2233,7 @@ fn mining_snapshot_for_hash(
             network_id,
             generation,
             tip: HeaderSummary::from_block(&block, record.height),
+            next_tree_root,
             chainwork: record.chainwork,
         }),
         authoritative,
@@ -2009,15 +2245,16 @@ fn bind_store_identity(store: &StoreHandle, network: Network) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("failed to initialize node schema: {error}"))?;
 
     let expected_network = [network.canonical_id()];
-    let expected_genesis = network.params().genesis_hash.as_bytes();
+    let network_params = network.params();
+    let expected_genesis = network_params.genesis_hash.as_bytes();
     let snapshot = store.snapshot()?;
     let bindings = [
+        (MetaKey::Network, expected_network.as_slice(), "network"),
         (
-            MetaKey::Network,
-            expected_network.as_slice(),
-            "network",
+            MetaKey::GenesisHash,
+            expected_genesis.as_slice(),
+            "genesis hash",
         ),
-        (MetaKey::GenesisHash, expected_genesis.as_slice(), "genesis hash"),
         (MetaKey::StorageProfile, STORAGE_PROFILE, "storage profile"),
     ];
     let mut missing = Vec::new();
@@ -2078,9 +2315,7 @@ fn current_unix_time() -> Result<u64> {
         .context("system clock is before the Unix epoch")
 }
 
-fn best_block_tip_from_snapshot(
-    snapshot: &impl ReadSnapshot,
-) -> Result<Option<ChainTip>> {
+fn best_block_tip_from_snapshot(snapshot: &impl ReadSnapshot) -> Result<Option<ChainTip>> {
     let Some(bytes) = snapshot
         .get(ColumnFamily::Meta, MetaKey::BestBlockHash.as_bytes())
         .context("failed to read active-chain tip")?
@@ -2088,8 +2323,9 @@ fn best_block_tip_from_snapshot(
         return Ok(None);
     };
     let hash = block_hash_from_bytes(&bytes)?;
-    let record = load_block_index_record(snapshot, &hash)?
-        .ok_or_else(|| anyhow::anyhow!("active-chain tip index is missing for {}", hash.to_hex()))?;
+    let record = load_block_index_record(snapshot, &hash)?.ok_or_else(|| {
+        anyhow::anyhow!("active-chain tip index is missing for {}", hash.to_hex())
+    })?;
     if !record.status.active_chain {
         anyhow::bail!("active-chain tip {} is not marked active", hash.to_hex());
     }
@@ -2100,9 +2336,7 @@ fn best_block_tip_from_snapshot(
     }))
 }
 
-fn best_header_tip_from_snapshot(
-    snapshot: &impl ReadSnapshot,
-) -> Result<Option<ChainTip>> {
+fn best_header_tip_from_snapshot(snapshot: &impl ReadSnapshot) -> Result<Option<ChainTip>> {
     let Some(bytes) = snapshot
         .get(ColumnFamily::Meta, MetaKey::BestHeaderHash.as_bytes())
         .context("failed to read best-header binding")?
@@ -2183,7 +2417,10 @@ fn stored_path_from_genesis(
 
     loop {
         if !seen.insert(current) {
-            anyhow::bail!("stored header chain contains a cycle at {}", current.to_hex());
+            anyhow::bail!(
+                "stored header chain contains a cycle at {}",
+                current.to_hex()
+            );
         }
         let record = load_header_record(snapshot, &current)?
             .ok_or_else(|| anyhow::anyhow!("stored header {} is missing", current.to_hex()))?;
@@ -2278,10 +2515,16 @@ fn validate_reorg_plan(
                 anyhow::anyhow!("disconnect block index {} is missing", hash.to_hex())
             })?;
             if !record.status.active_chain || record.height != expected_height {
-                anyhow::bail!("disconnect block {} is not the expected active block", hash.to_hex());
+                anyhow::bail!(
+                    "disconnect block {} is not the expected active block",
+                    hash.to_hex()
+                );
             }
             if hns_chain::read_canonical_hash(snapshot, record.height)? != Some(*hash) {
-                anyhow::bail!("disconnect block {} is absent from the canonical height index", hash.to_hex());
+                anyhow::bail!(
+                    "disconnect block {} is absent from the canonical height index",
+                    hash.to_hex()
+                );
             }
 
             if record.height == 0 {
@@ -2289,9 +2532,13 @@ fn validate_reorg_plan(
                 fork_height = None;
                 fork_work = Uint256::ZERO;
             } else {
-                let parent = load_block_index_record(snapshot, &record.prev_hash)?.ok_or_else(|| {
-                    anyhow::anyhow!("disconnect parent {} is missing", record.prev_hash.to_hex())
-                })?;
+                let parent =
+                    load_block_index_record(snapshot, &record.prev_hash)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "disconnect parent {} is missing",
+                            record.prev_hash.to_hex()
+                        )
+                    })?;
                 fork_hash = Some(parent.hash);
                 fork_height = Some(parent.height);
                 fork_work = parent.chainwork;
@@ -2303,7 +2550,11 @@ fn validate_reorg_plan(
 
     let mut expected_parent = fork_hash;
     let mut expected_height = fork_height
-        .map(|height| height.checked_add(1).ok_or_else(|| anyhow::anyhow!("height exhausted")))
+        .map(|height| {
+            height
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("height exhausted"))
+        })
         .transpose()?
         .unwrap_or(0);
     let mut parent_work = fork_work;
@@ -2312,16 +2563,21 @@ fn validate_reorg_plan(
         if !seen.insert(*hash) {
             anyhow::bail!("reorganization plan repeats block {}", hash.to_hex());
         }
-        let record = load_block_index_record(snapshot, hash)?.ok_or_else(|| {
-            anyhow::anyhow!("connect block index {} is missing", hash.to_hex())
-        })?;
+        let record = load_block_index_record(snapshot, hash)?
+            .ok_or_else(|| anyhow::anyhow!("connect block index {} is missing", hash.to_hex()))?;
         validate_stored_activation_status(&record)?;
         if record.height != expected_height {
-            anyhow::bail!("connect block {} has a non-contiguous height", hash.to_hex());
+            anyhow::bail!(
+                "connect block {} has a non-contiguous height",
+                hash.to_hex()
+            );
         }
         match expected_parent {
             Some(parent) if record.prev_hash != parent => {
-                anyhow::bail!("connect block {} does not extend the planned fork", hash.to_hex())
+                anyhow::bail!(
+                    "connect block {} does not extend the planned fork",
+                    hash.to_hex()
+                )
             }
             None if record.height != 0 || record.prev_hash != BlockHash::ZERO => {
                 anyhow::bail!("connect path does not begin with a valid genesis block")
@@ -2329,7 +2585,10 @@ fn validate_reorg_plan(
             _ => {}
         }
         if record.chainwork <= parent_work {
-            anyhow::bail!("connect block {} does not increase chainwork", hash.to_hex());
+            anyhow::bail!(
+                "connect block {} does not increase chainwork",
+                hash.to_hex()
+            );
         }
         let raw = load_raw_block_record(snapshot, hash)?
             .ok_or_else(|| anyhow::anyhow!("connect block body {} is missing", hash.to_hex()))?;
@@ -2381,8 +2640,17 @@ fn validate_branch_extension(
     snapshot: &impl ReadSnapshot,
     request: &NodeBlockImport,
     chainwork: Uint256,
+    network: Network,
 ) -> Result<()> {
     if request.height == 0 {
+        if matches!(request.validation, ImportValidationPolicy::Strict) {
+            let params = network.params();
+            if request.block.header != params.genesis_header()
+                || request.block.hash() != params.genesis_hash
+            {
+                anyhow::bail!("strict height-zero block is not the canonical network genesis");
+            }
+        }
         if chainwork == Uint256::ZERO {
             anyhow::bail!("genesis chainwork must be positive");
         }
@@ -2435,7 +2703,12 @@ fn validate_active_extension(
                     parent.hash.to_hex()
                 );
             }
-            if request.height != parent.height.checked_add(1).ok_or_else(|| anyhow::anyhow!("active height exhausted"))? {
+            if request.height
+                != parent
+                    .height
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("active height exhausted"))?
+            {
                 anyhow::bail!("block height does not extend the active tip");
             }
             if chainwork <= parent.chainwork {
@@ -2500,7 +2773,11 @@ fn validate_reorg_request_shape(
 
     let mut expected_parent = fork_hash;
     let mut expected_height = fork_height
-        .map(|height| height.checked_add(1).ok_or_else(|| anyhow::anyhow!("height exhausted")))
+        .map(|height| {
+            height
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("height exhausted"))
+        })
         .transpose()?
         .unwrap_or(0);
     for connect in &request.connect {
@@ -2649,7 +2926,7 @@ mod tests {
     }
 
     #[test]
-    fn node_rpc_snapshot_reflects_state() {
+    fn node_rpc_snapshot_reflects_fail_closed_mempool_admission() {
         let mut node = NodeService::new(NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
@@ -2665,10 +2942,16 @@ mod tests {
                 verify_pow: false,
             })
             .expect("header");
-        node.state_mut()
+        let admission = node
+            .state_mut()
             .mempool
             .submit(transaction())
             .expect("submit");
+        assert!(matches!(
+            admission,
+            hns_mempool::Admission::Rejected { reason }
+                if reason == "verified-mempool-context-required"
+        ));
 
         let rpc = node.rpc_service().expect("rpc service");
         let response = rpc
@@ -2680,7 +2963,30 @@ mod tests {
             })
             .expect("response");
 
-        assert_eq!(response.result.expect("result")["size"], 1);
+        assert_eq!(response.result.expect("result")["size"], 0);
+    }
+
+    #[test]
+    fn strict_height_zero_import_rejects_mutated_genesis() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let mut block = hns_primitives::Block {
+            header: Network::Regtest.params().genesis_header(),
+            transactions: vec![coinbase_transaction()],
+        };
+        block.header.nonce ^= 1;
+
+        let error = node
+            .accept_block(NodeBlockImport::from_peer(block, 0))
+            .expect_err("mutated genesis");
+        assert!(
+            error
+                .to_string()
+                .contains("genesis header does not match the selected HNS network"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2747,6 +3053,7 @@ mod tests {
                 .map(|bytes| decode_u64(&bytes).expect("decode generation")),
             Some(1)
         );
+        drop(snapshot);
         assert_eq!(
             node.observed_mining_snapshot()
                 .expect("observed state")
@@ -2890,7 +3197,11 @@ mod tests {
             .connect_block(NodeBlockImport::from_peer(child, 1))
             .is_err());
         assert_eq!(
-            node.observed_mining_snapshot().expect("observed state").expect("parent snapshot").tip.hash,
+            node.observed_mining_snapshot()
+                .expect("observed state")
+                .expect("parent snapshot")
+                .tip
+                .hash,
             parent_record.hash
         );
     }
@@ -2986,6 +3297,40 @@ mod tests {
         assert_eq!(snapshot.tip.hash, expected_hash);
         assert_eq!(snapshot.chainwork, Uint256::ONE);
         assert_eq!(snapshot.network_id, Network::Regtest.canonical_id());
+    }
+
+    #[test]
+    fn startup_rejects_active_tip_undo_root_drift() {
+        let store = StoreHandle::memory();
+        let config = NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        };
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let mut node = NodeService::try_with_state(config, state).expect("node");
+        let block = block_with_commitments(vec![coinbase_transaction()]);
+        let block_hash = block.hash();
+        node.connect_block(NodeBlockImport::fixture(block, 0, 1))
+            .expect("connect block");
+        drop(node);
+
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut encoded = snapshot
+            .get(ColumnFamily::Undo, block_hash.as_bytes())
+            .expect("undo lookup")
+            .expect("undo payload");
+        drop(snapshot);
+        assert!(encoded.len() >= 104);
+        encoded[72..104].fill(0x55);
+
+        let mut batch = store.batch();
+        batch
+            .put(ColumnFamily::Undo, block_hash.as_bytes(), &encoded)
+            .expect("corrupt undo root");
+        store.commit(batch).expect("commit corrupt undo root");
+
+        assert!(NodeState::from_store_for_network(store, Network::Regtest).is_err());
     }
 
     #[test]
@@ -3107,7 +3452,7 @@ mod tests {
         let (_, response_body) = response.split_once("\r\n\r\n").expect("body split");
         let json: Value = serde_json::from_str(response_body).expect("json response");
         assert_eq!(json["id"], 7);
-        assert_eq!(json["result"]["networkactive"], true);
+        assert_eq!(json["result"]["networkactive"], false);
 
         shutdown_tx.send(()).expect("shutdown");
         server.await.expect("server join").expect("server result");
@@ -3226,15 +3571,13 @@ mod tests {
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
             .expect("genesis");
 
-        let mut active =
-            block_with_commitments(vec![coinbase_transaction_with_address(41, 50)]);
+        let mut active = block_with_commitments(vec![coinbase_transaction_with_address(41, 50)]);
         active.header.prev_block = genesis_record.hash;
         let active_record = node
             .connect_block(NodeBlockImport::fixture(active, 1, 2))
             .expect("active child");
 
-        let mut alternate =
-            block_with_commitments(vec![coinbase_transaction_with_address(42, 50)]);
+        let mut alternate = block_with_commitments(vec![coinbase_transaction_with_address(42, 50)]);
         alternate.header.prev_block = genesis_record.hash;
         let alternate_hash = alternate.hash();
         let acceptance = node
@@ -3243,7 +3586,11 @@ mod tests {
 
         assert_eq!(acceptance.disposition, BlockDisposition::StoredAlternate);
         assert_eq!(
-            node.state().best_block_tip().expect("tip").expect("active").hash,
+            node.state()
+                .best_block_tip()
+                .expect("tip")
+                .expect("active")
+                .hash,
             active_record.hash
         );
         let alternate_record = node
@@ -3281,16 +3628,14 @@ mod tests {
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
             .expect("genesis");
 
-        let mut active =
-            block_with_commitments(vec![coinbase_transaction_with_address(44, 50)]);
+        let mut active = block_with_commitments(vec![coinbase_transaction_with_address(44, 50)]);
         active.header.prev_block = genesis_record.hash;
         let active_txid = active.transactions[0].txid();
         let active_record = node
             .connect_block(NodeBlockImport::fixture(active, 1, 2))
             .expect("active child");
 
-        let mut alternate =
-            block_with_commitments(vec![coinbase_transaction_with_address(45, 50)]);
+        let mut alternate = block_with_commitments(vec![coinbase_transaction_with_address(45, 50)]);
         alternate.header.prev_block = genesis_record.hash;
         let alternate_txid = alternate.transactions[0].txid();
         let alternate_hash = alternate.hash();
@@ -3306,25 +3651,32 @@ mod tests {
             }
         );
         assert_eq!(
-            node.state().best_block_tip().expect("tip").expect("active").hash,
+            node.state()
+                .best_block_tip()
+                .expect("tip")
+                .expect("active")
+                .hash,
             alternate_hash
         );
-        assert!(!node
-            .state()
-            .blocks
-            .load_block_record(&active_record.hash)
-            .expect("old index")
-            .expect("old block")
-            .status
-            .active_chain);
-        assert!(node
-            .state()
-            .blocks
-            .load_block_record(&alternate_hash)
-            .expect("new index")
-            .expect("new block")
-            .status
-            .active_chain);
+        assert!(
+            !node
+                .state()
+                .blocks
+                .load_block_record(&active_record.hash)
+                .expect("old index")
+                .expect("old block")
+                .status
+                .active_chain
+        );
+        assert!(
+            node.state()
+                .blocks
+                .load_block_record(&alternate_hash)
+                .expect("new index")
+                .expect("new block")
+                .status
+                .active_chain
+        );
         assert!(node
             .state()
             .blocks
@@ -3363,15 +3715,13 @@ mod tests {
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
             .expect("genesis");
 
-        let mut active =
-            block_with_commitments(vec![coinbase_transaction_with_address(47, 50)]);
+        let mut active = block_with_commitments(vec![coinbase_transaction_with_address(47, 50)]);
         active.header.prev_block = genesis_record.hash;
         let active_record = node
             .connect_block(NodeBlockImport::fixture(active, 1, 3))
             .expect("active child");
 
-        let mut side_one =
-            block_with_commitments(vec![coinbase_transaction_with_address(48, 50)]);
+        let mut side_one = block_with_commitments(vec![coinbase_transaction_with_address(48, 50)]);
         side_one.header.prev_block = genesis_record.hash;
         let side_one_hash = side_one.hash();
         let side_one_acceptance = node
@@ -3382,8 +3732,7 @@ mod tests {
             BlockDisposition::StoredAlternate
         );
 
-        let mut side_two =
-            block_with_commitments(vec![coinbase_transaction_with_address(49, 50)]);
+        let mut side_two = block_with_commitments(vec![coinbase_transaction_with_address(49, 50)]);
         side_two.header.prev_block = side_one_hash;
         let side_two_hash = side_two.hash();
         let acceptance = node
@@ -3398,25 +3747,32 @@ mod tests {
             }
         );
         assert_eq!(
-            node.state().best_block_tip().expect("tip").expect("active").hash,
+            node.state()
+                .best_block_tip()
+                .expect("tip")
+                .expect("active")
+                .hash,
             side_two_hash
         );
-        assert!(!node
-            .state()
-            .blocks
-            .load_block_record(&active_record.hash)
-            .expect("old record")
-            .expect("old")
-            .status
-            .active_chain);
-        assert!(node
-            .state()
-            .blocks
-            .load_block_record(&side_one_hash)
-            .expect("side one")
-            .expect("side one record")
-            .status
-            .active_chain);
+        assert!(
+            !node
+                .state()
+                .blocks
+                .load_block_record(&active_record.hash)
+                .expect("old record")
+                .expect("old")
+                .status
+                .active_chain
+        );
+        assert!(
+            node.state()
+                .blocks
+                .load_block_record(&side_one_hash)
+                .expect("side one")
+                .expect("side one record")
+                .status
+                .active_chain
+        );
     }
 
     #[test]
@@ -3426,16 +3782,15 @@ mod tests {
             network: Network::Regtest,
             ..NodeConfig::default()
         };
-        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
-            .expect("state");
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
         let mut shadow = NodeService::try_with_state(shadow_config, state).expect("shadow node");
 
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(50, 50)]);
         let genesis_record = shadow
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
             .expect("genesis");
-        let mut active =
-            block_with_commitments(vec![coinbase_transaction_with_address(51, 50)]);
+        let mut active = block_with_commitments(vec![coinbase_transaction_with_address(51, 50)]);
         active.header.prev_block = genesis_record.hash;
         shadow
             .connect_block(NodeBlockImport::fixture(active, 1, 2))
@@ -3445,15 +3800,18 @@ mod tests {
         side.header.prev_block = genesis_record.hash;
         let side_hash = side.hash();
         let import = NodeBlockImport::fixture(side, 1, 3);
-        let validated = shadow.state().validate_import(&import).expect("validate side");
+        let validated = shadow
+            .state()
+            .validate_import(&import)
+            .expect("validate side");
         shadow
             .state_mut()
             .store_validated_alternate(import, validated)
             .expect("persist side before simulated crash");
         drop(shadow);
 
-        let state = NodeState::from_store_for_network(store, Network::Regtest)
-            .expect("reloaded state");
+        let state =
+            NodeState::from_store_for_network(store, Network::Regtest).expect("reloaded state");
         let restarted = NodeService::try_with_state(experimental_authority_config(), state)
             .expect("experimental recovery");
         assert_eq!(
@@ -3496,9 +3854,15 @@ mod tests {
                 connect: vec![NodeBlockImport::fixture(replacement, 0, 1)],
             })
             .expect_err("lower-work replacement must fail");
-        assert!(error.to_string().contains("does not exceed active tip chainwork"));
+        assert!(error
+            .to_string()
+            .contains("does not exceed active tip chainwork"));
         assert_eq!(
-            node.state().best_block_tip().expect("tip").expect("active").hash,
+            node.state()
+                .best_block_tip()
+                .expect("tip")
+                .expect("active")
+                .hash,
             original_record.hash
         );
         let snapshot = node.state().store.snapshot().expect("snapshot");
@@ -3519,13 +3883,15 @@ mod tests {
             ..NodeConfig::default()
         });
         assert!(shadow.subscribe_mining_events().is_err());
-        assert!(!shadow
-            .rpc_service()
-            .expect("rpc")
-            .snapshot()
-            .node_status
-            .authority
-            .can_authorize_mining_templates);
+        assert!(
+            !shadow
+                .rpc_service()
+                .expect("rpc")
+                .snapshot()
+                .node_status
+                .authority
+                .can_authorize_mining_templates
+        );
 
         assert!(validate_node_config(&NodeConfig {
             network: Network::Mainnet,
@@ -3542,9 +3908,8 @@ mod tests {
         .is_err());
 
         let mut experimental = NodeService::new(experimental_authority_config());
-        let mut events = experimental
-            .subscribe_mining_events()
-            .expect("experimental subscription");
+        assert!(experimental.subscribe_mining_events().is_err());
+        let mut events = experimental.subscribe_observed_mining_events();
         experimental
             .connect_block(NodeBlockImport::fixture(
                 block_with_commitments(vec![coinbase_transaction()]),
@@ -3552,6 +3917,7 @@ mod tests {
                 1,
             ))
             .expect("experimental staged block");
+        assert!(experimental.subscribe_mining_events().is_ok());
         assert!(experimental.mining_snapshot().is_some());
         assert!(matches!(
             events.events.try_recv().expect("candidate"),
@@ -3566,12 +3932,8 @@ mod tests {
             hns_mining::ChainEvent::TipCommitted { .. }
         ));
 
-        let authority = &experimental
-            .rpc_service()
-            .expect("rpc")
-            .snapshot()
-            .node_status
-            .authority;
+        let rpc_service = experimental.rpc_service().expect("rpc");
+        let authority = &rpc_service.snapshot().node_status.authority;
         assert!(!authority.consensus_complete);
         assert!(authority.experimental_bypass_active);
         assert!(authority.can_authorize_mining_templates);
@@ -3593,8 +3955,7 @@ mod tests {
             .connect_block(NodeBlockImport::fixture(original.clone(), 0, 1))
             .expect("original block");
 
-        let replacement =
-            block_with_commitments(vec![coinbase_transaction_with_address(32, 50)]);
+        let replacement = block_with_commitments(vec![coinbase_transaction_with_address(32, 50)]);
         let replacement_hash = replacement.hash();
         let mut invalid_child = block_with_commitments(vec![
             coinbase_transaction_with_address(33, 50),
@@ -3649,7 +4010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_serves_read_only_phase1_diagnostics() {
+    async fn node_serves_read_only_diagnostics() {
         let node = NodeService::new(NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
@@ -3665,9 +4026,8 @@ mod tests {
             .await
         });
 
-        let request = format!(
-            "GET /api/v1/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-        );
+        let request =
+            format!("GET /api/v1/status HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
         let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
         stream
             .write_all(request.as_bytes())
@@ -3686,6 +4046,24 @@ mod tests {
         assert_eq!(json["release_stage"], "pre-authority");
         assert_eq!(json["authority"]["mode"], "shadow");
         assert_eq!(json["parity"]["oracle_revision"], HSD_ORACLE_REVISION);
+
+        let request = format!(
+            "GET /api/v1/mining-engine HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read response");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let (_, response_body) = response.split_once("\r\n\r\n").expect("body split");
+        let json: Value = serde_json::from_str(response_body).expect("json response");
+        assert_eq!(json["enabled"], false);
 
         shutdown_tx.send(()).expect("shutdown");
         server.await.expect("server join").expect("server result");

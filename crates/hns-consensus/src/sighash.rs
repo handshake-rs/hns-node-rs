@@ -51,10 +51,7 @@ pub fn signature_hash(
     };
 
     let hash_sequences = if anyone_can_pay
-        || matches!(
-            base,
-            SIGHASH_NONE | SIGHASH_SINGLE | SIGHASH_SINGLE_REVERSE
-        )
+        || matches!(base, SIGHASH_NONE | SIGHASH_SINGLE | SIGHASH_SINGLE_REVERSE)
     {
         zero_hash
     } else {
@@ -202,9 +199,7 @@ mod tests {
             SIGHASH_ALL | SIGHASH_NOINPUT,
             SIGHASH_ALL | SIGHASH_ANYONE_CAN_PAY,
         ]
-        .map(|hash_type| {
-            signature_hash(&transaction, 0, &script, 50, hash_type).expect("sighash")
-        });
+        .map(|hash_type| signature_hash(&transaction, 0, &script, 50, hash_type).expect("sighash"));
 
         for left in 0..hashes.len() {
             for right in left + 1..hashes.len() {
@@ -251,8 +246,8 @@ mod tests {
             "../../../fixtures/hsd/scripts/sighash-v1.json"
         ))
         .expect("oracle fixture");
-        let transaction = Transaction::decode(&decode_hex(&fixture.transaction_raw))
-            .expect("oracle transaction");
+        let transaction =
+            Transaction::decode(&decode_hex(&fixture.transaction_raw)).expect("oracle transaction");
         let previous_script = decode_hex(&fixture.previous_script_raw);
 
         for vector in fixture.vectors {

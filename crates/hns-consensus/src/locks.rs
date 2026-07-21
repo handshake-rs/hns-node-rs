@@ -291,8 +291,7 @@ mod tests {
             let mut view = View::default();
             for (input, height) in transaction.inputs.iter().zip(&vector.coin_heights) {
                 if let Ok(height) = Height::try_from(*height) {
-                    view.heights
-                        .insert(input.previous_output.clone(), height);
+                    view.heights.insert(input.previous_output.clone(), height);
                 }
             }
             for (height, time) in vector.ancestor_median_times {

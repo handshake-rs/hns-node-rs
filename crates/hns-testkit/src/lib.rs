@@ -124,12 +124,7 @@ impl FixtureOracle {
                 "oracle repository is empty".to_owned(),
             ));
         }
-        if self.revision.len() != 40
-            || !self
-                .revision
-                .as_bytes()
-                .iter()
-                .all(u8::is_ascii_hexdigit)
+        if self.revision.len() != 40 || !self.revision.as_bytes().iter().all(u8::is_ascii_hexdigit)
         {
             return Err(FixtureError::InvalidManifest(
                 "oracle revision must be a 40-character hexadecimal commit id".to_owned(),
@@ -194,6 +189,8 @@ pub enum FixtureKind {
     Rpc,
     Network,
     Snapshot,
+    P2pWire,
+    MiningTemplate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -300,12 +297,11 @@ impl HsdFixtureLoader {
             path: path.clone(),
             source,
         })?;
-        let vector = serde_json::from_slice::<RawVector>(&bytes).map_err(|source| {
-            FixtureError::Json {
+        let vector =
+            serde_json::from_slice::<RawVector>(&bytes).map_err(|source| FixtureError::Json {
                 path: path.clone(),
                 source,
-            }
-        })?;
+            })?;
         decode_hex(&vector.raw).map_err(|message| FixtureError::Hex { path, message })
     }
 }
@@ -438,15 +434,11 @@ mod tests {
     #[test]
     fn primitive_json_vectors_decode_into_hns_types() {
         let loader = HsdFixtureLoader::workspace_default();
-        let header = loader
-            .load_header("milestone1-header.json")
-            .expect("header fixture");
+        let header = loader.load_header("codec-v1.json").expect("header fixture");
         let transaction = loader
-            .load_transaction("milestone1-transaction.json")
+            .load_transaction("codec-v1.json")
             .expect("transaction fixture");
-        let block = loader
-            .load_block("milestone1-block.json")
-            .expect("block fixture");
+        let block = loader.load_block("codec-v1.json").expect("block fixture");
 
         assert_eq!(
             header.hash().to_hex(),

@@ -431,7 +431,9 @@ name = "hns-mining"
 version = "0.1.0"
 dependencies = [
  "hns-consensus",
+ "hns-mempool",
  "hns-primitives",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -467,6 +469,7 @@ dependencies = [
  "hns-consensus",
  "hns-primitives",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
@@ -505,10 +508,13 @@ dependencies = [
 name = "hns-state"
 version = "0.1.0"
 dependencies = [
+ "hns-chain",
  "hns-consensus",
  "hns-primitives",
  "hns-store",
+ "hns-urkel",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -528,8 +534,10 @@ dependencies = [
  "hns-chain",
  "hns-p2p",
  "hns-primitives",
+ "hns-store",
  "serde",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -548,6 +556,7 @@ version = "0.1.0"
 dependencies = [
  "hns-primitives",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

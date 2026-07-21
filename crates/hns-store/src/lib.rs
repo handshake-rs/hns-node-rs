@@ -13,11 +13,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v1";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v5";
 
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
 
@@ -263,6 +263,8 @@ pub enum MetaKey {
     BestBlockHash,
     MiningGeneration,
     StorageProfile,
+    NameTreeRoot,
+    SyncCheckpoint,
     ChainEpoch,
     CleanShutdown,
 }
@@ -277,6 +279,8 @@ impl MetaKey {
             Self::BestBlockHash => b"best-block-hash",
             Self::MiningGeneration => b"mining-generation",
             Self::StorageProfile => b"storage-profile",
+            Self::NameTreeRoot => b"name-tree-root",
+            Self::SyncCheckpoint => b"sync-checkpoint",
             Self::ChainEpoch => b"chain-epoch",
             Self::CleanShutdown => b"clean-shutdown",
         }
@@ -311,27 +315,115 @@ pub fn decode_u64(bytes: &[u8]) -> Result<u64, StoreError> {
 
 pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
     let snapshot = store.snapshot()?;
+    let schema = snapshot.get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())?;
+    let profile = snapshot.get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())?;
+    let name_tree_root = snapshot.get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())?;
 
-    match snapshot.get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())? {
+    match schema {
         Some(bytes) => {
             let version = decode_u32(&bytes)?;
             if version != SCHEMA_VERSION {
                 return Err(StoreError::Schema(format!(
-                    "expected schema version {SCHEMA_VERSION}, got {version}"
+                    "expected schema version {SCHEMA_VERSION}, got {version}; a clean reindex is required"
+                )));
+            }
+            let profile = profile.ok_or_else(|| {
+                StoreError::Schema(
+                    "schema marker exists without a storage-profile marker; refusing ambiguous database"
+                        .to_owned(),
+                )
+            })?;
+            if profile.as_slice() != STORAGE_PROFILE {
+                return Err(StoreError::Schema(format!(
+                    "expected storage profile `{}`, got `{}`; a clean reindex is required",
+                    String::from_utf8_lossy(STORAGE_PROFILE),
+                    String::from_utf8_lossy(&profile),
+                )));
+            }
+            let name_tree_root = name_tree_root.ok_or_else(|| {
+                StoreError::Schema(
+                    "schema marker exists without a durable name-tree-root binding; a clean reindex is required"
+                        .to_owned(),
+                )
+            })?;
+            if name_tree_root.len() != 32 {
+                return Err(StoreError::Schema(format!(
+                    "durable name-tree-root binding must contain 32 bytes, got {}; a clean reindex is required",
+                    name_tree_root.len()
                 )));
             }
             Ok(())
         }
         None => {
+            if profile.is_some() || name_tree_root.is_some() || !snapshot_is_empty(&snapshot)? {
+                return Err(StoreError::Schema(
+                    "database contains data but has no schema marker; refusing to stamp a potentially incompatible store"
+                        .to_owned(),
+                ));
+            }
+
             let mut batch = store.batch();
             batch.put(
                 ColumnFamily::Meta,
                 MetaKey::SchemaVersion.as_bytes(),
                 &encode_u32(SCHEMA_VERSION),
             )?;
+            batch.put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )?;
+            batch.put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                &[0; 32],
+            )?;
             store.commit(batch)
         }
     }
+}
+
+fn snapshot_is_empty<S: ReadSnapshot>(snapshot: &S) -> Result<bool, StoreError> {
+    for family in ColumnFamily::ALL {
+        if !snapshot.scan_prefix(family, b"")?.is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Return whether the previous process completed its explicit clean-shutdown
+/// transition. Missing state is treated as unclean so recovery checks run on
+/// first use and after abrupt termination.
+pub fn was_clean_shutdown<S: Store>(store: &S) -> Result<bool, StoreError> {
+    initialize_schema(store)?;
+    let snapshot = store.snapshot()?;
+    match snapshot.get(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes())? {
+        Some(bytes) if bytes.as_slice() == [1] => Ok(true),
+        Some(bytes) if bytes.as_slice() == [0] => Ok(false),
+        Some(bytes) => Err(StoreError::Schema(format!(
+            "invalid clean-shutdown marker length/value: {bytes:?}"
+        ))),
+        None => Ok(false),
+    }
+}
+
+/// Mark the database as owned by a running process. This must be committed
+/// before network or mining services are started.
+pub fn mark_unclean_start<S: Store>(store: &S) -> Result<(), StoreError> {
+    initialize_schema(store)?;
+    let mut batch = store.batch();
+    batch.put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[0])?;
+    store.commit(batch)
+}
+
+/// Mark the database clean only after all state and service shutdown work has
+/// completed successfully.
+pub fn mark_clean_shutdown<S: Store>(store: &S) -> Result<(), StoreError> {
+    initialize_schema(store)?;
+    let mut batch = store.batch();
+    batch.put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[1])?;
+    store.commit(batch)
 }
 
 pub fn open_store(config: &StoreConfig) -> Result<StoreHandle, StoreError> {
@@ -791,8 +883,6 @@ enum RocksOperation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("store backend is not implemented in the scaffold")]
-    Unimplemented,
     #[error("store feature `{0}` is disabled")]
     FeatureDisabled(&'static str),
     #[error("store backend mismatch")]
@@ -920,13 +1010,11 @@ mod tests {
 
         let live = store.snapshot().expect("live snapshot");
         assert_eq!(
-            live.get(ColumnFamily::Headers, b"b/1")
-                .expect("live get"),
+            live.get(ColumnFamily::Headers, b"b/1").expect("live get"),
             Some(b"old".to_vec())
         );
         assert_eq!(
-            live.get(ColumnFamily::Headers, b"b/2")
-                .expect("live get"),
+            live.get(ColumnFamily::Headers, b"b/2").expect("live get"),
             None
         );
 
@@ -989,6 +1077,290 @@ mod tests {
             .expect("get")
             .expect("version");
         assert_eq!(decode_u32(&version).expect("decode"), SCHEMA_VERSION);
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())
+                .expect("root"),
+            Some(vec![0; 32])
+        );
+    }
+
+    #[test]
+    fn initialize_schema_writes_profile_and_rejects_markerless_data() {
+        let store = MemoryStore::new();
+        initialize_schema(&store).expect("initialize");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())
+                .expect("profile"),
+            Some(STORAGE_PROFILE.to_vec())
+        );
+
+        let markerless = MemoryStore::new();
+        let mut batch = markerless.batch();
+        batch
+            .put(ColumnFamily::Headers, b"orphan", b"header")
+            .expect("put markerless data");
+        markerless.commit(batch).expect("commit markerless data");
+        assert!(matches!(
+            initialize_schema(&markerless),
+            Err(StoreError::Schema(message)) if message.contains("no schema marker")
+        ));
+    }
+
+    #[test]
+    fn initialize_schema_rejects_profile_drift() {
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION),
+            )
+            .expect("schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                b"hsrd-obsolete-profile",
+            )
+            .expect("profile");
+        store.commit(batch).expect("commit");
+        assert!(matches!(
+            initialize_schema(&store),
+            Err(StoreError::Schema(message)) if message.contains("clean reindex")
+        ));
+    }
+
+    #[test]
+    fn initialize_schema_rejects_partial_marker_sets() {
+        let schema_only = MemoryStore::new();
+        let mut batch = schema_only.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION),
+            )
+            .expect("schema");
+        schema_only.commit(batch).expect("commit schema-only store");
+        assert!(matches!(
+            initialize_schema(&schema_only),
+            Err(StoreError::Schema(message)) if message.contains("without a storage-profile")
+        ));
+
+        let profile_only = MemoryStore::new();
+        let mut batch = profile_only.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )
+            .expect("profile");
+        profile_only
+            .commit(batch)
+            .expect("commit profile-only store");
+        assert!(matches!(
+            initialize_schema(&profile_only),
+            Err(StoreError::Schema(message)) if message.contains("no schema marker")
+        ));
+    }
+
+    #[test]
+    fn initialize_schema_rejects_missing_or_malformed_name_tree_root() {
+        let missing = MemoryStore::new();
+        let mut batch = missing.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION),
+            )
+            .expect("schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )
+            .expect("profile");
+        missing.commit(batch).expect("commit missing-root store");
+        assert!(matches!(
+            initialize_schema(&missing),
+            Err(StoreError::Schema(message)) if message.contains("name-tree-root")
+        ));
+
+        let malformed = MemoryStore::new();
+        let mut batch = malformed.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION),
+            )
+            .expect("schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )
+            .expect("profile");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                &[0; 31],
+            )
+            .expect("root");
+        malformed
+            .commit(batch)
+            .expect("commit malformed-root store");
+        assert!(matches!(
+            initialize_schema(&malformed),
+            Err(StoreError::Schema(message)) if message.contains("32 bytes")
+        ));
+    }
+
+    #[test]
+    fn initialize_schema_rejects_version_drift() {
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION.saturating_sub(1)),
+            )
+            .expect("schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )
+            .expect("profile");
+        store.commit(batch).expect("commit");
+        assert!(matches!(
+            initialize_schema(&store),
+            Err(StoreError::Schema(message)) if message.contains("clean reindex")
+        ));
+    }
+
+    #[test]
+    fn clean_shutdown_marker_rejects_unknown_values() {
+        let store = MemoryStore::new();
+        initialize_schema(&store).expect("schema");
+        let mut batch = store.batch();
+        batch
+            .put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[2])
+            .expect("marker");
+        store.commit(batch).expect("commit marker");
+        assert!(matches!(
+            was_clean_shutdown(&store),
+            Err(StoreError::Schema(message)) if message.contains("invalid clean-shutdown marker")
+        ));
+    }
+
+    #[test]
+    fn clean_shutdown_marker_is_explicit_and_fail_closed() {
+        let store = MemoryStore::new();
+        initialize_schema(&store).expect("schema");
+        assert!(!was_clean_shutdown(&store).expect("missing marker is unclean"));
+        mark_clean_shutdown(&store).expect("mark clean");
+        assert!(was_clean_shutdown(&store).expect("clean"));
+        mark_unclean_start(&store).expect("mark running");
+        assert!(!was_clean_shutdown(&store).expect("unclean"));
+    }
+
+    #[derive(Clone)]
+    struct FailingStore {
+        inner: MemoryStore,
+        fail_next_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FailingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                fail_next_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_commit(&self) {
+            self.fail_next_commit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Store for FailingStore {
+        type Snapshot<'a> = MemorySnapshot;
+        type Batch = MemoryBatch;
+
+        fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+            self.inner.snapshot()
+        }
+
+        fn batch(&self) -> Self::Batch {
+            self.inner.batch()
+        }
+
+        fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
+            if self
+                .fail_next_commit
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::Io("injected commit failure".to_owned()));
+            }
+            self.inner.commit(batch)
+        }
+    }
+
+    #[test]
+    fn failed_commit_preserves_the_complete_old_state() {
+        let store = FailingStore::new();
+        let mut initial = store.batch();
+        initial
+            .put(ColumnFamily::Meta, b"tip", b"old")
+            .expect("initial");
+        initial
+            .put(ColumnFamily::Headers, b"old", b"header")
+            .expect("initial header");
+        store.commit(initial).expect("initial commit");
+
+        let mut replacement = store.batch();
+        replacement
+            .put(ColumnFamily::Meta, b"tip", b"new")
+            .expect("replacement tip");
+        replacement
+            .put(ColumnFamily::Headers, b"new", b"header")
+            .expect("replacement header");
+        replacement
+            .delete(ColumnFamily::Headers, b"old")
+            .expect("replacement delete");
+        store.fail_next_commit();
+        assert!(store.commit(replacement).is_err());
+
+        let snapshot = store.snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.get(ColumnFamily::Meta, b"tip").expect("tip"),
+            Some(b"old".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Headers, b"old")
+                .expect("old header"),
+            Some(b"header".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Headers, b"new")
+                .expect("new header"),
+            None
+        );
     }
 
     #[test]
@@ -1001,8 +1373,14 @@ mod tests {
 
     #[test]
     fn durability_policy_is_explicit_and_strictly_parsed() {
-        assert_eq!("sync".parse::<DurabilityPolicy>().expect("sync"), DurabilityPolicy::Sync);
-        assert_eq!("wal".parse::<DurabilityPolicy>().expect("wal"), DurabilityPolicy::Wal);
+        assert_eq!(
+            "sync".parse::<DurabilityPolicy>().expect("sync"),
+            DurabilityPolicy::Sync
+        );
+        assert_eq!(
+            "wal".parse::<DurabilityPolicy>().expect("wal"),
+            DurabilityPolicy::Wal
+        );
         assert!("none".parse::<DurabilityPolicy>().is_err());
         assert_eq!(DurabilityPolicy::Sync.to_string(), "sync");
         assert_eq!(DurabilityPolicy::Wal.to_string(), "wal");
@@ -1059,13 +1437,11 @@ mod tests {
     #[cfg(feature = "rocksdb-backend")]
     #[test]
     fn rocks_store_exposes_selected_wal_durability_policy() {
-        let path = std::env::temp_dir().join(format!(
-            "hsrd-rocks-durability-test-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("hsrd-rocks-durability-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
-        let store = RocksStore::open_with_durability(&path, DurabilityPolicy::Wal)
-            .expect("open rocksdb");
+        let store =
+            RocksStore::open_with_durability(&path, DurabilityPolicy::Wal).expect("open rocksdb");
         assert_eq!(store.durability, DurabilityPolicy::Wal);
         drop(store);
         let _ = std::fs::remove_dir_all(&path);
@@ -1074,10 +1450,8 @@ mod tests {
     #[cfg(feature = "rocksdb-backend")]
     #[test]
     fn rocks_snapshot_is_sequence_consistent() {
-        let path = std::env::temp_dir().join(format!(
-            "hsrd-rocks-snapshot-test-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("hsrd-rocks-snapshot-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         let store = RocksStore::open(&path).expect("open rocksdb");
 

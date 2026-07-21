@@ -1,6 +1,7 @@
 # hsd Fixtures
 
-This directory is reserved for hsd-derived fixture data. The scaffold keeps the layout explicit so later milestones can add golden vectors without changing testkit paths.
+These pinned HSD-derived vectors are grouped by protocol surface so additional
+golden cases can be added without changing testkit paths.
 
 - `headers`: serialized headers and expected metadata.
 - `blocks`: serialized blocks.

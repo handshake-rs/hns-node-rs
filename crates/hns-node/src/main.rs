@@ -1,13 +1,15 @@
 #![forbid(unsafe_code)]
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use hns_consensus::Network;
-use hns_store::DurabilityPolicy;
+use hns_mempool::MempoolLimits;
 use hns_node::{
-    init_logging, validate_node_config, AuthorityMode, NodeConfig, NodeService, ShutdownSignal,
+    init_logging, validate_node_config, AuthorityMode, MiningEngineConfig, NodeConfig, NodeService,
+    ShadowSyncConfig, ShutdownSignal,
 };
+use hns_store::DurabilityPolicy;
 
 #[derive(Debug, Parser)]
 #[command(name = "hsrd", about = "Lean Handshake consensus and mining full node")]
@@ -18,14 +20,8 @@ struct Cli {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    #[arg(long)]
-    config: Option<PathBuf>,
-
     #[arg(long, default_value = "127.0.0.1:12037")]
     rpc_bind: SocketAddr,
-
-    #[arg(long)]
-    metrics_bind: Option<SocketAddr>,
 
     #[arg(long, env = "HSRD_LOG", default_value = "info")]
     log_filter: String,
@@ -39,6 +35,75 @@ struct Cli {
     #[arg(long, default_value_t = DurabilityPolicy::Sync)]
     storage_durability: DurabilityPolicy,
 
+    /// Enable live, observation-only P2P and shadow synchronization.
+    #[arg(long)]
+    shadow_sync: bool,
+
+    /// Bind an inbound plaintext Handshake P2P listener.
+    #[arg(long)]
+    p2p_listen: Option<SocketAddr>,
+
+    /// Connect to an explicit Handshake peer. May be repeated.
+    #[arg(long = "connect")]
+    p2p_connect: Vec<SocketAddr>,
+
+    #[arg(long, default_value_t = 32)]
+    maximum_inbound: usize,
+
+    #[arg(long, default_value_t = 8)]
+    maximum_outbound: usize,
+
+    #[arg(long, default_value_t = 4)]
+    validation_workers: usize,
+
+    #[arg(long, default_value_t = 128)]
+    validation_queue: usize,
+
+    #[arg(long, default_value_t = 1_024)]
+    orphan_blocks: usize,
+
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    orphan_bytes: usize,
+
+    #[arg(long, default_value_t = 250)]
+    shadow_sync_poll_ms: u64,
+
+    /// Enable the bounded mining engine for mempool, template, and publication work.
+    #[arg(long)]
+    mining_engine: bool,
+
+    /// Serve already admitted transactions and mempool inventory to peers.
+    /// Admission remains fail closed until complete contextual consensus parity.
+    #[arg(long)]
+    transaction_relay: bool,
+
+    #[arg(long, default_value_t = 50_000)]
+    mempool_max_transactions: usize,
+
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    mempool_max_bytes: usize,
+
+    #[arg(long, default_value_t = 1_024)]
+    mempool_max_orphans: usize,
+
+    #[arg(long, default_value_t = 32 * 1024 * 1024)]
+    mempool_max_orphan_bytes: usize,
+
+    #[arg(long, default_value_t = 25)]
+    mempool_max_ancestors: usize,
+
+    #[arg(long, default_value_t = 25)]
+    mempool_max_descendants: usize,
+
+    #[arg(long, default_value_t = 16)]
+    template_variants: usize,
+
+    #[arg(long, default_value_t = 64)]
+    pending_publications: usize,
+
+    #[arg(long, default_value_t = 250)]
+    publication_retry_ms: u64,
+
     #[arg(long)]
     check_config: bool,
 }
@@ -48,13 +113,38 @@ impl Cli {
         NodeConfig {
             network: self.network.into(),
             data_dir: self.data_dir,
-            config_file: self.config,
             rpc_bind: self.rpc_bind,
-            metrics_bind: self.metrics_bind,
             log_filter: self.log_filter,
             authority_mode: self.authority_mode,
             acknowledge_incomplete_consensus: self.acknowledge_incomplete_consensus,
             storage_durability: self.storage_durability,
+            shadow_sync: ShadowSyncConfig {
+                enabled: self.shadow_sync,
+                listen: self.p2p_listen,
+                connect: self.p2p_connect,
+                maximum_inbound: self.maximum_inbound,
+                maximum_outbound: self.maximum_outbound,
+                validation_workers: self.validation_workers,
+                validation_queue: self.validation_queue,
+                orphan_blocks: self.orphan_blocks,
+                orphan_bytes: self.orphan_bytes,
+                poll_interval: Duration::from_millis(self.shadow_sync_poll_ms),
+            },
+            mining_engine: MiningEngineConfig {
+                enabled: self.mining_engine,
+                transaction_relay: self.transaction_relay,
+                mempool_limits: MempoolLimits {
+                    maximum_transactions: self.mempool_max_transactions,
+                    maximum_bytes: self.mempool_max_bytes,
+                    maximum_orphans: self.mempool_max_orphans,
+                    maximum_orphan_bytes: self.mempool_max_orphan_bytes,
+                    maximum_ancestors: self.mempool_max_ancestors,
+                    maximum_descendants: self.mempool_max_descendants,
+                },
+                maximum_template_variants: self.template_variants,
+                maximum_pending_publications: self.pending_publications,
+                publication_retry_interval: Duration::from_millis(self.publication_retry_ms),
+            },
         }
     }
 }
@@ -92,6 +182,9 @@ async fn main() -> anyhow::Result<()> {
             network = %config.network,
             authority_mode = config.authority_mode.as_str(),
             storage_durability = %config.storage_durability,
+            shadow_sync = config.shadow_sync.enabled,
+            mining_engine = config.mining_engine.enabled,
+            transaction_relay = config.mining_engine.transaction_relay,
             "configuration parsed successfully"
         );
         return Ok(());

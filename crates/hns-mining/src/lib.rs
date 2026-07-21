@@ -1,5 +1,17 @@
 #![forbid(unsafe_code)]
 
+mod publication;
+mod template;
+
+pub use publication::{
+    SolvedBlockPublicationIntent, PUBLICATION_INTENT_VERSION, PUBLICATION_KEY_PREFIX,
+};
+pub use template::{
+    FutureTemplateCache, MiningTemplate, TemplateAssembler, TemplateBuildRequest, TemplateCacheKey,
+    TemplateCoordinator, TemplateId, TemplateMetrics, TemplatePolicy, TemplateVariant,
+    DEFAULT_RESERVED_TEMPLATE_SIGOPS, DEFAULT_RESERVED_TEMPLATE_WEIGHT, MAX_TEMPLATE_VARIANTS,
+};
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -7,8 +19,8 @@ use std::{
 
 use hns_consensus::{block_weight, ConsensusParams, HeaderConsensus, Network};
 use hns_primitives::{
-    blake2b_256_many, Block, BlockHash, Header, Height, Transaction, Uint256, MAX_BLOCK_WEIGHT,
-    NONCE_SIZE,
+    blake2b_256_many, Block, BlockHash, Header, Height, Transaction, Txid, Uint256,
+    MAX_BLOCK_WEIGHT, NONCE_SIZE,
 };
 use tokio::sync::{broadcast, watch};
 
@@ -45,6 +57,10 @@ pub struct MiningSnapshot {
     pub network_id: u8,
     pub generation: MiningGeneration,
     pub tip: HeaderSummary,
+    /// Authenticated name-tree root resulting from the active tip. This is the
+    /// root which the next block must commit to; `tip.tree_root` is the root
+    /// inherited by the tip itself.
+    pub next_tree_root: [u8; 32],
     pub chainwork: Uint256,
 }
 
@@ -335,7 +351,10 @@ impl PreparedMiningJob {
         header: MiningHeaderTemplate,
         transactions: Arc<[Transaction]>,
     ) -> Result<Self, MiningError> {
-        if header.parent_hash != snapshot.tip.hash || transactions.is_empty() {
+        if header.parent_hash != snapshot.tip.hash
+            || header.tree_root != snapshot.next_tree_root
+            || transactions.is_empty()
+        {
             return Err(MiningError::InvalidJob);
         }
         let provisional = Block {
@@ -395,6 +414,7 @@ impl PreparedMiningJob {
     pub fn validate_for_snapshot(&self, snapshot: &MiningSnapshot) -> Result<(), MiningError> {
         if self.snapshot_generation != snapshot.generation
             || self.header.parent_hash != snapshot.tip.hash
+            || self.header.tree_root != snapshot.next_tree_root
             || self.job_id
                 != job_id(
                     snapshot.network_id,
@@ -585,6 +605,28 @@ pub enum MiningError {
     InvalidReconstruction,
     #[error("opened-mask mining result does not meet the HNS network target")]
     InsufficientProofOfWork,
+    #[error("mining-template policy is invalid")]
+    InvalidTemplatePolicy,
+    #[error("mining-template context is invalid or incomplete")]
+    InvalidTemplateContext,
+    #[error("constructed mining-template body is invalid")]
+    InvalidTemplateBody,
+    #[error("mining-template arithmetic overflow")]
+    TemplateArithmetic,
+    #[error("mempool template input failed: {0}")]
+    Mempool(String),
+    #[error("mempool transaction {0:?} disappeared from an immutable snapshot")]
+    MempoolTransactionMissing(Txid),
+    #[error("future mining template is stale")]
+    StaleTemplate,
+    #[error("future mining-template key conflicts with different bytes")]
+    TemplateConflict,
+    #[error("future mining-template capacity is exhausted")]
+    TemplateCapacity,
+    #[error("future mining template is unknown")]
+    UnknownTemplate,
+    #[error("solved-block publication intent is invalid")]
+    InvalidPublicationIntent,
 }
 
 #[cfg(test)]
@@ -628,6 +670,7 @@ mod tests {
                 time: 100,
                 bits: 0x207f_ffff,
             },
+            next_tree_root: [marker.wrapping_add(1); 32],
             chainwork: Uint256::from(u64::from(marker)),
         }
     }
@@ -642,7 +685,7 @@ mod tests {
             snapshot,
             MiningHeaderTemplate {
                 parent_hash: snapshot.tip.hash,
-                tree_root: [2; 32],
+                tree_root: snapshot.next_tree_root,
                 reserved_root: [3; 32],
                 witness_root: hns_consensus::block_witness_root(&body),
                 merkle_root: hns_consensus::block_merkle_root(&body),

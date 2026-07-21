@@ -4,101 +4,130 @@
 
 ### Primitive, chain, and storage foundation
 
-- Bounded header, transaction, block, covenant, address, resource, and witness
-  codecs with HSD-derived primitive fixtures.
-- Header/block index records, canonical-height indexes, raw block and
-  transaction indexes, exact unsigned 256-bit chainwork, and durable mining
-  generations.
-- Memory and RocksDB stores behind typed traits, atomic write batches,
-  sequence-consistent RocksDB read snapshots, and a read-your-writes staging
-  overlay for one-commit multi-block reorganizations.
-- Persistent network, genesis, storage-profile, schema, and chain-epoch
-  bindings. Schema version 5 is a mandatory reindex boundary.
-- Validated non-active block/header/body storage, strict greater-work best-header
-  promotion, equal-work first-seen preservation, explicit active-to-candidate
-  reorganization plans, and one-batch activation after ancestry/body/status/work
-  checks. Best known header and active best block remain separate bindings.
+- Bounded header, transaction, block, covenant, address, resource, witness, and
+  sync-relevant P2P codecs with HSD-derived fixtures.
+- Exact unsigned 256-bit chainwork and durable header/block/raw-body indexes.
+- Memory and RocksDB stores behind typed traits, atomic batches, true RocksDB
+  snapshots, and a read-your-writes reorganization overlay.
+- Schema version 9, profile `hsrd-mining-v5`, network, genesis, epoch,
+  mandatory name-tree-root binding, checksummed sync checkpoint, and a bounded
+  checksummed solved-block publication namespace.
+- Durable alternate branches, separate best-header and active-block bindings,
+  equal-work stability, strict greater-work activation, and one-batch
+  replacement after ancestry/body/status/work/root checks.
 
 ### Validation and state foundation
 
-- Header proof-of-work, parent linkage, HNS difficulty transitions,
-  median/future timestamp admission, block commitments, bounded block syntax,
-  ordinary subsidy-plus-fee accounting, absolute locktime finality, UTXO
-  connect/disconnect, undo, coinbase maturity, duplicate/missing spend checks,
-  value conservation, and unspent-output collision checks.
-- Explicit durable validation stages distinguish syntax, scripts, covenant
-  linkage, contextual covenants, claims/airdrops, UTXO state, name state, tree
-  root, undo, and active-chain membership.
-- HSD-compatible signature hashing, relative sequence-lock calculations, and
-  CLTV/CSV predicates.
-- A bounded version-zero witness/script execution foundation with pluggable
-  signature verification. The production default rejects all non-coinbase
-  spends until a complete verifier is installed.
-- Exact non-coinbase covenant input/output linkage from HSD
-  `verifyCovenants`, checked before UTXO mutation. A deterministic pinned oracle
-  corpus covers 33 linkage cases.
-- Claim/airdrop coinbase issuance fails closed; it is not accepted on structural
-  checks alone.
+- Header PoW, parent linkage, HNS difficulty, timestamp bounds, block syntax and
+  commitments, ordinary subsidy-plus-fee accounting, absolute finality, UTXO
+  connect/disconnect, coinbase maturity, duplicate/missing spend checks, value
+  conservation, and output-collision checks.
+- HSD signature hashing, relative locks, CLTV, and CSV.
+- Broad bounded witness/script foundation.
+- Verification-only wrapper around the exact vendored HSD secp256k1 source,
+  including compact low-S ECDSA and compressed keys.
+- Exact non-coinbase covenant linkage before UTXO mutation.
+- Contextual non-claim name-state transition foundation.
+- Exact reserved-name/lockup datasets and renewal boundary evidence.
+- Exact HSD `NameState` codec and name undo.
+- Correctness-first exact Urkel roots and internal memory proof checks.
+- Correct Handshake pre-state header-root timing and durable resulting-root
+  binding.
+- Claim/airdrop issuance fails closed.
 
-### Mining and operational foundation
+### Network and synchronization foundation
+
+- Exact bounded HNS framing and sync packet behavior with pinned HSD wire
+  fixtures.
+- Live inbound/outbound plaintext peers with handshake, service, self-connect,
+  timeout, ping/pong, and priority-queue controls.
+- Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
+- Headers-first synchronization with bounded pending/inflight/per-peer body
+  requests, retry, timeout, and reassignment.
+- Bounded orphan retention only for statelessly valid bodies with known header
+  context; unknown-context bodies are dropped after requesting headers.
+- Blocking validation workers with ordered result delivery.
+- Durable non-active body retention, contiguous-body recovery, restart
+  checkpointing, and bounded read-only serving.
+- Observation-only diagnostics; network data cannot grant authority.
+
+### Mempool, template, and publication foundation
+
+- Explicit hard bounds for accepted transactions, bytes, orphans, dependency
+  graphs, package members, template variants, and pending publication intents.
+- Immutable mempool generations, parent/child/spent-outpoint indexes,
+  deterministic dependency-ordered packages, and bounded orphan promotion.
+- Admission stages for syntax, finality, conflicts, coin resolution, maturity,
+  relative locks, input authorization, covenant linkage, contextual checks,
+  value, fees, and resource limits.
+- Explicit verifier-completeness gates; compatibility and peer transaction
+  entrypoints fail closed until complete contextual consensus is composed.
+- Deterministic ancestor-inclusive future templates with HNS weight, sigops,
+  OPEN, UPDATE, RENEW, transaction-count, and exclusive-name limits.
+- HSD-derived subsidy boundaries and deterministic coinbase bytes.
+- Atomic bounded template-variant replacement tied to exact chain and mempool
+  generations, parent, and next authenticated tree root.
+- Versioned checksummed publication intents and bounded durable recovery.
+- Full local candidate admission before parallel reserved critical peer fan-out.
+- Retry only for blocks already accepted on the local active chain.
+- Conservative mempool clearing on disconnect/reorganization and cache
+  invalidation on relevant chain/mempool changes.
+- Mining-engine readiness, queue, mempool, and template diagnostics.
+
+### Authority and operational foundation
 
 - Native immutable mining snapshots, durable generation ordering, prepared-job
-  identity, exact parent/generation activation, mask-hash binding, reconstructed
-  candidate admission, and a fail-closed MeshMine assignment boundary.
-- Bounded staged events distinguish candidate observation, syntax validation,
-  staged non-authoritative tips, authoritative committed tips, reorg fencing,
-  and mempool reconciliation.
-- Explicit authority modes, readiness blockers, parity status, and read-only
-  diagnostics. `shadow` is the default and incomplete states are never exposed
-  through the authoritative snapshot channel.
-- Full nested-workspace CI definition plus static metadata, fixture-integrity,
-  oracle-pin, schema, and authority-invariant checks.
+  identity, exact parent/generation activation, mask binding, and candidate
+  admission boundaries.
+- Staged versus authoritative event channels.
+- Explicit authority modes, capability-gated authoritative paths, readiness
+  blockers, parity status, and read-only diagnostics.
+- Nested-workspace CI definition, static fixture/schema/authority checks, and a
+  C-level vendored secp256k1 smoke test.
 
 These are substantial foundations, not a production full node.
 
 ## Mandatory missing work
 
-### Consensus
+### Consensus and authenticated state
 
-- Audited secp256k1 verification and complete HSD script/opcode/flag/historical
-  parity. The current script engine is a foundation, not a release claim.
-- Deployment and checkpoint parity and all historical exceptions.
-- Verified DNSSEC claim and airdrop proofs, historical datasets, deflation-era
-  accounting, and exact conjured-value rules.
-- Full contextual covenant validation: rollout, reserved names, auction phase,
-  winner/second-price selection, ownership, renewal, expiration,
-  transfer/finalize timing, revocation, and resource rules.
-- Complete name-state transition derivation and agreement with the header
-  `tree_root`.
-- Production Urkel mutation, persistence, undo, membership/non-membership
-  proofs, snapshots, and exact root parity.
+- Complete script opcode/flag/deployment/historical parity and mutation corpus.
+- Deployment, checkpoint, and historical-exception parity.
+- DNSSEC claim and airdrop proofs, historical datasets, duplicate prevention,
+  deflation-era accounting, and exact conjured-value rules.
+- Complete contextual covenant/name behavior across mainnet history.
+- Production persistent incremental Urkel storage, exact HSD proof wire format,
+  snapshots, compaction, and crash recovery.
 
-### Chain, network, and mining authority
+### Chain and network qualification
 
-- Full alternate-chain inventory, orphan handling, best-chain selection, deep
-  historical reorganization parity, pruning interactions, and crash recovery
-  evidence. Atomic database application now exists, but complete consensus
-  behavior around every reorganization does not.
-- Live HNS connection management, encrypted/plain peer negotiation as required,
-  inventory/getdata/block/tx serving, peer scoring, stall detection,
-  backpressure, and reserved solved-block relay.
-- Headers-first parallel download, ordered block commit, restartable IBD, and
-  pruning.
-- Consensus-complete mempool admission, package/dependency indexes, incremental
-  templates, fee/covenant/claim selection, and future-job activation.
-- End-to-end candidate validation and multi-target publication after every
-  authority gate is complete.
+- Active-state ordered connection of downloaded blocks and full restartable IBD.
+- Invalid-branch persistence policy, pruning interactions, historical
+  reorganizations, and RocksDB fault evidence.
+- Brontide, address-manager/DNS-seed discovery, durable bans/reputation, and
+  broader peer-diversity controls.
+- Compact-block reconstruction and pruning-aware synchronization.
+- Production-complete contextual peer transaction admission and relay.
+- Sustained multipath publication and reconnect/retry supervision under WAN
+  partitions and queue saturation.
 
-### Qualification
+### Mining authority
 
+- Contextually complete mempool admission, replacement/policy parity, and
+  disconnected-transaction re-admission.
+- Continuous future-template lifecycle tied to live committed tips and the ASIC
+  gateway.
+- End-to-end candidate validation against a historically qualified active state.
 - Complete historical mainnet replay against the pinned HSD oracle.
-- Positive and negative invalid corpora for every consensus rule family.
-- Byte-for-byte state, UTXO, name-tree, deployment, undo, and reorganization
-  parity.
-- Sustained live shadow-node agreement through restarts, partitions, tip races,
+- Positive and negative invalid corpora for every rule family.
+- Byte-for-byte UTXO, name-state, Urkel-root, deployment, undo, and
+  reorganization parity.
+- Sustained live HSD shadow agreement through restarts, partitions, tip races,
   and real reorganizations.
-- Reproducible release builds, external review, fuzzing, and published latency
-  and recovery evidence.
+- Measured P50/P95/P99/maximum tip-to-job, candidate-validation, local-connect,
+  and first-peer-acceptance latency.
+- Reproducible builds, external review, fuzzing, and published latency/recovery
+  evidence.
 
 ## Explicitly excluded product work
 
