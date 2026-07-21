@@ -23,6 +23,9 @@ Implemented:
 - Exact HSD deployment/checkpoint constants, BIP9 transitions, block-version
   signaling, deployment effects, cached next-block versions, and a
   checkpoint-backed historical validation-stage plan.
+- Canonical mainnet block-1 finality parity: ordinary transaction finality
+  excludes the coinbase, including HSD's accepted non-final-looking historical
+  coinbase vector.
 - Active-chain deployment caches and parent-derived contextual name,
   DNSSEC-claim, and full airdrop validation across connect/reorg/restart.
 - Strict header checkpoint enforcement in native peer and candidate imports.

@@ -906,6 +906,10 @@ pub fn validate_block_finality(
     if block
         .transactions
         .iter()
+        // HSD's contextual block validation starts at transaction index one.
+        // A coinbase locktime/sequence commits miner data and is not subject to
+        // ordinary transaction finality (mainnet block 1 is a canonical case).
+        .skip(1)
         .any(|transaction| !is_final_transaction(transaction, block_height, median_time_past))
     {
         return Err(ConsensusError::InvalidBlock(
@@ -1735,6 +1739,17 @@ mod tests {
             validate_block_finality(&block, 5, 0).expect_err("non-final block"),
             ConsensusError::InvalidBlock("block contains a non-final transaction")
         ));
+    }
+
+    #[test]
+    fn block_finality_does_not_apply_to_the_coinbase() {
+        let mut coinbase = coinbase(vec![output(50)]);
+        coinbase.locktime = 1;
+        coinbase.inputs[0].sequence = 368_910_623;
+        let block = block_with_roots(vec![coinbase]);
+
+        assert!(!is_final_transaction(&block.transactions[0], 1, 0));
+        validate_block_finality(&block, 1, 0).expect("coinbase finality is not checked");
     }
 
     #[test]

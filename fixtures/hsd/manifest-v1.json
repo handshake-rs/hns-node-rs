@@ -218,7 +218,7 @@
         "script-flags",
         "checkpoint-policy"
       ],
-      "blake2b256": "c9cfc054dcd51c3fcd54851d94326f01cb520628b073a244253fdebb31af90c3"
+      "blake2b256": "b8faafefca6ecd80b05a27b4438c4b1a9b6a358f8b5b2d1cb36648d0b2bba3e0"
     },
     {
       "id": "sighash-v1",

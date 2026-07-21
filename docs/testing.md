@@ -280,6 +280,11 @@ deployment period through height 338,688. Its offline check replays each real
 median time and signal count through the pinned HSD `Chain` methods; the Rust
 test independently advances the same cached states and compares deployment
 effects, next-block versions, and the checkpoint-backed historical decision.
+It also carries canonical mainnet block 1 as an absolute-finality regression:
+HSD reports its only transaction as individually non-final because the
+coinbase uses locktime 1 and a non-final sequence, while contextual block
+validation accepts it because HSD applies transaction finality only after the
+coinbase. Rust decodes the same raw block and verifies both decisions.
 The compact deployment fixture also executes HSD's full-body versus
 commitments-only and verified-input versus historical-input routes, pinning the
 exact validation-stage plan on both sides of checkpoint height 258,026:
@@ -296,8 +301,9 @@ NODE_BACKEND=js npm run refresh-hsrd-mainnet-deployment-history \
   --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
 ```
 
-This is deployment and historical-policy evidence, not complete transaction,
-UTXO, covenant, name-root, or block-validity replay.
+This is deployment, historical-policy, and one exact historical finality-route
+case; it is not complete transaction, UTXO, covenant, name-root, or
+block-validity replay.
 
 The claim fixture is generated through HSD's `Claim` and `ownership` codecs:
 

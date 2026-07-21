@@ -33,7 +33,8 @@
   stage-by-stage full/historical route matrix.
 - Canonical-mainnet replay of all 168 completed deployment periods through
   height 338,688, including real median times, signal counts, threshold states,
-  deployment effects, next-block versions, and the historical boundary.
+  deployment effects, next-block versions, the historical boundary, and the
+  exact accepted block-1 coinbase-finality exception.
 - Active blocks derive name and issuance flags from their parent, cache all
   four threshold states atomically, retain branch caches across reorganization,
   and fail startup on missing or inconsistent active-chain cache entries.

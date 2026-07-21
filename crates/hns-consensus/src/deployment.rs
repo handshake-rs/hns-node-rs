@@ -712,9 +712,11 @@ pub enum DeploymentError {
 mod tests {
     use std::str::FromStr;
 
+    use hns_primitives::Block;
     use serde::Deserialize;
 
     use super::*;
+    use crate::{is_final_transaction, validate_block_finality};
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -846,6 +848,7 @@ mod tests {
         anchor_hash: String,
         deployments: Vec<FixtureDeployment>,
         historical_boundaries: Vec<FixtureHistoricalBoundary>,
+        historical_finality_cases: Vec<FixtureHistoricalFinalityCase>,
         periods: Vec<FixtureHistoricalPeriod>,
     }
 
@@ -856,6 +859,19 @@ mod tests {
         hash: String,
         historical_height: bool,
         historical_block: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureHistoricalFinalityCase {
+        id: String,
+        height: Height,
+        hash: String,
+        parent_median_time_past: u64,
+        raw: String,
+        transaction_finality: Vec<bool>,
+        checked_transaction_indexes: Vec<usize>,
+        accepted: bool,
     }
 
     #[derive(Deserialize)]
@@ -955,6 +971,15 @@ mod tests {
             *output = (hex_nibble(bytes[index * 2]) << 4) | hex_nibble(bytes[index * 2 + 1]);
         }
         BlockHash::new(raw)
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        let bytes = value.as_bytes();
+        assert_eq!(bytes.len() % 2, 0);
+        bytes
+            .chunks_exact(2)
+            .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+            .collect()
     }
 
     #[test]
@@ -1184,7 +1209,7 @@ mod tests {
     #[test]
     fn historical_mainnet_periods_match_hsd_deployments_and_script_policy() {
         let fixture = historical_fixture();
-        assert_eq!(fixture.schema, 2);
+        assert_eq!(fixture.schema, 3);
         assert_eq!(fixture.network, "main");
         assert_eq!(
             fixture.activation_threshold,
@@ -1247,6 +1272,35 @@ mod tests {
                 .map(|boundary| boundary.hash.as_str()),
             Some(fixture.anchor_hash.as_str())
         );
+
+        assert_eq!(fixture.historical_finality_cases.len(), 1);
+        for case in &fixture.historical_finality_cases {
+            assert_eq!(case.id, "mainnet-block-1-coinbase-finality-exemption");
+            let block = Block::decode(&decode_hex(&case.raw)).expect("historical block");
+            assert_eq!(block.hash(), decode_hash(&case.hash));
+            assert_eq!(block.encode(), decode_hex(&case.raw));
+            let finality = block
+                .transactions
+                .iter()
+                .map(|transaction| {
+                    is_final_transaction(transaction, case.height, case.parent_median_time_past)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(finality, case.transaction_finality);
+            assert_eq!(
+                case.checked_transaction_indexes,
+                (1..block.transactions.len()).collect::<Vec<_>>()
+            );
+            assert!(
+                !finality[0],
+                "fixture must retain non-final coinbase evidence"
+            );
+            assert_eq!(
+                validate_block_finality(&block, case.height, case.parent_median_time_past,).is_ok(),
+                case.accepted
+            );
+            assert!(case.accepted);
+        }
 
         let params = Network::Mainnet.params();
         let mut states = [ThresholdState::Defined; 4];
