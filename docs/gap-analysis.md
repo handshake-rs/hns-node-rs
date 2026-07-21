@@ -43,7 +43,8 @@
   BID/REDEEM bypasses, renewal context, hardening, and post-state bytes.
 - Exact reserved-name/lockup datasets and renewal boundary evidence.
 - Exact HSD `NameState` codec and name undo.
-- Correctness-first exact Urkel roots and internal memory proof checks.
+- Correctness-first exact Urkel roots and byte-for-byte canonical HSD
+  inclusion/non-inclusion proof generation, decoding, and native verification.
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
 - Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,
@@ -137,8 +138,8 @@ These are substantial foundations, not a production full node.
   implemented.
 - Complete contextual covenant/name behavior across mainnet history; all
   non-claim families now have deterministic HSD differential coverage.
-- Production persistent incremental Urkel storage, exact HSD proof wire format,
-  snapshots, compaction, and crash recovery.
+- Production persistent incremental Urkel storage, durable proof serving,
+  snapshots, compaction, undo, and crash recovery.
 
 ### Chain and network qualification
 

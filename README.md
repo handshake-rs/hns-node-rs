@@ -133,7 +133,10 @@ Implemented:
 - HSD-derived renewal-commitment boundary fixtures.
 - Exact HSD `NameState` value encoding and undo records.
 - A correctness-first in-memory compressed Urkel implementation with exact
-  HSD-derived roots and internal inclusion/non-inclusion proof checks.
+  HSD-derived roots, canonical bounded HSD proof encoding/decoding, and native
+  inclusion/non-inclusion verification across all four terminal forms.
+- A pinned byte-for-byte Urkel proof corpus with inclusion, dead-end, short,
+  collision, trailing-byte, malformed-length, wrong-root, and wrong-key cases.
 - Correct Handshake root timing: block `H` commits to the inherited pre-state
   root; applying block `H` produces the root that block `H+1` must commit to.
 - Durable previous/resulting roots in block undo records.
@@ -151,8 +154,8 @@ Still release-blocking:
 - current/live production-valid claim-proof evidence and complete historical
   claim replay beyond the pinned initial/replacement histories;
 - full contextual covenant parity across mainnet history;
-- a production persistent incremental Urkel node store and exact HSD proof-wire
-  codec;
+- a production persistent incremental Urkel node store with durable proof
+  serving, snapshots, compaction, undo, and crash qualification;
 - complete historical root, undo, and reorganization replay.
 
 ## Live P2P and restartable shadow synchronization
@@ -268,6 +271,7 @@ npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
 npm run hsrd-name-transition-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
+npm run hsrd-urkel-proof-fixtures --prefix hsd-oracle
 npm run hsrd-name-policy-fixtures --prefix hsd-oracle
 npm run hsrd-p2p-wire-fixtures --prefix hsd-oracle
 npm run hsrd-mining-template-fixtures --prefix hsd-oracle

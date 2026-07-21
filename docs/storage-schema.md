@@ -246,6 +246,7 @@ previous database.
 The current root path rebuilds the authenticated tree from all durable
 `NameState` records. This prioritizes correctness and oracle parity over
 performance. A production persistent incremental Urkel store must preserve the
-same exact roots while adding node persistence, snapshots, proof-wire parity,
-undo, compaction, and crash recovery. It must not silently replace the current
-root calculation until differential replay proves equality.
+same exact roots and canonical proof bytes while adding node persistence,
+durable proof serving, snapshots, undo, compaction, and crash recovery. It must
+not silently replace the current root calculation until differential replay
+proves equality.

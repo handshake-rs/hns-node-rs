@@ -14,8 +14,8 @@
 //! a sorted map when a root or proof is requested. It is intended for oracle
 //! parity, deterministic state-root checks, and tests. It is not represented as
 //! the production persistent HNS name tree: the `NameTree` implementation below
-//! remains explicitly non-authoritative until persistence, HSD proof-codec
-//! parity, snapshots, undo, and crash recovery are independently qualified.
+//! remains explicitly non-authoritative until persistence, durable snapshots,
+//! undo, compaction, and crash recovery are independently qualified.
 
 #![forbid(unsafe_code)]
 
@@ -29,6 +29,12 @@ use serde::{Deserialize, Serialize};
 
 pub const URKEL_BITS: usize = 256;
 pub const EMPTY_ROOT: [u8; 32] = [0; 32];
+pub const MAX_HSD_PROOF_SIZE: usize = 82_469;
+
+const HSD_PROOF_DEADEND: u16 = 0;
+const HSD_PROOF_SHORT: u16 = 1;
+const HSD_PROOF_COLLISION: u16 = 2;
+const HSD_PROOF_EXISTS: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct TreeRoot([u8; 32]);
@@ -55,14 +61,334 @@ pub enum ProofKind {
     NonInclusion,
 }
 
-/// Opaque HSD proof bytes. The production interface intentionally does not
-/// invent a wire representation while the exact HSD/Urkel proof codec remains
-/// unported.
+/// Exact HSD/Urkel proof bytes bound to the requested name hash and expected
+/// inclusion class.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UrkelProof {
     pub name_hash: NameHash,
     pub kind: ProofKind,
     pub raw: Vec<u8>,
+}
+
+impl UrkelProof {
+    pub fn decode(&self) -> Result<HsdUrkelProof, UrkelError> {
+        HsdUrkelProof::decode(&self.raw)
+    }
+
+    pub fn verify_value(&self, root: TreeRoot) -> Result<Option<Vec<u8>>, UrkelError> {
+        let proof = self.decode()?;
+        if proof.kind() != self.kind {
+            return Err(UrkelError::InvalidProof(
+                "proof terminal type does not match its declared kind".to_owned(),
+            ));
+        }
+        proof.verify(root, &self.name_hash)
+    }
+}
+
+/// Structured form of the exact `urkel/lib/proof.js` wire format used by HSD.
+/// Prefix and node fields remain private so callers cannot construct an
+/// unchecked representation; proofs enter through `decode` or the native tree
+/// generator and leave through canonical `encode`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HsdUrkelProof {
+    depth: u16,
+    nodes: Vec<HsdProofNode>,
+    terminal: HsdProofTerminal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HsdProofNode {
+    prefix: BitPrefix,
+    sibling: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HsdProofTerminal {
+    DeadEnd,
+    Short {
+        prefix: BitPrefix,
+        left: [u8; 32],
+        right: [u8; 32],
+    },
+    Collision {
+        key: NameHash,
+        value_hash: [u8; 32],
+    },
+    Exists {
+        value: Vec<u8>,
+    },
+}
+
+impl HsdUrkelProof {
+    pub fn decode(raw: &[u8]) -> Result<Self, UrkelError> {
+        if raw.len() > MAX_HSD_PROOF_SIZE {
+            return Err(UrkelError::Codec(format!(
+                "HSD proof uses {} bytes, exceeding {MAX_HSD_PROOF_SIZE}",
+                raw.len()
+            )));
+        }
+
+        let mut reader = HsdProofReader::new(raw);
+        let field = reader.read_u16()?;
+        let proof_type = field >> 14;
+        let depth = field & 0x3fff;
+        if usize::from(depth) > URKEL_BITS {
+            return Err(UrkelError::Codec(format!(
+                "HSD proof depth {depth} exceeds {URKEL_BITS}"
+            )));
+        }
+
+        let count = usize::from(reader.read_u16()?);
+        if count > URKEL_BITS {
+            return Err(UrkelError::Codec(format!(
+                "HSD proof node count {count} exceeds {URKEL_BITS}"
+            )));
+        }
+        let prefix_field = reader.read_vec(count.div_ceil(8))?;
+        let mut nodes = Vec::with_capacity(count);
+        for index in 0..count {
+            let prefix = if packed_bit(&prefix_field, index) == 1 {
+                let prefix = reader.read_prefix()?;
+                if prefix.bit_len() == 0 {
+                    return Err(UrkelError::Codec(
+                        "HSD proof node encodes an empty explicit prefix".to_owned(),
+                    ));
+                }
+                prefix
+            } else {
+                BitPrefix::default()
+            };
+            nodes.push(HsdProofNode {
+                prefix,
+                sibling: reader.read_hash()?,
+            });
+        }
+
+        let terminal = match proof_type {
+            HSD_PROOF_DEADEND => HsdProofTerminal::DeadEnd,
+            HSD_PROOF_SHORT => {
+                let prefix = reader.read_prefix()?;
+                if prefix.bit_len() == 0 {
+                    return Err(UrkelError::Codec(
+                        "HSD short proof has an empty prefix".to_owned(),
+                    ));
+                }
+                HsdProofTerminal::Short {
+                    prefix,
+                    left: reader.read_hash()?,
+                    right: reader.read_hash()?,
+                }
+            }
+            HSD_PROOF_COLLISION => HsdProofTerminal::Collision {
+                key: NameHash::new(reader.read_hash()?),
+                value_hash: reader.read_hash()?,
+            },
+            HSD_PROOF_EXISTS => {
+                let size = usize::from(reader.read_u16()?);
+                HsdProofTerminal::Exists {
+                    value: reader.read_vec(size)?,
+                }
+            }
+            _ => unreachable!("two-bit HSD proof type"),
+        };
+
+        let proof = Self {
+            depth,
+            nodes,
+            terminal,
+        };
+        proof.validate_sane()?;
+        Ok(proof)
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, UrkelError> {
+        self.validate_sane()?;
+        let proof_type = match self.terminal {
+            HsdProofTerminal::DeadEnd => HSD_PROOF_DEADEND,
+            HsdProofTerminal::Short { .. } => HSD_PROOF_SHORT,
+            HsdProofTerminal::Collision { .. } => HSD_PROOF_COLLISION,
+            HsdProofTerminal::Exists { .. } => HSD_PROOF_EXISTS,
+        };
+        let field = (proof_type << 14) | self.depth;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&field.to_le_bytes());
+        raw.extend_from_slice(&(self.nodes.len() as u16).to_le_bytes());
+
+        let field_offset = raw.len();
+        raw.resize(field_offset + self.nodes.len().div_ceil(8), 0);
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.prefix.bit_len() != 0 {
+                set_packed_bit(&mut raw[field_offset..], index, 1);
+                node.prefix.write_hsd(&mut raw);
+            }
+            raw.extend_from_slice(&node.sibling);
+        }
+
+        match &self.terminal {
+            HsdProofTerminal::DeadEnd => {}
+            HsdProofTerminal::Short {
+                prefix,
+                left,
+                right,
+            } => {
+                prefix.write_hsd(&mut raw);
+                raw.extend_from_slice(left);
+                raw.extend_from_slice(right);
+            }
+            HsdProofTerminal::Collision { key, value_hash } => {
+                raw.extend_from_slice(key.as_bytes());
+                raw.extend_from_slice(value_hash);
+            }
+            HsdProofTerminal::Exists { value } => {
+                raw.extend_from_slice(&(value.len() as u16).to_le_bytes());
+                raw.extend_from_slice(value);
+            }
+        }
+
+        if raw.len() > MAX_HSD_PROOF_SIZE {
+            return Err(UrkelError::Codec(format!(
+                "encoded HSD proof uses {} bytes, exceeding {MAX_HSD_PROOF_SIZE}",
+                raw.len()
+            )));
+        }
+        Ok(raw)
+    }
+
+    pub fn kind(&self) -> ProofKind {
+        match self.terminal {
+            HsdProofTerminal::Exists { .. } => ProofKind::Inclusion,
+            _ => ProofKind::NonInclusion,
+        }
+    }
+
+    pub fn depth(&self) -> u16 {
+        self.depth
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn verify(
+        &self,
+        expected_root: TreeRoot,
+        key: &NameHash,
+    ) -> Result<Option<Vec<u8>>, UrkelError> {
+        self.validate_sane()?;
+        let key_bytes = key.as_bytes();
+        let (mut hash, value) = match &self.terminal {
+            HsdProofTerminal::DeadEnd => (EMPTY_ROOT, None),
+            HsdProofTerminal::Short {
+                prefix,
+                left,
+                right,
+            } => {
+                if prefix.matches_key(key_bytes, usize::from(self.depth)) {
+                    return Err(UrkelError::InvalidProof(
+                        "short proof prefix follows the requested key".to_owned(),
+                    ));
+                }
+                (hash_internal(prefix, left, right), None)
+            }
+            HsdProofTerminal::Collision {
+                key: collision,
+                value_hash,
+            } => {
+                if collision == key {
+                    return Err(UrkelError::InvalidProof(
+                        "collision proof uses the requested key".to_owned(),
+                    ));
+                }
+                (hash_leaf(collision.as_bytes(), value_hash), None)
+            }
+            HsdProofTerminal::Exists { value } => (
+                hash_leaf(key_bytes, &blake2b_256(value)),
+                Some(value.clone()),
+            ),
+        };
+
+        let mut depth = usize::from(self.depth);
+        for node in self.nodes.iter().rev() {
+            let prefix_bits = node.prefix.bit_len();
+            if depth < prefix_bits + 1 {
+                return Err(UrkelError::InvalidProof(
+                    "proof depth precedes a compressed ancestor".to_owned(),
+                ));
+            }
+            depth -= 1;
+            hash = if key_bit(key_bytes, depth) == 1 {
+                hash_internal(&node.prefix, &node.sibling, &hash)
+            } else {
+                hash_internal(&node.prefix, &hash, &node.sibling)
+            };
+            depth -= prefix_bits;
+            if !node.prefix.matches_key(key_bytes, depth) {
+                return Err(UrkelError::InvalidProof(
+                    "compressed ancestor prefix does not match the requested key".to_owned(),
+                ));
+            }
+        }
+
+        if depth != 0 {
+            return Err(UrkelError::InvalidProof(
+                "proof does not return to the tree root".to_owned(),
+            ));
+        }
+        if hash != expected_root.into_inner() {
+            return Err(UrkelError::RootMismatch {
+                expected: expected_root,
+                actual: TreeRoot::new(hash),
+            });
+        }
+        Ok(value)
+    }
+
+    fn validate_sane(&self) -> Result<(), UrkelError> {
+        if usize::from(self.depth) > URKEL_BITS {
+            return Err(UrkelError::InvalidProof(
+                "proof depth exceeds 256 bits".to_owned(),
+            ));
+        }
+        if self.nodes.len() > URKEL_BITS {
+            return Err(UrkelError::InvalidProof(
+                "proof contains more than 256 ancestor nodes".to_owned(),
+            ));
+        }
+        for node in &self.nodes {
+            node.prefix.validate()?;
+        }
+        match &self.terminal {
+            HsdProofTerminal::Short { prefix, .. } => {
+                prefix.validate()?;
+                if prefix.bit_len() == 0 {
+                    return Err(UrkelError::InvalidProof(
+                        "short proof has an empty prefix".to_owned(),
+                    ));
+                }
+            }
+            HsdProofTerminal::Exists { value } if value.len() > u16::MAX as usize => {
+                return Err(UrkelError::InvalidProof(
+                    "included proof value exceeds 65535 bytes".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeUrkelVerifier;
+
+impl UrkelVerifier for NativeUrkelVerifier {
+    fn verify(&self, proof: &UrkelProof, root: TreeRoot) -> Result<(), UrkelError> {
+        proof.verify_value(root).map(|_| ())
+    }
+
+    fn is_consensus_complete(&self) -> bool {
+        true
+    }
 }
 
 pub trait UrkelVerifier: Send + Sync {
@@ -259,6 +585,65 @@ impl MemoryProof {
 
         Ok(value)
     }
+
+    pub fn to_hsd_proof(&self) -> Result<HsdUrkelProof, UrkelError> {
+        if self.steps.len() > URKEL_BITS {
+            return Err(UrkelError::InvalidProof(
+                "proof contains more than 256 branch steps".to_owned(),
+            ));
+        }
+        let mut depth = 0usize;
+        let mut nodes = Vec::with_capacity(self.steps.len());
+        for step in &self.steps {
+            step.prefix.validate()?;
+            depth = depth
+                .checked_add(step.prefix.bit_len())
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| {
+                    UrkelError::InvalidProof("proof path length overflowed".to_owned())
+                })?;
+            if depth > URKEL_BITS {
+                return Err(UrkelError::InvalidProof(
+                    "proof path exceeds the 256-bit key".to_owned(),
+                ));
+            }
+            nodes.push(HsdProofNode {
+                prefix: step.prefix.clone(),
+                sibling: step.sibling,
+            });
+        }
+
+        let terminal = match &self.terminal {
+            MemoryProofTerminal::Empty => HsdProofTerminal::DeadEnd,
+            MemoryProofTerminal::Inclusion { value } => HsdProofTerminal::Exists {
+                value: value.clone(),
+            },
+            MemoryProofTerminal::Collision { key, value_hash } => HsdProofTerminal::Collision {
+                key: *key,
+                value_hash: *value_hash,
+            },
+            MemoryProofTerminal::DeadEnd {
+                prefix,
+                left,
+                right,
+            } => HsdProofTerminal::Short {
+                prefix: prefix.clone(),
+                left: *left,
+                right: *right,
+            },
+        };
+        let proof = HsdUrkelProof {
+            depth: depth as u16,
+            nodes,
+            terminal,
+        };
+        proof.validate_sane()?;
+        Ok(proof)
+    }
+
+    pub fn encode_hsd(&self) -> Result<Vec<u8>, UrkelError> {
+        self.to_hsd_proof()?.encode()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -383,6 +768,89 @@ impl BitPrefix {
             }
         }
         Ok(())
+    }
+
+    fn write_hsd(&self, output: &mut Vec<u8>) {
+        let bit_len = self.bit_len();
+        debug_assert!(bit_len <= URKEL_BITS);
+        if bit_len >= 0x80 {
+            output.push(0x80 | ((bit_len >> 8) as u8));
+        }
+        output.push(bit_len as u8);
+        output.extend_from_slice(&self.bytes);
+    }
+}
+
+struct HsdProofReader<'a> {
+    raw: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> HsdProofReader<'a> {
+    fn new(raw: &'a [u8]) -> Self {
+        Self { raw, offset: 0 }
+    }
+
+    fn read_u8(&mut self) -> Result<u8, UrkelError> {
+        let value = *self.raw.get(self.offset).ok_or_else(|| {
+            UrkelError::Codec(format!(
+                "unexpected end of HSD proof at byte {}",
+                self.offset
+            ))
+        })?;
+        self.offset += 1;
+        Ok(value)
+    }
+
+    fn read_u16(&mut self) -> Result<u16, UrkelError> {
+        let bytes: [u8; 2] = self
+            .read_slice(2)?
+            .try_into()
+            .expect("two-byte proof field");
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn read_hash(&mut self) -> Result<[u8; 32], UrkelError> {
+        Ok(self.read_slice(32)?.try_into().expect("32-byte proof hash"))
+    }
+
+    fn read_vec(&mut self, size: usize) -> Result<Vec<u8>, UrkelError> {
+        Ok(self.read_slice(size)?.to_vec())
+    }
+
+    fn read_prefix(&mut self) -> Result<BitPrefix, UrkelError> {
+        let first = self.read_u8()?;
+        let bit_len = if first & 0x80 != 0 {
+            (usize::from(first & 0x7f) << 8) | usize::from(self.read_u8()?)
+        } else {
+            usize::from(first)
+        };
+        if bit_len > URKEL_BITS {
+            return Err(UrkelError::Codec(format!(
+                "HSD proof prefix uses {bit_len} bits"
+            )));
+        }
+        let prefix = BitPrefix {
+            bit_len: bit_len as u16,
+            bytes: self.read_vec(bit_len.div_ceil(8))?,
+        };
+        prefix.validate()?;
+        Ok(prefix)
+    }
+
+    fn read_slice(&mut self, size: usize) -> Result<&'a [u8], UrkelError> {
+        let end = self
+            .offset
+            .checked_add(size)
+            .ok_or_else(|| UrkelError::Codec("HSD proof offset overflowed".to_owned()))?;
+        let bytes = self.raw.get(self.offset..end).ok_or_else(|| {
+            UrkelError::Codec(format!(
+                "unexpected end of HSD proof at byte {}",
+                self.offset
+            ))
+        })?;
+        self.offset = end;
+        Ok(bytes)
     }
 }
 
@@ -609,8 +1077,8 @@ fn validate_value_size(size: usize) -> Result<(), UrkelError> {
 
 /// Atomic in-memory tree useful for tests, fixtures, and shadow diagnostics.
 /// It intentionally reports `is_consensus_complete() == false` because it is
-/// not the qualified persistent implementation and does not expose HSD wire
-/// proof bytes.
+/// not the qualified persistent implementation and has no durable snapshot,
+/// compaction, undo, or crash-recovery contract.
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryNameTree {
     tree: Arc<RwLock<MemoryUrkel>>,
@@ -636,8 +1104,13 @@ impl NameTreeSnapshot for InMemorySnapshot {
         Ok(self.tree.get(name_hash).map(ToOwned::to_owned))
     }
 
-    fn prove(&self, _name_hash: &NameHash) -> Result<UrkelProof, UrkelError> {
-        Err(UrkelError::ProofCodecUnavailable)
+    fn prove(&self, name_hash: &NameHash) -> Result<UrkelProof, UrkelError> {
+        let structured = self.tree.prove_memory(*name_hash).to_hsd_proof()?;
+        Ok(UrkelProof {
+            name_hash: *name_hash,
+            kind: structured.kind(),
+            raw: structured.encode()?,
+        })
     }
 }
 
@@ -720,8 +1193,6 @@ impl UrkelVerifier for UnavailableUrkelVerifier {
 pub enum UrkelError {
     #[error("the consensus Urkel implementation is unavailable")]
     Unavailable,
-    #[error("the exact HSD Urkel proof codec is unavailable")]
-    ProofCodecUnavailable,
     #[error("urkel value size {0} exceeds the configured bound")]
     ValueTooLarge(usize),
     #[error("invalid urkel proof: {0}")]
@@ -785,6 +1256,66 @@ mod tests {
         root: String,
     }
 
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ProofFixture {
+        entries: Vec<ProofEntry>,
+        root: String,
+        proofs: Vec<CanonicalProof>,
+        mutations: Vec<ProofMutation>,
+    }
+
+    #[derive(Deserialize)]
+    struct ProofEntry {
+        key: String,
+        value: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CanonicalProof {
+        id: String,
+        root: String,
+        key: String,
+        kind: String,
+        #[serde(rename = "type")]
+        proof_type: String,
+        depth: u16,
+        node_count: usize,
+        raw: String,
+        value: Option<String>,
+        verify_code: u32,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ProofMutation {
+        id: String,
+        root: String,
+        key: String,
+        raw: String,
+        decode_accepted: bool,
+        canonical_raw: Option<String>,
+        verify_code: Option<u32>,
+    }
+
+    fn proof_fixture() -> ProofFixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/name-states/urkel-proofs-v1.json"
+        ))
+        .expect("proof fixture")
+    }
+
+    fn fixture_tree(fixture: &ProofFixture) -> MemoryUrkel {
+        MemoryUrkel::from_entries(fixture.entries.iter().map(|entry| {
+            (
+                NameHash::new(decode_hex_32(&entry.key)),
+                decode_hex(&entry.value),
+            )
+        }))
+        .expect("fixture tree")
+    }
+
     #[test]
     fn exact_roots_match_the_pinned_hsd_urkel_fixture() {
         let fixture: RootFixture = serde_json::from_str(include_str!(
@@ -802,6 +1333,130 @@ mod tests {
             .expect("insert");
             assert_eq!(tree.root(), TreeRoot::new(decode_hex_32(&expected.root)));
         }
+    }
+
+    #[test]
+    fn exact_proofs_match_the_pinned_hsd_urkel_fixture() {
+        let fixture = proof_fixture();
+        let populated = fixture_tree(&fixture);
+        assert_eq!(
+            populated.root(),
+            TreeRoot::new(decode_hex_32(&fixture.root))
+        );
+        let empty = MemoryUrkel::new();
+        let verifier = NativeUrkelVerifier;
+        assert!(verifier.is_consensus_complete());
+
+        for expected in &fixture.proofs {
+            assert_eq!(expected.verify_code, 0, "{}", expected.id);
+            let raw = decode_hex(&expected.raw);
+            let key = NameHash::new(decode_hex_32(&expected.key));
+            let root = TreeRoot::new(decode_hex_32(&expected.root));
+            let proof = HsdUrkelProof::decode(&raw)
+                .unwrap_or_else(|error| panic!("{} failed to decode: {error}", expected.id));
+            assert_eq!(
+                proof.encode().expect("canonical encode"),
+                raw,
+                "{}",
+                expected.id
+            );
+            assert_eq!(proof.depth(), expected.depth, "{}", expected.id);
+            assert_eq!(proof.node_count(), expected.node_count, "{}", expected.id);
+
+            let kind = match expected.kind.as_str() {
+                "inclusion" => ProofKind::Inclusion,
+                "nonInclusion" => ProofKind::NonInclusion,
+                other => panic!("{} has unknown fixture kind {other}", expected.id),
+            };
+            assert_eq!(proof.kind(), kind, "{}", expected.id);
+            let encoded_type = u16::from_le_bytes([raw[0], raw[1]]) >> 14;
+            let expected_type = match expected.proof_type.as_str() {
+                "TYPE_DEADEND" => HSD_PROOF_DEADEND,
+                "TYPE_SHORT" => HSD_PROOF_SHORT,
+                "TYPE_COLLISION" => HSD_PROOF_COLLISION,
+                "TYPE_EXISTS" => HSD_PROOF_EXISTS,
+                other => panic!("{} has unknown fixture type {other}", expected.id),
+            };
+            assert_eq!(encoded_type, expected_type, "{}", expected.id);
+
+            let value = proof
+                .verify(root, &key)
+                .unwrap_or_else(|error| panic!("{} failed to verify: {error}", expected.id));
+            assert_eq!(
+                value,
+                expected.value.as_deref().map(decode_hex),
+                "{}",
+                expected.id
+            );
+
+            let native = if root == TreeRoot::ZERO {
+                &empty
+            } else {
+                &populated
+            };
+            assert_eq!(
+                native.prove_memory(key).encode_hsd().expect("native proof"),
+                raw,
+                "{}",
+                expected.id
+            );
+
+            let wrapped = UrkelProof {
+                name_hash: key,
+                kind,
+                raw,
+            };
+            verifier.verify(&wrapped, root).unwrap_or_else(|error| {
+                panic!("{} wrapper verification failed: {error}", expected.id)
+            });
+        }
+    }
+
+    #[test]
+    fn malformed_and_cross_root_proof_fixture_fails_closed() {
+        let fixture = proof_fixture();
+
+        for expected in &fixture.mutations {
+            let raw = decode_hex(&expected.raw);
+            let decoded = HsdUrkelProof::decode(&raw);
+            assert_eq!(decoded.is_ok(), expected.decode_accepted, "{}", expected.id);
+            let Ok(proof) = decoded else {
+                continue;
+            };
+            assert_eq!(
+                proof.encode().expect("canonical encode"),
+                decode_hex(expected.canonical_raw.as_deref().expect("canonical raw")),
+                "{}",
+                expected.id
+            );
+            let root = TreeRoot::new(decode_hex_32(&expected.root));
+            let key = NameHash::new(decode_hex_32(&expected.key));
+            assert_eq!(
+                proof.verify(root, &key).is_ok(),
+                expected.verify_code == Some(0),
+                "{}",
+                expected.id
+            );
+        }
+
+        let inclusion = fixture
+            .proofs
+            .iter()
+            .find(|proof| proof.kind == "inclusion")
+            .expect("inclusion proof");
+        let mislabeled = UrkelProof {
+            name_hash: NameHash::new(decode_hex_32(&inclusion.key)),
+            kind: ProofKind::NonInclusion,
+            raw: decode_hex(&inclusion.raw),
+        };
+        assert!(matches!(
+            mislabeled.verify_value(TreeRoot::new(decode_hex_32(&inclusion.root))),
+            Err(UrkelError::InvalidProof(_))
+        ));
+        assert!(matches!(
+            HsdUrkelProof::decode(&vec![0; MAX_HSD_PROOF_SIZE + 1]),
+            Err(UrkelError::Codec(_))
+        ));
     }
 
     #[test]
@@ -847,6 +1502,17 @@ mod tests {
         assert_ne!(committed, TreeRoot::ZERO);
         assert_eq!(tree.snapshot().expect("snapshot").root(), committed);
         assert!(!tree.is_consensus_complete());
+
+        let snapshot = tree.snapshot().expect("proof snapshot");
+        let proof = snapshot.prove(&key(1)).expect("proof");
+        assert_eq!(proof.kind, ProofKind::Inclusion);
+        assert_eq!(
+            proof.verify_value(snapshot.root()).expect("verify proof"),
+            Some(b"one".to_vec())
+        );
+        NativeUrkelVerifier
+            .verify(&proof, snapshot.root())
+            .expect("native verifier");
     }
 
     #[test]

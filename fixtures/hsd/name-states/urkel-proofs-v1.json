@@ -1,0 +1,491 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
+    "dependency": "urkel",
+    "proofSource": "urkel/lib/proof.js"
+  },
+  "hash": "BLAKE2b-256",
+  "bits": 256,
+  "entries": [
+    {
+      "name": "alpha-proof",
+      "key": "8f9ca3f331d0e099a724c861aabc1a5906f7b92f4c3b10618c791aab9d433045",
+      "value": "00010203"
+    },
+    {
+      "name": "bravo-proof",
+      "key": "b526ea04ca1a2407609ce6fee2d089a97a1191db4af69fce8a59b31b4a35ea7b",
+      "value": "68616e647368616b65"
+    },
+    {
+      "name": "charlie-proof",
+      "key": "c1ede907713bb23a7d62405418499ffa16287646451329c36f22ff3e1b09ba6c",
+      "value": "333333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "name": "delta-proof",
+      "key": "c36b9c7594a3d7c5a00c9d97345b0f8b57e0c967c2b2f0892d7bb97250fbd351",
+      "value": "deadbeef00"
+    },
+    {
+      "name": "echo-proof",
+      "key": "b0efdc1d51476844017f0739d38cbca8ffa2088b633ac5a3ccbad951c0061414",
+      "value": "55555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+    },
+    {
+      "name": "foxtrot-proof",
+      "key": "3c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2",
+      "value": "75726b656c2d70726f6f662d77697265"
+    },
+    {
+      "name": "golf-proof",
+      "key": "a8f313877541be49ca49483e713aac1c0ee66bf36e11d77806fd721ae28e3e0c",
+      "value": "77"
+    },
+    {
+      "name": "hotel-proof",
+      "key": "4b14956c228bb9ee98dd19e629e77e1c75dde95463262772f204ccb01317047c",
+      "value": "8888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888"
+    }
+  ],
+  "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+  "proofs": [
+    {
+      "id": "empty-tree-deadend",
+      "root": "0000000000000000000000000000000000000000000000000000000000000000",
+      "key": "0d516ac48958d945bb52fda678360bb8c05904a4ffe8c4de0f87e467ba8c8a17",
+      "kind": "nonInclusion",
+      "type": "TYPE_DEADEND",
+      "depth": 0,
+      "nodeCount": 0,
+      "json": {
+        "type": "TYPE_DEADEND",
+        "depth": 0,
+        "nodes": []
+      },
+      "raw": "00000000",
+      "rawBlake2b256": "11da6d1f761ddf9bdb4c9d6e5303ebd41f61858d0a5647a1a7bfe089bf921be9",
+      "value": null,
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "included-alpha-proof",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "8f9ca3f331d0e099a724c861aabc1a5906f7b92f4c3b10618c791aab9d433045",
+      "kind": "inclusion",
+      "type": "TYPE_EXISTS",
+      "depth": 3,
+      "nodeCount": 3,
+      "json": {
+        "type": "TYPE_EXISTS",
+        "depth": 3,
+        "nodes": [
+          [
+            "",
+            "08ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e"
+          ],
+          [
+            "",
+            "89fdfeee71539b6fc6020cb25173cd2ec986f83abab0a9d59411893e887875d8"
+          ],
+          [
+            "",
+            "3049a050258883441796a0c2263168cf9c1143b98e25b3a86157c7045444e20b"
+          ]
+        ],
+        "value": "00010203"
+      },
+      "raw": "03c003000008ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e89fdfeee71539b6fc6020cb25173cd2ec986f83abab0a9d59411893e887875d83049a050258883441796a0c2263168cf9c1143b98e25b3a86157c7045444e20b040000010203",
+      "rawBlake2b256": "60adbdd828cf42bd063f490ae9b6ac49e49e3b6bcc6831c27cf1a9ff475c1a85",
+      "value": "00010203",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "included-bravo-proof",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "b526ea04ca1a2407609ce6fee2d089a97a1191db4af69fce8a59b31b4a35ea7b",
+      "kind": "inclusion",
+      "type": "TYPE_EXISTS",
+      "depth": 6,
+      "nodeCount": 5,
+      "json": {
+        "type": "TYPE_EXISTS",
+        "depth": 6,
+        "nodes": [
+          [
+            "",
+            "08ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e"
+          ],
+          [
+            "",
+            "89fdfeee71539b6fc6020cb25173cd2ec986f83abab0a9d59411893e887875d8"
+          ],
+          [
+            "",
+            "83a829ef84d6fe1f92cd6ed70dd20f6ae3a8e00d37d951bbc752b2b3b06e8204"
+          ],
+          [
+            "",
+            "96a0bf1598b29966895ef3d95244e7e41bb740e0061b60c9a9a0240874e971b5"
+          ],
+          [
+            "0",
+            "d0744704b0dfe8254600e3c514b12068d8a6bd476fccd6c5204c6b2a7e0d4454"
+          ]
+        ],
+        "value": "68616e647368616b65"
+      },
+      "raw": "06c005000808ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e89fdfeee71539b6fc6020cb25173cd2ec986f83abab0a9d59411893e887875d883a829ef84d6fe1f92cd6ed70dd20f6ae3a8e00d37d951bbc752b2b3b06e820496a0bf1598b29966895ef3d95244e7e41bb740e0061b60c9a9a0240874e971b50100d0744704b0dfe8254600e3c514b12068d8a6bd476fccd6c5204c6b2a7e0d4454090068616e647368616b65",
+      "rawBlake2b256": "a04acb61aba70fe83af5a3d960688eb469f66e68ba6c32237fc88fccd8f39b2c",
+      "value": "68616e647368616b65",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "included-charlie-proof",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "c1ede907713bb23a7d62405418499ffa16287646451329c36f22ff3e1b09ba6c",
+      "kind": "inclusion",
+      "type": "TYPE_EXISTS",
+      "depth": 7,
+      "nodeCount": 3,
+      "json": {
+        "type": "TYPE_EXISTS",
+        "depth": 7,
+        "nodes": [
+          [
+            "",
+            "08ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e"
+          ],
+          [
+            "",
+            "f789264e81a9fea73d4a4306c6e87c2815f4251c6ab57f5f6436e73a1897316d"
+          ],
+          [
+            "0000",
+            "1ed52b6ddb9149df707e5058baff9e22bfcb812ff8e035a2b7580bc9cd287021"
+          ]
+        ],
+        "value": "333333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "raw": "07c003002008ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210ef789264e81a9fea73d4a4306c6e87c2815f4251c6ab57f5f6436e73a1897316d04001ed52b6ddb9149df707e5058baff9e22bfcb812ff8e035a2b7580bc9cd2870212100333333333333333333333333333333333333333333333333333333333333333333",
+      "rawBlake2b256": "74621ffca0a59aea2773effec2e85adbccd411146466d3d9ad22e9ba1847e619",
+      "value": "333333333333333333333333333333333333333333333333333333333333333333",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "included-delta-proof",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "c36b9c7594a3d7c5a00c9d97345b0f8b57e0c967c2b2f0892d7bb97250fbd351",
+      "kind": "inclusion",
+      "type": "TYPE_EXISTS",
+      "depth": 7,
+      "nodeCount": 3,
+      "json": {
+        "type": "TYPE_EXISTS",
+        "depth": 7,
+        "nodes": [
+          [
+            "",
+            "08ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e"
+          ],
+          [
+            "",
+            "f789264e81a9fea73d4a4306c6e87c2815f4251c6ab57f5f6436e73a1897316d"
+          ],
+          [
+            "0000",
+            "795975f88d7a3d9faf04acb0b541c65df9308de3e3580cbce81e4ef6b5d066d5"
+          ]
+        ],
+        "value": "deadbeef00"
+      },
+      "raw": "07c003002008ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210ef789264e81a9fea73d4a4306c6e87c2815f4251c6ab57f5f6436e73a1897316d0400795975f88d7a3d9faf04acb0b541c65df9308de3e3580cbce81e4ef6b5d066d50500deadbeef00",
+      "rawBlake2b256": "638cdb3dca64b3da0f6b9abd4c14603e2d3030091577f7a334fd453102a3f4ca",
+      "value": "deadbeef00",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "included-echo-proof",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "b0efdc1d51476844017f0739d38cbca8ffa2088b633ac5a3ccbad951c0061414",
+      "kind": "inclusion",
+      "type": "TYPE_EXISTS",
+      "depth": 6,
+      "nodeCount": 5,
+      "json": {
+        "type": "TYPE_EXISTS",
+        "depth": 6,
+        "nodes": [
+          [
+            "",
+            "08ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e"
+          ],
+          [
+            "",
+            "89fdfeee71539b6fc6020cb25173cd2ec986f83abab0a9d59411893e887875d8"
+          ],
+          [
+            "",
+            "83a829ef84d6fe1f92cd6ed70dd20f6ae3a8e00d37d951bbc752b2b3b06e8204"
+          ],
+          [
+            "",
+            "96a0bf1598b29966895ef3d95244e7e41bb740e0061b60c9a9a0240874e971b5"
+          ],
+          [
+            "0",
+            "6ed572a45d948c1f9a1e8c28e030a2a8f7f2b99109965919310c8e4623c79d92"
+          ]
+        ],
+        "value": "55555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "raw": "06c005000808ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e89fdfeee71539b6fc6020cb25173cd2ec986f83abab0a9d59411893e887875d883a829ef84d6fe1f92cd6ed70dd20f6ae3a8e00d37d951bbc752b2b3b06e820496a0bf1598b29966895ef3d95244e7e41bb740e0061b60c9a9a0240874e971b501006ed572a45d948c1f9a1e8c28e030a2a8f7f2b99109965919310c8e4623c79d92400055555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+      "rawBlake2b256": "43c7aaef5dec5cb2d02807841e3a3db9f3c70d961a2fd242719e5fbb7dcc2e22",
+      "value": "55555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "included-foxtrot-proof",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "3c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2",
+      "kind": "inclusion",
+      "type": "TYPE_EXISTS",
+      "depth": 2,
+      "nodeCount": 2,
+      "json": {
+        "type": "TYPE_EXISTS",
+        "depth": 2,
+        "nodes": [
+          [
+            "",
+            "b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663b"
+          ],
+          [
+            "",
+            "e4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f17"
+          ]
+        ],
+        "value": "75726b656c2d70726f6f662d77697265"
+      },
+      "raw": "02c0020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f17100075726b656c2d70726f6f662d77697265",
+      "rawBlake2b256": "71a89faecacf25d47d7992ba34c641c2ec17f43c2c3708cc484fb90b1d9ff82d",
+      "value": "75726b656c2d70726f6f662d77697265",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "included-golf-proof",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "a8f313877541be49ca49483e713aac1c0ee66bf36e11d77806fd721ae28e3e0c",
+      "kind": "inclusion",
+      "type": "TYPE_EXISTS",
+      "depth": 4,
+      "nodeCount": 4,
+      "json": {
+        "type": "TYPE_EXISTS",
+        "depth": 4,
+        "nodes": [
+          [
+            "",
+            "08ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e"
+          ],
+          [
+            "",
+            "89fdfeee71539b6fc6020cb25173cd2ec986f83abab0a9d59411893e887875d8"
+          ],
+          [
+            "",
+            "83a829ef84d6fe1f92cd6ed70dd20f6ae3a8e00d37d951bbc752b2b3b06e8204"
+          ],
+          [
+            "",
+            "6b4758f46e9c01b223b31d22d006fd6100a32ed492a2b77ae505b3d8f8a97f27"
+          ]
+        ],
+        "value": "77"
+      },
+      "raw": "04c004000008ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e89fdfeee71539b6fc6020cb25173cd2ec986f83abab0a9d59411893e887875d883a829ef84d6fe1f92cd6ed70dd20f6ae3a8e00d37d951bbc752b2b3b06e82046b4758f46e9c01b223b31d22d006fd6100a32ed492a2b77ae505b3d8f8a97f27010077",
+      "rawBlake2b256": "dcb904c61f966ec0756856607b82dc93326d3bc3796c2bcc2052bd910072e2f2",
+      "value": "77",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "included-hotel-proof",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "4b14956c228bb9ee98dd19e629e77e1c75dde95463262772f204ccb01317047c",
+      "kind": "inclusion",
+      "type": "TYPE_EXISTS",
+      "depth": 2,
+      "nodeCount": 2,
+      "json": {
+        "type": "TYPE_EXISTS",
+        "depth": 2,
+        "nodes": [
+          [
+            "",
+            "b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663b"
+          ],
+          [
+            "",
+            "8170314032d2477ee3bc1566edde4a391976f632015d2221a0a1698e3d2faf0f"
+          ]
+        ],
+        "value": "8888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888"
+      },
+      "raw": "02c0020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663b8170314032d2477ee3bc1566edde4a391976f632015d2221a0a1698e3d2faf0f01018888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888",
+      "rawBlake2b256": "ff24f6b80bc6227960b9968451273e429c2ad212b2f8a56877183e9e35617a68",
+      "value": "8888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "missing-short-prefix",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "e4c5923b20bd6ade4dfbc2afe74ec66d9c5aceefeb7a4905f9459b3400658037",
+      "kind": "nonInclusion",
+      "type": "TYPE_SHORT",
+      "depth": 2,
+      "nodeCount": 2,
+      "json": {
+        "type": "TYPE_SHORT",
+        "depth": 2,
+        "nodes": [
+          [
+            "",
+            "08ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210e"
+          ],
+          [
+            "",
+            "f789264e81a9fea73d4a4306c6e87c2815f4251c6ab57f5f6436e73a1897316d"
+          ]
+        ],
+        "prefix": "0000",
+        "left": "795975f88d7a3d9faf04acb0b541c65df9308de3e3580cbce81e4ef6b5d066d5",
+        "right": "1ed52b6ddb9149df707e5058baff9e22bfcb812ff8e035a2b7580bc9cd287021"
+      },
+      "raw": "024002000008ccd32448dd945f74c5df7b689096a8e9b2e7556196a2ed6567379328eb210ef789264e81a9fea73d4a4306c6e87c2815f4251c6ab57f5f6436e73a1897316d0400795975f88d7a3d9faf04acb0b541c65df9308de3e3580cbce81e4ef6b5d066d51ed52b6ddb9149df707e5058baff9e22bfcb812ff8e035a2b7580bc9cd287021",
+      "rawBlake2b256": "fd4b73585f1162f8398e6c1fe5c158a3f8b623e643b35b1afcd9382ab066ce05",
+      "value": null,
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    },
+    {
+      "id": "missing-leaf-collision",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "23e587a06765c200c68c20a62f7b9c766a29dce0a572f59268e854f30118083d",
+      "kind": "nonInclusion",
+      "type": "TYPE_COLLISION",
+      "depth": 2,
+      "nodeCount": 2,
+      "json": {
+        "type": "TYPE_COLLISION",
+        "depth": 2,
+        "nodes": [
+          [
+            "",
+            "b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663b"
+          ],
+          [
+            "",
+            "e4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f17"
+          ]
+        ],
+        "key": "3c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2",
+        "hash": "545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63"
+      },
+      "raw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63",
+      "rawBlake2b256": "36efca63aaa6f71dac21724e0930a94c7529e528d1a47afdc6fde73cf85b4902",
+      "value": null,
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK"
+    }
+  ],
+  "mutations": [
+    {
+      "id": "truncated-terminal",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "23e587a06765c200c68c20a62f7b9c766a29dce0a572f59268e854f30118083d",
+      "raw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f",
+      "decodeAccepted": false,
+      "canonicalRaw": null,
+      "verifyCode": null,
+      "verifyCodeName": null,
+      "value": null
+    },
+    {
+      "id": "trailing-byte-is-ignored-by-upstream-decoder",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "23e587a06765c200c68c20a62f7b9c766a29dce0a572f59268e854f30118083d",
+      "raw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63ff",
+      "decodeAccepted": true,
+      "canonicalRaw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63",
+      "verifyCode": 0,
+      "verifyCodeName": "PROOF_OK",
+      "value": null
+    },
+    {
+      "id": "depth-exceeds-key-bits",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "23e587a06765c200c68c20a62f7b9c766a29dce0a572f59268e854f30118083d",
+      "raw": "0181020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63",
+      "decodeAccepted": false,
+      "canonicalRaw": null,
+      "verifyCode": null,
+      "verifyCodeName": null,
+      "value": null
+    },
+    {
+      "id": "node-count-exceeds-key-bits",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "23e587a06765c200c68c20a62f7b9c766a29dce0a572f59268e854f30118083d",
+      "raw": "0280010100b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63",
+      "decodeAccepted": false,
+      "canonicalRaw": null,
+      "verifyCode": null,
+      "verifyCodeName": null,
+      "value": null
+    },
+    {
+      "id": "corrupted-terminal-hash",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "23e587a06765c200c68c20a62f7b9c766a29dce0a572f59268e854f30118083d",
+      "raw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f62",
+      "decodeAccepted": true,
+      "canonicalRaw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f62",
+      "verifyCode": 1,
+      "verifyCodeName": "PROOF_HASH_MISMATCH",
+      "value": null
+    },
+    {
+      "id": "valid-proof-against-wrong-root",
+      "root": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "key": "23e587a06765c200c68c20a62f7b9c766a29dce0a572f59268e854f30118083d",
+      "raw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63",
+      "decodeAccepted": true,
+      "canonicalRaw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63",
+      "verifyCode": 1,
+      "verifyCodeName": "PROOF_HASH_MISMATCH",
+      "value": null
+    },
+    {
+      "id": "valid-proof-against-wrong-key",
+      "root": "961d2caeea0311f64152665755a905fed00a3dd39bfa1b1217a5bbd356586f80",
+      "key": "b5ab2116de3441277ec0cfd874c27d3534569f40add267218776b0a2f741907e",
+      "raw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63",
+      "decodeAccepted": true,
+      "canonicalRaw": "0280020000b47b6f4bca3a4caf5304170027f760a4cced32b9739a0e580ffbd50a7c18663be4221ce21fbf13e813163c53a4efaf779f15da26ee65a4367e33291a09906f173c2bb709c7f6df963eef15c9a9b024d059f99fec904116fd5bc05726945e2df2545db83fd403da1091070a319d15d0d29faf383af24c68172bd6a565d0d71f63",
+      "verifyCode": 1,
+      "verifyCodeName": "PROOF_HASH_MISMATCH",
+      "value": null
+    }
+  ]
+}

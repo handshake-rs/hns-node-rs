@@ -324,6 +324,24 @@
       "blake2b256": "e7e5bab4d4ee1d12e099f543516e394e6194c8a30da0c027e024de7bd0bacc56"
     },
     {
+      "id": "urkel-proofs-v1",
+      "network": "agnostic",
+      "kind": "urkel",
+      "path": "name-states/urkel-proofs-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "urkel",
+        "proof",
+        "codec",
+        "non-inclusion",
+        "mutation-corpus",
+        "oracle"
+      ],
+      "blake2b256": "3ba44146c94cb0d078d073b1c22e7290e46d538bab08ae634d3d065c391fad34"
+    },
+    {
       "id": "name-policy-v1",
       "network": "main",
       "kind": "name-state",

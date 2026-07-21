@@ -97,6 +97,9 @@ Current evidence includes:
   rejections, with native linkage and byte-for-byte post-state checks;
 - incremental HSD Urkel roots with explicit header/pre-state and
   resulting/post-state roots;
+- canonical HSD Urkel inclusion and non-inclusion proof bytes across dead-end,
+  short, collision, and exists terminals, plus malformed, wrong-root,
+  wrong-key, and trailing-byte cases;
 - reserved-name and lockup dataset checks;
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,

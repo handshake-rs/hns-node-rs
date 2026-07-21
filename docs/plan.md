@@ -70,7 +70,8 @@ reserved low-latency paths.
   accounting, authenticated state replacement, and reverse disconnect.
 - Reserved/lockup datasets and renewal-policy fixtures.
 - Exact `NameState` encoding and undo.
-- Correctness-first exact Urkel roots and internal proofs.
+- Correctness-first exact Urkel roots plus byte-for-byte canonical HSD
+  inclusion/non-inclusion proof encoding, decoding, and verification.
 - Correct pre-state header commitment and durable resulting-root semantics.
 
 ### Live shadow networking
@@ -113,9 +114,9 @@ reserved low-latency paths.
    duplicate prevention/undo are implemented.
 2. **Contextual covenant closure** — extend the complete deterministic HSD
    transition-family corpus into mainnet history and historical exceptions.
-3. **Persistent Urkel** — incremental nodes, exact proof wire format,
-   snapshots, undo, compaction, and crash qualification while preserving exact
-   correctness-first roots.
+3. **Persistent Urkel** — incremental nodes, durable proof serving, snapshots,
+   undo, compaction, and crash qualification while preserving the qualified
+   exact roots and proof bytes.
 4. **Active-state IBD** — connect downloaded bodies through the one consensus
    pipeline, persist invalid branches, recover from restart, and qualify
    pruning/reorganizations without changing the authority boundary.
