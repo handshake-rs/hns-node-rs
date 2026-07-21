@@ -25,7 +25,10 @@ use hns_primitives::{
 use hns_store::{
     ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES,
 };
-use hns_urkel::{MemoryUrkel, NameTreeSnapshot, TreeRoot, UrkelError, UrkelProof};
+use hns_urkel::{
+    prove_hsd_from_records, validate_record_tree, MemoryUrkel, NameTreeSnapshot, TreeRoot,
+    UrkelError, UrkelProof,
+};
 use serde::{Deserialize, Serialize};
 
 const BLOCK_UNDO_VERSION: u32 = 5;
@@ -585,6 +588,16 @@ impl<S: Store> StoredStateEngine<S> {
         let snapshot = self.store.snapshot()?;
         materialize_name_tree_snapshot(&snapshot)
     }
+
+    /// Generate a path-local proof from the content-addressed durable node
+    /// records bound to the current root. Only records on the requested path
+    /// are loaded and each is rehashed before use.
+    pub fn name_proof(&self, name_hash: NameHash) -> Result<(TreeRoot, UrkelProof), StateError> {
+        let snapshot = self.store.snapshot()?;
+        let root = load_stored_name_tree_root(&snapshot)?;
+        let proof = prove_persisted_name_tree(&snapshot, root, name_hash)?;
+        Ok((root, proof))
+    }
 }
 
 impl<S: Store> StateView for StoredStateEngine<S> {
@@ -684,6 +697,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     // applied only after this comparison and produce the root committed by the
     // following block.
     let inherited_tree_root = verify_stored_name_tree_root(snapshot)?;
+    validate_persisted_name_tree(snapshot, inherited_tree_root)?;
     let committed_tree_root = TreeRoot::new(request.block.header.tree_root);
     if committed_tree_root != inherited_tree_root {
         return Err(StateError::HeaderTreeRootMismatch {
@@ -862,7 +876,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         name_overrides.insert(*name_hash, (!state.is_null()).then_some(state.clone()));
     }
 
-    let resulting_tree_root = rebuild_name_tree_root_with_overrides(snapshot, &name_overrides)?;
+    let resulting_tree_root = stage_name_tree_with_overrides(snapshot, batch, &name_overrides)?;
     batch.put(
         ColumnFamily::Meta,
         MetaKey::NameTreeRoot.as_bytes(),
@@ -1453,6 +1467,7 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
     }
 
     let current_tree_root = verify_stored_name_tree_root(snapshot)?;
+    validate_persisted_name_tree(snapshot, current_tree_root)?;
     if current_tree_root != undo.resulting_tree_root {
         return Err(StateError::UndoResultingTreeRootMismatch {
             expected: undo.resulting_tree_root,
@@ -1486,7 +1501,7 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
                 .cloned(),
         );
     }
-    let restored_tree_root = rebuild_name_tree_root_with_overrides(snapshot, &name_overrides)?;
+    let restored_tree_root = stage_name_tree_with_overrides(snapshot, batch, &name_overrides)?;
     if restored_tree_root != undo.previous_tree_root {
         return Err(StateError::UndoPreviousTreeRootMismatch {
             expected: undo.previous_tree_root,
@@ -1611,6 +1626,61 @@ fn materialize_name_tree_with_overrides<T: ReadSnapshot>(
     }
 
     MemoryUrkel::from_entries(entries).map_err(StateError::NameTree)
+}
+
+/// Stage every previously unseen content-addressed record reachable from the
+/// next root in the same state batch. Existing records must be byte-identical;
+/// conflicting bytes under an authenticated key are durable corruption.
+fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    overrides: &BTreeMap<NameHash, Option<NameState>>,
+) -> Result<TreeRoot, StateError> {
+    let tree = materialize_name_tree_with_overrides(snapshot, overrides)?;
+    let root = tree.root();
+    for (node_root, raw) in tree.node_records()? {
+        match snapshot.get(ColumnFamily::NameTreeNodes, node_root.as_bytes())? {
+            Some(existing) if existing != raw => {
+                return Err(StateError::PersistedNodeConflict(node_root));
+            }
+            Some(_) => {}
+            None => batch.put(ColumnFamily::NameTreeNodes, node_root.as_bytes(), &raw)?,
+        }
+    }
+    Ok(root)
+}
+
+fn load_persisted_node<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+) -> Result<Option<Vec<u8>>, UrkelError> {
+    snapshot
+        .get(ColumnFamily::NameTreeNodes, root.as_bytes())
+        .map_err(|error| UrkelError::Storage(error.to_string()))
+}
+
+/// Verify every unique content-addressed record reachable from the durable
+/// root. The materialized `NameState` root must be checked separately (startup
+/// does both) so neither representation can silently authorize the other.
+pub fn validate_persisted_name_tree<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+) -> Result<usize, StateError> {
+    validate_record_tree(root, |node_root| load_persisted_node(snapshot, node_root))
+        .map_err(StateError::NameTree)
+}
+
+/// Generate one canonical HSD inclusion/non-inclusion proof by traversing only
+/// the durable records on `name_hash`'s path from the supplied bound root.
+pub fn prove_persisted_name_tree<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+    name_hash: NameHash,
+) -> Result<UrkelProof, StateError> {
+    prove_hsd_from_records(root, name_hash, |node_root| {
+        load_persisted_node(snapshot, node_root)
+    })
+    .map_err(StateError::NameTree)
 }
 
 /// Immutable exact-proof view rebuilt from one durable store snapshot after
@@ -1950,6 +2020,8 @@ pub enum StateError {
     InvalidStoredTreeRootLength(usize),
     #[error("durable name-tree root {stored:?} does not match materialized name state {actual:?}")]
     StoredTreeRootMismatch { stored: TreeRoot, actual: TreeRoot },
+    #[error("durable urkel node key {0:?} maps to conflicting record bytes")]
+    PersistedNodeConflict(TreeRoot),
     #[error(
         "block header commits to name-tree root {committed:?}, but inherited state root is {inherited:?}"
     )]
@@ -2523,29 +2595,38 @@ mod tests {
 
         let store = MemoryStore::new();
         hns_store::initialize_schema(&store).expect("schema");
-        for (state, expected) in fixture.states.iter().zip(&fixture.incremental_roots) {
+        for (index, (state, expected)) in fixture
+            .states
+            .iter()
+            .zip(&fixture.incremental_roots)
+            .enumerate()
+        {
             let snapshot = store.snapshot().expect("pre-state snapshot");
             assert_eq!(
                 verify_stored_name_tree_root(&snapshot).expect("pre-state root"),
                 TreeRoot::new(decode_hash(&expected.header_root))
             );
-            drop(snapshot);
 
+            let name_hash = NameHash::new(decode_hash(&state.name_hash));
+            let encoded = decode_fixture_bytes(&state.encoded);
+            let decoded = decode_name_state(&name_hash, &encoded).expect("decode state");
             let mut batch = store.batch();
-            batch
-                .put(
-                    ColumnFamily::NameState,
-                    &decode_hash(&state.name_hash),
-                    &decode_fixture_bytes(&state.encoded),
-                )
-                .expect("put");
+            write_name_state_to_batch(&mut batch, &decoded).expect("write state");
+            let overrides = BTreeMap::from([(name_hash, Some(decoded))]);
+            let staged_root =
+                stage_name_tree_with_overrides(&snapshot, &mut batch, &overrides).expect("stage");
+            assert_eq!(
+                staged_root,
+                TreeRoot::new(decode_hash(&expected.resulting_root))
+            );
             batch
                 .put(
                     ColumnFamily::Meta,
                     MetaKey::NameTreeRoot.as_bytes(),
-                    &decode_hash(&expected.resulting_root),
+                    staged_root.as_bytes(),
                 )
                 .expect("bind resulting root");
+            drop(snapshot);
             store.commit(batch).expect("commit");
             let snapshot = store.snapshot().expect("snapshot");
             assert_eq!(expected.root, expected.resulting_root);
@@ -2556,6 +2637,17 @@ mod tests {
             assert_eq!(
                 verify_stored_name_tree_root(&snapshot).expect("bound root"),
                 TreeRoot::new(decode_hash(&expected.resulting_root))
+            );
+            assert_eq!(
+                validate_persisted_name_tree(&snapshot, staged_root).expect("persisted node tree"),
+                index * 2 + 1
+            );
+            assert_eq!(
+                prove_persisted_name_tree(&snapshot, staged_root, name_hash)
+                    .expect("persisted proof")
+                    .verify_value(staged_root)
+                    .expect("verify proof"),
+                Some(encoded)
             );
         }
     }
@@ -2654,6 +2746,120 @@ mod tests {
                 .expect("repeat proof")
                 .raw,
             second_proof.raw
+        );
+    }
+
+    #[test]
+    fn persisted_name_tree_proofs_survive_restart_and_reject_node_faults() {
+        let store = MemoryStore::new();
+        let mut state = engine(store.clone());
+        let name = "hsrdpersistedproof";
+        let name_hash = hash_name(name).expect("name hash");
+        let mut opening = block(90, vec![coinbase(vec![open_output(name.as_bytes())])]);
+        opening.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let summary = state
+            .connect_block(ConnectBlock {
+                block_hash: opening.hash(),
+                height: 100,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &opening,
+            })
+            .expect("connect opening");
+        assert_ne!(summary.resulting_tree_root, TreeRoot::ZERO);
+
+        let (root, proof) = state.name_proof(name_hash).expect("persisted proof");
+        let absent_hash = hash_name("hsrdabsentproof").expect("absent name hash");
+        let (_, absent_proof) = state.name_proof(absent_hash).expect("non-inclusion proof");
+        assert_eq!(root, summary.resulting_tree_root);
+        let snapshot = store.snapshot().expect("snapshot");
+        let encoded = snapshot
+            .get(ColumnFamily::NameState, name_hash.as_bytes())
+            .expect("name state read")
+            .expect("name state");
+        let nodes = snapshot
+            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+            .expect("node records");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            validate_persisted_name_tree(&snapshot, root).expect("validate records"),
+            nodes.len()
+        );
+        assert_eq!(
+            proof.verify_value(root).expect("verify proof"),
+            Some(encoded)
+        );
+        assert_eq!(
+            absent_proof
+                .verify_value(root)
+                .expect("verify non-inclusion proof"),
+            None
+        );
+        let root_record = snapshot
+            .get(ColumnFamily::NameTreeNodes, root.as_bytes())
+            .expect("root read")
+            .expect("root record");
+        drop(snapshot);
+        drop(state);
+
+        let mut reopened = engine(store.clone());
+        let (_, repeated) = reopened.name_proof(name_hash).expect("reopened proof");
+        assert_eq!(repeated.raw, proof.raw);
+        let (_, repeated_absent) = reopened
+            .name_proof(absent_hash)
+            .expect("reopened non-inclusion proof");
+        assert_eq!(repeated_absent.raw, absent_proof.raw);
+
+        let mut missing = store.batch();
+        missing
+            .delete(ColumnFamily::NameTreeNodes, root.as_bytes())
+            .expect("delete root record");
+        store.commit(missing).expect("commit missing record");
+        assert!(matches!(
+            reopened.name_proof(name_hash),
+            Err(StateError::NameTree(UrkelError::MissingNode(missing_root)))
+                if missing_root == root
+        ));
+
+        let mut corrupted = root_record;
+        *corrupted.last_mut().expect("record byte") ^= 1;
+        let mut corrupt = store.batch();
+        corrupt
+            .put(ColumnFamily::NameTreeNodes, root.as_bytes(), &corrupted)
+            .expect("corrupt root record");
+        store.commit(corrupt).expect("commit corrupt record");
+        assert!(matches!(
+            reopened.name_proof(name_hash),
+            Err(StateError::NameTree(UrkelError::NodeHashMismatch {
+                expected,
+                ..
+            })) if expected == root
+        ));
+
+        let mut next = block(91, vec![coinbase(Vec::new())]);
+        next.header.tree_root = *root.as_bytes();
+        let next_hash = next.hash();
+        assert!(matches!(
+            reopened.connect_block(ConnectBlock {
+                block_hash: next_hash,
+                height: 201,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &next,
+            }),
+            Err(StateError::NameTree(UrkelError::NodeHashMismatch {
+                expected,
+                ..
+            })) if expected == root
+        ));
+        let snapshot = store.snapshot().expect("post-rejection snapshot");
+        assert!(snapshot
+            .get(ColumnFamily::Undo, next_hash.as_bytes())
+            .expect("undo read")
+            .is_none());
+        assert_eq!(
+            load_stored_name_tree_root(&snapshot).expect("stored root"),
+            root
         );
     }
 

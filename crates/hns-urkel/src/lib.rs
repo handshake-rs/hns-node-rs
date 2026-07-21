@@ -20,7 +20,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, RwLock},
 };
 
@@ -30,13 +30,16 @@ use serde::{Deserialize, Serialize};
 pub const URKEL_BITS: usize = 256;
 pub const EMPTY_ROOT: [u8; 32] = [0; 32];
 pub const MAX_HSD_PROOF_SIZE: usize = 82_469;
+pub const MAX_URKEL_NODE_RECORD_SIZE: usize = 1 + 32 + 4 + MAX_TX_SIZE;
 
 const HSD_PROOF_DEADEND: u16 = 0;
 const HSD_PROOF_SHORT: u16 = 1;
 const HSD_PROOF_COLLISION: u16 = 2;
 const HSD_PROOF_EXISTS: u16 = 3;
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 pub struct TreeRoot([u8; 32]);
 
 impl TreeRoot {
@@ -490,11 +493,330 @@ impl MemoryUrkel {
         })
     }
 
+    /// Encode every reachable node under its authenticated hash. Records are
+    /// history-independent and content-addressed: an unchanged subtree keeps
+    /// the same key and bytes across generations.
+    pub fn node_records(&self) -> Result<BTreeMap<TreeRoot, Vec<u8>>, UrkelError> {
+        let mut records = BTreeMap::new();
+        let root = build_root(&self.entries).collect_records(&mut records)?;
+        debug_assert_eq!(root, self.root());
+        Ok(records)
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = (&NameHash, &[u8])> {
         self.entries
             .iter()
             .map(|(key, value)| (key, value.as_slice()))
     }
+}
+
+/// Canonical durable representation of one content-addressed Urkel node.
+/// The record bytes are not HSD's filesystem format; their authenticated hash
+/// is exactly the HSD/Urkel node hash used by roots and proofs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UrkelNodeRecord {
+    Leaf {
+        key: NameHash,
+        value: Vec<u8>,
+    },
+    Internal {
+        prefix: BitPrefix,
+        left: TreeRoot,
+        right: TreeRoot,
+    },
+}
+
+impl UrkelNodeRecord {
+    const LEAF_TAG: u8 = 0;
+    const INTERNAL_TAG: u8 = 1;
+
+    pub fn decode(raw: &[u8]) -> Result<Self, UrkelError> {
+        if raw.len() > MAX_URKEL_NODE_RECORD_SIZE {
+            return Err(UrkelError::Codec(format!(
+                "Urkel node record uses {} bytes, exceeding {MAX_URKEL_NODE_RECORD_SIZE}",
+                raw.len()
+            )));
+        }
+        let Some((&tag, payload)) = raw.split_first() else {
+            return Err(UrkelError::Codec("empty Urkel node record".to_owned()));
+        };
+        match tag {
+            Self::LEAF_TAG => {
+                if payload.len() < 36 {
+                    return Err(UrkelError::Codec("truncated Urkel leaf record".to_owned()));
+                }
+                let key = NameHash::new(payload[..32].try_into().expect("leaf key"));
+                let size = u32::from_le_bytes(payload[32..36].try_into().expect("value size"));
+                let size = usize::try_from(size).map_err(|_| {
+                    UrkelError::Codec("Urkel leaf value length does not fit usize".to_owned())
+                })?;
+                validate_value_size(size)?;
+                let expected = 36usize
+                    .checked_add(size)
+                    .ok_or_else(|| UrkelError::Codec("Urkel leaf length overflowed".to_owned()))?;
+                if payload.len() != expected {
+                    return Err(UrkelError::Codec(format!(
+                        "Urkel leaf record declares {size} value bytes but contains {}",
+                        payload.len().saturating_sub(36)
+                    )));
+                }
+                Ok(Self::Leaf {
+                    key,
+                    value: payload[36..].to_vec(),
+                })
+            }
+            Self::INTERNAL_TAG => {
+                if payload.len() < 66 {
+                    return Err(UrkelError::Codec(
+                        "truncated Urkel internal record".to_owned(),
+                    ));
+                }
+                let bit_len = usize::from(u16::from_le_bytes(
+                    payload[..2].try_into().expect("prefix size"),
+                ));
+                if bit_len > URKEL_BITS {
+                    return Err(UrkelError::Codec(format!(
+                        "Urkel internal prefix uses {bit_len} bits"
+                    )));
+                }
+                let prefix_bytes = bit_len.div_ceil(8);
+                let expected = 2usize
+                    .checked_add(prefix_bytes)
+                    .and_then(|size| size.checked_add(64))
+                    .ok_or_else(|| {
+                        UrkelError::Codec("Urkel internal length overflowed".to_owned())
+                    })?;
+                if payload.len() != expected {
+                    return Err(UrkelError::Codec(format!(
+                        "Urkel internal record uses {} payload bytes; expected {expected}",
+                        payload.len()
+                    )));
+                }
+                let prefix = BitPrefix {
+                    bit_len: bit_len as u16,
+                    bytes: payload[2..2 + prefix_bytes].to_vec(),
+                };
+                prefix.validate()?;
+                let left = TreeRoot::new(
+                    payload[2 + prefix_bytes..34 + prefix_bytes]
+                        .try_into()
+                        .expect("left hash"),
+                );
+                let right = TreeRoot::new(
+                    payload[34 + prefix_bytes..66 + prefix_bytes]
+                        .try_into()
+                        .expect("right hash"),
+                );
+                if left == TreeRoot::ZERO || right == TreeRoot::ZERO {
+                    return Err(UrkelError::Codec(
+                        "compressed Urkel internal node has an empty child".to_owned(),
+                    ));
+                }
+                Ok(Self::Internal {
+                    prefix,
+                    left,
+                    right,
+                })
+            }
+            other => Err(UrkelError::Codec(format!(
+                "unknown Urkel node-record tag {other}"
+            ))),
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, UrkelError> {
+        match self {
+            Self::Leaf { key, value } => {
+                validate_value_size(value.len())?;
+                let size = u32::try_from(value.len()).map_err(|_| {
+                    UrkelError::Codec("Urkel leaf value exceeds u32 length".to_owned())
+                })?;
+                let mut raw = Vec::with_capacity(37 + value.len());
+                raw.push(Self::LEAF_TAG);
+                raw.extend_from_slice(key.as_bytes());
+                raw.extend_from_slice(&size.to_le_bytes());
+                raw.extend_from_slice(value);
+                Ok(raw)
+            }
+            Self::Internal {
+                prefix,
+                left,
+                right,
+            } => {
+                prefix.validate()?;
+                if *left == TreeRoot::ZERO || *right == TreeRoot::ZERO {
+                    return Err(UrkelError::InvalidNode(
+                        "compressed internal node has an empty child".to_owned(),
+                    ));
+                }
+                let mut raw = Vec::with_capacity(67 + prefix.bytes().len());
+                raw.push(Self::INTERNAL_TAG);
+                raw.extend_from_slice(&(prefix.bit_len() as u16).to_le_bytes());
+                raw.extend_from_slice(prefix.bytes());
+                raw.extend_from_slice(left.as_bytes());
+                raw.extend_from_slice(right.as_bytes());
+                Ok(raw)
+            }
+        }
+    }
+
+    pub fn root(&self) -> TreeRoot {
+        match self {
+            Self::Leaf { key, value } => {
+                TreeRoot::new(hash_leaf(key.as_bytes(), &blake2b_256(value)))
+            }
+            Self::Internal {
+                prefix,
+                left,
+                right,
+            } => TreeRoot::new(hash_internal(prefix, left.as_bytes(), right.as_bytes())),
+        }
+    }
+}
+
+/// Produce an exact HSD proof by loading only the records on the requested
+/// path. Each content-addressed record is decoded canonically and rehashed
+/// before it is trusted.
+pub fn prove_hsd_from_records<F>(
+    root: TreeRoot,
+    key: NameHash,
+    mut load: F,
+) -> Result<UrkelProof, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    let mut steps = Vec::new();
+    let mut depth = 0usize;
+    let mut current = root;
+    let terminal = loop {
+        if current == TreeRoot::ZERO {
+            break MemoryProofTerminal::Empty;
+        }
+        let record = load_verified_record(current, &mut load)?;
+        match record {
+            UrkelNodeRecord::Leaf {
+                key: leaf_key,
+                value,
+            } => {
+                break if leaf_key == key {
+                    MemoryProofTerminal::Inclusion { value }
+                } else {
+                    MemoryProofTerminal::Collision {
+                        key: leaf_key,
+                        value_hash: blake2b_256(&value),
+                    }
+                };
+            }
+            UrkelNodeRecord::Internal {
+                prefix,
+                left,
+                right,
+            } => {
+                if !prefix.matches_key(key.as_bytes(), depth) {
+                    break MemoryProofTerminal::DeadEnd {
+                        prefix,
+                        left: left.into_inner(),
+                        right: right.into_inner(),
+                    };
+                }
+                let branch_depth = depth.checked_add(prefix.bit_len()).ok_or_else(|| {
+                    UrkelError::InvalidNode("Urkel proof path depth overflowed".to_owned())
+                })?;
+                if branch_depth >= URKEL_BITS {
+                    return Err(UrkelError::InvalidNode(
+                        "Urkel internal path exceeds the key".to_owned(),
+                    ));
+                }
+                let branch = key_bit(key.as_bytes(), branch_depth);
+                let (next, sibling) = if branch == 0 {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                steps.push(MemoryProofStep {
+                    prefix,
+                    branch,
+                    sibling: sibling.into_inner(),
+                });
+                current = next;
+                depth = branch_depth + 1;
+            }
+        }
+    };
+
+    let proof = MemoryProof {
+        key,
+        steps,
+        terminal,
+    };
+    proof.verify(root)?;
+    let structured = proof.to_hsd_proof()?;
+    Ok(UrkelProof {
+        name_hash: key,
+        kind: structured.kind(),
+        raw: structured.encode()?,
+    })
+}
+
+/// Validate every unique record reachable from `root`, including canonical
+/// decoding, content hashes, non-empty internal children, and bounded depth.
+pub fn validate_record_tree<F>(root: TreeRoot, mut load: F) -> Result<usize, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    if root == TreeRoot::ZERO {
+        return Ok(0);
+    }
+    let mut seen_nodes = BTreeSet::new();
+    let mut seen_paths = BTreeSet::new();
+    let mut pending = vec![(root, 0usize)];
+    while let Some((current, depth)) = pending.pop() {
+        if !seen_paths.insert((current, depth)) {
+            continue;
+        }
+        seen_nodes.insert(current);
+        match load_verified_record(current, &mut load)? {
+            UrkelNodeRecord::Leaf { .. } => {}
+            UrkelNodeRecord::Internal {
+                prefix,
+                left,
+                right,
+            } => {
+                let child_depth = depth
+                    .checked_add(prefix.bit_len())
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| {
+                        UrkelError::InvalidNode("Urkel record depth overflowed".to_owned())
+                    })?;
+                if child_depth > URKEL_BITS {
+                    return Err(UrkelError::InvalidNode(
+                        "Urkel record path exceeds the key".to_owned(),
+                    ));
+                }
+                pending.push((right, child_depth));
+                pending.push((left, child_depth));
+            }
+        }
+    }
+    Ok(seen_nodes.len())
+}
+
+fn load_verified_record<F>(expected: TreeRoot, load: &mut F) -> Result<UrkelNodeRecord, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    let raw = load(expected)?.ok_or(UrkelError::MissingNode(expected))?;
+    let record = UrkelNodeRecord::decode(&raw)?;
+    let actual = record.root();
+    if actual != expected {
+        return Err(UrkelError::NodeHashMismatch { expected, actual });
+    }
+    if record.encode()? != raw {
+        return Err(UrkelError::InvalidNode(
+            "Urkel node record is not canonically encoded".to_owned(),
+        ));
+    }
+    Ok(record)
 }
 
 pub fn root_from_entries<I>(entries: I) -> Result<TreeRoot, UrkelError>
@@ -889,6 +1211,36 @@ impl Node {
             } => hash_internal(prefix, &left.hash(), &right.hash()),
         }
     }
+
+    fn collect_records(
+        &self,
+        records: &mut BTreeMap<TreeRoot, Vec<u8>>,
+    ) -> Result<TreeRoot, UrkelError> {
+        let record = match self {
+            Self::Null => return Ok(TreeRoot::ZERO),
+            Self::Leaf { key, value } => UrkelNodeRecord::Leaf {
+                key: *key,
+                value: value.clone(),
+            },
+            Self::Internal {
+                prefix,
+                left,
+                right,
+            } => UrkelNodeRecord::Internal {
+                prefix: prefix.clone(),
+                left: left.collect_records(records)?,
+                right: right.collect_records(records)?,
+            },
+        };
+        let root = record.root();
+        let raw = record.encode()?;
+        if let Some(existing) = records.insert(root, raw.clone()) {
+            if existing != raw {
+                return Err(UrkelError::NodeHashCollision(root));
+            }
+        }
+        Ok(root)
+    }
 }
 
 fn build_root(entries: &BTreeMap<NameHash, Vec<u8>>) -> Node {
@@ -1201,6 +1553,17 @@ pub enum UrkelError {
     ValueTooLarge(usize),
     #[error("invalid urkel proof: {0}")]
     InvalidProof(String),
+    #[error("invalid urkel node: {0}")]
+    InvalidNode(String),
+    #[error("missing content-addressed urkel node {0:?}")]
+    MissingNode(TreeRoot),
+    #[error("urkel node hash mismatch: expected {expected:?}, got {actual:?}")]
+    NodeHashMismatch {
+        expected: TreeRoot,
+        actual: TreeRoot,
+    },
+    #[error("distinct urkel node records collide at {0:?}")]
+    NodeHashCollision(TreeRoot),
     #[error("urkel root mismatch: expected {expected:?}, got {actual:?}")]
     RootMismatch {
         expected: TreeRoot,
@@ -1348,6 +1711,16 @@ mod tests {
             TreeRoot::new(decode_hex_32(&fixture.root))
         );
         let empty = MemoryUrkel::new();
+        let empty_records = BTreeMap::new();
+        let populated_records = populated.node_records().expect("node records");
+        assert_eq!(populated_records.len(), fixture.entries.len() * 2 - 1);
+        assert_eq!(
+            validate_record_tree(populated.root(), |hash| {
+                Ok(populated_records.get(&hash).cloned())
+            })
+            .expect("record tree"),
+            populated_records.len()
+        );
         let verifier = NativeUrkelVerifier;
         assert!(verifier.is_consensus_complete());
 
@@ -1400,6 +1773,19 @@ mod tests {
             };
             assert_eq!(
                 native.prove_memory(key).encode_hsd().expect("native proof"),
+                raw,
+                "{}",
+                expected.id
+            );
+            let records = if root == TreeRoot::ZERO {
+                &empty_records
+            } else {
+                &populated_records
+            };
+            assert_eq!(
+                prove_hsd_from_records(root, key, |hash| Ok(records.get(&hash).cloned()))
+                    .expect("content-addressed proof")
+                    .raw,
                 raw,
                 "{}",
                 expected.id
@@ -1459,6 +1845,40 @@ mod tests {
         ));
         assert!(matches!(
             HsdUrkelProof::decode(&vec![0; MAX_HSD_PROOF_SIZE + 1]),
+            Err(UrkelError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn content_addressed_nodes_reject_missing_corrupt_and_noncanonical_records() {
+        let tree = MemoryUrkel::from_entries([
+            (key(7), b"alpha".to_vec()),
+            (key(11), b"beta".to_vec()),
+            (key(19), b"gamma".to_vec()),
+        ])
+        .expect("tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("records");
+
+        let mut missing = records.clone();
+        missing.remove(&root);
+        assert!(matches!(
+            prove_hsd_from_records(root, key(7), |hash| Ok(missing.get(&hash).cloned())),
+            Err(UrkelError::MissingNode(hash)) if hash == root
+        ));
+
+        let mut corrupt = records.clone();
+        let root_record = corrupt.get_mut(&root).expect("root record");
+        *root_record.last_mut().expect("record byte") ^= 1;
+        assert!(matches!(
+            validate_record_tree(root, |hash| Ok(corrupt.get(&hash).cloned())),
+            Err(UrkelError::NodeHashMismatch { expected, .. }) if expected == root
+        ));
+
+        let mut trailing = records;
+        trailing.get_mut(&root).expect("root record").push(0);
+        assert!(matches!(
+            validate_record_tree(root, |hash| Ok(trailing.get(&hash).cloned())),
             Err(UrkelError::Codec(_))
         ));
     }

@@ -103,6 +103,9 @@ Current evidence includes:
 - materialized durable name-tree proof snapshots that remain root-pinned across
   later commits, reproduce proof bytes after state-engine restart, and reject
   corrupt durable root bindings;
+- content-addressed node-record parity against every pinned HSD proof, path-local
+  durable inclusion/non-inclusion reads, memory/RocksDB reopen stability, and
+  fail-closed missing/corrupt-node handling at proof, transition, and startup;
 - reserved-name and lockup dataset checks;
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,

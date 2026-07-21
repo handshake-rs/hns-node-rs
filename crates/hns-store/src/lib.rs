@@ -13,11 +13,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v7";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v8";
 
 /// HSD's MSB-first spent-allocation field contains 216,199 airdrop positions
 /// followed by 1,358 faucet positions.
@@ -87,6 +87,7 @@ pub enum ColumnFamily {
     TxIndex,
     Utxo,
     NameState,
+    NameTreeNodes,
     Undo,
     Peers,
     Orphans,
@@ -95,7 +96,7 @@ pub enum ColumnFamily {
 }
 
 impl ColumnFamily {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Meta,
         Self::Headers,
         Self::HeightIndex,
@@ -104,6 +105,7 @@ impl ColumnFamily {
         Self::TxIndex,
         Self::Utxo,
         Self::NameState,
+        Self::NameTreeNodes,
         Self::Undo,
         Self::Peers,
         Self::Orphans,
@@ -121,6 +123,7 @@ impl ColumnFamily {
             Self::TxIndex => "tx_index",
             Self::Utxo => "utxo",
             Self::NameState => "name_state",
+            Self::NameTreeNodes => "name_tree_nodes",
             Self::Undo => "undo",
             Self::Peers => "peers",
             Self::Orphans => "orphans",

@@ -52,8 +52,9 @@ use hns_rpc::{
 };
 use hns_state::{
     connect_block_to_batch_with_services, decode_coin, decode_name_state,
-    disconnect_block_to_batch, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
-    BlockUndo, ConnectBlock, DisconnectBlock, StateServices, StoredStateEngine,
+    disconnect_block_to_batch, validate_persisted_name_tree, verify_stored_name_tree_root,
+    AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock, StateServices,
+    StoredStateEngine,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_clean_shutdown, mark_unclean_start, open_store,
@@ -1131,6 +1132,9 @@ impl NodeState {
         let snapshot = self.store.snapshot()?;
         let durable_name_tree_root = verify_stored_name_tree_root(&snapshot)
             .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?;
+        validate_persisted_name_tree(&snapshot, durable_name_tree_root).map_err(|error| {
+            anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
+        })?;
         let active_tip = best_block_tip_from_snapshot(&snapshot)?;
         let best_header = best_header_tip_from_snapshot(&snapshot)?;
         let mut heights = snapshot
@@ -3076,7 +3080,7 @@ mod tests {
         Witness,
     };
     use hns_rpc::{JsonRpcRequest, RpcService};
-    use hns_state::StateView;
+    use hns_state::{StateEngine, StateView};
     use hns_store::ReadSnapshot;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3129,6 +3133,24 @@ mod tests {
             }],
             locktime: 0,
         }
+    }
+
+    fn open_coinbase_transaction(name: &[u8]) -> Transaction {
+        let mut transaction = coinbase_transaction();
+        let name_hash = NameHash::new(hns_primitives::sha3_256(name));
+        transaction.outputs.push(Output {
+            value: 0,
+            address: Address::new(0, vec![7; 20]).expect("address"),
+            covenant: Covenant {
+                kind: CovenantKind::Open,
+                items: vec![
+                    name_hash.as_bytes().to_vec(),
+                    0u32.to_le_bytes().to_vec(),
+                    name.to_vec(),
+                ],
+            },
+        });
+        transaction
     }
 
     fn block_with_commitments(transactions: Vec<Transaction>) -> hns_primitives::Block {
@@ -3739,6 +3761,135 @@ mod tests {
                 .expect_err("deployment-state corruption");
             assert!(error.to_string().contains("deployment-state"), "{error}");
         }
+    }
+
+    #[test]
+    fn startup_rejects_missing_or_corrupt_content_addressed_name_nodes() {
+        for missing in [true, false] {
+            let store = StoreHandle::memory();
+            let state =
+                NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+            let mut node = NodeService::try_with_state(
+                NodeConfig {
+                    network: Network::Regtest,
+                    ..NodeConfig::default()
+                },
+                state,
+            )
+            .expect("node");
+            let active = block_with_commitments(vec![coinbase_transaction()]);
+            node.connect_block(NodeBlockImport::fixture(active, 0, 1))
+                .expect("connect active block");
+            drop(node);
+            let name_block =
+                block_with_commitments(vec![open_coinbase_transaction(b"persistedstartupnode")]);
+            let mut proof_state =
+                StoredStateEngine::with_native_authorization_and_verified_name_flags(
+                    store.clone(),
+                    Network::Regtest,
+                    NameFlags::NONE,
+                )
+                .expect("proof state");
+            proof_state
+                .connect_block(ConnectBlock {
+                    block_hash: name_block.hash(),
+                    height: 200,
+                    coinbase_maturity: 0,
+                    block_reward: 50,
+                    block: &name_block,
+                })
+                .expect("stage authenticated name state");
+            drop(proof_state);
+
+            let snapshot = store.snapshot().expect("snapshot");
+            let root = snapshot
+                .get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())
+                .expect("root read")
+                .expect("root");
+            let mut record = snapshot
+                .get(ColumnFamily::NameTreeNodes, &root)
+                .expect("record read")
+                .expect("record");
+            drop(snapshot);
+
+            let mut batch = store.batch();
+            if missing {
+                batch
+                    .delete(ColumnFamily::NameTreeNodes, &root)
+                    .expect("delete record");
+            } else {
+                *record.last_mut().expect("record byte") ^= 1;
+                batch
+                    .put(ColumnFamily::NameTreeNodes, &root, &record)
+                    .expect("corrupt record");
+            }
+            store.commit(batch).expect("commit node fault");
+
+            let error = NodeState::from_store_for_network(store, Network::Regtest)
+                .expect_err("content-addressed name-tree corruption");
+            assert!(error.to_string().contains("content-addressed"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn content_addressed_name_proofs_survive_rocksdb_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-proof-reopen-{}-{}",
+            std::process::id(),
+            current_unix_time().expect("time")
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let config = StoreConfig {
+            path: path.clone(),
+            backend: StoreBackend::RocksDb,
+            durability: DurabilityPolicy::Sync,
+        };
+        let name = b"persistedrocksproof";
+        let name_hash = NameHash::new(hns_primitives::sha3_256(name));
+        let expected;
+
+        {
+            let store = open_store(&config).expect("open store");
+            let mut state = StoredStateEngine::with_native_authorization_and_verified_name_flags(
+                store,
+                Network::Regtest,
+                NameFlags::NONE,
+            )
+            .expect("state");
+            let block = block_with_commitments(vec![open_coinbase_transaction(name)]);
+            state
+                .connect_block(ConnectBlock {
+                    block_hash: block.hash(),
+                    height: 200,
+                    coinbase_maturity: 0,
+                    block_reward: 50,
+                    block: &block,
+                })
+                .expect("connect name state");
+            let (root, proof) = state.name_proof(name_hash).expect("proof");
+            proof.verify_value(root).expect("verify proof");
+            expected = (root, proof.raw);
+        }
+
+        {
+            let store = open_store(&config).expect("reopen store");
+            let state = StoredStateEngine::with_native_authorization_and_verified_name_flags(
+                store,
+                Network::Regtest,
+                NameFlags::NONE,
+            )
+            .expect("reopened state");
+            let (root, proof) = state.name_proof(name_hash).expect("reopened proof");
+            assert_eq!(root, expected.0);
+            assert_eq!(proof.raw, expected.1);
+            assert!(proof
+                .verify_value(root)
+                .expect("verify reopened proof")
+                .is_some());
+        }
+
+        std::fs::remove_dir_all(&path).expect("remove test store");
     }
 
     #[test]

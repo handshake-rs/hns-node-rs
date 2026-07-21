@@ -7,12 +7,12 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **11** and the storage profile is
-**`hsrd-mining-v7`**. This is an intentional clean-reindex boundary.
+The current persistent schema version is **12** and the storage profile is
+**`hsrd-mining-v8`**. This is an intentional clean-reindex boundary.
 
-Version 11 contains the authority, state, shadow-synchronization, and mining
-publication schema, durable HSD airdrop duplicate prevention, and active-chain
-deployment-state persistence:
+Version 12 contains the authority, state, shadow-synchronization, and mining
+publication schema, durable HSD airdrop duplicate prevention, active-chain
+deployment-state persistence, and content-addressed authenticated name nodes:
 
 - granular block-status bit assignments;
 - spent output address in the UTXO `Coin` codec;
@@ -20,6 +20,8 @@ deployment-state persistence:
 - block undo version 5 with previous/resulting name-tree roots and airdrop
   positions to clear on disconnect;
 - mandatory 32-byte `name-tree-root` metadata binding;
+- canonical content-addressed `name_tree_nodes` records keyed by their exact
+  HSD/Urkel node hash and staged atomically with name-state/root changes;
 - mandatory 27,195-byte MSB-first `airdrop-field` metadata binding for all
   217,557 HSD airdrop and faucet allocation positions;
 - separate best-header and active-best-block bindings;
@@ -108,6 +110,9 @@ cannot promote a block or grant authority.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.
+- `name_tree_nodes`: canonical leaf/internal node records keyed by their exact
+  authenticated root. Historical records are retained for undo and snapshot
+  reachability; compaction remains a separately qualified future boundary.
 - `undo`: block UTXO/name/airdrop undo records, including pre-state and
   post-state roots.
 - `snapshots`: operational durable records. The mining engine uses the bounded
@@ -142,7 +147,7 @@ path. The queue is bounded by configuration and by a hard maximum.
 
 ## Block status bit layout
 
-Schema version 11 preserves the existing `u32` status layout:
+Schema version 12 preserves the existing `u32` status layout:
 
 | Bit | Field | Meaning |
 |---:|---|---|
@@ -236,20 +241,24 @@ exact bytes before fixture use.
 
 ## Migration policy
 
-Schema 11/profile `hsrd-mining-v7` requires an explicit clean reindex from every
+Schema 12/profile `hsrd-mining-v8` requires an explicit clean reindex from every
 prior handoff. No automatic in-place migration is attempted while `hsrd`
 remains pre-authority. A failed or interrupted reindex must not modify the
 previous database.
 
-## Future persistent Urkel store
+## Persistent Urkel status
 
 The current root path rebuilds the authenticated tree from all durable
 `NameState` records. This prioritizes correctness and oracle parity over
-performance. The same sequence-consistent store snapshot can now materialize a
-root-checked immutable tree for exact HSD proof generation; that view remains
-pinned if the live store advances and rejects a corrupt durable root binding
-before returning a proof. A production persistent incremental Urkel store must
-preserve the same exact roots and canonical proof bytes while adding node
-persistence, incremental proof serving, interval snapshots, undo, compaction,
-and crash recovery. It must not silently replace the current root calculation
-until differential replay proves equality.
+performance. Each transition now also stages every previously unseen reachable
+node as a canonical content-addressed `name_tree_nodes` record in the same
+atomic batch. Proof reads traverse only the requested durable path, rehash every
+record before use, and reproduce the exact pinned HSD proof bytes across engine
+and RocksDB restart. Startup and state transitions validate the persisted tree
+against the bound root; materialized `NameState` remains an independent root
+check.
+
+Production closure still requires incremental mutation/root construction in
+place of the O(N) rebuild, interval snapshots, retained-node compaction, and
+crash/fault qualification. Any replacement root algorithm must preserve the
+qualified exact roots and canonical proof bytes under differential replay.

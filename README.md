@@ -42,10 +42,10 @@ Implemented:
 - Separate durable best-header and active-best-block bindings.
 - Strict greater-work activation; equal-work branches preserve the existing
   first-seen tip.
-- Schema version **11**, storage profile **`hsrd-mining-v7`**, explicit clean
-  reindex behavior, durable name-tree-root and HSD airdrop-field bindings,
-  hash-keyed deployment-state caches, and a checksummed synchronization
-  checkpoint.
+- Schema version **12**, storage profile **`hsrd-mining-v8`**, explicit clean
+  reindex behavior, durable name-tree-root/content-addressed-node and HSD
+  airdrop-field bindings, hash-keyed deployment-state caches, and a checksummed
+  synchronization checkpoint.
 - Startup checks that compare durable name-tree-root metadata against the
   materialized name-state column family.
 
@@ -137,6 +137,12 @@ Implemented:
   inclusion/non-inclusion verification across all four terminal forms.
 - A pinned byte-for-byte Urkel proof corpus with inclusion, dead-end, short,
   collision, trailing-byte, malformed-length, wrong-root, and wrong-key cases.
+- Canonical content-addressed node records keyed by their exact HSD/Urkel node
+  hash, staged atomically with each name-state/root transition and retained
+  across later roots.
+- Path-local durable inclusion/non-inclusion proof reads that rehash every
+  loaded record and reproduce the pinned HSD proof bytes after engine and
+  RocksDB restart.
 - Root-checked immutable proof views rebuilt from sequence-consistent durable
   name-state snapshots; views stay pinned across later commits and reproduce
   exact proof bytes after state-engine restart.
@@ -157,8 +163,8 @@ Still release-blocking:
 - current/live production-valid claim-proof evidence and complete historical
   claim replay beyond the pinned initial/replacement histories;
 - full contextual covenant parity across mainnet history;
-- a production persistent incremental Urkel node store with incremental proof
-  serving, interval snapshots, compaction, undo, and crash qualification;
+- incremental Urkel mutation/root construction, interval snapshots, retained
+  node compaction, and production crash/fault qualification;
 - complete historical root, undo, and reorganization replay.
 
 ## Live P2P and restartable shadow synchronization
@@ -195,7 +201,7 @@ Still release-blocking:
   long-lived peer reputation;
 - contextually complete transaction admission and compact-block reconstruction;
 - complete contextual active-state block connection during IBD;
-- pruning-aware synchronization and production persistent Urkel storage;
+- pruning-aware synchronization and production Urkel lifecycle qualification;
 - live HSD state/root comparison and sustained shadow agreement;
 - active-state IBD, live HSD comparison, and native mainnet mining authority.
 
@@ -227,7 +233,7 @@ Still release-blocking:
 
 - production-complete contextual peer transaction admission;
 - disconnected-transaction re-admission after reorganizations;
-- active-state IBD and production persistent Urkel;
+- active-state IBD and the incremental production Urkel lifecycle;
 - live HSD state/root comparison and sustained shadow agreement;
 - measured template/job and solved-block publication latency;
 - native mainnet authority.
@@ -309,7 +315,7 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 
 ## Storage migration
 
-Schema version 11 and storage profile `hsrd-mining-v7` add durable hash-keyed
-deployment-state caches to schema 10's HSD airdrop allocation field and
-airdrop-position undo. Existing pre-authority databases must be reindexed. No
-implicit in-place migration is attempted.
+Schema version 12 and storage profile `hsrd-mining-v8` add content-addressed
+authenticated name-tree nodes and path-local proof reads to schema 11's
+deployment-state caches. Existing pre-authority databases must be reindexed.
+No implicit in-place migration is attempted.

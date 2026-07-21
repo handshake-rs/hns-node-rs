@@ -9,10 +9,10 @@
 - Exact unsigned 256-bit chainwork and durable header/block/raw-body indexes.
 - Memory and RocksDB stores behind typed traits, atomic batches, true RocksDB
   snapshots, and a read-your-writes reorganization overlay.
-- Schema version 11, profile `hsrd-mining-v7`, network, genesis, epoch,
-  mandatory name-tree-root and HSD airdrop-field bindings, hash-keyed
-  deployment-state caches, checksummed sync checkpoint, and a bounded
-  checksummed solved-block publication namespace.
+- Schema version 12, profile `hsrd-mining-v8`, network, genesis, epoch,
+  mandatory name-tree-root/content-addressed-node and HSD airdrop-field
+  bindings, hash-keyed deployment-state caches, checksummed sync checkpoint,
+  and a bounded checksummed solved-block publication namespace.
 - Durable alternate branches, separate best-header and active-block bindings,
   equal-work stability, strict greater-work activation, and one-batch
   replacement after ancestry/body/status/work/root checks.
@@ -47,6 +47,9 @@
   inclusion/non-inclusion proof generation, decoding, and native verification.
 - Root-checked immutable proof views rebuilt from sequence-consistent durable
   name-state snapshots and stable across later commits and state-engine restart.
+- Canonical content-addressed nodes written atomically with authenticated state,
+  path-local proofs that rehash loaded records, and restart/corruption evidence
+  for both memory and RocksDB stores.
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
 - Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,
@@ -140,8 +143,8 @@ These are substantial foundations, not a production full node.
   implemented.
 - Complete contextual covenant/name behavior across mainnet history; all
   non-claim families now have deterministic HSD differential coverage.
-- Production persistent incremental Urkel storage, incremental proof serving,
-  interval snapshots, compaction, undo, and crash recovery.
+- Incremental Urkel mutation/root construction, interval snapshots, retained
+  node compaction, and production crash/fault qualification.
 
 ### Chain and network qualification
 
