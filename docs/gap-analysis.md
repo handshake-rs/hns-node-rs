@@ -38,7 +38,9 @@
 - Verification-only wrapper around the exact vendored HSD secp256k1 source,
   including compact low-S ECDSA and compressed keys.
 - Exact non-coinbase covenant linkage before UTXO mutation.
-- Contextual non-claim name-state transition foundation.
+- Contextual non-claim name-state transition foundation plus 28 exact HSD
+  accepted/rejected cases covering every transition family, historical
+  BID/REDEEM bypasses, renewal context, hardening, and post-state bytes.
 - Exact reserved-name/lockup datasets and renewal boundary evidence.
 - Exact HSD `NameState` codec and name undo.
 - Correctness-first exact Urkel roots and internal memory proof checks.
@@ -133,7 +135,8 @@ These are substantial foundations, not a production full node.
   deflation accounting, complete airdrop-key verification, active-node
   deployment composition, and airdrop duplicate/conjured-value accounting are
   implemented.
-- Complete contextual covenant/name behavior across mainnet history.
+- Complete contextual covenant/name behavior across mainnet history; all
+  non-claim families now have deterministic HSD differential coverage.
 - Production persistent incremental Urkel storage, exact HSD proof wire format,
   snapshots, compaction, and crash recovery.
 

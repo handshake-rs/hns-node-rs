@@ -1,0 +1,962 @@
+{
+  "schema": 1,
+  "oracle": {
+    "repository": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
+    "hsdVersion": "8.99.0"
+  },
+  "network": "regtest",
+  "parameters": {
+    "auctionStart": 0,
+    "rolloutInterval": 2,
+    "lockupPeriod": 2,
+    "renewalWindow": 5000,
+    "renewalPeriod": 2500,
+    "renewalMaturity": 50,
+    "claimPeriod": 250000,
+    "alexaLockupPeriod": 500000,
+    "claimFrequency": 0,
+    "biddingPeriod": 5,
+    "revealPeriod": 10,
+    "treeInterval": 5,
+    "transferLockup": 10,
+    "auctionMaturity": 65,
+    "noRollout": false,
+    "noReserved": false
+  },
+  "scope": "HSD contextual NameState transitions with independently rechecked covenant linkage",
+  "cases": [
+    {
+      "id": "open-absent-name",
+      "height": 120,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "00000000000000000000000000",
+      "transactionRaw": "0100000001010101010101010101010101010101010101010101010101010101010101010100000000ffffffff01000000000000000000143131313131313131313131313131313131313131020320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804000000000c6d6573686d696e65746573740000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0101010101010101010101010101010101010101010101010101010101010101",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e6574657374000078000000780000000000"
+    },
+    {
+      "id": "first-bid-does-not-mutate-name-state",
+      "height": 126,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e6574657374000078000000780000000000",
+      "transactionRaw": "0100000001020202020202020202020202020202020202020202020202020202020202020200000000ffffffff01d00700000000000000143131313131313131313131313131313131313131030420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000000c6d6573686d696e657465737420a420428c493889fa1c87fc8d5bf1f8f14e61fbc2c85437ddb7597a1b39b853810000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0202020202020202020202020202020202020202020202020202020202020202",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e6574657374000078000000780000000000"
+    },
+    {
+      "id": "second-bid-does-not-mutate-name-state",
+      "height": 127,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e6574657374000078000000780000000000",
+      "transactionRaw": "0100000001030303030303030303030303030303030303030303030303030303030303030300000000ffffffff01881300000000000000143232323232323232323232323232323232323232030420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000000c6d6573686d696e6574657374201b21431a2500bd3b446bec35ee9d4a8b47a8640ac338e05ebfe7881b912426f10000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0303030303030303030303030303030303030303030303030303030303030303",
+          "outpointIndex": 0,
+          "value": 5000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e6574657374000078000000780000000000"
+    },
+    {
+      "id": "first-reveal-establishes-high-bid",
+      "height": 131,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e6574657374000078000000780000000000",
+      "transactionRaw": "0100000001928606d21dcdb0176ad4a69612c0e98bad51ddb3a20a659edba897f13528df6300000000ffffffff01d00700000000000000143131313131313131313131313131313131313131040320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000002041414141414141414141414141414141414141414141414141414141414141410000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "928606d21dcdb0176ad4a69612c0e98bad51ddb3a20a659edba897f13528df63",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 3,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "6d6573686d696e6574657374",
+            "a420428c493889fa1c87fc8d5bf1f8f14e61fbc2c85437ddb7597a1b39b85381"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e65746573740000780000007800000005006c4cccdc13da983d9d900d7292cd8c6333bb94cd22e1e61ba6b943b44297bb4c00fdd007"
+    },
+    {
+      "id": "second-reveal-establishes-second-price",
+      "height": 132,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740000780000007800000005006c4cccdc13da983d9d900d7292cd8c6333bb94cd22e1e61ba6b943b44297bb4c00fdd007",
+      "transactionRaw": "01000000013fc3af44e7c0e0cdf0651dcdd458e437fce446f2f4cecb7c88335f940d0c947100000000ffffffff01881300000000000000143232323232323232323232323232323232323232040320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000002042424242424242424242424242424242424242424242424242424242424242420000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "3fc3af44e7c0e0cdf0651dcdd458e437fce446f2f4cecb7c88335f940d0c9471",
+          "outpointIndex": 0,
+          "value": 5000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 3,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "6d6573686d696e6574657374",
+            "1b21431a2500bd3b446bec35ee9d4a8b47a8640ac338e05ebfe7881b912426f1"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e65746573740000780000007800000007009392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00fdd007fd8813"
+    },
+    {
+      "id": "winning-reveal-registers-at-second-price",
+      "height": 141,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740000780000007800000007009392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00fdd007fd8813",
+      "transactionRaw": "01000000019392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00000000ffffffff01d00700000000000000143232323232323232323232323232323232323232060420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d01480478000000030102032051515151515151515151515151515151515151515151515151515151515151510000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "9392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc",
+          "outpointIndex": 0,
+          "value": 5000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 4,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "4242424242424242424242424242424242424242424242424242424242424242"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5151515151515151515151515151515151515151515151515151515151515151",
+          "height": 90,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e65746573740300010203780000008d0000008700c38ac4f1c9b7d1b6fab490f1294d02d1b6e970884a9adbe79651b30441a0b95d00fdd007fd8813"
+    },
+    {
+      "id": "update-replaces-resource-and-owner-outpoint",
+      "height": 142,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740300010203780000008d0000008700c38ac4f1c9b7d1b6fab490f1294d02d1b6e970884a9adbe79651b30441a0b95d00fdd007fd8813",
+      "transactionRaw": "0100000001c38ac4f1c9b7d1b6fab490f1294d02d1b6e970884a9adbe79651b30441a0b95d00000000ffffffff01d00700000000000000143232323232323232323232323232323232323232070320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d01480478000000030405060000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "c38ac4f1c9b7d1b6fab490f1294d02d1b6e970884a9adbe79651b30441a0b95d",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 6,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "010203",
+            "5151515151515151515151515151515151515151515151515151515151515151"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e65746573740300040506780000008d0000008700ca114936233daae223cdfcf31f461a27001fda59c5d1d467c045fbaa9570e4fa00fdd007fd8813"
+    },
+    {
+      "id": "renew-uses-mature-active-chain-commitment",
+      "height": 146,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740300040506780000008d0000008700ca114936233daae223cdfcf31f461a27001fda59c5d1d467c045fbaa9570e4fa00fdd007fd8813",
+      "transactionRaw": "0100000001ca114936233daae223cdfcf31f461a27001fda59c5d1d467c045fbaa9570e4fa00000000ffffffff01d00700000000000000143232323232323232323232323232323232323232080320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000002051515151515151515151515151515151515151515151515151515151515151510000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "ca114936233daae223cdfcf31f461a27001fda59c5d1d467c045fbaa9570e4fa",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 7,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "040506"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5151515151515151515151515151515151515151515151515151515151515151",
+          "height": 90,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e657465737403000405067800000092000000c700e45c3498eb80a7315df49f364a4f7fb37c3b81ce80a2c7f4ef7ee0e01e5ac7c000fdd007fd881301"
+    },
+    {
+      "id": "transfer-starts-lockup",
+      "height": 147,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e657465737403000405067800000092000000c700e45c3498eb80a7315df49f364a4f7fb37c3b81ce80a2c7f4ef7ee0e01e5ac7c000fdd007fd881301",
+      "transactionRaw": "0100000001e45c3498eb80a7315df49f364a4f7fb37c3b81ce80a2c7f4ef7ee0e01e5ac7c000000000ffffffff01d00700000000000000143232323232323232323232323232323232323232090420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148047800000001002033333333333333333333333333333333333333333333333333333333333333330000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "e45c3498eb80a7315df49f364a4f7fb37c3b81ce80a2c7f4ef7ee0e01e5ac7c0",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 8,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "5151515151515151515151515151515151515151515151515151515151515151"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e657465737403000405067800000092000000cf00703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c644100fdd007fd88139300000001"
+    },
+    {
+      "id": "finalize-mature-transfer-and-state-commitment",
+      "height": 157,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e657465737403000405067800000092000000cf00703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c644100fdd007fd88139300000001",
+      "transactionRaw": "0100000001703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c644100000000ffffffff01d007000000000000002033333333333333333333333333333333333333333333333333333333333333330a0720821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000000c6d6573686d696e65746573740100040000000004010000002051515151515151515151515151515151515151515151515151515151515151510000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c6441",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 9,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "00",
+            "3333333333333333333333333333333333333333333333333333333333333333"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5151515151515151515151515151515151515151515151515151515151515151",
+          "height": 90,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e65746573740300040506780000009d000000c7006070891c2c8536c9d71a71c5ee44acc02e2da23d61eb72f4c5a47e3afd0608eb00fdd007fd881302"
+    },
+    {
+      "id": "revoke-clears-resource-and-transfer",
+      "height": 158,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740300040506780000009d000000c7006070891c2c8536c9d71a71c5ee44acc02e2da23d61eb72f4c5a47e3afd0608eb00fdd007fd881302",
+      "transactionRaw": "01000000016070891c2c8536c9d71a71c5ee44acc02e2da23d61eb72f4c5a47e3afd0608eb00000000ffffffff01d007000000000000002033333333333333333333333333333333333333333333333333333333333333330b0220821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "6070891c2c8536c9d71a71c5ee44acc02e2da23d61eb72f4c5a47e3afd0608eb",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3333333333333333333333333333333333333333333333333333333333333333",
+          "covenantType": 10,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "6d6573686d696e6574657374",
+            "00",
+            "00000000",
+            "01000000",
+            "5151515151515151515151515151515151515151515151515151515151515151"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e65746573740000780000009d000000d7006070891c2c8536c9d71a71c5ee44acc02e2da23d61eb72f4c5a47e3afd0608eb00fdd007fd88139e00000002"
+    },
+    {
+      "id": "reopen-after-revoke-auction-maturity",
+      "height": 223,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740000780000009d000000d7006070891c2c8536c9d71a71c5ee44acc02e2da23d61eb72f4c5a47e3afd0608eb00fdd007fd88139e00000002",
+      "transactionRaw": "0100000001040404040404040404040404040404040404040404040404040404040404040400000000ffffffff01000000000000000000143131313131313131313131313131313131313131020320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804000000000c6d6573686d696e65746573740000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0404040404040404040404040404040404040404040404040404040404040404",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0c6d6573686d696e65746573740000df000000df0000000001"
+    },
+    {
+      "id": "historical-bid-bypasses-absent-name-read",
+      "height": 50,
+      "nameFlags": 0,
+      "historical": true,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "00000000000000000000000000",
+      "transactionRaw": "0100000001050505050505050505050505050505050505050505050505050505050505050500000000ffffffff01b80b00000000000000143131313131313131313131313131313131313131030420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148040a0000000c6d6573686d696e65746573742031bce7a43e4dcb8ca8f24d81af62e3863ebdc4a09f56ee2391a831094dcf4dcd0000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0505050505050505050505050505050505050505050505050505050505050505",
+          "outpointIndex": 0,
+          "value": 3000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "00000000000000000000000000"
+    },
+    {
+      "id": "historical-redeem-bypasses-absent-name-read",
+      "height": 50,
+      "nameFlags": 0,
+      "historical": true,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "00000000000000000000000000",
+      "transactionRaw": "0100000001060606060606060606060606060606060606060606060606060606060606060600000000ffffffff01d00700000000000000143131313131313131313131313131313131313131050220821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148040a0000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0606060606060606060606060606060606060606060606060606060606060606",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 4,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "0a000000",
+            "4141414141414141414141414141414141414141414141414141414141414141"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "00000000000000000000000000"
+    },
+    {
+      "id": "reject-second-open-before-expiration",
+      "height": 121,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e6574657374000078000000780000000000",
+      "transactionRaw": "0100000001070707070707070707070707070707070707070707070707070707070707070700000000ffffffff01000000000000000000143131313131313131313131313131313131313131020320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804000000000c6d6573686d696e65746573740000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0707070707070707070707070707070707070707070707070707070707070707",
+          "outpointIndex": 0,
+          "value": 1000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-open-multiple",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-bid-before-bidding-state",
+      "height": 125,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e6574657374000078000000780000000000",
+      "transactionRaw": "0100000001080808080808080808080808080808080808080808080808080808080808080800000000ffffffff01d00700000000000000143131313131313131313131313131313131313131030420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000000c6d6573686d696e657465737420a420428c493889fa1c87fc8d5bf1f8f14e61fbc2c85437ddb7597a1b39b853810000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0808080808080808080808080808080808080808080808080808080808080808",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 0,
+          "covenantItems": []
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-bid-state",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-reveal-with-nonlocal-start",
+      "height": 131,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e6574657374000078000000780000000000",
+      "transactionRaw": "0100000001090909090909090909090909090909090909090909090909090909090909090900000000ffffffff01d00700000000000000143131313131313131313131313131313131313131040320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804790000002041414141414141414141414141414141414141414141414141414141414141410000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0909090909090909090909090909090909090909090909090909090909090909",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 3,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "79000000",
+            "6d6573686d696e6574657374",
+            "a420428c493889fa1c87fc8d5bf1f8f14e61fbc2c85437ddb7597a1b39b85381"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-reveal-nonlocal",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-winning-reveal-redemption",
+      "height": 141,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740000780000007800000007009392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00fdd007fd8813",
+      "transactionRaw": "01000000019392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00000000ffffffff01881300000000000000143232323232323232323232323232323232323232050220821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "9392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc",
+          "outpointIndex": 0,
+          "value": 5000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 4,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "4242424242424242424242424242424242424242424242424242424242424242"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-redeem-owner",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-losing-reveal-registration",
+      "height": 141,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740000780000007800000007009392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00fdd007fd8813",
+      "transactionRaw": "01000000016c4cccdc13da983d9d900d7292cd8c6333bb94cd22e1e61ba6b943b44297bb4c00000000ffffffff01d00700000000000000143131313131313131313131313131313131313131060420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d01480478000000002051515151515151515151515151515151515151515151515151515151515151510000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "6c4cccdc13da983d9d900d7292cd8c6333bb94cd22e1e61ba6b943b44297bb4c",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 4,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "4141414141414141414141414141414141414141414141414141414141414141"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5151515151515151515151515151515151515151515151515151515151515151",
+          "height": 90,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-register-owner",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-register-value-above-second-price",
+      "height": 141,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740000780000007800000007009392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00fdd007fd8813",
+      "transactionRaw": "01000000019392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00000000ffffffff01d10700000000000000143232323232323232323232323232323232323232060420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d01480478000000002051515151515151515151515151515151515151515151515151515151515151510000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "9392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc",
+          "outpointIndex": 0,
+          "value": 5000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 4,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "4242424242424242424242424242424242424242424242424242424242424242"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5151515151515151515151515151515151515151515151515151515151515151",
+          "height": 90,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-register-value",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-register-immature-renewal-commitment",
+      "height": 141,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740000780000007800000007009392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00fdd007fd8813",
+      "transactionRaw": "01000000019392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00000000ffffffff01d00700000000000000143232323232323232323232323232323232323232060420821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d01480478000000002052525252525252525252525252525252525252525252525252525252525252520000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "9392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc",
+          "outpointIndex": 0,
+          "value": 5000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 4,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "4242424242424242424242424242424242424242424242424242424242424242"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5252525252525252525252525252525252525252525252525252525252525252",
+          "height": 100,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-register-renewal",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-update-before-closed-state",
+      "height": 135,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740000780000007800000007009392541efdfed0b57c4e8fdb23abd522b898b43e9078f940926e7a9790bd23fc00fdd007fd8813",
+      "transactionRaw": "01000000010a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00000000ffffffff01d00700000000000000143232323232323232323232323232323232323232070320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d01480478000000000000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 6,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "",
+            "5151515151515151515151515151515151515151515151515151515151515151"
+          ]
+        }
+      ],
+      "activeChain": [],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-update-state",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-premature-renewal",
+      "height": 145,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740300010203780000008d0000008700c38ac4f1c9b7d1b6fab490f1294d02d1b6e970884a9adbe79651b30441a0b95d00fdd007fd8813",
+      "transactionRaw": "01000000010a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00000000ffffffff01d00700000000000000143232323232323232323232323232323232323232080320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000002051515151515151515151515151515151515151515151515151515151515151510000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 6,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "",
+            "5151515151515151515151515151515151515151515151515151515151515151"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5151515151515151515151515151515151515151515151515151515151515151",
+          "height": 90,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-renewal-premature",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-renewal-commitment-inside-reorg-window",
+      "height": 146,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e65746573740300010203780000008d0000008700c38ac4f1c9b7d1b6fab490f1294d02d1b6e970884a9adbe79651b30441a0b95d00fdd007fd8813",
+      "transactionRaw": "01000000010a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a00000000ffffffff01d00700000000000000143232323232323232323232323232323232323232080320821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000002053535353535353535353535353535353535353535353535353535353535353530000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 6,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "",
+            "5151515151515151515151515151515151515151515151515151515151515151"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5353535353535353535353535353535353535353535353535353535353535353",
+          "height": 97,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-renewal",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-finalize-before-transfer-maturity",
+      "height": 156,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e657465737403000405067800000092000000cf00703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c644100fdd007fd88139300000001",
+      "transactionRaw": "0100000001703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c644100000000ffffffff01d007000000000000002033333333333333333333333333333333333333333333333333333333333333330a0720821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000000c6d6573686d696e65746573740100040000000004010000002051515151515151515151515151515151515151515151515151515151515151510000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c6441",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 9,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "00",
+            "3333333333333333333333333333333333333333333333333333333333333333"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5151515151515151515151515151515151515151515151515151515151515151",
+          "height": 90,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-finalize-maturity",
+      "postStateRaw": null
+    },
+    {
+      "id": "reject-finalize-state-transfer-mismatch",
+      "height": 157,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+      "preStateRaw": "0c6d6573686d696e657465737403000405067800000092000000cf00703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c644100fdd007fd88139300000001",
+      "transactionRaw": "0100000001703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c644100000000ffffffff01d007000000000000002033333333333333333333333333333333333333333333333333333333333333330a0720821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d014804780000000c6d6573686d696e65746573740100040000000004000000002051515151515151515151515151515151515151515151515151515151515151510000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "703e469f6bebb071c7953860cbad67bd1ba5a6b391df37d2c19814e4727c6441",
+          "outpointIndex": 0,
+          "value": 2000,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3232323232323232323232323232323232323232",
+          "covenantType": 9,
+          "covenantItems": [
+            "821b29586dba4051285fe7cd94c390de92cd93b1f0a953ca890bbef8f56d0148",
+            "78000000",
+            "00",
+            "3333333333333333333333333333333333333333333333333333333333333333"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5151515151515151515151515151515151515151515151515151515151515151",
+          "height": 90,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-finalize-statetransfer",
+      "postStateRaw": null
+    },
+    {
+      "id": "weak-claimed-register-before-hardening",
+      "height": 103,
+      "nameFlags": 0,
+      "historical": false,
+      "nameHash": "2d3c5e638d9affdc736fbf2a26a00b258c35a33acc8245aeb59e8369f65d5689",
+      "preStateRaw": "0d636c61696d65642d616c7068610000640000006400000021020b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0001000000",
+      "transactionRaw": "01000000010b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b00000000ffffffff010000000000000000001431313131313131313131313131313131313131310604202d3c5e638d9affdc736fbf2a26a00b258c35a33acc8245aeb59e8369f65d56890464000000002054545454545454545454545454545454545454545454545454545454545454540000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+          "outpointIndex": 0,
+          "value": 0,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 1,
+          "covenantItems": [
+            "2d3c5e638d9affdc736fbf2a26a00b258c35a33acc8245aeb59e8369f65d5689",
+            "64000000",
+            "636c61696d65642d616c706861",
+            "01",
+            "9191919191919191919191919191919191919191919191919191919191919191",
+            "01000000"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5454545454545454545454545454545454545454545454545454545454545454",
+          "height": 50,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": true,
+      "reason": null,
+      "postStateRaw": "0d636c61696d65642d616c70686100006400000067000000a102b74eaa451f2095f8dfcc114c95b8fa4baa970defe3b7bdec370c1e4834fa313a0001000000"
+    },
+    {
+      "id": "reject-weak-claimed-register-after-hardening",
+      "height": 103,
+      "nameFlags": 1,
+      "historical": false,
+      "nameHash": "2d3c5e638d9affdc736fbf2a26a00b258c35a33acc8245aeb59e8369f65d5689",
+      "preStateRaw": "0d636c61696d65642d616c7068610000640000006400000021020b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0001000000",
+      "transactionRaw": "01000000010b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b00000000ffffffff010000000000000000001431313131313131313131313131313131313131310604202d3c5e638d9affdc736fbf2a26a00b258c35a33acc8245aeb59e8369f65d56890464000000002054545454545454545454545454545454545454545454545454545454545454540000000000",
+      "inputCoins": [
+        {
+          "outpointTxid": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+          "outpointIndex": 0,
+          "value": 0,
+          "height": 1,
+          "coinbase": false,
+          "addressVersion": 0,
+          "addressHash": "3131313131313131313131313131313131313131",
+          "covenantType": 1,
+          "covenantItems": [
+            "2d3c5e638d9affdc736fbf2a26a00b258c35a33acc8245aeb59e8369f65d5689",
+            "64000000",
+            "636c61696d65642d616c706861",
+            "01",
+            "9191919191919191919191919191919191919191919191919191919191919191",
+            "01000000"
+          ]
+        }
+      ],
+      "activeChain": [
+        {
+          "hash": "5454545454545454545454545454545454545454545454545454545454545454",
+          "height": 50,
+          "main": true
+        }
+      ],
+      "linkageResult": 0,
+      "accepted": false,
+      "reason": "bad-register-state",
+      "postStateRaw": null
+    }
+  ]
+}

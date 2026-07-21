@@ -290,6 +290,24 @@
       "blake2b256": "7aa0bcf5bd2b248f304c13f6313a47681db79f251d2d4a6d67e636c714aec62b"
     },
     {
+      "id": "name-transitions-v1",
+      "network": "regtest",
+      "kind": "name-state",
+      "path": "name-states/transitions-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "name-state",
+        "contextual",
+        "lifecycle",
+        "historical",
+        "negative",
+        "oracle"
+      ],
+      "blake2b256": "7673c6354cfc72fed4e37aecb43cc27b0679fe911b05c5f0bcbc7aba64a822dd"
+    },
+    {
       "id": "name-state-urkel-v1",
       "network": "regtest",
       "kind": "name-state",

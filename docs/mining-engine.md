@@ -79,7 +79,9 @@ broader claim-history and historical-qualification gaps remain. The pinned
 height-62,517 case and the 39,086-39,101 -> 76,722 replacement history establish
 exact proof/accounting, parent-header-time, retained-value, and commit-advance
 behavior for bounded real mainnet claims, but they are not full-chain
-qualification.
+qualification. A separate 28-case pinned-HSD corpus now covers every non-claim
+contextual transition family with exact accepted post-states and targeted
+rejections; it is deterministic regtest evidence, not mainnet replay.
 
 ## Template construction
 

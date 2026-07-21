@@ -55,6 +55,7 @@ npm run hsrd-mainnet-claim-history --prefix hsd-oracle
 npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
+npm run hsrd-name-transition-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
 npm run hsrd-name-policy-fixtures --prefix hsd-oracle
 npm run hsrd-p2p-wire-fixtures --prefix hsd-oracle
@@ -91,6 +92,9 @@ Current evidence includes:
   codes;
 - 33 covenant-linkage accepted/rejected cases;
 - exact HSD `NameState` encoding vectors;
+- 28 exact HSD contextual name-transition cases: 15 accepted lifecycle,
+  historical-bypass, expiration, and hardening paths plus 13 targeted
+  rejections, with native linkage and byte-for-byte post-state checks;
 - incremental HSD Urkel roots with explicit header/pre-state and
   resulting/post-state roots;
 - reserved-name and lockup dataset checks;
@@ -312,6 +316,20 @@ NODE_BACKEND=js npm run refresh-hsrd-mainnet-claim-replacements \
 
 These are bounded canonical initial and replacement histories, not complete
 historical claim, UTXO, covenant, name-root, or reorganization replay.
+
+The contextual name-transition fixture is generated directly through the
+pinned HSD `Chain.verifyCovenants` implementation. Each case records the exact
+pre-state, raw transaction, resolved input covenant, active-chain renewal
+lookups, deployment-derived name flags, accept/reject result, and accepted
+post-state bytes:
+
+```bash
+NODE_BACKEND=js npm run hsrd-name-transition-fixtures --prefix hsd-oracle
+```
+
+It covers every non-claim covenant family and important negative boundaries,
+but remains deterministic regtest evidence rather than complete mainnet
+historical replay.
 
 For every mainnet block and mutation-corpus case, compare:
 

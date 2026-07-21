@@ -2127,6 +2127,89 @@ mod tests {
     }
 
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameTransitionFixture {
+        network: String,
+        parameters: NameTransitionParametersFixture,
+        cases: Vec<NameTransitionCaseFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameTransitionParametersFixture {
+        auction_start: u32,
+        rollout_interval: u32,
+        lockup_period: u32,
+        renewal_window: u32,
+        renewal_period: u32,
+        renewal_maturity: u32,
+        claim_period: u32,
+        alexa_lockup_period: u32,
+        claim_frequency: u32,
+        bidding_period: u32,
+        reveal_period: u32,
+        tree_interval: u32,
+        transfer_lockup: u32,
+        auction_maturity: u32,
+        no_rollout: bool,
+        no_reserved: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameTransitionCaseFixture {
+        id: String,
+        height: u32,
+        name_flags: u32,
+        historical: bool,
+        name_hash: String,
+        pre_state_raw: String,
+        transaction_raw: String,
+        input_coins: Vec<NameTransitionCoinFixture>,
+        active_chain: Vec<NameTransitionChainEntryFixture>,
+        linkage_result: i32,
+        accepted: bool,
+        reason: Option<String>,
+        post_state_raw: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NameTransitionCoinFixture {
+        outpoint_txid: String,
+        outpoint_index: u32,
+        value: u64,
+        height: u32,
+        coinbase: bool,
+        address_version: u8,
+        address_hash: String,
+        covenant_type: u8,
+        covenant_items: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct NameTransitionChainEntryFixture {
+        hash: String,
+        height: u32,
+        main: bool,
+    }
+
+    struct FixtureNameContext {
+        historical: bool,
+        heights: HashMap<BlockHash, Height>,
+    }
+
+    impl NameContext for FixtureNameContext {
+        fn main_chain_height(&self, hash: &BlockHash) -> Result<Option<Height>, ConsensusError> {
+            Ok(self.heights.get(hash).copied())
+        }
+
+        fn is_historical_height(&self, _height: Height) -> bool {
+            self.historical
+        }
+    }
+
+    #[derive(Deserialize)]
     struct AirdropFixture {
         faucet: AirdropFixtureProof,
     }
@@ -2657,6 +2740,125 @@ mod tests {
                 expected
             );
             assert_eq!(encode_name_state(&expected).expect("encode"), raw);
+        }
+    }
+
+    #[test]
+    fn contextual_name_transitions_match_the_pinned_hsd_oracle() {
+        let fixture: NameTransitionFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/name-states/transitions-v1.json"
+        ))
+        .expect("name transition fixture");
+        assert_eq!(fixture.network, "regtest");
+
+        let expected = Network::Regtest.params().names;
+        let actual = fixture.parameters;
+        assert_eq!(actual.auction_start, expected.auction_start);
+        assert_eq!(actual.rollout_interval, expected.rollout_interval);
+        assert_eq!(actual.lockup_period, expected.lockup_period);
+        assert_eq!(actual.renewal_window, expected.renewal_window);
+        assert_eq!(actual.renewal_period, expected.renewal_period);
+        assert_eq!(actual.renewal_maturity, expected.renewal_maturity);
+        assert_eq!(actual.claim_period, expected.claim_period);
+        assert_eq!(actual.alexa_lockup_period, expected.alexa_lockup_period);
+        assert_eq!(actual.claim_frequency, expected.claim_frequency);
+        assert_eq!(actual.bidding_period, expected.bidding_period);
+        assert_eq!(actual.reveal_period, expected.reveal_period);
+        assert_eq!(actual.tree_interval, expected.tree_interval);
+        assert_eq!(actual.transfer_lockup, expected.transfer_lockup);
+        assert_eq!(actual.auction_maturity, expected.auction_maturity);
+        assert_eq!(actual.no_rollout, expected.no_rollout);
+        assert_eq!(actual.no_reserved, expected.no_reserved);
+        assert_eq!(fixture.cases.len(), 28);
+
+        for case in fixture.cases {
+            let transaction = Transaction::decode(&decode_hex_vec(&case.transaction_raw))
+                .unwrap_or_else(|error| panic!("{} transaction: {error}", case.id));
+            let input_coins = case
+                .input_coins
+                .into_iter()
+                .map(|coin| Coin {
+                    outpoint: Outpoint {
+                        txid: Txid::new(decode_hex::<32>(&coin.outpoint_txid)),
+                        index: coin.outpoint_index,
+                    },
+                    value: coin.value,
+                    height: coin.height,
+                    coinbase: coin.coinbase,
+                    address: Address::new(coin.address_version, decode_hex_vec(&coin.address_hash))
+                        .expect("transition coin address"),
+                    covenant: Covenant {
+                        kind: CovenantKind::from_u8(coin.covenant_type),
+                        items: coin
+                            .covenant_items
+                            .iter()
+                            .map(|item| decode_hex_vec(item))
+                            .collect(),
+                    },
+                })
+                .collect::<Vec<_>>();
+            assert!(case.linkage_result >= 0, "oracle linkage {}", case.id);
+            verify_transaction_covenant_links(&transaction, &input_coins)
+                .unwrap_or_else(|error| panic!("{} native linkage: {error}", case.id));
+
+            let name_hash = NameHash::new(decode_hex::<32>(&case.name_hash));
+            let mut state = decode_name_state(&name_hash, &decode_hex_vec(&case.pre_state_raw))
+                .unwrap_or_else(|error| panic!("{} pre-state: {error}", case.id));
+            let context = FixtureNameContext {
+                historical: case.historical,
+                heights: case
+                    .active_chain
+                    .into_iter()
+                    .filter(|entry| entry.main)
+                    .map(|entry| (BlockHash::new(decode_hex::<32>(&entry.hash)), entry.height))
+                    .collect(),
+            };
+            let name_outputs = transaction
+                .outputs
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| output.covenant.kind.is_name())
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(name_outputs.len(), 1, "oracle case {}", case.id);
+            let result = verify_and_apply_name_covenant(
+                &transaction,
+                name_outputs[0],
+                case.height,
+                expected,
+                NameFlags::from_bits(case.name_flags),
+                &mut state,
+                &context,
+            );
+            assert_eq!(result.is_ok(), case.accepted, "oracle case {}", case.id);
+
+            if case.accepted {
+                assert!(case.reason.is_none(), "accepted oracle case {}", case.id);
+                let post_raw = decode_hex_vec(
+                    case.post_state_raw
+                        .as_deref()
+                        .expect("accepted transition post-state"),
+                );
+                assert_eq!(
+                    encode_name_state(&state).expect("native transition post-state"),
+                    post_raw,
+                    "oracle case {}",
+                    case.id
+                );
+                assert_eq!(
+                    state,
+                    decode_name_state(&name_hash, &post_raw).expect("oracle transition post-state"),
+                    "oracle case {}",
+                    case.id
+                );
+            } else {
+                assert!(case.reason.is_some(), "rejected oracle case {}", case.id);
+                assert!(
+                    case.post_state_raw.is_none(),
+                    "rejected oracle case {}",
+                    case.id
+                );
+            }
         }
     }
 

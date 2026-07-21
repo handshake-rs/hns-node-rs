@@ -23,6 +23,8 @@ The current foundation verifies or records evidence for:
 - exact non-coinbase covenant linkage;
 - contextual non-claim name transitions plus authenticated CLAIM
   connect/disconnect at an explicit proof-capable service boundary;
+- exact pinned-HSD contextual results and accepted post-state bytes for all
+  non-claim transition families, including historical shortcuts and hardening;
 - parent-derived deployment-state caches composed into active node name,
   DNSSEC-claim, and faucet checks with restart/reorg validation;
 - ICANN-rooted DNSSEC claim verification and HSD claim output/commit/deflation
@@ -64,7 +66,8 @@ The following remain untrusted and release-blocking:
   upstream corpus;
 - current/live claim-proof evidence and complete historical claim replay beyond
   the pinned initial/replacement histories;
-- complete contextual name consensus over all historical cases;
+- complete contextual name consensus over mainnet historical cases beyond the
+  deterministic all-family transition corpus;
 - persistent production Urkel nodes and HSD proof-wire parity;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;
 - Brontide, durable peer reputation, discovery, compact blocks, and

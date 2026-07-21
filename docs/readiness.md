@@ -29,6 +29,9 @@ Implemented:
 - Exact non-coinbase covenant linkage.
 - Contextual name-transition foundation, including authenticated CLAIM
   connect/disconnect at the proof-capable state-service boundary.
+- Exact HSD contextual transition replay across all non-claim families: 15
+  accepted and 13 rejected cases with linkage, renewal-chain context,
+  deployment flags, and byte-for-byte `NameState` post-images.
 - Exact HSD ownership-proof codecs, sanity/time/weak rules, ICANN-rooted DNSSEC
   verification, all five HSD DS digests including legacy GOST94/CryptoPro,
   complete upstream historical-proof corpus replay, and claim output/commit/
@@ -50,7 +53,7 @@ Remaining:
   corpora;
 - current/live claim-proof evidence and complete historical claim replay beyond
   the pinned initial/replacement histories;
-- full contextual transition replay and invalid corpus.
+- mainnet historical contextual replay and broader invalid corpus.
 
 ## State and reorganization engine — hardened foundation
 
@@ -165,9 +168,10 @@ Implemented:
   boundaries, all 167 canonical mainnet deployment periods through height
   336,672, airdrop proofs, Claim/TXT/DNSSEC ownership-proof codecs and all four
   upstream signed proof chains under SHA-256/GOST94 historical anchors,
-  covenant linkage, name-state codec, reserved/lockup/renewal policy,
-  incremental Urkel roots, P2P wire bytes, subsidy, and deterministic coinbase
-  behavior;
+  covenant linkage, all-family contextual name transitions with 15 accepted
+  and 13 rejected exact state cases, name-state codec,
+  reserved/lockup/renewal policy, incremental Urkel roots, P2P wire bytes,
+  subsidy, and deterministic coinbase behavior;
 - static integrity checks, native secp256k1 smoke verification, and exact
   vendored-Goosig source comparison against HSD's pinned dependency.
 

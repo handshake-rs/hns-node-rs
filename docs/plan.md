@@ -58,6 +58,9 @@ reserved low-latency paths.
 - Exact non-coinbase covenant linkage.
 - Contextual non-claim name-state transitions plus authenticated CLAIM
   connect/disconnect under active parent-derived deployment state.
+- Pinned HSD replay of 28 contextual transition cases spanning every non-claim
+  family, historical BID/REDEEM shortcuts, renewal ancestry, expiration,
+  hardening, exact accepted post-states, and targeted rejections.
 - A checkpoint-linked canonical mainnet claim case at height 62,517: full raw
   block/body validation, both real DNSSEC witnesses, HSD's exact parent-header
   timestamp rule, and exact coinbase connect/disconnect through native state.
@@ -108,8 +111,8 @@ reserved low-latency paths.
    rules, all five airdrop key types (including pinned GooSig), faucet and
    production-root proof verification, conjured accounting, and durable
    duplicate prevention/undo are implemented.
-2. **Contextual covenant closure** — replay all mainnet transition families and
-   historical exceptions against HSD.
+2. **Contextual covenant closure** — extend the complete deterministic HSD
+   transition-family corpus into mainnet history and historical exceptions.
 3. **Persistent Urkel** — incremental nodes, exact proof wire format,
    snapshots, undo, compaction, and crash qualification while preserving exact
    correctness-first roots.

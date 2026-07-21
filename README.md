@@ -125,6 +125,10 @@ Implemented:
   unknown-covenant restrictions.
 - A contextual non-claim name-transition foundation covering OPEN, BID,
   REVEAL, REDEEM, REGISTER, UPDATE, RENEW, TRANSFER, FINALIZE, and REVOKE.
+- A pinned HSD contextual corpus with 15 accepted and 13 rejected transitions,
+  including the full auction/ownership lifecycle, exact `NameState` post-images,
+  historical BID/REDEEM bypasses, expiration/reopen, renewal ancestry, and
+  hardened weak-claim registration.
 - Exact pinned reserved-name and lockup datasets.
 - HSD-derived renewal-commitment boundary fixtures.
 - Exact HSD `NameState` value encoding and undo records.
@@ -262,6 +266,7 @@ npm run hsrd-mainnet-claim-history --prefix hsd-oracle
 npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
+npm run hsrd-name-transition-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
 npm run hsrd-name-policy-fixtures --prefix hsd-oracle
 npm run hsrd-p2p-wire-fixtures --prefix hsd-oracle
