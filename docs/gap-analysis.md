@@ -57,6 +57,11 @@
   contextual claimed-name connect/disconnect at the service boundary. All four
   upstream HSD ownership proofs replay under both SHA-256 and legacy GOST94
   historical anchors.
+- Canonical mainnet block 62,517 is pinned with a checkpoint-linked header
+  context and two real CLAIM witnesses (`jinronghd` and `namecheap`). Native
+  tests validate the complete raw body and both proofs, reject median-time-past
+  in place of HSD's exact parent-header time, and connect/disconnect the exact
+  claim coinbase through the proof-capable state service.
 
 ### Network and synchronization foundation
 
@@ -119,10 +124,11 @@ These are substantial foundations, not a production full node.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
 - Current/live valid claim-proof evidence, remaining historical datasets, and
-  complete replay evidence. Claim DNSSEC algorithms and DS digests, the full
-  upstream historical proof corpus, deflation accounting, complete airdrop-key
-  verification, active-node deployment composition, and airdrop duplicate/
-  conjured-value accounting are implemented.
+  complete replay beyond the pinned block 62,517 claim case. Claim DNSSEC
+  algorithms and DS digests, the full upstream historical proof corpus,
+  deflation accounting, complete airdrop-key verification, active-node
+  deployment composition, and airdrop duplicate/conjured-value accounting are
+  implemented.
 - Complete contextual covenant/name behavior across mainnet history.
 - Production persistent incremental Urkel storage, exact HSD proof wire format,
   snapshots, compaction, and crash recovery.

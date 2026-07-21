@@ -54,7 +54,7 @@ pub fn verify_claim_output(
     proof_raw: &[u8],
     output: &Output,
     height: Height,
-    parent_median_time: u64,
+    parent_time: u64,
     network: Network,
     flags: ClaimFlags,
     dnssec: &dyn DnssecVerifier,
@@ -73,7 +73,7 @@ pub fn verify_claim_output(
     if !proof.verify_signatures(dnssec) {
         return Err(ClaimConsensusError::InvalidSignatures);
     }
-    if !proof.verify_time(parent_median_time) {
+    if !proof.verify_time(parent_time) {
         return Err(ClaimConsensusError::InvalidTime);
     }
 
@@ -183,7 +183,7 @@ pub enum ClaimConsensusError {
     Insane,
     #[error("ownership proof DNSSEC signature chain is invalid")]
     InvalidSignatures,
-    #[error("ownership proof signatures do not cover the parent median time")]
+    #[error("ownership proof signatures do not cover the parent block time")]
     InvalidTime,
     #[error("ownership proof has no valid target")]
     MissingTarget,
@@ -357,7 +357,9 @@ fn verify_digest(
 
 #[cfg(test)]
 mod tests {
-    use hns_primitives::{DnsRecord, DnsRecordData, DnssecAnchor, OwnershipProof, DNS_TYPE_TXT};
+    use hns_primitives::{
+        Block, DnsRecord, DnsRecordData, DnssecAnchor, OwnershipProof, DNS_TYPE_TXT,
+    };
     use serde::Deserialize;
 
     use super::*;
@@ -398,9 +400,62 @@ mod tests {
         digest: String,
     }
 
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetHistoryFixture {
+        canonical_context: MainnetContextFixture,
+        block: MainnetBlockFixture,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetContextFixture {
+        parent_time: u64,
+        parent_median_time: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetBlockFixture {
+        height: u32,
+        hash: String,
+        raw: String,
+        size: usize,
+        base_size: usize,
+        weight: usize,
+        transaction_count: usize,
+        claims: Vec<MainnetClaimFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimFixture {
+        output_index: usize,
+        name: String,
+        target: String,
+        name_hash: String,
+        weak: bool,
+        proof_raw: String,
+        commit_hash: String,
+        commit_height: u32,
+        version: u8,
+        address: String,
+        reserved_value: u64,
+        fee: u64,
+        output_value: u64,
+        conjured: u64,
+    }
+
     fn fixture() -> Fixture {
         serde_json::from_str(include_str!("../../../fixtures/hsd/claims/codec-v1.json"))
             .expect("HSD ownership proof fixture")
+    }
+
+    fn mainnet_history_fixture() -> MainnetHistoryFixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-history-v1.json"
+        ))
+        .expect("HSD canonical mainnet claim fixture")
     }
 
     fn decode_hex(value: &str) -> Vec<u8> {
@@ -508,5 +563,106 @@ mod tests {
         }
         assert_eq!(OpenSslDnssecVerifier.digest(0, b"unsupported"), None);
         assert_eq!(OpenSslDnssecVerifier.digest(6, b"unsupported"), None);
+    }
+
+    #[test]
+    fn native_claim_validation_matches_canonical_mainnet_block() {
+        let fixture = mainnet_history_fixture();
+        let block = Block::decode(&decode_hex(&fixture.block.raw)).expect("mainnet block");
+        assert_eq!(block.encode(), decode_hex(&fixture.block.raw));
+        assert_eq!(block.hash().to_hex(), fixture.block.hash);
+        assert_eq!(block.transactions.len(), fixture.block.transaction_count);
+        let validation = crate::validate_block_body(&block).expect("mainnet block body");
+        assert_eq!(validation.base_size, fixture.block.base_size);
+        assert_eq!(validation.weight, fixture.block.weight);
+        assert_eq!(block.encode().len(), fixture.block.size);
+
+        let coinbase = &block.transactions[0];
+        assert_eq!(coinbase.locktime, fixture.block.height);
+        assert_eq!(fixture.block.claims.len(), 2);
+        for expected in fixture.block.claims {
+            let proof_raw = &coinbase.inputs[expected.output_index].witness.items[0];
+            let output = &coinbase.outputs[expected.output_index];
+            assert_eq!(proof_raw, &decode_hex(&expected.proof_raw));
+            assert_eq!(output.value, expected.output_value);
+
+            let verified = verify_claim_output(
+                proof_raw,
+                output,
+                fixture.block.height,
+                fixture.canonical_context.parent_time,
+                Network::Mainnet,
+                ClaimFlags { hardened: false },
+                &OpenSslDnssecVerifier,
+            )
+            .expect("canonical mainnet claim");
+            assert_eq!(verified.name, expected.name.as_bytes());
+            assert_eq!(verified.name_hash.to_hex(), expected.name_hash);
+            assert_eq!(verified.weak, expected.weak);
+            assert_eq!(
+                verified.commit_hash.to_vec(),
+                decode_hex(&expected.commit_hash)
+            );
+            assert_eq!(verified.commit_height, expected.commit_height);
+            assert_eq!(verified.value, expected.reserved_value);
+            assert_eq!(verified.fee, expected.fee);
+            assert_eq!(verified.conjured, expected.conjured);
+            assert_eq!(output.address.version, expected.version);
+            assert_eq!(output.address.hash, decode_hex(&expected.address));
+            let proof = OwnershipProof::decode(proof_raw).expect("ownership proof");
+            assert_eq!(
+                proof.target().expect("claim target").to_ascii_fqdn(),
+                Some(expected.target)
+            );
+
+            assert!(matches!(
+                verify_claim_output(
+                    proof_raw,
+                    output,
+                    fixture.block.height,
+                    fixture.canonical_context.parent_median_time,
+                    Network::Mainnet,
+                    ClaimFlags { hardened: false },
+                    &OpenSslDnssecVerifier,
+                ),
+                Err(ClaimConsensusError::InvalidTime)
+            ));
+            assert!(matches!(
+                verify_claim_output(
+                    proof_raw,
+                    output,
+                    fixture.block.height,
+                    fixture.canonical_context.parent_time,
+                    Network::Mainnet,
+                    ClaimFlags { hardened: true },
+                    &OpenSslDnssecVerifier,
+                ),
+                Err(ClaimConsensusError::WeakDisabled)
+            ));
+
+            let mut altered = proof;
+            let DnsRecordData::Rrsig(signature) = &mut altered.zones[0]
+                .keys
+                .last_mut()
+                .expect("root signature")
+                .data
+            else {
+                panic!("root signature record");
+            };
+            signature.signature[0] ^= 1;
+            let altered_raw = altered.encode().expect("altered ownership proof");
+            assert!(matches!(
+                verify_claim_output(
+                    &altered_raw,
+                    output,
+                    fixture.block.height,
+                    fixture.canonical_context.parent_time,
+                    Network::Mainnet,
+                    ClaimFlags { hardened: false },
+                    &OpenSslDnssecVerifier,
+                ),
+                Err(ClaimConsensusError::InvalidSignatures)
+            ));
+        }
     }
 }

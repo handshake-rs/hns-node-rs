@@ -58,6 +58,9 @@ reserved low-latency paths.
 - Exact non-coinbase covenant linkage.
 - Contextual non-claim name-state transitions plus authenticated CLAIM
   connect/disconnect under active parent-derived deployment state.
+- A checkpoint-linked canonical mainnet claim case at height 62,517: full raw
+  block/body validation, both real DNSSEC witnesses, HSD's exact parent-header
+  timestamp rule, and exact coinbase connect/disconnect through native state.
 - Reserved/lockup datasets and renewal-policy fixtures.
 - Exact `NameState` encoding and undo.
 - Correctness-first exact Urkel roots and internal proofs.
@@ -91,13 +94,15 @@ reserved low-latency paths.
 ## Remaining implementation order
 
 1. **Claim and airdrop validation** — capture current/live valid claim evidence
-   and replay the proof-capable active-node service across mainnet history.
-   Exact Claim/DNSSEC/TXT codecs, all HSD DS digests including GOST94, the
-   complete upstream historical ownership-proof corpus, ICANN-rooted signature
-   verification, parent-derived deployment composition, claim deflation and
-   name-state rules, all five airdrop key types (including pinned GooSig),
-   faucet and production-root proof verification, conjured accounting, and
-   durable duplicate prevention/undo are implemented.
+   and replay the proof-capable active-node service across the rest of mainnet
+   history. Height 62,517 now supplies a checkpoint-linked real two-claim case
+   with exact parent-time and coinbase state replay. Exact Claim/DNSSEC/TXT
+   codecs, all HSD DS digests including GOST94, the complete upstream
+   historical ownership-proof corpus, ICANN-rooted signature verification,
+   parent-derived deployment composition, claim deflation and name-state
+   rules, all five airdrop key types (including pinned GooSig), faucet and
+   production-root proof verification, conjured accounting, and durable
+   duplicate prevention/undo are implemented.
 2. **Contextual covenant closure** — replay all mainnet transition families and
    historical exceptions against HSD.
 3. **Persistent Urkel** — incremental nodes, exact proof wire format,

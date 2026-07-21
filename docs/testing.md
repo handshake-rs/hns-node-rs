@@ -51,6 +51,7 @@ npm run hsrd-script-fixtures --prefix hsd-oracle
 npm run hsrd-deployment-fixtures --prefix hsd-oracle
 npm run hsrd-airdrop-fixtures --prefix hsd-oracle
 npm run hsrd-claim-fixtures --prefix hsd-oracle
+npm run hsrd-mainnet-claim-history --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
@@ -72,6 +73,9 @@ Current evidence includes:
   four upstream signed DNSKEY/DS/TXT/RRSIG proofs, their exact codec/sanity/
   window/weak outputs, SHA-256 and legacy GOST94 historical-anchor results,
   and direct GOST94 boundary/multiblock vectors;
+- checkpoint-linked canonical mainnet block 62,517 with two real DNSSEC claim
+  witnesses, full raw body metrics, exact parent-header-time context, native
+  proof mutation/hardening rejection, and claim coinbase connect/disconnect;
 - build-checked libFuzzer targets for bounded Claim/TXT/ownership-proof and
   airdrop key/proof decoding plus their derived hash, sanity, and Merkle paths;
 - signature-type encoding validity;
@@ -254,6 +258,33 @@ classification, reserved-target lookup, current ICANN-anchor rejection, all
 five DS digest types, and successful end-to-end chain verification under both
 SHA-256 and legacy GOST94/CryptoPro historical anchors. State tests separately
 cover authenticated claim connect and disconnect semantics.
+
+The canonical mainnet claim-history fixture is checked offline through the
+pinned HSD implementation:
+
+```bash
+NODE_BACKEND=js npm run hsrd-mainnet-claim-history --prefix hsd-oracle
+```
+
+It pins block 62,517, its two real claims, the height-1 commit header, and the
+eleven headers needed for parent-time/MTP context. The native consensus test
+round-trips and validates the full block and both proofs, while the state test
+connects and disconnects the exact historical coinbase. A deliberately
+negative assertion proves that using MTP instead of HSD's exact parent block
+timestamp rejects both otherwise canonical proofs.
+
+An operator can refresh this fixture using a synchronized local mainnet HSD
+node. Refresh obtains the historical block bytes from the bounded archival
+endpoint recorded in the fixture, then requires a continuous locally queried
+header chain from HSD checkpoint 61,043 through the block before writing:
+
+```bash
+NODE_BACKEND=js npm run refresh-hsrd-mainnet-claim-history \
+  --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
+```
+
+This is one canonical block and coinbase-state replay case, not complete
+historical claim, UTXO, covenant, name-root, or reorganization replay.
 
 For every mainnet block and mutation-corpus case, compare:
 

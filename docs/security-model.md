@@ -27,6 +27,9 @@ The current foundation verifies or records evidence for:
   DNSSEC-claim, and faucet checks with restart/reorg validation;
 - ICANN-rooted DNSSEC claim verification and HSD claim output/commit/deflation
   accounting;
+- checkpoint-linked block 62,517 claim evidence validating two real mainnet
+  proofs and their state transition against HSD's exact parent-header-time
+  rule;
 - correctness-first exact Urkel roots;
 - atomic single- and multi-block database mutations;
 - sequence-consistent snapshots;
@@ -56,7 +59,8 @@ The following remain untrusted and release-blocking:
 - non-script historical exceptions and historical replay qualification;
 - independent script fuzz/invalid evidence beyond the complete pinned HSD
   upstream corpus;
-- current/live claim-proof evidence and complete historical claim replay;
+- current/live claim-proof evidence and complete historical claim replay beyond
+  the pinned block 62,517 case;
 - complete contextual name consensus over all historical cases;
 - persistent production Urkel nodes and HSD proof-wire parity;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;

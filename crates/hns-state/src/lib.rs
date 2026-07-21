@@ -229,7 +229,7 @@ pub trait CoinbaseIssuanceVerifier: Send + Sync {
         &self,
         transaction: &Transaction,
         height: Height,
-        parent_median_time: u64,
+        parent_time: u64,
         network: Network,
     ) -> Result<CoinbaseIssuanceSummary, StateError>;
 }
@@ -244,7 +244,7 @@ impl CoinbaseIssuanceVerifier for RejectSpecialCoinbaseIssuance {
         &self,
         transaction: &Transaction,
         _height: Height,
-        _parent_median_time: u64,
+        _parent_time: u64,
         _network: Network,
     ) -> Result<CoinbaseIssuanceSummary, StateError> {
         let special_input = transaction.inputs.len() > 1;
@@ -323,7 +323,7 @@ impl CoinbaseIssuanceVerifier for AirdropCoinbaseIssuanceVerifier {
         &self,
         transaction: &Transaction,
         height: Height,
-        parent_median_time: u64,
+        parent_time: u64,
         network: Network,
     ) -> Result<CoinbaseIssuanceSummary, StateError> {
         let mut conjured = 0u64;
@@ -346,7 +346,7 @@ impl CoinbaseIssuanceVerifier for AirdropCoinbaseIssuanceVerifier {
                     &input.witness.items[0],
                     output,
                     height,
-                    parent_median_time,
+                    parent_time,
                     network,
                     ClaimFlags {
                         hardened: self.flags.hardening,
@@ -694,15 +694,18 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         .outputs
         .iter()
         .any(|output| output.covenant.kind == CovenantKind::Claim);
-    let parent_median_time = if has_claim && request.height != 0 {
-        chain_context.median_time_past(request.height - 1)?
+    // HSD validates claim RRSIG windows against the exact candidate parent's
+    // header time. This is deliberately distinct from the median-time-past
+    // clock used for transaction finality and sequence locks.
+    let parent_time = if has_claim && request.height != 0 {
+        chain_context.block_time(request.height - 1)?
     } else {
         0
     };
     let issuance = services.issuance_verifier.verify_coinbase(
         coinbase,
         request.height,
-        parent_median_time,
+        parent_time,
         services.network,
     )?;
     stage_airdrop_positions(snapshot, batch, &issuance.airdrop_positions)?;
@@ -1366,6 +1369,16 @@ impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
         times.sort_unstable();
         Ok(times[times.len() / 2])
     }
+
+    fn block_time(&self, height: Height) -> Result<u64, StateError> {
+        self.header_at(height)?
+            .map(|record| record.header.time)
+            .ok_or_else(|| {
+                StateError::ChainView(format!(
+                    "cannot load canonical block time at height {height}"
+                ))
+            })
+    }
 }
 
 impl<T: ReadSnapshot> NameContext for SnapshotChainContext<'_, T> {
@@ -2006,7 +2019,7 @@ mod tests {
             &self,
             _transaction: &Transaction,
             _height: Height,
-            _parent_median_time: u64,
+            _parent_time: u64,
             _network: Network,
         ) -> Result<CoinbaseIssuanceSummary, StateError> {
             Ok(CoinbaseIssuanceSummary {
@@ -2128,6 +2141,42 @@ mod tests {
         position: u32,
     }
 
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimHistoryFixture {
+        canonical_context: MainnetClaimContextFixture,
+        block: MainnetClaimBlockFixture,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimContextFixture {
+        context_headers: Vec<MainnetClaimHeaderFixture>,
+    }
+
+    #[derive(Deserialize)]
+    struct MainnetClaimHeaderFixture {
+        height: u32,
+        hash: String,
+        raw: String,
+    }
+
+    #[derive(Deserialize)]
+    struct MainnetClaimBlockFixture {
+        height: u32,
+        raw: String,
+        claims: Vec<MainnetClaimStateFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MainnetClaimStateFixture {
+        name: String,
+        weak: bool,
+        commit_height: u32,
+        conjured: u64,
+    }
+
     fn decode_fixture_bytes(value: &str) -> Vec<u8> {
         assert_eq!(value.len() % 2, 0);
         (0..value.len())
@@ -2140,6 +2189,33 @@ mod tests {
         decode_fixture_bytes(value)
             .try_into()
             .expect("32-byte hash")
+    }
+
+    fn seed_mainnet_claim_headers(store: &MemoryStore, context: &MainnetClaimContextFixture) {
+        let mut batch = store.batch();
+        for expected in &context.context_headers {
+            let header = Header::decode(&decode_fixture_bytes(&expected.raw))
+                .expect("mainnet context header");
+            let hash = header.hash();
+            assert_eq!(hash.to_hex(), expected.hash);
+            batch
+                .put(
+                    ColumnFamily::Headers,
+                    hash.as_bytes(),
+                    &HeaderRecord {
+                        hash,
+                        height: expected.height,
+                        chainwork: Uint256::ONE,
+                        header,
+                        status: BlockStatus::default(),
+                    }
+                    .encode(),
+                )
+                .expect("mainnet context header");
+            write_canonical_height_to_batch(&mut batch, expected.height, hash)
+                .expect("mainnet canonical header");
+        }
+        store.commit(batch).expect("mainnet context headers");
     }
 
     #[test]
@@ -2758,5 +2834,91 @@ mod tests {
             .name_state(&name_hash)
             .expect("name state read")
             .is_none());
+    }
+
+    #[test]
+    fn canonical_mainnet_claim_coinbase_connects_with_exact_parent_time() {
+        let fixture: MainnetClaimHistoryFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-history-v1.json"
+        ))
+        .expect("mainnet claim history fixture");
+        let historical = Block::decode(&decode_fixture_bytes(&fixture.block.raw))
+            .expect("canonical mainnet claim block");
+        let coinbase = historical.transactions[0].clone();
+        assert_eq!(fixture.block.claims.len(), 2);
+
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        seed_mainnet_claim_headers(&store, &fixture.canonical_context);
+        let mut engine = StoredStateEngine::with_services(
+            store,
+            Network::Mainnet,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(
+                AirdropCoinbaseIssuanceVerifier::native(DeploymentState::from_states(
+                    [ThresholdState::Defined; 4],
+                ))
+                .expect("native issuance verifier"),
+            ),
+        )
+        .expect("mainnet claim state engine");
+
+        let candidate = block(fixture.block.height, vec![coinbase.clone()]);
+        let output_value = coinbase
+            .outputs
+            .iter()
+            .try_fold(0u64, |total, output| total.checked_add(output.value))
+            .expect("coinbase output value");
+        let conjured = fixture
+            .block
+            .claims
+            .iter()
+            .try_fold(0u64, |total, claim| total.checked_add(claim.conjured))
+            .expect("claim conjured value");
+        let ordinary_reward_and_fees = output_value
+            .checked_sub(conjured)
+            .expect("ordinary coinbase component");
+        let summary = engine
+            .connect_block(ConnectBlock {
+                block_hash: candidate.hash(),
+                height: fixture.block.height,
+                coinbase_maturity: 100,
+                block_reward: ordinary_reward_and_fees,
+                block: &candidate,
+            })
+            .expect("canonical mainnet claim coinbase");
+        assert_eq!(summary.coins_created, coinbase.outputs.len());
+        assert_eq!(summary.names_changed, fixture.block.claims.len());
+        assert!(summary.validation.claims_and_airdrops_valid);
+
+        for expected in &fixture.block.claims {
+            let name_hash = hash_name(&expected.name).expect("claimed name hash");
+            let state = engine
+                .name_state(&name_hash)
+                .expect("claimed name state read")
+                .expect("claimed name state");
+            assert_eq!(state.name, expected.name.as_bytes());
+            assert_eq!(state.height, fixture.block.height);
+            assert_eq!(state.renewal, fixture.block.height);
+            assert_eq!(state.claimed, expected.commit_height);
+            assert_eq!(state.owner.txid, coinbase.txid());
+            assert_eq!(state.weak, expected.weak);
+        }
+
+        engine
+            .disconnect_block(DisconnectBlock {
+                block_hash: candidate.hash(),
+                height: fixture.block.height,
+            })
+            .expect("mainnet claim disconnect");
+        for expected in &fixture.block.claims {
+            let name_hash = hash_name(&expected.name).expect("claimed name hash");
+            assert!(engine
+                .name_state(&name_hash)
+                .expect("restored name state read")
+                .is_none());
+        }
     }
 }

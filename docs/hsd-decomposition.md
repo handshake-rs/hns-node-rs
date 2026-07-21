@@ -25,6 +25,11 @@ scripts, covenant rules, name state, ownership proofs, airdrop proofs, and coin
 views. Those are mining dependencies, not domain-product features. Removing
 them would allow an invalid state root or transaction into a template.
 
+Its claim path also checks ownership-proof signature windows against the exact
+parent entry's header time. That clock is intentionally distinct from the
+median-time-past used for finality and sequence locks; native state composition
+must preserve both clocks rather than sharing one contextual timestamp.
+
 Likewise, `lib/mining/miner.js` obtains version, MTP, deployments, next target,
 and the live Urkel root from the chain before assembling claims, airdrops, and
 ordinary transactions. A fast template engine may cache and incrementally

@@ -33,6 +33,9 @@ Implemented:
   verification, all five HSD DS digests including legacy GOST94/CryptoPro,
   complete upstream historical-proof corpus replay, and claim output/commit/
   deflation accounting.
+- Checkpoint-linked canonical mainnet block 62,517 with two real claims,
+  complete raw body/proof verification, exact parent-header-time parity, and
+  native claim coinbase connect/disconnect evidence.
 - Native RSA/SHA-256, compact P-256, Ed25519, direct-address, and pinned
   Goosig 0.11.0 airdrop verification, including an upstream production-root
   GooSig proof through active block connection and durable duplicate rejection.
@@ -42,7 +45,8 @@ Remaining:
 - historical replay qualification;
 - non-script historical exceptions and broader independent invalid/fuzz
   corpora;
-- current/live claim-proof evidence and complete historical claim replay;
+- current/live claim-proof evidence and complete historical claim replay beyond
+  the pinned block 62,517 case;
 - full contextual transition replay and invalid corpus.
 
 ## State and reorganization engine — hardened foundation

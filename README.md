@@ -91,6 +91,11 @@ Implemented:
   DS digests including legacy GOST94/CryptoPro, and reserved-target/output/
   commit/deflation accounting checks. The complete four-proof HSD upstream
   ownership corpus is replayed under SHA-256 and GOST94 historical anchors.
+- Checkpoint-linked canonical-mainnet evidence from block 62,517, including its
+  two real CLAIM witnesses, exact parent-header timestamp semantics, full raw
+  block/body validation, and native claim coinbase connect/disconnect. The
+  fixture demonstrates why HSD's claim RRSIG clock is the exact parent block
+  time rather than median-time-past.
 - Native verification for all five HSD airdrop key types: direct address
   allocations, RSA/SHA-256, compact P-256 ECDSA, Ed25519, and the exact pinned
   Goosig 0.11.0 verifier. HSD-generated vectors cover valid and mutated
@@ -134,7 +139,7 @@ Implemented:
 Still release-blocking:
 
 - current/live production-valid claim-proof evidence and complete historical
-  claim replay;
+  claim replay beyond the pinned block 62,517 case;
 - full contextual covenant parity across mainnet history;
 - a production persistent incremental Urkel node store and exact HSD proof-wire
   codec;
@@ -247,6 +252,7 @@ python3 scripts/validate-hsrd-source-handoff.py
 npm run hsrd-script-fixtures --prefix hsd-oracle
 npm run hsrd-deployment-fixtures --prefix hsd-oracle
 npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
+npm run hsrd-mainnet-claim-history --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle

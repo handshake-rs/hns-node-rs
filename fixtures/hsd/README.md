@@ -8,8 +8,9 @@ golden cases can be added without changing testkit paths.
 - `airdrops`: HSD key/proof codecs, hash preimages, allocation roots, and a
   complete valid faucet proof from the pinned upstream corpus.
 - `claims`: HSD Claim envelope/hash vectors, checksummed ownership TXT payloads
-  for all four network prefixes, and a complete upstream DNSKEY/DS/TXT/RRSIG
-  proof with exact sanity/window/weak and trust-policy results.
+  for all four network prefixes, the complete four-proof upstream historical
+  DNSKEY/DS/TXT/RRSIG corpus, and a canonical mainnet block containing two real
+  CLAIM outputs with checkpoint-linked header/time context.
 - `transactions`: serialized transactions.
 - `scripts`: signature hashes, sequence locks, and HSD execution/error vectors.
 - `covenants`: covenant cases and name-operation vectors.

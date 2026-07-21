@@ -75,7 +75,9 @@ The compatibility `Mempool::submit` entrypoint rejects with
 `verified-mempool-context-required`. Production admission must use
 `submit_with_context` with complete input and contextual verifiers. Mining-engine
 peer relay therefore remains deliberately fail closed while the documented
-broader claim-evidence and historical-qualification gaps remain.
+broader claim-history and historical-qualification gaps remain. The pinned
+height-62,517 case establishes exact proof/accounting and parent-header-time
+behavior for two real mainnet claims, but it is not full-chain qualification.
 
 ## Template construction
 
@@ -160,8 +162,9 @@ remain release-blocking:
 
 - historical replay qualification;
 - independent script fuzz/invalid evidence beyond the pinned HSD corpus;
-- current/live claim-proof evidence and complete historical replay for the
-  active deployment-composed proof/accounting service;
+- current/live claim-proof evidence and complete historical replay beyond the
+  pinned block 62,517 case for the active deployment-composed proof/accounting
+  service;
 - complete contextual name-state parity;
 - production persistent incremental Urkel storage;
 - active-state IBD and live HSD state comparison;
