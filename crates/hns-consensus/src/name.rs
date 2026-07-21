@@ -9,6 +9,51 @@ use crate::ConsensusError;
 const RESERVED_DB: &[u8] = include_bytes!("../vendor/names.db");
 const LOCKUP_DB: &[u8] = include_bytes!("../vendor/lockup.db");
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservedName {
+    pub name: Vec<u8>,
+    pub target: Vec<u8>,
+    pub value: u64,
+}
+
+pub fn reserved_name(name: &[u8]) -> Option<ReservedName> {
+    if name.is_empty() || name.len() > 63 || !name.is_ascii() {
+        return None;
+    }
+    let normalized = name.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
+    let hash = sha3_256(&normalized);
+    let position = database_find(RESERVED_DB, 28, &hash)? as usize;
+    let target_size = usize::from(*RESERVED_DB.get(position)?);
+    let target_start = position.checked_add(1)?;
+    let target_end = target_start.checked_add(target_size)?;
+    let target = RESERVED_DB.get(target_start..target_end)?.to_vec();
+    let flags = *RESERVED_DB.get(target_end)?;
+    let name_size = usize::from(*RESERVED_DB.get(target_end.checked_add(1)?)?);
+    if name_size > target.len() || target.get(..name_size)? != normalized {
+        return None;
+    }
+
+    let mut value = read_u64(RESERVED_DB, 4)?;
+    if flags & 1 != 0 {
+        value = value.checked_add(read_u64(RESERVED_DB, 12)?)?;
+    }
+    if flags & 2 != 0 {
+        value = value.checked_add(read_u64(RESERVED_DB, 20)?)?;
+    }
+    if flags & 4 != 0 {
+        value = value.checked_add(read_u64(RESERVED_DB, target_end.checked_add(2)?)?)?;
+    }
+    if flags & 8 != 0 {
+        value = 0;
+    }
+
+    Some(ReservedName {
+        name: normalized,
+        target,
+        value,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NameParams {
     pub auction_start: Height,
@@ -641,6 +686,12 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let end = offset.checked_add(4)?;
     let value: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
     Some(u32::from_le_bytes(value))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let value: [u8; 8] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u64::from_le_bytes(value))
 }
 
 #[cfg(test)]

@@ -51,6 +51,39 @@
       "blake2b256": "f20dcccde245cf462912781c67841191a8fad12b66b7402cc71cf6f0c0c64e6e"
     },
     {
+      "id": "airdrop-codec-v1",
+      "network": "all",
+      "kind": "airdrop",
+      "path": "airdrops/codec-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "oracle",
+        "codec",
+        "merkle",
+        "faucet",
+        "coinbase"
+      ],
+      "blake2b256": "f8a3a95124f773cda017ba73534e07125302d9e5c148bf531d4d417ebf5c2e55"
+    },
+    {
+      "id": "claim-codec-v1",
+      "network": "all",
+      "kind": "claim",
+      "path": "claims/codec-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "oracle",
+        "codec",
+        "ownership",
+        "dnssec"
+      ],
+      "blake2b256": "48f087d3ed8dee93dd44a6e5fe3200fb33ac1ebef44770b6e8bd36453a0e2c96"
+    },
+    {
       "id": "covenant-codec-v1",
       "network": "agnostic",
       "kind": "covenant",
@@ -121,7 +154,7 @@
         "historical",
         "script-flags"
       ],
-      "blake2b256": "fec56762e960b04a4d38e0a5ed808609f3e647d2350f3833e7d0c599642cb313"
+      "blake2b256": "06d73967116e6314e48a04405c650b1c3642b2b88b10656833950ecb5aa9487b"
     },
     {
       "id": "sighash-v1",

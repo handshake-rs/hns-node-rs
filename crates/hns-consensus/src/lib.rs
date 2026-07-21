@@ -9,6 +9,8 @@ use hns_primitives::{
 };
 use serde::{Deserialize, Serialize};
 
+mod airdrop;
+mod claim;
 mod covenant;
 mod deployment;
 mod locks;
@@ -16,13 +18,18 @@ mod name;
 mod script;
 mod sighash;
 
+pub use airdrop::{verify_airdrop_output, AirdropConsensusError, AirdropFlags, VerifiedAirdrop};
+pub use claim::{
+    verify_claim_output, ClaimConsensusError, ClaimFlags, OpenSslDnssecVerifier, VerifiedClaim,
+};
 pub use covenant::{
     blind_bid, verify_transaction_covenant_links, CovenantLinkError, CovenantLinkSummary,
 };
 pub use deployment::{
-    compute_block_version, deployment_state, is_hsd_historical_block, is_hsd_historical_height,
-    threshold_state, verify_checkpoint, Checkpoint, Deployment, DeploymentError,
-    DeploymentHistoryEntry, DeploymentId, DeploymentState, HistoricalScriptPolicy, ThresholdState,
+    advance_threshold_state, compute_block_version, deployment_state, is_hsd_historical_block,
+    is_hsd_historical_height, threshold_state, verify_checkpoint, Checkpoint, Deployment,
+    DeploymentError, DeploymentHistoryEntry, DeploymentId, DeploymentPeriod, DeploymentState,
+    HistoricalScriptPolicy, ThresholdState,
 };
 pub use locks::{
     calculate_sequence_locks, verify_locktime_predicate, verify_sequence_locks,
@@ -30,8 +37,8 @@ pub use locks::{
 };
 pub use name::{
     has_rollout, is_locked_up, is_name_claimable, is_name_expired, is_reserved, maybe_expire_name,
-    name_lifecycle, rollout_height, verify_and_apply_name_covenant, verify_renewal_commitment,
-    NameContext, NameFlags, NameMutation, NameParams,
+    name_lifecycle, reserved_name, rollout_height, verify_and_apply_name_covenant,
+    verify_renewal_commitment, NameContext, NameFlags, NameMutation, NameParams, ReservedName,
 };
 pub use script::{
     verify_witness_program, NativeSignatureVerifier, ScriptError, ScriptFlags, SignatureVerifier,
@@ -133,6 +140,15 @@ impl Network {
         }
     }
 
+    pub const fn claim_prefix(self) -> &'static str {
+        match self {
+            Self::Mainnet => "hns-claim:",
+            Self::Testnet => "hns-testnet:",
+            Self::Regtest => "hns-regtest:",
+            Self::Simnet => "hns-simnet:",
+        }
+    }
+
     pub const fn params(self) -> NetworkParams {
         match self {
             Self::Mainnet => NetworkParams {
@@ -142,6 +158,8 @@ impl Network {
                 brontide_port: 44_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 100,
+                goosig_stop: 56_880,
+                deflation_height: 61_043,
                 activation_threshold: 1_916,
                 miner_window: 2_016,
                 names: NameParams {
@@ -187,6 +205,8 @@ impl Network {
                 brontide_port: 45_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 100,
+                goosig_stop: 2_880,
+                deflation_height: 0,
                 activation_threshold: 1_512,
                 miner_window: 2_016,
                 names: NameParams {
@@ -232,6 +252,8 @@ impl Network {
                 brontide_port: 46_806,
                 halving_interval: 2_500,
                 coinbase_maturity: 2,
+                goosig_stop: u32::MAX,
+                deflation_height: 200,
                 activation_threshold: 108,
                 miner_window: 144,
                 names: NameParams {
@@ -277,6 +299,8 @@ impl Network {
                 brontide_port: 47_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 6,
+                goosig_stop: u32::MAX,
+                deflation_height: 0,
                 activation_threshold: 75,
                 miner_window: 100,
                 names: NameParams {
@@ -340,6 +364,8 @@ pub struct NetworkParams {
     pub brontide_port: u16,
     pub halving_interval: u32,
     pub coinbase_maturity: u32,
+    pub goosig_stop: Height,
+    pub deflation_height: Height,
     pub activation_threshold: u32,
     pub miner_window: u32,
     pub names: NameParams,

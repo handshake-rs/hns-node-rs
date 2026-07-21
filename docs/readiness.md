@@ -22,18 +22,22 @@ Implemented:
 - Exact results for all 876 cases in HSD's pinned upstream script corpus.
 - Exact HSD deployment/checkpoint constants, BIP9 transitions, block-version
   signaling, deployment effects, and checkpoint/historical-script policy.
+- Active-chain deployment caches and parent-derived contextual name,
+  DNSSEC-claim, and faucet validation across connect/reorg/restart.
 - Strict header checkpoint enforcement in native peer and candidate imports.
 - Pinned vendored native secp256k1 verification.
 - Exact non-coinbase covenant linkage.
-- Contextual non-claim name-transition foundation.
+- Contextual name-transition foundation, including authenticated CLAIM
+  connect/disconnect at the proof-capable state-service boundary.
+- Exact HSD ownership-proof codecs, sanity/time/weak rules, ICANN-rooted DNSSEC
+  verification, and claim output/commit/deflation accounting.
 
 Remaining:
 
-- active-chain deployment cache/composition and historical replay
-  qualification;
+- historical replay qualification;
 - non-script historical exceptions and broader independent invalid/fuzz
   corpora;
-- claim and airdrop proof/accounting validation;
+- non-address airdrop signatures and broader claim proof corpora;
 - full contextual transition replay and invalid corpus.
 
 ## State and reorganization engine — hardened foundation
@@ -55,7 +59,7 @@ Implemented:
 Remaining:
 
 - production persistent incremental Urkel storage and HSD proof-wire parity;
-- claims/airdrops and complete historical contextual behavior;
+- complete historical contextual claim/airdrop behavior;
 - pruning and RocksDB crash/fault qualification;
 - complete mainnet reorganization/root replay.
 
@@ -146,7 +150,8 @@ Implemented:
 
 - HSD generators for sighash, locks, a 56-case focused script execution/error
   corpus, all 876 upstream script cases, deployments/checkpoints/historical
-  boundaries, covenant linkage, name-state codec, reserved/lockup/renewal policy,
+  boundaries, airdrop proofs, Claim/TXT/DNSSEC ownership-proof codecs,
+  covenant linkage, name-state codec, reserved/lockup/renewal policy,
   incremental Urkel roots, P2P wire bytes, subsidy, and deterministic coinbase
   behavior;
 - static integrity checks and native secp256k1 smoke verification.

@@ -175,7 +175,7 @@ never penalized as a network peer.
 
 ## Restart and checkpoint semantics
 
-A versioned sync checkpoint (retained by the current schema 9/profile `hsrd-mining-v5`) contains:
+A versioned sync checkpoint (retained by the current schema 11/profile `hsrd-mining-v7`) contains:
 
 - monotonically increasing sequence;
 - stage;

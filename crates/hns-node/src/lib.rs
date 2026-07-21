@@ -34,8 +34,9 @@ use hns_chain::{
     StoredBlockIndex, StoredHeaderIndex,
 };
 use hns_consensus::{
-    expected_next_bits, validate_block_finality, ConsensusParams, DifficultyPoint, HeaderConsensus,
-    HeaderParent, HeaderValidationContext, NameFlags, Network, MAX_FUTURE_BLOCK_TIME,
+    advance_threshold_state, expected_next_bits, validate_block_finality, ConsensusParams,
+    Deployment, DeploymentPeriod, DeploymentState, DifficultyPoint, HeaderConsensus, HeaderParent,
+    HeaderValidationContext, NameFlags, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
     MEDIAN_TIMESPAN,
 };
 use hns_mempool::{MemoryMempool, Mempool};
@@ -51,8 +52,8 @@ use hns_rpc::{
 };
 use hns_state::{
     connect_block_to_batch_with_services, decode_coin, decode_name_state,
-    disconnect_block_to_batch, verify_stored_name_tree_root, BlockUndo, ConnectBlock,
-    DisconnectBlock, StoredStateEngine,
+    disconnect_block_to_batch, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
+    BlockUndo, ConnectBlock, DisconnectBlock, StateServices, StoredStateEngine,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_clean_shutdown, mark_unclean_start, open_store,
@@ -65,6 +66,10 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 3;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
+
+const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
+const DEPLOYMENT_STATE_CACHE_VERSION: u8 = 1;
+const DEPLOYMENT_STATE_CACHE_SIZE: usize = 1 + 4 + 4;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -195,7 +200,7 @@ fn durable_tip_can_authorize(config: &NodeConfig, durable: &DurableMiningState) 
 fn consensus_readiness() -> RpcConsensusReadiness {
     RpcConsensusReadiness {
         header_pow_difficulty: true,
-        checkpoints_and_deployments: false,
+        checkpoints_and_deployments: true,
         block_syntax: true,
         absolute_finality: true,
         sighash_primitives: true,
@@ -1173,7 +1178,10 @@ impl NodeState {
                     let record = load_block_index_record(&snapshot, &hash)?.ok_or_else(|| {
                         anyhow::anyhow!("active block index {} is missing", hash.to_hex())
                     })?;
-                    if record.height != height || !record.status.active_chain {
+                    if record.height != height
+                        || !record.status.active_chain
+                        || !record.status.deployment_state_valid
+                    {
                         anyhow::bail!(
                             "active block index {} has inconsistent status",
                             hash.to_hex()
@@ -1202,6 +1210,26 @@ impl NodeState {
                     if block.hash() != hash || block.header.prev_block != record.prev_hash {
                         anyhow::bail!(
                             "active block body {} disagrees with its index",
+                            hash.to_hex()
+                        );
+                    }
+                    let expected_deployments = self.deployment_state_for_block(
+                        &snapshot,
+                        height,
+                        block.header.prev_block,
+                    )?;
+                    let cached_deployments =
+                        load_deployment_state(&snapshot, hash)?.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "active block {} is missing its deployment-state cache",
+                                hash.to_hex()
+                            )
+                        })?;
+                    if cached_deployments.height != height
+                        || cached_deployments.state != expected_deployments
+                    {
+                        anyhow::bail!(
+                            "active block {} has an invalid deployment-state cache",
                             hash.to_hex()
                         );
                     }
@@ -1763,6 +1791,110 @@ impl NodeState {
         Ok(times[times.len() / 2])
     }
 
+    fn deployment_state_for_block<T: ReadSnapshot>(
+        &self,
+        snapshot: &T,
+        height: Height,
+        previous_hash: BlockHash,
+    ) -> Result<DeploymentState> {
+        if height == 0 {
+            if previous_hash != BlockHash::ZERO {
+                anyhow::bail!("genesis deployment state has a non-zero parent");
+            }
+            return Ok(DeploymentState::from_states([ThresholdState::Defined; 4]));
+        }
+
+        let parent = load_header_record(snapshot, &previous_hash)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "deployment-state parent {} is missing",
+                previous_hash.to_hex()
+            )
+        })?;
+        if parent.height.checked_add(1) != Some(height) || parent.hash != previous_hash {
+            anyhow::bail!(
+                "deployment-state parent {} is not contiguous with height {height}",
+                previous_hash.to_hex()
+            );
+        }
+        let previous = load_deployment_state(snapshot, parent.hash)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "deployment-state cache is missing for parent {} at height {}",
+                parent.hash.to_hex(),
+                parent.height
+            )
+        })?;
+        if previous.height != parent.height {
+            anyhow::bail!(
+                "deployment-state cache height {} disagrees with parent height {}",
+                previous.height,
+                parent.height
+            );
+        }
+
+        let params = self.network.params();
+        let mut state = previous.state;
+        for deployment in self.network.deployments() {
+            let window = deployment.effective_window(params.miner_window);
+            if window == 0 {
+                anyhow::bail!("deployment {} has a zero window", deployment.name());
+            }
+            let period = if height % window == 0 {
+                Some(self.completed_deployment_period(snapshot, &parent, *deployment, window)?)
+            } else {
+                None
+            };
+            let next = advance_threshold_state(
+                params.activation_threshold,
+                params.miner_window,
+                *deployment,
+                height,
+                previous.state.state(deployment.id),
+                period,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to advance deployment {} for block height {height}",
+                    deployment.name()
+                )
+            })?;
+            state = state.with_state(deployment.id, next);
+        }
+        Ok(state)
+    }
+
+    fn completed_deployment_period<T: ReadSnapshot>(
+        &self,
+        snapshot: &T,
+        parent: &HeaderRecord,
+        deployment: Deployment,
+        window: u32,
+    ) -> Result<DeploymentPeriod> {
+        let signal = 1u32
+            .checked_shl(u32::from(deployment.bit))
+            .ok_or_else(|| anyhow::anyhow!("deployment bit {} is invalid", deployment.bit))?;
+        let mut entry = parent.clone();
+        let mut signalling_blocks = 0u32;
+        for offset in 0..window {
+            if entry.header.version & signal != 0 {
+                signalling_blocks = signalling_blocks
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("deployment signalling count overflow"))?;
+            }
+            if offset + 1 != window {
+                entry = self.header_parent(snapshot, &entry).with_context(|| {
+                    format!(
+                        "deployment {} period is not parent-contiguous",
+                        deployment.name()
+                    )
+                })?;
+            }
+        }
+        Ok(DeploymentPeriod {
+            median_time_past: self.median_time_past(snapshot, parent)?,
+            signalling_blocks,
+        })
+    }
+
     fn ancestor<T: ReadSnapshot>(
         &self,
         snapshot: &T,
@@ -1842,6 +1974,28 @@ impl NodeState {
         let mut status = validated.status;
         let raw_record = RawBlockRecord::from_block(&request.block, request.source);
 
+        let deployments = self.deployment_state_for_block(
+            snapshot,
+            request.height,
+            request.block.header.prev_block,
+        )?;
+        if let Some(cached) = load_deployment_state(snapshot, block_hash)? {
+            if cached.height != request.height || cached.state != deployments {
+                anyhow::bail!(
+                    "deployment-state cache for {} disagrees with the active branch",
+                    block_hash.to_hex()
+                );
+            }
+        }
+        let issuance = AirdropCoinbaseIssuanceVerifier::faucet_only(deployments);
+        let services = StateServices {
+            network: self.network,
+            name_flags: deployments.name_flags,
+            name_flags_valid: true,
+            input_verifier: self.state_engine.input_verifier(),
+            issuance_verifier: &issuance,
+        };
+
         let state_summary = connect_block_to_batch_with_services(
             snapshot,
             batch,
@@ -1852,10 +2006,13 @@ impl NodeState {
                 block_reward: self.network.params().block_reward(request.height),
                 block: &request.block,
             },
-            self.state_engine.services(),
+            services,
         )
         .map_err(|error| anyhow::anyhow!("failed to stage state update: {error}"))?;
 
+        write_deployment_state(batch, block_hash, request.height, deployments)?;
+
+        status.deployment_state_valid = true;
         status.relative_locks_valid = state_summary.validation.relative_locks_valid;
         status.scripts_valid = state_summary.validation.scripts_valid;
         status.covenant_links_valid = state_summary.validation.covenant_links_valid;
@@ -2156,6 +2313,75 @@ fn load_block_undo(snapshot: &impl ReadSnapshot, hash: &BlockHash) -> Result<Opt
     BlockUndo::decode(&bytes)
         .map(Some)
         .map_err(|error| anyhow::anyhow!("failed to decode block undo: {error}"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CachedDeploymentState {
+    height: Height,
+    state: DeploymentState,
+}
+
+fn deployment_state_cache_key(hash: BlockHash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(DEPLOYMENT_STATE_CACHE_PREFIX.len() + 32);
+    key.extend_from_slice(DEPLOYMENT_STATE_CACHE_PREFIX);
+    key.extend_from_slice(hash.as_bytes());
+    key
+}
+
+fn load_deployment_state(
+    snapshot: &impl ReadSnapshot,
+    hash: BlockHash,
+) -> Result<Option<CachedDeploymentState>> {
+    let Some(bytes) = snapshot
+        .get(ColumnFamily::Snapshots, &deployment_state_cache_key(hash))
+        .context("failed to read deployment-state cache")?
+    else {
+        return Ok(None);
+    };
+    if bytes.len() != DEPLOYMENT_STATE_CACHE_SIZE {
+        anyhow::bail!(
+            "deployment-state cache for {} has {} bytes; expected {}",
+            hash.to_hex(),
+            bytes.len(),
+            DEPLOYMENT_STATE_CACHE_SIZE
+        );
+    }
+    if bytes[0] != DEPLOYMENT_STATE_CACHE_VERSION {
+        anyhow::bail!(
+            "deployment-state cache for {} has unsupported version {}",
+            hash.to_hex(),
+            bytes[0]
+        );
+    }
+    let height_bytes: [u8; 4] = bytes[1..5]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("deployment-state height has invalid length"))?;
+    let state_bytes: [u8; 4] = bytes[5..9]
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("deployment-state vector has invalid length"))?;
+    let height = Height::from_le_bytes(height_bytes);
+    let state = DeploymentState::decode_states(state_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid deployment-state cache: {error}"))?;
+    Ok(Some(CachedDeploymentState { height, state }))
+}
+
+fn write_deployment_state(
+    batch: &mut impl WriteBatch,
+    hash: BlockHash,
+    height: Height,
+    state: DeploymentState,
+) -> Result<()> {
+    let mut bytes = [0u8; DEPLOYMENT_STATE_CACHE_SIZE];
+    bytes[0] = DEPLOYMENT_STATE_CACHE_VERSION;
+    bytes[1..5].copy_from_slice(&height.to_le_bytes());
+    bytes[5..9].copy_from_slice(&state.encode_states());
+    batch
+        .put(
+            ColumnFamily::Snapshots,
+            &deployment_state_cache_key(hash),
+            &bytes,
+        )
+        .context("failed to stage deployment-state cache")
 }
 
 fn block_hash_from_bytes(bytes: &[u8]) -> Result<BlockHash> {
@@ -2918,6 +3144,55 @@ mod tests {
         block
     }
 
+    #[derive(serde::Deserialize)]
+    struct AirdropFixture {
+        faucet: AirdropFixtureProof,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AirdropFixtureProof {
+        raw: String,
+        value: u64,
+        version: u8,
+        address: String,
+        fee: u64,
+        position: u32,
+    }
+
+    fn decode_fixture_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).expect("fixture hex"))
+            .collect()
+    }
+
+    fn faucet_coinbase() -> (Transaction, u32) {
+        let fixture: AirdropFixture =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        let proof = fixture.faucet;
+        let mut transaction =
+            coinbase_transaction_with_address(6, Network::Regtest.params().block_reward(0));
+        transaction.inputs.push(Input {
+            previous_output: Outpoint::null(),
+            sequence: u32::MAX,
+            witness: Witness {
+                items: vec![decode_fixture_hex(&proof.raw)],
+            },
+        });
+        transaction.outputs.push(Output {
+            value: proof.value - proof.fee,
+            address: Address::new(proof.version, decode_fixture_hex(&proof.address))
+                .expect("faucet address"),
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        });
+        (transaction, proof.position)
+    }
+
     fn experimental_authority_config() -> NodeConfig {
         NodeConfig {
             network: Network::Regtest,
@@ -3115,6 +3390,47 @@ mod tests {
             Some(2)
         );
         assert!(node.mining_snapshot().is_none());
+    }
+
+    #[test]
+    fn active_node_verifies_faucet_issuance_from_parent_deployments() {
+        let store = StoreHandle::memory();
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("node");
+        let (coinbase, position) = faucet_coinbase();
+        let block = block_with_commitments(vec![coinbase.clone()]);
+        let record = node
+            .connect_block(NodeBlockImport::fixture(block, 0, 1))
+            .expect("faucet block");
+        assert!(record.status.deployment_state_valid);
+        assert!(record.status.claims_and_airdrops_valid);
+
+        let snapshot = store.snapshot().expect("snapshot");
+        let cached = load_deployment_state(&snapshot, record.hash)
+            .expect("deployment state read")
+            .expect("deployment state");
+        assert_eq!(cached.height, 0);
+        assert_eq!(cached.state.encode_states(), [0; 4]);
+        drop(snapshot);
+
+        let mut duplicate = block_with_commitments(vec![coinbase]);
+        duplicate.header.prev_block = record.hash;
+        duplicate.header.nonce = 11;
+        let error = node
+            .connect_block(NodeBlockImport::fixture(duplicate, 1, 2))
+            .expect_err("duplicate faucet");
+        assert!(error.to_string().contains(&position.to_string()), "{error}");
+
+        drop(node);
+        NodeState::from_store_for_network(store, Network::Regtest).expect("faucet state restarts");
     }
 
     #[test]
@@ -3337,6 +3653,49 @@ mod tests {
     }
 
     #[test]
+    fn startup_rejects_missing_or_corrupt_deployment_state_cache() {
+        for corrupt in [false, true] {
+            let store = StoreHandle::memory();
+            let state =
+                NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+            let mut node = NodeService::try_with_state(
+                NodeConfig {
+                    network: Network::Regtest,
+                    ..NodeConfig::default()
+                },
+                state,
+            )
+            .expect("node");
+            let block = block_with_commitments(vec![coinbase_transaction()]);
+            let block_hash = block.hash();
+            node.connect_block(NodeBlockImport::fixture(block, 0, 1))
+                .expect("connect block");
+            drop(node);
+
+            let key = deployment_state_cache_key(block_hash);
+            let mut batch = store.batch();
+            if corrupt {
+                batch
+                    .put(
+                        ColumnFamily::Snapshots,
+                        &key,
+                        &[DEPLOYMENT_STATE_CACHE_VERSION, 0, 0, 0, 0, 0, 0, 0, 9],
+                    )
+                    .expect("corrupt deployment state");
+            } else {
+                batch
+                    .delete(ColumnFamily::Snapshots, &key)
+                    .expect("delete deployment state");
+            }
+            store.commit(batch).expect("commit cache fault");
+
+            let error = NodeState::from_store_for_network(store, Network::Regtest)
+                .expect_err("deployment-state corruption");
+            assert!(error.to_string().contains("deployment-state"), "{error}");
+        }
+    }
+
+    #[test]
     fn durable_store_rejects_cross_network_reopen() {
         let store = StoreHandle::memory();
         NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("bind regtest");
@@ -3534,6 +3893,23 @@ mod tests {
                 .expect("best block"),
             Some(summary.connected[0].hash.as_bytes().to_vec())
         );
+        assert_eq!(
+            load_deployment_state(&snapshot, old_record.hash)
+                .expect("old deployment cache")
+                .expect("retained old deployment state")
+                .state
+                .encode_states(),
+            [0; 4]
+        );
+        assert_eq!(
+            load_deployment_state(&snapshot, summary.connected[0].hash)
+                .expect("new deployment cache")
+                .expect("new deployment state")
+                .state
+                .encode_states(),
+            [0; 4]
+        );
+        assert!(summary.connected[0].status.deployment_state_valid);
         assert!(matches!(
             mining.events.try_recv().expect("candidate"),
             hns_mining::ChainEvent::CandidateTipSeen { .. }

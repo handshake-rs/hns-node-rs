@@ -48,6 +48,9 @@ Generators support `--check` reproducibility mode:
 
 ```bash
 npm run hsrd-script-fixtures --prefix hsd-oracle
+npm run hsrd-deployment-fixtures --prefix hsd-oracle
+npm run hsrd-airdrop-fixtures --prefix hsd-oracle
+npm run hsrd-claim-fixtures --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
@@ -59,6 +62,14 @@ npm run hsrd-mining-template-fixtures --prefix hsd-oracle
 Current evidence includes:
 
 - signature-hash vectors for every defined base mode/modifier combination;
+- all five HSD airdrop-key codecs, proof hashes and signature preimages,
+  allocation-root checks, strict decode failures, and a complete valid faucet
+  proof from HSD's upstream corpus;
+- HSD Claim envelope encoding and blob-only hashes, strict length/trailing
+  failures, checksummed ownership TXT payloads for every network prefix, a
+  complete upstream signed DNSKEY/DS/TXT/RRSIG proof, its exact codec/sanity/
+  window/weak outputs, and explicit current-anchor versus historical-test
+  signature results;
 - signature-type encoding validity;
 - relative sequence-lock cases;
 - 56 HSD-executed witness-program cases spanning control flow, stack and
@@ -203,6 +214,21 @@ NODE_BACKEND=js npm run hsrd-deployment-fixtures --prefix hsd-oracle
 It pins all network deployment parameters and mainnet checkpoint hashes, then
 checks compact synthetic histories across DEFINED, STARTED, LOCKED_IN, ACTIVE,
 FAILED, timeout, partial-period, and per-deployment window/threshold behavior.
+
+The claim fixture is generated through HSD's `Claim` and `ownership` codecs:
+
+```bash
+NODE_BACKEND=js npm run hsrd-claim-fixtures --prefix hsd-oracle
+```
+
+It pins the bounded Claim envelope, blob-only identifier hash, all four network
+TXT prefixes, binary address/fee/commit fields, checksum behavior, strict
+decode failures, and a byte-exact upstream ownership proof. Rust tests cover
+compression-free proof parsing, HSD sanity/window/weak classification,
+reserved-target lookup, the current ICANN anchor rejection, and successful
+end-to-end RSA chain verification under HSD's recorded historical test
+anchor/claim-filter policy. State tests separately cover authenticated claim
+connect and disconnect semantics.
 
 For every mainnet block and mutation-corpus case, compare:
 

@@ -8,21 +8,26 @@ use std::{
 
 use hns_chain::{read_canonical_hash, HeaderRecord};
 use hns_consensus::{
-    verify_and_apply_name_covenant, verify_sequence_locks, verify_transaction_covenant_links,
-    ConsensusError, CovenantLinkError, NameContext, NameFlags, NativeSignatureVerifier, Network,
-    RejectUnverifiedInputs, SequenceLockView, TransactionInputVerifier, WitnessProgramVerifier,
-    MEDIAN_TIMESPAN,
+    is_reserved, maybe_expire_name, name_lifecycle, verify_airdrop_output,
+    verify_and_apply_name_covenant, verify_claim_output, verify_sequence_locks,
+    verify_transaction_covenant_links, AirdropFlags, ClaimFlags, ConsensusError, CovenantLinkError,
+    DeploymentState, NameContext, NameFlags, NativeSignatureVerifier, Network,
+    OpenSslDnssecVerifier, RejectUnverifiedInputs, SequenceLockView, TransactionInputVerifier,
+    VerifiedClaim, WitnessProgramVerifier, MAX_MONEY, MEDIAN_TIMESPAN,
 };
 use hns_primitives::{
-    Address, Amount, Block, BlockHash, Coin, Covenant, CovenantKind, Height, NameHash, NameState,
-    Outpoint, PrimitiveError, Reader, Transaction, Writer, MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT,
-    MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_TX_SIZE,
+    Address, AirdropSignatureVerifier, Amount, Block, BlockHash, Coin, Covenant, CovenantKind,
+    DnssecVerifier, Height, NameHash, NameLifecycleState, NameState, Outpoint, PrimitiveError,
+    Reader, Transaction, UnavailableAirdropSignatureVerifier, Writer, AIRDROP_TREE_LEAVES,
+    MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_TX_SIZE,
 };
-use hns_store::{ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch};
+use hns_store::{
+    ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES,
+};
 use hns_urkel::{root_from_entries, TreeRoot, UrkelError};
 use serde::{Deserialize, Serialize};
 
-const BLOCK_UNDO_VERSION: u32 = 4;
+const BLOCK_UNDO_VERSION: u32 = 5;
 const OUTPOINT_KEY_SIZE: usize = 36;
 const ADDRESS_CODEC_MAX: usize = 2 + MAX_ADDRESS_HASH_SIZE;
 const COIN_CODEC_MAX: usize = OUTPOINT_KEY_SIZE + 8 + 4 + 1 + ADDRESS_CODEC_MAX + MAX_TX_SIZE + 9;
@@ -96,6 +101,7 @@ pub struct BlockUndo {
     pub resulting_tree_root: TreeRoot,
     pub spent_coins: Vec<Coin>,
     pub created_coins: Vec<Outpoint>,
+    pub airdrop_positions: Vec<u32>,
     pub previous_name_states: Vec<NameUndo>,
 }
 
@@ -116,6 +122,11 @@ impl BlockUndo {
         writer.write_varint(self.created_coins.len() as u64);
         for outpoint in &self.created_coins {
             outpoint.write_to(&mut writer);
+        }
+
+        writer.write_varint(self.airdrop_positions.len() as u64);
+        for position in &self.airdrop_positions {
+            writer.write_u32(*position);
         }
 
         writer.write_varint(self.previous_name_states.len() as u64);
@@ -152,6 +163,12 @@ impl BlockUndo {
             created_coins.push(Outpoint::read_from(&mut reader)?);
         }
 
+        let airdrop_count = reader.read_varint_usize("airdrop undo positions")?;
+        let mut airdrop_positions = Vec::with_capacity(airdrop_count);
+        for _ in 0..airdrop_count {
+            airdrop_positions.push(reader.read_u32()?);
+        }
+
         let name_count = reader.read_varint_usize("name undo records")?;
         let mut previous_name_states = Vec::with_capacity(name_count);
         for _ in 0..name_count {
@@ -167,6 +184,7 @@ impl BlockUndo {
             resulting_tree_root,
             spent_coins,
             created_coins,
+            airdrop_positions,
             previous_name_states,
         })
     }
@@ -185,10 +203,24 @@ pub trait StateEngine {
 /// Result from the dedicated coinbase claim/airdrop boundary. A production
 /// implementation must account for every conjured unit and authenticate every
 /// special input against the historical HNS datasets.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CoinbaseIssuanceSummary {
     pub conjured: Amount,
     pub claims_and_airdrops_valid: bool,
+    /// HSD allocation-field positions authenticated by this verifier. The
+    /// state engine atomically rejects already-spent positions and records the
+    /// newly spent positions in block undo.
+    pub airdrop_positions: Vec<u32>,
+    /// Fully authenticated claims keyed to their same-index coinbase outputs.
+    /// The state engine applies these transitions to the name tree only after
+    /// every special issuance input has passed atomically.
+    pub claims: Vec<CoinbaseClaim>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoinbaseClaim {
+    pub output_index: usize,
+    pub claim: VerifiedClaim,
 }
 
 pub trait CoinbaseIssuanceVerifier: Send + Sync {
@@ -196,6 +228,7 @@ pub trait CoinbaseIssuanceVerifier: Send + Sync {
         &self,
         transaction: &Transaction,
         height: Height,
+        parent_median_time: u64,
         network: Network,
     ) -> Result<CoinbaseIssuanceSummary, StateError>;
 }
@@ -210,6 +243,7 @@ impl CoinbaseIssuanceVerifier for RejectSpecialCoinbaseIssuance {
         &self,
         transaction: &Transaction,
         _height: Height,
+        _parent_median_time: u64,
         _network: Network,
     ) -> Result<CoinbaseIssuanceSummary, StateError> {
         let special_input = transaction.inputs.len() > 1;
@@ -223,6 +257,128 @@ impl CoinbaseIssuanceVerifier for RejectSpecialCoinbaseIssuance {
         Ok(CoinbaseIssuanceSummary {
             conjured: 0,
             claims_and_airdrops_valid: true,
+            airdrop_positions: Vec::new(),
+            claims: Vec::new(),
+        })
+    }
+}
+
+/// A proof-capable coinbase boundary for HSD airdrops and DNSSEC CLAIM outputs.
+/// The historical type name is retained while this boundary grows toward full
+/// issuance parity. Supplying `UnavailableAirdropSignatureVerifier` enables
+/// only the cryptographically self-authenticating address/faucet airdrop
+/// subset; non-address airdrop keys fail closed until a matching backend is
+/// installed. CLAIM signatures are verified by the OpenSSL DNSSEC backend.
+#[derive(Clone)]
+pub struct AirdropCoinbaseIssuanceVerifier {
+    flags: AirdropFlags,
+    signatures: Arc<dyn AirdropSignatureVerifier>,
+    dnssec: Arc<dyn DnssecVerifier>,
+}
+
+impl fmt::Debug for AirdropCoinbaseIssuanceVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AirdropCoinbaseIssuanceVerifier")
+            .field("flags", &self.flags)
+            .field("signatures", &"<airdrop-signature-verifier>")
+            .field("dnssec", &"<dnssec-verifier>")
+            .finish()
+    }
+}
+
+impl AirdropCoinbaseIssuanceVerifier {
+    /// Construct from deployment state already derived for the candidate's
+    /// active-chain parent. GooSig cutoff is additionally derived from the
+    /// candidate height and selected network on every verification call.
+    pub fn new(
+        deployments: DeploymentState,
+        signatures: Arc<dyn AirdropSignatureVerifier>,
+    ) -> Self {
+        Self {
+            flags: AirdropFlags {
+                airstop: deployments.has_airstop,
+                hardening: deployments.name_flags.contains(NameFlags::HARDENED),
+                goosig_disabled: false,
+            },
+            signatures,
+            dnssec: Arc::new(OpenSslDnssecVerifier),
+        }
+    }
+
+    pub fn faucet_only(deployments: DeploymentState) -> Self {
+        Self::new(deployments, Arc::new(UnavailableAirdropSignatureVerifier))
+    }
+}
+
+impl CoinbaseIssuanceVerifier for AirdropCoinbaseIssuanceVerifier {
+    fn verify_coinbase(
+        &self,
+        transaction: &Transaction,
+        height: Height,
+        parent_median_time: u64,
+        network: Network,
+    ) -> Result<CoinbaseIssuanceSummary, StateError> {
+        let mut conjured = 0u64;
+        let mut airdrop_positions = Vec::with_capacity(transaction.inputs.len().saturating_sub(1));
+        let mut claims = Vec::new();
+        for input_index in 1..transaction.inputs.len() {
+            let input = &transaction.inputs[input_index];
+            if input.witness.items.len() != 1 {
+                return Err(StateError::AirdropVerification(format!(
+                    "coinbase input {input_index} must contain exactly one proof item"
+                )));
+            }
+            let output = transaction.outputs.get(input_index).ok_or_else(|| {
+                StateError::AirdropVerification(format!(
+                    "coinbase input {input_index} has no same-index output"
+                ))
+            })?;
+            if output.covenant.kind == CovenantKind::Claim {
+                let verified = verify_claim_output(
+                    &input.witness.items[0],
+                    output,
+                    height,
+                    parent_median_time,
+                    network,
+                    ClaimFlags {
+                        hardened: self.flags.hardening,
+                    },
+                    self.dnssec.as_ref(),
+                )
+                .map_err(|error| StateError::ClaimVerification(error.to_string()))?;
+                conjured = conjured
+                    .checked_add(verified.conjured)
+                    .filter(|value| *value <= MAX_MONEY)
+                    .ok_or(StateError::CoinbaseRewardOverflow)?;
+                claims.push(CoinbaseClaim {
+                    output_index: input_index,
+                    claim: verified,
+                });
+                continue;
+            }
+
+            let mut flags = self.flags;
+            flags.goosig_disabled = height >= network.params().goosig_stop;
+            let verified = verify_airdrop_output(
+                &input.witness.items[0],
+                output,
+                flags,
+                self.signatures.as_ref(),
+            )
+            .map_err(|error| StateError::AirdropVerification(error.to_string()))?;
+            conjured = conjured
+                .checked_add(verified.value)
+                .filter(|value| *value <= MAX_MONEY)
+                .ok_or(StateError::CoinbaseRewardOverflow)?;
+            airdrop_positions.push(verified.position);
+        }
+
+        Ok(CoinbaseIssuanceSummary {
+            conjured,
+            claims_and_airdrops_valid: true,
+            airdrop_positions,
+            claims,
         })
     }
 }
@@ -299,8 +455,9 @@ impl<S: Store> StoredStateEngine<S> {
     }
 
     /// Construct the native shadow-validation engine. Authority remains gated
-    /// elsewhere until deployments, claims/airdrops, persistent Urkel/proof parity,
-    /// and historical replay have independently completed.
+    /// elsewhere until claim/airdrop coverage, persistent Urkel/proof parity,
+    /// and historical replay have independently completed. Active node callers
+    /// supply verified parent-derived deployment flags per block.
     pub fn with_native_authorization(
         store: S,
         network: Network,
@@ -525,13 +682,24 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         .transactions
         .first()
         .ok_or(StateError::MissingCoinbase)?;
-    let issuance =
-        services
-            .issuance_verifier
-            .verify_coinbase(coinbase, request.height, services.network)?;
-    let coinbase_value = transaction_output_value(coinbase)?;
-
     let chain_context = SnapshotChainContext::new(snapshot);
+    let has_claim = coinbase
+        .outputs
+        .iter()
+        .any(|output| output.covenant.kind == CovenantKind::Claim);
+    let parent_median_time = if has_claim && request.height != 0 {
+        chain_context.median_time_past(request.height - 1)?
+    } else {
+        0
+    };
+    let issuance = services.issuance_verifier.verify_coinbase(
+        coinbase,
+        request.height,
+        parent_median_time,
+        services.network,
+    )?;
+    stage_airdrop_positions(snapshot, batch, &issuance.airdrop_positions)?;
+    let coinbase_value = transaction_output_value(coinbase)?;
 
     let mut spent_coins = Vec::new();
     let mut spent_outpoints = HashSet::new();
@@ -540,6 +708,16 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     let mut pending_created = HashMap::new();
     let mut name_state_changes = NameStateChanges::default();
     let mut total_fees = 0u64;
+
+    apply_verified_claims(
+        snapshot,
+        coinbase,
+        request.height,
+        services,
+        &chain_context,
+        &mut name_state_changes,
+        &issuance.claims,
+    )?;
 
     for (transaction_index, transaction) in request.block.transactions.iter().enumerate() {
         if transaction_index != 0 {
@@ -585,6 +763,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
                 services,
                 &chain_context,
                 &mut name_state_changes,
+                false,
             )?;
 
             stage_transaction_spends(
@@ -605,6 +784,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
                 services,
                 &chain_context,
                 &mut name_state_changes,
+                true,
             )?;
         }
 
@@ -686,6 +866,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         resulting_tree_root,
         spent_coins,
         created_coins,
+        airdrop_positions: issuance.airdrop_positions.clone(),
         previous_name_states,
     };
     batch.put(
@@ -799,6 +980,141 @@ fn verify_transaction_inputs(
     Ok(())
 }
 
+fn apply_verified_claims<T: ReadSnapshot>(
+    snapshot: &T,
+    coinbase: &Transaction,
+    height: Height,
+    services: StateServices<'_>,
+    context: &SnapshotChainContext<'_, T>,
+    changes: &mut NameStateChanges,
+    claims: &[CoinbaseClaim],
+) -> Result<(), StateError> {
+    let claim_outputs = coinbase
+        .outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| {
+            (output.covenant.kind == CovenantKind::Claim).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if claim_outputs.len() != claims.len()
+        || !claim_outputs
+            .iter()
+            .zip(claims)
+            .all(|(index, claim)| *index == claim.output_index)
+    {
+        return Err(StateError::ClaimVerification(
+            "authenticated claim set does not match coinbase claim outputs".to_owned(),
+        ));
+    }
+    if claims.is_empty() {
+        return Ok(());
+    }
+    if !services.name_flags_valid {
+        return Err(StateError::DeploymentStateUnavailable);
+    }
+
+    let params = services.network.params().names;
+    let transaction_id = coinbase.txid();
+    for authenticated in claims {
+        let claim = &authenticated.claim;
+        let output = coinbase
+            .outputs
+            .get(authenticated.output_index)
+            .ok_or_else(|| {
+                StateError::ClaimVerification("claim output index is out of range".to_owned())
+            })?;
+
+        if let Entry::Vacant(entry) = changes.current.entry(claim.name_hash) {
+            let loaded = load_name_state(snapshot, &claim.name_hash)?;
+            changes
+                .previous
+                .entry(claim.name_hash)
+                .or_insert_with(|| loaded.clone());
+            let mut state = loaded.unwrap_or_else(|| NameState::null(claim.name_hash));
+            if state.is_null() {
+                state.initialize(claim.name.clone(), height);
+            }
+            entry.insert(state);
+        }
+        let state = changes.current.get_mut(&claim.name_hash).ok_or_else(|| {
+            StateError::ClaimVerification("claim name cache insertion failed".to_owned())
+        })?;
+        if state.name != claim.name {
+            return Err(StateError::ClaimVerification(
+                "claim name does not match stored name state".to_owned(),
+            ));
+        }
+
+        maybe_expire_name(state, height, params);
+        let lifecycle = name_lifecycle(state, height, params);
+        let valid_state = matches!(
+            lifecycle,
+            NameLifecycleState::Opening | NameLifecycleState::Locked
+        ) || (lifecycle == NameLifecycleState::Closed && !state.registered);
+        if !valid_state {
+            return Err(StateError::ClaimVerification(format!(
+                "claim cannot replace name in {lifecycle:?} state"
+            )));
+        }
+        if state.expired || !is_reserved(&claim.name_hash, height, params) {
+            return Err(StateError::ClaimVerification(
+                "claim targets an expired or non-reserved name".to_owned(),
+            ));
+        }
+        if services.name_flags.contains(NameFlags::HARDENED) && claim.weak {
+            return Err(StateError::ClaimVerification(
+                "hardened covenant rules reject weak claim keys".to_owned(),
+            ));
+        }
+
+        let committed = context.main_chain_height(&BlockHash::new(claim.commit_hash))?;
+        if committed != Some(claim.commit_height) || claim.commit_height <= state.claimed {
+            return Err(StateError::ClaimVerification(
+                "claim commit is not a newer active-chain ancestor".to_owned(),
+            ));
+        }
+
+        if height >= services.network.params().deflation_height {
+            if state.owner.is_null() && claim.commit_height != 1 {
+                return Err(StateError::ClaimVerification(
+                    "initial post-deflation claim must commit to height 1".to_owned(),
+                ));
+            }
+            if !state.owner.is_null()
+                && height < state.height.saturating_add(params.claim_frequency)
+            {
+                return Err(StateError::ClaimVerification(
+                    "replacement claim violates claim-frequency limit".to_owned(),
+                ));
+            }
+            if !state.owner.is_null() {
+                let previous = load_existing_coin(snapshot, &state.owner)?;
+                if output.value != previous.value {
+                    return Err(StateError::ClaimVerification(
+                        "replacement claim changes its post-deflation output value".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        state.height = height;
+        state.renewal = height;
+        state.claimed = claim.commit_height;
+        state.value = 0;
+        state.owner = Outpoint {
+            txid: transaction_id,
+            index: u32::try_from(authenticated.output_index).map_err(|_| {
+                StateError::ClaimVerification("claim output index exceeds u32".to_owned())
+            })?,
+        };
+        state.highest = 0;
+        state.weak = claim.weak;
+        changes.changed.insert(claim.name_hash);
+    }
+    Ok(())
+}
+
 fn apply_transaction_name_covenants<T: ReadSnapshot>(
     snapshot: &T,
     transaction: &Transaction,
@@ -806,12 +1122,16 @@ fn apply_transaction_name_covenants<T: ReadSnapshot>(
     services: StateServices<'_>,
     context: &SnapshotChainContext<'_, T>,
     changes: &mut NameStateChanges,
+    allow_verified_claims: bool,
 ) -> Result<(), StateError> {
     for (output_index, output) in transaction.outputs.iter().enumerate() {
         if !output.covenant.kind.is_name() {
             continue;
         }
         if output.covenant.kind == CovenantKind::Claim {
+            if allow_verified_claims {
+                continue;
+            }
             return Err(StateError::UnsupportedCoinbaseIssuance);
         }
         if !services.name_flags_valid {
@@ -895,6 +1215,65 @@ fn transaction_output_value(transaction: &Transaction) -> Result<Amount, StateEr
             .checked_add(output.value)
             .ok_or(StateError::OutputValueOverflow)
     })
+}
+
+fn load_airdrop_field<T: ReadSnapshot>(snapshot: &T) -> Result<Vec<u8>, StateError> {
+    let field = snapshot
+        .get(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes())?
+        .ok_or(StateError::MissingAirdropField)?;
+    if field.len() != AIRDROP_FIELD_BYTES {
+        return Err(StateError::InvalidAirdropFieldLength(field.len()));
+    }
+    Ok(field)
+}
+
+fn airdrop_mask(position: u32) -> Result<(usize, u8), StateError> {
+    if position >= AIRDROP_TREE_LEAVES {
+        return Err(StateError::AirdropPositionOutOfRange(position));
+    }
+    let position =
+        usize::try_from(position).map_err(|_| StateError::AirdropPositionOutOfRange(position))?;
+    Ok((position >> 3, 1 << (7 - (position & 7))))
+}
+
+fn stage_airdrop_positions<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    positions: &[u32],
+) -> Result<(), StateError> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let mut field = load_airdrop_field(snapshot)?;
+    for position in positions {
+        let (byte, mask) = airdrop_mask(*position)?;
+        if field[byte] & mask != 0 {
+            return Err(StateError::AirdropAlreadySpent(*position));
+        }
+        field[byte] |= mask;
+    }
+    batch.put(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes(), &field)?;
+    Ok(())
+}
+
+fn undo_airdrop_positions<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    positions: &[u32],
+) -> Result<(), StateError> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let mut field = load_airdrop_field(snapshot)?;
+    for position in positions {
+        let (byte, mask) = airdrop_mask(*position)?;
+        if field[byte] & mask == 0 {
+            return Err(StateError::UndoAirdropPositionNotSpent(*position));
+        }
+        field[byte] &= !mask;
+    }
+    batch.put(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes(), &field)?;
+    Ok(())
 }
 
 fn load_existing_coin<T: ReadSnapshot>(
@@ -1063,6 +1442,7 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
             &encode_coin(coin),
         )?;
     }
+    undo_airdrop_positions(snapshot, batch, &undo.airdrop_positions)?;
     let mut name_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
     for name_undo in &undo.previous_name_states {
         match &name_undo.previous {
@@ -1522,10 +1902,22 @@ pub enum StateError {
     MissingCoinbase,
     #[error("deployment-derived name flags are unavailable for contextual covenant validation")]
     DeploymentStateUnavailable,
-    #[error(
-        "coinbase claim/airdrop issuance is disabled until its proof and historical dataset are verified"
-    )]
+    #[error("coinbase claim/airdrop issuance is disabled by the configured state service")]
     UnsupportedCoinbaseIssuance,
+    #[error("airdrop issuance verification failed: {0}")]
+    AirdropVerification(String),
+    #[error("DNSSEC claim issuance verification failed: {0}")]
+    ClaimVerification(String),
+    #[error("durable airdrop allocation field is missing")]
+    MissingAirdropField,
+    #[error("durable airdrop allocation field must contain {AIRDROP_FIELD_BYTES} bytes, got {0}")]
+    InvalidAirdropFieldLength(usize),
+    #[error("airdrop allocation position {0} is outside the HSD field")]
+    AirdropPositionOutOfRange(u32),
+    #[error("airdrop allocation position {0} was already spent")]
+    AirdropAlreadySpent(u32),
+    #[error("airdrop undo position {0} is not currently spent")]
+    UndoAirdropPositionNotSpent(u32),
     #[error("transaction input value overflow")]
     InputValueOverflow,
     #[error("transaction output value overflow")]
@@ -1572,8 +1964,11 @@ impl From<PrimitiveError> for StateError {
 mod tests {
     use std::sync::Arc;
 
-    use hns_consensus::ConsensusError;
-    use hns_primitives::{hash_name, Address, CovenantKind, Header, Input, Output, Txid, Witness};
+    use hns_chain::{write_canonical_height_to_batch, BlockStatus, HeaderRecord};
+    use hns_consensus::{reserved_name, ConsensusError, ThresholdState};
+    use hns_primitives::{
+        hash_name, Address, CovenantKind, Header, Input, Output, Txid, Uint256, Witness,
+    };
     use hns_store::{MemoryStore, Store};
 
     use super::*;
@@ -1589,6 +1984,31 @@ mod tests {
             _coin: &Coin,
         ) -> Result<(), ConsensusError> {
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct AuthenticatedClaimIssuer {
+        claim: VerifiedClaim,
+    }
+
+    impl CoinbaseIssuanceVerifier for AuthenticatedClaimIssuer {
+        fn verify_coinbase(
+            &self,
+            _transaction: &Transaction,
+            _height: Height,
+            _parent_median_time: u64,
+            _network: Network,
+        ) -> Result<CoinbaseIssuanceSummary, StateError> {
+            Ok(CoinbaseIssuanceSummary {
+                conjured: self.claim.conjured,
+                claims_and_airdrops_valid: true,
+                airdrop_positions: Vec::new(),
+                claims: vec![CoinbaseClaim {
+                    output_index: 1,
+                    claim: self.claim.clone(),
+                }],
+            })
         }
     }
 
@@ -1682,6 +2102,21 @@ mod tests {
         header_root: String,
         resulting_root: String,
         root: String,
+    }
+
+    #[derive(Deserialize)]
+    struct AirdropFixture {
+        faucet: AirdropFixtureProof,
+    }
+
+    #[derive(Deserialize)]
+    struct AirdropFixtureProof {
+        raw: String,
+        value: u64,
+        version: u8,
+        address: String,
+        fee: u64,
+        position: u32,
     }
 
     fn decode_fixture_bytes(value: &str) -> Vec<u8> {
@@ -2122,5 +2557,197 @@ mod tests {
             }),
             Err(StateError::UnsupportedCoinbaseIssuance)
         ));
+    }
+
+    #[test]
+    fn faucet_issuance_spends_rejects_duplicates_and_undoes_hsd_position() {
+        let fixture: AirdropFixture =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        let proof = fixture.faucet;
+        let store = MemoryStore::new();
+        let mut engine = StoredStateEngine::with_services(
+            store,
+            Network::Regtest,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(AirdropCoinbaseIssuanceVerifier::faucet_only(
+                DeploymentState::from_states([ThresholdState::Defined; 4]),
+            )),
+        )
+        .expect("airdrop state engine");
+
+        let mut transaction = coinbase(vec![output(0)]);
+        transaction.inputs.push(Input {
+            previous_output: Outpoint::null(),
+            sequence: u32::MAX,
+            witness: Witness {
+                items: vec![decode_fixture_bytes(&proof.raw)],
+            },
+        });
+        transaction.outputs.push(Output {
+            value: proof.value - proof.fee,
+            address: Address::new(proof.version, decode_fixture_bytes(&proof.address))
+                .expect("faucet address"),
+            covenant: covenant(),
+        });
+        let candidate = block(30, vec![transaction]);
+        let summary = engine
+            .connect_block(ConnectBlock {
+                block_hash: candidate.hash(),
+                height: 0,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &candidate,
+            })
+            .expect("valid faucet issuance");
+        assert!(summary.validation.claims_and_airdrops_valid);
+        let undo = engine
+            .load_undo(&candidate.hash())
+            .expect("undo read")
+            .expect("undo record");
+        assert_eq!(undo.airdrop_positions, vec![proof.position]);
+
+        let snapshot = engine.store().snapshot().expect("snapshot");
+        let field = load_airdrop_field(&snapshot).expect("airdrop field");
+        let (byte, mask) = airdrop_mask(proof.position).expect("field position");
+        assert_eq!(field[byte] & mask, mask);
+        drop(snapshot);
+
+        let duplicate = block(31, candidate.transactions.clone());
+        assert!(matches!(
+            engine.connect_block(ConnectBlock {
+                block_hash: duplicate.hash(),
+                height: 1,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &duplicate,
+            }),
+            Err(StateError::AirdropAlreadySpent(position)) if position == proof.position
+        ));
+
+        engine
+            .disconnect_block(DisconnectBlock {
+                block_hash: candidate.hash(),
+                height: 0,
+            })
+            .expect("faucet disconnect");
+        let snapshot = engine.store().snapshot().expect("snapshot");
+        let field = load_airdrop_field(&snapshot).expect("airdrop field");
+        assert_eq!(field[byte] & mask, 0);
+    }
+
+    #[test]
+    fn authenticated_claim_connects_name_state_and_disconnect_restores_it() {
+        let reserved = reserved_name(b"nl").expect("reserved nl name");
+        let name_hash = hash_name("nl").expect("nl name hash");
+        let commit_header = Header {
+            time: 1_600_000_000,
+            ..Header::default()
+        };
+        let commit_hash = commit_header.hash();
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let mut header_batch = store.batch();
+        header_batch
+            .put(
+                ColumnFamily::Headers,
+                commit_hash.as_bytes(),
+                &HeaderRecord {
+                    hash: commit_hash,
+                    height: 1,
+                    chainwork: Uint256::ONE,
+                    header: commit_header,
+                    status: BlockStatus::default(),
+                }
+                .encode(),
+            )
+            .expect("commit header");
+        write_canonical_height_to_batch(&mut header_batch, 1, commit_hash)
+            .expect("canonical commit height");
+        store.commit(header_batch).expect("commit header index");
+
+        let fee = 1_000u64;
+        let claim = VerifiedClaim {
+            name_hash,
+            name: reserved.name.clone(),
+            weak: false,
+            commit_hash: *commit_hash.as_bytes(),
+            commit_height: 1,
+            value: reserved.value,
+            fee,
+            conjured: reserved.value,
+        };
+        let mut engine = StoredStateEngine::with_services(
+            store.clone(),
+            Network::Regtest,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(AuthenticatedClaimIssuer {
+                claim: claim.clone(),
+            }),
+        )
+        .expect("claim state engine");
+
+        let mut transaction = coinbase(vec![output(0)]);
+        transaction.inputs.push(Input {
+            previous_output: Outpoint::null(),
+            sequence: u32::MAX,
+            witness: Witness {
+                items: vec![vec![0]],
+            },
+        });
+        transaction.outputs.push(Output {
+            value: reserved.value - fee,
+            address: address(),
+            covenant: Covenant {
+                kind: CovenantKind::Claim,
+                items: vec![
+                    name_hash.as_bytes().to_vec(),
+                    2u32.to_le_bytes().to_vec(),
+                    b"nl".to_vec(),
+                    vec![0],
+                    commit_hash.as_bytes().to_vec(),
+                    1u32.to_le_bytes().to_vec(),
+                ],
+            },
+        });
+        let candidate = block(32, vec![transaction]);
+        let summary = engine
+            .connect_block(ConnectBlock {
+                block_hash: candidate.hash(),
+                height: 2,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &candidate,
+            })
+            .expect("authenticated claim connect");
+        assert_eq!(summary.names_changed, 1);
+        assert!(summary.validation.claims_and_airdrops_valid);
+
+        let state = engine
+            .name_state(&name_hash)
+            .expect("name state read")
+            .expect("claimed name state");
+        assert_eq!(state.name, b"nl");
+        assert_eq!(state.height, 2);
+        assert_eq!(state.renewal, 2);
+        assert_eq!(state.claimed, 1);
+        assert_eq!(state.owner.txid, candidate.transactions[0].txid());
+        assert_eq!(state.owner.index, 1);
+        assert!(!state.weak);
+
+        engine
+            .disconnect_block(DisconnectBlock {
+                block_hash: candidate.hash(),
+                height: 2,
+            })
+            .expect("claim disconnect");
+        assert!(engine
+            .name_state(&name_hash)
+            .expect("name state read")
+            .is_none());
     }
 }

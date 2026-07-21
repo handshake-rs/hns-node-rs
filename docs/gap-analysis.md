@@ -9,8 +9,9 @@
 - Exact unsigned 256-bit chainwork and durable header/block/raw-body indexes.
 - Memory and RocksDB stores behind typed traits, atomic batches, true RocksDB
   snapshots, and a read-your-writes reorganization overlay.
-- Schema version 9, profile `hsrd-mining-v5`, network, genesis, epoch,
-  mandatory name-tree-root binding, checksummed sync checkpoint, and a bounded
+- Schema version 11, profile `hsrd-mining-v7`, network, genesis, epoch,
+  mandatory name-tree-root and HSD airdrop-field bindings, hash-keyed
+  deployment-state caches, checksummed sync checkpoint, and a bounded
   checksummed solved-block publication namespace.
 - Durable alternate branches, separate best-header and active-block bindings,
   equal-work stability, strict greater-work activation, and one-batch
@@ -28,6 +29,9 @@
 - Exact HSD BIP9 transitions, block-version selection, deployment effects,
   network checkpoint tables, strict header checkpoint enforcement, and a
   checkpoint-ancestry-gated historical script policy.
+- Active blocks derive name and issuance flags from their parent, cache all
+  four threshold states atomically, retain branch caches across reorganization,
+  and fail startup on missing or inconsistent active-chain cache entries.
 - Verification-only wrapper around the exact vendored HSD secp256k1 source,
   including compact low-S ECDSA and compressed keys.
 - Exact non-coinbase covenant linkage before UTXO mutation.
@@ -37,7 +41,17 @@
 - Correctness-first exact Urkel roots and internal memory proof checks.
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
-- Claim/airdrop issuance fails closed.
+- Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,
+  valid faucet proof handling, and atomic duplicate-position connect/undo;
+  the active node composes faucet verification from parent deployment state,
+  while non-address signature backends remain fail-closed.
+- Exact HSD Claim envelope encoding and blob-only hashes plus checksummed
+  ownership TXT payloads for all four networks.
+- Exact compression-free ownership-proof DNS codecs and HSD sanity/time/weak
+  behavior, ICANN-rooted DS/RRSIG authentication through RSA, P-256/P-384,
+  Ed25519, and Ed448, reserved allocation/output/commit/deflation accounting,
+  and atomic contextual claimed-name connect/disconnect at the service
+  boundary.
 
 ### Network and synchronization foundation
 
@@ -95,14 +109,15 @@ These are substantial foundations, not a production full node.
 
 ### Consensus and authenticated state
 
-- Active-chain deployment-state caching and composition into contextual
-  claim/airdrop and name validation.
 - Historical checkpoint-fast-path replay qualification and non-script
   historical exceptions.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
-- DNSSEC claim and airdrop proofs, historical datasets, duplicate prevention,
-  deflation-era accounting, and exact conjured-value rules.
+- Non-address airdrop signatures, legacy GOST94 DS compatibility, broader
+  current/historical valid claim-proof corpora, remaining historical datasets,
+  and complete replay evidence. Claim deflation accounting, active-node
+  deployment composition, and airdrop duplicate/conjured-value accounting are
+  implemented.
 - Complete contextual covenant/name behavior across mainnet history.
 - Production persistent incremental Urkel storage, exact HSD proof wire format,
   snapshots, compaction, and crash recovery.

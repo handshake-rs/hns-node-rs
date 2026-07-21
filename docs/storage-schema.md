@@ -7,27 +7,35 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **9** and the storage profile is
-**`hsrd-mining-v5`**. This is an intentional clean-reindex boundary.
+The current persistent schema version is **11** and the storage profile is
+**`hsrd-mining-v7`**. This is an intentional clean-reindex boundary.
 
-Version 9 contains the authority, state, and shadow-synchronization schema and
-adds the mining release identity and durable solved-block publication
-namespace:
+Version 11 contains the authority, state, shadow-synchronization, and mining
+publication schema, durable HSD airdrop duplicate prevention, and active-chain
+deployment-state persistence:
 
 - granular block-status bit assignments;
 - spent output address in the UTXO `Coin` codec;
 - expanded HSD-compatible `NameState` encoding;
-- block undo version 4 with previous and resulting name-tree roots;
+- block undo version 5 with previous/resulting name-tree roots and airdrop
+  positions to clear on disconnect;
 - mandatory 32-byte `name-tree-root` metadata binding;
+- mandatory 27,195-byte MSB-first `airdrop-field` metadata binding for all
+  217,557 HSD airdrop and faucet allocation positions;
 - separate best-header and active-best-block bindings;
 - chain-epoch and mining-generation metadata;
 - a versioned, checksummed `sync-checkpoint` metadata record;
 - versioned and checksummed solved-block publication intents stored under
   `publication/v1/<block-hash>` in the `snapshots` column family.
+- versioned deployment-state records stored under
+  `deployment-state/v1/<block-hash>` in the `snapshots` column family. Each
+  value binds the block height and all four HSD threshold states; active-chain
+  startup recomputes period transitions and rejects missing or inconsistent
+  entries.
 
-A schema/profile mismatch, nonempty unversioned database, missing root binding,
-malformed root binding, or network/genesis mismatch fails closed. The node does
-not stamp or implicitly migrate ambiguous state.
+A schema/profile mismatch, nonempty unversioned database, missing/malformed
+root or airdrop-field binding, or network/genesis mismatch fails closed. The
+node does not stamp or implicitly migrate ambiguous state.
 
 Durable identity binds:
 
@@ -65,12 +73,18 @@ The `meta` column family currently contains:
 - `mining-generation`
 - `chain-epoch`
 - `name-tree-root`
+- `airdrop-field`
 - `sync-checkpoint`
 - `clean-shutdown`
 
 The `name-tree-root` value is exactly 32 bytes and must equal the root rebuilt
 from materialized non-null `name_state` records at every committed active
 state.
+
+The `airdrop-field` follows HSD's bit order: position zero is the high bit of
+byte zero. A special issuance sets its authenticated position in the same
+atomic batch as UTXO and undo state; duplicate positions fail before commit,
+and disconnect clears exactly the positions recorded in block undo.
 
 The synchronization checkpoint is operational progress, not consensus state.
 It is versioned and checksummed, and startup cross-checks it against durable
@@ -94,7 +108,8 @@ cannot promote a block or grant authority.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.
-- `undo`: block UTXO/name undo records, including pre-state and post-state roots.
+- `undo`: block UTXO/name/airdrop undo records, including pre-state and
+  post-state roots.
 - `snapshots`: operational durable records. The mining engine uses the bounded
   `publication/v1/<block-hash>` namespace for solved-block publication intents.
   Each intent commits to its mining generation, job ID, block hash, creation
@@ -127,7 +142,7 @@ path. The queue is bounded by configuration and by a hard maximum.
 
 ## Block status bit layout
 
-Schema version 9 preserves the existing `u32` status layout:
+Schema version 11 preserves the existing `u32` status layout:
 
 | Bit | Field | Meaning |
 |---:|---|---|
@@ -221,7 +236,7 @@ exact bytes before fixture use.
 
 ## Migration policy
 
-Schema 9/profile `hsrd-mining-v5` requires an explicit clean reindex from every
+Schema 11/profile `hsrd-mining-v7` requires an explicit clean reindex from every
 prior handoff. No automatic in-place migration is attempted while `hsrd`
 remains pre-authority. A failed or interrupted reindex must not modify the
 previous database.

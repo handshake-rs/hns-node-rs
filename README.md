@@ -42,9 +42,10 @@ Implemented:
 - Separate durable best-header and active-best-block bindings.
 - Strict greater-work activation; equal-work branches preserve the existing
   first-seen tip.
-- Schema version **9**, storage profile **`hsrd-mining-v5`**, explicit clean
-  reindex behavior, a durable 32-byte name-tree-root binding, and a checksummed
-  synchronization checkpoint.
+- Schema version **11**, storage profile **`hsrd-mining-v7`**, explicit clean
+  reindex behavior, durable name-tree-root and HSD airdrop-field bindings,
+  hash-keyed deployment-state caches, and a checksummed synchronization
+  checkpoint.
 - Startup checks that compare durable name-tree-root metadata against the
   materialized name-state column family.
 
@@ -72,9 +73,18 @@ Implemented:
 - Exact HSD BIP9 threshold transitions, block-version signaling, deployment
   effects, mandatory/standard script flags, all four networks' deployment
   parameters, and all 15 mainnet checkpoint hashes.
+- Parent-derived active-chain deployment state with HSD period-boundary
+  caching, atomic reorganization/restart persistence, and fail-closed cache
+  validation before contextual name and claim/airdrop checks.
 - Strict header checkpoint enforcement and a fail-closed historical-script
   policy that requires verified checkpoint ancestry before allowing HSD's
   optional historical validation shortcut.
+- Exact bounded HSD Claim envelope encoding, blob-only Claim hashes, and the
+  checksummed ownership TXT payload codec for all four network prefixes.
+- Compression-free DNSKEY/DS/TXT/RRSIG ownership-proof parsing, exact HSD
+  sanity/window/weak-key behavior, the pinned ICANN 2017 root anchor, canonical
+  DNSSEC signature-chain verification for HSD's supported algorithms, and
+  reserved-target/output/commit/deflation accounting checks.
 
 Still release-blocking:
 
@@ -104,14 +114,17 @@ Implemented:
 - Durable previous/resulting roots in block undo records.
 - Atomic name-state and durable-root writes on connect, disconnect, and
   multi-block reorganization.
+- Authenticated CLAIM name-state creation/replacement with active-chain commit,
+  hardening, frequency/value, and atomic disconnect/undo checks at the state
+  service boundary.
 - Stored-root versus materialized-state corruption detection.
 - Durable non-active header/index/body storage and validated atomic activation
   of a strictly greater-work replacement branch.
 
 Still release-blocking:
 
-- DNSSEC claim and airdrop proof/accounting validation;
-- deployment-aware claim/airdrop and contextual name composition;
+- non-address airdrop signature backends, legacy GOST94 DS compatibility, and
+  broader current/historical production-valid claim-proof corpora;
 - full contextual covenant parity across mainnet history;
 - a production persistent incremental Urkel node store and exact HSD proof-wire
   codec;
@@ -260,7 +273,7 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 
 ## Storage migration
 
-Schema version 9 and storage profile `hsrd-mining-v5` add the mining
-release identity and durable solved-block publication namespace beyond the
-shadow-synchronization schema. Existing pre-authority databases must be
-reindexed. No implicit in-place migration is attempted.
+Schema version 11 and storage profile `hsrd-mining-v7` add durable hash-keyed
+deployment-state caches to schema 10's HSD airdrop allocation field and
+airdrop-position undo. Existing pre-authority databases must be reindexed. No
+implicit in-place migration is attempted.

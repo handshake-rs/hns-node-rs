@@ -9,3 +9,6 @@ blake2 = "0.10"
 serde.workspace = true
 sha3 = "0.10"
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

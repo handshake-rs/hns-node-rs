@@ -1,8 +1,27 @@
 #![forbid(unsafe_code)]
 
+mod airdrop;
+mod claim;
 mod legacy_hash;
+mod ownership;
 
+pub use airdrop::{
+    AirdropError, AirdropKey, AirdropKeyType, AirdropProof, AirdropSignatureVerifier,
+    UnavailableAirdropSignatureVerifier, AIRDROP_CONTEXT, AIRDROP_DEPTH, AIRDROP_LEAVES,
+    AIRDROP_RECIPIENT_FEE, AIRDROP_REWARD, AIRDROP_ROOT, AIRDROP_SPONSOR_FEE, AIRDROP_SUBDEPTH,
+    AIRDROP_SUBLEAVES, AIRDROP_TREE_LEAVES, FAUCET_DEPTH, FAUCET_LEAVES, FAUCET_ROOT,
+    GOO_COMMITMENT_SIZE, MAX_AIRDROP_PROOF_SIZE,
+};
+pub use claim::{
+    Claim, ClaimError, OwnershipClaimData, MAX_CLAIM_ENVELOPE_SIZE, MAX_OWNERSHIP_CLAIM_DATA_SIZE,
+    MAX_OWNERSHIP_PROOF_SIZE,
+};
 pub use legacy_hash::{hash160, hash256, ripemd160, sha1, sha256};
+pub use ownership::{
+    icann_root_anchor_2017, DnsDnskey, DnsDs, DnsName, DnsRecord, DnsRecordData, DnsRrsig,
+    DnssecAnchor, DnssecVerifier, OwnershipProof, OwnershipProofError, OwnershipZone, DNS_CLASS_IN,
+    DNS_TYPE_DNSKEY, DNS_TYPE_DS, DNS_TYPE_RRSIG, DNS_TYPE_TXT,
+};
 
 use blake2::{
     digest::{Update, VariableOutput},
@@ -1429,6 +1448,11 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes(bytes))
     }
 
+    pub fn read_u32_be(&mut self) -> Result<u32, PrimitiveError> {
+        let bytes = self.read_array::<4>()?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
     pub fn read_u64(&mut self) -> Result<u64, PrimitiveError> {
         let bytes = self.read_array::<8>()?;
         Ok(u64::from_le_bytes(bytes))
@@ -1593,8 +1617,16 @@ impl Writer {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    pub fn write_u16_be(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
     pub fn write_u32(&mut self, value: u32) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pub fn write_u32_be(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
     }
 
     pub fn write_u64(&mut self, value: u64) {

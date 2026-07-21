@@ -13,6 +13,9 @@
       "name": "main",
       "activationThreshold": 1916,
       "minerWindow": 2016,
+      "goosigStop": 56880,
+      "deflationHeight": 61043,
+      "claimPrefix": "hns-claim:",
       "lastCheckpoint": 258026,
       "checkpoints": [
         {
@@ -123,6 +126,9 @@
       "name": "testnet",
       "activationThreshold": 1512,
       "minerWindow": 2016,
+      "goosigStop": 2880,
+      "deflationHeight": 0,
+      "claimPrefix": "hns-testnet:",
       "lastCheckpoint": 0,
       "checkpoints": [],
       "deployments": [
@@ -172,6 +178,9 @@
       "name": "regtest",
       "activationThreshold": 108,
       "minerWindow": 144,
+      "goosigStop": 4294967295,
+      "deflationHeight": 200,
+      "claimPrefix": "hns-regtest:",
       "lastCheckpoint": 0,
       "checkpoints": [],
       "deployments": [
@@ -221,6 +230,9 @@
       "name": "simnet",
       "activationThreshold": 75,
       "minerWindow": 100,
+      "goosigStop": 4294967295,
+      "deflationHeight": 0,
+      "claimPrefix": "hns-simnet:",
       "lastCheckpoint": 0,
       "checkpoints": [],
       "deployments": [

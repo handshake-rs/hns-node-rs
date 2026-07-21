@@ -35,6 +35,20 @@ impl Deployment {
             DeploymentId::TestDummy => "testdummy",
         }
     }
+
+    pub const fn effective_threshold(self, activation_threshold: u32) -> u32 {
+        match self.threshold {
+            Some(threshold) => threshold,
+            None => activation_threshold,
+        }
+    }
+
+    pub const fn effective_window(self, miner_window: u32) -> u32 {
+        match self.window {
+            Some(window) => window,
+            None => miner_window,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,6 +66,29 @@ pub enum ThresholdState {
     LockedIn,
     Active,
     Failed,
+}
+
+impl ThresholdState {
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Defined => 0,
+            Self::Started => 1,
+            Self::LockedIn => 2,
+            Self::Active => 3,
+            Self::Failed => 4,
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Defined),
+            1 => Some(Self::Started),
+            2 => Some(Self::LockedIn),
+            3 => Some(Self::Active),
+            4 => Some(Self::Failed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,6 +128,30 @@ impl DeploymentState {
             states,
         }
     }
+
+    pub fn with_state(mut self, id: DeploymentId, state: ThresholdState) -> Self {
+        self.states[deployment_index(id)] = state;
+        Self::from_states(self.states)
+    }
+
+    pub fn encode_states(self) -> [u8; 4] {
+        self.states.map(ThresholdState::to_u8)
+    }
+
+    pub fn decode_states(bytes: [u8; 4]) -> Result<Self, DeploymentError> {
+        let mut states = [ThresholdState::Defined; 4];
+        for (index, value) in bytes.into_iter().enumerate() {
+            states[index] =
+                ThresholdState::from_u8(value).ok_or(DeploymentError::InvalidCachedState(value))?;
+        }
+        Ok(Self::from_states(states))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeploymentPeriod {
+    pub median_time_past: u64,
+    pub signalling_blocks: u32,
 }
 
 const COMMON_DEPLOYMENTS: [Deployment; 4] = [
@@ -341,17 +402,8 @@ pub fn threshold_state(
     if history.is_empty() {
         return Err(DeploymentError::EmptyHistory);
     }
-    let window = deployment.window.unwrap_or(miner_window);
-    let threshold = deployment.threshold.unwrap_or(activation_threshold);
-    if window == 0 {
-        return Err(DeploymentError::ZeroWindow);
-    }
-    if threshold > window {
-        return Err(DeploymentError::ThresholdExceedsWindow { threshold, window });
-    }
-    if deployment.bit >= 32 {
-        return Err(DeploymentError::InvalidBit(deployment.bit));
-    }
+    let (window, threshold) =
+        deployment_parameters(activation_threshold, miner_window, deployment)?;
 
     let window = usize::try_from(window).map_err(|_| DeploymentError::WindowTooLarge)?;
     let completed_periods = history.len() / window;
@@ -384,6 +436,70 @@ pub fn threshold_state(
     }
 
     Ok(state)
+}
+
+/// Advance one cached HSD BIP9 deployment state for the block at
+/// `next_height`. HSD changes state only when the candidate begins a new
+/// deployment window. The caller supplies the completed parent window at that
+/// boundary; no history is needed between boundaries.
+pub fn advance_threshold_state(
+    activation_threshold: u32,
+    miner_window: u32,
+    deployment: Deployment,
+    next_height: Height,
+    previous: ThresholdState,
+    period: Option<DeploymentPeriod>,
+) -> Result<ThresholdState, DeploymentError> {
+    let (window, threshold) =
+        deployment_parameters(activation_threshold, miner_window, deployment)?;
+    if next_height % window != 0 {
+        return Ok(previous);
+    }
+
+    let period = period.ok_or(DeploymentError::MissingCompletedPeriod { next_height })?;
+    if period.signalling_blocks > window {
+        return Err(DeploymentError::SignallingCountExceedsWindow {
+            count: period.signalling_blocks,
+            window,
+        });
+    }
+
+    Ok(match previous {
+        ThresholdState::Defined if period.median_time_past >= deployment.timeout => {
+            ThresholdState::Failed
+        }
+        ThresholdState::Defined if period.median_time_past >= deployment.start_time => {
+            ThresholdState::Started
+        }
+        ThresholdState::Started if period.median_time_past >= deployment.timeout => {
+            ThresholdState::Failed
+        }
+        ThresholdState::Started if period.signalling_blocks >= threshold => {
+            ThresholdState::LockedIn
+        }
+        ThresholdState::LockedIn => ThresholdState::Active,
+        terminal @ (ThresholdState::Active | ThresholdState::Failed) => terminal,
+        state => state,
+    })
+}
+
+fn deployment_parameters(
+    activation_threshold: u32,
+    miner_window: u32,
+    deployment: Deployment,
+) -> Result<(u32, u32), DeploymentError> {
+    let window = deployment.effective_window(miner_window);
+    let threshold = deployment.effective_threshold(activation_threshold);
+    if window == 0 {
+        return Err(DeploymentError::ZeroWindow);
+    }
+    if threshold > window {
+        return Err(DeploymentError::ThresholdExceedsWindow { threshold, window });
+    }
+    if deployment.bit >= 32 {
+        return Err(DeploymentError::InvalidBit(deployment.bit));
+    }
+    Ok((window, threshold))
 }
 
 pub fn compute_block_version(
@@ -475,6 +591,12 @@ pub enum DeploymentError {
     WindowTooLarge,
     #[error("deployment bit {0} exceeds the 32-bit header version")]
     InvalidBit(u8),
+    #[error("cached deployment state byte {0} is invalid")]
+    InvalidCachedState(u8),
+    #[error("completed deployment period is missing for block height {next_height}")]
+    MissingCompletedPeriod { next_height: Height },
+    #[error("deployment signalling count {count} exceeds window {window}")]
+    SignallingCountExceedsWindow { count: u32, window: u32 },
     #[error("height {height} is not a checkpoint on the selected network")]
     UnknownCheckpoint { height: Height },
     #[error("checkpoint hash mismatch at height {height}")]
@@ -512,6 +634,9 @@ mod tests {
         name: String,
         activation_threshold: u32,
         miner_window: u32,
+        goosig_stop: Height,
+        deflation_height: Height,
+        claim_prefix: String,
         last_checkpoint: Height,
         checkpoints: Vec<FixtureCheckpoint>,
         deployments: Vec<FixtureDeployment>,
@@ -633,6 +758,9 @@ mod tests {
             let params = network.params();
             assert_eq!(params.activation_threshold, expected.activation_threshold);
             assert_eq!(params.miner_window, expected.miner_window);
+            assert_eq!(params.goosig_stop, expected.goosig_stop);
+            assert_eq!(params.deflation_height, expected.deflation_height);
+            assert_eq!(network.claim_prefix(), expected.claim_prefix);
             assert_eq!(network.last_checkpoint(), expected.last_checkpoint);
             let checkpoints = expected
                 .checkpoints
@@ -686,6 +814,101 @@ mod tests {
             .expect("block version"),
             vector.expected_version
         );
+    }
+
+    #[test]
+    fn cached_period_transitions_match_full_hsd_history() {
+        let deployment = Deployment {
+            id: DeploymentId::TestDummy,
+            bit: 3,
+            start_time: 20,
+            timeout: 100,
+            threshold: Some(2),
+            window: Some(3),
+            required: false,
+            force: false,
+        };
+        let signal = 1u32 << deployment.bit;
+        let history = [
+            DeploymentHistoryEntry {
+                version: 0,
+                median_time_past: 0,
+            },
+            DeploymentHistoryEntry {
+                version: 0,
+                median_time_past: 10,
+            },
+            DeploymentHistoryEntry {
+                version: 0,
+                median_time_past: 20,
+            },
+            DeploymentHistoryEntry {
+                version: signal,
+                median_time_past: 30,
+            },
+            DeploymentHistoryEntry {
+                version: 0,
+                median_time_past: 40,
+            },
+            DeploymentHistoryEntry {
+                version: signal,
+                median_time_past: 50,
+            },
+            DeploymentHistoryEntry {
+                version: 0,
+                median_time_past: 60,
+            },
+            DeploymentHistoryEntry {
+                version: 0,
+                median_time_past: 70,
+            },
+            DeploymentHistoryEntry {
+                version: 0,
+                median_time_past: 80,
+            },
+        ];
+
+        let mut cached = ThresholdState::Defined;
+        for next_height in 1..=history.len() {
+            let period = (next_height % 3 == 0).then(|| {
+                let completed = &history[next_height - 3..next_height];
+                DeploymentPeriod {
+                    median_time_past: history[next_height - 1].median_time_past,
+                    signalling_blocks: completed
+                        .iter()
+                        .filter(|entry| entry.version & signal != 0)
+                        .count() as u32,
+                }
+            });
+            cached =
+                advance_threshold_state(2, 3, deployment, next_height as Height, cached, period)
+                    .expect("cached deployment transition");
+            assert_eq!(
+                cached,
+                threshold_state(2, 3, deployment, &history[..next_height])
+                    .expect("full deployment history"),
+                "height {next_height}"
+            );
+        }
+        assert_eq!(cached, ThresholdState::Active);
+    }
+
+    #[test]
+    fn deployment_state_cache_codec_is_total_and_rejects_unknown_states() {
+        let state = DeploymentState::from_states([
+            ThresholdState::Active,
+            ThresholdState::LockedIn,
+            ThresholdState::Failed,
+            ThresholdState::Started,
+        ]);
+        assert_eq!(
+            DeploymentState::decode_states(state.encode_states()),
+            Ok(state)
+        );
+        assert!(matches!(
+            DeploymentState::decode_states([0, 1, 2, 5]),
+            Err(DeploymentError::InvalidCachedState(5))
+        ));
     }
 
     #[test]

@@ -13,11 +13,16 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v5";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v7";
+
+/// HSD's MSB-first spent-allocation field contains 216,199 airdrop positions
+/// followed by 1,358 faucet positions.
+pub const AIRDROP_FIELD_BITS: usize = 217_557;
+pub const AIRDROP_FIELD_BYTES: usize = AIRDROP_FIELD_BITS.div_ceil(8);
 
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
 
@@ -264,6 +269,7 @@ pub enum MetaKey {
     MiningGeneration,
     StorageProfile,
     NameTreeRoot,
+    AirdropField,
     SyncCheckpoint,
     ChainEpoch,
     CleanShutdown,
@@ -280,6 +286,7 @@ impl MetaKey {
             Self::MiningGeneration => b"mining-generation",
             Self::StorageProfile => b"storage-profile",
             Self::NameTreeRoot => b"name-tree-root",
+            Self::AirdropField => b"airdrop-field",
             Self::SyncCheckpoint => b"sync-checkpoint",
             Self::ChainEpoch => b"chain-epoch",
             Self::CleanShutdown => b"clean-shutdown",
@@ -318,6 +325,7 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
     let schema = snapshot.get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())?;
     let profile = snapshot.get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())?;
     let name_tree_root = snapshot.get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())?;
+    let airdrop_field = snapshot.get(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes())?;
 
     match schema {
         Some(bytes) => {
@@ -352,10 +360,26 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
                     name_tree_root.len()
                 )));
             }
+            let airdrop_field = airdrop_field.ok_or_else(|| {
+                StoreError::Schema(
+                    "schema marker exists without a durable airdrop-field binding; a clean reindex is required"
+                        .to_owned(),
+                )
+            })?;
+            if airdrop_field.len() != AIRDROP_FIELD_BYTES {
+                return Err(StoreError::Schema(format!(
+                    "durable airdrop-field binding must contain {AIRDROP_FIELD_BYTES} bytes, got {}; a clean reindex is required",
+                    airdrop_field.len()
+                )));
+            }
             Ok(())
         }
         None => {
-            if profile.is_some() || name_tree_root.is_some() || !snapshot_is_empty(&snapshot)? {
+            if profile.is_some()
+                || name_tree_root.is_some()
+                || airdrop_field.is_some()
+                || !snapshot_is_empty(&snapshot)?
+            {
                 return Err(StoreError::Schema(
                     "database contains data but has no schema marker; refusing to stamp a potentially incompatible store"
                         .to_owned(),
@@ -377,6 +401,11 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
                 ColumnFamily::Meta,
                 MetaKey::NameTreeRoot.as_bytes(),
                 &[0; 32],
+            )?;
+            batch.put(
+                ColumnFamily::Meta,
+                MetaKey::AirdropField.as_bytes(),
+                &[0; AIRDROP_FIELD_BYTES],
             )?;
             store.commit(batch)
         }
@@ -1083,6 +1112,12 @@ mod tests {
                 .expect("root"),
             Some(vec![0; 32])
         );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes())
+                .expect("airdrop field"),
+            Some(vec![0; AIRDROP_FIELD_BYTES])
+        );
     }
 
     #[test]
@@ -1222,6 +1257,76 @@ mod tests {
         assert!(matches!(
             initialize_schema(&malformed),
             Err(StoreError::Schema(message)) if message.contains("32 bytes")
+        ));
+    }
+
+    #[test]
+    fn initialize_schema_rejects_missing_or_malformed_airdrop_field() {
+        let missing = MemoryStore::new();
+        let mut batch = missing.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION),
+            )
+            .expect("schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )
+            .expect("profile");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                &[0; 32],
+            )
+            .expect("root");
+        missing.commit(batch).expect("commit missing-field store");
+        assert!(matches!(
+            initialize_schema(&missing),
+            Err(StoreError::Schema(message)) if message.contains("airdrop-field")
+        ));
+
+        let malformed = MemoryStore::new();
+        let mut batch = malformed.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION),
+            )
+            .expect("schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )
+            .expect("profile");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                &[0; 32],
+            )
+            .expect("root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::AirdropField.as_bytes(),
+                &[0; AIRDROP_FIELD_BYTES - 1],
+            )
+            .expect("field");
+        malformed
+            .commit(batch)
+            .expect("commit malformed-field store");
+        assert!(matches!(
+            initialize_schema(&malformed),
+            Err(StoreError::Schema(message)) if message.contains(&AIRDROP_FIELD_BYTES.to_string())
         ));
     }
 

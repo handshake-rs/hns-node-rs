@@ -37,9 +37,10 @@ reserved low-latency paths.
 - Sequence-consistent RocksDB snapshots.
 - Atomic read-your-writes multi-block reorganizations.
 - Separate best-header and active-block bindings.
-- Schema 9/profile `hsrd-mining-v5`, durable name-tree-root binding, a
-  checksummed synchronization checkpoint, and a versioned solved-block
-  publication namespace.
+- Schema 11/profile `hsrd-mining-v7`, durable name-tree-root and HSD
+  airdrop-field bindings, hash-keyed deployment-state caches, a checksummed
+  synchronization checkpoint, and a versioned solved-block publication
+  namespace.
 - Root/materialized-state verification at connect, disconnect, reorganization,
   and startup.
 
@@ -55,7 +56,8 @@ reserved low-latency paths.
 ### Covenant and name state
 
 - Exact non-coinbase covenant linkage.
-- Contextual non-claim name-state transition foundation.
+- Contextual non-claim name-state transitions plus authenticated CLAIM
+  connect/disconnect under active parent-derived deployment state.
 - Reserved/lockup datasets and renewal-policy fixtures.
 - Exact `NameState` encoding and undo.
 - Correctness-first exact Urkel roots and internal proofs.
@@ -88,11 +90,14 @@ reserved low-latency paths.
 
 ## Remaining implementation order
 
-1. **Claim and airdrop validation** — proof codecs, historical datasets,
-   duplicate prevention, deflation-era rules, and exact conjured-value
-   accounting.
-2. **Contextual covenant closure** — compose active deployment state and replay
-   all mainnet transition families and historical exceptions against HSD.
+1. **Claim and airdrop validation** — finish non-address airdrop cryptography,
+   broaden current/historical valid claim corpora, and replay the proof-capable
+   active-node service. Exact Claim/DNSSEC/TXT codecs, ICANN-rooted signature
+   verification, parent-derived deployment composition, claim deflation and
+   name-state rules, airdrop codecs, faucet verification, conjured accounting,
+   and durable duplicate prevention/undo are implemented.
+2. **Contextual covenant closure** — replay all mainnet transition families and
+   historical exceptions against HSD.
 3. **Persistent Urkel** — incremental nodes, exact proof wire format,
    snapshots, undo, compaction, and crash qualification while preserving exact
    correctness-first roots.

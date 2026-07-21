@@ -21,7 +21,12 @@ The current foundation verifies or records evidence for:
   backend;
 - bounded witness/script execution for the implemented operation set;
 - exact non-coinbase covenant linkage;
-- contextual non-claim name-transition foundations;
+- contextual non-claim name transitions plus authenticated CLAIM
+  connect/disconnect at an explicit proof-capable service boundary;
+- parent-derived deployment-state caches composed into active node name,
+  DNSSEC-claim, and faucet checks with restart/reorg validation;
+- ICANN-rooted DNSSEC claim verification and HSD claim output/commit/deflation
+  accounting;
 - correctness-first exact Urkel roots;
 - atomic single- and multi-block database mutations;
 - sequence-consistent snapshots;
@@ -48,11 +53,11 @@ the existing authoritative mining boundary.
 
 The following remain untrusted and release-blocking:
 
-- active-chain deployment composition, non-script historical exceptions, and
-  historical replay qualification;
+- non-script historical exceptions and historical replay qualification;
 - independent script fuzz/invalid evidence beyond the complete pinned HSD
   upstream corpus;
-- claim and airdrop proofs/accounting;
+- non-address airdrop signatures, legacy GOST94 DS compatibility, and broader
+  current/historical claim-proof evidence;
 - complete contextual name consensus over all historical cases;
 - persistent production Urkel nodes and HSD proof-wire parity;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;
