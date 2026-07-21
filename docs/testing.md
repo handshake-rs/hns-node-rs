@@ -100,6 +100,9 @@ Current evidence includes:
 - canonical HSD Urkel inclusion and non-inclusion proof bytes across dead-end,
   short, collision, and exists terminals, plus malformed, wrong-root,
   wrong-key, and trailing-byte cases;
+- materialized durable name-tree proof snapshots that remain root-pinned across
+  later commits, reproduce proof bytes after state-engine restart, and reject
+  corrupt durable root bindings;
 - reserved-name and lockup dataset checks;
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,

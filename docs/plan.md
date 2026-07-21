@@ -72,6 +72,8 @@ reserved low-latency paths.
 - Exact `NameState` encoding and undo.
 - Correctness-first exact Urkel roots plus byte-for-byte canonical HSD
   inclusion/non-inclusion proof encoding, decoding, and verification.
+- Root-checked immutable proof views materialized from sequence-consistent
+  durable name-state snapshots, stable across later commits and engine restart.
 - Correct pre-state header commitment and durable resulting-root semantics.
 
 ### Live shadow networking
@@ -114,9 +116,9 @@ reserved low-latency paths.
    duplicate prevention/undo are implemented.
 2. **Contextual covenant closure** — extend the complete deterministic HSD
    transition-family corpus into mainnet history and historical exceptions.
-3. **Persistent Urkel** — incremental nodes, durable proof serving, snapshots,
-   undo, compaction, and crash qualification while preserving the qualified
-   exact roots and proof bytes.
+3. **Persistent Urkel** — incremental nodes, incremental proof serving,
+   interval snapshots, undo, compaction, and crash qualification while
+   preserving the qualified exact roots and proof bytes.
 4. **Active-state IBD** — connect downloaded bodies through the one consensus
    pipeline, persist invalid branches, recover from restart, and qualify
    pruning/reorganizations without changing the authority boundary.

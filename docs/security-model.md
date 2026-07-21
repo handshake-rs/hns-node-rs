@@ -37,6 +37,8 @@ The current foundation verifies or records evidence for:
   commit-advance, and reverse-disconnect behavior;
 - correctness-first exact Urkel roots and canonical bounded HSD
   inclusion/non-inclusion proof bytes with native verification;
+- root-checked immutable proof views rebuilt from sequence-consistent durable
+  name-state snapshots, with corruption rejected before proof exposure;
 - atomic single- and multi-block database mutations;
 - sequence-consistent snapshots;
 - bounded HNS framing, peer lifecycle, header synchronization, body scheduling,
@@ -69,8 +71,8 @@ The following remain untrusted and release-blocking:
   the pinned initial/replacement histories;
 - complete contextual name consensus over mainnet historical cases beyond the
   deterministic all-family transition corpus;
-- persistent production Urkel nodes, durable proof serving, snapshots,
-  compaction, undo, and crash recovery;
+- persistent production Urkel nodes, incremental proof serving, interval
+  snapshots, compaction, undo, and crash recovery;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;
 - Brontide, durable peer reputation, discovery, compact blocks, and
   production-complete contextual transaction relay;

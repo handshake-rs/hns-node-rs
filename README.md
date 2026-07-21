@@ -137,6 +137,9 @@ Implemented:
   inclusion/non-inclusion verification across all four terminal forms.
 - A pinned byte-for-byte Urkel proof corpus with inclusion, dead-end, short,
   collision, trailing-byte, malformed-length, wrong-root, and wrong-key cases.
+- Root-checked immutable proof views rebuilt from sequence-consistent durable
+  name-state snapshots; views stay pinned across later commits and reproduce
+  exact proof bytes after state-engine restart.
 - Correct Handshake root timing: block `H` commits to the inherited pre-state
   root; applying block `H` produces the root that block `H+1` must commit to.
 - Durable previous/resulting roots in block undo records.
@@ -154,8 +157,8 @@ Still release-blocking:
 - current/live production-valid claim-proof evidence and complete historical
   claim replay beyond the pinned initial/replacement histories;
 - full contextual covenant parity across mainnet history;
-- a production persistent incremental Urkel node store with durable proof
-  serving, snapshots, compaction, undo, and crash qualification;
+- a production persistent incremental Urkel node store with incremental proof
+  serving, interval snapshots, compaction, undo, and crash qualification;
 - complete historical root, undo, and reorganization replay.
 
 ## Live P2P and restartable shadow synchronization

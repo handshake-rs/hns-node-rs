@@ -481,6 +481,15 @@ impl MemoryUrkel {
         }
     }
 
+    pub fn prove_hsd(&self, key: NameHash) -> Result<UrkelProof, UrkelError> {
+        let structured = self.prove_memory(key).to_hsd_proof()?;
+        Ok(UrkelProof {
+            name_hash: key,
+            kind: structured.kind(),
+            raw: structured.encode()?,
+        })
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = (&NameHash, &[u8])> {
         self.entries
             .iter()
@@ -1105,12 +1114,7 @@ impl NameTreeSnapshot for InMemorySnapshot {
     }
 
     fn prove(&self, name_hash: &NameHash) -> Result<UrkelProof, UrkelError> {
-        let structured = self.tree.prove_memory(*name_hash).to_hsd_proof()?;
-        Ok(UrkelProof {
-            name_hash: *name_hash,
-            kind: structured.kind(),
-            raw: structured.encode()?,
-        })
+        self.tree.prove_hsd(*name_hash)
     }
 }
 

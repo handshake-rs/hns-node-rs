@@ -45,6 +45,8 @@
 - Exact HSD `NameState` codec and name undo.
 - Correctness-first exact Urkel roots and byte-for-byte canonical HSD
   inclusion/non-inclusion proof generation, decoding, and native verification.
+- Root-checked immutable proof views rebuilt from sequence-consistent durable
+  name-state snapshots and stable across later commits and state-engine restart.
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
 - Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,
@@ -138,8 +140,8 @@ These are substantial foundations, not a production full node.
   implemented.
 - Complete contextual covenant/name behavior across mainnet history; all
   non-claim families now have deterministic HSD differential coverage.
-- Production persistent incremental Urkel storage, durable proof serving,
-  snapshots, compaction, undo, and crash recovery.
+- Production persistent incremental Urkel storage, incremental proof serving,
+  interval snapshots, compaction, undo, and crash recovery.
 
 ### Chain and network qualification
 

@@ -245,8 +245,11 @@ previous database.
 
 The current root path rebuilds the authenticated tree from all durable
 `NameState` records. This prioritizes correctness and oracle parity over
-performance. A production persistent incremental Urkel store must preserve the
-same exact roots and canonical proof bytes while adding node persistence,
-durable proof serving, snapshots, undo, compaction, and crash recovery. It must
-not silently replace the current root calculation until differential replay
-proves equality.
+performance. The same sequence-consistent store snapshot can now materialize a
+root-checked immutable tree for exact HSD proof generation; that view remains
+pinned if the live store advances and rejects a corrupt durable root binding
+before returning a proof. A production persistent incremental Urkel store must
+preserve the same exact roots and canonical proof bytes while adding node
+persistence, incremental proof serving, interval snapshots, undo, compaction,
+and crash recovery. It must not silently replace the current root calculation
+until differential replay proves equality.

@@ -65,6 +65,8 @@ Implemented:
 - Exact HSD `NameState` encoding.
 - Correctness-first exact Urkel roots plus canonical bounded HSD proof
   encoding, decoding, and native inclusion/non-inclusion verification.
+- Root-checked immutable proof views rebuilt from sequence-consistent durable
+  name-state snapshots and stable across later commits and engine restart.
 - Correct pre-state root validation and durable post-state root binding.
 - Previous/resulting roots in undo and atomic root restoration.
 - True store snapshots and one-batch multi-block reorganizations.
@@ -74,8 +76,8 @@ Implemented:
 
 Remaining:
 
-- production persistent incremental Urkel storage, durable proof serving,
-  snapshots, compaction, undo, and crash recovery;
+- production persistent incremental Urkel storage, incremental proof serving,
+  interval snapshots, compaction, undo, and crash recovery;
 - complete historical contextual claim/airdrop behavior;
 - pruning and RocksDB crash/fault qualification;
 - complete mainnet reorganization/root replay.

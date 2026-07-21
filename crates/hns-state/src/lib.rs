@@ -25,7 +25,7 @@ use hns_primitives::{
 use hns_store::{
     ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES,
 };
-use hns_urkel::{root_from_entries, TreeRoot, UrkelError};
+use hns_urkel::{MemoryUrkel, NameTreeSnapshot, TreeRoot, UrkelError, UrkelProof};
 use serde::{Deserialize, Serialize};
 
 const BLOCK_UNDO_VERSION: u32 = 5;
@@ -462,8 +462,8 @@ impl<S: Store> StoredStateEngine<S> {
     }
 
     /// Construct the native shadow-validation engine. Authority remains gated
-    /// elsewhere until claim/airdrop coverage, persistent Urkel/proof parity,
-    /// and historical replay have independently completed. Active node callers
+    /// elsewhere until claim/airdrop coverage, persistent Urkel storage, and
+    /// historical replay have independently completed. Active node callers
     /// supply verified parent-derived deployment flags per block.
     pub fn with_native_authorization(
         store: S,
@@ -576,6 +576,14 @@ impl<S: Store> StoredStateEngine<S> {
             return Ok(None);
         };
         BlockUndo::decode(&bytes).map(Some)
+    }
+
+    /// Materialize one immutable, root-checked view of the durable name-state
+    /// column family. The view owns its exact HSD proof-generation tree, so a
+    /// later store commit cannot mix roots and values within one proof.
+    pub fn name_tree_snapshot(&self) -> Result<MaterializedNameTreeSnapshot, StateError> {
+        let snapshot = self.store.snapshot()?;
+        materialize_name_tree_snapshot(&snapshot)
     }
 }
 
@@ -1546,6 +1554,13 @@ pub fn rebuild_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot,
     rebuild_name_tree_root_with_overrides(snapshot, &BTreeMap::new())
 }
 
+/// Materialize the exact authenticated tree represented by one immutable
+/// durable snapshot. This correctness-first path remains O(number of names)
+/// and does not claim persistent incremental-Urkel qualification.
+pub fn materialize_name_tree<T: ReadSnapshot>(snapshot: &T) -> Result<MemoryUrkel, StateError> {
+    materialize_name_tree_with_overrides(snapshot, &BTreeMap::new())
+}
+
 /// Rebuild the authenticated name-tree root from one immutable base snapshot
 /// plus an explicit set of staged name-state replacements. This keeps root
 /// calculation independent of whether a particular WriteBatch implementation
@@ -1554,6 +1569,13 @@ pub fn rebuild_name_tree_root_with_overrides<T: ReadSnapshot>(
     snapshot: &T,
     overrides: &BTreeMap<NameHash, Option<NameState>>,
 ) -> Result<TreeRoot, StateError> {
+    Ok(materialize_name_tree_with_overrides(snapshot, overrides)?.root())
+}
+
+fn materialize_name_tree_with_overrides<T: ReadSnapshot>(
+    snapshot: &T,
+    overrides: &BTreeMap<NameHash, Option<NameState>>,
+) -> Result<MemoryUrkel, StateError> {
     let mut entries = BTreeMap::<NameHash, Vec<u8>>::new();
     for (key, value) in snapshot.scan_prefix(ColumnFamily::NameState, b"")? {
         let key: [u8; 32] = key.try_into().map_err(|key: Vec<u8>| {
@@ -1588,7 +1610,58 @@ pub fn rebuild_name_tree_root_with_overrides<T: ReadSnapshot>(
         }
     }
 
-    root_from_entries(entries).map_err(StateError::NameTree)
+    MemoryUrkel::from_entries(entries).map_err(StateError::NameTree)
+}
+
+/// Immutable exact-proof view rebuilt from one durable store snapshot after
+/// checking its materialized root against the durable root binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaterializedNameTreeSnapshot {
+    root: TreeRoot,
+    tree: MemoryUrkel,
+}
+
+impl MaterializedNameTreeSnapshot {
+    pub const fn root(&self) -> TreeRoot {
+        self.root
+    }
+
+    pub fn get(&self, name_hash: &NameHash) -> Option<&[u8]> {
+        self.tree.get(name_hash)
+    }
+
+    pub fn prove(&self, name_hash: NameHash) -> Result<UrkelProof, UrkelError> {
+        self.tree.prove_hsd(name_hash)
+    }
+}
+
+impl NameTreeSnapshot for MaterializedNameTreeSnapshot {
+    fn root(&self) -> TreeRoot {
+        self.root
+    }
+
+    fn get(&self, name_hash: &NameHash) -> Result<Option<Vec<u8>>, UrkelError> {
+        Ok(self.tree.get(name_hash).map(ToOwned::to_owned))
+    }
+
+    fn prove(&self, name_hash: &NameHash) -> Result<UrkelProof, UrkelError> {
+        self.tree.prove_hsd(*name_hash)
+    }
+}
+
+/// Build an immutable exact-proof view from one durable store snapshot. Root
+/// metadata corruption or a mismatched materialized column fails before any
+/// proof can be returned.
+pub fn materialize_name_tree_snapshot<T: ReadSnapshot>(
+    snapshot: &T,
+) -> Result<MaterializedNameTreeSnapshot, StateError> {
+    let stored = load_stored_name_tree_root(snapshot)?;
+    let tree = materialize_name_tree(snapshot)?;
+    let actual = tree.root();
+    if stored != actual {
+        return Err(StateError::StoredTreeRootMismatch { stored, actual });
+    }
+    Ok(MaterializedNameTreeSnapshot { root: stored, tree })
 }
 
 /// Load the durable binding for the currently materialized name-state tree.
@@ -2488,6 +2561,103 @@ mod tests {
     }
 
     #[test]
+    fn materialized_name_tree_proofs_are_snapshot_and_restart_stable() {
+        let fixture: NameTreeFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/name-states/state-urkel-v1.json"
+        ))
+        .expect("fixture");
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+
+        let first_state = &fixture.states[0];
+        let first_root = TreeRoot::new(decode_hash(&fixture.incremental_roots[0].resulting_root));
+        let mut first_batch = store.batch();
+        first_batch
+            .put(
+                ColumnFamily::NameState,
+                &decode_hash(&first_state.name_hash),
+                &decode_fixture_bytes(&first_state.encoded),
+            )
+            .expect("first state");
+        first_batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                first_root.as_bytes(),
+            )
+            .expect("first root");
+        store.commit(first_batch).expect("first commit");
+
+        let first_engine = engine(store.clone());
+        let frozen = first_engine.name_tree_snapshot().expect("first snapshot");
+        assert_eq!(frozen.root(), first_root);
+        let first_hash = NameHash::new(decode_hash(&first_state.name_hash));
+        let first_proof = frozen.prove(first_hash).expect("first proof");
+        assert_eq!(
+            first_proof.verify_value(first_root).expect("verify first"),
+            Some(decode_fixture_bytes(&first_state.encoded))
+        );
+
+        let second_state = &fixture.states[1];
+        let second_hash = NameHash::new(decode_hash(&second_state.name_hash));
+        let absent_before = frozen.prove(second_hash).expect("absence proof");
+        assert_eq!(
+            absent_before
+                .verify_value(first_root)
+                .expect("verify absence"),
+            None
+        );
+
+        let second_root = TreeRoot::new(decode_hash(&fixture.incremental_roots[1].resulting_root));
+        let mut second_batch = store.batch();
+        second_batch
+            .put(
+                ColumnFamily::NameState,
+                second_hash.as_bytes(),
+                &decode_fixture_bytes(&second_state.encoded),
+            )
+            .expect("second state");
+        second_batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                second_root.as_bytes(),
+            )
+            .expect("second root");
+        store.commit(second_batch).expect("second commit");
+
+        assert_eq!(
+            frozen
+                .prove(second_hash)
+                .expect("frozen absence proof")
+                .verify_value(first_root)
+                .expect("verify frozen absence"),
+            None
+        );
+        drop(first_engine);
+
+        let reopened = engine(store.clone());
+        let current = reopened.name_tree_snapshot().expect("reopened snapshot");
+        assert_eq!(current.root(), second_root);
+        let second_proof = current.prove(second_hash).expect("second proof");
+        assert_eq!(
+            second_proof
+                .verify_value(second_root)
+                .expect("verify second"),
+            Some(decode_fixture_bytes(&second_state.encoded))
+        );
+        assert_eq!(
+            reopened
+                .name_tree_snapshot()
+                .expect("repeat snapshot")
+                .prove(second_hash)
+                .expect("repeat proof")
+                .raw,
+            second_proof.raw
+        );
+    }
+
+    #[test]
     fn block_header_commits_pre_state_root_and_disconnect_restores_it() {
         let store = MemoryStore::new();
         let mut state = engine(store.clone());
@@ -2619,6 +2789,10 @@ mod tests {
         let snapshot = store.snapshot().expect("snapshot");
         assert!(matches!(
             verify_stored_name_tree_root(&snapshot),
+            Err(StateError::StoredTreeRootMismatch { .. })
+        ));
+        assert!(matches!(
+            materialize_name_tree_snapshot(&snapshot),
             Err(StateError::StoredTreeRootMismatch { .. })
         ));
     }
