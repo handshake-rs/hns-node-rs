@@ -215,6 +215,27 @@ It pins all network deployment parameters and mainnet checkpoint hashes, then
 checks compact synthetic histories across DEFINED, STARTED, LOCKED_IN, ACTIVE,
 FAILED, timeout, partial-period, and per-deployment window/threshold behavior.
 
+The committed canonical-mainnet fixture adds every completed 2,016-block
+deployment period through height 336,672. Its offline check replays each real
+median time and signal count through the pinned HSD `Chain` methods; the Rust
+test independently advances the same cached states and compares deployment
+effects plus the checkpoint-backed historical-script decision:
+
+```bash
+NODE_BACKEND=js npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
+```
+
+An operator with a synchronized mainnet HSD node can reproduce the compact
+fixture without embedding an API key or machine path:
+
+```bash
+NODE_BACKEND=js npm run refresh-hsrd-mainnet-deployment-history \
+  --prefix hsd-oracle -- --hsd-prefix /path/to/hsd-prefix
+```
+
+This is deployment and historical-policy evidence, not complete transaction,
+UTXO, covenant, name-root, or block-validity replay.
+
 The claim fixture is generated through HSD's `Claim` and `ownership` codecs:
 
 ```bash

@@ -716,11 +716,104 @@ mod tests {
         has_airstop: bool,
     }
 
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct HistoricalDeploymentFixture {
+        network: String,
+        activation_threshold: u32,
+        miner_window: u32,
+        last_checkpoint: Height,
+        through_height: Height,
+        anchor_hash: String,
+        deployments: Vec<FixtureDeployment>,
+        historical_boundaries: Vec<FixtureHistoricalBoundary>,
+        periods: Vec<FixtureHistoricalPeriod>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureHistoricalBoundary {
+        height: Height,
+        hash: String,
+        historical_height: bool,
+        historical_block: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureHistoricalPeriod {
+        next_height: Height,
+        period_start_height: Height,
+        period_end_height: Height,
+        period_start_hash: String,
+        period_end_hash: String,
+        median_time_past: u64,
+        signalling: FixtureDeploymentCounts,
+        states: FixtureDeploymentStates,
+        effects: FixtureHistoricalEffects,
+        historical_height: bool,
+        historical_block: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct FixtureDeploymentCounts {
+        hardening: u32,
+        icannlockup: u32,
+        airstop: u32,
+        testdummy: u32,
+    }
+
+    impl FixtureDeploymentCounts {
+        fn get(&self, id: DeploymentId) -> u32 {
+            match id {
+                DeploymentId::Hardening => self.hardening,
+                DeploymentId::IcannLockup => self.icannlockup,
+                DeploymentId::Airstop => self.airstop,
+                DeploymentId::TestDummy => self.testdummy,
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct FixtureDeploymentStates {
+        hardening: ThresholdState,
+        icannlockup: ThresholdState,
+        airstop: ThresholdState,
+        testdummy: ThresholdState,
+    }
+
+    impl FixtureDeploymentStates {
+        fn get(&self, id: DeploymentId) -> ThresholdState {
+            match id {
+                DeploymentId::Hardening => self.hardening,
+                DeploymentId::IcannLockup => self.icannlockup,
+                DeploymentId::Airstop => self.airstop,
+                DeploymentId::TestDummy => self.testdummy,
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureHistoricalEffects {
+        script_flags: u32,
+        lock_flags: u32,
+        name_flags: u32,
+        has_airstop: bool,
+    }
+
     fn fixture() -> Fixture {
         serde_json::from_str(include_str!(
             "../../../fixtures/hsd/chains/deployments-v1.json"
         ))
         .expect("deployment fixture")
+    }
+
+    fn historical_fixture() -> HistoricalDeploymentFixture {
+        serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/chains/mainnet-deployment-history-v1.json"
+        ))
+        .expect("historical deployment fixture")
     }
 
     fn deployment_id(name: &str) -> DeploymentId {
@@ -935,6 +1028,136 @@ mod tests {
             .expect("verified checkpoint");
         assert!(backed.may_assume_scripts(last.height));
         assert!(backed.requires_script_verification(last.height + 1));
+    }
+
+    #[test]
+    fn historical_mainnet_periods_match_hsd_deployments_and_script_policy() {
+        let fixture = historical_fixture();
+        assert_eq!(fixture.network, "main");
+        assert_eq!(
+            fixture.activation_threshold,
+            Network::Mainnet.params().activation_threshold
+        );
+        assert_eq!(fixture.miner_window, Network::Mainnet.params().miner_window);
+        assert_eq!(fixture.last_checkpoint, Network::Mainnet.last_checkpoint());
+        assert_eq!(fixture.through_height % fixture.miner_window, 0);
+        assert_eq!(
+            fixture.periods.len(),
+            usize::try_from(fixture.through_height / fixture.miner_window)
+                .expect("period count fits in memory")
+        );
+        assert_eq!(
+            fixture
+                .deployments
+                .iter()
+                .map(FixtureDeployment::deployment)
+                .collect::<Vec<_>>(),
+            Network::Mainnet.deployments()
+        );
+
+        let last = *Network::Mainnet
+            .checkpoints()
+            .last()
+            .expect("mainnet checkpoint");
+        let policy = HistoricalScriptPolicy::new(Network::Mainnet, true)
+            .with_verified_checkpoint(last.height, &last.hash)
+            .expect("verified checkpoint policy");
+
+        for boundary in &fixture.historical_boundaries {
+            let hash = decode_hash(&boundary.hash);
+            assert_eq!(
+                is_hsd_historical_height(Network::Mainnet, true, boundary.height),
+                boundary.historical_height,
+                "historical-height decision at {} ({hash:?})",
+                boundary.height,
+            );
+            assert_eq!(
+                is_hsd_historical_block(Network::Mainnet, true, boundary.height),
+                boundary.historical_block,
+                "historical-block decision at {} ({hash:?})",
+                boundary.height,
+            );
+            assert_eq!(
+                policy.may_assume_scripts(boundary.height),
+                boundary.historical_block,
+                "script policy at {} ({hash:?})",
+                boundary.height,
+            );
+            if let Some(checkpoint) = Network::Mainnet.checkpoint(boundary.height) {
+                assert_eq!(hash, checkpoint.hash);
+            }
+        }
+        assert_eq!(
+            fixture
+                .historical_boundaries
+                .last()
+                .map(|boundary| boundary.hash.as_str()),
+            Some(fixture.anchor_hash.as_str())
+        );
+
+        let params = Network::Mainnet.params();
+        let mut states = [ThresholdState::Defined; 4];
+        for (period_index, period) in fixture.periods.iter().enumerate() {
+            let expected_height = u32::try_from(period_index + 1)
+                .expect("period index fits u32")
+                .checked_mul(fixture.miner_window)
+                .expect("period height fits u32");
+            assert_eq!(period.next_height, expected_height);
+            assert_eq!(
+                period.period_start_height,
+                period.next_height - fixture.miner_window
+            );
+            assert_eq!(period.period_end_height, period.next_height - 1);
+            let _ = decode_hash(&period.period_start_hash);
+            let _ = decode_hash(&period.period_end_hash);
+
+            for deployment in Network::Mainnet.deployments() {
+                let index = deployment_index(deployment.id);
+                states[index] = advance_threshold_state(
+                    params.activation_threshold,
+                    params.miner_window,
+                    *deployment,
+                    period.next_height,
+                    states[index],
+                    Some(DeploymentPeriod {
+                        median_time_past: period.median_time_past,
+                        signalling_blocks: period.signalling.get(deployment.id),
+                    }),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} transition at height {} failed: {error}",
+                        deployment.name(),
+                        period.next_height
+                    )
+                });
+                assert_eq!(
+                    states[index],
+                    period.states.get(deployment.id),
+                    "{} state at height {}",
+                    deployment.name(),
+                    period.next_height
+                );
+            }
+
+            let state = DeploymentState::from_states(states);
+            assert_eq!(state.script_flags.bits(), period.effects.script_flags);
+            assert_eq!(state.lock_flags, period.effects.lock_flags);
+            assert_eq!(state.name_flags.bits(), period.effects.name_flags);
+            assert_eq!(state.has_airstop, period.effects.has_airstop);
+            assert_eq!(
+                is_hsd_historical_height(Network::Mainnet, true, period.next_height),
+                period.historical_height
+            );
+            assert_eq!(
+                is_hsd_historical_block(Network::Mainnet, true, period.next_height),
+                period.historical_block
+            );
+            assert_eq!(
+                policy.may_assume_scripts(period.next_height),
+                period.historical_block
+            );
+        }
     }
 
     #[test]

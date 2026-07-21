@@ -157,6 +157,24 @@
       "blake2b256": "06d73967116e6314e48a04405c650b1c3642b2b88b10656833950ecb5aa9487b"
     },
     {
+      "id": "mainnet-deployment-history-v1",
+      "network": "main",
+      "kind": "deployment",
+      "path": "chains/mainnet-deployment-history-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "oracle",
+        "mainnet",
+        "historical",
+        "versionbits",
+        "script-flags",
+        "checkpoint-policy"
+      ],
+      "blake2b256": "38e2269cce7c4793c8556fd4e0bf95bf27e8e3013ebed5383fe50495676fc709"
+    },
+    {
       "id": "sighash-v1",
       "network": "agnostic",
       "kind": "script",

@@ -150,7 +150,8 @@ Implemented:
 
 - HSD generators for sighash, locks, a 56-case focused script execution/error
   corpus, all 876 upstream script cases, deployments/checkpoints/historical
-  boundaries, airdrop proofs, Claim/TXT/DNSSEC ownership-proof codecs,
+  boundaries, all 167 canonical mainnet deployment periods through height
+  336,672, airdrop proofs, Claim/TXT/DNSSEC ownership-proof codecs,
   covenant linkage, name-state codec, reserved/lockup/renewal policy,
   incremental Urkel roots, P2P wire bytes, subsidy, and deterministic coinbase
   behavior;

@@ -29,6 +29,9 @@
 - Exact HSD BIP9 transitions, block-version selection, deployment effects,
   network checkpoint tables, strict header checkpoint enforcement, and a
   checkpoint-ancestry-gated historical script policy.
+- Canonical-mainnet replay of all 167 completed deployment periods through
+  height 336,672, including real median times, signal counts, threshold states,
+  deployment effects, and the historical-script boundary.
 - Active blocks derive name and issuance flags from their parent, cache all
   four threshold states atomically, retain branch caches across reorganization,
   and fail startup on missing or inconsistent active-chain cache entries.

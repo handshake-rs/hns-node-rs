@@ -73,6 +73,10 @@ Implemented:
 - Exact HSD BIP9 threshold transitions, block-version signaling, deployment
   effects, mandatory/standard script flags, all four networks' deployment
   parameters, and all 15 mainnet checkpoint hashes.
+- Compact canonical-mainnet evidence for all 167 completed deployment periods
+  through height 336,672, replaying real signal counts, median times, threshold
+  states, deployment effects, and the checkpoint-backed historical-script
+  boundary through both pinned HSD and Rust.
 - Parent-derived active-chain deployment state with HSD period-boundary
   caching, atomic reorganization/restart persistence, and fail-closed cache
   validation before contextual name and claim/airdrop checks.
@@ -88,7 +92,6 @@ Implemented:
 
 Still release-blocking:
 
-- active-chain caching/composition of deployment-derived name and airdrop flags;
 - broader independently generated script fuzz and invalid corpora beyond HSD's
   upstream suite;
 - complete mainnet replay and independent review of the Rust wrapper and script
@@ -236,6 +239,7 @@ python3 scripts/validate-hsrd-static.py
 python3 scripts/validate-hsrd-source-handoff.py
 npm run hsrd-script-fixtures --prefix hsd-oracle
 npm run hsrd-deployment-fixtures --prefix hsd-oracle
+npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
