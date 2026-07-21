@@ -135,6 +135,22 @@
       "blake2b256": "ed5c3aea407ba768e043374fa23e5e1c884f9e1063357d1575e9f1cdcad5765b"
     },
     {
+      "id": "script-execution-v1",
+      "network": "agnostic",
+      "kind": "script",
+      "path": "scripts/execution-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "script-execution",
+        "flags",
+        "mutation-corpus",
+        "oracle"
+      ],
+      "blake2b256": "0e33ec3f3ede4667a2ef1cebf2130ccdcc0b0447add46daf585e73ed19a01b46"
+    },
+    {
       "id": "covenant-linkage-v1",
       "network": "regtest",
       "kind": "covenant",

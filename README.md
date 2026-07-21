@@ -67,7 +67,8 @@ Implemented:
 - Input authorization and relative-lock checks before any spend is staged.
 - Fail-closed verification when a complete authorization backend is not
   explicitly installed.
-- Reproducible HSD signature-hash and sequence-lock fixtures.
+- Reproducible HSD signature-hash, sequence-lock, and 56-case script
+  execution/error fixtures, including flag-sensitive numeric-depth behavior.
 
 Still release-blocking:
 

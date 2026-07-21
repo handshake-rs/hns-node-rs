@@ -130,6 +130,10 @@ impl ScriptFlags {
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 pub trait SignatureVerifier: Send + Sync {
@@ -498,7 +502,7 @@ fn execute_script(
                 stack.push(stack[len - 2].clone());
             }
             OP_PICK | OP_ROLL => {
-                let depth = decode_script_number(&pop(stack)?, true, 4)?;
+                let depth = decode_script_number(&pop(stack)?, minimal_numbers(flags), 4)?;
                 let depth =
                     usize::try_from(depth).map_err(|_| ScriptError::InvalidStackOperation)?;
                 if depth >= stack.len() {
@@ -944,7 +948,7 @@ fn decode_script_number(
         return Err(ScriptError::NumericOverflow);
     }
     if require_minimal && !is_minimal_script_number(bytes) {
-        return Err(ScriptError::MinimalData);
+        return Err(ScriptError::NonMinimalNumber);
     }
     if bytes.is_empty() {
         return Ok(0);
@@ -1077,6 +1081,8 @@ pub enum ScriptError {
     OperationCount,
     #[error("script push is not minimally encoded")]
     MinimalData,
+    #[error("script number is not minimally encoded")]
+    NonMinimalNumber,
     #[error("conditional argument is not minimally encoded")]
     MinimalIf,
     #[error("script conditional is unbalanced")]
@@ -1119,11 +1125,58 @@ pub enum ScriptError {
     Sighash(String),
 }
 
+impl ScriptError {
+    /// Return the rejection code used by the pinned HSD script engine for the
+    /// same failure class. This is diagnostic parity only; consensus callers
+    /// must continue to treat every error as rejection.
+    pub const fn hsd_code(&self) -> &'static str {
+        match self {
+            Self::InputIndexOutOfRange
+            | Self::NumericOverflow
+            | Self::NonMinimalNumber
+            | Self::SignatureBackendUnavailable
+            | Self::Sighash(_) => "UNKNOWN_ERROR",
+            Self::OpReturn => "OP_RETURN",
+            Self::ScriptSize => "SCRIPT_SIZE",
+            Self::StackSize => "STACK_SIZE",
+            Self::PushSize => "PUSH_SIZE",
+            Self::WitnessProgramWitnessEmpty => "WITNESS_PROGRAM_WITNESS_EMPTY",
+            Self::WitnessProgramMismatch => "WITNESS_PROGRAM_MISMATCH",
+            Self::WitnessProgramWrongLength => "WITNESS_PROGRAM_WRONG_LENGTH",
+            Self::DiscourageUpgradableWitnessProgram => "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
+            Self::DiscourageUpgradableNops => "DISCOURAGE_UPGRADABLE_NOPS",
+            Self::EvalFalse => "EVAL_FALSE",
+            Self::BadOpcode(_) | Self::UnsupportedOpcode(_) => "BAD_OPCODE",
+            Self::DisabledOpcode(_) => "DISABLED_OPCODE",
+            Self::OperationCount => "OP_COUNT",
+            Self::MinimalData => "MINIMALDATA",
+            Self::MinimalIf => "MINIMALIF",
+            Self::UnbalancedConditional => "UNBALANCED_CONDITIONAL",
+            Self::InvalidStackOperation => "INVALID_STACK_OPERATION",
+            Self::InvalidAltStackOperation => "INVALID_ALTSTACK_OPERATION",
+            Self::Verify => "VERIFY",
+            Self::EqualVerify => "EQUALVERIFY",
+            Self::NumEqualVerify => "NUMEQUALVERIFY",
+            Self::NegativeLocktime => "NEGATIVE_LOCKTIME",
+            Self::UnsatisfiedLocktime => "UNSATISFIED_LOCKTIME",
+            Self::PublicKeyCount => "PUBKEY_COUNT",
+            Self::SignatureCount => "SIG_COUNT",
+            Self::PublicKeyEncoding => "PUBKEY_ENCODING",
+            Self::SignatureEncoding => "SIG_ENCODING",
+            Self::SignatureNullDummy => "SIG_NULLDUMMY",
+            Self::NullFail => "NULLFAIL",
+            Self::CheckSigVerify => "CHECKSIGVERIFY",
+            Self::CheckMultiSigVerify => "CHECKMULTISIGVERIFY",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use hns_primitives::{
         Address, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Txid, Witness,
     };
+    use serde::Deserialize;
 
     use super::*;
 
@@ -1281,5 +1334,102 @@ mod tests {
         }
         assert!(!cast_to_bool(&[0x80]));
         assert!(cast_to_bool(&[0x81]));
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ScriptExecutionFixture {
+        schema: u32,
+        vectors: Vec<ScriptExecutionVector>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ScriptExecutionVector {
+        id: String,
+        script_raw: String,
+        witness: Vec<String>,
+        transaction_raw: String,
+        previous_value: u64,
+        address_version: u8,
+        address_hash: String,
+        flags: Vec<String>,
+        result: String,
+    }
+
+    #[test]
+    fn script_execution_matches_hsd_fixture() {
+        let fixture: ScriptExecutionFixture = serde_json::from_slice(include_bytes!(
+            "../../../fixtures/hsd/scripts/execution-v1.json"
+        ))
+        .expect("script execution fixture");
+        assert_eq!(fixture.schema, 1);
+        let signatures = NativeSignatureVerifier::new().expect("native signature verifier");
+
+        for vector in fixture.vectors {
+            let transaction = Transaction::decode(&decode_hex(&vector.transaction_raw))
+                .unwrap_or_else(|error| panic!("{} transaction: {error}", vector.id));
+            let input = transaction
+                .inputs
+                .first()
+                .unwrap_or_else(|| panic!("{} input", vector.id));
+            let expected_witness = vector
+                .witness
+                .iter()
+                .map(|item| decode_hex(item))
+                .chain(std::iter::once(decode_hex(&vector.script_raw)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                input.witness.items, expected_witness,
+                "{} witness",
+                vector.id
+            );
+            let coin = Coin {
+                outpoint: input.previous_output.clone(),
+                value: vector.previous_value,
+                height: 1,
+                coinbase: false,
+                address: Address::new(vector.address_version, decode_hex(&vector.address_hash))
+                    .unwrap_or_else(|error| panic!("{} address: {error}", vector.id)),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            };
+            let flags = fixture_flags(&vector.flags);
+            let observed = match verify_witness_program(&transaction, 0, &coin, flags, &signatures)
+            {
+                Ok(()) => "OK",
+                Err(error) => error.hsd_code(),
+            };
+            assert_eq!(observed, vector.result, "{} result", vector.id);
+        }
+    }
+
+    fn fixture_flags(names: &[String]) -> ScriptFlags {
+        let mut flags = ScriptFlags::NONE;
+        for name in names {
+            flags.0 |= match name.as_str() {
+                "MINIMALDATA" => ScriptFlags::VERIFY_MINIMAL_DATA.0,
+                "DISCOURAGE_UPGRADABLE_NOPS" => ScriptFlags::VERIFY_DISCOURAGE_UPGRADABLE_NOPS.0,
+                "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => {
+                    ScriptFlags::VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM.0
+                }
+                "MINIMALIF" => ScriptFlags::VERIFY_MINIMAL_IF.0,
+                "NULLFAIL" => ScriptFlags::VERIFY_NULLFAIL.0,
+                other => panic!("unknown fixture script flag {other}"),
+            };
+        }
+        flags
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0, "hex fixture length");
+        (0..value.len())
+            .step_by(2)
+            .map(|offset| {
+                u8::from_str_radix(&value[offset..offset + 2], 16).expect("hex fixture byte")
+            })
+            .collect()
     }
 }

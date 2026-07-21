@@ -137,9 +137,10 @@ Remaining:
 
 Implemented:
 
-- HSD generators for sighash, locks, covenant linkage, name-state codec,
-  reserved/lockup/renewal policy, incremental Urkel roots, P2P wire bytes,
-  subsidy, and deterministic coinbase behavior;
+- HSD generators for sighash, locks, a 56-case script execution/error corpus,
+  covenant linkage, name-state codec, reserved/lockup/renewal policy,
+  incremental Urkel roots, P2P wire bytes, subsidy, and deterministic coinbase
+  behavior;
 - static integrity checks and native secp256k1 smoke verification.
 
 Remaining:

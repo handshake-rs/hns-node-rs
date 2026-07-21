@@ -61,6 +61,10 @@ Current evidence includes:
 - signature-hash vectors for every defined base mode/modifier combination;
 - signature-type encoding validity;
 - relative sequence-lock cases;
+- 56 HSD-executed witness-program cases spanning control flow, stack and
+  numeric operations, hashes, native `CHECKSIG`/`CHECKMULTISIG`, CLTV/CSV,
+  disabled/unknown opcodes, and policy flags with normalized HSD rejection
+  codes;
 - 33 covenant-linkage accepted/rejected cases;
 - exact HSD `NameState` encoding vectors;
 - incremental HSD Urkel roots with explicit header/pre-state and
@@ -170,6 +174,23 @@ Tests and fault harnesses should cover:
   `MiningAuthorityPermit`.
 
 ## Differential replay
+
+An exact pinned HSD checkout can export its complete upstream script corpus for
+the Rust differential verifier without adding machine-specific source paths to
+the committed fixture set:
+
+```bash
+NODE_BACKEND=js node hsd-oracle/generate-hsrd-script-fixtures.js \
+  --hsd-source /path/to/hsd \
+  --full-script-output /tmp/hsrd-hsd-script-corpus.json
+cargo run --locked --manifest-path hsrd/Cargo.toml -p hns-consensus \
+  --example verify_hsd_script_corpus -- /tmp/hsrd-hsd-script-corpus.json
+```
+
+The exporter requires the exact pinned Git revision, reruns every declared HSD
+case through that checkout's script engine, and refuses source/result drift.
+The Rust verifier compares all normalized success and rejection codes and exits
+nonzero on any mismatch.
 
 For every mainnet block and mutation-corpus case, compare:
 

@@ -23,7 +23,8 @@
   connect/disconnect, coinbase maturity, duplicate/missing spend checks, value
   conservation, and output-collision checks.
 - HSD signature hashing, relative locks, CLTV, and CSV.
-- Broad bounded witness/script foundation.
+- Broad bounded witness/script foundation with 56 pinned HSD execution/error
+  vectors, including flag-sensitive numeric-depth behavior.
 - Verification-only wrapper around the exact vendored HSD secp256k1 source,
   including compact low-S ECDSA and compressed keys.
 - Exact non-coinbase covenant linkage before UTXO mutation.
