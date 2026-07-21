@@ -613,6 +613,7 @@ impl NodeService {
                 &HeaderValidationContext {
                     height: 0,
                     previous: None,
+                    enforce_checkpoints: true,
                     expected_bits: Some(params.pow.bits),
                     median_time_past: None,
                     maximum_time: None,
@@ -626,6 +627,7 @@ impl NodeService {
                 header,
                 height: 0,
                 verify_pow: false,
+                checkpoint_valid: true,
             })
             .map_err(|error| anyhow::anyhow!("failed to persist genesis header: {error}"))
     }
@@ -691,6 +693,7 @@ impl NodeService {
                             bits: record.header.bits,
                             chainwork: record.chainwork,
                         }),
+                        enforce_checkpoints: true,
                         expected_bits: Some(expected_bits),
                         median_time_past,
                         maximum_time: Some(maximum_time),
@@ -707,6 +710,7 @@ impl NodeService {
                     header,
                     height,
                     verify_pow: !is_canonical_genesis,
+                    checkpoint_valid: true,
                 })
                 .map_err(|error| anyhow::anyhow!("failed to persist header: {error}"))?;
             imported.push(record);

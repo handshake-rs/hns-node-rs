@@ -131,6 +131,14 @@ impl ScriptFlags {
         self.0 & other.0 == other.0
     }
 
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -356,7 +364,7 @@ fn execute_script(
         }
 
         let executing = conditions.iter().all(|condition| *condition);
-        let is_branch = matches!(instruction.opcode, OP_IF | OP_NOTIF | OP_ELSE | OP_ENDIF);
+        let is_branch = (OP_IF..=OP_ENDIF).contains(&instruction.opcode);
         if !executing && !is_branch {
             enforce_stack_limit(stack, &alt_stack)?;
             continue;
@@ -395,7 +403,8 @@ fn execute_script(
                 if value < 0 {
                     return Err(ScriptError::NegativeLocktime);
                 }
-                let predicate = u32::try_from(value).map_err(|_| ScriptError::NegativeLocktime)?;
+                let predicate =
+                    u32::try_from(value).map_err(|_| ScriptError::UnsatisfiedLocktime)?;
                 if !verify_locktime_predicate(transaction, input_index, predicate) {
                     return Err(ScriptError::UnsatisfiedLocktime);
                 }
@@ -405,7 +414,8 @@ fn execute_script(
                 if value < 0 {
                     return Err(ScriptError::NegativeLocktime);
                 }
-                let predicate = u32::try_from(value).map_err(|_| ScriptError::NegativeLocktime)?;
+                let predicate =
+                    u32::try_from(value).map_err(|_| ScriptError::UnsatisfiedLocktime)?;
                 if !verify_sequence_predicate(transaction, input_index, predicate) {
                     return Err(ScriptError::UnsatisfiedLocktime);
                 }
@@ -708,22 +718,27 @@ fn check_signature(
     public_key: &[u8],
     signatures: &dyn SignatureVerifier,
 ) -> Result<bool, ScriptError> {
+    let compact = if signature.is_empty() {
+        None
+    } else {
+        if signature.len() != 65 || !is_valid_signature_hash_type(signature[64]) {
+            return Err(ScriptError::SignatureEncoding);
+        }
+        let compact: &[u8; 64] = signature[..64]
+            .try_into()
+            .map_err(|_| ScriptError::SignatureEncoding)?;
+        signatures.validate_compact_signature(compact)?;
+        Some(compact)
+    };
     let public_key: &[u8; 33] = public_key
         .try_into()
         .map_err(|_| ScriptError::PublicKeyEncoding)?;
     if !matches!(public_key[0], 0x02 | 0x03) {
         return Err(ScriptError::PublicKeyEncoding);
     }
-    if signature.is_empty() {
+    let Some(compact) = compact else {
         return Ok(false);
-    }
-    if signature.len() != 65 || !is_valid_signature_hash_type(signature[64]) {
-        return Err(ScriptError::SignatureEncoding);
-    }
-    let compact: &[u8; 64] = signature[..64]
-        .try_into()
-        .map_err(|_| ScriptError::SignatureEncoding)?;
-    signatures.validate_compact_signature(compact)?;
+    };
     let message = signature_hash(
         transaction,
         input_index,
@@ -770,20 +785,20 @@ fn check_multisig(
     let signatures_start = stack.len() - signature_count;
     let candidate_signatures = stack.split_off(signatures_start);
     let dummy = pop(stack)?;
-    if !dummy.is_empty() {
-        return Err(ScriptError::SignatureNullDummy);
-    }
 
-    let mut signature_index = 0usize;
-    let mut key_index = 0usize;
+    // HSD consumes both lists from the top of the stack. Besides preserving
+    // ordered multisignature matching, this determines which malformed
+    // signature or key is observed before an impossible remainder exits.
+    let mut remaining_signatures = candidate_signatures.len();
+    let mut remaining_keys = keys.len();
     let mut valid = true;
-    while signature_index < candidate_signatures.len() {
-        if candidate_signatures.len() - signature_index > keys.len() - key_index {
+    while remaining_signatures > 0 {
+        if remaining_signatures > remaining_keys {
             valid = false;
             break;
         }
-        let signature = &candidate_signatures[signature_index];
-        let key = &keys[key_index];
+        let signature = &candidate_signatures[remaining_signatures - 1];
+        let key = &keys[remaining_keys - 1];
         if check_signature(
             transaction,
             input_index,
@@ -793,11 +808,11 @@ fn check_multisig(
             key,
             signatures,
         )? {
-            signature_index += 1;
+            remaining_signatures -= 1;
         }
-        key_index += 1;
+        remaining_keys -= 1;
     }
-    valid &= signature_index == candidate_signatures.len();
+    valid &= remaining_signatures == 0;
 
     if !valid
         && flags.contains(ScriptFlags::VERIFY_NULLFAIL)
@@ -806,6 +821,9 @@ fn check_multisig(
             .any(|signature| !signature.is_empty())
     {
         return Err(ScriptError::NullFail);
+    }
+    if !dummy.is_empty() {
+        return Err(ScriptError::SignatureNullDummy);
     }
     Ok(valid)
 }

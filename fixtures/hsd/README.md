@@ -11,6 +11,7 @@ golden cases can be added without changing testkit paths.
 - `resources`: DNS/resource-value encodings.
 - `rpc`: hsd JSON-RPC golden responses.
 - `name-states`: expected name-state records.
-- `chains`: generated regtest/simnet chain scenarios.
+- `chains`: HSD deployment/checkpoint/historical-boundary vectors and generated
+  regtest/simnet chain scenarios.
 - `network`: P2P peer and packet fixtures.
 - `snapshots`: snapshot manifest and chunk fixtures.

@@ -192,6 +192,18 @@ case through that checkout's script engine, and refuses source/result drift.
 The Rust verifier compares all normalized success and rejection codes and exits
 nonzero on any mismatch.
 
+The committed deployment/checkpoint fixture is generated through HSD's own
+`Chain.getState`, `getDeployments`, `computeBlockVersion`, and historical
+boundary methods:
+
+```bash
+NODE_BACKEND=js npm run hsrd-deployment-fixtures --prefix hsd-oracle
+```
+
+It pins all network deployment parameters and mainnet checkpoint hashes, then
+checks compact synthetic histories across DEFINED, STARTED, LOCKED_IN, ACTIVE,
+FAILED, timeout, partial-period, and per-deployment window/threshold behavior.
+
 For every mainnet block and mutation-corpus case, compare:
 
 - accept/reject and normalized reason;

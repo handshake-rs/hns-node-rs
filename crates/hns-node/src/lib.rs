@@ -1640,6 +1640,7 @@ impl NodeState {
                                 bits: record.header.bits,
                                 chainwork: record.chainwork,
                             }),
+                            enforce_checkpoints: true,
                             expected_bits,
                             median_time_past,
                             maximum_time: Some(maximum_time),
@@ -1680,6 +1681,7 @@ impl NodeState {
             chainwork,
             status: BlockStatus {
                 header_context_valid,
+                checkpoint_valid: matches!(request.validation, ImportValidationPolicy::Strict),
                 body_present: true,
                 body_syntax_valid: true,
                 absolute_finality_valid: true,
@@ -2940,6 +2942,7 @@ mod tests {
                 },
                 height: 0,
                 verify_pow: false,
+                checkpoint_valid: false,
             })
             .expect("header");
         let admission = node

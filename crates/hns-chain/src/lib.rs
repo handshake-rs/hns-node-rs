@@ -546,6 +546,9 @@ pub struct HeaderImport {
     pub header: Header,
     pub height: Height,
     pub verify_pow: bool,
+    /// The caller enforced its selected checkpoint policy while validating
+    /// this header. The index itself has no network parameter dependency.
+    pub checkpoint_valid: bool,
 }
 
 pub trait HeaderIndex {
@@ -791,7 +794,9 @@ impl<S: Store> StoredHeaderIndex<S> {
         // corresponding durable batch commits. A storage failure must not leave
         // the live index ahead of the database.
         let mut next = self.memory.clone();
-        let record = next.insert_header(request.header, request.height)?;
+        let mut record = next.insert_header(request.header, request.height)?;
+        record.status.checkpoint_valid = request.checkpoint_valid;
+        next.records.insert(record.hash, record.clone());
         self.persist_record_against(&record, &next)?;
         self.memory = next;
         Ok(record)
@@ -1598,6 +1603,7 @@ mod tests {
                 header: header(BlockHash::ZERO, 11),
                 height: 0,
                 verify_pow: false,
+                checkpoint_valid: false,
             })
             .expect("import");
 
@@ -1639,6 +1645,7 @@ mod tests {
                 header: header(BlockHash::ZERO, 12),
                 height: 0,
                 verify_pow: true,
+                checkpoint_valid: false,
             })
             .expect_err("bad pow");
 

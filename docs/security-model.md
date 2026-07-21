@@ -48,7 +48,10 @@ the existing authoritative mining boundary.
 
 The following remain untrusted and release-blocking:
 
-- complete script/deployment/checkpoint/historical behavior;
+- active-chain deployment composition, non-script historical exceptions, and
+  historical replay qualification;
+- independent script fuzz/invalid evidence beyond the complete pinned HSD
+  upstream corpus;
 - claim and airdrop proofs/accounting;
 - complete contextual name consensus over all historical cases;
 - persistent production Urkel nodes and HSD proof-wire parity;

@@ -46,7 +46,9 @@ reserved low-latency paths.
 ### Transaction authorization
 
 - HSD signature hashing and relative locks.
-- Broad bounded witness/script foundation.
+- Complete pinned-HSD interpreter parity across all 876 upstream script cases.
+- Exact HSD BIP9 deployment selection, checkpoint tables/enforcement, and a
+  fail-closed checkpoint-backed historical script policy.
 - Exact vendored native secp256k1 verification backend.
 - Authorization and lock checks before state mutation.
 
@@ -84,35 +86,31 @@ reserved low-latency paths.
 - Parallel critical fan-out with writer-completion acknowledgment and retry only for locally accepted active blocks.
 - Conservative mempool clearing on disconnect/reorganization.
 
-## Next implementation order
+## Remaining implementation order
 
-1. **Cargo reconciliation** — run formatting, Clippy, all feature modes, unit and
-   integration tests; fix errors without weakening fail-closed behavior.
-2. **Script parity closure** — complete HSD flags, deployment selection,
-   historical behavior, mutation corpus, and script differential tests.
-3. **Claim and airdrop validation** — proof codecs, historical datasets,
+1. **Claim and airdrop validation** — proof codecs, historical datasets,
    duplicate prevention, deflation-era rules, and exact conjured-value
    accounting.
-4. **Contextual covenant closure** — replay all mainnet transition families and
-   historical exceptions against HSD.
-5. **Persistent Urkel** — incremental nodes, exact proof wire format,
+2. **Contextual covenant closure** — compose active deployment state and replay
+   all mainnet transition families and historical exceptions against HSD.
+3. **Persistent Urkel** — incremental nodes, exact proof wire format,
    snapshots, undo, compaction, and crash qualification while preserving exact
    correctness-first roots.
-6. **Active-state IBD** — connect downloaded bodies through the one consensus
+4. **Active-state IBD** — connect downloaded bodies through the one consensus
    pipeline, persist invalid branches, recover from restart, and qualify
    pruning/reorganizations without changing the authority boundary.
-7. **Network hardening** — Brontide, address management/discovery, durable
+5. **Network hardening** — Brontide, address management/discovery, durable
    bans/reputation, peer diversity, compact blocks, and adversarial WAN tests.
-8. **Mempool admission closure** — compose complete active-chain views,
+6. **Mempool admission closure** — compose complete active-chain views,
    scripts/deployments/claims/name context, disconnected-transaction
    re-admission, policy replacement, and differential corpora.
-9. **Mining composition** — continuously rebuild bounded future variants,
+7. **Mining composition** — continuously rebuild bounded future variants,
    activate jobs on committed tips, supervise publication retries, and bind the
    ASIC gateway without allowing shadow state to authorize work.
-10. **Historical/live qualification** — full mainnet replay, invalid corpus,
+8. **Historical/live qualification** — full mainnet replay, invalid corpus,
     state/root comparison, restart/partition/reorganization shadow tests, and
     P50/P95/P99/max mining-lane measurements.
-11. **Controlled authority transition** — HSD cross-check and fallback first;
+9. **Controlled authority transition** — HSD cross-check and fallback first;
     remove HSD only after reviewed reproducible evidence.
 
 Implementation follows `hsd-decomposition.md`. Wallet, DNS, UI, domain manager,

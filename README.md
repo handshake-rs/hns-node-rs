@@ -55,9 +55,9 @@ Implemented:
 - HSD-compatible signature hashing for all defined base modes and
   `NOINPUT`/`ANYONECANPAY` combinations.
 - Relative sequence-lock calculation and CLTV/CSV predicates.
-- A bounded version-zero witness/script interpreter covering the principal
-  stack, numeric, control, hash, signature, multisignature, CLTV, and CSV
-  operation families.
+- A bounded version-zero witness/script interpreter matching every case in the
+  pinned HSD 876-case upstream script corpus, including normalized rejection
+  codes and historical BIP66-derived ordering cases.
 - Handshake BLAKE160, BLAKE256, SHA3, and Keccak script operations.
 - A verification-only safe Rust wrapper over the exact vendored
   `libsecp256k1` source used by the pinned HSD dependency.
@@ -69,11 +69,18 @@ Implemented:
   explicitly installed.
 - Reproducible HSD signature-hash, sequence-lock, and 56-case script
   execution/error fixtures, including flag-sensitive numeric-depth behavior.
+- Exact HSD BIP9 threshold transitions, block-version signaling, deployment
+  effects, mandatory/standard script flags, all four networks' deployment
+  parameters, and all 15 mainnet checkpoint hashes.
+- Strict header checkpoint enforcement and a fail-closed historical-script
+  policy that requires verified checkpoint ancestry before allowing HSD's
+  optional historical validation shortcut.
 
 Still release-blocking:
 
-- complete HSD opcode/flag/deployment/historical parity;
-- broader positive and negative script corpora;
+- active-chain caching/composition of deployment-derived name and airdrop flags;
+- broader independently generated script fuzz and invalid corpora beyond HSD's
+  upstream suite;
 - complete mainnet replay and independent review of the Rust wrapper and script
   integration.
 
@@ -104,7 +111,7 @@ Implemented:
 Still release-blocking:
 
 - DNSSEC claim and airdrop proof/accounting validation;
-- complete deployment/checkpoint and historical-exception parity;
+- deployment-aware claim/airdrop and contextual name composition;
 - full contextual covenant parity across mainnet history;
 - a production persistent incremental Urkel node store and exact HSD proof-wire
   codec;
@@ -215,6 +222,7 @@ The individual fixture and native-dependency checks include:
 python3 scripts/validate-hsrd-static.py
 python3 scripts/validate-hsrd-source-handoff.py
 npm run hsrd-script-fixtures --prefix hsd-oracle
+npm run hsrd-deployment-fixtures --prefix hsd-oracle
 npm run hsrd-covenant-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-codec-fixtures --prefix hsd-oracle
 npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle

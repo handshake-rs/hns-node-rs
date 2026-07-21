@@ -19,13 +19,20 @@ Implemented:
 - Header PoW/difficulty/time and block syntax/commitment foundations.
 - HSD sighash, sequence-lock, CLTV, and CSV behavior.
 - Broad bounded version-zero witness/script interpreter.
+- Exact results for all 876 cases in HSD's pinned upstream script corpus.
+- Exact HSD deployment/checkpoint constants, BIP9 transitions, block-version
+  signaling, deployment effects, and checkpoint/historical-script policy.
+- Strict header checkpoint enforcement in native peer and candidate imports.
 - Pinned vendored native secp256k1 verification.
 - Exact non-coinbase covenant linkage.
 - Contextual non-claim name-transition foundation.
 
 Remaining:
 
-- complete script flags, deployments, checkpoints, and historical exceptions;
+- active-chain deployment cache/composition and historical replay
+  qualification;
+- non-script historical exceptions and broader independent invalid/fuzz
+  corpora;
 - claim and airdrop proof/accounting validation;
 - full contextual transition replay and invalid corpus.
 
@@ -137,8 +144,9 @@ Remaining:
 
 Implemented:
 
-- HSD generators for sighash, locks, a 56-case script execution/error corpus,
-  covenant linkage, name-state codec, reserved/lockup/renewal policy,
+- HSD generators for sighash, locks, a 56-case focused script execution/error
+  corpus, all 876 upstream script cases, deployments/checkpoints/historical
+  boundaries, covenant linkage, name-state codec, reserved/lockup/renewal policy,
   incremental Urkel roots, P2P wire bytes, subsidy, and deterministic coinbase
   behavior;
 - static integrity checks and native secp256k1 smoke verification.

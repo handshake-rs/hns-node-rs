@@ -23,8 +23,11 @@
   connect/disconnect, coinbase maturity, duplicate/missing spend checks, value
   conservation, and output-collision checks.
 - HSD signature hashing, relative locks, CLTV, and CSV.
-- Broad bounded witness/script foundation with 56 pinned HSD execution/error
-  vectors, including flag-sensitive numeric-depth behavior.
+- Bounded witness/script interpreter matching all 876 pinned upstream HSD
+  execution cases, plus 56 committed focused execution/error vectors.
+- Exact HSD BIP9 transitions, block-version selection, deployment effects,
+  network checkpoint tables, strict header checkpoint enforcement, and a
+  checkpoint-ancestry-gated historical script policy.
 - Verification-only wrapper around the exact vendored HSD secp256k1 source,
   including compact low-S ECDSA and compressed keys.
 - Exact non-coinbase covenant linkage before UTXO mutation.
@@ -92,8 +95,12 @@ These are substantial foundations, not a production full node.
 
 ### Consensus and authenticated state
 
-- Complete script opcode/flag/deployment/historical parity and mutation corpus.
-- Deployment, checkpoint, and historical-exception parity.
+- Active-chain deployment-state caching and composition into contextual
+  claim/airdrop and name validation.
+- Historical checkpoint-fast-path replay qualification and non-script
+  historical exceptions.
+- Independently generated script fuzz/invalid corpora beyond the complete
+  pinned HSD upstream suite.
 - DNSSEC claim and airdrop proofs, historical datasets, duplicate prevention,
   deflation-era accounting, and exact conjured-value rules.
 - Complete contextual covenant/name behavior across mainnet history.

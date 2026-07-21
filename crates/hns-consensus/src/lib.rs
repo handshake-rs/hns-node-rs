@@ -10,6 +10,7 @@ use hns_primitives::{
 use serde::{Deserialize, Serialize};
 
 mod covenant;
+mod deployment;
 mod locks;
 mod name;
 mod script;
@@ -17,6 +18,11 @@ mod sighash;
 
 pub use covenant::{
     blind_bid, verify_transaction_covenant_links, CovenantLinkError, CovenantLinkSummary,
+};
+pub use deployment::{
+    compute_block_version, deployment_state, is_hsd_historical_block, is_hsd_historical_height,
+    threshold_state, verify_checkpoint, Checkpoint, Deployment, DeploymentError,
+    DeploymentHistoryEntry, DeploymentId, DeploymentState, HistoricalScriptPolicy, ThresholdState,
 };
 pub use locks::{
     calculate_sequence_locks, verify_locktime_predicate, verify_sequence_locks,
@@ -136,6 +142,8 @@ impl Network {
                 brontide_port: 44_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 100,
+                activation_threshold: 1_916,
+                miner_window: 2_016,
                 names: NameParams {
                     auction_start: 2_016,
                     rollout_interval: 1_008,
@@ -179,6 +187,8 @@ impl Network {
                 brontide_port: 45_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 100,
+                activation_threshold: 1_512,
+                miner_window: 2_016,
                 names: NameParams {
                     auction_start: 36,
                     rollout_interval: 36,
@@ -222,6 +232,8 @@ impl Network {
                 brontide_port: 46_806,
                 halving_interval: 2_500,
                 coinbase_maturity: 2,
+                activation_threshold: 108,
+                miner_window: 144,
                 names: NameParams {
                     auction_start: 0,
                     rollout_interval: 2,
@@ -265,6 +277,8 @@ impl Network {
                 brontide_port: 47_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 6,
+                activation_threshold: 75,
+                miner_window: 100,
                 names: NameParams {
                     auction_start: 0,
                     rollout_interval: 1,
@@ -326,6 +340,8 @@ pub struct NetworkParams {
     pub brontide_port: u16,
     pub halving_interval: u32,
     pub coinbase_maturity: u32,
+    pub activation_threshold: u32,
+    pub miner_window: u32,
     pub names: NameParams,
     pub pow: PowParams,
     pub genesis_hash: BlockHash,
@@ -532,6 +548,9 @@ impl TransactionInputVerifier for RejectUnverifiedInputs {
 pub struct HeaderValidationContext {
     pub height: Height,
     pub previous: Option<HeaderParent>,
+    /// Enforce the selected network's pinned HSD checkpoint hash when this
+    /// height has one. HSD exposes this as an optional synchronization policy.
+    pub enforce_checkpoints: bool,
     pub expected_bits: Option<u32>,
     pub median_time_past: Option<u64>,
     pub maximum_time: Option<u64>,
@@ -589,6 +608,15 @@ impl HeaderConsensus {
                     "previous header hash mismatch",
                 ));
             }
+        }
+
+        if !verify_checkpoint(
+            self.params.network,
+            context.enforce_checkpoints,
+            context.height,
+            &header.hash(),
+        ) {
+            return Err(ConsensusError::InvalidHeader("checkpoint mismatch"));
         }
 
         if let Some(expected_bits) = context.expected_bits {
@@ -1338,6 +1366,7 @@ mod tests {
                 &HeaderValidationContext {
                     height: 0,
                     previous: None,
+                    enforce_checkpoints: false,
                     expected_bits: Some(testnet_genesis.bits),
                     median_time_past: None,
                     maximum_time: None,
@@ -1365,6 +1394,7 @@ mod tests {
                         bits: parent.bits,
                         chainwork: Uint256::ONE,
                     }),
+                    enforce_checkpoints: false,
                     expected_bits: Some(0),
                     median_time_past: None,
                     maximum_time: None,
@@ -1388,6 +1418,7 @@ mod tests {
                         bits: 0,
                         chainwork: Uint256::ONE,
                     }),
+                    enforce_checkpoints: false,
                     expected_bits: Some(0),
                     median_time_past: None,
                     maximum_time: None,
@@ -1415,6 +1446,7 @@ mod tests {
                 bits: 0,
                 chainwork: Uint256::ONE,
             }),
+            enforce_checkpoints: false,
             expected_bits: Some(0),
             median_time_past: Some(100),
             maximum_time: Some(200),
@@ -1429,6 +1461,39 @@ mod tests {
         consensus
             .validate_header(&child, &context)
             .expect("bounded timestamp");
+    }
+
+    #[test]
+    fn header_consensus_enforces_selected_network_checkpoints() {
+        let consensus = HeaderConsensus::new(ConsensusParams::for_network(Network::Mainnet));
+        let checkpoint = Network::Mainnet.checkpoints()[0];
+        let parent = header(BlockHash::ZERO, 1, 0);
+        let candidate = header(parent.hash(), 2, 0);
+        let context = HeaderValidationContext {
+            height: checkpoint.height,
+            previous: Some(HeaderParent {
+                hash: parent.hash(),
+                height: checkpoint.height - 1,
+                bits: 0,
+                chainwork: Uint256::ONE,
+            }),
+            enforce_checkpoints: true,
+            expected_bits: Some(0),
+            median_time_past: None,
+            maximum_time: None,
+            require_pow: false,
+        };
+
+        assert!(matches!(
+            consensus.validate_header(&candidate, &context),
+            Err(ConsensusError::InvalidHeader("checkpoint mismatch"))
+        ));
+
+        let mut disabled = context;
+        disabled.enforce_checkpoints = false;
+        consensus
+            .validate_header(&candidate, &disabled)
+            .expect("disabled checkpoint policy");
     }
 
     fn covenant() -> Covenant {
