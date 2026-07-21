@@ -2,6 +2,7 @@
 members = [
     "crates/hns-primitives",
     "crates/hns-consensus",
+    "crates/hns-goosig",
     "crates/hns-secp256k1",
     "crates/hns-chain",
     "crates/hns-state",

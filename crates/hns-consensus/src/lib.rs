@@ -18,7 +18,10 @@ mod name;
 mod script;
 mod sighash;
 
-pub use airdrop::{verify_airdrop_output, AirdropConsensusError, AirdropFlags, VerifiedAirdrop};
+pub use airdrop::{
+    verify_airdrop_output, AirdropConsensusError, AirdropFlags, NativeAirdropSignatureVerifier,
+    VerifiedAirdrop,
+};
 pub use claim::{
     verify_claim_output, ClaimConsensusError, ClaimFlags, OpenSslDnssecVerifier, VerifiedClaim,
 };

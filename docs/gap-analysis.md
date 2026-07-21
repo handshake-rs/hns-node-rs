@@ -45,9 +45,9 @@
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
 - Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,
-  valid faucet proof handling, and atomic duplicate-position connect/undo;
-  the active node composes faucet verification from parent deployment state,
-  while non-address signature backends remain fail-closed.
+  native RSA/P-256/Ed25519/GooSig verification, valid faucet and upstream
+  production-root GooSig proofs, and atomic duplicate-position connect/undo;
+  the active node composes the complete verifier from parent deployment state.
 - Exact HSD Claim envelope encoding and blob-only hashes plus checksummed
   ownership TXT payloads for all four networks.
 - Exact compression-free ownership-proof DNS codecs and HSD sanity/time/weak
@@ -116,9 +116,9 @@ These are substantial foundations, not a production full node.
   historical exceptions.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
-- Non-address airdrop signatures, legacy GOST94 DS compatibility, broader
-  current/historical valid claim-proof corpora, remaining historical datasets,
-  and complete replay evidence. Claim deflation accounting, active-node
+- Legacy GOST94 DS compatibility, broader current/historical valid claim-proof
+  corpora, remaining historical datasets, and complete replay evidence. Claim
+  deflation accounting, complete airdrop-key verification, active-node
   deployment composition, and airdrop duplicate/conjured-value accounting are
   implemented.
 - Complete contextual covenant/name behavior across mainnet history.

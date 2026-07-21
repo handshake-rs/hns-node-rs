@@ -89,6 +89,11 @@ Implemented:
   sanity/window/weak-key behavior, the pinned ICANN 2017 root anchor, canonical
   DNSSEC signature-chain verification for HSD's supported algorithms, and
   reserved-target/output/commit/deflation accounting checks.
+- Native verification for all five HSD airdrop key types: direct address
+  allocations, RSA/SHA-256, compact P-256 ECDSA, Ed25519, and the exact pinned
+  Goosig 0.11.0 verifier. HSD-generated vectors cover valid and mutated
+  signatures, plus an upstream production-root GooSig allocation through the
+  active node's durable duplicate-prevention path.
 
 Still release-blocking:
 
@@ -126,8 +131,8 @@ Implemented:
 
 Still release-blocking:
 
-- non-address airdrop signature backends, legacy GOST94 DS compatibility, and
-  broader current/historical production-valid claim-proof corpora;
+- legacy GOST94 DS compatibility and broader current/historical
+  production-valid claim-proof corpora;
 - full contextual covenant parity across mainnet history;
 - a production persistent incremental Urkel node store and exact HSD proof-wire
   codec;

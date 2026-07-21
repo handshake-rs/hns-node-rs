@@ -23,7 +23,7 @@ Implemented:
 - Exact HSD deployment/checkpoint constants, BIP9 transitions, block-version
   signaling, deployment effects, and checkpoint/historical-script policy.
 - Active-chain deployment caches and parent-derived contextual name,
-  DNSSEC-claim, and faucet validation across connect/reorg/restart.
+  DNSSEC-claim, and full airdrop validation across connect/reorg/restart.
 - Strict header checkpoint enforcement in native peer and candidate imports.
 - Pinned vendored native secp256k1 verification.
 - Exact non-coinbase covenant linkage.
@@ -31,13 +31,16 @@ Implemented:
   connect/disconnect at the proof-capable state-service boundary.
 - Exact HSD ownership-proof codecs, sanity/time/weak rules, ICANN-rooted DNSSEC
   verification, and claim output/commit/deflation accounting.
+- Native RSA/SHA-256, compact P-256, Ed25519, direct-address, and pinned
+  Goosig 0.11.0 airdrop verification, including an upstream production-root
+  GooSig proof through active block connection and durable duplicate rejection.
 
 Remaining:
 
 - historical replay qualification;
 - non-script historical exceptions and broader independent invalid/fuzz
   corpora;
-- non-address airdrop signatures and broader claim proof corpora;
+- broader current/historical claim proof corpora, including legacy GOST94 DS;
 - full contextual transition replay and invalid corpus.
 
 ## State and reorganization engine — hardened foundation
@@ -155,7 +158,8 @@ Implemented:
   covenant linkage, name-state codec, reserved/lockup/renewal policy,
   incremental Urkel roots, P2P wire bytes, subsidy, and deterministic coinbase
   behavior;
-- static integrity checks and native secp256k1 smoke verification.
+- static integrity checks, native secp256k1 smoke verification, and exact
+  vendored-Goosig source comparison against HSD's pinned dependency.
 
 Remaining:
 

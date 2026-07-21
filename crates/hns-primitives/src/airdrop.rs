@@ -555,6 +555,8 @@ pub enum AirdropError {
     PositionOverflow,
     #[error("airdrop signature backend is unavailable")]
     SignatureBackendUnavailable,
+    #[error("airdrop signature backend failed: {0}")]
+    SignatureBackendFailure(String),
 }
 
 #[cfg(test)]

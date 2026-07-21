@@ -153,10 +153,19 @@ dependencies = [
 name = "hns-consensus"
 version = "0.1.0"
 dependencies = [
+ "hns-goosig",
  "hns-primitives",
  "hns-secp256k1",
  "openssl",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "hns-goosig"
+version = "0.1.0"
+dependencies = [
+ "cc",
  "thiserror",
 ]
 

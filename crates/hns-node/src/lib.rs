@@ -1987,7 +1987,7 @@ impl NodeState {
                 );
             }
         }
-        let issuance = AirdropCoinbaseIssuanceVerifier::faucet_only(deployments);
+        let issuance = AirdropCoinbaseIssuanceVerifier::native(deployments)?;
         let services = StateServices {
             network: self.network,
             name_flags: deployments.name_flags,
@@ -3147,6 +3147,7 @@ mod tests {
     #[derive(serde::Deserialize)]
     struct AirdropFixture {
         faucet: AirdropFixtureProof,
+        airdrop: AirdropFixtureProof,
     }
 
     #[derive(serde::Deserialize)]
@@ -3167,11 +3168,8 @@ mod tests {
             .collect()
     }
 
-    fn faucet_coinbase() -> (Transaction, u32) {
-        let fixture: AirdropFixture =
-            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
-                .expect("airdrop fixture");
-        let proof = fixture.faucet;
+    fn fixture_airdrop_coinbase(proof: AirdropFixtureProof) -> (Transaction, u32) {
+        let position = proof.position;
         let mut transaction =
             coinbase_transaction_with_address(6, Network::Regtest.params().block_reward(0));
         transaction.inputs.push(Input {
@@ -3184,13 +3182,27 @@ mod tests {
         transaction.outputs.push(Output {
             value: proof.value - proof.fee,
             address: Address::new(proof.version, decode_fixture_hex(&proof.address))
-                .expect("faucet address"),
+                .expect("airdrop address"),
             covenant: Covenant {
                 kind: CovenantKind::None,
                 items: Vec::new(),
             },
         });
-        (transaction, proof.position)
+        (transaction, position)
+    }
+
+    fn faucet_coinbase() -> (Transaction, u32) {
+        let fixture: AirdropFixture =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        fixture_airdrop_coinbase(fixture.faucet)
+    }
+
+    fn goosig_airdrop_coinbase() -> (Transaction, u32) {
+        let fixture: AirdropFixture =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        fixture_airdrop_coinbase(fixture.airdrop)
     }
 
     fn experimental_authority_config() -> NodeConfig {
@@ -3431,6 +3443,40 @@ mod tests {
 
         drop(node);
         NodeState::from_store_for_network(store, Network::Regtest).expect("faucet state restarts");
+    }
+
+    #[test]
+    fn active_node_verifies_upstream_goosig_airdrop() {
+        let store = StoreHandle::memory();
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("node");
+        let (coinbase, position) = goosig_airdrop_coinbase();
+        let block = block_with_commitments(vec![coinbase.clone()]);
+        let record = node
+            .connect_block(NodeBlockImport::fixture(block, 0, 1))
+            .expect("valid upstream GooSig airdrop");
+        assert!(record.status.deployment_state_valid);
+        assert!(record.status.claims_and_airdrops_valid);
+
+        let mut duplicate = block_with_commitments(vec![coinbase]);
+        duplicate.header.prev_block = record.hash;
+        duplicate.header.nonce = 11;
+        let error = node
+            .connect_block(NodeBlockImport::fixture(duplicate, 1, 2))
+            .expect_err("duplicate GooSig allocation");
+        assert!(error.to_string().contains(&position.to_string()), "{error}");
+
+        drop(node);
+        NodeState::from_store_for_network(store, Network::Regtest)
+            .expect("GooSig airdrop state restarts");
     }
 
     #[test]

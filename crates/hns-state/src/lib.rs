@@ -11,9 +11,10 @@ use hns_consensus::{
     is_reserved, maybe_expire_name, name_lifecycle, verify_airdrop_output,
     verify_and_apply_name_covenant, verify_claim_output, verify_sequence_locks,
     verify_transaction_covenant_links, AirdropFlags, ClaimFlags, ConsensusError, CovenantLinkError,
-    DeploymentState, NameContext, NameFlags, NativeSignatureVerifier, Network,
-    OpenSslDnssecVerifier, RejectUnverifiedInputs, SequenceLockView, TransactionInputVerifier,
-    VerifiedClaim, WitnessProgramVerifier, MAX_MONEY, MEDIAN_TIMESPAN,
+    DeploymentState, NameContext, NameFlags, NativeAirdropSignatureVerifier,
+    NativeSignatureVerifier, Network, OpenSslDnssecVerifier, RejectUnverifiedInputs,
+    SequenceLockView, TransactionInputVerifier, VerifiedClaim, WitnessProgramVerifier, MAX_MONEY,
+    MEDIAN_TIMESPAN,
 };
 use hns_primitives::{
     Address, AirdropSignatureVerifier, Amount, Block, BlockHash, Coin, Covenant, CovenantKind,
@@ -265,10 +266,10 @@ impl CoinbaseIssuanceVerifier for RejectSpecialCoinbaseIssuance {
 
 /// A proof-capable coinbase boundary for HSD airdrops and DNSSEC CLAIM outputs.
 /// The historical type name is retained while this boundary grows toward full
-/// issuance parity. Supplying `UnavailableAirdropSignatureVerifier` enables
-/// only the cryptographically self-authenticating address/faucet airdrop
-/// subset; non-address airdrop keys fail closed until a matching backend is
-/// installed. CLAIM signatures are verified by the OpenSSL DNSSEC backend.
+/// issuance parity. [`Self::native`] enables the full HSD key set, including
+/// the historical GooSig allocations. [`Self::faucet_only`] remains available
+/// for explicitly fail-closed tests and tools. CLAIM signatures are verified
+/// by the OpenSSL DNSSEC backend.
 #[derive(Clone)]
 pub struct AirdropCoinbaseIssuanceVerifier {
     flags: AirdropFlags,
@@ -304,6 +305,12 @@ impl AirdropCoinbaseIssuanceVerifier {
             signatures,
             dnssec: Arc::new(OpenSslDnssecVerifier),
         }
+    }
+
+    pub fn native(deployments: DeploymentState) -> Result<Self, StateError> {
+        let signatures = NativeAirdropSignatureVerifier::new()
+            .map_err(|error| StateError::AirdropSignatureBackend(error.to_string()))?;
+        Ok(Self::new(deployments, Arc::new(signatures)))
     }
 
     pub fn faucet_only(deployments: DeploymentState) -> Self {
@@ -1884,6 +1891,8 @@ pub enum StateError {
     ChainView(String),
     #[error("input-authorization backend failed to initialize: {0}")]
     InputAuthorizationBackend(String),
+    #[error("airdrop-signature backend failed to initialize: {0}")]
+    AirdropSignatureBackend(String),
     #[error("missing coin for outpoint {0:?}")]
     MissingCoin(Outpoint),
     #[error("duplicate spend for outpoint {0:?}")]

@@ -1,6 +1,115 @@
+use hns_goosig::GooSigVerifier;
 use hns_primitives::{
-    AirdropError, AirdropProof, AirdropSignatureVerifier, Amount, CovenantKind, Output,
+    AirdropError, AirdropKey, AirdropProof, AirdropSignatureVerifier, Amount, CovenantKind, Output,
 };
+use openssl::{
+    bn::{BigNum, BigNumContext},
+    ec::{EcGroup, EcKey, EcPoint},
+    ecdsa::EcdsaSig,
+    md::Md,
+    nid::Nid,
+    pkey::{Id, PKey},
+    pkey_ctx::PkeyCtx,
+    rsa::{Padding, Rsa},
+    sign::Verifier,
+};
+
+/// Native verifier for every HSD airdrop key type. RSA wraps HSD's 32-byte
+/// digest in the SHA-256 PKCS#1 v1.5 `DigestInfo`, while P-256, Ed25519, and
+/// GooSig consume those bytes directly, matching `AirdropKey.verify` in the
+/// pinned oracle.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeAirdropSignatureVerifier {
+    goo: GooSigVerifier,
+}
+
+impl NativeAirdropSignatureVerifier {
+    pub fn new() -> Result<Self, AirdropError> {
+        let goo = GooSigVerifier::new()
+            .map_err(|error| AirdropError::SignatureBackendFailure(error.to_string()))?;
+        Ok(Self { goo })
+    }
+}
+
+impl AirdropSignatureVerifier for NativeAirdropSignatureVerifier {
+    fn verify(
+        &self,
+        key: &AirdropKey,
+        message: &[u8; 32],
+        signature: &[u8],
+    ) -> Result<bool, AirdropError> {
+        Ok(match key {
+            AirdropKey::Rsa {
+                modulus, exponent, ..
+            } => verify_rsa(message, signature, modulus, exponent),
+            AirdropKey::Goo { commitment } => self
+                .goo
+                .verify(message, signature, commitment)
+                .map_err(|error| AirdropError::SignatureBackendFailure(error.to_string()))?,
+            AirdropKey::P256 { point, .. } => verify_p256(message, signature, point),
+            AirdropKey::Ed25519 { point, .. } => verify_ed25519(message, signature, point),
+            // Address allocations are bound directly by `AirdropProof` and
+            // never delegated to this backend.
+            AirdropKey::Address { .. } => false,
+        })
+    }
+}
+
+fn verify_rsa(message: &[u8], signature: &[u8], modulus: &[u8], exponent: &[u8]) -> bool {
+    let key = (|| {
+        let modulus = BigNum::from_slice(modulus)?;
+        let exponent = BigNum::from_slice(exponent)?;
+        let rsa = Rsa::from_public_components(modulus, exponent)?;
+        PKey::from_rsa(rsa)
+    })();
+    let Ok(key) = key else {
+        return false;
+    };
+    let Ok(mut verifier) = PkeyCtx::new(&key) else {
+        return false;
+    };
+    if verifier.verify_init().is_err()
+        || verifier.set_rsa_padding(Padding::PKCS1).is_err()
+        || verifier.set_signature_md(Md::sha256()).is_err()
+    {
+        return false;
+    }
+    verifier.verify(message, signature).unwrap_or(false)
+}
+
+fn verify_p256(message: &[u8], signature: &[u8], point: &[u8; 33]) -> bool {
+    if signature.len() != 64 {
+        return false;
+    }
+    let key = (|| {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let mut context = BigNumContext::new()?;
+        let point = EcPoint::from_bytes(&group, point, &mut context)?;
+        EcKey::from_public_key(&group, &point)
+    })();
+    let Ok(key) = key else {
+        return false;
+    };
+    let compact = (|| {
+        let r = BigNum::from_slice(&signature[..32])?;
+        let s = BigNum::from_slice(&signature[32..])?;
+        EcdsaSig::from_private_components(r, s)
+    })();
+    let Ok(compact) = compact else {
+        return false;
+    };
+    compact.verify(message, &key).unwrap_or(false)
+}
+
+fn verify_ed25519(message: &[u8], signature: &[u8], point: &[u8; 32]) -> bool {
+    let Ok(key) = PKey::public_key_from_raw_bytes(point, Id::ED25519) else {
+        return false;
+    };
+    let Ok(mut verifier) = Verifier::new_without_digest(&key) else {
+        return false;
+    };
+    verifier.verify_oneshot(signature, message).unwrap_or(false)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AirdropFlags {
@@ -108,8 +217,11 @@ mod tests {
     use super::*;
 
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Fixture {
         proofs: Vec<FixtureProof>,
+        signature_cases: Vec<FixtureSignatureCase>,
+        airdrop: FixtureProof,
         faucet: FixtureProof,
     }
 
@@ -122,6 +234,18 @@ mod tests {
         version: u8,
         address: String,
         fee: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureSignatureCase {
+        r#type: String,
+        key_raw: String,
+        message: String,
+        signature: String,
+        valid: bool,
+        altered_message_valid: bool,
+        altered_signature_valid: bool,
     }
 
     fn fixture() -> Fixture {
@@ -173,6 +297,64 @@ mod tests {
         assert_eq!(verified.position, 216_503);
         assert_eq!(verified.value, 8_493_988_628);
         assert_eq!(proof.id, "upstream-valid-faucet");
+    }
+
+    #[test]
+    fn native_signatures_match_every_hsd_airdrop_key_type() {
+        let verifier = NativeAirdropSignatureVerifier::new().expect("native airdrop verifier");
+        for case in fixture().signature_cases {
+            let key = AirdropKey::decode(&decode_hex(&case.key_raw)).expect("fixture key");
+            let message: [u8; 32] = decode_hex(&case.message)
+                .try_into()
+                .expect("32-byte fixture message");
+            let signature = decode_hex(&case.signature);
+            assert_eq!(
+                verifier
+                    .verify(&key, &message, &signature)
+                    .unwrap_or_else(|error| panic!("{} verifier failed: {error}", case.r#type)),
+                case.valid,
+                "{} valid signature",
+                case.r#type
+            );
+
+            let mut altered_message = message;
+            altered_message[0] ^= 1;
+            assert_eq!(
+                verifier
+                    .verify(&key, &altered_message, &signature)
+                    .expect("altered message verification"),
+                case.altered_message_valid,
+                "{} altered message",
+                case.r#type
+            );
+
+            let mut altered_signature = signature;
+            altered_signature[0] ^= 1;
+            assert_eq!(
+                verifier
+                    .verify(&key, &message, &altered_signature)
+                    .expect("altered signature verification"),
+                case.altered_signature_valid,
+                "{} altered signature",
+                case.r#type
+            );
+        }
+    }
+
+    #[test]
+    fn native_goosig_verifies_upstream_production_airdrop() {
+        let proof = fixture().airdrop;
+        let verifier = NativeAirdropSignatureVerifier::new().expect("native airdrop verifier");
+        let verified = verify_airdrop_output(
+            &decode_hex(&proof.raw),
+            &output_for(&proof),
+            AirdropFlags::default(),
+            &verifier,
+        )
+        .expect("HSD GooSig airdrop proof");
+        assert_eq!(verified.position, 213_572);
+        assert_eq!(verified.value, 4_246_994_314);
+        assert_eq!(proof.id, "upstream-valid-goosig-airdrop");
     }
 
     #[test]

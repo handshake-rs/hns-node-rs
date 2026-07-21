@@ -65,7 +65,7 @@
         "faucet",
         "coinbase"
       ],
-      "blake2b256": "f8a3a95124f773cda017ba73534e07125302d9e5c148bf531d4d417ebf5c2e55"
+      "blake2b256": "b4161d316d6f7a37a12baf78e3f808e48a61ecdd978964138e33628d9357beeb"
     },
     {
       "id": "claim-codec-v1",

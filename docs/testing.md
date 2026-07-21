@@ -63,8 +63,10 @@ Current evidence includes:
 
 - signature-hash vectors for every defined base mode/modifier combination;
 - all five HSD airdrop-key codecs, proof hashes and signature preimages,
-  allocation-root checks, strict decode failures, and a complete valid faucet
-  proof from HSD's upstream corpus;
+  allocation-root checks, strict decode failures, HSD-generated valid and
+  mutated RSA/P-256/Ed25519/GooSig signature cases, a complete valid faucet
+  proof, and an upstream production-root GooSig proof exercised through native
+  consensus and active-node state;
 - HSD Claim envelope encoding and blob-only hashes, strict length/trailing
   failures, checksummed ownership TXT payloads for every network prefix, a
   complete upstream signed DNSKEY/DS/TXT/RRSIG proof, its exact codec/sanity/
