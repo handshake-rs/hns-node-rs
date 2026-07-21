@@ -194,9 +194,10 @@
         "checkpoints",
         "historical",
         "pruning",
-        "script-flags"
+        "script-flags",
+        "validation-plan"
       ],
-      "blake2b256": "a136e330fd1f1f15daf76f2bae7aba1af1c1f1e35531e76bf91b69f5e1f36457"
+      "blake2b256": "36b93ab7d5bf2d5304c30a152cc0d13e3e2b60329826dae4f084d1353309f08b"
     },
     {
       "id": "mainnet-deployment-history-v1",
@@ -211,10 +212,11 @@
         "mainnet",
         "historical",
         "versionbits",
+        "block-version",
         "script-flags",
         "checkpoint-policy"
       ],
-      "blake2b256": "38e2269cce7c4793c8556fd4e0bf95bf27e8e3013ebed5383fe50495676fc709"
+      "blake2b256": "c9cfc054dcd51c3fcd54851d94326f01cb520628b073a244253fdebb31af90c3"
     },
     {
       "id": "sighash-v1",

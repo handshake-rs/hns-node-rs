@@ -391,6 +391,89 @@ impl HistoricalScriptPolicy {
     pub const fn requires_script_verification(self, height: Height) -> bool {
         !self.may_assume_scripts(height)
     }
+
+    /// Describe every HSD validation stage affected by the checkpoint-backed
+    /// historical fast path. This is evidence and replay policy, not a blanket
+    /// authorization to bypass checks: callers without verified checkpoint
+    /// ancestry always receive the full fail-closed plan.
+    pub const fn validation_plan(self, height: Height) -> HistoricalValidationPlan {
+        if self.may_assume_scripts(height) {
+            HistoricalValidationPlan::hsd_checkpointed()
+        } else {
+            HistoricalValidationPlan::full()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalValidationPlan {
+    pub historical: bool,
+    pub body_sanity: bool,
+    pub body_commitments: bool,
+    pub name_limits: bool,
+    pub header_context: bool,
+    pub deployment_state: bool,
+    pub absolute_finality: bool,
+    pub claim_airdrop_sanity: bool,
+    pub claim_airdrop_cryptography: bool,
+    pub sequence_locks: bool,
+    pub input_values: bool,
+    pub covenant_links: bool,
+    pub contextual_covenants: bool,
+    pub bid_redeem_context: bool,
+    pub scripts: bool,
+    pub coinbase_reward: bool,
+}
+
+impl HistoricalValidationPlan {
+    pub const fn full() -> Self {
+        Self {
+            historical: false,
+            body_sanity: true,
+            body_commitments: true,
+            name_limits: true,
+            header_context: true,
+            deployment_state: true,
+            absolute_finality: true,
+            claim_airdrop_sanity: true,
+            claim_airdrop_cryptography: true,
+            sequence_locks: true,
+            input_values: true,
+            covenant_links: true,
+            contextual_covenants: true,
+            bid_redeem_context: true,
+            scripts: true,
+            coinbase_reward: true,
+        }
+    }
+
+    pub const fn hsd_checkpointed() -> Self {
+        Self {
+            historical: true,
+            body_sanity: false,
+            body_commitments: true,
+            name_limits: true,
+            header_context: true,
+            deployment_state: true,
+            absolute_finality: true,
+            claim_airdrop_sanity: true,
+            claim_airdrop_cryptography: false,
+            sequence_locks: false,
+            input_values: false,
+            covenant_links: false,
+            contextual_covenants: true,
+            bid_redeem_context: false,
+            scripts: false,
+            coinbase_reward: false,
+        }
+    }
+}
+
+impl Default for HistoricalValidationPlan {
+    fn default() -> Self {
+        Self::full()
+    }
 }
 
 pub fn threshold_state(
@@ -520,6 +603,28 @@ pub fn compute_block_version(
     Ok(version)
 }
 
+/// Compute HSD's next-block version from an already derived deployment-state
+/// cache. This is the path used by a node or template engine at a concrete tip;
+/// `compute_block_version` remains the independent full-history oracle.
+pub fn compute_block_version_from_state(
+    deployments: &[Deployment],
+    state: DeploymentState,
+) -> Result<u32, DeploymentError> {
+    let mut version = 0u32;
+    for deployment in deployments {
+        if deployment.bit >= 32 {
+            return Err(DeploymentError::InvalidBit(deployment.bit));
+        }
+        if matches!(
+            state.state(deployment.id),
+            ThresholdState::Started | ThresholdState::LockedIn
+        ) {
+            version |= 1u32 << deployment.bit;
+        }
+    }
+    Ok(version)
+}
+
 pub fn deployment_state(
     network: Network,
     history: &[DeploymentHistoryEntry],
@@ -614,12 +719,14 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Fixture {
+        schema: u32,
         script_flags: FixtureScriptFlags,
         networks: Vec<FixtureNetwork>,
         threshold_vectors: Vec<FixtureThresholdVector>,
         block_version_case: FixtureBlockVersion,
         deployment_effect_cases: Vec<FixtureDeploymentEffect>,
         historical_cases: Vec<FixtureHistoricalCase>,
+        historical_validation_cases: Vec<FixtureHistoricalValidationCase>,
     }
 
     #[derive(Deserialize)]
@@ -710,6 +817,15 @@ mod tests {
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
+    struct FixtureHistoricalValidationCase {
+        checkpoints: bool,
+        height: Height,
+        #[serde(flatten)]
+        plan: HistoricalValidationPlan,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct FixtureDeploymentEffect {
         active: Vec<String>,
         script_flags: u32,
@@ -721,6 +837,7 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct HistoricalDeploymentFixture {
+        schema: u32,
         network: String,
         activation_threshold: u32,
         miner_window: u32,
@@ -753,6 +870,7 @@ mod tests {
         signalling: FixtureDeploymentCounts,
         states: FixtureDeploymentStates,
         effects: FixtureHistoricalEffects,
+        next_block_version: u32,
         historical_height: bool,
         historical_block: bool,
     }
@@ -842,6 +960,7 @@ mod tests {
     #[test]
     fn network_constants_match_hsd_fixture() {
         let fixture = fixture();
+        assert_eq!(fixture.schema, 2);
         assert_eq!(
             ScriptFlags::MANDATORY.bits(),
             fixture.script_flags.mandatory
@@ -1035,8 +1154,37 @@ mod tests {
     }
 
     #[test]
+    fn historical_validation_plan_matches_hsd_routes_and_fails_closed() {
+        let fixture = fixture();
+        let last = *Network::Mainnet
+            .checkpoints()
+            .last()
+            .expect("mainnet checkpoint");
+        let closed = HistoricalScriptPolicy::new(Network::Mainnet, true);
+        assert_eq!(closed.validation_plan(1), HistoricalValidationPlan::full());
+
+        for case in fixture.historical_validation_cases {
+            let policy = HistoricalScriptPolicy::new(Network::Mainnet, case.checkpoints)
+                .with_verified_checkpoint(last.height, &last.hash)
+                .expect("checkpoint evidence");
+            assert_eq!(
+                policy.validation_plan(case.height),
+                case.plan,
+                "historical validation plan at height {} with checkpoints {}",
+                case.height,
+                case.checkpoints
+            );
+            assert_eq!(
+                policy.requires_script_verification(case.height),
+                case.plan.scripts
+            );
+        }
+    }
+
+    #[test]
     fn historical_mainnet_periods_match_hsd_deployments_and_script_policy() {
         let fixture = historical_fixture();
+        assert_eq!(fixture.schema, 2);
         assert_eq!(fixture.network, "main");
         assert_eq!(
             fixture.activation_threshold,
@@ -1044,6 +1192,7 @@ mod tests {
         );
         assert_eq!(fixture.miner_window, Network::Mainnet.params().miner_window);
         assert_eq!(fixture.last_checkpoint, Network::Mainnet.last_checkpoint());
+        assert_eq!(fixture.through_height, 338_688);
         assert_eq!(fixture.through_height % fixture.miner_window, 0);
         assert_eq!(
             fixture.periods.len(),
@@ -1149,6 +1298,13 @@ mod tests {
             assert_eq!(state.lock_flags, period.effects.lock_flags);
             assert_eq!(state.name_flags.bits(), period.effects.name_flags);
             assert_eq!(state.has_airstop, period.effects.has_airstop);
+            assert_eq!(
+                compute_block_version_from_state(Network::Mainnet.deployments(), state)
+                    .expect("cached block version"),
+                period.next_block_version,
+                "next block version at height {}",
+                period.next_height
+            );
             assert_eq!(
                 is_hsd_historical_height(Network::Mainnet, true, period.next_height),
                 period.historical_height

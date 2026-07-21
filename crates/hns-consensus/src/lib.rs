@@ -30,10 +30,11 @@ pub use covenant::{
     blind_bid, verify_transaction_covenant_links, CovenantLinkError, CovenantLinkSummary,
 };
 pub use deployment::{
-    advance_threshold_state, compute_block_version, deployment_state, is_hsd_historical_block,
-    is_hsd_historical_height, threshold_state, verify_checkpoint, Checkpoint, Deployment,
-    DeploymentError, DeploymentHistoryEntry, DeploymentId, DeploymentPeriod, DeploymentState,
-    HistoricalScriptPolicy, ThresholdState,
+    advance_threshold_state, compute_block_version, compute_block_version_from_state,
+    deployment_state, is_hsd_historical_block, is_hsd_historical_height, threshold_state,
+    verify_checkpoint, Checkpoint, Deployment, DeploymentError, DeploymentHistoryEntry,
+    DeploymentId, DeploymentPeriod, DeploymentState, HistoricalScriptPolicy,
+    HistoricalValidationPlan, ThresholdState,
 };
 pub use locks::{
     calculate_sequence_locks, verify_locktime_predicate, verify_sequence_locks,

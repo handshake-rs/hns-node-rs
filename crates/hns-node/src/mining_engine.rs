@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use hns_chain::BlockIndexRecord;
+use hns_consensus::compute_block_version_from_state;
 use hns_mempool::{Mempool, MempoolInfo, MempoolLimits};
 use hns_mining::{
     MiningTemplate, PreparedMiningJob, SolvedBlockPublicationIntent, SolvedMiningCandidate,
@@ -254,6 +255,26 @@ impl NodeService {
             .durable_mining_state()?
             .snapshot
             .ok_or_else(|| anyhow::anyhow!("no durable mining snapshot is available"))?;
+        let next_height = snapshot
+            .tip
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("mining template height exhausted"))?;
+        let metadata = self.state.store.snapshot()?;
+        let deployments =
+            self.state
+                .deployment_state_for_block(&metadata, next_height, snapshot.tip.hash)?;
+        let expected_version =
+            compute_block_version_from_state(self.config.network.deployments(), deployments)?;
+        drop(metadata);
+        for request in &requests {
+            if request.version != expected_version {
+                anyhow::bail!(
+                    "mining template version {} disagrees with HSD deployment version {expected_version} at height {next_height}",
+                    request.version
+                );
+            }
+        }
         let mempool = self.state.mempool.snapshot();
         let variants = requests.into_iter().map(|request| TemplateVariant {
             variant: request.variant,

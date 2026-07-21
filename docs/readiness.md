@@ -21,7 +21,8 @@ Implemented:
 - Broad bounded version-zero witness/script interpreter.
 - Exact results for all 876 cases in HSD's pinned upstream script corpus.
 - Exact HSD deployment/checkpoint constants, BIP9 transitions, block-version
-  signaling, deployment effects, and checkpoint/historical-script policy.
+  signaling, deployment effects, cached next-block versions, and a
+  checkpoint-backed historical validation-stage plan.
 - Active-chain deployment caches and parent-derived contextual name,
   DNSSEC-claim, and full airdrop validation across connect/reorg/restart.
 - Strict header checkpoint enforcement in native peer and candidate imports.
@@ -183,8 +184,9 @@ Implemented:
 
 - HSD generators for sighash, locks, a 56-case focused script execution/error
   corpus, all 876 upstream script cases, deployments/checkpoints/historical
-  boundaries, all 167 canonical mainnet deployment periods through height
-  336,672, airdrop proofs, Claim/TXT/DNSSEC ownership-proof codecs and all four
+  boundaries and validation routes, all 168 canonical mainnet deployment
+  periods through height 338,688 with next-block versions, airdrop proofs,
+  Claim/TXT/DNSSEC ownership-proof codecs and all four
   upstream signed proof chains under SHA-256/GOST94 historical anchors,
   covenant linkage, all-family contextual name transitions with 15 accepted
   and 13 rejected exact state cases, name-state codec,

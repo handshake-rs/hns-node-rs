@@ -104,6 +104,12 @@ weight, sigops, OPEN, UPDATE, RENEW, transaction-count, and exclusive-name
 bounds. The coinbase and subsidy boundary are checked against fixtures generated
 by the pinned HSD revision.
 
+The base header version is not an unconstrained variant field. Before template
+assembly, the node advances the parent-derived deployment cache for the next
+height, computes HSD's exact `computeBlockVersion` result, and rejects any
+caller-supplied mismatch. The canonical 168-period mainnet history pins this
+cached calculation against HSD through height 338,688.
+
 `TemplateCoordinator` atomically replaces a bounded set of variants for one
 chain/mempool generation. If any variant fails, the previous set remains intact.
 Activation rechecks the durable chain generation, parent, and next tree root.

@@ -263,10 +263,13 @@ checks compact synthetic histories across DEFINED, STARTED, LOCKED_IN, ACTIVE,
 FAILED, timeout, partial-period, and per-deployment window/threshold behavior.
 
 The committed canonical-mainnet fixture adds every completed 2,016-block
-deployment period through height 336,672. Its offline check replays each real
+deployment period through height 338,688. Its offline check replays each real
 median time and signal count through the pinned HSD `Chain` methods; the Rust
 test independently advances the same cached states and compares deployment
-effects plus the checkpoint-backed historical-script decision:
+effects, next-block versions, and the checkpoint-backed historical decision.
+The compact deployment fixture also executes HSD's full-body versus
+commitments-only and verified-input versus historical-input routes, pinning the
+exact validation-stage plan on both sides of checkpoint height 258,026:
 
 ```bash
 NODE_BACKEND=js npm run hsrd-mainnet-deployment-history --prefix hsd-oracle

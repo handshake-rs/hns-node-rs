@@ -80,16 +80,23 @@ Implemented:
 - Exact HSD BIP9 threshold transitions, block-version signaling, deployment
   effects, mandatory/standard script flags, all four networks' deployment
   parameters, and all 15 mainnet checkpoint hashes.
-- Compact canonical-mainnet evidence for all 167 completed deployment periods
-  through height 336,672, replaying real signal counts, median times, threshold
-  states, deployment effects, and the checkpoint-backed historical-script
-  boundary through both pinned HSD and Rust.
+- Compact canonical-mainnet evidence for all 168 completed deployment periods
+  through height 338,688, replaying real signal counts, median times, threshold
+  states, deployment effects, next-block versions, and the checkpoint-backed
+  historical boundary through both pinned HSD and Rust.
 - Parent-derived active-chain deployment state with HSD period-boundary
   caching, atomic reorganization/restart persistence, and fail-closed cache
-  validation before contextual name and claim/airdrop checks.
+  validation before contextual name and claim/airdrop checks. Native template
+  assembly derives HSD's next-block version from that exact cache and rejects a
+  caller-selected mismatch.
 - Strict header checkpoint enforcement and a fail-closed historical-script
   policy that requires verified checkpoint ancestry before allowing HSD's
   optional historical validation shortcut.
+- An HSD-executed historical validation-plan matrix pins which body, header,
+  deployment, finality, claim/airdrop, input, covenant, reward, and script
+  stages are checked or assumed at the checkpoint boundary. The native runtime
+  keeps the broader non-script assumptions disabled until historical replay is
+  independently qualified.
 - Exact bounded HSD Claim envelope encoding, blob-only Claim hashes, and the
   checksummed ownership TXT payload codec for all four network prefixes.
 - Compression-free DNSKEY/DS/TXT/RRSIG ownership-proof parsing, exact HSD

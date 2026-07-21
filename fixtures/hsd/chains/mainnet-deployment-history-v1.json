@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "oracle": {
     "repository": "handshake-org/hsd",
     "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
@@ -9,8 +9,8 @@
   "activationThreshold": 1916,
   "minerWindow": 2016,
   "lastCheckpoint": 258026,
-  "throughHeight": 336672,
-  "anchorHash": "000000000000000edc2d372273e3169b3e2c58bd23e76932382966364e62c474",
+  "throughHeight": 338688,
+  "anchorHash": "00000000000000100d935aa46187db6e4ade0619fd0bb06bb0dfe293e97e42d7",
   "deployments": [
     {
       "name": "hardening",
@@ -85,8 +85,8 @@
       "historicalBlock": false
     },
     {
-      "height": 336672,
-      "hash": "000000000000000edc2d372273e3169b3e2c58bd23e76932382966364e62c474",
+      "height": 338688,
+      "hash": "00000000000000100d935aa46187db6e4ade0619fd0bb06bb0dfe293e97e42d7",
       "historicalHeight": false,
       "historicalBlock": false
     }
@@ -117,6 +117,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -145,6 +146,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -173,6 +175,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -201,6 +204,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -229,6 +233,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -257,6 +262,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -285,6 +291,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -313,6 +320,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -341,6 +349,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -369,6 +378,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -397,6 +407,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -425,6 +436,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -453,6 +465,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -481,6 +494,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -509,6 +523,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -537,6 +552,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -565,6 +581,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -593,6 +610,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -621,6 +639,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -649,6 +668,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -677,6 +697,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -705,6 +726,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -733,6 +755,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -761,6 +784,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -789,6 +813,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -817,6 +842,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -845,6 +871,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -873,6 +900,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -901,6 +929,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -929,6 +958,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -957,6 +987,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -985,6 +1016,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1013,6 +1045,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1041,6 +1074,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1069,6 +1103,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1097,6 +1132,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1125,6 +1161,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1153,6 +1190,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1181,6 +1219,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1209,6 +1248,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1237,6 +1277,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1265,6 +1306,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1293,6 +1335,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1321,6 +1364,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1349,6 +1393,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1377,6 +1422,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1405,6 +1451,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1433,6 +1480,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1461,6 +1509,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1489,6 +1538,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1517,6 +1567,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1545,6 +1596,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1573,6 +1625,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1601,6 +1654,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1629,6 +1683,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1657,6 +1712,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1685,6 +1741,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1713,6 +1770,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1741,6 +1799,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1769,6 +1828,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1797,6 +1857,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1825,6 +1886,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1853,6 +1915,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1881,6 +1944,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1909,6 +1973,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1937,6 +2002,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1965,6 +2031,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -1993,6 +2060,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2021,6 +2089,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2049,6 +2118,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2077,6 +2147,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2105,6 +2176,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2133,6 +2205,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2161,6 +2234,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2189,6 +2263,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2217,6 +2292,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2245,6 +2321,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2273,6 +2350,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2301,6 +2379,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2329,6 +2408,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2357,6 +2437,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2385,6 +2466,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2413,6 +2495,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2441,6 +2524,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2469,6 +2553,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2497,6 +2582,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2525,6 +2611,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2553,6 +2640,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2581,6 +2669,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2609,6 +2698,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2637,6 +2727,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2665,6 +2756,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 3,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2693,6 +2785,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 3,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2721,6 +2814,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 3,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2749,6 +2843,7 @@
         "nameFlags": 0,
         "hasAirstop": false
       },
+      "nextBlockVersion": 3,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2777,6 +2872,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2805,6 +2901,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2833,6 +2930,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2861,6 +2959,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2889,6 +2988,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2917,6 +3017,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2945,6 +3046,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -2973,6 +3075,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3001,6 +3104,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3029,6 +3133,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 1,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3057,6 +3162,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3085,6 +3191,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3113,6 +3220,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3141,6 +3249,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3169,6 +3278,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3197,6 +3307,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3225,6 +3336,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3253,6 +3365,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3281,6 +3394,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3309,6 +3423,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3337,6 +3452,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3365,6 +3481,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3393,6 +3510,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3421,6 +3539,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3449,6 +3568,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3477,6 +3597,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3505,6 +3626,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3533,6 +3655,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3561,6 +3684,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3589,6 +3713,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3617,6 +3742,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3645,6 +3771,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": true,
       "historicalBlock": true
     },
@@ -3673,6 +3800,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3701,6 +3829,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3729,6 +3858,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3757,6 +3887,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3785,6 +3916,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3813,6 +3945,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3841,6 +3974,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3869,6 +4003,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3897,6 +4032,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3925,6 +4061,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3953,6 +4090,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -3981,6 +4119,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4009,6 +4148,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4037,6 +4177,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 4,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4065,6 +4206,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 4,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4093,6 +4235,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 4,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4121,6 +4264,7 @@
         "nameFlags": 2,
         "hasAirstop": false
       },
+      "nextBlockVersion": 4,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4149,6 +4293,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4177,6 +4322,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4205,6 +4351,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4233,6 +4380,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4261,6 +4409,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4289,6 +4438,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4317,6 +4467,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4345,6 +4496,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4373,6 +4525,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4401,6 +4554,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4429,6 +4583,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4457,6 +4612,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4485,6 +4641,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4513,6 +4670,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4541,6 +4699,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4569,6 +4728,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4597,6 +4757,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4625,6 +4786,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4653,6 +4815,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4681,6 +4844,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4709,6 +4873,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4737,6 +4902,7 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     },
@@ -4765,6 +4931,36 @@
         "nameFlags": 2,
         "hasAirstop": true
       },
+      "nextBlockVersion": 0,
+      "historicalHeight": false,
+      "historicalBlock": false
+    },
+    {
+      "nextHeight": 338688,
+      "periodStartHeight": 336672,
+      "periodEndHeight": 338687,
+      "periodStartHash": "000000000000000edc2d372273e3169b3e2c58bd23e76932382966364e62c474",
+      "periodEndHash": "000000000000001049b54e7299a8205ce402b6224cd2d747d8e8da1cb1246c43",
+      "medianTimePast": 1784347672,
+      "signalling": {
+        "hardening": 0,
+        "icannlockup": 0,
+        "airstop": 0,
+        "testdummy": 0
+      },
+      "states": {
+        "hardening": "FAILED",
+        "icannlockup": "ACTIVE",
+        "airstop": "ACTIVE",
+        "testdummy": "FAILED"
+      },
+      "effects": {
+        "scriptFlags": 50,
+        "lockFlags": 0,
+        "nameFlags": 2,
+        "hasAirstop": true
+      },
+      "nextBlockVersion": 0,
       "historicalHeight": false,
       "historicalBlock": false
     }

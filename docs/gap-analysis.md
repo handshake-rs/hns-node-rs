@@ -29,10 +29,11 @@
   execution cases, plus 56 committed focused execution/error vectors.
 - Exact HSD BIP9 transitions, block-version selection, deployment effects,
   network checkpoint tables, strict header checkpoint enforcement, and a
-  checkpoint-ancestry-gated historical script policy.
-- Canonical-mainnet replay of all 167 completed deployment periods through
-  height 336,672, including real median times, signal counts, threshold states,
-  deployment effects, and the historical-script boundary.
+  checkpoint-ancestry-gated historical validation policy with an HSD-executed
+  stage-by-stage full/historical route matrix.
+- Canonical-mainnet replay of all 168 completed deployment periods through
+  height 338,688, including real median times, signal counts, threshold states,
+  deployment effects, next-block versions, and the historical boundary.
 - Active blocks derive name and issuance flags from their parent, cache all
   four threshold states atomically, retain branch caches across reorganization,
   and fail startup on missing or inconsistent active-chain cache entries.

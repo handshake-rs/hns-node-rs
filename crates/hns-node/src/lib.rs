@@ -5882,6 +5882,51 @@ mod tests {
     }
 
     #[test]
+    fn mining_templates_require_the_cached_hsd_deployment_version() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            mining_engine: MiningEngineConfig {
+                enabled: true,
+                ..MiningEngineConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        node.connect_block(NodeBlockImport::fixture(
+            block_with_commitments(vec![coinbase_transaction()]),
+            0,
+            1,
+        ))
+        .expect("fixture genesis");
+
+        let mut request = MiningTemplateRequest {
+            variant: 0,
+            payout_address: Address::new(0, vec![0x72; 20]).expect("payout address"),
+            coinbase_flags: b"hsrd-deployment-version".to_vec(),
+            version: 1,
+            bits: Network::Regtest.params().pow.bits,
+            minimum_time: 1,
+            reserved_root: [0; 32],
+            mask_hash: [0x73; 32],
+            policy: hns_mining::TemplatePolicy::default(),
+        };
+        let error = node
+            .mining_engine_build_template(request.clone())
+            .expect_err("caller-selected deployment version");
+        assert!(
+            error
+                .to_string()
+                .contains("disagrees with HSD deployment version 0"),
+            "{error}"
+        );
+
+        request.version = 0;
+        let template = node
+            .mining_engine_build_template(request)
+            .expect("HSD deployment version template");
+        assert_eq!(template.header().version, 0);
+    }
+
+    #[test]
     fn failed_multi_step_reorg_leaves_every_durable_value_unchanged() {
         let mut node = NodeService::new(NodeConfig {
             network: Network::Regtest,
