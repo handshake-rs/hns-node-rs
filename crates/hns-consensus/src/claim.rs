@@ -27,9 +27,9 @@ const ALG_ED448: u8 = 16;
 /// DNSSEC cryptography for HSD ownership proofs. OpenSSL is used only through
 /// its verification APIs; DNS wire parsing, canonicalization, trust-chain
 /// selection, algorithm policy, and root anchoring remain explicit Rust code
-/// in `hns-primitives`. SHA-1, SHA-256, SHA-384, and SHA-512 DS digests are
-/// supported; GOST R 34.11-94 DS records fail closed because OpenSSL does not
-/// expose that legacy digest without an external provider.
+/// in `hns-primitives`. SHA-1, SHA-256, SHA-384, and SHA-512 use OpenSSL;
+/// DNSSEC digest type 3 uses the exact GOST R 34.11-94 CryptoPro construction
+/// selected by HSD's pinned `bns` dependency.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenSslDnssecVerifier;
 
@@ -215,6 +215,9 @@ pub enum ClaimConsensusError {
 
 impl DnssecVerifier for OpenSslDnssecVerifier {
     fn digest(&self, digest_type: u8, data: &[u8]) -> Option<Vec<u8>> {
+        if digest_type == 3 {
+            return Some(crate::gost94::digest(data).to_vec());
+        }
         let digest = match digest_type {
             1 => MessageDigest::sha1(),
             2 => MessageDigest::sha256(),
@@ -362,7 +365,8 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Fixture {
-        proof: ProofFixture,
+        proofs: Vec<ProofFixture>,
+        gost94_digests: Vec<GostDigestFixture>,
     }
 
     #[derive(Deserialize)]
@@ -370,8 +374,7 @@ mod tests {
     struct ProofFixture {
         raw: String,
         signatures_valid: bool,
-        signatures_valid_with_historical_test_policy: bool,
-        proof_root_anchor: AnchorFixture,
+        root_anchors: Vec<AnchorFixture>,
         name: String,
         reserved_target: String,
         reserved_value: u64,
@@ -380,9 +383,18 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct AnchorFixture {
+        name: String,
         key_tag: u16,
         algorithm: u8,
         digest_type: u8,
+        digest: String,
+        signatures_valid_with_historical_test_policy: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct GostDigestFixture {
+        id: String,
+        data: String,
         digest: String,
     }
 
@@ -431,44 +443,70 @@ mod tests {
     }
 
     #[test]
-    fn openssl_dnssec_matches_hsd_historical_proof_policy() {
-        let expected = fixture().proof;
-        let mut proof = OwnershipProof::decode(&decode_hex(&expected.raw)).expect("proof");
-        let reserved = crate::reserved_name(expected.name.as_bytes()).expect("reserved name");
-        assert_eq!(reserved.name, expected.name.as_bytes());
-        assert_eq!(reserved.target, expected.reserved_target.as_bytes());
-        assert_eq!(reserved.value, expected.reserved_value);
-        assert_eq!(
-            proof.verify_signatures(&OpenSslDnssecVerifier),
-            expected.signatures_valid
-        );
+    fn native_dnssec_matches_complete_hsd_historical_proof_corpus() {
+        for expected in fixture().proofs {
+            let mut proof = OwnershipProof::decode(&decode_hex(&expected.raw)).expect("proof");
+            let reserved = crate::reserved_name(expected.name.as_bytes()).expect("reserved name");
+            assert_eq!(reserved.name, expected.name.as_bytes());
+            assert_eq!(reserved.target, expected.reserved_target.as_bytes());
+            assert_eq!(reserved.value, expected.reserved_value);
+            assert_eq!(
+                proof.verify_signatures(&OpenSslDnssecVerifier),
+                expected.signatures_valid,
+                "{} current anchor policy",
+                expected.name
+            );
 
-        proof
-            .zones
-            .last_mut()
-            .expect("target zone")
-            .claim
-            .retain(|record| !is_hsd_test_claim(record));
-        let anchor = DnssecAnchor {
-            key_tag: expected.proof_root_anchor.key_tag,
-            algorithm: expected.proof_root_anchor.algorithm,
-            digest_type: expected.proof_root_anchor.digest_type,
-            digest: decode_hex(&expected.proof_root_anchor.digest),
-        };
-        assert_eq!(
-            proof.verify_signatures_with_anchors(
-                &OpenSslDnssecVerifier,
-                std::slice::from_ref(&anchor),
-            ),
-            expected.signatures_valid_with_historical_test_policy
-        );
+            proof
+                .zones
+                .last_mut()
+                .expect("target zone")
+                .claim
+                .retain(|record| !is_hsd_test_claim(record));
+            for expected_anchor in expected.root_anchors {
+                let anchor = DnssecAnchor {
+                    key_tag: expected_anchor.key_tag,
+                    algorithm: expected_anchor.algorithm,
+                    digest_type: expected_anchor.digest_type,
+                    digest: decode_hex(&expected_anchor.digest),
+                };
+                assert_eq!(
+                    proof.verify_signatures_with_anchors(
+                        &OpenSslDnssecVerifier,
+                        std::slice::from_ref(&anchor),
+                    ),
+                    expected_anchor.signatures_valid_with_historical_test_policy,
+                    "{} {} historical anchor policy",
+                    expected.name,
+                    expected_anchor.name
+                );
 
-        let DnsRecordData::Rrsig(signature) =
-            &mut proof.zones[0].keys.last_mut().expect("root signature").data
-        else {
-            panic!("root signature record");
-        };
-        signature.signature[0] ^= 1;
-        assert!(!proof.verify_signatures_with_anchors(&OpenSslDnssecVerifier, &[anchor]));
+                let mut altered = proof.clone();
+                let DnsRecordData::Rrsig(signature) = &mut altered.zones[0]
+                    .keys
+                    .last_mut()
+                    .expect("root signature")
+                    .data
+                else {
+                    panic!("root signature record");
+                };
+                signature.signature[0] ^= 1;
+                assert!(!altered.verify_signatures_with_anchors(&OpenSslDnssecVerifier, &[anchor]));
+            }
+        }
+    }
+
+    #[test]
+    fn gost94_ds_digests_match_hsds_pinned_bcrypto() {
+        for expected in fixture().gost94_digests {
+            assert_eq!(
+                OpenSslDnssecVerifier.digest(3, &decode_hex(&expected.data)),
+                Some(decode_hex(&expected.digest)),
+                "{}",
+                expected.id
+            );
+        }
+        assert_eq!(OpenSslDnssecVerifier.digest(0, b"unsupported"), None);
+        assert_eq!(OpenSslDnssecVerifier.digest(6, b"unsupported"), None);
     }
 }

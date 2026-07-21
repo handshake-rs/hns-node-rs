@@ -13,6 +13,7 @@ mod airdrop;
 mod claim;
 mod covenant;
 mod deployment;
+mod gost94;
 mod locks;
 mod name;
 mod script;

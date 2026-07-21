@@ -79,9 +79,11 @@
         "oracle",
         "codec",
         "ownership",
-        "dnssec"
+        "dnssec",
+        "gost94",
+        "upstream-corpus"
       ],
-      "blake2b256": "48f087d3ed8dee93dd44a6e5fe3200fb33ac1ebef44770b6e8bd36453a0e2c96"
+      "blake2b256": "a36e26ba244c45f655cf1badea1515a1339ac28a4fb2ec0978a70202baa11822"
     },
     {
       "id": "covenant-codec-v1",

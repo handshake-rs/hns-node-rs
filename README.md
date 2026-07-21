@@ -87,8 +87,10 @@ Implemented:
   checksummed ownership TXT payload codec for all four network prefixes.
 - Compression-free DNSKEY/DS/TXT/RRSIG ownership-proof parsing, exact HSD
   sanity/window/weak-key behavior, the pinned ICANN 2017 root anchor, canonical
-  DNSSEC signature-chain verification for HSD's supported algorithms, and
-  reserved-target/output/commit/deflation accounting checks.
+  DNSSEC signature-chain verification for HSD's supported algorithms, all five
+  DS digests including legacy GOST94/CryptoPro, and reserved-target/output/
+  commit/deflation accounting checks. The complete four-proof HSD upstream
+  ownership corpus is replayed under SHA-256 and GOST94 historical anchors.
 - Native verification for all five HSD airdrop key types: direct address
   allocations, RSA/SHA-256, compact P-256 ECDSA, Ed25519, and the exact pinned
   Goosig 0.11.0 verifier. HSD-generated vectors cover valid and mutated
@@ -131,8 +133,8 @@ Implemented:
 
 Still release-blocking:
 
-- legacy GOST94 DS compatibility and broader current/historical
-  production-valid claim-proof corpora;
+- current/live production-valid claim-proof evidence and complete historical
+  claim replay;
 - full contextual covenant parity across mainnet history;
 - a production persistent incremental Urkel node store and exact HSD proof-wire
   codec;

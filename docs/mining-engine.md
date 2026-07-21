@@ -160,8 +160,8 @@ remain release-blocking:
 
 - historical replay qualification;
 - independent script fuzz/invalid evidence beyond the pinned HSD corpus;
-- broader current/historical claim-proof evidence for the active
-  deployment-composed proof/accounting service;
+- current/live claim-proof evidence and complete historical replay for the
+  active deployment-composed proof/accounting service;
 - complete contextual name-state parity;
 - production persistent incremental Urkel storage;
 - active-state IBD and live HSD state comparison;

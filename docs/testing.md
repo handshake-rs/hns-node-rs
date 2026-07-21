@@ -68,10 +68,12 @@ Current evidence includes:
   proof, and an upstream production-root GooSig proof exercised through native
   consensus and active-node state;
 - HSD Claim envelope encoding and blob-only hashes, strict length/trailing
-  failures, checksummed ownership TXT payloads for every network prefix, a
-  complete upstream signed DNSKEY/DS/TXT/RRSIG proof, its exact codec/sanity/
-  window/weak outputs, and explicit current-anchor versus historical-test
-  signature results;
+  failures, checksummed ownership TXT payloads for every network prefix, all
+  four upstream signed DNSKEY/DS/TXT/RRSIG proofs, their exact codec/sanity/
+  window/weak outputs, SHA-256 and legacy GOST94 historical-anchor results,
+  and direct GOST94 boundary/multiblock vectors;
+- build-checked libFuzzer targets for bounded Claim/TXT/ownership-proof and
+  airdrop key/proof decoding plus their derived hash, sanity, and Merkle paths;
 - signature-type encoding validity;
 - relative sequence-lock cases;
 - 56 HSD-executed witness-program cases spanning control flow, stack and
@@ -246,12 +248,12 @@ NODE_BACKEND=js npm run hsrd-claim-fixtures --prefix hsd-oracle
 
 It pins the bounded Claim envelope, blob-only identifier hash, all four network
 TXT prefixes, binary address/fee/commit fields, checksum behavior, strict
-decode failures, and a byte-exact upstream ownership proof. Rust tests cover
-compression-free proof parsing, HSD sanity/window/weak classification,
-reserved-target lookup, the current ICANN anchor rejection, and successful
-end-to-end RSA chain verification under HSD's recorded historical test
-anchor/claim-filter policy. State tests separately cover authenticated claim
-connect and disconnect semantics.
+decode failures, and HSD's complete four-file upstream ownership-proof corpus.
+Rust tests cover compression-free proof parsing, HSD sanity/window/weak
+classification, reserved-target lookup, current ICANN-anchor rejection, all
+five DS digest types, and successful end-to-end chain verification under both
+SHA-256 and legacy GOST94/CryptoPro historical anchors. State tests separately
+cover authenticated claim connect and disconnect semantics.
 
 For every mainnet block and mutation-corpus case, compare:
 

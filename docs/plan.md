@@ -90,13 +90,14 @@ reserved low-latency paths.
 
 ## Remaining implementation order
 
-1. **Claim and airdrop validation** — broaden current/historical valid claim
-   corpora and replay the proof-capable active-node service. Exact
-   Claim/DNSSEC/TXT codecs, ICANN-rooted signature verification,
-   parent-derived deployment composition, claim deflation and name-state
-   rules, all five airdrop key types (including pinned GooSig), faucet and
-   production-root proof verification, conjured accounting, and durable
-   duplicate prevention/undo are implemented.
+1. **Claim and airdrop validation** — capture current/live valid claim evidence
+   and replay the proof-capable active-node service across mainnet history.
+   Exact Claim/DNSSEC/TXT codecs, all HSD DS digests including GOST94, the
+   complete upstream historical ownership-proof corpus, ICANN-rooted signature
+   verification, parent-derived deployment composition, claim deflation and
+   name-state rules, all five airdrop key types (including pinned GooSig),
+   faucet and production-root proof verification, conjured accounting, and
+   durable duplicate prevention/undo are implemented.
 2. **Contextual covenant closure** — replay all mainnet transition families and
    historical exceptions against HSD.
 3. **Persistent Urkel** — incremental nodes, exact proof wire format,

@@ -30,7 +30,9 @@ Implemented:
 - Contextual name-transition foundation, including authenticated CLAIM
   connect/disconnect at the proof-capable state-service boundary.
 - Exact HSD ownership-proof codecs, sanity/time/weak rules, ICANN-rooted DNSSEC
-  verification, and claim output/commit/deflation accounting.
+  verification, all five HSD DS digests including legacy GOST94/CryptoPro,
+  complete upstream historical-proof corpus replay, and claim output/commit/
+  deflation accounting.
 - Native RSA/SHA-256, compact P-256, Ed25519, direct-address, and pinned
   Goosig 0.11.0 airdrop verification, including an upstream production-root
   GooSig proof through active block connection and durable duplicate rejection.
@@ -40,7 +42,7 @@ Remaining:
 - historical replay qualification;
 - non-script historical exceptions and broader independent invalid/fuzz
   corpora;
-- broader current/historical claim proof corpora, including legacy GOST94 DS;
+- current/live claim-proof evidence and complete historical claim replay;
 - full contextual transition replay and invalid corpus.
 
 ## State and reorganization engine — hardened foundation
@@ -154,7 +156,8 @@ Implemented:
 - HSD generators for sighash, locks, a 56-case focused script execution/error
   corpus, all 876 upstream script cases, deployments/checkpoints/historical
   boundaries, all 167 canonical mainnet deployment periods through height
-  336,672, airdrop proofs, Claim/TXT/DNSSEC ownership-proof codecs,
+  336,672, airdrop proofs, Claim/TXT/DNSSEC ownership-proof codecs and all four
+  upstream signed proof chains under SHA-256/GOST94 historical anchors,
   covenant linkage, name-state codec, reserved/lockup/renewal policy,
   incremental Urkel roots, P2P wire bytes, subsidy, and deterministic coinbase
   behavior;

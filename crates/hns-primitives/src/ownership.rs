@@ -990,7 +990,7 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Fixture {
-        proof: ProofFixture,
+        proofs: Vec<ProofFixture>,
     }
 
     #[derive(Deserialize)]
@@ -1031,29 +1031,30 @@ mod tests {
 
     #[test]
     fn ownership_proof_codec_sanity_window_and_weakness_match_hsd() {
-        let expected = fixture().proof;
-        let raw = decode_hex(&expected.raw);
-        assert_eq!(raw.len(), expected.size);
-        let proof = OwnershipProof::decode(&raw).expect("HSD ownership proof");
-        assert_eq!(proof.encode().expect("proof encode"), raw);
-        assert_eq!(proof.zones.len(), expected.zones);
-        assert_eq!(
-            proof.target().and_then(DnsName::to_ascii_fqdn),
-            Some(expected.target)
-        );
-        assert_eq!(proof.name(), Some(expected.name.as_bytes()));
-        assert_eq!(proof.is_sane(), expected.sane);
-        assert_eq!(proof.is_weak(), expected.weak);
-        assert_eq!(proof.window(), (expected.inception, expected.expiration));
-        assert!(proof.verify_time(u64::from(expected.inception)));
-        assert!(proof.verify_time(u64::from(expected.expiration)));
-        assert!(!proof.verify_time(u64::from(expected.inception) - 1));
-        assert!(!proof.verify_time(u64::from(expected.expiration) + 1));
+        for expected in fixture().proofs {
+            let raw = decode_hex(&expected.raw);
+            assert_eq!(raw.len(), expected.size);
+            let proof = OwnershipProof::decode(&raw).expect("HSD ownership proof");
+            assert_eq!(proof.encode().expect("proof encode"), raw);
+            assert_eq!(proof.zones.len(), expected.zones);
+            assert_eq!(
+                proof.target().and_then(DnsName::to_ascii_fqdn),
+                Some(expected.target)
+            );
+            assert_eq!(proof.name(), Some(expected.name.as_bytes()));
+            assert_eq!(proof.is_sane(), expected.sane);
+            assert_eq!(proof.is_weak(), expected.weak);
+            assert_eq!(proof.window(), (expected.inception, expected.expiration));
+            assert!(proof.verify_time(u64::from(expected.inception)));
+            assert!(proof.verify_time(u64::from(expected.expiration)));
+            assert!(!proof.verify_time(u64::from(expected.inception) - 1));
+            assert!(!proof.verify_time(u64::from(expected.expiration) + 1));
+        }
     }
 
     #[test]
     fn ownership_proof_rejects_compression_trailing_and_wrong_record_type() {
-        let raw = decode_hex(&fixture().proof.raw);
+        let raw = decode_hex(&fixture().proofs[0].raw);
         let mut trailing = raw.clone();
         trailing.push(0);
         assert!(OwnershipProof::decode(&trailing).is_err());

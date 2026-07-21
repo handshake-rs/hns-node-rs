@@ -52,9 +52,11 @@
   ownership TXT payloads for all four networks.
 - Exact compression-free ownership-proof DNS codecs and HSD sanity/time/weak
   behavior, ICANN-rooted DS/RRSIG authentication through RSA, P-256/P-384,
-  Ed25519, and Ed448, reserved allocation/output/commit/deflation accounting,
-  and atomic contextual claimed-name connect/disconnect at the service
-  boundary.
+  Ed25519, and Ed448, SHA-1/SHA-256/GOST94/SHA-384/SHA-512 DS digests,
+  reserved allocation/output/commit/deflation accounting, and atomic
+  contextual claimed-name connect/disconnect at the service boundary. All four
+  upstream HSD ownership proofs replay under both SHA-256 and legacy GOST94
+  historical anchors.
 
 ### Network and synchronization foundation
 
@@ -116,11 +118,11 @@ These are substantial foundations, not a production full node.
   historical exceptions.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
-- Legacy GOST94 DS compatibility, broader current/historical valid claim-proof
-  corpora, remaining historical datasets, and complete replay evidence. Claim
-  deflation accounting, complete airdrop-key verification, active-node
-  deployment composition, and airdrop duplicate/conjured-value accounting are
-  implemented.
+- Current/live valid claim-proof evidence, remaining historical datasets, and
+  complete replay evidence. Claim DNSSEC algorithms and DS digests, the full
+  upstream historical proof corpus, deflation accounting, complete airdrop-key
+  verification, active-node deployment composition, and airdrop duplicate/
+  conjured-value accounting are implemented.
 - Complete contextual covenant/name behavior across mainnet history.
 - Production persistent incremental Urkel storage, exact HSD proof wire format,
   snapshots, compaction, and crash recovery.

@@ -56,8 +56,7 @@ The following remain untrusted and release-blocking:
 - non-script historical exceptions and historical replay qualification;
 - independent script fuzz/invalid evidence beyond the complete pinned HSD
   upstream corpus;
-- legacy GOST94 DS compatibility and broader current/historical claim-proof
-  evidence;
+- current/live claim-proof evidence and complete historical claim replay;
 - complete contextual name consensus over all historical cases;
 - persistent production Urkel nodes and HSD proof-wire parity;
 - active-state IBD, pruning, and complete alternate-chain/reorganization parity;

@@ -51,6 +51,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "claim_parser"
+path = "fuzz_targets/claim_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "airdrop_proof_parser"
+path = "fuzz_targets/airdrop_proof_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "p2p_frame_parser"
 path = "fuzz_targets/p2p_frame_parser.rs"
 test = false
