@@ -637,6 +637,8 @@ mod tests {
         goosig_stop: Height,
         deflation_height: Height,
         claim_prefix: String,
+        prune_after_height: Height,
+        keep_blocks: u32,
         last_checkpoint: Height,
         checkpoints: Vec<FixtureCheckpoint>,
         deployments: Vec<FixtureDeployment>,
@@ -853,6 +855,8 @@ mod tests {
             assert_eq!(params.miner_window, expected.miner_window);
             assert_eq!(params.goosig_stop, expected.goosig_stop);
             assert_eq!(params.deflation_height, expected.deflation_height);
+            assert_eq!(params.block.prune_after_height, expected.prune_after_height);
+            assert_eq!(params.block.keep_blocks, expected.keep_blocks);
             assert_eq!(network.claim_prefix(), expected.claim_prefix);
             assert_eq!(network.last_checkpoint(), expected.last_checkpoint);
             let checkpoints = expected

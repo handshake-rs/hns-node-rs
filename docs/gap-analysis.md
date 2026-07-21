@@ -59,8 +59,11 @@
   and pinned-root reachable union. Malformed pins and failed commits preserve
   every node.
 - Opt-in height-gated startup scheduling and forced serialized maintenance with
-  an atomic checksummed last-run checkpoint, API-v4 status, and unclean RocksDB
+  an atomic checksummed last-run checkpoint, API-v5 status, and unclean RocksDB
   reopen evidence.
+- Exact HSD `pruneAfterHeight`/`keepBlocks` constants and opt-in atomic undo
+  retirement, including startup catch-up, pruning-aware pinned-root compaction,
+  deep-reorg rejection, checksummed checkpoints, and unclean RocksDB reopen.
 - Correct Handshake pre-state header-root timing and durable resulting-root
   binding.
 - Exact HSD airdrop key/proof codecs, hashes, Merkle/output/accounting checks,

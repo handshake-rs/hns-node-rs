@@ -76,8 +76,11 @@ Implemented:
 - Validated mark-and-sweep compaction retaining the current, undo, and pinned
   root union, including idempotence and failed-commit atomicity evidence.
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
-  atomic checksummed last-run checkpoint, API-v4 diagnostics, and unclean
+  atomic checksummed last-run checkpoint, API-v5 diagnostics, and unclean
   RocksDB reopen evidence.
+- Exact HSD undo-retention horizons with opt-in atomic retirement, bounded
+  startup catch-up, pruning-aware pin/compaction validation, and deep-reorg
+  rejection across retired history.
 - Correct pre-state root validation and durable post-state root binding.
 - Previous/resulting roots in undo and atomic root restoration.
 - True store snapshots and one-batch multi-block reorganizations.

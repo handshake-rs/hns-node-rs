@@ -226,6 +226,16 @@ pub struct RpcNameTreeCompactionInfo {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcUndoRetentionInfo {
+    pub prune_history: bool,
+    pub prune_after_height: Height,
+    pub keep_blocks: u32,
+    pub pruned_through: Option<Height>,
+    pub checkpoint_block: Option<BlockHash>,
+    pub pruned_undos: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcNodeStatus {
     pub api_version: u32,
     pub release_stage: String,
@@ -245,6 +255,7 @@ pub struct RpcNodeStatus {
     pub authoritative_mining_tip: bool,
     pub tip_validation: Option<BlockStatus>,
     pub name_tree_compaction: RpcNameTreeCompactionInfo,
+    pub undo_retention: RpcUndoRetentionInfo,
     pub authority: RpcAuthorityInfo,
     pub parity: RpcParityInfo,
 }

@@ -8,7 +8,7 @@ use hns_mempool::MempoolLimits;
 use hns_node::{
     init_logging, validate_node_config, AuthorityMode, MiningEngineConfig,
     NameTreeCompactionConfig, NodeConfig, NodeService, ShadowSyncConfig, ShutdownSignal,
-    DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
+    UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
 };
 use hns_store::DurabilityPolicy;
 
@@ -43,6 +43,10 @@ struct Cli {
     /// Minimum active-chain height advance between startup compactions.
     #[arg(long, default_value_t = DEFAULT_NAME_TREE_COMPACTION_INTERVAL)]
     name_tree_compaction_interval: u32,
+
+    /// Retire active-chain undo records beyond the HSD network reorg horizon.
+    #[arg(long)]
+    prune_undo_history: bool,
 
     /// Enable live, observation-only P2P and shadow synchronization.
     #[arg(long)]
@@ -131,6 +135,9 @@ impl Cli {
                 compact_on_startup: self.compact_name_tree_on_startup,
                 startup_interval: self.name_tree_compaction_interval,
             },
+            undo_retention: UndoRetentionConfig {
+                prune_history: self.prune_undo_history,
+            },
             shadow_sync: ShadowSyncConfig {
                 enabled: self.shadow_sync,
                 listen: self.p2p_listen,
@@ -197,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
             storage_durability = %config.storage_durability,
             compact_name_tree_on_startup = config.name_tree_compaction.compact_on_startup,
             name_tree_compaction_interval = config.name_tree_compaction.startup_interval,
+            prune_undo_history = config.undo_retention.prune_history,
             shadow_sync = config.shadow_sync.enabled,
             mining_engine = config.mining_engine.enabled,
             transaction_relay = config.mining_engine.transaction_relay,

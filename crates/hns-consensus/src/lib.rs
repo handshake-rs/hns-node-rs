@@ -166,6 +166,10 @@ impl Network {
                 deflation_height: 61_043,
                 activation_threshold: 1_916,
                 miner_window: 2_016,
+                block: BlockRetentionParams {
+                    prune_after_height: 1_000,
+                    keep_blocks: 288,
+                },
                 names: NameParams {
                     auction_start: 2_016,
                     rollout_interval: 1_008,
@@ -213,6 +217,10 @@ impl Network {
                 deflation_height: 0,
                 activation_threshold: 1_512,
                 miner_window: 2_016,
+                block: BlockRetentionParams {
+                    prune_after_height: 1_000,
+                    keep_blocks: 10_000,
+                },
                 names: NameParams {
                     auction_start: 36,
                     rollout_interval: 36,
@@ -260,6 +268,10 @@ impl Network {
                 deflation_height: 200,
                 activation_threshold: 108,
                 miner_window: 144,
+                block: BlockRetentionParams {
+                    prune_after_height: 1_000,
+                    keep_blocks: 10_000,
+                },
                 names: NameParams {
                     auction_start: 0,
                     rollout_interval: 2,
@@ -307,6 +319,10 @@ impl Network {
                 deflation_height: 0,
                 activation_threshold: 75,
                 miner_window: 100,
+                block: BlockRetentionParams {
+                    prune_after_height: 1_000,
+                    keep_blocks: 10_000,
+                },
                 names: NameParams {
                     auction_start: 0,
                     rollout_interval: 1,
@@ -361,6 +377,12 @@ pub struct PowParams {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockRetentionParams {
+    pub prune_after_height: Height,
+    pub keep_blocks: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NetworkParams {
     pub network_id: u8,
     pub packet_magic: u32,
@@ -372,6 +394,7 @@ pub struct NetworkParams {
     pub deflation_height: Height,
     pub activation_threshold: u32,
     pub miner_window: u32,
+    pub block: BlockRetentionParams,
     pub names: NameParams,
     pub pow: PowParams,
     pub genesis_hash: BlockHash,

@@ -193,9 +193,10 @@
         "versionbits",
         "checkpoints",
         "historical",
+        "pruning",
         "script-flags"
       ],
-      "blake2b256": "06d73967116e6314e48a04405c650b1c3642b2b88b10656833950ecb5aa9487b"
+      "blake2b256": "a136e330fd1f1f15daf76f2bae7aba1af1c1f1e35531e76bf91b69f5e1f36457"
     },
     {
       "id": "mainnet-deployment-history-v1",

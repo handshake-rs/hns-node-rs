@@ -39,7 +39,9 @@ durable interval-root retention metadata:
   startup recomputes period transitions and rejects missing or inconsistent
   entries;
 - an optional versioned, checksummed `name-tree-compaction/v1` checkpoint that
-  binds the last compacted active height/tip and exact retained/deleted counts.
+  binds the last compacted active height/tip and exact retained/deleted counts;
+- an optional versioned, checksummed `undo-pruning/v1` checkpoint that binds
+  the last retired canonical height/block and cumulative retired undo count.
 
 A schema/profile mismatch, nonempty unversioned database, missing/malformed
 root or airdrop-field binding, or network/genesis mismatch fails closed. The
@@ -121,13 +123,16 @@ cannot promote a block or grant authority.
   reachability. Explicit compaction validates every retained root before
   atomically deleting unreachable records.
 - `undo`: block UTXO/name/airdrop undo records, including pre-state and
-  post-state roots.
+  post-state roots. With explicit undo retirement enabled, the HSD-protected
+  prefix and newest per-network reorg window remain while the intervening
+  active records are deleted.
 - `snapshots`: operational durable records. The mining engine uses the bounded
   `publication/v1/<block-hash>` namespace for solved-block publication intents.
   Each intent commits to its mining generation, job ID, block hash, creation
   time, and exact raw block and is checksummed on decode. State persistence uses
   `name-tree-snapshot/v1/<height-be>` for network-interval root pins and
-  `name-tree-compaction/v1` for the atomically published last compaction result.
+  `name-tree-compaction/v1` for the atomically published last compaction result,
+  plus `undo-pruning/v1` for the atomically advanced undo-retirement boundary.
 - `peers`, `orphans`, `mempool_persist`: reserved operational records as those
   subsystems mature. Current peer scores, reconnect state, orphan bodies, and
   the mining-engine mempool/template cache are process-local and bounded
@@ -288,9 +293,20 @@ coordinator.
 The node coordinator exposes forced maintenance and HSD-shaped opt-in startup
 scheduling. A nonzero height interval (10,000 by default) prevents repeated
 work at the same tip. The deletion set and checksummed height/tip/count
-checkpoint commit in one batch; malformed checkpoints fail startup. API-v4
+checkpoint commit in one batch; malformed checkpoints fail startup. API-v5
 status reports the configured policy and last result. Unclean RocksDB reopen
 tests verify that the checkpoint and compacted node set remain synchronized.
+
+Undo retirement is separately opt-in. It uses HSD's exact network constants:
+no height through `pruneAfterHeight` is retired, and the newest `keepBlocks`
+remain disconnectable. The target comparison is strict, matching HSD. Each
+retirement deletes the undo bytes, clears the matching header/block status,
+and advances `undo-pruning/v1` in the same batch. Startup validates the
+protected prefix, retired band, retained suffix, canonical checkpoint binding,
+root continuity, and interval pins; missed retirements are caught up in bounded
+batches. Reorganizations crossing the retired band fail before any state
+mutation. A store with a pruning checkpoint cannot later open with retirement
+disabled.
 
 Production closure still requires deployment-scale performance and priority
 isolation plus RocksDB mid-commit process-kill/fault injection without weakening

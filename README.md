@@ -49,6 +49,12 @@ Implemented:
   synchronization checkpoint.
 - Startup checks that compare durable name-tree-root metadata against the
   materialized name-state column family.
+- Opt-in `--prune-undo-history` retirement at HSD's exact per-network
+  `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
+  block/header undo status and advances a checksummed checkpoint; startup
+  catches up missed heights, retained interval pins remain compactable, and a
+  reorganization that reaches retired undo fails before mutation. Once a store
+  has retired undo, the option cannot be disabled for that store.
 
 ## Transaction authorization foundation
 
@@ -162,7 +168,11 @@ Implemented:
   commits leave all records unchanged.
 - HSD-shaped opt-in startup scheduling with a nonzero block-height interval
   (10,000 by default), a checksummed last-run checkpoint committed in the same
-  batch as deletions, manual serialized maintenance, and API-v4 status counts.
+  batch as deletions, manual serialized maintenance, and API-v5 status counts.
+- Optional HSD-shaped undo retirement preserves heights through
+  `pruneAfterHeight` and the newest `keepBlocks`, advances a checksummed
+  checkpoint in the same batch as each status/undo deletion, preserves
+  interval-pinned roots after their undo expires, and rejects deeper reorgs.
 - Atomic name-state and durable-root writes on connect, disconnect, and
   multi-block reorganization.
 - Authenticated CLAIM name-state creation/replacement with active-chain commit,
@@ -332,5 +342,7 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 Schema version 13 and storage profile `hsrd-mining-v9` add checksummed
 network-interval name-tree snapshot pins and retained-root node compaction to
 schema 12's content-addressed authenticated nodes and path-local proof reads.
-Existing pre-authority databases must be reindexed. No implicit in-place
-migration is attempted.
+The optional undo-retirement checkpoint uses the existing snapshots namespace;
+once present, `--prune-undo-history` is required on subsequent opens. Existing
+pre-authority databases must be reindexed. No implicit in-place migration is
+attempted.

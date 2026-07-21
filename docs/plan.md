@@ -85,8 +85,10 @@ reserved low-latency paths.
   and network-interval pins, with restart, malformed-pin, idempotence, and
   failed-commit atomicity coverage.
 - Opt-in HSD-shaped startup compaction scheduling, a checksummed atomic
-  last-run checkpoint, forced coordinator maintenance, API-v4 diagnostics, and
+  last-run checkpoint, forced coordinator maintenance, API-v5 diagnostics, and
   unclean RocksDB reopen evidence.
+- Opt-in HSD-horizon undo retirement with atomic checkpoints, bounded startup
+  catch-up, pruning-aware pinned roots, and fail-closed deep-reorg handling.
 - Correct pre-state header commitment and durable resulting-root semantics.
 
 ### Live shadow networking

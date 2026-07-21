@@ -16,6 +16,8 @@
       "goosigStop": 56880,
       "deflationHeight": 61043,
       "claimPrefix": "hns-claim:",
+      "pruneAfterHeight": 1000,
+      "keepBlocks": 288,
       "lastCheckpoint": 258026,
       "checkpoints": [
         {
@@ -129,6 +131,8 @@
       "goosigStop": 2880,
       "deflationHeight": 0,
       "claimPrefix": "hns-testnet:",
+      "pruneAfterHeight": 1000,
+      "keepBlocks": 10000,
       "lastCheckpoint": 0,
       "checkpoints": [],
       "deployments": [
@@ -181,6 +185,8 @@
       "goosigStop": 4294967295,
       "deflationHeight": 200,
       "claimPrefix": "hns-regtest:",
+      "pruneAfterHeight": 1000,
+      "keepBlocks": 10000,
       "lastCheckpoint": 0,
       "checkpoints": [],
       "deployments": [
@@ -233,6 +239,8 @@
       "goosigStop": 4294967295,
       "deflationHeight": 0,
       "claimPrefix": "hns-simnet:",
+      "pruneAfterHeight": 1000,
+      "keepBlocks": 10000,
       "lastCheckpoint": 0,
       "checkpoints": [],
       "deployments": [

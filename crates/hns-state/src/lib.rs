@@ -1881,7 +1881,8 @@ fn stage_remove_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
 fn retained_name_tree_roots<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<BTreeSet<TreeRoot>, StateError> {
-    let mut roots = BTreeSet::from([load_stored_name_tree_root(snapshot)?]);
+    let current_root = load_stored_name_tree_root(snapshot)?;
+    let mut roots = BTreeSet::from([current_root]);
     let mut undos = BTreeMap::new();
     for (key, raw) in snapshot.scan_prefix(ColumnFamily::Undo, b"")? {
         let undo = BlockUndo::decode(&raw)?;
@@ -1896,21 +1897,64 @@ fn retained_name_tree_roots<T: ReadSnapshot>(
     }
 
     for pin in load_name_tree_snapshot_pins(snapshot)? {
-        let Some(undo) = undos.get(&pin.block_hash) else {
-            return Err(StateError::NameTreeSnapshotPinInvariant {
-                height: pin.height,
-                reason: "pinned block undo is missing".to_owned(),
-            });
-        };
-        if undo.height != pin.height || undo.resulting_tree_root != pin.root {
-            return Err(StateError::NameTreeSnapshotPinInvariant {
-                height: pin.height,
-                reason: "pin disagrees with its block undo".to_owned(),
-            });
+        if let Some(undo) = undos.get(&pin.block_hash) {
+            if undo.height != pin.height || undo.resulting_tree_root != pin.root {
+                return Err(StateError::NameTreeSnapshotPinInvariant {
+                    height: pin.height,
+                    reason: "pin disagrees with its block undo".to_owned(),
+                });
+            }
+        } else {
+            let active_hash = read_canonical_hash(snapshot, pin.height)?.ok_or_else(|| {
+                StateError::NameTreeSnapshotPinInvariant {
+                    height: pin.height,
+                    reason: "pin has neither block undo nor an active height binding".to_owned(),
+                }
+            })?;
+            if active_hash != pin.block_hash {
+                return Err(StateError::NameTreeSnapshotPinInvariant {
+                    height: pin.height,
+                    reason: "pin block hash disagrees with the active height binding".to_owned(),
+                });
+            }
+            let expected_root = match pin.height.checked_add(1) {
+                Some(next_height) => match load_canonical_header(snapshot, next_height)? {
+                    Some(next) => TreeRoot::new(next.header.tree_root),
+                    None => current_root,
+                },
+                None => current_root,
+            };
+            if pin.root != expected_root {
+                return Err(StateError::NameTreeSnapshotPinInvariant {
+                    height: pin.height,
+                    reason: "pin root disagrees with active-chain root timing".to_owned(),
+                });
+            }
         }
         roots.insert(pin.root);
     }
     Ok(roots)
+}
+
+fn load_canonical_header<T: ReadSnapshot>(
+    snapshot: &T,
+    height: Height,
+) -> Result<Option<HeaderRecord>, StateError> {
+    let Some(hash) = read_canonical_hash(snapshot, height)? else {
+        return Ok(None);
+    };
+    let raw = snapshot
+        .get(ColumnFamily::Headers, hash.as_bytes())?
+        .ok_or(StateError::Chain(hns_chain::ChainError::MissingHeader(
+            hash,
+        )))?;
+    let record = HeaderRecord::decode(&raw)?;
+    if record.hash != hash || record.height != height {
+        return Err(StateError::Codec(format!(
+            "canonical header at height {height} disagrees with its index"
+        )));
+    }
+    Ok(Some(record))
 }
 
 /// Validate every retained root before staging any deletion, then remove all
