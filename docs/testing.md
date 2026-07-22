@@ -95,9 +95,10 @@ Current evidence includes:
   disabled/unknown opcodes, and policy flags with normalized HSD rejection
   codes plus exact per-program sigop counts;
 - an HSD-executed full/historical validation-route matrix proving that
-  candidate coinbase height remains checked under checkpoints while contextual
-  block sigops follow the full-input route, with native block-1 height evidence
-  and an atomic 80,020-sigop rejection;
+  transaction start and candidate coinbase height remain checked under
+  checkpoints while contextual block sigops follow the full-input route, with
+  HSD-driven pre-start/boundary block-shape cases, native block-1 evidence, and
+  an atomic 80,020-sigop rejection;
 - 33 covenant-linkage accepted/rejected cases;
 - exact HSD `NameState` encoding vectors;
 - 28 exact HSD contextual name-transition cases: 15 accepted lifecycle,

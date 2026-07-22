@@ -1,5 +1,5 @@
 {
-  "schema": 3,
+  "schema": 4,
   "oracle": {
     "repository": "handshake-org/hsd",
     "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
@@ -13,6 +13,7 @@
       "name": "main",
       "activationThreshold": 1916,
       "minerWindow": 2016,
+      "txStart": 2016,
       "goosigStop": 56880,
       "deflationHeight": 61043,
       "claimPrefix": "hns-claim:",
@@ -128,6 +129,7 @@
       "name": "testnet",
       "activationThreshold": 1512,
       "minerWindow": 2016,
+      "txStart": 0,
       "goosigStop": 2880,
       "deflationHeight": 0,
       "claimPrefix": "hns-testnet:",
@@ -182,6 +184,7 @@
       "name": "regtest",
       "activationThreshold": 108,
       "minerWindow": 144,
+      "txStart": 0,
       "goosigStop": 4294967295,
       "deflationHeight": 200,
       "claimPrefix": "hns-regtest:",
@@ -236,6 +239,7 @@
       "name": "simnet",
       "activationThreshold": 75,
       "minerWindow": 100,
+      "txStart": 0,
       "goosigStop": 4294967295,
       "deflationHeight": 0,
       "claimPrefix": "hns-simnet:",
@@ -892,6 +896,7 @@
       "headerContext": true,
       "deploymentState": true,
       "absoluteFinality": true,
+      "transactionStart": true,
       "coinbaseHeight": true,
       "claimAirdropSanity": true,
       "claimAirdropCryptography": true,
@@ -914,6 +919,7 @@
       "headerContext": true,
       "deploymentState": true,
       "absoluteFinality": true,
+      "transactionStart": true,
       "coinbaseHeight": true,
       "claimAirdropSanity": true,
       "claimAirdropCryptography": true,
@@ -936,6 +942,7 @@
       "headerContext": true,
       "deploymentState": true,
       "absoluteFinality": true,
+      "transactionStart": true,
       "coinbaseHeight": true,
       "claimAirdropSanity": true,
       "claimAirdropCryptography": true,
@@ -958,6 +965,7 @@
       "headerContext": true,
       "deploymentState": true,
       "absoluteFinality": true,
+      "transactionStart": true,
       "coinbaseHeight": true,
       "claimAirdropSanity": true,
       "claimAirdropCryptography": false,
@@ -980,6 +988,7 @@
       "headerContext": true,
       "deploymentState": true,
       "absoluteFinality": true,
+      "transactionStart": true,
       "coinbaseHeight": true,
       "claimAirdropSanity": true,
       "claimAirdropCryptography": false,
@@ -1002,6 +1011,7 @@
       "headerContext": true,
       "deploymentState": true,
       "absoluteFinality": true,
+      "transactionStart": true,
       "coinbaseHeight": true,
       "claimAirdropSanity": true,
       "claimAirdropCryptography": true,
@@ -1013,6 +1023,74 @@
       "bidRedeemContext": true,
       "scripts": true,
       "coinbaseReward": true
+    }
+  ],
+  "transactionStartCases": [
+    {
+      "id": "main-ordinary-before-start",
+      "network": "main",
+      "txStart": 2016,
+      "height": 2015,
+      "transactions": 1,
+      "coinbaseOutputs": 1,
+      "coinbaseCovenantNone": true,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "id": "main-extra-transaction-before-start",
+      "network": "main",
+      "txStart": 2016,
+      "height": 2015,
+      "transactions": 2,
+      "coinbaseOutputs": 1,
+      "coinbaseCovenantNone": true,
+      "accepted": false,
+      "reason": "no-tx-allowed-yet"
+    },
+    {
+      "id": "main-extra-coinbase-output-before-start",
+      "network": "main",
+      "txStart": 2016,
+      "height": 2015,
+      "transactions": 1,
+      "coinbaseOutputs": 2,
+      "coinbaseCovenantNone": true,
+      "accepted": false,
+      "reason": "no-tx-allowed-yet"
+    },
+    {
+      "id": "main-name-coinbase-before-start",
+      "network": "main",
+      "txStart": 2016,
+      "height": 2015,
+      "transactions": 1,
+      "coinbaseOutputs": 1,
+      "coinbaseCovenantNone": false,
+      "accepted": false,
+      "reason": "no-tx-allowed-yet"
+    },
+    {
+      "id": "main-extra-transaction-at-start",
+      "network": "main",
+      "txStart": 2016,
+      "height": 2016,
+      "transactions": 2,
+      "coinbaseOutputs": 1,
+      "coinbaseCovenantNone": true,
+      "accepted": true,
+      "reason": null
+    },
+    {
+      "id": "regtest-extra-transaction-height-one",
+      "network": "regtest",
+      "txStart": 0,
+      "height": 1,
+      "transactions": 2,
+      "coinbaseOutputs": 1,
+      "coinbaseCovenantNone": true,
+      "accepted": true,
+      "reason": null
     }
   ]
 }

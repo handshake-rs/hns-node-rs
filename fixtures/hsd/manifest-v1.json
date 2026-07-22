@@ -197,11 +197,12 @@
         "historical",
         "pruning",
         "script-flags",
+        "transaction-start",
         "coinbase-height",
         "block-sigops",
         "validation-plan"
       ],
-      "blake2b256": "a90d0f6a56e68eeb4df86476c8a52adf35bbfe377ac1a3f03a21aaa195d32963"
+      "blake2b256": "b9c55cd7efd3c56d8471801c7a60c01f2ed606b508de0a116d6954efd1518a2a"
     },
     {
       "id": "mainnet-deployment-history-v1",

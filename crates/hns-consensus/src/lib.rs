@@ -164,6 +164,7 @@ impl Network {
                 brontide_port: 44_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 100,
+                tx_start: 2_016,
                 goosig_stop: 56_880,
                 deflation_height: 61_043,
                 activation_threshold: 1_916,
@@ -215,6 +216,7 @@ impl Network {
                 brontide_port: 45_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 100,
+                tx_start: 0,
                 goosig_stop: 2_880,
                 deflation_height: 0,
                 activation_threshold: 1_512,
@@ -266,6 +268,7 @@ impl Network {
                 brontide_port: 46_806,
                 halving_interval: 2_500,
                 coinbase_maturity: 2,
+                tx_start: 0,
                 goosig_stop: u32::MAX,
                 deflation_height: 200,
                 activation_threshold: 108,
@@ -317,6 +320,7 @@ impl Network {
                 brontide_port: 47_806,
                 halving_interval: 170_000,
                 coinbase_maturity: 6,
+                tx_start: 0,
                 goosig_stop: u32::MAX,
                 deflation_height: 0,
                 activation_threshold: 75,
@@ -392,6 +396,10 @@ pub struct NetworkParams {
     pub brontide_port: u16,
     pub halving_interval: u32,
     pub coinbase_maturity: u32,
+    /// First height at which HSD permits ordinary transactions and special
+    /// coinbase issuance. Mainnet accumulated two weeks of work first; the
+    /// other networks permit them from genesis.
+    pub tx_start: Height,
     pub goosig_stop: Height,
     pub deflation_height: Height,
     pub activation_threshold: u32,
@@ -792,6 +800,34 @@ pub fn validate_block_body(block: &Block) -> Result<BlockValidation, ConsensusEr
         merkle_root,
         witness_root,
     })
+}
+
+/// Enforce HSD's pre-`txStart` block restriction. Before the network-specific
+/// boundary a block may contain only its coinbase, that coinbase must have one
+/// output, and the output must carry no covenant. HSD applies this rule before
+/// selecting the checkpoint-backed historical input-validation shortcut, so
+/// it is never eligible for script-history bypass.
+pub fn validate_transaction_start(
+    block: &Block,
+    height: Height,
+    network: Network,
+) -> Result<(), ConsensusError> {
+    if height >= network.params().tx_start {
+        return Ok(());
+    }
+
+    let Some(coinbase) = block.transactions.first() else {
+        return Err(ConsensusError::InvalidBlock("block has no transactions"));
+    };
+    if block.transactions.len() != 1
+        || coinbase.outputs.len() != 1
+        || coinbase.outputs[0].covenant.kind != CovenantKind::None
+    {
+        return Err(ConsensusError::InvalidBlock(
+            "transactions are not allowed before network tx start",
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_transaction_sanity(transaction: &Transaction) -> Result<(), ConsensusError> {

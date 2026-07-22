@@ -415,6 +415,7 @@ pub struct HistoricalValidationPlan {
     pub header_context: bool,
     pub deployment_state: bool,
     pub absolute_finality: bool,
+    pub transaction_start: bool,
     pub coinbase_height: bool,
     pub claim_airdrop_sanity: bool,
     pub claim_airdrop_cryptography: bool,
@@ -438,6 +439,7 @@ impl HistoricalValidationPlan {
             header_context: true,
             deployment_state: true,
             absolute_finality: true,
+            transaction_start: true,
             coinbase_height: true,
             claim_airdrop_sanity: true,
             claim_airdrop_cryptography: true,
@@ -461,6 +463,7 @@ impl HistoricalValidationPlan {
             header_context: true,
             deployment_state: true,
             absolute_finality: true,
+            transaction_start: true,
             coinbase_height: true,
             claim_airdrop_sanity: true,
             claim_airdrop_cryptography: false,
@@ -718,11 +721,17 @@ pub enum DeploymentError {
 mod tests {
     use std::str::FromStr;
 
-    use hns_primitives::Block;
+    use hns_primitives::{
+        Address, Block, Covenant, CovenantKind, Header, Input, Outpoint, Output, Transaction, Txid,
+        Witness,
+    };
     use serde::Deserialize;
 
     use super::*;
-    use crate::{is_final_transaction, validate_block_finality, validate_coinbase_height};
+    use crate::{
+        is_final_transaction, validate_block_finality, validate_coinbase_height,
+        validate_transaction_start,
+    };
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -735,6 +744,7 @@ mod tests {
         deployment_effect_cases: Vec<FixtureDeploymentEffect>,
         historical_cases: Vec<FixtureHistoricalCase>,
         historical_validation_cases: Vec<FixtureHistoricalValidationCase>,
+        transaction_start_cases: Vec<FixtureTransactionStartCase>,
     }
 
     #[derive(Deserialize)]
@@ -749,6 +759,7 @@ mod tests {
         name: String,
         activation_threshold: u32,
         miner_window: u32,
+        tx_start: Height,
         goosig_stop: Height,
         deflation_height: Height,
         claim_prefix: String,
@@ -830,6 +841,20 @@ mod tests {
         height: Height,
         #[serde(flatten)]
         plan: HistoricalValidationPlan,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureTransactionStartCase {
+        id: String,
+        network: String,
+        tx_start: Height,
+        height: Height,
+        transactions: usize,
+        coinbase_outputs: usize,
+        coinbase_covenant_none: bool,
+        accepted: bool,
+        reason: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -988,10 +1013,43 @@ mod tests {
             .collect()
     }
 
+    fn transaction_start_block(case: &FixtureTransactionStartCase) -> Block {
+        let covenant_kind = if case.coinbase_covenant_none {
+            CovenantKind::None
+        } else {
+            CovenantKind::Open
+        };
+        let output = Output {
+            value: 0,
+            address: Address::new(0, vec![0; 20]).expect("fixture address"),
+            covenant: Covenant {
+                kind: covenant_kind,
+                items: Vec::new(),
+            },
+        };
+        let transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    txid: Txid::ZERO,
+                    index: u32::MAX,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![output; case.coinbase_outputs],
+            locktime: case.height,
+        };
+        Block {
+            header: Header::default(),
+            transactions: vec![transaction; case.transactions],
+        }
+    }
+
     #[test]
     fn network_constants_match_hsd_fixture() {
         let fixture = fixture();
-        assert_eq!(fixture.schema, 3);
+        assert_eq!(fixture.schema, 4);
         assert_eq!(
             ScriptFlags::MANDATORY.bits(),
             fixture.script_flags.mandatory
@@ -1003,6 +1061,7 @@ mod tests {
             let params = network.params();
             assert_eq!(params.activation_threshold, expected.activation_threshold);
             assert_eq!(params.miner_window, expected.miner_window);
+            assert_eq!(params.tx_start, expected.tx_start);
             assert_eq!(params.goosig_stop, expected.goosig_stop);
             assert_eq!(params.deflation_height, expected.deflation_height);
             assert_eq!(params.block.prune_after_height, expected.prune_after_height);
@@ -1024,6 +1083,24 @@ mod tests {
                 .map(FixtureDeployment::deployment)
                 .collect::<Vec<_>>();
             assert_eq!(network.deployments(), deployments);
+        }
+    }
+
+    #[test]
+    fn transaction_start_rules_match_hsd_connect_route() {
+        let fixture = fixture();
+        for case in fixture.transaction_start_cases {
+            let network = Network::from_str(&case.network).expect("fixture network");
+            assert_eq!(network.params().tx_start, case.tx_start, "{}", case.id);
+            let result =
+                validate_transaction_start(&transaction_start_block(&case), case.height, network);
+            assert_eq!(result.is_ok(), case.accepted, "{}: {result:?}", case.id);
+            assert_eq!(
+                case.reason.as_deref(),
+                (!case.accepted).then_some("no-tx-allowed-yet"),
+                "{}",
+                case.id
+            );
         }
     }
 
@@ -1210,6 +1287,7 @@ mod tests {
                 case.plan.scripts
             );
             assert!(case.plan.coinbase_height);
+            assert!(case.plan.transaction_start);
             assert_eq!(case.plan.block_sigops, !case.plan.historical);
         }
     }

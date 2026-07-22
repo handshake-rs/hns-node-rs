@@ -35,9 +35,9 @@ use hns_chain::{
 };
 use hns_consensus::{
     advance_threshold_state, expected_next_bits, validate_block_finality, validate_coinbase_height,
-    ConsensusParams, Deployment, DeploymentPeriod, DeploymentState, DifficultyPoint,
-    HeaderConsensus, HeaderParent, HeaderValidationContext, NameFlags, Network, ThresholdState,
-    MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
+    validate_transaction_start, ConsensusParams, Deployment, DeploymentPeriod, DeploymentState,
+    DifficultyPoint, HeaderConsensus, HeaderParent, HeaderValidationContext, NameFlags, Network,
+    ThresholdState, MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
 };
 use hns_mempool::{MemoryMempool, Mempool};
 use hns_mining::{
@@ -2368,6 +2368,11 @@ impl NodeState {
             ImportValidationPolicy::Fixture { chainwork } => (chainwork, true),
         };
 
+        if matches!(request.validation, ImportValidationPolicy::Strict) {
+            validate_transaction_start(&request.block, request.height, self.network)
+                .map_err(|error| anyhow::anyhow!("transaction-start validation failed: {error}"))?;
+        }
+
         HeaderConsensus::new(ConsensusParams::for_network(self.network))
             .validate_block_body(&request.block)
             .map_err(|error| anyhow::anyhow!("block body validation failed: {error}"))?;
@@ -4501,6 +4506,33 @@ mod tests {
         assert!(
             error.to_string().contains("block parent index"),
             "canonical block one must pass strict header, body, finality, and coinbase-height checks before parent-body activation context: {error}"
+        );
+    }
+
+    #[test]
+    fn strict_mainnet_block_one_retains_transaction_start_under_checkpoints() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/chains/mainnet-deployment-history-v1.json"
+        ))
+        .expect("mainnet deployment fixture");
+        let case = &fixture["historicalFinalityCases"][0];
+        let mut block = Block::decode(&decode_hex(case["raw"].as_str().expect("raw block one")))
+            .expect("canonical mainnet block one");
+        block.transactions.push(block.transactions[0].clone());
+
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Mainnet,
+            ..NodeConfig::default()
+        });
+        node.shadow_sync_ensure_genesis_header()
+            .expect("canonical mainnet genesis header");
+        let error = node
+            .state
+            .validate_import(&NodeBlockImport::from_peer(block, 1))
+            .expect_err("pre-txStart transaction must be rejected");
+        assert!(
+            error.to_string().contains("transaction-start validation"),
+            "checkpoint-backed historical validation must retain txStart: {error}"
         );
     }
 

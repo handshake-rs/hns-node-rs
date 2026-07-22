@@ -98,10 +98,12 @@ Implemented:
   policy that requires verified checkpoint ancestry before allowing HSD's
   optional historical validation shortcut.
 - An HSD-executed historical validation-plan matrix pins which body, header,
-  deployment, finality, claim/airdrop, input, covenant, reward, and script
-  stages are checked or assumed at the checkpoint boundary. The native runtime
-  keeps the broader non-script assumptions disabled until historical replay is
-  independently qualified.
+  deployment, finality, transaction-start, claim/airdrop, input, covenant,
+  reward, and script stages are checked or assumed at the checkpoint boundary.
+  HSD's always-on mainnet pre-height-2,016 restriction permits only one
+  ordinary coinbase output and is enforced before any historical shortcut. The
+  native runtime keeps the broader non-script assumptions disabled until
+  historical replay is independently qualified.
 - Exact bounded HSD Claim envelope encoding, blob-only Claim hashes, and the
   checksummed ownership TXT payload codec for all four network prefixes.
 - Compression-free DNSKEY/DS/TXT/RRSIG ownership-proof parsing, exact HSD

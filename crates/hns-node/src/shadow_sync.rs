@@ -14,8 +14,9 @@ use axum::{
 };
 use hns_chain::{BlockIndexRecord, ChainTip, HeaderImport, HeaderIndex, HeaderRecord};
 use hns_consensus::{
-    block_merkle_root, block_witness_root, ConsensusParams, HeaderConsensus, HeaderParent,
-    HeaderValidationContext, MAX_FUTURE_BLOCK_TIME,
+    block_merkle_root, block_witness_root, validate_coinbase_height, validate_transaction_start,
+    ConsensusParams, HeaderConsensus, HeaderParent, HeaderValidationContext, Network,
+    MAX_FUTURE_BLOCK_TIME,
 };
 use hns_mempool::Admission;
 use hns_p2p::{
@@ -237,6 +238,7 @@ pub struct ShadowSyncDiagnostics {
 
 #[derive(Clone, Debug)]
 struct HnsBodyValidator {
+    network: Network,
     consensus: HeaderConsensus,
 }
 
@@ -248,8 +250,9 @@ pub(super) struct ActiveStateConnectOutcome {
 }
 
 impl HnsBodyValidator {
-    fn new(network: hns_consensus::Network) -> Self {
+    fn new(network: Network) -> Self {
         Self {
+            network,
             consensus: HeaderConsensus::new(ConsensusParams::for_network(network)),
         }
     }
@@ -259,7 +262,7 @@ impl StatelessBlockValidator for HnsBodyValidator {
     fn validate(
         &self,
         block: &Block,
-        _height: Height,
+        height: Height,
     ) -> std::result::Result<(), ValidationRejection> {
         if block_merkle_root(block) != block.header.merkle_root {
             return Err(ValidationRejection::invalid_response(
@@ -271,9 +274,12 @@ impl StatelessBlockValidator for HnsBodyValidator {
                 "body does not match the header witness root",
             ));
         }
+        validate_transaction_start(block, height, self.network)
+            .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
         self.consensus
             .validate_block_body(block)
-            .map(|_| ())
+            .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
+        validate_coinbase_height(block, height)
             .map_err(|error| ValidationRejection::invalid_block(error.to_string()))
     }
 }
@@ -2342,8 +2348,41 @@ fn runtime_instance_id() -> String {
 mod tests {
     use super::*;
     use crate::NodeConfig;
-    use hns_consensus::Network;
+    use hns_primitives::{
+        Address, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Witness,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn validator_coinbase_block(height: Height, output_count: usize) -> Block {
+        let output = Output {
+            value: 0,
+            address: Address::new(0, vec![0; 20]).expect("validator fixture address"),
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        };
+        let transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    txid: Txid::ZERO,
+                    index: u32::MAX,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![output; output_count],
+            locktime: height,
+        };
+        let mut block = Block {
+            header: Header::default(),
+            transactions: vec![transaction],
+        };
+        block.header.merkle_root = block_merkle_root(&block);
+        block.header.witness_root = block_witness_root(&block);
+        block
+    }
 
     #[test]
     fn shadow_sync_rejects_authority_modes_and_duplicate_peers() {
@@ -2412,6 +2451,23 @@ mod tests {
                 .kind,
             ValidationFailureKind::InvalidResponse
         );
+    }
+
+    #[test]
+    fn body_validator_marks_always_on_height_rules_permanent() {
+        let pre_start = validator_coinbase_block(2_015, 2);
+        let rejection = HnsBodyValidator::new(Network::Mainnet)
+            .validate(&pre_start, 2_015)
+            .expect_err("special issuance before mainnet txStart");
+        assert_eq!(rejection.kind, ValidationFailureKind::InvalidBlock);
+        assert!(rejection.reason.contains("network tx start"));
+
+        let wrong_height = validator_coinbase_block(2, 1);
+        let rejection = HnsBodyValidator::new(Network::Regtest)
+            .validate(&wrong_height, 1)
+            .expect_err("wrong coinbase height");
+        assert_eq!(rejection.kind, ValidationFailureKind::InvalidBlock);
+        assert!(rejection.reason.contains("coinbase height"));
     }
 
     #[tokio::test]

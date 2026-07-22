@@ -25,7 +25,10 @@ Implemented:
 - Exact HSD deployment/checkpoint constants, BIP9 transitions, block-version
   signaling, deployment effects, cached next-block versions, and a
   checkpoint-backed historical validation-stage plan that distinguishes the
-  always-on candidate coinbase height from checkpoint-skipped block sigops.
+  always-on transaction-start and candidate-coinbase-height checks from
+  checkpoint-skipped block sigops.
+- Exact per-network HSD `txStart` values and strict mainnet enforcement before
+  height 2,016: only the coinbase, exactly one output, and no covenant.
 - Canonical mainnet block-1 finality parity: ordinary transaction finality
   excludes the coinbase, including HSD's accepted non-final-looking historical
   coinbase vector, while the independent coinbase-height commitment remains

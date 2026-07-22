@@ -21,7 +21,8 @@
 ### Validation and state foundation
 
 - Header PoW, parent linkage, HNS difficulty, timestamp bounds, block syntax and
-  commitments, candidate coinbase-height binding, ordinary subsidy-plus-fee
+  commitments, candidate coinbase-height binding, HSD's mainnet
+  pre-height-2,016 transaction/coinbase restriction, ordinary subsidy-plus-fee
   accounting, absolute finality, contextual 80,000-sigop enforcement, UTXO
   connect/disconnect, coinbase maturity, duplicate/missing spend checks, value
   conservation, and output-collision checks.
@@ -32,8 +33,8 @@
 - Exact HSD BIP9 transitions, block-version selection, deployment effects,
   network checkpoint tables, strict header checkpoint enforcement, and a
   checkpoint-ancestry-gated historical validation policy with an HSD-executed
-  stage-by-stage full/historical route matrix, including always-on coinbase
-  height and checkpoint-skipped contextual sigops.
+  stage-by-stage full/historical route matrix, including always-on transaction
+  start and coinbase height plus checkpoint-skipped contextual sigops.
 - Canonical-mainnet replay of all 168 completed deployment periods through
   height 338,688, including real median times, signal counts, threshold states,
   deployment effects, next-block versions, the historical boundary, and the
