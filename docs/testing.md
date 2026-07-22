@@ -135,8 +135,8 @@ Current evidence includes:
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,
   `noRelay`, ASCII handling, inventory, locators, headers, blocks, and rejects;
-- cooperative 64-header import slicing with cancellation only after a durable
-  prefix;
+- maximum-size 2,000-header atomic protocol-batch import, including
+  late-invalid and failed-commit rollback;
 - durable invalid/invalid-child propagation, best-header fallback across
   restart, body/header mismatch retry, and non-attribution of validator-worker
   failures;
@@ -212,7 +212,7 @@ Tests and fault harnesses should cover:
 - process-local self-connection detection through the node's own listener;
 - handshake, idle, ping, pong, request, and reconnect timeouts;
 - priority-lane isolation and queue saturation;
-- invalid header batches with a durable valid prefix;
+- late-invalid header batches with full current-batch rollback;
 - known and unknown header/body ordering;
 - bounded pending/inflight/per-peer body requests and reassignment;
 - stateless validation result ordering despite out-of-order worker completion;

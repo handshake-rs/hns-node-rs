@@ -556,6 +556,57 @@ pub struct HeaderImport {
     pub checkpoint_valid: bool,
 }
 
+/// Construct the durable record for a contextually validated header import.
+/// This helper is also used by staged callers that need later headers in the
+/// same atomic batch to observe their predecessors before anything commits.
+pub fn prepare_header_record(
+    request: &HeaderImport,
+    parent: Option<&HeaderRecord>,
+) -> Result<HeaderRecord, ChainError> {
+    if request.verify_pow && !request.header.verify_pow() {
+        return Err(ChainError::InvalidHeader("proof of work failed"));
+    }
+
+    let (parent_work, failed) = match (request.height, parent) {
+        (0, None) => (Uint256::ZERO, false),
+        (0, Some(_)) => {
+            return Err(ChainError::InvalidHeader(
+                "genesis import unexpectedly has a parent",
+            ));
+        }
+        (_, None) => return Err(ChainError::MissingParent(request.header.prev_block)),
+        (_, Some(parent)) => {
+            if parent.hash != request.header.prev_block
+                || parent.height.checked_add(1) != Some(request.height)
+            {
+                return Err(ChainError::InvalidHeader(
+                    "height is not contiguous with parent",
+                ));
+            }
+            (parent.chainwork, parent.status.failed)
+        }
+    };
+    let proof = CompactTarget::from_bits(request.header.bits)
+        .proof()
+        .ok_or(ChainError::InvalidHeader("invalid proof-of-work target"))?;
+    let chainwork = parent_work
+        .checked_add(proof)
+        .ok_or_else(|| ChainError::Codec("chainwork overflow".to_owned()))?;
+
+    Ok(HeaderRecord {
+        hash: request.header.hash(),
+        height: request.height,
+        chainwork,
+        header: request.header.clone(),
+        status: BlockStatus {
+            header_context_valid: true,
+            checkpoint_valid: request.checkpoint_valid,
+            failed,
+            ..BlockStatus::default()
+        },
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FailedHeaderPlan {
     pub affected: Vec<HeaderRecord>,
@@ -632,36 +683,27 @@ impl MemoryHeaderIndex {
         header: Header,
         height: Height,
     ) -> Result<HeaderRecord, ChainError> {
-        let hash = header.hash();
-        let (parent_work, failed) = if height == 0 {
-            (Uint256::ZERO, false)
-        } else {
-            let parent = self
-                .records
-                .get(&header.prev_block)
-                .ok_or(ChainError::MissingParent(header.prev_block))?;
-            (parent.chainwork, parent.status.failed)
-        };
-
-        let record = HeaderRecord {
-            hash,
-            height,
-            chainwork: parent_work
-                .checked_add(
-                    CompactTarget::from_bits(header.bits)
-                        .proof()
-                        .ok_or(ChainError::InvalidHeader("invalid proof-of-work target"))?,
-                )
-                .ok_or_else(|| ChainError::Codec("chainwork overflow".to_owned()))?,
+        self.insert_import(HeaderImport {
             header,
-            status: BlockStatus {
-                header_context_valid: true,
-                failed,
-                ..BlockStatus::default()
-            },
-        };
+            height,
+            verify_pow: false,
+            checkpoint_valid: false,
+        })
+    }
 
-        self.records.insert(hash, record.clone());
+    fn insert_import(&mut self, request: HeaderImport) -> Result<HeaderRecord, ChainError> {
+        let parent = if request.height == 0 {
+            None
+        } else {
+            Some(
+                self.records
+                    .get(&request.header.prev_block)
+                    .ok_or(ChainError::MissingParent(request.header.prev_block))?,
+            )
+        };
+        let record = prepare_header_record(&request, parent)?;
+
+        self.records.insert(record.hash, record.clone());
         self.promote_if_best(&record)?;
         Ok(record)
     }
@@ -783,6 +825,20 @@ impl MemoryHeaderIndex {
         if record.status.failed {
             return Err(ChainError::FailedBestHeader(record.hash));
         }
+
+        if self.best.as_ref().is_some_and(|best| {
+            record.header.prev_block == best.hash
+                && best.height.checked_add(1) == Some(record.height)
+        }) {
+            self.canonical.insert(record.height, record.hash);
+            self.best = Some(ChainTip {
+                hash: record.hash,
+                height: record.height,
+                chainwork: record.chainwork,
+            });
+            return Ok(());
+        }
+
         let path = self.path_to_genesis(record.hash)?;
         self.canonical.clear();
 
@@ -916,20 +972,124 @@ impl<S: Store> StoredHeaderIndex<S> {
     }
 
     pub fn import_header(&mut self, request: HeaderImport) -> Result<HeaderRecord, ChainError> {
-        if request.verify_pow && !request.header.verify_pow() {
-            return Err(ChainError::InvalidHeader("proof of work failed"));
+        self.import_headers(vec![request])?
+            .pop()
+            .ok_or_else(|| ChainError::Codec("single-header import returned no record".to_owned()))
+    }
+
+    /// Import a validated header sequence with one durable commit. The next
+    /// in-memory view is built first and is published only after every record
+    /// and the final best-header binding commit atomically.
+    pub fn import_headers(
+        &mut self,
+        requests: Vec<HeaderImport>,
+    ) -> Result<Vec<HeaderRecord>, ChainError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
         }
 
-        // Build the next in-memory view first, but publish it only after the
-        // corresponding durable batch commits. A storage failure must not leave
-        // the live index ahead of the database.
-        let mut next = self.memory.clone();
-        let mut record = next.insert_header(request.header, request.height)?;
-        record.status.checkpoint_valid = request.checkpoint_valid;
-        next.records.insert(record.hash, record.clone());
-        self.persist_record_against(&record, &next)?;
-        self.memory = next;
-        Ok(record)
+        // Build a compact staged view. Cloning the complete historical index
+        // for every bounded network slice would make initial header sync
+        // quadratic in chain height.
+        let original_best = self.memory.best.clone();
+        let mut next_best = original_best.clone();
+        let mut direct_extension = true;
+        let mut canonical_appends = Vec::with_capacity(requests.len());
+        let mut staged = HashMap::<BlockHash, HeaderRecord>::with_capacity(requests.len());
+        let mut records = Vec::with_capacity(requests.len());
+        for request in requests {
+            let hash = request.header.hash();
+            if self.memory.records.contains_key(&hash) || staged.contains_key(&hash) {
+                return Err(ChainError::DuplicateHeader(hash));
+            }
+            let parent = if request.height == 0 {
+                None
+            } else {
+                Some(
+                    staged
+                        .get(&request.header.prev_block)
+                        .or_else(|| self.memory.records.get(&request.header.prev_block))
+                        .ok_or(ChainError::MissingParent(request.header.prev_block))?,
+                )
+            };
+            let record = prepare_header_record(&request, parent)?;
+
+            if !record.status.failed
+                && next_best
+                    .as_ref()
+                    .map(|best| record.chainwork > best.chainwork)
+                    .unwrap_or(true)
+            {
+                let extends_best = next_best.as_ref().map_or(record.height == 0, |best| {
+                    record.header.prev_block == best.hash
+                        && best.height.checked_add(1) == Some(record.height)
+                });
+                if direct_extension && extends_best {
+                    canonical_appends.push((record.height, record.hash));
+                } else {
+                    direct_extension = false;
+                    canonical_appends.clear();
+                }
+                next_best = Some(ChainTip {
+                    hash: record.hash,
+                    height: record.height,
+                    chainwork: record.chainwork,
+                });
+            }
+
+            staged.insert(record.hash, record.clone());
+            records.push(record);
+        }
+
+        let best = next_best.ok_or(ChainError::MissingBestHeaderBinding)?;
+        let best_changed = original_best.as_ref() != Some(&best);
+        let canonical_replacement = if best_changed && !direct_extension {
+            let mut canonical = HashMap::new();
+            let mut current = best.hash;
+            loop {
+                let record = staged
+                    .get(&current)
+                    .or_else(|| self.memory.records.get(&current))
+                    .ok_or(ChainError::MissingHeader(current))?;
+                if record.status.failed {
+                    return Err(ChainError::InconsistentFailureAncestry(best.hash));
+                }
+                canonical.insert(record.height, record.hash);
+                if record.height == 0 {
+                    break;
+                }
+                current = record.header.prev_block;
+            }
+            Some(canonical)
+        } else {
+            None
+        };
+
+        let mut batch = self.store.batch();
+        for record in &records {
+            write_record_to_batch(&mut batch, record)?;
+        }
+        batch.put(
+            ColumnFamily::Meta,
+            MetaKey::BestHeaderHash.as_bytes(),
+            best.hash.as_bytes(),
+        )?;
+        self.store.commit(batch)?;
+
+        for record in &records {
+            self.memory.records.insert(record.hash, record.clone());
+        }
+        if best_changed {
+            if let Some(canonical) = canonical_replacement {
+                self.memory.canonical = canonical;
+            } else {
+                for (height, hash) in canonical_appends {
+                    self.memory.canonical.insert(height, hash);
+                }
+            }
+            self.memory.best = Some(best);
+        }
+        Ok(records)
     }
 
     pub fn persist_record(&self, record: &HeaderRecord) -> Result<(), ChainError> {
@@ -1412,6 +1572,8 @@ pub enum ChainError {
     Codec(String),
     #[error("missing parent header {0:?}")]
     MissingParent(BlockHash),
+    #[error("header {0:?} is already indexed or duplicated in its import batch")]
+    DuplicateHeader(BlockHash),
     #[error("missing header {0:?}")]
     MissingHeader(BlockHash),
     #[error("stored headers exist without a persisted best-header binding")]
@@ -1474,7 +1636,59 @@ fn varint_size(value: u64) -> usize {
 mod tests {
     use super::*;
     use hns_primitives::{Address, Covenant, CovenantKind, Input, Outpoint, Output, Witness};
-    use hns_store::{MemoryStore, Store};
+    use hns_store::{MemoryBatch, MemorySnapshot, MemoryStore, Store};
+
+    #[derive(Clone)]
+    struct InstrumentedStore {
+        inner: MemoryStore,
+        commits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_next_commit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl InstrumentedStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                commits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                fail_next_commit: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        fn commit_count(&self) -> usize {
+            self.commits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn fail_next_commit(&self) {
+            self.fail_next_commit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Store for InstrumentedStore {
+        type Snapshot<'a> = MemorySnapshot;
+        type Batch = MemoryBatch;
+
+        fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+            self.inner.snapshot()
+        }
+
+        fn batch(&self) -> Self::Batch {
+            self.inner.batch()
+        }
+
+        fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
+            if self
+                .fail_next_commit
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::Io("injected commit failure".to_owned()));
+            }
+            self.inner.commit(batch)?;
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     fn header(prev_block: BlockHash, nonce: u32) -> Header {
         Header {
@@ -1885,6 +2099,145 @@ mod tests {
             error,
             ChainError::InvalidHeader("proof of work failed")
         ));
+    }
+
+    #[test]
+    fn stored_header_index_commits_a_header_batch_once() {
+        let store = InstrumentedStore::new();
+        let mut index = StoredHeaderIndex::new(store.clone()).expect("index");
+        let commits_before = store.commit_count();
+        let genesis_header = header(BlockHash::ZERO, 21);
+        let first_header = header(genesis_header.hash(), 22);
+        let second_header = header(first_header.hash(), 23);
+
+        let records = index
+            .import_headers(vec![
+                HeaderImport {
+                    header: genesis_header,
+                    height: 0,
+                    verify_pow: false,
+                    checkpoint_valid: true,
+                },
+                HeaderImport {
+                    header: first_header,
+                    height: 1,
+                    verify_pow: false,
+                    checkpoint_valid: true,
+                },
+                HeaderImport {
+                    header: second_header,
+                    height: 2,
+                    verify_pow: false,
+                    checkpoint_valid: true,
+                },
+            ])
+            .expect("batch import");
+
+        assert_eq!(store.commit_count(), commits_before + 1);
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().all(|record| record.status.checkpoint_valid));
+        assert_eq!(
+            index.best_tip().expect("tip").expect("best").hash,
+            records[2].hash
+        );
+        assert_eq!(
+            StoredHeaderIndex::new(store)
+                .expect("reload")
+                .canonical_hash(2)
+                .expect("canonical"),
+            Some(records[2].hash)
+        );
+    }
+
+    #[test]
+    fn invalid_header_batch_leaves_no_partial_import() {
+        let store = InstrumentedStore::new();
+        let mut index = StoredHeaderIndex::new(store.clone()).expect("index");
+        let commits_before = store.commit_count();
+        let genesis_header = header(BlockHash::ZERO, 24);
+        let first_header = header(genesis_header.hash(), 25);
+        let first_hash = first_header.hash();
+        let invalid_second = header(first_hash, 26);
+
+        let error = index
+            .import_headers(vec![
+                HeaderImport {
+                    header: genesis_header,
+                    height: 0,
+                    verify_pow: false,
+                    checkpoint_valid: true,
+                },
+                HeaderImport {
+                    header: first_header,
+                    height: 1,
+                    verify_pow: false,
+                    checkpoint_valid: true,
+                },
+                HeaderImport {
+                    header: invalid_second,
+                    height: 3,
+                    verify_pow: false,
+                    checkpoint_valid: true,
+                },
+            ])
+            .expect_err("non-contiguous header");
+
+        assert!(matches!(error, ChainError::InvalidHeader(_)));
+        assert_eq!(store.commit_count(), commits_before);
+        assert_eq!(index.best_tip().expect("tip"), None);
+        assert_eq!(index.load_record(&first_hash).expect("record"), None);
+    }
+
+    #[test]
+    fn failed_header_batch_commit_preserves_durable_and_live_tip() {
+        let store = InstrumentedStore::new();
+        let mut index = StoredHeaderIndex::new(store.clone()).expect("index");
+        let genesis = index
+            .import_header(HeaderImport {
+                header: header(BlockHash::ZERO, 27),
+                height: 0,
+                verify_pow: false,
+                checkpoint_valid: true,
+            })
+            .expect("genesis");
+        let first_header = header(genesis.hash, 28);
+        let first_hash = first_header.hash();
+        let second_header = header(first_hash, 29);
+        let second_hash = second_header.hash();
+
+        store.fail_next_commit();
+        index
+            .import_headers(vec![
+                HeaderImport {
+                    header: first_header,
+                    height: 1,
+                    verify_pow: false,
+                    checkpoint_valid: true,
+                },
+                HeaderImport {
+                    header: second_header,
+                    height: 2,
+                    verify_pow: false,
+                    checkpoint_valid: true,
+                },
+            ])
+            .expect_err("injected commit failure");
+
+        assert_eq!(
+            index.best_tip().expect("live tip").expect("best").hash,
+            genesis.hash
+        );
+        assert_eq!(index.load_record(&first_hash).expect("first"), None);
+        assert_eq!(index.load_record(&second_hash).expect("second"), None);
+        assert_eq!(
+            StoredHeaderIndex::new(store)
+                .expect("reload")
+                .best_tip()
+                .expect("durable tip")
+                .expect("best")
+                .hash,
+            genesis.hash
+        );
     }
 
     #[test]

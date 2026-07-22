@@ -142,8 +142,8 @@ an authoritative durable tip.
 - Duplicate socket addresses and over-capacity registrations fail under the
   peer-manager registration lock.
 - Invalid header batches consume the outstanding request and disconnect the
-  sender at the current score threshold. Any valid durable prefix remains
-  tracked by the scheduler.
+  sender at the current score threshold. The current atomic protocol batch is
+  rejected in full; earlier complete batches remain tracked by the scheduler.
 - A body without known header context is dropped after requesting headers; it
   is not retained as an unvalidated orphan.
 - A body with known header context but unavailable parent body is retained only

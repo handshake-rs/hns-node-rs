@@ -238,8 +238,10 @@ Implemented:
 - A bounded peer manager with connection limits, duplicate-address rejection,
   process-local scoring, disconnect thresholds, snapshots, and exponential
   outbound reconnect backoff.
-- Headers-first synchronization with bounded pending, global inflight, and
-  per-peer block requests; timeout, retry, penalty, and reassignment behavior.
+- Headers-first synchronization with 2,000-header atomic protocol batches and an
+  explicit headers-only checkpoint/deployment-ancestry qualification mode,
+  plus bounded pending, global inflight, and per-peer block requests; timeout,
+  retry, penalty, and reassignment behavior.
 - Bounded oldest-first orphan retention only after the block's header context is
   known and the body passes stateless validation. Bodies with no known header
   context are dropped after requesting headers.

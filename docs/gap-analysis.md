@@ -117,7 +117,7 @@
 - Live inbound/outbound plaintext peers with handshake, service, self-connect,
   timeout, ping/pong, and priority-queue controls.
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
-- Headers-first synchronization with 64-header durable shutdown slices plus
+- Headers-first synchronization with 2,000-header atomic protocol batches plus
   bounded pending/inflight/per-peer body requests, retry, timeout, and
   reassignment.
 - Bounded orphan retention only for statelessly valid bodies with known header

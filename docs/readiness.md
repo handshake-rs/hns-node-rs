@@ -127,7 +127,7 @@ Implemented:
 - process-local self-connection detection, service checks, timeouts, ping/pong,
   and priority outbound lanes;
 - bounded peer registration, scoring, disconnect, diagnostics, and reconnect;
-- headers-first acquisition, 64-header durable cancellation slices, and
+- headers-first acquisition, 2,000-header atomic durable protocol batches, and
   best-work header retention;
 - bounded pending/inflight/per-peer block scheduling with retry and timeout;
 - bounded known-header orphan handling;

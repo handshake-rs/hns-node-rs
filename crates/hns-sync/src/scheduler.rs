@@ -157,6 +157,7 @@ struct InflightBlock {
 pub struct SyncScheduler {
     limits: SyncLimits,
     stage: SyncStage,
+    headers_only: bool,
     peers: BTreeMap<PeerId, PeerSyncState>,
     pending_order: VecDeque<BlockHash>,
     pending: HashMap<BlockHash, PendingBlock>,
@@ -177,6 +178,7 @@ impl SyncScheduler {
         Ok(Self {
             limits,
             stage: SyncStage::Idle,
+            headers_only: false,
             peers: BTreeMap::new(),
             pending_order: VecDeque::new(),
             pending: HashMap::new(),
@@ -212,6 +214,12 @@ impl SyncScheduler {
 
     pub fn stage(&self) -> SyncStage {
         self.stage
+    }
+
+    pub fn set_headers_only(&mut self, headers_only: bool) {
+        self.headers_only = headers_only;
+        self.update_stage();
+        self.bump_sequence();
     }
 
     pub fn set_stage(&mut self, stage: SyncStage) {
@@ -856,6 +864,8 @@ impl SyncScheduler {
         let target = self.target_height.unwrap_or(best_height);
         self.stage = if best_height < target {
             SyncStage::Headers
+        } else if self.headers_only {
+            SyncStage::Synced
         } else if !self.inflight.is_empty()
             || !self.pending.is_empty()
             || stored_height < best_height
@@ -1106,6 +1116,22 @@ mod tests {
         assert_eq!(scheduler.stage(), SyncStage::BackgroundVerify);
         scheduler.set_active_tip(Some(tip(1, 5)));
         assert_eq!(scheduler.stage(), SyncStage::Synced);
+    }
+
+    #[test]
+    fn headers_only_reaches_synced_without_body_or_active_tips() {
+        let now = Instant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        scheduler.set_headers_only(true);
+        scheduler
+            .register_peer(PeerId(1), SERVICE_NETWORK, 5)
+            .expect("peer");
+        scheduler.set_best_header(Some(tip(1, 4)));
+        assert_eq!(scheduler.stage(), SyncStage::Headers);
+        scheduler.set_best_header(Some(tip(2, 5)));
+        assert_eq!(scheduler.stage(), SyncStage::Synced);
+        assert_eq!(scheduler.snapshot().stored_tip, None);
+        assert_eq!(scheduler.snapshot().active_tip, None);
     }
 
     #[test]

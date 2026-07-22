@@ -52,6 +52,10 @@ struct Cli {
     #[arg(long)]
     shadow_sync: bool,
 
+    /// Validate and persist only headers; do not schedule block-body downloads.
+    #[arg(long, requires = "shadow_sync")]
+    shadow_sync_headers_only: bool,
+
     /// Connect downloaded bodies to active state without granting mining authority.
     /// Requires --acknowledge-incomplete-consensus while parity gates remain open.
     #[arg(long)]
@@ -149,6 +153,7 @@ impl Cli {
             },
             shadow_sync: ShadowSyncConfig {
                 enabled: self.shadow_sync,
+                headers_only: self.shadow_sync_headers_only,
                 connect_active_state: self.shadow_sync_active_state,
                 active_state_connect_batch: self.active_state_connect_batch,
                 listen: self.p2p_listen,
@@ -217,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
             name_tree_compaction_interval = config.name_tree_compaction.startup_interval,
             prune_undo_history = config.undo_retention.prune_history,
             shadow_sync = config.shadow_sync.enabled,
+            shadow_sync_headers_only = config.shadow_sync.headers_only,
             shadow_sync_active_state = config.shadow_sync.connect_active_state,
             mining_engine = config.mining_engine.enabled,
             transaction_relay = config.mining_engine.transaction_relay,

@@ -52,6 +52,25 @@ size limits, calls have bounded timeouts and retries, and the runner rereads
 both nodes after gathering comparison material. A tip change during the probe
 is retried instead of being reported as a divergence.
 
+## Header-only qualification
+
+A pruned HSD node still exposes the canonical header chain through P2P and
+canonical hashes through RPC. Start hsrd with `--shadow-sync-headers-only`, then
+compare its durable best header without making any block-body or state claim:
+
+```bash
+scripts/compare-hsrd-hsd-shadow.py \
+  --headers-only --require-current-tip \
+  --hsrd-url http://127.0.0.1:13037 \
+  --hsd-cli /absolute/path/to/hsd/bin/hsd-cli \
+  --hsd-source /absolute/path/to/hsd
+```
+
+The emitted scope covers header linkage, difficulty, timestamps, checkpoints,
+chainwork, and canonical ancestry. It does not cover body, script, covenant,
+UTXO, name-state, or root parity. Header-only mode refuses the active-state
+evidence `--state-file` format rather than mixing those scopes.
+
 ## Evidence checkpoint
 
 Each coherent probe emits one canonical JSON line. `--state-file` maintains

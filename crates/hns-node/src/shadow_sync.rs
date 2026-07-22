@@ -12,7 +12,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use hns_chain::{BlockIndexRecord, ChainTip, HeaderImport, HeaderIndex, HeaderRecord};
+use hns_chain::{
+    prepare_header_record, BlockIndexRecord, ChainTip, HeaderImport, HeaderIndex, HeaderRecord,
+};
 use hns_consensus::{
     block_merkle_root, block_witness_root, is_hsd_historical_block, validate_coinbase_height,
     validate_transaction_start, ConsensusParams, HeaderConsensus, HeaderParent,
@@ -25,7 +27,7 @@ use hns_p2p::{
 };
 use hns_primitives::{Block, BlockHash, Header, Height, Txid};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
-use hns_store::{mark_clean_shutdown, Store};
+use hns_store::mark_clean_shutdown;
 use hns_sync::{
     spawn_validation_pipeline, BoundedOrphanPool, OrderedValidationResult, OrphanLimits,
     OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction, SyncCheckpoint,
@@ -41,9 +43,9 @@ use tokio::{
 };
 
 use super::{
-    current_unix_time, json_rpc_error, load_header_record, AuthorityMode, ChainActivationFailure,
-    FailedBlockMutation, FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
-    ShutdownSignal,
+    current_unix_time, expected_bits_with_lookup, json_rpc_error, median_time_past_with_lookup,
+    AuthorityMode, ChainActivationFailure, FailedBlockMutation, FailedBlockStage, HeaderSummary,
+    NodeBlockImport, NodeReorg, NodeService, ShutdownSignal,
 };
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
@@ -58,12 +60,14 @@ const MAX_SHADOW_SYNC_ORPHAN_BLOCKS: usize = 8_192;
 const MAX_SHADOW_SYNC_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
 pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 8;
-const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = 64;
+const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
 const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShadowSyncConfig {
     pub enabled: bool,
+    /// Acquire and validate canonical headers without scheduling block bodies.
+    pub headers_only: bool,
     pub connect_active_state: bool,
     pub active_state_connect_batch: usize,
     pub listen: Option<SocketAddr>,
@@ -81,6 +85,7 @@ impl Default for ShadowSyncConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            headers_only: false,
             connect_active_state: false,
             active_state_connect_batch: 288,
             listen: None,
@@ -100,6 +105,12 @@ impl ShadowSyncConfig {
     pub fn validate(&self, authority_mode: AuthorityMode) -> Result<()> {
         if self.connect_active_state && !self.enabled {
             anyhow::bail!("active-state synchronization requires shadow sync to be enabled");
+        }
+        if self.headers_only && !self.enabled {
+            anyhow::bail!("headers-only synchronization requires shadow sync to be enabled");
+        }
+        if self.headers_only && self.connect_active_state {
+            anyhow::bail!("headers-only shadow sync cannot connect active state");
         }
         if !self.enabled {
             return Ok(());
@@ -204,6 +215,7 @@ impl ShadowSyncConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ShadowSyncDiagnostics {
     pub enabled: bool,
+    pub headers_only: bool,
     pub observation_only: bool,
     pub active_state: bool,
     /// Opaque process-local identifier used only to correlate qualification
@@ -369,6 +381,7 @@ impl NodeService {
             None => SyncScheduler::new(sync_limits, scheduler_now),
         }
         .map_err(|error| anyhow::anyhow!("failed to initialize sync scheduler: {error}"))?;
+        scheduler.set_headers_only(shadow_sync_config.headers_only);
 
         let (best_header, active_tip, stored_tip) = {
             let node = node.lock().await;
@@ -414,6 +427,7 @@ impl NodeService {
             .map_or(0, |checkpoint| checkpoint.sequence);
         let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
             enabled: true,
+            headers_only: shadow_sync_config.headers_only,
             observation_only: !shadow_sync_config.connect_active_state,
             active_state: shadow_sync_config.connect_active_state,
             runtime_instance: runtime_instance_id(),
@@ -605,9 +619,9 @@ impl NodeService {
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
                     };
-                    // Header batches yield after each durable import slice.
-                    // Race that cooperative work against shutdown so an HSD
-                    // peer cannot keep SIGINT behind a full 2,000-header batch.
+                    // Each maximum-size header packet is one atomic durable
+                    // batch. Once started it completes as a unit; the event
+                    // loop observes shutdown before starting another packet.
                     let handled = tokio::select! {
                         _ = &mut shutdown_wait => None,
                         result = handle_peer_event(
@@ -617,6 +631,7 @@ impl NodeService {
                             &validation,
                             &mut scheduler,
                             &mut reconnects,
+                            shadow_sync_config.headers_only,
                             &diagnostics,
                         ) => Some(result),
                     };
@@ -736,51 +751,52 @@ impl NodeService {
     }
 
     fn shadow_sync_import_headers(&mut self, headers: Vec<Header>) -> Result<Vec<HeaderRecord>> {
-        if headers.len() > hns_p2p::MAX_HEADERS {
+        if headers.len() > MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE {
             anyhow::bail!("peer sent too many headers: {}", headers.len());
         }
 
+        let maximum_time = current_unix_time()?.saturating_add(MAX_FUTURE_BLOCK_TIME);
         let mut imported = Vec::with_capacity(headers.len());
+        let mut requests = Vec::with_capacity(headers.len());
+        let mut pending_records = Vec::with_capacity(headers.len());
+        let mut staged_headers = HashMap::<BlockHash, HeaderRecord>::with_capacity(headers.len());
         for header in headers {
             let hash = header.hash();
-            if let Some(record) = self
-                .state
-                .chain
-                .load_record(&hash)
-                .map_err(|error| anyhow::anyhow!("failed to load known header: {error}"))?
-            {
+            let mut lookup = |candidate: &BlockHash| -> Result<Option<HeaderRecord>> {
+                if let Some(record) = staged_headers.get(candidate) {
+                    return Ok(Some(record.clone()));
+                }
+                self.state
+                    .chain
+                    .header(candidate)
+                    .map_err(|error| anyhow::anyhow!("failed to read staged header: {error}"))
+            };
+            if let Some(record) = lookup(&hash)? {
                 imported.push(record);
                 continue;
             }
 
-            let snapshot = self.state.store.snapshot()?;
             let parent = if header == self.config.network.params().genesis_header() {
                 None
             } else {
-                Some(
-                    load_header_record(&snapshot, &header.prev_block)?.ok_or_else(|| {
-                        anyhow::anyhow!("missing header parent {}", header.prev_block.to_hex())
-                    })?,
-                )
+                Some(lookup(&header.prev_block)?.ok_or_else(|| {
+                    anyhow::anyhow!("missing header parent {}", header.prev_block.to_hex())
+                })?)
             };
             let height = parent
                 .as_ref()
                 .map_or(0, |record| record.height.saturating_add(1));
             let median_time_past = parent
                 .as_ref()
-                .map(|record| self.state.median_time_past(&snapshot, record))
+                .map(|record| median_time_past_with_lookup(record, &mut lookup))
                 .transpose()?;
-            let dummy = NodeBlockImport::from_peer(
-                Block {
-                    header: header.clone(),
-                    transactions: Vec::new(),
-                },
-                height,
+            let expected_bits = expected_bits_with_lookup(
+                self.config.network,
+                header.time,
+                parent.as_ref(),
+                &mut lookup,
             );
-            let expected_bits =
-                self.state
-                    .expected_bits_for_import(&snapshot, &dummy, parent.as_ref())?;
-            let maximum_time = current_unix_time()?.saturating_add(MAX_FUTURE_BLOCK_TIME);
+            let expected_bits = expected_bits?;
             let network_params = self.config.network.params();
             let is_canonical_genesis = height == 0
                 && header == network_params.genesis_header()
@@ -804,19 +820,28 @@ impl NodeService {
                     },
                 )
                 .map_err(|error| anyhow::anyhow!("header validation failed: {error}"))?;
-            drop(snapshot);
 
-            let record = self
-                .state
-                .chain
-                .import_header(HeaderImport {
-                    header,
-                    height,
-                    verify_pow: !is_canonical_genesis,
-                    checkpoint_valid: true,
-                })
-                .map_err(|error| anyhow::anyhow!("failed to persist header: {error}"))?;
+            let request = HeaderImport {
+                header,
+                height,
+                verify_pow: !is_canonical_genesis,
+                checkpoint_valid: true,
+            };
+            let record = prepare_header_record(&request, parent.as_ref())
+                .map_err(|error| anyhow::anyhow!("failed to stage header: {error}"))?;
+            requests.push(request);
+            pending_records.push(record.clone());
+            staged_headers.insert(record.hash, record.clone());
             imported.push(record);
+        }
+
+        let committed = self
+            .state
+            .chain
+            .import_headers(requests)
+            .map_err(|error| anyhow::anyhow!("failed to persist header batch: {error}"))?;
+        if committed != pending_records {
+            anyhow::bail!("committed header batch differs from its staged validation view");
         }
         Ok(imported)
     }
@@ -1075,6 +1100,9 @@ impl NodeService {
         &self,
         scheduler: &mut SyncScheduler,
     ) -> Result<usize> {
+        if self.config.shadow_sync.headers_only {
+            return Ok(0);
+        }
         let contiguous = self.shadow_sync_contiguous_body_tip(scheduler.stored_tip())?;
         if scheduler.stored_tip() != contiguous.as_ref() {
             scheduler.set_stored_tip(contiguous.clone());
@@ -1360,6 +1388,7 @@ async fn handle_peer_event(
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    headers_only: bool,
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
 ) -> Result<()> {
     match event {
@@ -1405,16 +1434,14 @@ async fn handle_peer_event(
                 // supplied batch is invalid. Otherwise a malicious peer can
                 // pin the header-request slot until the timeout fires.
                 scheduler.note_headers_response(peer, header_count);
-                let imported = import_headers_cooperatively(node, headers).await;
+                let imported = import_header_packet(node, headers).await;
                 let imported = match imported {
                     Ok(imported) => imported,
                     Err(error) => {
-                        // Header import is intentionally incremental: a valid
-                        // prefix may already be durable when a later header in
-                        // the same batch fails. Refresh the scheduler from the
-                        // durable index before disconnecting the sender so the
-                        // accepted prefix is neither forgotten nor requested
-                        // again after the peer event returns.
+                        // Header packets commit atomically. Refresh from the
+                        // unchanged durable index before disconnecting the
+                        // sender so the scheduler retries from the last
+                        // complete protocol batch.
                         {
                             let node = node.lock().await;
                             scheduler.set_best_header(node.shadow_sync_best_header_tip()?);
@@ -1456,7 +1483,7 @@ async fn handle_peer_event(
                         node.shadow_sync_header_record(&hash)?
                     };
                     match record {
-                        Some(record) => {
+                        Some(record) if !headers_only => {
                             let has_body = {
                                 let node = node.lock().await;
                                 node.shadow_sync_has_block(&hash)?
@@ -1469,6 +1496,7 @@ async fn handle_peer_event(
                                     })?;
                             }
                         }
+                        Some(_) => {}
                         None => unknown_header_seen = true,
                     }
                 }
@@ -1479,9 +1507,14 @@ async fn handle_peer_event(
             Packet::Block(block) => {
                 update_diagnostics(diagnostics, |state| {
                     state.received_blocks = state.received_blocks.saturating_add(1);
+                    if headers_only {
+                        state.rejected_messages = state.rejected_messages.saturating_add(1);
+                    }
                 })
                 .await;
-                accept_peer_block(peer, block, node, peers, validation, scheduler).await?;
+                if !headers_only {
+                    accept_peer_block(peer, block, node, peers, validation, scheduler).await?;
+                }
             }
             Packet::GetHeaders(locator) => {
                 let headers = {
@@ -1712,31 +1745,16 @@ async fn handle_peer_event(
     Ok(())
 }
 
-async fn import_headers_cooperatively(
+async fn import_header_packet(
     node: &Arc<Mutex<NodeService>>,
     headers: Vec<Header>,
 ) -> Result<Vec<HeaderRecord>> {
-    if headers.len() > hns_p2p::MAX_HEADERS {
+    if headers.len() > MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE {
         anyhow::bail!("peer sent too many headers: {}", headers.len());
     }
 
-    let mut pending = headers.into_iter();
-    let mut imported = Vec::with_capacity(pending.len());
-    while pending.len() != 0 {
-        let slice = pending
-            .by_ref()
-            .take(MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE)
-            .collect::<Vec<_>>();
-        let records = {
-            let mut node = node.lock().await;
-            node.shadow_sync_import_headers(slice)?
-        };
-        imported.extend(records);
-        if pending.len() != 0 {
-            tokio::task::yield_now().await;
-        }
-    }
-    Ok(imported)
+    let mut node = node.lock().await;
+    node.shadow_sync_import_headers(headers)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2422,6 +2440,25 @@ mod tests {
         assert!(active_without_network
             .validate(AuthorityMode::Shadow)
             .is_err());
+
+        let headers_without_network = ShadowSyncConfig {
+            headers_only: true,
+            ..ShadowSyncConfig::default()
+        };
+        assert!(headers_without_network
+            .validate(AuthorityMode::Shadow)
+            .is_err());
+
+        let headers_only_active_state = ShadowSyncConfig {
+            enabled: true,
+            headers_only: true,
+            connect_active_state: true,
+            connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+            ..ShadowSyncConfig::default()
+        };
+        assert!(headers_only_active_state
+            .validate(AuthorityMode::Shadow)
+            .is_err());
     }
 
     #[test]
@@ -2504,8 +2541,61 @@ mod tests {
             .contains("first transaction is not coinbase"));
     }
 
+    #[test]
+    fn shadow_header_slice_validation_is_atomic() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis");
+        let params = Network::Regtest.params();
+        let mut first = Header {
+            prev_block: genesis.hash,
+            time: genesis.header.time + 1,
+            bits: params.pow.bits,
+            ..Header::default()
+        };
+        while !first.verify_pow() {
+            first.nonce = first.nonce.checked_add(1).expect("regtest nonce space");
+        }
+        let first_hash = first.hash();
+        let mut invalid_second = Header {
+            prev_block: first_hash,
+            time: 0,
+            bits: params.pow.bits,
+            ..Header::default()
+        };
+        while !invalid_second.verify_pow() {
+            invalid_second.nonce = invalid_second
+                .nonce
+                .checked_add(1)
+                .expect("regtest nonce space");
+        }
+
+        service
+            .shadow_sync_import_headers(vec![first, invalid_second])
+            .expect_err("late invalid header rejects the slice");
+
+        assert_eq!(
+            service
+                .shadow_sync_best_header_tip()
+                .expect("best header")
+                .expect("tip")
+                .hash,
+            genesis.hash
+        );
+        assert_eq!(
+            service
+                .shadow_sync_header_record(&first_hash)
+                .expect("first header lookup"),
+            None
+        );
+    }
+
     #[tokio::test]
-    async fn cooperative_header_import_cancels_at_a_durable_slice_boundary() {
+    async fn maximum_header_packet_imports_as_one_durable_batch() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
@@ -2516,7 +2606,7 @@ mod tests {
         let params = Network::Regtest.params();
         let mut previous = genesis.header;
         let mut headers = Vec::new();
-        for _ in 0..MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE * 2 {
+        for _ in 0..MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE {
             let mut header = Header {
                 prev_block: previous.hash(),
                 time: previous.time + 1,
@@ -2531,19 +2621,10 @@ mod tests {
         }
         let node = Arc::new(Mutex::new(service));
 
-        {
-            let import = import_headers_cooperatively(&node, headers);
-            tokio::pin!(import);
-            let shutdown = async { tokio::task::yield_now().await };
-            tokio::pin!(shutdown);
-            tokio::select! {
-                biased;
-                _ = &mut shutdown => {}
-                result = &mut import => {
-                    panic!("header import completed before cancellation: {result:?}")
-                }
-            }
-        }
+        let imported = import_header_packet(&node, headers)
+            .await
+            .expect("maximum header packet");
+        assert_eq!(imported.len(), MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE);
 
         let node = node.lock().await;
         assert_eq!(

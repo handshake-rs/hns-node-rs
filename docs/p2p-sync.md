@@ -7,11 +7,14 @@ preserving its pre-authority status. The runtime can discover chain progress
 from explicit peers, validate and retain headers and block bodies, serve
 retained data, and resume from a durable checkpoint after restart.
 
-The default remains an **observation-only shadow path**. An explicit
-`--shadow-sync-active-state --acknowledge-incomplete-consensus` mode additionally
-connects stored bodies to active UTXO/name state in bounded atomic batches. Both
-modes are non-authoritative: shadow state cannot authorize mining templates,
-publish ASIC jobs, or mint the private mining capability.
+The default remains an **observation-only shadow path**. A
+`--shadow-sync-headers-only` qualification mode validates and durably indexes
+canonical headers without scheduling block bodies, which is useful with a
+pruned HSD reference or when proving checkpoint/deployment ancestry. An
+explicit `--shadow-sync-active-state --acknowledge-incomplete-consensus` mode
+additionally connects stored bodies to active UTXO/name state in bounded atomic
+batches. All modes are non-authoritative: shadow state cannot authorize mining
+templates, publish ASIC jobs, or mint the private mining capability.
 
 ## Runtime flow
 
@@ -139,15 +142,23 @@ maximum. Every unknown header is checked for:
 - proof of work;
 - unsigned cumulative chainwork.
 
-Valid headers are persisted individually. The next in-memory header-index view
-is published only after its matching durable batch commits. If a later header
-in one peer batch is invalid, any valid durable prefix remains accepted, the
-scheduler refreshes from durable state, and the sender is disconnected. The
-runtime imports at most 64 headers before yielding back to the supervisor; a
-shutdown may cancel the unprocessed suffix only after that durable boundary,
-and restart resumes from the accepted prefix. The durable best header may
-advance ahead of block-body availability. Equal-work branches preserve
-first-seen selection according to the existing chain-index rules.
+Valid headers are persisted in atomic protocol batches of at most 2,000. Every
+batch is contextually validated against one stable resident header-index view
+plus its earlier staged predecessors; one RocksDB batch then commits all
+records and the final best-header binding before the compact in-memory delta is
+published. A late invalid header or failed commit therefore accepts none of
+that batch. The runtime yields to the supervisor between protocol batches, so
+shutdown may cancel only a later batch and restart resumes from the last
+complete batch. The durable best header may advance ahead of block-body
+availability. Equal-work branches preserve first-seen selection according to
+the existing chain-index rules.
+
+Headers-only mode is mutually exclusive with active-state connection. Its
+diagnostic flag makes the reduced qualification scope explicit; it proves the
+header, difficulty, timestamp, checkpoint, chainwork, and canonical ancestry
+path, not block-body or state parity. Its scheduler reports `Synced` when the
+best header reaches the peer target without pretending that stored-body or
+active-state tips advanced.
 
 ## Block-body synchronization
 
@@ -303,7 +314,8 @@ instance so external evidence can distinguish observations across restarts.
 
 `observation_only` is true in the default retention mode and false only when the
 explicit active-state connector is enabled. `active_state` reports that choice.
-Neither value changes the authority mode or claims a live HSD oracle.
+`headers_only` reports the narrower no-body qualification mode. None of these
+values changes the authority mode or claims a live HSD oracle.
 
 `scripts/compare-hsrd-hsd-shadow.py` consumes those diagnostics and a pinned
 operator-selected `hsd-cli`. It compares the canonical block at height `H` and
@@ -314,6 +326,12 @@ divergence separately from unavailable/racing observations, and can maintain a
 checksummed bounded restart/reorganization evidence checkpoint. See
 [`live-shadow-parity.md`](live-shadow-parity.md).
 
+With `--headers-only`, the same runner instead compares the durable hsrd
+best-header height/hash with `getblockhash` from a coherent pinned HSD RPC
+snapshot. `--require-current-tip` additionally fails unless both heights match.
+This mode deliberately rejects `--state-file`, whose schema records active
+block/root evidence rather than header-only evidence.
+
 ## Known limitations
 
 The shadow-sync runtime does not yet provide:
@@ -323,7 +341,7 @@ The shadow-sync runtime does not yet provide:
 - durable peer scoring or bans;
 - transaction and mempool relay;
 - compact-block reconstruction;
-- historical mainnet replay qualification;
+- historical mainnet block-body and active-state replay qualification;
 - pruning-aware and sustained-reorganization IBD qualification;
 - solved-block fan-out;
 - mining authority.

@@ -2470,71 +2470,13 @@ impl NodeState {
         request: &NodeBlockImport,
         parent: Option<&HeaderRecord>,
     ) -> Result<u32> {
-        let pow = self.network.params().pow;
-        let Some(parent) = parent else {
-            return Ok(pow.bits);
-        };
-        let previous = difficulty_point(parent);
-        let reset = pow.target_reset
-            && request.block.header.time
-                > parent
-                    .header
-                    .time
-                    .saturating_add(u64::from(pow.target_spacing).saturating_mul(2));
-        if pow.no_retargeting || reset || parent.height < pow.target_window.saturating_add(2) {
-            return expected_next_bits(pow, request.block.header.time, previous, None, None)
-                .map_err(|error| anyhow::anyhow!("difficulty validation failed: {error}"));
-        }
-
-        let last = self.suitable_block(snapshot, parent)?;
-        let ancestor_height = parent
-            .height
-            .checked_sub(pow.target_window)
-            .ok_or_else(|| anyhow::anyhow!("difficulty ancestor height underflow"))?;
-        let ancestor = self.ancestor(snapshot, parent.clone(), ancestor_height)?;
-        let first = self.suitable_block(snapshot, &ancestor)?;
-        expected_next_bits(
-            pow,
-            request.block.header.time,
-            previous,
-            Some(difficulty_point(&first)),
-            Some(difficulty_point(&last)),
-        )
-        .map_err(|error| anyhow::anyhow!("difficulty validation failed: {error}"))
-    }
-
-    fn suitable_block<T: ReadSnapshot>(
-        &self,
-        snapshot: &T,
-        tip: &HeaderRecord,
-    ) -> Result<HeaderRecord> {
-        let mut z = tip.clone();
-        let mut y = self.header_parent(snapshot, &z)?;
-        let mut x = self.header_parent(snapshot, &y)?;
-        if x.header.time > z.header.time {
-            std::mem::swap(&mut x, &mut z);
-        }
-        if x.header.time > y.header.time {
-            std::mem::swap(&mut x, &mut y);
-        }
-        if y.header.time > z.header.time {
-            std::mem::swap(&mut y, &mut z);
-        }
-        Ok(y)
+        let mut lookup = |hash: &BlockHash| load_header_record(snapshot, hash);
+        expected_bits_with_lookup(self.network, request.block.header.time, parent, &mut lookup)
     }
 
     fn median_time_past<T: ReadSnapshot>(&self, snapshot: &T, tip: &HeaderRecord) -> Result<u64> {
-        let mut times = Vec::with_capacity(MEDIAN_TIMESPAN);
-        let mut record = tip.clone();
-        loop {
-            times.push(record.header.time);
-            if times.len() == MEDIAN_TIMESPAN || record.height == 0 {
-                break;
-            }
-            record = self.header_parent(snapshot, &record)?;
-        }
-        times.sort_unstable();
-        Ok(times[times.len() / 2])
+        let mut lookup = |hash: &BlockHash| load_header_record(snapshot, hash);
+        median_time_past_with_lookup(tip, &mut lookup)
     }
 
     fn deployment_state_for_block<T: ReadSnapshot>(
@@ -2641,40 +2583,13 @@ impl NodeState {
         })
     }
 
-    fn ancestor<T: ReadSnapshot>(
-        &self,
-        snapshot: &T,
-        mut record: HeaderRecord,
-        height: Height,
-    ) -> Result<HeaderRecord> {
-        if height > record.height {
-            anyhow::bail!("difficulty ancestor is above the starting header");
-        }
-        while record.height > height {
-            record = self.header_parent(snapshot, &record)?;
-        }
-        if record.height != height {
-            anyhow::bail!("difficulty ancestor chain is not contiguous");
-        }
-        Ok(record)
-    }
-
     fn header_parent<T: ReadSnapshot>(
         &self,
         snapshot: &T,
         record: &HeaderRecord,
     ) -> Result<HeaderRecord> {
-        if record.height == 0 {
-            anyhow::bail!("genesis header has no parent");
-        }
-        let parent = load_header_record(snapshot, &record.header.prev_block)?
-            .ok_or_else(|| anyhow::anyhow!("difficulty parent header is missing"))?;
-        if parent.height.checked_add(1) != Some(record.height)
-            || parent.hash != record.header.prev_block
-        {
-            anyhow::bail!("difficulty parent linkage is invalid");
-        }
-        Ok(parent)
+        let mut lookup = |hash: &BlockHash| load_header_record(snapshot, hash);
+        header_parent_with_lookup(record, &mut lookup)
     }
 
     fn commit_staged_block(
@@ -3695,6 +3610,121 @@ fn difficulty_point(record: &HeaderRecord) -> DifficultyPoint {
         bits: record.header.bits,
         chainwork: record.chainwork,
     }
+}
+
+fn header_parent_with_lookup<F>(record: &HeaderRecord, lookup: &mut F) -> Result<HeaderRecord>
+where
+    F: FnMut(&BlockHash) -> Result<Option<HeaderRecord>>,
+{
+    if record.height == 0 {
+        anyhow::bail!("genesis header has no parent");
+    }
+    let parent = lookup(&record.header.prev_block)?
+        .ok_or_else(|| anyhow::anyhow!("difficulty parent header is missing"))?;
+    if parent.height.checked_add(1) != Some(record.height)
+        || parent.hash != record.header.prev_block
+    {
+        anyhow::bail!("difficulty parent linkage is invalid");
+    }
+    Ok(parent)
+}
+
+fn ancestor_with_lookup<F>(
+    mut record: HeaderRecord,
+    height: Height,
+    lookup: &mut F,
+) -> Result<HeaderRecord>
+where
+    F: FnMut(&BlockHash) -> Result<Option<HeaderRecord>>,
+{
+    if height > record.height {
+        anyhow::bail!("difficulty ancestor is above the starting header");
+    }
+    while record.height > height {
+        record = header_parent_with_lookup(&record, lookup)?;
+    }
+    if record.height != height {
+        anyhow::bail!("difficulty ancestor chain is not contiguous");
+    }
+    Ok(record)
+}
+
+fn suitable_block_with_lookup<F>(tip: &HeaderRecord, lookup: &mut F) -> Result<HeaderRecord>
+where
+    F: FnMut(&BlockHash) -> Result<Option<HeaderRecord>>,
+{
+    let mut z = tip.clone();
+    let mut y = header_parent_with_lookup(&z, lookup)?;
+    let mut x = header_parent_with_lookup(&y, lookup)?;
+    if x.header.time > z.header.time {
+        std::mem::swap(&mut x, &mut z);
+    }
+    if x.header.time > y.header.time {
+        std::mem::swap(&mut x, &mut y);
+    }
+    if y.header.time > z.header.time {
+        std::mem::swap(&mut y, &mut z);
+    }
+    Ok(y)
+}
+
+fn median_time_past_with_lookup<F>(tip: &HeaderRecord, lookup: &mut F) -> Result<u64>
+where
+    F: FnMut(&BlockHash) -> Result<Option<HeaderRecord>>,
+{
+    let mut times = Vec::with_capacity(MEDIAN_TIMESPAN);
+    let mut record = tip.clone();
+    loop {
+        times.push(record.header.time);
+        if times.len() == MEDIAN_TIMESPAN || record.height == 0 {
+            break;
+        }
+        record = header_parent_with_lookup(&record, lookup)?;
+    }
+    times.sort_unstable();
+    Ok(times[times.len() / 2])
+}
+
+fn expected_bits_with_lookup<F>(
+    network: Network,
+    header_time: u64,
+    parent: Option<&HeaderRecord>,
+    lookup: &mut F,
+) -> Result<u32>
+where
+    F: FnMut(&BlockHash) -> Result<Option<HeaderRecord>>,
+{
+    let pow = network.params().pow;
+    let Some(parent) = parent else {
+        return Ok(pow.bits);
+    };
+    let previous = difficulty_point(parent);
+    let reset = pow.target_reset
+        && header_time
+            > parent
+                .header
+                .time
+                .saturating_add(u64::from(pow.target_spacing).saturating_mul(2));
+    if pow.no_retargeting || reset || parent.height < pow.target_window.saturating_add(2) {
+        return expected_next_bits(pow, header_time, previous, None, None)
+            .map_err(|error| anyhow::anyhow!("difficulty validation failed: {error}"));
+    }
+
+    let last = suitable_block_with_lookup(parent, lookup)?;
+    let ancestor_height = parent
+        .height
+        .checked_sub(pow.target_window)
+        .ok_or_else(|| anyhow::anyhow!("difficulty ancestor height underflow"))?;
+    let ancestor = ancestor_with_lookup(parent.clone(), ancestor_height, lookup)?;
+    let first = suitable_block_with_lookup(&ancestor, lookup)?;
+    expected_next_bits(
+        pow,
+        header_time,
+        previous,
+        Some(difficulty_point(&first)),
+        Some(difficulty_point(&last)),
+    )
+    .map_err(|error| anyhow::anyhow!("difficulty validation failed: {error}"))
 }
 
 fn current_unix_time() -> Result<u64> {
