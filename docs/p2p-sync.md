@@ -373,17 +373,20 @@ Ready peers may request:
 - block inventory following a locator;
 - retained full or compact block bodies and recent missing block transactions;
 - an empty address response;
-- bounded transaction inventory and accepted mempool transactions when the mining engine
-  is enabled.
+- bounded ordinary/airdrop inventory and accepted mempool transactions or
+  airdrop proofs when the mining engine is enabled.
 
 Serving is read-only. When explicitly enabled, ordinary peer transactions are
 admitted against one immutable active-chain UTXO/deployment/name snapshot with
 the native script verifier, HSD's minimum relay fee, deterministic name-overlay
-replay, and bounded orphan promotion. The compatibility admission API remains
-fail closed; special HSD claim/airdrop relay
-are not silently emulated. Requests are bounded below the wire protocol maxima
-to limit local work and queue occupation. Ordinary serving uses noncritical
-lanes and cannot consume solved-block publication capacity.
+replay, and bounded orphan promotion. Typed HSD airdrop packets are admitted
+against next-block airstop/hardening/GooSig flags, native proof verification,
+the durable spent-allocation field, and an unconfirmed position index; accepted
+inventory is served back through GETDATA. The compatibility admission API
+remains fail closed, and DNSSEC claim relay is still explicitly unsupported.
+Requests are bounded below the wire protocol maxima to limit local work and
+queue occupation. Mempool serving uses noncritical lanes and cannot consume
+solved-block publication capacity.
 
 ## Diagnostics
 

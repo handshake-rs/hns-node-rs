@@ -4,7 +4,7 @@ use hns_consensus::{
     block_merkle_root, block_subsidy, block_witness_root, validate_block_body, Network,
     MAX_BLOCK_OPENS, MAX_BLOCK_RENEWALS, MAX_BLOCK_SIGOPS, MAX_BLOCK_UPDATES,
 };
-use hns_mempool::{minimum_policy_fee, MempoolPackage, MempoolSnapshot};
+use hns_mempool::{minimum_policy_fee, AirdropMempoolEntry, MempoolPackage, MempoolSnapshot};
 use hns_primitives::{
     blake2b_256_many, Address, Block, Covenant, CovenantKind, Header, Input, Outpoint, Output,
     Transaction, Witness, MAX_BLOCK_WEIGHT,
@@ -85,6 +85,7 @@ pub struct TemplateBuildRequest<'a> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TemplateMetrics {
     pub transaction_count: usize,
+    pub airdrop_count: usize,
     pub selected_packages: usize,
     pub fees: u64,
     pub weight: usize,
@@ -171,11 +172,41 @@ impl TemplateAssembler {
         let mut selected = HashSet::new();
         let mut selected_transactions = Vec::new();
         let mut selected_names = HashSet::new();
+        let mut selected_airdrops = Vec::new();
         let mut metrics = TemplateMetrics {
             weight: request.policy.reserved_weight,
             sigops: request.policy.reserved_sigops,
             ..TemplateMetrics::default()
         };
+
+        let mut airdrops = request.mempool.airdrops().cloned().collect::<Vec<_>>();
+        airdrops.sort_by(|left, right| {
+            compare_fee_rates(right.fee, right.policy_size, left.fee, left.policy_size)
+                .then_with(|| left.hash.cmp(&right.hash))
+        });
+        for entry in airdrops {
+            if selected_airdrops.len() >= 10 {
+                break;
+            }
+            if metrics
+                .weight
+                .checked_add(entry.coinbase_weight)
+                .is_none_or(|weight| weight > request.policy.maximum_weight)
+                || metrics.updates.saturating_add(1) > request.policy.maximum_updates
+            {
+                continue;
+            }
+            metrics.fees = metrics
+                .fees
+                .checked_add(entry.fee)
+                .ok_or(MiningError::TemplateArithmetic)?;
+            metrics.weight = metrics
+                .weight
+                .checked_add(entry.coinbase_weight)
+                .ok_or(MiningError::TemplateArithmetic)?;
+            metrics.updates = metrics.updates.saturating_add(1);
+            selected_airdrops.push(entry);
+        }
 
         loop {
             let mut best: Option<MempoolPackage> = None;
@@ -245,6 +276,7 @@ impl TemplateAssembler {
             reward,
             request.payout_address,
             request.coinbase_flags,
+            &selected_airdrops,
         )?;
         let mut transactions = Vec::with_capacity(selected_transactions.len().saturating_add(1));
         transactions.push(coinbase);
@@ -268,6 +300,7 @@ impl TemplateAssembler {
             return Err(MiningError::InvalidTemplateBody);
         }
         metrics.transaction_count = block.transactions.len();
+        metrics.airdrop_count = selected_airdrops.len();
         metrics.weight = body.weight;
         let header = MiningHeaderTemplate {
             parent_hash: block.header.prev_block,
@@ -305,13 +338,14 @@ fn create_coinbase(
     reward: u64,
     payout_address: Address,
     coinbase_flags: Vec<u8>,
+    airdrops: &[AirdropMempoolEntry],
 ) -> Result<Transaction, MiningError> {
     if coinbase_flags.len() > hns_consensus::MAX_COINBASE_WITNESS_SIZE {
         return Err(MiningError::InvalidTemplateContext);
     }
     let sequence = u32::try_from(generation & u64::from(u32::MAX))
         .map_err(|_| MiningError::TemplateArithmetic)?;
-    Ok(Transaction {
+    let mut coinbase = Transaction {
         version: 0,
         inputs: vec![Input {
             previous_output: Outpoint::null(),
@@ -329,7 +363,43 @@ fn create_coinbase(
             },
         }],
         locktime: height,
-    })
+    };
+    for entry in airdrops {
+        let raw = entry
+            .proof
+            .encode()
+            .map_err(|_| MiningError::InvalidTemplateBody)?;
+        let address = Address::new(entry.proof.version, entry.proof.address.clone())
+            .map_err(|_| MiningError::InvalidTemplateBody)?;
+        coinbase.inputs.push(Input {
+            previous_output: Outpoint::null(),
+            sequence: u32::MAX,
+            witness: Witness { items: vec![raw] },
+        });
+        coinbase.outputs.push(Output {
+            value: entry
+                .value
+                .checked_sub(entry.fee)
+                .ok_or(MiningError::TemplateArithmetic)?,
+            address,
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        });
+    }
+    Ok(coinbase)
+}
+
+fn compare_fee_rates(
+    left_fee: u64,
+    left_size: usize,
+    right_fee: u64,
+    right_size: usize,
+) -> Ordering {
+    let left = u128::from(left_fee).saturating_mul(right_size.max(1) as u128);
+    let right = u128::from(right_fee).saturating_mul(left_size.max(1) as u128);
+    left.cmp(&right)
 }
 
 fn package_meets_fee_rate(package: &MempoolPackage, minimum_rate: u64) -> bool {
@@ -603,15 +673,16 @@ mod tests {
         transaction_weight, ConsensusError, Network, SequenceLockView, TransactionInputVerifier,
     };
     use hns_mempool::{
-        sigop_adjusted_virtual_size, standard_output_dust_threshold, Admission,
-        ContextualTransactionVerifier, MemoryMempool, Mempool, MempoolContext, MempoolView,
-        BYTES_PER_SIGOP, HSD_ABSURD_FEE_FACTOR, HSD_FREE_DECAY_SECONDS, HSD_FREE_RELAY_MULTIPLIER,
-        HSD_FREE_THRESHOLD, HSD_LIMIT_FREE_RELAY, HSD_MAX_P2WSH_PUSH, HSD_MAX_P2WSH_SIZE,
-        HSD_MAX_P2WSH_STACK, HSD_MAX_STANDARD_TX_VERSION, HSD_MAX_STANDARD_TX_WEIGHT,
-        HSD_MEMPOOL_EXPIRY_TIME, HSD_MEMPOOL_MAX_SIZE, HSD_MEMPOOL_TRIM_DENOMINATOR,
-        HSD_MEMPOOL_TRIM_NUMERATOR, HSD_MINIMUM_RELAY_FEE_RATE, MAX_TX_SIGOPS,
+        sigop_adjusted_virtual_size, standard_output_dust_threshold, Admission, AirdropAdmission,
+        AirdropMempoolContext, AirdropMempoolView, ContextualTransactionVerifier, MemoryMempool,
+        Mempool, MempoolContext, MempoolView, BYTES_PER_SIGOP, HSD_ABSURD_FEE_FACTOR,
+        HSD_FREE_DECAY_SECONDS, HSD_FREE_RELAY_MULTIPLIER, HSD_FREE_THRESHOLD,
+        HSD_LIMIT_FREE_RELAY, HSD_MAX_P2WSH_PUSH, HSD_MAX_P2WSH_SIZE, HSD_MAX_P2WSH_STACK,
+        HSD_MAX_STANDARD_TX_VERSION, HSD_MAX_STANDARD_TX_WEIGHT, HSD_MEMPOOL_EXPIRY_TIME,
+        HSD_MEMPOOL_MAX_SIZE, HSD_MEMPOOL_TRIM_DENOMINATOR, HSD_MEMPOOL_TRIM_NUMERATOR,
+        HSD_MINIMUM_RELAY_FEE_RATE, MAX_TX_SIGOPS,
     };
-    use hns_primitives::{Coin, Height, Txid};
+    use hns_primitives::{AirdropProof, Coin, Height, Txid, UnavailableAirdropSignatureVerifier};
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -632,6 +703,12 @@ mod tests {
     impl MempoolView for View {
         fn coin(&self, outpoint: &Outpoint) -> Result<Option<Coin>, ConsensusError> {
             Ok(self.coins.get(outpoint).cloned())
+        }
+    }
+
+    impl AirdropMempoolView for View {
+        fn airdrop_position_spent(&self, _position: u32) -> Result<bool, ConsensusError> {
+            Ok(false)
         }
     }
 
@@ -735,7 +812,7 @@ mod tests {
             "../../../fixtures/hsd/mining/template-v1.json"
         ))
         .expect("hsrd mining fixture");
-        assert_eq!(fixture["schema"], 5);
+        assert_eq!(fixture["schema"], 6);
         let deterministic = &fixture["deterministicCoinbase"];
         let coinbase = create_coinbase(
             u32::try_from(deterministic["height"].as_u64().expect("height"))
@@ -746,6 +823,7 @@ mod tests {
             deterministic["reward"].as_u64().expect("reward"),
             address(9),
             b"hsrd".to_vec(),
+            &[],
         )
         .expect("coinbase");
         assert_eq!(
@@ -883,6 +961,71 @@ mod tests {
         assert_eq!(dynamic["freeRelayMultiplier"], HSD_FREE_RELAY_MULTIPLIER);
         assert_eq!(dynamic["strictFreeThreshold"], true);
         assert_eq!(dynamic["strictRateLimitThreshold"], true);
+
+        let special = &fixture["specialAirdropPolicy"];
+        let proof_vector = &special["proof"];
+        let proof = AirdropProof::decode(&decode_hex(
+            proof_vector["raw"].as_str().expect("airdrop proof raw"),
+        ))
+        .expect("airdrop proof");
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            pool.submit_airdrop_with_context(
+                proof,
+                &AirdropMempoolContext {
+                    next_height: 11,
+                    transaction_start: 0,
+                    current_time: 5,
+                    airstop: false,
+                    hardening: false,
+                    goosig_disabled: false,
+                },
+                &View::default(),
+                &UnavailableAirdropSignatureVerifier,
+            )
+            .expect("airdrop admission"),
+            AirdropAdmission::Accepted(_)
+        ));
+        let entry = pool
+            .airdrop_entries()
+            .into_iter()
+            .next()
+            .expect("airdrop entry");
+        assert_eq!(
+            hns_primitives::hex_encode(&entry.hash),
+            proof_vector["hash"].as_str().expect("airdrop hash")
+        );
+        assert_eq!(entry.position as u64, proof_vector["position"]);
+        assert_eq!(entry.value, proof_vector["value"]);
+        assert_eq!(entry.fee, proof_vector["fee"]);
+        assert_eq!(entry.policy_size as u64, proof_vector["policySize"]);
+        assert_eq!(entry.memory_usage as u64, proof_vector["memoryUsage"]);
+        assert_eq!(entry.coinbase_weight as u64, proof_vector["coinbaseWeight"]);
+        let mining_snapshot = snapshot();
+        let mempool_snapshot = pool.snapshot();
+        let template = TemplateAssembler
+            .assemble(TemplateBuildRequest {
+                snapshot: &mining_snapshot,
+                mempool: &mempool_snapshot,
+                payout_address: address(9),
+                coinbase_flags: b"hsrd".to_vec(),
+                version: 1,
+                bits: 0x207f_ffff,
+                minimum_time: 101,
+                reserved_root: [0; 32],
+                mask_hash: [8; 32],
+                policy: TemplatePolicy::default(),
+            })
+            .expect("airdrop template");
+        let expected = &special["deterministicCoinbase"];
+        let coinbase = &template.transactions()[0];
+        assert_eq!(
+            hns_primitives::hex_encode(&coinbase.encode()),
+            expected["raw"].as_str().expect("airdrop coinbase raw")
+        );
+        assert_eq!(template.metrics().airdrop_count, 1);
+        assert_eq!(coinbase.outputs[0].value, expected["payoutValue"]);
+        assert_eq!(coinbase.outputs[1].value, expected["airdropValue"]);
     }
 
     #[test]

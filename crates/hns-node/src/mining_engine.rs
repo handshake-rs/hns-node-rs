@@ -10,8 +10,8 @@ use hns_consensus::{
     ScriptFlags, SequenceLockView, WitnessProgramVerifier, MEDIAN_TIMESPAN,
 };
 use hns_mempool::{
-    ContextualTransactionVerifier, Mempool, MempoolContext, MempoolInfo, MempoolLimits,
-    MempoolView, HSD_MINIMUM_RELAY_FEE_RATE,
+    AirdropAdmission, AirdropMempoolContext, AirdropMempoolView, ContextualTransactionVerifier,
+    Mempool, MempoolContext, MempoolInfo, MempoolLimits, MempoolView, HSD_MINIMUM_RELAY_FEE_RATE,
 };
 use hns_mining::{
     MiningTemplate, PreparedMiningJob, SolvedBlockPublicationIntent, SolvedMiningCandidate,
@@ -19,8 +19,10 @@ use hns_mining::{
     PUBLICATION_KEY_PREFIX,
 };
 use hns_p2p::{BroadcastReport, LivePeerManager, Packet};
-use hns_primitives::{Address, BlockHash, Coin, Height, Outpoint, Transaction};
-use hns_state::{decode_coin, encode_outpoint_key, verify_mempool_name_context};
+use hns_primitives::{Address, AirdropProof, BlockHash, Coin, Height, Outpoint, Transaction};
+use hns_state::{
+    airdrop_position_spent, decode_coin, encode_outpoint_key, verify_mempool_name_context,
+};
 use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,13 @@ impl<T: ReadSnapshot> MempoolView for ActiveMempoolView<'_, T> {
     }
 }
 
+impl<T: ReadSnapshot> AirdropMempoolView for ActiveMempoolView<'_, T> {
+    fn airdrop_position_spent(&self, position: u32) -> Result<bool, ConsensusError> {
+        airdrop_position_spent(self.snapshot, position)
+            .map_err(|error| ConsensusError::View(error.to_string()))
+    }
+}
+
 struct ActiveContextualTransactionVerifier<'a, T> {
     snapshot: &'a T,
     network: Network,
@@ -170,6 +179,29 @@ fn active_mempool_parameters<T: ReadSnapshot>(
         },
         deployments.name_flags,
     )))
+}
+
+fn active_airdrop_parameters<T: ReadSnapshot>(
+    state: &super::NodeState,
+    network: Network,
+    snapshot: &T,
+) -> Result<Option<AirdropMempoolContext>> {
+    let Some(tip) = super::best_block_tip_from_snapshot(snapshot)? else {
+        return Ok(None);
+    };
+    let next_height = tip
+        .height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("active-chain height exhausted"))?;
+    let deployments = state.deployment_state_for_block(snapshot, next_height, tip.hash)?;
+    Ok(Some(AirdropMempoolContext {
+        next_height,
+        transaction_start: network.params().tx_start,
+        current_time: super::current_unix_time()?,
+        airstop: deployments.has_airstop,
+        hardening: deployments.name_flags.contains(NameFlags::HARDENED),
+        goosig_disabled: next_height >= network.params().goosig_stop,
+    }))
 }
 
 fn active_mempool_input_verifier() -> Result<WitnessProgramVerifier<NativeSignatureVerifier>> {
@@ -353,10 +385,8 @@ impl NodeService {
             blockers.push("no mining-authority permit is available".to_owned());
         }
         if self.config.mining_engine.transaction_relay {
-            blockers.push(
-                "transaction relay is limited to ordinary transactions until HSD standardness and claim/airdrop relay parity are complete"
-                    .to_owned(),
-            );
+            blockers
+                .push("transaction relay does not yet admit or mine HSD DNSSEC claims".to_owned());
         }
         blockers.sort();
         blockers.dedup();
@@ -508,7 +538,8 @@ impl NodeService {
                 name_flags,
             };
             let input_verifier = active_mempool_input_verifier()?;
-            self.state
+            let mut revalidation = self
+                .state
                 .mempool
                 .reconcile_chain_transition_with_context(
                     connected_transactions,
@@ -518,7 +549,28 @@ impl NodeService {
                     &input_verifier,
                     &contextual_verifier,
                 )
-                .map_err(|error| anyhow::anyhow!("post-connect revalidation failed: {error}"))
+                .map_err(|error| anyhow::anyhow!("post-connect revalidation failed: {error}"))?;
+            let airdrop_context =
+                active_airdrop_parameters(&self.state, self.config.network, &snapshot)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("connected chain has no airdrop mempool context")
+                    })?;
+            if self
+                .state
+                .mempool
+                .reconcile_airdrops_with_context(
+                    disconnected_transactions,
+                    &airdrop_context,
+                    &view,
+                    &self.airdrop_signatures,
+                )
+                .map_err(|error| anyhow::anyhow!("airdrop revalidation failed: {error}"))?
+            {
+                revalidation.changed = true;
+                revalidation.retained_airdrops = self.state.mempool.info().airdrop_count;
+                revalidation.generation = self.state.mempool.info().generation;
+            }
+            Ok(revalidation)
         })();
         let revalidation = match revalidation {
             Ok(revalidation) => revalidation,
@@ -552,12 +604,16 @@ impl NodeService {
     }
 
     pub fn mining_engine_mempool_inventory(&self, maximum: usize) -> Vec<hns_p2p::Inventory> {
-        self.state
-            .mempool
-            .snapshot()
+        let snapshot = self.state.mempool.snapshot();
+        snapshot
             .txids()
-            .take(maximum)
             .map(hns_p2p::Inventory::transaction)
+            .chain(
+                snapshot
+                    .airdrops()
+                    .map(|entry| hns_p2p::Inventory::airdrop(entry.hash)),
+            )
+            .take(maximum)
             .collect()
     }
 
@@ -566,6 +622,10 @@ impl NodeService {
         txid: &hns_primitives::Txid,
     ) -> Option<hns_primitives::Transaction> {
         self.state.mempool.transaction(txid).cloned()
+    }
+
+    pub fn mining_engine_mempool_airdrop(&self, hash: &[u8; 32]) -> Option<AirdropProof> {
+        self.state.mempool.airdrop(hash).cloned()
     }
 
     pub(crate) fn mining_engine_mempool_transactions(
@@ -633,6 +693,50 @@ impl NodeService {
                     .mempool_reconciled(durable.generation, mempool_generation)
                     .map_err(|error| {
                         anyhow::anyhow!("failed to publish mempool admission: {error}")
+                    })?;
+            }
+        }
+        Ok(admission)
+    }
+
+    /// Admit a peer airdrop/faucet proof against the same immutable active
+    /// snapshot used by templates and the durable allocation bitfield.
+    pub fn mining_engine_accept_peer_airdrop(
+        &mut self,
+        proof: AirdropProof,
+    ) -> Result<AirdropAdmission> {
+        if !self.config.mining_engine.enabled || !self.config.mining_engine.transaction_relay {
+            return Ok(AirdropAdmission::Rejected {
+                reason: "mining_engine-transaction-relay-disabled".to_owned(),
+            });
+        }
+        let snapshot = self
+            .state
+            .store
+            .snapshot()
+            .context("failed to open active airdrop mempool context")?;
+        let Some(context) = active_airdrop_parameters(&self.state, self.config.network, &snapshot)?
+        else {
+            return Ok(AirdropAdmission::Rejected {
+                reason: "active-chain-context-unavailable".to_owned(),
+            });
+        };
+        let view = ActiveMempoolView::new(&snapshot);
+        let admission = self
+            .state
+            .mempool
+            .submit_airdrop_with_context(proof, &context, &view, &self.airdrop_signatures)
+            .map_err(|error| anyhow::anyhow!("peer airdrop admission failed: {error}"))?;
+        drop(snapshot);
+        if matches!(admission, AirdropAdmission::Accepted(_)) {
+            self.mining_engine_template_cache().clear();
+            let durable = self.state.durable_mining_state()?;
+            let mempool_generation = self.state.mempool.info().generation;
+            if durable.generation > 0 && mempool_generation > 0 {
+                self.mining_events
+                    .mempool_reconciled(durable.generation, mempool_generation)
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to publish airdrop mempool admission: {error}")
                     })?;
             }
         }

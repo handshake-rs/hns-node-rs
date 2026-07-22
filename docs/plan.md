@@ -140,6 +140,9 @@ reserved low-latency paths.
   generations.
 - HSD-derived subsidy, deterministic coinbase, and mempool sigop-policy
   fixtures.
+- Typed HSD airdrop wire/inventory serving, native deployment/bitfield-aware
+  proof admission, connected/disconnected reconciliation, fee-rate ranking,
+  and exact ten-proof coinbase/template assembly.
 - Versioned and checksummed durable publication intents.
 - Local candidate admission before network publication.
 - Parallel critical fan-out with writer-completion acknowledgment and retry only for locally accepted active blocks.

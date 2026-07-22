@@ -395,9 +395,10 @@
       "tags": [
         "p2p",
         "wire",
+        "airdrop",
         "oracle"
       ],
-      "blake2b256": "35f47939448703181c84b4ca7c2f0256a16b5ad0b63d28c043c68eb4faa82dd6"
+      "blake2b256": "18a4a459e1637ad6e894d6653046f4cbf0ac973c5185b99942110576c3965e72"
     },
     {
       "id": "mining-template-v1",
@@ -422,9 +423,11 @@
         "descendant-package",
         "free-priority",
         "rate-limiting",
+        "airdrop",
+        "special-coinbase",
         "oracle"
       ],
-      "blake2b256": "8165136bbba0b925161e7bee8a47875ea0f593d97987e7822a0b225791802702"
+      "blake2b256": "18fb7fa5eaf3e8888a4ef30efd52874c156717f38bfaa89a73b6641bc17b35a4"
     }
   ]
 }

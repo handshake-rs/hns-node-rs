@@ -1654,6 +1654,18 @@ fn airdrop_mask(position: u32) -> Result<(usize, u8), StateError> {
     Ok((position >> 3, 1 << (7 - (position & 7))))
 }
 
+/// Read one allocation bit from the immutable active-chain snapshot. This is
+/// the storage-backed half of special airdrop mempool admission; the pool owns
+/// a second in-memory position index for unconfirmed proofs.
+pub fn airdrop_position_spent<T: ReadSnapshot>(
+    snapshot: &T,
+    position: u32,
+) -> Result<bool, StateError> {
+    let field = load_airdrop_field(snapshot)?;
+    let (byte, mask) = airdrop_mask(position)?;
+    Ok(field[byte] & mask != 0)
+}
+
 fn stage_airdrop_positions<T: ReadSnapshot, B: WriteBatch>(
     snapshot: &T,
     batch: &mut B,

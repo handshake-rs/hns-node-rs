@@ -21,7 +21,7 @@ use hns_consensus::{
     validate_transaction_start, ConsensusParams, DeploymentState, HeaderConsensus, HeaderParent,
     HeaderValidationContext, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
 };
-use hns_mempool::Admission;
+use hns_mempool::{Admission, AirdropAdmission};
 use hns_p2p::{
     normalize_peer_ip, peer_address_group, CompactBlock, CompactBlockError,
     CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse, Inventory,
@@ -346,6 +346,9 @@ pub struct ShadowSyncDiagnostics {
     pub received_transactions: u64,
     pub served_transactions: u64,
     pub rejected_transactions: u64,
+    pub received_airdrops: u64,
+    pub served_airdrops: u64,
+    pub rejected_airdrops: u64,
     pub served_mempool_inventories: u64,
     pub rejected_messages: u64,
     pub last_error: Option<String>,
@@ -2804,7 +2807,40 @@ async fn handle_peer_event(
             }
             Packet::Inv(items) => {
                 let mut unknown_header_seen = false;
+                let mut relay_requests = Vec::new();
+                let mut relay_seen = HashSet::new();
                 for item in items {
+                    if matches!(
+                        item.kind,
+                        InventoryKind::Transaction | InventoryKind::Airdrop
+                    ) {
+                        if relay_seen.len() >= MAX_GETDATA_ITEMS || !relay_seen.insert(item.clone())
+                        {
+                            continue;
+                        }
+                        let missing = {
+                            let node = node.lock().await;
+                            if !node.config.mining_engine.enabled
+                                || !node.config.mining_engine.transaction_relay
+                            {
+                                false
+                            } else {
+                                match item.kind {
+                                    InventoryKind::Transaction => node
+                                        .mining_engine_mempool_transaction(&Txid::new(item.hash))
+                                        .is_none(),
+                                    InventoryKind::Airdrop => {
+                                        node.mining_engine_mempool_airdrop(&item.hash).is_none()
+                                    }
+                                    _ => false,
+                                }
+                            }
+                        };
+                        if missing {
+                            relay_requests.push(item);
+                        }
+                        continue;
+                    }
                     if !matches!(
                         item.kind,
                         InventoryKind::Block
@@ -2838,6 +2874,18 @@ async fn handle_peer_event(
                 }
                 if unknown_header_seen {
                     request_headers_from_peer(peer, node, peers, scheduler).await?;
+                }
+                if !relay_requests.is_empty() {
+                    peers
+                        .try_send(
+                            peer,
+                            Arc::new(Packet::GetData(relay_requests)),
+                            OutboundPriority::Control,
+                        )
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to request relayed mempool item: {error}")
+                        })?;
                 }
             }
             Packet::Block(block) => {
@@ -2939,6 +2987,38 @@ async fn handle_peer_event(
                                     update_diagnostics(diagnostics, |state| {
                                         state.served_transactions =
                                             state.served_transactions.saturating_add(1);
+                                    })
+                                    .await;
+                                }
+                                None => not_found.push(item),
+                            }
+                        }
+                        InventoryKind::Airdrop => {
+                            let proof = {
+                                let node = node.lock().await;
+                                if node.config.mining_engine.enabled
+                                    && node.config.mining_engine.transaction_relay
+                                {
+                                    node.mining_engine_mempool_airdrop(&item.hash)
+                                } else {
+                                    None
+                                }
+                            };
+                            match proof {
+                                Some(proof) => {
+                                    peers
+                                        .try_send(
+                                            peer,
+                                            Arc::new(Packet::Airdrop(proof)),
+                                            OutboundPriority::Normal,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            anyhow::anyhow!("failed to serve airdrop: {error}")
+                                        })?;
+                                    update_diagnostics(diagnostics, |state| {
+                                        state.served_airdrops =
+                                            state.served_airdrops.saturating_add(1);
                                     })
                                     .await;
                                 }
@@ -3116,6 +3196,36 @@ async fn handle_peer_event(
                     }
                     Admission::Orphan(txid) => {
                         tracing::debug!(?peer, txid = %txid.to_hex(), "peer transaction retained as orphan");
+                    }
+                }
+            }
+            Packet::Airdrop(proof) => {
+                update_diagnostics(diagnostics, |state| {
+                    state.received_airdrops = state.received_airdrops.saturating_add(1);
+                })
+                .await;
+                let admission = {
+                    let mut node = node.lock().await;
+                    node.mining_engine_accept_peer_airdrop(proof)?
+                };
+                match admission {
+                    AirdropAdmission::Accepted(hash) => {
+                        let report = peers
+                            .broadcast(
+                                Arc::new(Packet::Inv(vec![Inventory::airdrop(hash)])),
+                                OutboundPriority::Normal,
+                            )
+                            .await;
+                        if report.failed.len() == report.attempted && report.attempted > 0 {
+                            tracing::debug!(?peer, "airdrop inventory relay reached no peer queue");
+                        }
+                    }
+                    AirdropAdmission::Rejected { reason } => {
+                        update_diagnostics(diagnostics, |state| {
+                            state.rejected_airdrops = state.rejected_airdrops.saturating_add(1);
+                        })
+                        .await;
+                        tracing::debug!(?peer, %reason, "peer airdrop rejected");
                     }
                 }
             }

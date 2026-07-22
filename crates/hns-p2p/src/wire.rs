@@ -5,7 +5,7 @@ use std::{
 
 use hns_consensus::Network;
 use hns_primitives::{
-    blake2b_256_many, Block, BlockHash, Header, Reader, Transaction, Txid, Writer,
+    blake2b_256_many, AirdropProof, Block, BlockHash, Header, Reader, Transaction, Txid, Writer,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -217,6 +217,20 @@ impl Inventory {
         Self {
             kind: InventoryKind::Transaction,
             hash: txid.into_inner(),
+        }
+    }
+
+    pub const fn claim(hash: [u8; 32]) -> Self {
+        Self {
+            kind: InventoryKind::Claim,
+            hash,
+        }
+    }
+
+    pub const fn airdrop(hash: [u8; 32]) -> Self {
+        Self {
+            kind: InventoryKind::Airdrop,
+            hash,
         }
     }
 
@@ -1091,6 +1105,7 @@ pub enum Packet {
     SendHeaders,
     Block(Block),
     Tx(Transaction),
+    Airdrop(AirdropProof),
     Reject(RejectPacket),
     Mempool,
     FeeFilter(i64),
@@ -1125,6 +1140,7 @@ impl Packet {
             Self::SendHeaders => PacketType::SendHeaders,
             Self::Block(_) => PacketType::Block,
             Self::Tx(_) => PacketType::Tx,
+            Self::Airdrop(_) => PacketType::Airdrop,
             Self::Reject(_) => PacketType::Reject,
             Self::Mempool => PacketType::Mempool,
             Self::FeeFilter(_) => PacketType::FeeFilter,
@@ -1185,6 +1201,11 @@ impl Packet {
             }
             Self::Block(block) => writer.write_bytes(&block.encode()),
             Self::Tx(transaction) => writer.write_bytes(&transaction.encode()),
+            Self::Airdrop(proof) => writer.write_bytes(
+                &proof
+                    .encode()
+                    .map_err(|error| P2pError::MalformedPacket(error.to_string()))?,
+            ),
             Self::Reject(packet) => {
                 if packet.reason.len() > MAX_REJECT_REASON_SIZE || !packet.reason.is_ascii() {
                     return Err(P2pError::MalformedPacket(
@@ -1310,6 +1331,11 @@ impl Packet {
                     .map(Self::Tx)
                     .map_err(|error| P2pError::MalformedPacket(error.to_string()));
             }
+            PacketType::Airdrop => {
+                return AirdropProof::decode(payload)
+                    .map(Self::Airdrop)
+                    .map_err(|error| P2pError::MalformedPacket(error.to_string()));
+            }
             PacketType::Reject => {
                 let message = PacketType::from_u8(primitive(reader.read_u8())?);
                 let code = primitive(reader.read_u8())?;
@@ -1346,7 +1372,6 @@ impl Packet {
             | PacketType::GetProof
             | PacketType::Proof
             | PacketType::Claim
-            | PacketType::Airdrop
             | PacketType::Unknown(_) => {
                 return Ok(Self::Unknown {
                     packet_type,
@@ -1968,6 +1993,14 @@ mod tests {
                 let request = CompactBlockRequest::from_block(&block, vec![1, 2]);
                 Packet::BlockTxn(CompactBlockResponse::from_block(&block, &request))
             }
+            "airdrop-regtest" => {
+                let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../fixtures/hsd/airdrops/codec-v1.json"
+                ))
+                .expect("airdrop fixture");
+                let raw = decode_hex(fixture["faucet"]["raw"].as_str().expect("faucet raw"));
+                Packet::Airdrop(AirdropProof::decode(&raw).expect("faucet proof"))
+            }
             other => panic!("unhandled oracle packet {other}"),
         }
     }
@@ -1980,6 +2013,29 @@ mod tests {
             "simnet" => NetworkMagic::Simnet,
             other => panic!("unknown oracle network {other}"),
         }
+    }
+
+    #[test]
+    fn airdrop_packet_uses_the_exact_hsd_proof_payload() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        let raw = decode_hex(fixture["faucet"]["raw"].as_str().expect("faucet raw"));
+        let proof = AirdropProof::decode(&raw).expect("faucet proof");
+        let packet = Packet::Airdrop(proof.clone());
+        assert_eq!(packet.packet_type(), PacketType::Airdrop);
+        assert_eq!(packet.encode_payload().expect("airdrop payload"), raw);
+        assert_eq!(
+            Packet::decode(PacketType::Airdrop, &raw).expect("airdrop packet"),
+            Packet::Airdrop(proof.clone())
+        );
+        let inventory = Inventory::airdrop(proof.hash().expect("airdrop hash"));
+        assert_eq!(inventory.kind, InventoryKind::Airdrop);
+        assert_eq!(inventory.hash, proof.hash().expect("airdrop hash"));
+
+        let mut trailing = raw;
+        trailing.push(0);
+        assert!(Packet::decode(PacketType::Airdrop, &trailing).is_err());
     }
 
     #[test]
@@ -2025,6 +2081,7 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../fixtures/hsd/p2p/wire-v1.json"))
                 .expect("hsrd p2p wire fixture");
+        assert_eq!(fixture["schema"], 2);
         for case in fixture["frames"].as_array().expect("frame cases") {
             let id = case["id"].as_str().expect("frame id");
             let network = oracle_network(case["network"].as_str().expect("network"));

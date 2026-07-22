@@ -11,12 +11,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use hns_consensus::{
     is_coinbase, is_final_transaction, transaction_sigops, transaction_weight,
-    validate_transaction_sanity, verify_sequence_locks, verify_transaction_covenant_links,
-    ConsensusError, SequenceLockView, TransactionInputVerifier, COIN, MAX_BLOCK_SIGOPS,
-    WITNESS_SCALE_FACTOR,
+    validate_transaction_sanity, verify_airdrop_output, verify_sequence_locks,
+    verify_transaction_covenant_links, AirdropFlags, ConsensusError, SequenceLockView,
+    TransactionInputVerifier, COIN, MAX_BLOCK_SIGOPS, WITNESS_SCALE_FACTOR,
 };
 use hns_primitives::{
-    Amount, Coin, CovenantKind, Height, Outpoint, Output, Transaction, Txid, MAX_BLOCK_WEIGHT,
+    Address, AirdropProof, AirdropSignatureVerifier, Amount, Coin, Covenant, CovenantKind, Height,
+    Outpoint, Output, Transaction, Txid, MAX_BLOCK_WEIGHT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -384,6 +385,43 @@ pub trait MempoolView: SequenceLockView {
     fn coin(&self, outpoint: &Outpoint) -> Result<Option<Coin>, ConsensusError>;
 }
 
+/// Durable active-chain lookup required by airdrop admission. The pool keeps
+/// its own position index; this view prevents reusing allocations already
+/// consumed by the active chain.
+pub trait AirdropMempoolView {
+    fn airdrop_position_spent(&self, position: u32) -> Result<bool, ConsensusError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AirdropMempoolContext {
+    pub next_height: Height,
+    pub transaction_start: Height,
+    pub current_time: u64,
+    pub airstop: bool,
+    pub hardening: bool,
+    pub goosig_disabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AirdropMempoolEntry {
+    pub hash: [u8; 32],
+    pub position: u32,
+    pub value: Amount,
+    pub fee: Amount,
+    pub policy_size: usize,
+    pub coinbase_weight: usize,
+    pub memory_usage: usize,
+    pub admitted_at: u64,
+    pub sequence: u64,
+    pub proof: AirdropProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AirdropAdmission {
+    Accepted([u8; 32]),
+    Rejected { reason: String },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolEntry {
     pub txid: Txid,
@@ -418,6 +456,7 @@ impl MempoolEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolInfo {
     pub transaction_count: usize,
+    pub airdrop_count: usize,
     pub bytes: usize,
     pub total_fee: Amount,
     pub orphan_count: usize,
@@ -440,6 +479,7 @@ pub struct MempoolRevalidation {
     pub promoted_orphans: usize,
     pub retained_transactions: usize,
     pub retained_orphans: usize,
+    pub retained_airdrops: usize,
     pub generation: u64,
 }
 
@@ -480,6 +520,7 @@ pub struct MempoolSnapshot {
     transactions: BTreeMap<Txid, Transaction>,
     parents: BTreeMap<Txid, BTreeSet<Txid>>,
     exclusive_names: BTreeMap<Txid, Vec<[u8; 32]>>,
+    airdrops: BTreeMap<[u8; 32], AirdropMempoolEntry>,
 }
 
 impl MempoolSnapshot {
@@ -505,6 +546,14 @@ impl MempoolSnapshot {
 
     pub fn txids(&self) -> impl Iterator<Item = Txid> + '_ {
         self.entries.keys().copied()
+    }
+
+    pub fn airdrop(&self, hash: &[u8; 32]) -> Option<&AirdropMempoolEntry> {
+        self.airdrops.get(hash)
+    }
+
+    pub fn airdrops(&self) -> impl Iterator<Item = &AirdropMempoolEntry> {
+        self.airdrops.values()
     }
 
     pub fn package_for(
@@ -637,6 +686,8 @@ pub struct MemoryMempool {
     children: HashMap<Txid, BTreeSet<Txid>>,
     exclusive_names: HashMap<Txid, Vec<[u8; 32]>>,
     exclusive_name_owners: HashMap<[u8; 32], Txid>,
+    airdrops: HashMap<[u8; 32], AirdropMempoolEntry>,
+    airdrop_positions: HashMap<u32, [u8; 32]>,
     bytes: usize,
     orphan_bytes: usize,
     free_count: f64,
@@ -668,6 +719,8 @@ impl MemoryMempool {
             children: HashMap::new(),
             exclusive_names: HashMap::new(),
             exclusive_name_owners: HashMap::new(),
+            airdrops: HashMap::new(),
+            airdrop_positions: HashMap::new(),
             bytes: 0,
             orphan_bytes: 0,
             free_count: 0.0,
@@ -683,6 +736,16 @@ impl MemoryMempool {
 
     pub fn transaction(&self, txid: &Txid) -> Option<&Transaction> {
         self.transactions.get(txid)
+    }
+
+    pub fn airdrop(&self, hash: &[u8; 32]) -> Option<&AirdropProof> {
+        self.airdrops.get(hash).map(|entry| &entry.proof)
+    }
+
+    pub fn airdrop_entries(&self) -> Vec<AirdropMempoolEntry> {
+        let mut entries = self.airdrops.values().cloned().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (entry.sequence, entry.hash));
+        entries
     }
 
     pub fn orphan(&self, txid: &Txid) -> Option<&Transaction> {
@@ -722,7 +785,250 @@ impl MemoryMempool {
                 .iter()
                 .map(|(txid, names)| (*txid, names.clone()))
                 .collect(),
+            airdrops: self
+                .airdrops
+                .iter()
+                .map(|(hash, entry)| (*hash, entry.clone()))
+                .collect(),
         }
+    }
+
+    /// Admit one HSD airdrop/faucet proof against the active deployment flags
+    /// and durable allocation bitfield. Proofs are indexed independently from
+    /// ordinary transactions because they become coinbase inputs rather than
+    /// standalone transactions.
+    pub fn submit_airdrop_with_context<V: AirdropMempoolView>(
+        &mut self,
+        proof: AirdropProof,
+        context: &AirdropMempoolContext,
+        view: &V,
+        signatures: &dyn AirdropSignatureVerifier,
+    ) -> Result<AirdropAdmission, MempoolError> {
+        if context.next_height < context.transaction_start {
+            return Ok(rejected_airdrop("no-tx-allowed-yet"));
+        }
+        let raw = proof
+            .encode()
+            .map_err(|error| MempoolError::Consensus(error.to_string()))?;
+        let hash = proof
+            .hash()
+            .map_err(|error| MempoolError::Consensus(error.to_string()))?;
+        if self.airdrops.contains_key(&hash) || self.entries.contains_key(&Txid::new(hash)) {
+            return Ok(rejected_airdrop("txn-already-in-mempool"));
+        }
+        if !proof.is_sane() {
+            return Ok(rejected_airdrop("bad-airdrop-proof"));
+        }
+        if context.airstop {
+            return Ok(rejected_airdrop("bad-airdrop-disabled"));
+        }
+        if context.goosig_disabled {
+            match proof.key() {
+                Ok(key) if key.is_goo() => {
+                    return Ok(rejected_airdrop("bad-goosig-disabled"));
+                }
+                Err(_) => return Ok(rejected_airdrop("bad-airdrop-proof")),
+                _ => {}
+            }
+        }
+
+        let position = proof
+            .position()
+            .map_err(|error| MempoolError::Consensus(error.to_string()))?;
+        if view
+            .airdrop_position_spent(position)
+            .map_err(|error| MempoolError::View(error.to_string()))?
+        {
+            return Ok(rejected_airdrop("bad-txns-inputs-missingorspent"));
+        }
+        if self.airdrop_positions.contains_key(&position) {
+            return Ok(rejected_airdrop("position-already-in-mempool"));
+        }
+        if context.hardening && proof.key().is_ok_and(|key| key.is_weak()) {
+            return Ok(rejected_airdrop("bad-airdrop-rsa1024"));
+        }
+
+        let address = match Address::new(proof.version, proof.address.clone()) {
+            Ok(address) => address,
+            Err(_) => return Ok(rejected_airdrop("bad-airdrop-proof")),
+        };
+        let output = Output {
+            value: proof.value().saturating_sub(proof.fee),
+            address,
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        };
+        let verified = match verify_airdrop_output(
+            &raw,
+            &output,
+            AirdropFlags {
+                airstop: context.airstop,
+                hardening: context.hardening,
+                goosig_disabled: context.goosig_disabled,
+            },
+            signatures,
+        ) {
+            Ok(verified) => verified,
+            Err(_) => return Ok(rejected_airdrop("bad-airdrop-proof")),
+        };
+        if verified.position != position {
+            return Err(MempoolError::Consensus(
+                "verified airdrop position changed during admission".to_owned(),
+            ));
+        }
+
+        let memory_usage = 300usize
+            .checked_add(raw.len())
+            .ok_or(MempoolError::WeightOverflow)?;
+        let projected_bytes = self
+            .bytes
+            .checked_add(memory_usage)
+            .ok_or(MempoolError::WeightOverflow)?;
+        let policy_size = raw.len().div_ceil(WITNESS_SCALE_FACTOR);
+        let coinbase_weight = airdrop_coinbase_weight(raw.len(), &output);
+        let sequence = self.take_sequence();
+        self.airdrop_positions.insert(position, hash);
+        self.airdrops.insert(
+            hash,
+            AirdropMempoolEntry {
+                hash,
+                position,
+                value: verified.value,
+                fee: proof.fee,
+                policy_size,
+                coinbase_weight,
+                memory_usage,
+                admitted_at: context.current_time,
+                sequence,
+                proof,
+            },
+        );
+        self.bytes = projected_bytes;
+        self.advance_generation();
+        if !self.limit_size_airdrop(hash, context.current_time) {
+            return Ok(rejected_airdrop("mempool-full"));
+        }
+        Ok(AirdropAdmission::Accepted(hash))
+    }
+
+    /// Revalidate retained proofs after an active-chain transition. Connected
+    /// coinbases are removed by `remove_confirmed`; this pass applies changed
+    /// deployment flags and the newly committed durable allocation field.
+    pub fn revalidate_airdrops_with_context<V: AirdropMempoolView>(
+        &mut self,
+        context: &AirdropMempoolContext,
+        view: &V,
+        signatures: &dyn AirdropSignatureVerifier,
+    ) -> Result<bool, MempoolError> {
+        let before_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
+        let mut invalid = Vec::new();
+        for entry in self.airdrops.values() {
+            let proof = &entry.proof;
+            let invalid_context = context.next_height < context.transaction_start
+                || context.airstop
+                || view
+                    .airdrop_position_spent(entry.position)
+                    .map_err(|error| MempoolError::View(error.to_string()))?;
+            let valid_proof = if invalid_context {
+                false
+            } else {
+                let address = Address::new(proof.version, proof.address.clone());
+                address.is_ok_and(|address| {
+                    let output = Output {
+                        value: proof.value().saturating_sub(proof.fee),
+                        address,
+                        covenant: Covenant {
+                            kind: CovenantKind::None,
+                            items: Vec::new(),
+                        },
+                    };
+                    proof.encode().is_ok_and(|raw| {
+                        verify_airdrop_output(
+                            &raw,
+                            &output,
+                            AirdropFlags {
+                                airstop: context.airstop,
+                                hardening: context.hardening,
+                                goosig_disabled: context.goosig_disabled,
+                            },
+                            signatures,
+                        )
+                        .is_ok_and(|verified| verified.position == entry.position)
+                    })
+                })
+            };
+            if !valid_proof {
+                invalid.push(entry.hash);
+            }
+        }
+        for hash in &invalid {
+            self.remove_airdrop_without_generation(hash);
+        }
+        let before_limit = self.airdrops.len();
+        self.enforce_size_limit(context.current_time);
+        let changed = !invalid.is_empty()
+            || self.airdrops.len() != before_limit
+            || self.entries.keys().copied().collect::<BTreeSet<_>>() != before_transactions;
+        if changed {
+            self.advance_generation();
+        }
+        Ok(changed)
+    }
+
+    /// Reconcile the special pool after a reorganization. Proofs recovered
+    /// from disconnected coinbases are considered after the durable bitfield
+    /// has been rewound and before templates observe the new generation.
+    pub fn reconcile_airdrops_with_context<V: AirdropMempoolView>(
+        &mut self,
+        disconnected_transactions: &[Transaction],
+        context: &AirdropMempoolContext,
+        view: &V,
+        signatures: &dyn AirdropSignatureVerifier,
+    ) -> Result<bool, MempoolError> {
+        let before = self.airdrops.keys().copied().collect::<BTreeSet<_>>();
+        let before_generation = self.generation;
+        self.revalidate_airdrops_with_context(context, view, signatures)?;
+        for coinbase in disconnected_transactions
+            .iter()
+            .filter(|transaction| is_coinbase(transaction))
+        {
+            for (index, input) in coinbase.inputs.iter().enumerate().skip(1) {
+                if coinbase
+                    .outputs
+                    .get(index)
+                    .is_none_or(|output| output.covenant.kind != CovenantKind::None)
+                {
+                    continue;
+                }
+                let Some(raw) = input.witness.items.first() else {
+                    continue;
+                };
+                let Ok(proof) = AirdropProof::decode(raw) else {
+                    continue;
+                };
+                let hash = proof
+                    .hash()
+                    .map_err(|error| MempoolError::Consensus(error.to_string()))?;
+                let position = proof
+                    .position()
+                    .map_err(|error| MempoolError::Consensus(error.to_string()))?;
+                if self.airdrops.contains_key(&hash) {
+                    continue;
+                }
+                if let Some(conflict) = self.airdrop_positions.get(&position).copied() {
+                    self.remove_airdrop_without_generation(&conflict);
+                }
+                let _ = self.submit_airdrop_with_context(proof, context, view, signatures)?;
+            }
+        }
+        let after = self.airdrops.keys().copied().collect::<BTreeSet<_>>();
+        let changed = before != after || self.generation != before_generation;
+        if changed && self.generation == before_generation {
+            self.advance_generation();
+        }
+        Ok(changed)
     }
 
     pub fn submit_with_context<V: MempoolView>(
@@ -784,6 +1090,7 @@ impl MemoryMempool {
     ) -> Result<MempoolRevalidation, MempoolError> {
         let previous_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
         let previous_orphans = self.orphans.keys().copied().collect::<BTreeSet<_>>();
+        let previous_airdrops = self.airdrops.keys().copied().collect::<BTreeSet<_>>();
         let previous_generation = self.generation;
 
         let connected_txids = connected_transactions
@@ -855,6 +1162,12 @@ impl MemoryMempool {
         let mut rebuilt = Self::with_limits(self.limits.clone())?;
         rebuilt.free_count = self.free_count;
         rebuilt.last_free_time = self.last_free_time;
+        rebuilt.airdrops = source.airdrops.clone();
+        rebuilt.airdrop_positions = source.airdrop_positions.clone();
+        rebuilt.bytes = rebuilt.airdrops.values().fold(0usize, |total, entry| {
+            total.saturating_add(entry.memory_usage)
+        });
+        rebuilt.next_sequence = self.next_sequence;
         for (transaction, allow_orphan, admitted_at, charge_free_relay) in candidates {
             let txid = transaction.txid();
             if !seen.insert(txid) {
@@ -946,8 +1259,10 @@ impl MemoryMempool {
 
         let retained_transactions = rebuilt.entries.keys().copied().collect::<BTreeSet<_>>();
         let retained_orphans = rebuilt.orphans.keys().copied().collect::<BTreeSet<_>>();
-        let changed =
-            retained_transactions != previous_transactions || retained_orphans != previous_orphans;
+        let retained_airdrops = rebuilt.airdrops.keys().copied().collect::<BTreeSet<_>>();
+        let changed = retained_transactions != previous_transactions
+            || retained_orphans != previous_orphans
+            || retained_airdrops != previous_airdrops;
         let previous_members = previous_transactions
             .union(&previous_orphans)
             .copied()
@@ -956,7 +1271,10 @@ impl MemoryMempool {
             .union(&retained_orphans)
             .copied()
             .collect::<BTreeSet<_>>();
-        let removed = previous_members.difference(&retained_members).count();
+        let removed = previous_members
+            .difference(&retained_members)
+            .count()
+            .saturating_add(previous_airdrops.difference(&retained_airdrops).count());
         let readmitted = disconnected_txids
             .intersection(&retained_transactions)
             .count();
@@ -979,6 +1297,7 @@ impl MemoryMempool {
             promoted_orphans,
             retained_transactions: retained_transactions.len(),
             retained_orphans: retained_orphans.len(),
+            retained_airdrops: retained_airdrops.len(),
             generation,
         })
     }
@@ -1284,6 +1603,16 @@ impl MemoryMempool {
     /// of its complete descendant package, so a high-fee child protects its
     /// low-fee ancestors from being separated.
     fn limit_size(&mut self, added: Txid, now: u64) -> bool {
+        self.enforce_size_limit(now);
+        self.entries.contains_key(&added)
+    }
+
+    fn limit_size_airdrop(&mut self, added: [u8; 32], now: u64) -> bool {
+        self.enforce_size_limit(now);
+        self.airdrops.contains_key(&added)
+    }
+
+    fn enforce_size_limit(&mut self, now: u64) {
         let mut expired = self
             .entries
             .values()
@@ -1298,10 +1627,10 @@ impl MemoryMempool {
             self.remove_transaction_without_generation(txid, true);
         }
 
-        if self.entries.len() <= self.limits.maximum_transactions
+        if self.member_count() <= self.limits.maximum_transactions
             && self.bytes <= self.limits.maximum_bytes
         {
-            return self.entries.contains_key(&added);
+            return;
         }
 
         let target_transactions = self
@@ -1336,11 +1665,44 @@ impl MemoryMempool {
         });
         for (txid, _, _, _) in roots {
             self.remove_transaction_without_generation(txid, true);
-            if self.entries.len() <= target_transactions && self.bytes <= target_bytes {
+            if self.member_count() <= target_transactions && self.bytes <= target_bytes {
                 break;
             }
         }
-        self.entries.contains_key(&added)
+        if self.member_count() <= target_transactions && self.bytes <= target_bytes {
+            return;
+        }
+
+        let mut airdrops = self
+            .airdrops
+            .values()
+            .map(|entry| {
+                (
+                    entry.hash,
+                    entry.fee,
+                    entry.policy_size.max(1),
+                    entry.sequence,
+                )
+            })
+            .collect::<Vec<_>>();
+        airdrops.sort_by(|left, right| {
+            let left_rate = u128::from(left.1) * (right.2 as u128);
+            let right_rate = u128::from(right.1) * (left.2 as u128);
+            left_rate
+                .cmp(&right_rate)
+                .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for (hash, _, _, _) in airdrops {
+            self.remove_airdrop_without_generation(&hash);
+            if self.member_count() <= target_transactions && self.bytes <= target_bytes {
+                break;
+            }
+        }
+    }
+
+    fn member_count(&self) -> usize {
+        self.entries.len().saturating_add(self.airdrops.len())
     }
 
     fn eviction_rate(&self, txid: Txid) -> (Amount, usize) {
@@ -1414,7 +1776,11 @@ impl MemoryMempool {
     /// for reorganizations until disconnected transactions can be contextually
     /// re-admitted through the complete consensus verifier.
     pub fn clear(&mut self) -> usize {
-        let removed = self.entries.len().saturating_add(self.orphans.len());
+        let removed = self
+            .entries
+            .len()
+            .saturating_add(self.orphans.len())
+            .saturating_add(self.airdrops.len());
         self.free_count = 0.0;
         self.last_free_time = 0;
         if removed == 0 {
@@ -1428,10 +1794,31 @@ impl MemoryMempool {
         self.children.clear();
         self.exclusive_names.clear();
         self.exclusive_name_owners.clear();
+        self.airdrops.clear();
+        self.airdrop_positions.clear();
         self.bytes = 0;
         self.orphan_bytes = 0;
         self.advance_generation();
         removed
+    }
+
+    pub fn remove_airdrop(&mut self, hash: &[u8; 32]) -> bool {
+        let removed = self.remove_airdrop_without_generation(hash);
+        if removed {
+            self.advance_generation();
+        }
+        removed
+    }
+
+    fn remove_airdrop_without_generation(&mut self, hash: &[u8; 32]) -> bool {
+        let Some(entry) = self.airdrops.remove(hash) else {
+            return false;
+        };
+        if self.airdrop_positions.get(&entry.position) == Some(hash) {
+            self.airdrop_positions.remove(&entry.position);
+        }
+        self.bytes = self.bytes.saturating_sub(entry.memory_usage);
+        true
     }
 
     pub fn remove_transaction(&mut self, txid: Txid, include_descendants: bool) -> usize {
@@ -1448,6 +1835,33 @@ impl MemoryMempool {
     /// reconciliation advances the immutable mempool generation at most once.
     pub fn remove_confirmed(&mut self, transactions: &[Transaction]) -> usize {
         let mut removed = 0;
+        for coinbase in transactions
+            .iter()
+            .filter(|transaction| is_coinbase(transaction))
+        {
+            for (index, input) in coinbase.inputs.iter().enumerate().skip(1) {
+                if coinbase
+                    .outputs
+                    .get(index)
+                    .is_none_or(|output| output.covenant.kind != CovenantKind::None)
+                {
+                    continue;
+                }
+                let Some(raw) = input.witness.items.first() else {
+                    continue;
+                };
+                let Ok(proof) = AirdropProof::decode(raw) else {
+                    continue;
+                };
+                let Ok(position) = proof.position() else {
+                    continue;
+                };
+                let Some(hash) = self.airdrop_positions.get(&position).copied() else {
+                    continue;
+                };
+                removed += usize::from(self.remove_airdrop_without_generation(&hash));
+            }
+        }
         for transaction in transactions {
             let confirmed_txid = transaction.txid();
             let conflicts = transaction
@@ -1775,11 +2189,17 @@ impl Mempool for MemoryMempool {
     fn info(&self) -> MempoolInfo {
         MempoolInfo {
             transaction_count: self.entries.len(),
+            airdrop_count: self.airdrops.len(),
             bytes: self.bytes,
             total_fee: self
                 .entries
                 .values()
-                .fold(0u64, |total, entry| total.saturating_add(entry.fee)),
+                .fold(0u64, |total, entry| total.saturating_add(entry.fee))
+                .saturating_add(
+                    self.airdrops
+                        .values()
+                        .fold(0u64, |total, entry| total.saturating_add(entry.fee)),
+                ),
             orphan_count: self.orphans.len(),
             orphan_bytes: self.orphan_bytes,
             generation: self.generation,
@@ -1818,6 +2238,35 @@ impl<V: MempoolView> SequenceLockView for AdmissionSequenceView<'_, V> {
 fn rejected(reason: impl Into<String>) -> Admission {
     Admission::Rejected {
         reason: reason.into(),
+    }
+}
+
+fn rejected_airdrop(reason: impl Into<String>) -> AirdropAdmission {
+    AirdropAdmission::Rejected {
+        reason: reason.into(),
+    }
+}
+
+/// HSD `BlockAirdrop.getWeight`: one count-byte delta, the special input's
+/// witness varbytes, and the base input/output contribution at scale four.
+fn airdrop_coinbase_weight(proof_size: usize, output: &Output) -> usize {
+    let address_size = 2usize.saturating_add(output.address.hash.len());
+    let base_size = 1usize
+        .saturating_add(8)
+        .saturating_add(address_size)
+        .saturating_add(5);
+    1usize
+        .saturating_add(varint_size(proof_size as u64))
+        .saturating_add(proof_size)
+        .saturating_add(base_size.saturating_mul(WITNESS_SCALE_FACTOR))
+}
+
+fn varint_size(value: u64) -> usize {
+    match value {
+        0x00..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
     }
 }
 
@@ -1901,7 +2350,9 @@ mod tests {
 
     use super::*;
     use hns_consensus::{ConsensusError, TransactionInputVerifier};
-    use hns_primitives::{sha3_256, Address, Covenant, Input, Output, Witness};
+    use hns_primitives::{
+        sha3_256, Address, Covenant, Input, Output, UnavailableAirdropSignatureVerifier, Witness,
+    };
 
     fn covenant() -> Covenant {
         Covenant {
@@ -1915,6 +2366,38 @@ mod tests {
             value,
             address: Address::new(0, vec![3; 20]).expect("address"),
             covenant: covenant(),
+        }
+    }
+
+    fn fixture_airdrop() -> AirdropProof {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        let raw = fixture["faucet"]["raw"]
+            .as_str()
+            .expect("faucet raw")
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let nibble = |byte| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    _ => panic!("invalid fixture hex"),
+                };
+                (nibble(pair[0]) << 4) | nibble(pair[1])
+            })
+            .collect::<Vec<_>>();
+        AirdropProof::decode(&raw).expect("faucet proof")
+    }
+
+    fn airdrop_context() -> AirdropMempoolContext {
+        AirdropMempoolContext {
+            next_height: 2,
+            transaction_start: 0,
+            current_time: 100,
+            airstop: false,
+            hardening: false,
+            goosig_disabled: false,
         }
     }
 
@@ -1942,6 +2425,7 @@ mod tests {
     struct FixedView {
         coins: HashMap<Outpoint, Coin>,
         times: HashMap<Height, u64>,
+        spent_airdrops: HashSet<u32>,
     }
 
     impl FixedView {
@@ -1957,6 +2441,7 @@ mod tests {
             Self {
                 coins: HashMap::from([(outpoint, coin)]),
                 times: HashMap::from([(0, 0), (1, 1), (2, 2)]),
+                spent_airdrops: HashSet::new(),
             }
         }
     }
@@ -1975,6 +2460,130 @@ mod tests {
         fn coin(&self, outpoint: &Outpoint) -> Result<Option<Coin>, ConsensusError> {
             Ok(self.coins.get(outpoint).cloned())
         }
+    }
+
+    impl AirdropMempoolView for FixedView {
+        fn airdrop_position_spent(&self, position: u32) -> Result<bool, ConsensusError> {
+            Ok(self.spent_airdrops.contains(&position))
+        }
+    }
+
+    #[test]
+    fn airdrop_admission_indexes_revalidates_and_removes_confirmed_proofs() {
+        let proof = fixture_airdrop();
+        let hash = proof.hash().expect("proof hash");
+        let position = proof.position().expect("proof position");
+        let raw_size = proof.encode().expect("proof raw").len();
+        let mut pool = MemoryMempool::new();
+        let view = FixedView::default();
+        assert_eq!(
+            pool.submit_airdrop_with_context(
+                proof.clone(),
+                &airdrop_context(),
+                &view,
+                &UnavailableAirdropSignatureVerifier,
+            )
+            .expect("airdrop admission"),
+            AirdropAdmission::Accepted(hash)
+        );
+        assert_eq!(pool.info().airdrop_count, 1);
+
+        let mut bounded = MemoryMempool::with_limits(MempoolLimits {
+            maximum_bytes: 300 + raw_size - 1,
+            ..MempoolLimits::default()
+        })
+        .expect("bounded airdrop pool");
+        assert!(matches!(
+            bounded
+                .submit_airdrop_with_context(
+                    proof.clone(),
+                    &airdrop_context(),
+                    &view,
+                    &UnavailableAirdropSignatureVerifier,
+                )
+                .expect("bounded admission"),
+            AirdropAdmission::Rejected { reason } if reason == "mempool-full"
+        ));
+        assert_eq!(bounded.info().airdrop_count, 0);
+        assert_eq!(pool.info().bytes, 300 + raw_size);
+        assert_eq!(pool.info().total_fee, proof.fee);
+        assert!(matches!(
+            pool.submit_airdrop_with_context(
+                proof.clone(),
+                &airdrop_context(),
+                &view,
+                &UnavailableAirdropSignatureVerifier,
+            )
+            .expect("duplicate admission"),
+            AirdropAdmission::Rejected { reason } if reason == "txn-already-in-mempool"
+        ));
+
+        let mut spent_view = FixedView::default();
+        spent_view.spent_airdrops.insert(position);
+        assert!(pool
+            .revalidate_airdrops_with_context(
+                &airdrop_context(),
+                &spent_view,
+                &UnavailableAirdropSignatureVerifier,
+            )
+            .expect("spent revalidation"));
+        assert_eq!(pool.info().airdrop_count, 0);
+
+        let disabled = AirdropMempoolContext {
+            airstop: true,
+            ..airdrop_context()
+        };
+        assert!(matches!(
+            pool.submit_airdrop_with_context(
+                proof.clone(),
+                &disabled,
+                &view,
+                &UnavailableAirdropSignatureVerifier,
+            )
+            .expect("disabled admission"),
+            AirdropAdmission::Rejected { reason } if reason == "bad-airdrop-disabled"
+        ));
+
+        assert!(matches!(
+            pool.submit_airdrop_with_context(
+                proof.clone(),
+                &airdrop_context(),
+                &view,
+                &UnavailableAirdropSignatureVerifier,
+            )
+            .expect("readmit"),
+            AirdropAdmission::Accepted(_)
+        ));
+        let coinbase = Transaction {
+            version: 0,
+            inputs: vec![
+                Input {
+                    previous_output: Outpoint::null(),
+                    sequence: 0,
+                    witness: Witness::default(),
+                },
+                Input {
+                    previous_output: Outpoint::null(),
+                    sequence: u32::MAX,
+                    witness: Witness {
+                        items: vec![proof.encode().expect("proof raw")],
+                    },
+                },
+            ],
+            outputs: vec![output(1), output(proof.value() - proof.fee)],
+            locktime: 2,
+        };
+        assert_eq!(pool.remove_confirmed(std::slice::from_ref(&coinbase)), 1);
+        assert_eq!(pool.info().airdrop_count, 0);
+        assert!(pool
+            .reconcile_airdrops_with_context(
+                &[coinbase],
+                &airdrop_context(),
+                &view,
+                &UnavailableAirdropSignatureVerifier,
+            )
+            .expect("disconnect reconciliation"));
+        assert_eq!(pool.info().airdrop_count, 1);
     }
 
     struct FailingView;

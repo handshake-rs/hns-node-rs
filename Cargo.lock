@@ -448,6 +448,7 @@ dependencies = [
  "hns-consensus",
  "hns-primitives",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

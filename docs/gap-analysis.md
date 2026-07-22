@@ -191,6 +191,10 @@
 - Disconnects and reorganizations re-admit eligible ordinary transactions from
   disconnected blocks before the retained pool, then validate the result against
   the final atomic chain snapshot and replacement-branch conflicts.
+- Typed HSD airdrop packets, inventory, GETDATA serving, native proof admission,
+  durable/unconfirmed position conflicts, deployment revalidation, connected
+  removal, disconnected-coinbase readmission, fee-rate ranking, and the ten-proof
+  coinbase/template limit.
 - Deterministic ancestor-inclusive future templates with actual HNS block
   weight kept separate from HSD sigop-adjusted policy size, plus sigops, OPEN,
   UPDATE, RENEW, transaction-count, and exclusive-name limits.
@@ -248,13 +252,13 @@ These are substantial foundations, not a production full node.
   beyond implemented HSD network-prefix grouping, and adversarial network
   qualification.
 - Pruning-aware synchronization and sustained compact-relay WAN qualification.
-- Special HSD claim/airdrop relay, including replacement claims.
+- HSD DNSSEC claim relay and claim/name replacement admission.
 - Sustained multipath publication and reconnect/retry supervision under WAN
   partitions and queue saturation.
 
 ### Mining authority
 
-- Remaining HSD special-packet relay and replacement.
+- Remaining HSD DNSSEC claim packet relay and claim/name replacement.
 - Continuous future-template lifecycle tied to live committed tips and the ASIC
   gateway.
 - End-to-end candidate validation against a historically qualified active state.

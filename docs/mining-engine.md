@@ -73,6 +73,8 @@ local connection from becoming a network publication source.
   limiting;
 - atomic active-chain reconciliation with complete retained-pool revalidation
   and contextual ordinary-transaction re-admission after disconnects;
+- native HSD airdrop/faucet proof admission against deployment flags and the
+  durable allocation field, with hash/position indexes and unified size trim;
 - explicit verifier-completeness gates.
 
 The compatibility `Mempool::submit` entrypoint rejects with
@@ -81,15 +83,17 @@ The compatibility `Mempool::submit` entrypoint rejects with
 mining-engine peer boundary now does so for ordinary transactions using one
 immutable active-chain snapshot, deployment-derived name flags, HSD's 1,000
 minimum relay rate, the native script backend, and the live accepted-name
-overlay. The compatibility entrypoint remains fail closed, and special HSD
-claim/airdrop packets remain unfinished. Mainnet transaction/output and witness
+overlay. Typed airdrop packets use a dedicated proof-capable admission path and
+are relayed by HSD inventory hash; DNSSEC claim packets remain unfinished.
+Mainnet transaction/output and witness
 standardness, standard script flags, dust, and absurd-fee checks are active.
 Every direct active extension atomically rebuilds retained transactions and
 orphans through the same complete context, promoting newly resolvable inputs
 and advancing the generation once only when membership changes. Disconnects
-and reorganizations additionally consider non-coinbase transactions from the
-disconnected blocks before the retained pool, preserving HSD's older-name-update
-priority while the final replacement-chain view rejects conflicts. The pinned
+and reorganizations additionally consider ordinary transactions and special
+coinbase proofs from disconnected blocks before the retained pool, preserving
+HSD's older-name-update priority while the final replacement-chain view rejects
+conflicts. The pinned
 height-62,517 case and the 39,086-39,101 -> 76,722 replacement history establish
 exact proof/accounting, parent-header-time, retained-value, and commit-advance
 behavior for bounded real mainnet claims, but they are not full-chain
@@ -157,11 +161,13 @@ failure.
 
 ## Mempool and chain transitions
 
-A direct active-chain extension removes included and conflicting transactions
-from the mempool and advances the mempool generation at most once. A disconnect
+A direct active-chain extension removes included/conflicting transactions and
+mined airdrop positions from the mempool. A disconnect
 or reorganization atomically rebuilds the retained pool against the final chain
 snapshot and re-admits eligible ordinary transactions from disconnected blocks
-in oldest-block order. Internal view failures still clear the pool fail closed.
+in oldest-block order, then re-admits valid airdrop proofs from disconnected
+coinbases after the allocation bitfield has been rewound. Internal view failures
+still clear the pool fail closed.
 Mining-template caches are cleared whenever the durable chain generation
 advances or an accepted mempool generation changes.
 
@@ -196,6 +202,6 @@ remain release-blocking:
 - deployment-scale Urkel compaction performance/priority qualification and
   RocksDB mid-commit process-crash/fault injection;
 - qualified full-mainnet active-state IBD and live HSD state comparison;
-- special HSD claim/airdrop relay, including replacement claims;
+- HSD DNSSEC claim relay and claim/name replacement admission;
 - measured production template and solved-block latency;
 - native mainnet authority qualification.

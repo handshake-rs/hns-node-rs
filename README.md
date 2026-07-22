@@ -352,6 +352,9 @@ Implemented:
 - Contextual ordinary-transaction re-admission after disconnects and
   reorganizations, with older disconnected name updates considered before the
   retained pool and replacement-branch conflicts removed transitively.
+- Typed HSD airdrop wire/inventory/GETDATA relay, native deployment- and
+  allocation-field-aware admission, reorg reconciliation, and fee-ranked
+  ten-proof coinbase assembly.
 - Deterministic ancestor-inclusive template selection with HNS weight, sigops,
   OPEN, UPDATE, RENEW, transaction-count, and exclusive-name limits.
 - HSD-derived subsidy and deterministic coinbase fixtures.
@@ -366,7 +369,7 @@ Implemented:
 
 Still release-blocking:
 
-- special HSD claim/airdrop relay, including replacement claims;
+- HSD DNSSEC claim relay and claim/name replacement admission;
 - qualified full-mainnet active-state IBD and the incremental production Urkel
   lifecycle;
 - sustained live HSD comparison evidence across restarts, partitions, and real

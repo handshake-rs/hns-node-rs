@@ -81,7 +81,9 @@ instead stop synchronization without changing branch validity. The mining
 engine may build diagnostic future templates from a durable active snapshot,
 and explicitly enabled ordinary peer transaction relay admits only through a
 complete native script verifier and one immutable active UTXO/deployment/name
-snapshot. Relay does not grant authority. Solved-block staging, connection, and
+snapshot. Airdrop relay separately requires native proof verification,
+next-block deployment flags, and the immutable durable allocation field. Relay
+does not grant authority. Solved-block staging, connection, and
 publication require the same private authority capability as the existing
 authoritative mining boundary.
 
@@ -107,8 +109,7 @@ The following remain untrusted and release-blocking:
   mid-commit process-crash/fault injection;
 - full-mainnet active-state IBD, pruning, and sustained
   alternate-chain/reorganization qualification;
-- Brontide, long-lived subthreshold peer reputation, and special HSD
-  claim/airdrop relay;
+- Brontide, long-lived subthreshold peer reputation, and HSD DNSSEC claim relay;
 - production template qualification, continuously supervised publication
   retry, and measured publication latency;
 - complete mainnet replay, invalid corpus, and sustained live HSD shadow

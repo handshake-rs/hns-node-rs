@@ -38,8 +38,8 @@ use hns_consensus::{
     advance_threshold_state, expected_next_bits, validate_block_finality, validate_coinbase_height,
     validate_transaction_start, ConsensusParams, Deployment, DeploymentPeriod, DeploymentState,
     DifficultyPoint, HeaderConsensus, HeaderParent, HeaderValidationContext,
-    HistoricalScriptPolicy, HistoricalValidationPlan, NameFlags, Network, ThresholdState,
-    MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
+    HistoricalScriptPolicy, HistoricalValidationPlan, NameFlags, NativeAirdropSignatureVerifier,
+    Network, ThresholdState, MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
 };
 use hns_mempool::{MemoryMempool, Mempool};
 use hns_mining::{
@@ -613,6 +613,7 @@ pub struct NodeService {
     state: NodeState,
     mining_events: MiningEventHub,
     mining_engine_templates: Mutex<TemplateCoordinator>,
+    airdrop_signatures: NativeAirdropSignatureVerifier,
 }
 
 impl NodeService {
@@ -655,7 +656,10 @@ impl NodeService {
             .then(|| UndoRetentionPolicy::for_network(config.network));
 
         let mempool_info = state.mempool.info();
-        if mempool_info.transaction_count == 0 && mempool_info.orphan_count == 0 {
+        if mempool_info.transaction_count == 0
+            && mempool_info.airdrop_count == 0
+            && mempool_info.orphan_count == 0
+        {
             state.mempool = MemoryMempool::with_limits(config.mining_engine.mempool_limits.clone())
                 .map_err(|error| {
                     anyhow::anyhow!("failed to configure mining-engine mempool: {error}")
@@ -719,11 +723,15 @@ impl NodeService {
                 |error| anyhow::anyhow!("failed to initialize mining-engine templates: {error}"),
             )?,
         );
+        let airdrop_signatures = NativeAirdropSignatureVerifier::new().map_err(|error| {
+            anyhow::anyhow!("failed to initialize airdrop relay verifier: {error}")
+        })?;
         Ok(Self {
             config,
             state,
             mining_events,
             mining_engine_templates,
+            airdrop_signatures,
         })
     }
 
@@ -914,7 +922,9 @@ impl NodeService {
                     disconnect.block_hash.to_hex()
                 )
             })?;
-            transactions.extend(block.transactions.into_iter().skip(1));
+            // Retain coinbases for dedicated claim/airdrop reconciliation.
+            // Ordinary admission still rejects coinbases themselves.
+            transactions.extend(block.transactions);
         }
         Ok(transactions)
     }
@@ -5199,6 +5209,75 @@ mod tests {
                 if reason.contains("witness program")
         ));
         assert_eq!(node.state.mempool.info().transaction_count, 1);
+    }
+
+    #[test]
+    fn peer_airdrop_admission_populates_special_inventory_and_getdata_view() {
+        let mut node = peer_transaction_node(0);
+        let fixture: AirdropFixture =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        let proof = hns_primitives::AirdropProof::decode(&decode_fixture_hex(&fixture.faucet.raw))
+            .expect("faucet proof");
+        let hash = proof.hash().expect("faucet hash");
+        assert_eq!(
+            node.mining_engine_accept_peer_airdrop(proof.clone())
+                .expect("peer airdrop admission"),
+            hns_mempool::AirdropAdmission::Accepted(hash)
+        );
+        assert_eq!(node.state.mempool.info().airdrop_count, 1);
+        assert_eq!(node.mining_engine_mempool_airdrop(&hash), Some(proof));
+        assert!(node
+            .mining_engine_mempool_inventory(10)
+            .contains(&hns_p2p::Inventory::airdrop(hash)));
+        assert!(matches!(
+            node.mining_engine_accept_peer_airdrop(
+                node.mining_engine_mempool_airdrop(&hash)
+                    .expect("retained proof")
+            )
+            .expect("duplicate peer airdrop"),
+            hns_mempool::AirdropAdmission::Rejected { reason }
+                if reason == "txn-already-in-mempool"
+        ));
+    }
+
+    #[test]
+    fn connected_and_disconnected_airdrop_coinbase_reconciles_special_pool() {
+        let mut node = peer_transaction_node(0);
+        let fixture: AirdropFixture =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        let proof = hns_primitives::AirdropProof::decode(&decode_fixture_hex(&fixture.faucet.raw))
+            .expect("faucet proof");
+        let hash = proof.hash().expect("faucet hash");
+        assert!(matches!(
+            node.mining_engine_accept_peer_airdrop(proof)
+                .expect("peer airdrop admission"),
+            hns_mempool::AirdropAdmission::Accepted(accepted) if accepted == hash
+        ));
+
+        let tip = node
+            .state()
+            .best_block_tip()
+            .expect("tip read")
+            .expect("tip");
+        let (mut coinbase, _) = faucet_coinbase();
+        coinbase.locktime = 1;
+        let mut block = block_with_commitments(vec![coinbase]);
+        block.header.prev_block = tip.hash;
+        block.header.nonce = 12;
+        let record = node
+            .connect_block(NodeBlockImport::fixture(block, 1, 2))
+            .expect("connect airdrop block");
+        assert_eq!(node.state.mempool.info().airdrop_count, 0);
+
+        node.disconnect_block(NodeBlockDisconnect {
+            block_hash: record.hash,
+            height: 1,
+        })
+        .expect("disconnect airdrop block");
+        assert_eq!(node.state.mempool.info().airdrop_count, 1);
+        assert!(node.mining_engine_mempool_airdrop(&hash).is_some());
     }
 
     #[test]

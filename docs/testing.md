@@ -77,6 +77,10 @@ Current evidence includes:
   mutated RSA/P-256/Ed25519/GooSig signature cases, a complete valid faucet
   proof, and an upstream production-root GooSig proof exercised through native
   consensus and active-node state;
+- an exact typed HSD AIRDROP frame plus hash/position admission, durable-spent
+  revalidation, duplicate rejection, inventory/GETDATA access, connected
+  removal, disconnected-coinbase readmission, and a byte-identical HSD
+  fee-bearing airdrop coinbase;
 - HSD Claim envelope encoding and blob-only hashes, strict length/trailing
   failures, checksummed ownership TXT payloads for every network prefix, all
   four upstream signed DNSKEY/DS/TXT/RRSIG proofs, their exact codec/sanity/
@@ -188,7 +192,8 @@ Current evidence includes:
   header-derived deployment/script-policy comparison, divergence,
   restart/reorganization counters, hash normalization, and checksummed evidence
   chaining;
-- HSD subsidy boundaries and deterministic mining-template coinbase bytes.
+- HSD subsidy boundaries, deterministic ordinary coinbase bytes, and schema-v6
+  airdrop entry size/rate/weight plus special coinbase bytes.
 
 ## Native secp256k1 smoke gate
 

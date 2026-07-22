@@ -217,11 +217,13 @@ Implemented:
   trim target;
 - HSD confirmed-coin free priority and the default decaying low-fee relay
   limiter;
+- typed HSD airdrop wire/inventory/GETDATA relay, deployment- and bitfield-aware
+  native admission, reorg reconciliation, and fee-ranked coinbase assembly;
 - mining-engine readiness and queue diagnostics.
 
 Remaining:
 
-- special HSD claim/airdrop relay, including replacement claims;
+- HSD DNSSEC claim relay and claim/name replacement admission;
 - full-mainnet active-state IBD and live HSD state/root qualification;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
 - native mainnet authority qualification.

@@ -9,3 +9,6 @@ hns-consensus = { path = "../hns-consensus" }
 hns-primitives = { path = "../hns-primitives" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
