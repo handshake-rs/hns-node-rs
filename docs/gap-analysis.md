@@ -6,6 +6,9 @@
 
 - Bounded header, transaction, block, covenant, address, resource, witness, and
   sync-relevant P2P codecs with HSD-derived fixtures.
+- Complete pinned HSD canonical genesis-block bytes for all four networks,
+  including body-sanity results, strict peer-style import, connected UTXO/undo
+  state, durable restart, and canonical mainnet block-1 continuation.
 - Exact unsigned 256-bit chainwork and durable header/block/raw-body indexes.
 - Memory and RocksDB stores behind typed traits, atomic batches, true RocksDB
   snapshots, and a read-your-writes reorganization overlay.

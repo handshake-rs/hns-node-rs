@@ -9,6 +9,8 @@ Implemented:
 - Lean mining-node boundary.
 - Bounded primitive codecs.
 - Pinned, digest-verified HSD fixture manifest.
+- Complete canonical HSD genesis-block fixtures for all four networks with
+  strict import, durable state restart, and mainnet block-1 continuation.
 
 Remaining: broaden valid/invalid vectors and fuzz every parser family.
 

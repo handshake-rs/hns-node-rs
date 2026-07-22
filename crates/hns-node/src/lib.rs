@@ -5005,7 +5005,87 @@ mod tests {
     }
 
     #[test]
+    fn strict_import_accepts_every_canonical_hsd_genesis_block() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/blocks/genesis-v1.json"))
+                .expect("HSD genesis fixture");
+        let cases = fixture["networks"].as_array().expect("genesis networks");
+        assert_eq!(cases.len(), 4);
+
+        for case in cases {
+            let network = match case["network"].as_str().expect("network") {
+                "main" => Network::Mainnet,
+                "testnet" => Network::Testnet,
+                "regtest" => Network::Regtest,
+                "simnet" => Network::Simnet,
+                name => panic!("unexpected HSD network {name}"),
+            };
+            let raw = decode_hex(case["raw"].as_str().expect("raw genesis"));
+            assert_eq!(raw.len(), case["size"].as_u64().expect("size") as usize);
+            let block = Block::decode(&raw).expect("canonical HSD genesis block");
+            let hash = block.hash();
+
+            assert_eq!(block.encode(), raw);
+            assert_eq!(block.header, network.params().genesis_header());
+            assert_eq!(hash, network.params().genesis_hash);
+            assert_eq!(hash.to_hex(), case["hash"].as_str().expect("hash"));
+            assert_eq!(block.transactions.len(), 1);
+            assert_eq!(
+                block.transactions[0].txid().to_hex(),
+                case["coinbaseTxid"].as_str().expect("coinbase txid")
+            );
+            assert_eq!(
+                block.transactions[0].outputs[0].value,
+                network.params().block_reward(0)
+            );
+
+            let mut node = NodeService::new(NodeConfig {
+                network,
+                ..NodeConfig::default()
+            });
+            let acceptance = node
+                .accept_block(NodeBlockImport::from_peer(block.clone(), 0))
+                .unwrap_or_else(|error| panic!("{network:?} genesis import failed: {error}"));
+            assert_eq!(acceptance.disposition, BlockDisposition::Connected);
+            assert_eq!(acceptance.record.hash, hash);
+            assert_eq!(acceptance.record.height, 0);
+            assert_eq!(acceptance.record.prev_hash, BlockHash::ZERO);
+            assert_eq!(acceptance.record.tx_count, 1);
+            assert!(acceptance.record.status.active_chain);
+            assert!(acceptance.record.status.body_syntax_valid);
+            assert!(acceptance.record.status.utxo_connected);
+            assert!(acceptance.record.status.undo_present);
+
+            let store = node.state.store.clone();
+            drop(node);
+            let restarted = NodeState::from_store_for_network(store, network)
+                .unwrap_or_else(|error| panic!("{network:?} genesis restart failed: {error}"));
+            assert_eq!(
+                restarted
+                    .best_block_tip()
+                    .expect("tip")
+                    .expect("genesis")
+                    .hash,
+                hash
+            );
+        }
+    }
+
+    #[test]
     fn strict_mainnet_block_one_keeps_coinbase_finality_and_height_distinct() {
+        let genesis_fixture: Value =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/blocks/genesis-v1.json"))
+                .expect("HSD genesis fixture");
+        let genesis_case = genesis_fixture["networks"]
+            .as_array()
+            .expect("genesis networks")
+            .iter()
+            .find(|case| case["network"] == "main")
+            .expect("mainnet genesis");
+        let genesis = Block::decode(&decode_hex(
+            genesis_case["raw"].as_str().expect("raw genesis"),
+        ))
+        .expect("canonical mainnet genesis");
         let fixture: Value = serde_json::from_str(include_str!(
             "../../../fixtures/hsd/chains/mainnet-deployment-history-v1.json"
         ))
@@ -5024,16 +5104,15 @@ mod tests {
             network: Network::Mainnet,
             ..NodeConfig::default()
         });
-        node.shadow_sync_ensure_genesis_header()
-            .expect("canonical mainnet genesis header");
-        let error = node
-            .state
-            .validate_import(&NodeBlockImport::from_peer(block, 1))
-            .expect_err("the parent block body was not seeded");
-        assert!(
-            error.to_string().contains("block parent index"),
-            "canonical block one must pass strict header, body, finality, and coinbase-height checks before parent-body activation context: {error}"
-        );
+        node.accept_block(NodeBlockImport::from_peer(genesis, 0))
+            .expect("strict canonical mainnet genesis import");
+        let acceptance = node
+            .accept_block(NodeBlockImport::from_peer(block, 1))
+            .expect("strict canonical mainnet block-one import");
+        assert_eq!(acceptance.disposition, BlockDisposition::Connected);
+        assert_eq!(acceptance.record.height, 1);
+        assert!(acceptance.record.status.absolute_finality_valid);
+        assert!(acceptance.record.status.utxo_connected);
     }
 
     #[test]

@@ -50,6 +50,7 @@ Generators support `--check` reproducibility mode:
 ```bash
 npm run hsrd-script-fixtures --prefix hsd-oracle
 npm run hsrd-deployment-fixtures --prefix hsd-oracle
+npm run hsrd-genesis-fixtures --prefix hsd-oracle
 npm run hsrd-airdrop-fixtures --prefix hsd-oracle
 npm run hsrd-claim-fixtures --prefix hsd-oracle
 npm run hsrd-mainnet-claim-history --prefix hsd-oracle
@@ -65,6 +66,11 @@ npm run hsrd-mining-template-fixtures --prefix hsd-oracle
 
 Current evidence includes:
 
+- HSD's complete canonical 452-byte genesis blocks for mainnet, testnet,
+  regtest, and simnet, regenerated from `lib/protocol/genesis-data.json`,
+  round-tripped and body-checked by HSD, then decoded, strictly imported,
+  connected, and reopened by Rust; mainnet continues through the canonical
+  block-1 finality regression;
 - signature-hash vectors for every defined base mode/modifier combination;
 - all five HSD airdrop-key codecs, proof hashes and signature preimages,
   allocation-root checks, strict decode failures, HSD-generated valid and

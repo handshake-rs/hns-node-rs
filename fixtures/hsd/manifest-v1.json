@@ -51,6 +51,24 @@
       "blake2b256": "f20dcccde245cf462912781c67841191a8fad12b66b7402cc71cf6f0c0c64e6e"
     },
     {
+      "id": "genesis-v1",
+      "network": "all",
+      "kind": "block",
+      "path": "blocks/genesis-v1.json",
+      "expectation": {
+        "outcome": "accepted"
+      },
+      "tags": [
+        "oracle",
+        "canonical",
+        "genesis",
+        "codec",
+        "commitments",
+        "strict-import"
+      ],
+      "blake2b256": "6d4455689dec81bd92b68a551fd1c5c92360fe99fe9401648a19e38dcc4f4e2b"
+    },
+    {
       "id": "airdrop-codec-v1",
       "network": "all",
       "kind": "airdrop",

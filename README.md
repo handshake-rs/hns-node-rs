@@ -84,6 +84,9 @@ Implemented:
   explicitly installed.
 - Reproducible HSD signature-hash, sequence-lock, and 56-case script
   execution/error fixtures, including flag-sensitive numeric-depth behavior.
+- Reproducible complete canonical genesis blocks for all four HSD networks,
+  with strict peer-style import, UTXO/undo connection, durable restart, and a
+  canonical mainnet block-1 continuation through the ordinary validation path.
 - Exact HSD BIP9 threshold transitions, block-version signaling, deployment
   effects, mandatory/standard script flags, all four networks' deployment
   parameters, and all 15 mainnet checkpoint hashes.
@@ -368,6 +371,7 @@ python3 scripts/validate-hsrd-source-handoff.py
 scripts/compare-hsrd-hsd-shadow.py --self-test
 npm run hsrd-script-fixtures --prefix hsd-oracle
 npm run hsrd-deployment-fixtures --prefix hsd-oracle
+npm run hsrd-genesis-fixtures --prefix hsd-oracle
 npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
 npm run hsrd-mainnet-claim-history --prefix hsd-oracle
 npm run hsrd-mainnet-claim-replacements --prefix hsd-oracle
