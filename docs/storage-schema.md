@@ -146,10 +146,16 @@ cannot promote a block or grant authority.
   `name-tree-snapshot/v1/<height-be>` for network-interval root pins and
   `name-tree-compaction/v1` for the atomically published last compaction result,
   plus `undo-pruning/v1` for the atomically advanced undo-retirement boundary.
-- `peers`, `orphans`, `mempool_persist`: reserved operational records as those
-  subsystems mature. Current peer scores, reconnect state, orphan bodies, and
-  the mining-engine mempool/template cache are process-local and bounded
-  in memory.
+- `peers`: `address-book/v1` stores one bounded, checksummed, versioned, and
+  network-bound snapshot of discovered IP peers. Each entry retains services,
+  advertised time, connection attempts, last success, last attempt, and stable
+  selection sequence. Explicit operator peers are configuration, not cache
+  data. The cache is refreshed every 120 seconds and at clean runtime shutdown;
+  invalid records are discarded and replaced without becoming consensus input.
+- `orphans`, `mempool_persist`: reserved operational records as those
+  subsystems mature. Live peer scores/bans, socket reconnect timers, inflight
+  requests, orphan bodies, and the mining-engine mempool/template cache remain
+  process-local and bounded in memory.
 
 Null name states are represented by absence. Persisting a null state is treated
 as corruption by the correctness-first root rebuild.

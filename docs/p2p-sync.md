@@ -355,10 +355,13 @@ Diagnostics include configured endpoints, reconnect attempts, live peer
 snapshots, synchronization stage, best/active/stored tips, queue depths, orphan
 usage, received/served counts, durably failed-body count, checkpoint sequence,
 active-state connection/reorganization counts, contextual-failure count, and
-the last supervisor error. API-v9 node status separately counts valid non-active
-blocks and durably failed blocks and exposes the active tip's resulting
-authenticated root/height. The shadow endpoint includes an opaque runtime
-instance so external evidence can distinguish observations across restarts.
+the last supervisor error. Discovery diagnostics additionally expose durable
+address-book availability, loaded/pruned counts, generation, dirty state,
+successful/failed flushes, decode failures, the last flush time, and its last
+storage error. API-v9 node status separately counts valid non-active blocks and
+durably failed blocks and exposes the active tip's resulting authenticated
+root/height. The shadow endpoint includes an opaque runtime instance so external
+evidence can distinguish observations across restarts.
 
 `observation_only` is true in the default retention mode and false only when the
 explicit active-state connector is enabled. `active_state` reports that choice.
@@ -389,7 +392,7 @@ exchange. Mainnet resolves `hs-mainnet.bcoin.ninja` and `seed.htools.work` on
 port 12038; testnet resolves `hs-testnet.bcoin.ninja` on port 13038. Regtest and
 simnet have no HSD DNS seeds, so discovery alone is rejected there.
 
-The in-memory address book has an operator-configured bound (4,096 by default,
+The address book has an operator-configured bound (4,096 by default,
 16,384 hard maximum). It accepts only keyless IP addresses advertising the
 network service, rejects unroutable public-network ranges and the configured
 listener, and normalizes missing or future timestamps with HSD's five-day
@@ -406,19 +409,31 @@ Only a completed Ready handshake resets a target's connection-failure history.
 For example, mainnet can bootstrap without hard-coded socket addresses:
 
 ```bash
-hsrd --network mainnet --shadow-sync --p2p-discovery
+hsrd --network mainnet --data-dir /path/to/hsrd \
+  --shadow-sync --p2p-discovery
 ```
 
-The API reports known/received/accepted/rejected/served addresses, resolved DNS
-addresses, DNS failures, and discovered connection failures. Address state and
-reputation are not durable yet; restart resolves seeds again and relearns peers.
+When `--data-dir` is configured, discovered addresses, services, timestamps,
+attempt counts, last success, and last attempt are stored in the `peers` column
+family as one checksummed, versioned, network-bound snapshot. Explicit peers
+remain configuration and are never written into the cache. The runtime flushes
+dirty state every 120 seconds and on shutdown. Restore re-applies bounded
+cooldowns and HSD's recent-attempt, 30-day horizon, three-attempt
+never-successful, and ten-failure/seven-day stale rules. A malformed record is
+reported and replaced from fresh discovery; a store read failure aborts
+startup. Without `--data-dir`, discovery remains deliberately process-local and
+performs no meaningless memory-store flushes.
+
+The API reports persistence availability, loaded and pruned counts, generation,
+dirty/flush state and errors, known/received/accepted/rejected/served addresses,
+resolved DNS addresses, DNS failures, and discovered connection failures. Peer
+scores and bans remain process-local.
 
 ## Known limitations
 
 The shadow-sync runtime does not yet provide:
 
 - Brontide transport;
-- durable address-manager state;
 - durable peer scoring or bans;
 - transaction and mempool relay;
 - compact-block reconstruction;

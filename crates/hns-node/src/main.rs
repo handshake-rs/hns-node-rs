@@ -77,7 +77,7 @@ struct Cli {
     #[arg(long)]
     p2p_discovery: bool,
 
-    /// Maximum explicit and discovered plaintext peer addresses retained in memory.
+    /// Maximum explicit and discovered plaintext peers retained by the address book.
     #[arg(long, default_value_t = 4_096)]
     maximum_known_addresses: usize,
 

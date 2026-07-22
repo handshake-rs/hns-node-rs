@@ -124,7 +124,9 @@
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
 - HSD DNS-seed bootstrap and bounded GETADDR/ADDR learning with routability,
   service, key, timestamp, protected-explicit-peer, and failed-target rotation
-  rules; the address book remains process-local.
+  rules, plus a versioned, checksummed, network-bound address-book snapshot
+  flushed every 120 seconds and on clean shutdown. Restart restores attempt,
+  success, and cooldown metadata and applies HSD's stale-host horizons.
 - Headers-first synchronization with 2,000-header atomic protocol batches plus
   canonical-header BIP9/script-policy derivation and bounded
   pending/inflight/per-peer body requests, retry, timeout, and reassignment.
@@ -222,8 +224,7 @@ These are substantial foundations, not a production full node.
   and pruning qualification of the bounded restartable active-state connector.
 - Failed-branch pruning/retention policy, historical reorganizations, and
   RocksDB fault evidence.
-- Brontide, address-manager/DNS-seed discovery, durable bans/reputation, and
-  broader peer-diversity controls.
+- Brontide, durable bans/reputation, and broader peer-diversity controls.
 - Compact-block reconstruction and pruning-aware synchronization.
 - Production-complete contextual peer transaction admission and relay.
 - Sustained multipath publication and reconnect/retry supervision under WAN

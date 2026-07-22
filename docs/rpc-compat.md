@@ -32,8 +32,9 @@ snapshots only.
   pre-state root committed inside the active tip's own header.
 - Shadow-sync diagnostics distinguish default observation-only retention from
   explicitly enabled non-authoritative active-state connection and report
-  committed blocks, reorganizations, contextual-invalid bodies, and an opaque
-  process-local runtime instance used to correlate restart evidence.
+  committed blocks, reorganizations, contextual-invalid bodies, durable
+  address-book load/prune/generation/flush state, and an opaque process-local
+  runtime instance used to correlate restart evidence.
 - Unsupported mutations fail explicitly. No current control endpoint claims to
   authenticate or perform a mutation.
 

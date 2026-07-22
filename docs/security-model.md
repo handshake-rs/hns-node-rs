@@ -105,7 +105,7 @@ The following remain untrusted and release-blocking:
   mid-commit process-crash/fault injection;
 - full-mainnet active-state IBD, pruning, and sustained
   alternate-chain/reorganization qualification;
-- Brontide, durable address-manager/reputation state, compact blocks, and
+- Brontide, durable peer reputation/bans, compact blocks, and
   production-complete contextual transaction relay;
 - disconnected-transaction re-admission, production template qualification,
   continuously supervised publication retry, and measured publication latency;
@@ -148,8 +148,10 @@ an authoritative durable tip.
   is not retained as an unvalidated orphan.
 - A body with known header context but unavailable parent body is retained only
   after stateless validation and within count/byte bounds.
-- Peer scores, reconnect timers, inflight requests, and orphan bodies are
-  currently process-local and are not trusted after restart.
+- Discovered peer addresses and their attempt/success history use a bounded,
+  checksummed, network-bound cache; it is selection input, never consensus
+  input. Peer scores/bans, live reconnect timers, inflight requests, and orphan
+  bodies remain process-local and are not trusted after restart.
 - The synchronization checkpoint is checksummed and reconciled with durable
   chain/body state rather than trusted as consensus.
 - A block `notfound` is accepted only from its assigned request peer and is

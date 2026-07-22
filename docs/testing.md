@@ -144,6 +144,9 @@ Current evidence includes:
 - pinned HSD DNS seed/port selection, bounded address admission and eviction,
   unroutable/service/key/timestamp filtering, and failed discovered-target
   rotation without displacement of explicit reconnect peers;
+- versioned, checksummed, network-bound address-book codecs, HSD stale-entry
+  pruning, restored attempt/cooldown rotation, no-op clean flushes, compacted
+  generations, and exact RocksDB close/reopen retention;
 - a seed-only optimized mainnet replay with no explicit sockets: 20 DNS
   endpoints, eight Ready peers after three failed-target rotations, 287 unique
   learned addresses, active/stored progress from 7,232 to 7,416, and exact
@@ -236,6 +239,8 @@ Tests and fault harnesses should cover:
 - inbound/outbound capacity races and duplicate-address registration;
 - process-local self-connection detection through the node's own listener;
 - handshake, idle, ping, pong, request, and reconnect timeouts;
+- corrupt/network-mismatched address-book rejection, HSD stale pruning, and
+  attempt/success metadata retention across RocksDB reopen;
 - priority-lane isolation and queue saturation;
 - late-invalid header batches with full current-batch rollback;
 - known and unknown header/body ordering;

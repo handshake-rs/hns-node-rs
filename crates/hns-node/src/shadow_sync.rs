@@ -26,9 +26,9 @@ use hns_p2p::{
     Inventory, InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket, OutboundPriority,
     P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot, SERVICE_NETWORK,
 };
-use hns_primitives::{Block, BlockHash, Header, Height, Txid};
+use hns_primitives::{blake2b_256, Block, BlockHash, Header, Height, Reader, Txid, Writer};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
-use hns_store::mark_clean_shutdown;
+use hns_store::{mark_clean_shutdown, ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
 use hns_sync::{
     spawn_validation_pipeline, BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult,
     OrphanLimits, OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction,
@@ -58,6 +58,21 @@ const MAX_RECONNECT_DELAY_SECONDS: u64 = 60;
 const MAX_DISCOVERY_CONNECT_FAILURES: u32 = 3;
 const MAX_KNOWN_PEER_ADDRESSES: usize = 16_384;
 const DEFAULT_KNOWN_PEER_ADDRESSES: usize = 4_096;
+const ADDRESS_BOOK_KEY: &[u8] = b"address-book/v1";
+const ADDRESS_BOOK_MAGIC: &[u8; 4] = b"HAB1";
+const ADDRESS_BOOK_VERSION: u8 = 1;
+const ADDRESS_BOOK_CHECKSUM_SIZE: usize = 32;
+const ADDRESS_BOOK_ENTRY_SIZE: usize = 63;
+const ADDRESS_BOOK_HEADER_SIZE: usize = 26;
+const MAX_ADDRESS_BOOK_RECORD_SIZE: usize = ADDRESS_BOOK_HEADER_SIZE
+    + MAX_KNOWN_PEER_ADDRESSES * ADDRESS_BOOK_ENTRY_SIZE
+    + ADDRESS_BOOK_CHECKSUM_SIZE;
+const ADDRESS_BOOK_FLUSH_INTERVAL: Duration = Duration::from_secs(120);
+const HSD_ADDRESS_HORIZON_SECONDS: u64 = 30 * 24 * 60 * 60;
+const HSD_ADDRESS_MIN_FAIL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const HSD_ADDRESS_MAX_FAILURES: u32 = 10;
+const HSD_ADDRESS_RECENT_ATTEMPT_SECONDS: u64 = 60;
+const HSD_ADDRESS_TIMESTAMP_REFRESH_SECONDS: u64 = 20 * 60;
 const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ADDR_FUTURE_SECONDS: u64 = 10 * 60;
 const FALLBACK_ADDR_AGE_SECONDS: u64 = 5 * 24 * 60 * 60;
@@ -263,7 +278,17 @@ pub struct ShadowSyncDiagnostics {
     pub listen: Option<SocketAddr>,
     pub configured_outbound: Vec<SocketAddr>,
     pub discovery_enabled: bool,
+    pub address_book_persistent: bool,
     pub known_addresses: usize,
+    pub loaded_addresses: u64,
+    pub pruned_addresses: u64,
+    pub address_book_sequence: u64,
+    pub address_book_flushes: u64,
+    pub address_book_flush_failures: u64,
+    pub address_book_decode_failures: u64,
+    pub address_book_dirty: bool,
+    pub last_address_book_flush: Option<u64>,
+    pub address_book_last_error: Option<String>,
     pub dns_seed_addresses: u64,
     pub dns_seed_failures: u64,
     pub discovery_connection_failures: u64,
@@ -396,11 +421,32 @@ impl AddressAdmission {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PersistedPeerAddress {
+    address: SocketAddr,
+    services: u64,
+    time: u64,
+    failures: u32,
+    last_success: u64,
+    last_attempt: u64,
+    sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AddressBookRecord {
+    network: Network,
+    generation: u64,
+    updated_at: u64,
+    entries: Vec<PersistedPeerAddress>,
+}
+
 #[derive(Clone, Debug)]
 struct KnownPeerAddress {
     wire: hns_p2p::NetAddress,
     configured: bool,
     failures: u32,
+    last_success: u64,
+    last_attempt: u64,
     eligible_at: Instant,
     sequence: u64,
 }
@@ -411,6 +457,8 @@ struct BoundedAddressBook {
     listen: Option<SocketAddr>,
     maximum: usize,
     sequence: u64,
+    durable_sequence: u64,
+    dirty: bool,
     entries: BTreeMap<SocketAddr, KnownPeerAddress>,
 }
 
@@ -426,6 +474,8 @@ impl BoundedAddressBook {
             listen,
             maximum,
             sequence: 0,
+            durable_sequence: 0,
+            dirty: false,
             entries: BTreeMap::new(),
         })
     }
@@ -444,16 +494,21 @@ impl BoundedAddressBook {
             anyhow::bail!("configured outbound peers exceed the bounded address book");
         }
         self.sequence = self.sequence.saturating_add(1);
-        self.entries.insert(
+        let replaced = self.entries.insert(
             address,
             KnownPeerAddress {
                 wire: hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK),
                 configured: true,
                 failures: 0,
+                last_success: 0,
+                last_attempt: 0,
                 eligible_at: now,
                 sequence: self.sequence,
             },
         );
+        if replaced.is_some_and(|entry| !entry.configured) {
+            self.dirty = true;
+        }
         Ok(())
     }
 
@@ -475,9 +530,17 @@ impl BoundedAddressBook {
         wire.time = normalize_peer_timestamp(wire.time, timestamp);
 
         if let Some(existing) = self.entries.get_mut(&address) {
+            if existing.configured {
+                return AddressAdmission::Updated;
+            }
+            let old_services = existing.wire.services;
+            let old_time = existing.wire.time;
             existing.wire.services |= wire.services;
             if wire.time > existing.wire.time {
                 existing.wire.time = wire.time;
+            }
+            if existing.wire.services != old_services || existing.wire.time != old_time {
+                self.dirty = true;
             }
             return AddressAdmission::Updated;
         }
@@ -493,6 +556,7 @@ impl BoundedAddressBook {
                 return AddressAdmission::Rejected;
             };
             self.entries.remove(&eviction);
+            self.dirty = true;
         }
 
         self.sequence = self.sequence.saturating_add(1);
@@ -502,10 +566,13 @@ impl BoundedAddressBook {
                 wire,
                 configured: false,
                 failures: 0,
+                last_success: 0,
+                last_attempt: 0,
                 eligible_at: now,
                 sequence: self.sequence,
             },
         );
+        self.dirty = true;
         AddressAdmission::Added
     }
 
@@ -538,21 +605,42 @@ impl BoundedAddressBook {
             .collect()
     }
 
-    fn note_failure(&mut self, address: SocketAddr, now: Instant) {
+    fn note_attempt(&mut self, address: SocketAddr, now: Instant, timestamp: u64) {
         let Some(entry) = self.entries.get_mut(&address) else {
             return;
         };
         entry.failures = entry.failures.saturating_add(1);
+        entry.last_attempt = timestamp;
         entry.eligible_at = now + reconnect_delay(entry.failures);
+        if !entry.configured {
+            self.dirty = true;
+        }
     }
 
-    fn note_success(&mut self, address: SocketAddr, now: Instant, timestamp: u64) {
+    fn note_transport_success(&mut self, address: SocketAddr, timestamp: u64) {
         let Some(entry) = self.entries.get_mut(&address) else {
             return;
         };
+        if timestamp.saturating_sub(entry.wire.time) > HSD_ADDRESS_TIMESTAMP_REFRESH_SECONDS {
+            entry.wire.time = timestamp;
+            if !entry.configured {
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn note_success(&mut self, address: SocketAddr, now: Instant, timestamp: u64, services: u64) {
+        let Some(entry) = self.entries.get_mut(&address) else {
+            return;
+        };
+        entry.wire.services |= services;
         entry.failures = 0;
+        entry.last_success = timestamp;
+        entry.last_attempt = timestamp;
         entry.eligible_at = now;
-        entry.wire.time = timestamp;
+        if !entry.configured {
+            self.dirty = true;
+        }
     }
 
     fn advertised(&self, maximum: usize) -> Vec<hns_p2p::NetAddress> {
@@ -583,6 +671,277 @@ impl BoundedAddressBook {
             .map(|entry| entry.wire.clone())
             .collect()
     }
+
+    fn durable_entries(&self) -> Vec<PersistedPeerAddress> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| !entry.configured)
+            .map(|(address, entry)| PersistedPeerAddress {
+                address: *address,
+                services: entry.wire.services,
+                time: entry.wire.time,
+                failures: entry.failures,
+                last_success: entry.last_success,
+                last_attempt: entry.last_attempt,
+                sequence: entry.sequence,
+            })
+            .collect()
+    }
+
+    fn restore(
+        &mut self,
+        mut record: AddressBookRecord,
+        now: Instant,
+        timestamp: u64,
+    ) -> Result<(usize, usize)> {
+        if record.network != self.network {
+            anyhow::bail!(
+                "address-book network {} does not match configured {}",
+                record.network,
+                self.network
+            );
+        }
+        let original = record.entries.len();
+        record.entries.retain(|entry| {
+            is_discoverable_address(self.network, self.listen, entry.address)
+                && entry.services & SERVICE_NETWORK != 0
+                && !persisted_address_is_stale(entry, timestamp)
+        });
+        record.entries.sort_by_key(|entry| {
+            (
+                entry.failures,
+                std::cmp::Reverse(entry.last_success),
+                std::cmp::Reverse(entry.time),
+                entry.sequence,
+                entry.address,
+            )
+        });
+
+        let mut loaded = 0usize;
+        let mut seen = BTreeSet::new();
+        for entry in record.entries {
+            if !seen.insert(entry.address) || self.entries.contains_key(&entry.address) {
+                continue;
+            }
+            if self.entries.len() >= self.maximum {
+                break;
+            }
+            let retry_at = entry
+                .last_attempt
+                .saturating_add(reconnect_delay(entry.failures).as_secs());
+            let delay = retry_at
+                .saturating_sub(timestamp)
+                .min(MAX_RECONNECT_DELAY_SECONDS);
+            self.sequence = self.sequence.max(entry.sequence);
+            self.entries.insert(
+                entry.address,
+                KnownPeerAddress {
+                    wire: hns_p2p::NetAddress::from_socket_addr(
+                        entry.address,
+                        entry.time,
+                        entry.services,
+                    ),
+                    configured: false,
+                    failures: entry.failures,
+                    last_success: entry.last_success,
+                    last_attempt: entry.last_attempt,
+                    eligible_at: now + Duration::from_secs(delay),
+                    sequence: entry.sequence,
+                },
+            );
+            loaded = loaded.saturating_add(1);
+        }
+        self.durable_sequence = record.generation;
+        let pruned = original.saturating_sub(loaded);
+        self.dirty = pruned > 0;
+        Ok((loaded, pruned))
+    }
+}
+
+impl AddressBookRecord {
+    fn encode(&self) -> Result<Vec<u8>> {
+        if self.entries.len() > MAX_KNOWN_PEER_ADDRESSES {
+            anyhow::bail!(
+                "address-book record has {} entries; maximum is {MAX_KNOWN_PEER_ADDRESSES}",
+                self.entries.len()
+            );
+        }
+        let count = u32::try_from(self.entries.len())
+            .map_err(|_| anyhow::anyhow!("address-book entry count exceeds u32"))?;
+        let mut writer = Writer::with_capacity(
+            ADDRESS_BOOK_HEADER_SIZE
+                + self.entries.len() * ADDRESS_BOOK_ENTRY_SIZE
+                + ADDRESS_BOOK_CHECKSUM_SIZE,
+        );
+        writer.write_bytes(ADDRESS_BOOK_MAGIC);
+        writer.write_u8(ADDRESS_BOOK_VERSION);
+        writer.write_u8(self.network.canonical_id());
+        writer.write_u64(self.generation);
+        writer.write_u64(self.updated_at);
+        writer.write_u32(count);
+        for entry in &self.entries {
+            match entry.address.ip() {
+                IpAddr::V4(ip) => {
+                    writer.write_u8(4);
+                    writer.write_bytes(&ip.octets());
+                    writer.write_bytes(&[0; 12]);
+                }
+                IpAddr::V6(ip) => {
+                    writer.write_u8(6);
+                    writer.write_bytes(&ip.octets());
+                }
+            }
+            writer.write_u16(entry.address.port());
+            writer.write_u64(entry.services);
+            writer.write_u64(entry.time);
+            writer.write_u32(entry.failures);
+            writer.write_u64(entry.last_success);
+            writer.write_u64(entry.last_attempt);
+            writer.write_u64(entry.sequence);
+        }
+        let mut raw = writer.finish();
+        raw.extend_from_slice(&blake2b_256(&raw));
+        Ok(raw)
+    }
+
+    fn decode(raw: &[u8], expected_network: Network) -> Result<Self> {
+        if raw.len() < ADDRESS_BOOK_HEADER_SIZE + ADDRESS_BOOK_CHECKSUM_SIZE
+            || raw.len() > MAX_ADDRESS_BOOK_RECORD_SIZE
+        {
+            anyhow::bail!("address-book record has invalid length {}", raw.len());
+        }
+        let body_len = raw.len() - ADDRESS_BOOK_CHECKSUM_SIZE;
+        let (body, checksum) = raw.split_at(body_len);
+        if checksum != blake2b_256(body) {
+            anyhow::bail!("address-book checksum mismatch");
+        }
+        let mut reader = Reader::new(body, MAX_ADDRESS_BOOK_RECORD_SIZE)?;
+        if reader.read_vec(ADDRESS_BOOK_MAGIC.len())? != ADDRESS_BOOK_MAGIC {
+            anyhow::bail!("address-book magic mismatch");
+        }
+        let version = reader.read_u8()?;
+        if version != ADDRESS_BOOK_VERSION {
+            anyhow::bail!("unsupported address-book version {version}");
+        }
+        let network_id = reader.read_u8()?;
+        let network = Network::from_canonical_id(network_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown address-book network ID {network_id}"))?;
+        if network != expected_network {
+            anyhow::bail!(
+                "address-book network {network} does not match configured {expected_network}"
+            );
+        }
+        let generation = reader.read_u64()?;
+        let updated_at = reader.read_u64()?;
+        let count = usize::try_from(reader.read_u32()?)
+            .map_err(|_| anyhow::anyhow!("address-book count exceeds usize"))?;
+        if count > MAX_KNOWN_PEER_ADDRESSES {
+            anyhow::bail!(
+                "address-book record has {count} entries; maximum is {MAX_KNOWN_PEER_ADDRESSES}"
+            );
+        }
+        let expected_body_len = ADDRESS_BOOK_HEADER_SIZE
+            .checked_add(count.saturating_mul(ADDRESS_BOOK_ENTRY_SIZE))
+            .ok_or_else(|| anyhow::anyhow!("address-book record length overflow"))?;
+        if body.len() != expected_body_len {
+            anyhow::bail!(
+                "address-book body has {} bytes; expected {expected_body_len}",
+                body.len()
+            );
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut seen = BTreeSet::new();
+        for _ in 0..count {
+            let family = reader.read_u8()?;
+            let ip_bytes = reader.read_vec(16)?;
+            let ip = match family {
+                4 => {
+                    if ip_bytes[4..] != [0; 12] {
+                        anyhow::bail!("address-book IPv4 padding is nonzero");
+                    }
+                    IpAddr::V4(Ipv4Addr::new(
+                        ip_bytes[0],
+                        ip_bytes[1],
+                        ip_bytes[2],
+                        ip_bytes[3],
+                    ))
+                }
+                6 => {
+                    let bytes: [u8; 16] = ip_bytes
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("address-book IPv6 length mismatch"))?;
+                    IpAddr::V6(Ipv6Addr::from(bytes))
+                }
+                other => anyhow::bail!("unknown address-book address family {other}"),
+            };
+            let address = SocketAddr::new(ip, reader.read_u16()?);
+            if !seen.insert(address) {
+                anyhow::bail!("address-book contains duplicate address {address}");
+            }
+            entries.push(PersistedPeerAddress {
+                address,
+                services: reader.read_u64()?,
+                time: reader.read_u64()?,
+                failures: reader.read_u32()?,
+                last_success: reader.read_u64()?,
+                last_attempt: reader.read_u64()?,
+                sequence: reader.read_u64()?,
+            });
+        }
+        reader.ensure_finished()?;
+        Ok(Self {
+            network,
+            generation,
+            updated_at,
+            entries,
+        })
+    }
+}
+
+fn persisted_address_is_stale(entry: &PersistedPeerAddress, now: u64) -> bool {
+    if entry.last_attempt != 0
+        && entry.last_attempt >= now.saturating_sub(HSD_ADDRESS_RECENT_ATTEMPT_SECONDS)
+    {
+        return false;
+    }
+    if entry.time == 0 || entry.time > now.saturating_add(MAX_ADDR_FUTURE_SECONDS) {
+        return true;
+    }
+    if now.saturating_sub(entry.time) > HSD_ADDRESS_HORIZON_SECONDS {
+        return true;
+    }
+    if entry.last_success == 0 && entry.failures >= MAX_DISCOVERY_CONNECT_FAILURES {
+        return true;
+    }
+    entry.failures >= HSD_ADDRESS_MAX_FAILURES
+        && now.saturating_sub(entry.last_success) > HSD_ADDRESS_MIN_FAIL_SECONDS
+}
+
+fn persist_address_book(
+    store: &StoreHandle,
+    addresses: &mut BoundedAddressBook,
+    timestamp: u64,
+) -> Result<bool> {
+    if !addresses.dirty {
+        return Ok(false);
+    }
+    let generation = addresses
+        .durable_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("address-book generation exhausted"))?;
+    let record = AddressBookRecord {
+        network: addresses.network,
+        generation,
+        updated_at: timestamp,
+        entries: addresses.durable_entries(),
+    };
+    let raw = record.encode()?;
+    let mut batch = store.batch();
+    batch.put(ColumnFamily::Peers, ADDRESS_BOOK_KEY, &raw)?;
+    store.commit(batch)?;
+    addresses.durable_sequence = generation;
+    addresses.dirty = false;
+    Ok(true)
 }
 
 fn normalize_peer_timestamp(timestamp: u64, now: u64) -> u64 {
@@ -740,6 +1099,8 @@ impl NodeService {
         let shadow_sync_config = self.config.shadow_sync.clone();
         let rpc_bind = self.config.rpc_bind;
         let network = self.config.network;
+        let address_book_persistent =
+            shadow_sync_config.discovery && self.config.data_dir.is_some();
         let store = self.state.store.clone();
         let node = Arc::new(Mutex::new(self));
 
@@ -818,8 +1179,36 @@ impl NodeService {
         for address in &shadow_sync_config.connect {
             address_book.insert_configured(*address, address_now, address_timestamp)?;
         }
+        let mut loaded_addresses = 0u64;
+        let mut pruned_addresses = 0u64;
+        let mut address_book_decode_failures = 0u64;
         let mut dns_seed_addresses = 0u64;
         let mut dns_seed_failures = 0u64;
+        if address_book_persistent {
+            let durable_address_book = {
+                let snapshot = store
+                    .snapshot()
+                    .context("failed to open address-book snapshot")?;
+                snapshot
+                    .get(ColumnFamily::Peers, ADDRESS_BOOK_KEY)
+                    .context("failed to read durable address book")?
+            };
+            if let Some(raw) = durable_address_book {
+                match AddressBookRecord::decode(&raw, network)
+                    .and_then(|record| address_book.restore(record, address_now, address_timestamp))
+                {
+                    Ok((loaded, pruned)) => {
+                        loaded_addresses = loaded as u64;
+                        pruned_addresses = pruned as u64;
+                    }
+                    Err(error) => {
+                        address_book_decode_failures = 1;
+                        address_book.dirty = true;
+                        tracing::warn!(%error, "discarding invalid durable HNS address book");
+                    }
+                }
+            }
+        }
         if shadow_sync_config.discovery {
             let resolution = resolve_hsd_dns_seeds(network).await;
             dns_seed_failures = resolution.errors.len() as u64;
@@ -872,7 +1261,13 @@ impl NodeService {
             listen: shadow_sync_config.listen,
             configured_outbound: shadow_sync_config.connect.clone(),
             discovery_enabled: shadow_sync_config.discovery,
+            address_book_persistent,
             known_addresses: address_book.len(),
+            loaded_addresses,
+            pruned_addresses,
+            address_book_sequence: address_book.durable_sequence,
+            address_book_decode_failures,
+            address_book_dirty: address_book.dirty,
             dns_seed_addresses,
             dns_seed_failures,
             started_at: unix_time(),
@@ -939,6 +1334,9 @@ impl NodeService {
         let mut poll = tokio::time::interval(shadow_sync_config.poll_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         poll.tick().await;
+        let mut address_book_flush = tokio::time::interval(ADDRESS_BOOK_FLUSH_INTERVAL);
+        address_book_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        address_book_flush.tick().await;
         let mut served_getaddr = HashSet::new();
         let mut shutdown_wait = Box::pin(shutdown.wait());
         let mut terminal_error: Option<anyhow::Error> = None;
@@ -946,6 +1344,9 @@ impl NodeService {
         loop {
             tokio::select! {
                 _ = &mut shutdown_wait => break,
+                _ = address_book_flush.tick(), if address_book_persistent => {
+                    flush_address_book(&store, &mut address_book, &diagnostics).await;
+                }
                 _ = poll.tick() => {
                     if rpc_task.is_finished() {
                         let message = "Shadow sync RPC task terminated unexpectedly".to_owned();
@@ -974,6 +1375,7 @@ impl NodeService {
                     }
                     let attempts = spawn_due_connections(
                         &mut reconnects,
+                        &mut address_book,
                         &peers,
                         &connect_results_tx,
                         connection_now,
@@ -1076,7 +1478,6 @@ impl NodeService {
                     handle_connect_attempt_result(
                         result,
                         &mut reconnects,
-                        &mut address_book,
                         &diagnostics,
                     )
                     .await;
@@ -1174,6 +1575,9 @@ impl NodeService {
             }
         }
 
+        if address_book_persistent {
+            flush_address_book(&store, &mut address_book, &diagnostics).await;
+        }
         checkpoint_sequence = checkpoint_sequence.saturating_add(1);
         if let Err(error) = persist_checkpoint(&checkpoint_store, &scheduler, checkpoint_sequence) {
             record_error(&diagnostics, error.to_string()).await;
@@ -2087,6 +2491,7 @@ async fn handle_peer_event(
             if direction == PeerDirection::Outbound {
                 if let Some(state) = reconnects.get_mut(&address) {
                     state.transport_connected(Instant::now());
+                    addresses.note_transport_success(address, unix_time());
                 }
             }
         }
@@ -2106,7 +2511,7 @@ async fn handle_peer_event(
                 let now = Instant::now();
                 if let Some(state) = reconnects.get_mut(&snapshot.address) {
                     state.ready(now);
-                    addresses.note_success(snapshot.address, now, unix_time());
+                    addresses.note_success(snapshot.address, now, unix_time(), version.services);
                 }
             }
             if discovery
@@ -2130,7 +2535,7 @@ async fn handle_peer_event(
             scheduler.remove_peer(peer);
             served_getaddr.remove(&peer);
             if direction == PeerDirection::Outbound {
-                note_reconnect_failure(address, reconnects, addresses, Instant::now());
+                note_reconnect_failure(address, reconnects, Instant::now());
             }
             tracing::debug!(?peer, %address, %reason, "HNS peer disconnected");
         }
@@ -3167,6 +3572,7 @@ fn persist_checkpoint(
 
 fn spawn_due_connections(
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    addresses: &mut BoundedAddressBook,
     peers: &LivePeerManager,
     results: &mpsc::Sender<ConnectAttemptResult>,
     now: Instant,
@@ -3189,6 +3595,10 @@ fn spawn_due_connections(
         .take(available)
         .collect::<Vec<_>>();
 
+    let timestamp = unix_time();
+    for address in &due {
+        addresses.note_attempt(*address, now, timestamp);
+    }
     for address in &due {
         let address = *address;
         let peers = peers.clone();
@@ -3214,7 +3624,9 @@ fn fill_discovery_slots(
     let candidates = addresses.connection_candidates(reconnects, now, available);
     let added = candidates.len();
     for address in candidates {
-        reconnects.insert(address, ReconnectState::new(now, false));
+        let mut state = ReconnectState::new(now, false);
+        state.failures = addresses.entries[&address].failures;
+        reconnects.insert(address, state);
     }
     added
 }
@@ -3222,7 +3634,6 @@ fn fill_discovery_slots(
 fn note_reconnect_failure(
     address: SocketAddr,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
-    addresses: &mut BoundedAddressBook,
     now: Instant,
 ) {
     let retire = reconnects.get_mut(&address).is_some_and(|state| {
@@ -3231,14 +3642,12 @@ fn note_reconnect_failure(
     });
     if retire {
         reconnects.remove(&address);
-        addresses.note_failure(address, now);
     }
 }
 
 async fn handle_connect_attempt_result(
     result: ConnectAttemptResult,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
-    addresses: &mut BoundedAddressBook,
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
 ) {
     let Some(persistent) = reconnects
@@ -3252,7 +3661,7 @@ async fn handle_connect_attempt_result(
             tracing::debug!(?peer, address = %result.address, "outbound HNS peer connected");
         }
         Err(error) => {
-            note_reconnect_failure(result.address, reconnects, addresses, Instant::now());
+            note_reconnect_failure(result.address, reconnects, Instant::now());
             if persistent {
                 record_error(
                     diagnostics,
@@ -3287,8 +3696,45 @@ async fn refresh_diagnostics(
     state.orphans = orphans.snapshot();
     state.checkpoint_sequence = checkpoint_sequence;
     state.known_addresses = addresses.len();
+    state.address_book_sequence = addresses.durable_sequence;
+    state.address_book_dirty = addresses.dirty;
     state.outbound_connected = reconnects.values().filter(|item| item.connected).count();
     state.outbound_connecting = reconnects.values().filter(|item| item.connecting).count();
+}
+
+async fn flush_address_book(
+    store: &StoreHandle,
+    addresses: &mut BoundedAddressBook,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) {
+    let timestamp = unix_time();
+    match persist_address_book(store, addresses, timestamp) {
+        Ok(flushed) => {
+            let sequence = addresses.durable_sequence;
+            let dirty = addresses.dirty;
+            update_diagnostics(diagnostics, |state| {
+                state.address_book_sequence = sequence;
+                state.address_book_dirty = dirty;
+                if flushed {
+                    state.address_book_flushes = state.address_book_flushes.saturating_add(1);
+                    state.last_address_book_flush = Some(timestamp);
+                    state.address_book_last_error = None;
+                }
+            })
+            .await;
+        }
+        Err(error) => {
+            let error = error.to_string();
+            update_diagnostics(diagnostics, |state| {
+                state.address_book_flush_failures =
+                    state.address_book_flush_failures.saturating_add(1);
+                state.address_book_dirty = true;
+                state.address_book_last_error = Some(error.clone());
+            })
+            .await;
+            tracing::warn!(%error, "failed to persist HNS address book");
+        }
+    }
 }
 
 async fn update_diagnostics<F>(diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>, update: F)
@@ -3462,6 +3908,38 @@ mod tests {
     }
 
     #[test]
+    fn tcp_success_refreshes_time_but_only_ready_resets_attempts() {
+        let now = Instant::now();
+        let timestamp = 1_800_000_000;
+        let address: SocketAddr = "8.8.8.8:12038".parse().expect("peer");
+        let mut addresses = BoundedAddressBook::new(Network::Mainnet, None, 1).expect("book");
+        assert!(addresses
+            .insert_discovered(
+                hns_p2p::NetAddress::from_socket_addr(
+                    address,
+                    timestamp - HSD_ADDRESS_TIMESTAMP_REFRESH_SECONDS - 1,
+                    SERVICE_NETWORK,
+                ),
+                now,
+                timestamp,
+            )
+            .accepted());
+        addresses.note_attempt(address, now, timestamp);
+        addresses.note_transport_success(address, timestamp);
+        assert_eq!(addresses.entries[&address].wire.time, timestamp);
+        assert_eq!(addresses.entries[&address].failures, 1);
+        assert_eq!(addresses.entries[&address].last_success, 0);
+
+        addresses.note_success(address, now, timestamp, SERVICE_NETWORK | 2);
+        assert_eq!(addresses.entries[&address].failures, 0);
+        assert_eq!(addresses.entries[&address].last_success, timestamp);
+        assert_eq!(
+            addresses.entries[&address].wire.services,
+            SERVICE_NETWORK | 2
+        );
+    }
+
+    #[test]
     fn dns_discovery_uses_pinned_hsd_network_seeds() {
         assert_eq!(
             hsd_dns_seeds(Network::Mainnet),
@@ -3496,6 +3974,210 @@ mod tests {
         assert!(!admit_getaddr(peer, true, &mut served));
         served.remove(&peer);
         assert!(admit_getaddr(peer, true, &mut served));
+    }
+
+    #[test]
+    fn address_book_record_is_versioned_network_bound_and_checksummed() {
+        let record = AddressBookRecord {
+            network: Network::Mainnet,
+            generation: 7,
+            updated_at: 1_800_000_000,
+            entries: vec![
+                PersistedPeerAddress {
+                    address: "8.8.8.8:12038".parse().expect("IPv4 peer"),
+                    services: SERVICE_NETWORK,
+                    time: 1_799_999_900,
+                    failures: 2,
+                    last_success: 1_799_999_800,
+                    last_attempt: 1_799_999_900,
+                    sequence: 11,
+                },
+                PersistedPeerAddress {
+                    address: "[2606:4700:4700::1111]:12038".parse().expect("IPv6 peer"),
+                    services: SERVICE_NETWORK,
+                    time: 1_799_999_700,
+                    failures: 0,
+                    last_success: 1_799_999_700,
+                    last_attempt: 1_799_999_700,
+                    sequence: 12,
+                },
+            ],
+        };
+        let raw = record.encode().expect("encode record");
+        assert_eq!(
+            raw.len(),
+            ADDRESS_BOOK_HEADER_SIZE + 2 * ADDRESS_BOOK_ENTRY_SIZE + ADDRESS_BOOK_CHECKSUM_SIZE
+        );
+        assert_eq!(
+            AddressBookRecord::decode(&raw, Network::Mainnet).expect("decode record"),
+            record
+        );
+
+        let network_error =
+            AddressBookRecord::decode(&raw, Network::Testnet).expect_err("network-bound record");
+        assert!(network_error.to_string().contains("network"));
+
+        let mut corrupt = raw.clone();
+        corrupt[ADDRESS_BOOK_HEADER_SIZE] ^= 1;
+        let checksum_error =
+            AddressBookRecord::decode(&corrupt, Network::Mainnet).expect_err("checksummed record");
+        assert!(checksum_error.to_string().contains("checksum"));
+
+        let mut unknown_family = raw;
+        unknown_family[ADDRESS_BOOK_HEADER_SIZE] = 5;
+        let body_len = unknown_family.len() - ADDRESS_BOOK_CHECKSUM_SIZE;
+        let checksum = blake2b_256(&unknown_family[..body_len]);
+        unknown_family[body_len..].copy_from_slice(&checksum);
+        let family_error = AddressBookRecord::decode(&unknown_family, Network::Mainnet)
+            .expect_err("known IP family");
+        assert!(family_error.to_string().contains("family"));
+    }
+
+    #[test]
+    fn durable_address_book_round_trips_attempts_and_prunes_hsd_stale_entries() {
+        let now = Instant::now();
+        let timestamp = 1_800_000_000;
+        let configured: SocketAddr = "8.8.4.4:12038".parse().expect("configured peer");
+        let valid: SocketAddr = "8.8.8.8:12038".parse().expect("valid peer");
+        let stale: SocketAddr = "1.1.1.1:12038".parse().expect("stale peer");
+        let store = StoreHandle::memory();
+        let mut addresses = BoundedAddressBook::new(Network::Mainnet, None, 4).expect("book");
+        addresses
+            .insert_configured(configured, now, timestamp)
+            .expect("configured address");
+        for address in [valid, stale] {
+            assert_eq!(
+                addresses.insert_discovered(
+                    hns_p2p::NetAddress::from_socket_addr(
+                        address,
+                        timestamp - 100,
+                        SERVICE_NETWORK,
+                    ),
+                    now,
+                    timestamp,
+                ),
+                AddressAdmission::Added
+            );
+        }
+        {
+            let entry = addresses.entries.get_mut(&valid).expect("valid entry");
+            entry.failures = 2;
+            entry.last_success = timestamp - 200;
+            entry.last_attempt = timestamp - 100;
+        }
+        {
+            let entry = addresses.entries.get_mut(&stale).expect("stale entry");
+            entry.failures = MAX_DISCOVERY_CONNECT_FAILURES;
+            entry.last_attempt = timestamp - HSD_ADDRESS_RECENT_ATTEMPT_SECONDS - 1;
+        }
+
+        assert!(persist_address_book(&store, &mut addresses, timestamp).expect("first persist"));
+        assert!(!persist_address_book(&store, &mut addresses, timestamp).expect("clean no-op"));
+        let raw = store
+            .snapshot()
+            .expect("snapshot")
+            .get(ColumnFamily::Peers, ADDRESS_BOOK_KEY)
+            .expect("address-book read")
+            .expect("address-book record");
+        let record = AddressBookRecord::decode(&raw, Network::Mainnet).expect("decode persisted");
+        assert_eq!(record.generation, 1);
+        assert_eq!(record.entries.len(), 2);
+        assert!(record
+            .entries
+            .iter()
+            .all(|entry| entry.address != configured));
+
+        let mut restored = BoundedAddressBook::new(Network::Mainnet, None, 4).expect("restored");
+        let (loaded, pruned) = restored
+            .restore(record, now, timestamp)
+            .expect("restore record");
+        assert_eq!((loaded, pruned), (1, 1));
+        assert!(restored.entries.contains_key(&valid));
+        assert!(!restored.entries.contains_key(&stale));
+        assert_eq!(restored.entries[&valid].failures, 2);
+        assert_eq!(restored.entries[&valid].last_success, timestamp - 200);
+        assert_eq!(restored.durable_sequence, 1);
+        assert!(restored.dirty, "pruning must schedule a compacted flush");
+
+        let mut reconnects = HashMap::new();
+        assert_eq!(fill_discovery_slots(&restored, &mut reconnects, 1, now), 1);
+        assert_eq!(reconnects[&valid].failures, 2);
+        restored.note_attempt(valid, now, timestamp);
+        note_reconnect_failure(valid, &mut reconnects, now);
+        assert!(
+            !reconnects.contains_key(&valid),
+            "restored failure history must rotate a target at HSD's limit"
+        );
+
+        assert!(persist_address_book(&store, &mut restored, timestamp + 1)
+            .expect("persist pruned record"));
+        let compacted = store
+            .snapshot()
+            .expect("compacted snapshot")
+            .get(ColumnFamily::Peers, ADDRESS_BOOK_KEY)
+            .expect("compacted read")
+            .expect("compacted record");
+        let compacted =
+            AddressBookRecord::decode(&compacted, Network::Mainnet).expect("decode compacted");
+        assert_eq!(compacted.generation, 2);
+        assert_eq!(compacted.entries.len(), 1);
+        assert_eq!(compacted.entries[0].address, valid);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn durable_address_book_survives_rocksdb_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-address-book-reopen-{}-{}",
+            std::process::id(),
+            current_unix_time().expect("time")
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let config = hns_store::StoreConfig {
+            path: path.clone(),
+            backend: hns_store::StoreBackend::RocksDb,
+            durability: hns_store::DurabilityPolicy::Sync,
+        };
+        let address: SocketAddr = "9.9.9.9:12038".parse().expect("peer");
+        let timestamp = 1_800_000_000;
+
+        {
+            let store = hns_store::open_store(&config).expect("open store");
+            let now = Instant::now();
+            let mut addresses = BoundedAddressBook::new(Network::Mainnet, None, 4).expect("book");
+            assert!(addresses
+                .insert_discovered(
+                    hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK,),
+                    now,
+                    timestamp,
+                )
+                .accepted());
+            addresses.note_attempt(address, now, timestamp);
+            assert!(persist_address_book(&store, &mut addresses, timestamp).expect("persist"));
+        }
+
+        {
+            let store = hns_store::open_store(&config).expect("reopen store");
+            let raw = store
+                .snapshot()
+                .expect("snapshot")
+                .get(ColumnFamily::Peers, ADDRESS_BOOK_KEY)
+                .expect("address-book read")
+                .expect("address-book record");
+            let record = AddressBookRecord::decode(&raw, Network::Mainnet).expect("decode record");
+            let mut restored =
+                BoundedAddressBook::new(Network::Mainnet, None, 4).expect("restored book");
+            assert_eq!(
+                restored
+                    .restore(record, Instant::now(), timestamp)
+                    .expect("restore"),
+                (1, 0)
+            );
+            assert_eq!(restored.entries[&address].failures, 1);
+            assert_eq!(restored.entries[&address].last_attempt, timestamp);
+        }
+
+        std::fs::remove_dir_all(&path).expect("remove test store");
     }
 
     #[test]
@@ -3595,7 +4277,8 @@ mod tests {
         state.ready(now);
         assert_eq!(state.failures, 0, "a ready handshake resets failures");
         for _ in 0..MAX_DISCOVERY_CONNECT_FAILURES {
-            note_reconnect_failure(discovered, &mut reconnects, &mut addresses, now);
+            addresses.note_attempt(discovered, now, timestamp);
+            note_reconnect_failure(discovered, &mut reconnects, now);
         }
         assert!(!reconnects.contains_key(&discovered));
         assert!(reconnects.contains_key(&configured));

@@ -132,7 +132,8 @@ Implemented:
 - bounded peer registration, scoring, disconnect, diagnostics, and reconnect;
 - opt-in HSD DNS-seed bootstrap plus bounded GETADDR/ADDR learning, routability
   and service filtering, HSD timestamp normalization, protected explicit peers,
-  and failed discovered-target rotation;
+  failed discovered-target rotation, and a checksummed, network-bound durable
+  address book with HSD attempt/success metadata and stale-entry horizons;
 - headers-first acquisition, 2,000-header atomic durable protocol batches,
   best-work retention, and independent canonical-header derivation of BIP9
   states plus mandatory script/lock/name policy;
@@ -165,7 +166,7 @@ Implemented:
 
 Remaining:
 
-- Brontide and durable address-manager state;
+- Brontide transport;
 - durable bans/reputation and broader adversarial network qualification;
 - full-mainnet replay and pruning-aware qualification of active-state IBD;
 - compact blocks and production-complete contextual transaction relay;
