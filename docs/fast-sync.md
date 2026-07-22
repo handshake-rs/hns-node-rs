@@ -5,7 +5,7 @@ Sync is headers-first, block-parallel, and state-ordered. The node should maximi
 ## Header Synchronization
 
 - Maintain many outbound peers with address-group diversity.
-- Start with static seeds, DNS seeds, persisted peers, and optional operator peers.
+- Start with authenticated key-bearing fixed seeds, persisted peers, and optional operator peers.
 - Handshake with version/verack, record advertised height, and request `sendheaders` when supported.
 - Request headers using a locator generated from the best validated header chain.
 - Validate every received header for length, hash, previous link, PoW, mainnet difficulty, checkpoint ancestry, timestamp policy, and duplicate behavior.

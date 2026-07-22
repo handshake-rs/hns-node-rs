@@ -56,7 +56,7 @@ is retried instead of being reported as a divergence.
 ## Header-only qualification
 
 A pruned HSD node still exposes the canonical header chain through P2P and
-canonical hashes through RPC. Start hsrd with `--shadow-sync-headers-only`, then
+canonical hashes through RPC. Start hsrd with `--native-sync-headers-only`, then
 compare its durable best header without making any block-body or state claim:
 
 ```bash

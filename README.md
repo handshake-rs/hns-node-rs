@@ -13,18 +13,18 @@ exists for diagnostics, operations, and differential testing.
 ## Current release stage
 
 `hsrd` remains **pre-authority**. The pinned `hsd` revision is still the
-behavioral oracle and production authority. The default mode is `shadow`.
+offline behavioral oracle; it is not a runtime parent or production authority.
+The default mode is `native`.
 `native-experimental` requires an explicit Cargo feature, an explicit runtime
 acknowledgement, and regtest or simnet. No incomplete validation or
 synchronization stage is presented as complete Handshake consensus.
 
 The current tree contains hardened authority, storage, transaction, covenant,
-and name-state foundations, a live P2P/shadow-synchronization foundation, and a
+and name-state foundations, a live native P2P/synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication
-foundation. Network data remains non-authoritative, and the mining engine cannot
-authorize jobs or publish solved blocks without the private authority capability. An explicitly
-acknowledged active-state sync mode can now connect downloaded bodies through
-the same atomic consensus pipeline, but it remains non-authoritative. API-v9
+foundation. Native synchronization can produce fully validated durable block
+status, but the mining engine cannot authorize jobs or publish solved blocks
+without the private authority capability and complete readiness. API-v9
 exposes the exact next-header interval-committed root, and the external comparison
 runner can check it against a pinned live HSD node without feeding oracle data
 back into consensus.
@@ -37,7 +37,7 @@ Implemented:
   release builds, and RustSec checks.
 - Explicit validation-stage bits rather than coarse `tx_valid` or
   `state_connected` labels.
-- `disabled`, `shadow`, reserved `hsd-verified`, and explicitly gated
+- `disabled`, legacy `shadow`, fail-closed `native`, reserved `hsd-verified`, and explicitly gated
   `native-experimental` authority modes.
 - A private authority capability required by authoritative mining-template and
   candidate-admission boundaries.
@@ -233,7 +233,7 @@ Still release-blocking:
   mid-commit process-crash/fault injection for the incremental Urkel lifecycle;
 - complete historical root, undo, and reorganization replay.
 
-## Live P2P and restartable shadow synchronization
+## Live native P2P and restartable synchronization
 
 Implemented:
 
@@ -303,7 +303,7 @@ Implemented:
   neither poison branches nor affect peer-failure accounting.
 - Durable best-header and contiguous stored-body progress plus a versioned,
   checksummed restart checkpoint that is cross-checked against durable state.
-- Explicitly acknowledged, bounded active-state batches that resume stored work
+- Bounded native active-state batches that resume stored work
   after restart and use the same contextual state/reorganization pipeline as
   local blocks. Contextual-invalid roots and known descendants are durably
   failed with atomic header fallback; local storage/backend faults stop sync
@@ -312,8 +312,9 @@ Implemented:
   compact bodies, requested block transactions, learned routable addresses,
   and accepted ordinary/claim/airdrop mempool inventory and payloads.
 - Read-only peer and synchronization diagnostics.
-- Default observation-only storage plus an opt-in non-authoritative active-state
-  connector. Neither mode can authorize mining work in `shadow` authority mode.
+- Native mainnet body and active-state synchronization by default, plus explicit
+  headers-only and observe-only reductions. Synchronization alone cannot mint
+  the private mining authority capability.
 - A fail-closed external live HSD comparison runner for canonical block hashes
   and post-tip authenticated roots, with race retries, pinned-source checks,
   provisional-versus-confirmed root labeling, and a checksummed bounded
@@ -398,8 +399,9 @@ See [`docs/mining-engine.md`](docs/mining-engine.md).
 
 Native mainnet authority remains disabled until all readiness fields report
 complete and historical/live evidence is independently reviewed. The live
-network path is available only in `disabled` or `shadow` authority modes.
-Downloaded network data cannot produce a `MiningAuthorityPermit`.
+network path is available in `disabled`, legacy `shadow`, or `native` authority
+modes. A complete durable block status is necessary but cannot alone produce a
+`MiningAuthorityPermit` while readiness remains incomplete.
 
 See:
 

@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
@@ -23,10 +26,11 @@ use hns_consensus::{
 };
 use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
 use hns_p2p::{
-    normalize_peer_ip, peer_address_group, CompactBlock, CompactBlockError,
-    CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse, Inventory,
-    InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket, OutboundPriority, P2pError,
-    Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot, SERVICE_NETWORK,
+    generate_private_key, normalize_peer_ip, peer_address_group, BrontideIdentity, CompactBlock,
+    CompactBlockError, CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse,
+    Inventory, InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket, OutboundPriority,
+    P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot, PeerTransport,
+    SERVICE_NETWORK,
 };
 use hns_primitives::{blake2b_256, Block, BlockHash, Header, Height, Reader, Txid, Writer};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
@@ -94,6 +98,7 @@ const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
 pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 8;
 const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
 const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const BRONTIDE_IDENTITY_FILE: &str = "p2p-identity-v1.key";
 
 // Key-bearing fixed seeds from the pinned HSD `lib/net/seeds` tables. HSD's
 // DNS seed answers expose legacy plaintext endpoints without static keys, so a
@@ -178,6 +183,8 @@ pub struct ShadowSyncConfig {
     pub active_state_connect_batch: usize,
     pub listen: Option<SocketAddr>,
     pub connect: Vec<SocketAddr>,
+    /// Authenticated remote static keys for configured public-network peers.
+    pub connect_keys: BTreeMap<SocketAddr, [u8; 33]>,
     /// Bootstrap from HSD's key-bearing fixed seeds and learn bounded peers
     /// from GETADDR/ADDR. Explicit `connect` peers remain pinned reconnect targets.
     pub discovery: bool,
@@ -191,6 +198,10 @@ pub struct ShadowSyncConfig {
     pub poll_interval: Duration,
 }
 
+/// Native name for the synchronization configuration. The older alias remains
+/// available so persisted API integrations can migrate without a flag day.
+pub type NativeSyncConfig = ShadowSyncConfig;
+
 impl Default for ShadowSyncConfig {
     fn default() -> Self {
         Self {
@@ -200,6 +211,7 @@ impl Default for ShadowSyncConfig {
             active_state_connect_batch: 288,
             listen: None,
             connect: Vec::new(),
+            connect_keys: BTreeMap::new(),
             discovery: false,
             maximum_known_addresses: DEFAULT_KNOWN_PEER_ADDRESSES,
             maximum_inbound: 32,
@@ -216,23 +228,23 @@ impl Default for ShadowSyncConfig {
 impl ShadowSyncConfig {
     pub fn validate(&self, authority_mode: AuthorityMode, network: Network) -> Result<()> {
         if self.connect_active_state && !self.enabled {
-            anyhow::bail!("active-state synchronization requires shadow sync to be enabled");
+            anyhow::bail!("active-state synchronization requires native sync to be enabled");
         }
         if self.headers_only && !self.enabled {
-            anyhow::bail!("headers-only synchronization requires shadow sync to be enabled");
+            anyhow::bail!("headers-only synchronization requires native sync to be enabled");
         }
         if self.headers_only && self.connect_active_state {
-            anyhow::bail!("headers-only shadow sync cannot connect active state");
+            anyhow::bail!("headers-only native sync cannot connect active state");
         }
         if !self.enabled {
             return Ok(());
         }
         if !matches!(
             authority_mode,
-            AuthorityMode::Disabled | AuthorityMode::Shadow
+            AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::Native
         ) {
             anyhow::bail!(
-                "Shadow sync live P2P is non-authoritative and requires disabled or shadow authority mode"
+                "native sync live P2P requires disabled, shadow, or native authority mode"
             );
         }
         if self.active_state_connect_batch == 0
@@ -246,14 +258,14 @@ impl ShadowSyncConfig {
         let has_discovery_endpoint = self.discovery && !hsd_brontide_seeds(network).is_empty();
         if self.listen.is_none() && self.connect.is_empty() && !has_discovery_endpoint {
             anyhow::bail!(
-                "Shadow sync requires an inbound listener, an explicit outbound peer, or DNS discovery on a seeded network"
+                "Native sync requires an inbound listener, an explicit outbound peer, or DNS discovery on a seeded network"
             );
         }
         if self.listen.is_some() && self.maximum_inbound == 0 {
-            anyhow::bail!("Shadow sync listener requires a non-zero maximum-inbound value");
+            anyhow::bail!("Native sync listener requires a non-zero maximum-inbound value");
         }
         if (!self.connect.is_empty() || self.discovery) && self.maximum_outbound == 0 {
-            anyhow::bail!("Shadow sync outbound peers require a non-zero maximum-outbound value");
+            anyhow::bail!("Native sync outbound peers require a non-zero maximum-outbound value");
         }
         if self.connect.len() > self.maximum_outbound {
             anyhow::bail!(
@@ -262,11 +274,33 @@ impl ShadowSyncConfig {
                 self.maximum_outbound
             );
         }
+        if self
+            .connect_keys
+            .keys()
+            .any(|address| !self.connect.contains(address))
+        {
+            anyhow::bail!("native sync has a static key for an unconfigured outbound peer");
+        }
+        if self
+            .connect_keys
+            .values()
+            .any(|key| !matches!(key[0], 0x02 | 0x03))
+        {
+            anyhow::bail!("native sync configured peer has an invalid compressed static key");
+        }
+        if matches!(network, Network::Mainnet | Network::Testnet)
+            && self
+                .connect
+                .iter()
+                .any(|address| !self.connect_keys.contains_key(address))
+        {
+            anyhow::bail!("public-network configured peers require key@address Brontide endpoints");
+        }
         if self.maximum_known_addresses == 0
             || self.maximum_known_addresses > MAX_KNOWN_PEER_ADDRESSES
         {
             anyhow::bail!(
-                "Shadow sync known-address limit {} must be within 1..={MAX_KNOWN_PEER_ADDRESSES}",
+                "Native sync known-address limit {} must be within 1..={MAX_KNOWN_PEER_ADDRESSES}",
                 self.maximum_known_addresses
             );
         }
@@ -278,59 +312,59 @@ impl ShadowSyncConfig {
             );
         }
         if self.validation_workers == 0 || self.validation_queue == 0 {
-            anyhow::bail!("Shadow sync validation workers and queue must be non-zero");
+            anyhow::bail!("Native sync validation workers and queue must be non-zero");
         }
         if self.validation_workers > MAX_SHADOW_SYNC_VALIDATION_WORKERS {
             anyhow::bail!(
-                "Shadow sync validation workers {} exceed the hard limit {}",
+                "Native sync validation workers {} exceed the hard limit {}",
                 self.validation_workers,
                 MAX_SHADOW_SYNC_VALIDATION_WORKERS
             );
         }
         if self.validation_queue > MAX_SHADOW_SYNC_VALIDATION_QUEUE {
             anyhow::bail!(
-                "Shadow sync validation queue {} exceeds the hard limit {}",
+                "Native sync validation queue {} exceeds the hard limit {}",
                 self.validation_queue,
                 MAX_SHADOW_SYNC_VALIDATION_QUEUE
             );
         }
         if self.orphan_blocks == 0 || self.orphan_bytes == 0 {
-            anyhow::bail!("Shadow sync orphan bounds must be non-zero");
+            anyhow::bail!("Native sync orphan bounds must be non-zero");
         }
         if self.orphan_blocks > MAX_SHADOW_SYNC_ORPHAN_BLOCKS {
             anyhow::bail!(
-                "Shadow sync orphan block limit {} exceeds the hard limit {}",
+                "Native sync orphan block limit {} exceeds the hard limit {}",
                 self.orphan_blocks,
                 MAX_SHADOW_SYNC_ORPHAN_BLOCKS
             );
         }
         if self.orphan_bytes > MAX_SHADOW_SYNC_ORPHAN_BYTES {
             anyhow::bail!(
-                "Shadow sync orphan byte limit {} exceeds the hard limit {}",
+                "Native sync orphan byte limit {} exceeds the hard limit {}",
                 self.orphan_bytes,
                 MAX_SHADOW_SYNC_ORPHAN_BYTES
             );
         }
         if self.poll_interval < MIN_SHADOW_SYNC_POLL_INTERVAL {
             anyhow::bail!(
-                "Shadow sync poll interval must be at least {} ms",
+                "Native sync poll interval must be at least {} ms",
                 MIN_SHADOW_SYNC_POLL_INTERVAL.as_millis()
             );
         }
         let maximum_peers = self
             .maximum_inbound
             .checked_add(self.maximum_outbound)
-            .ok_or_else(|| anyhow::anyhow!("Shadow sync peer limits overflow usize"))?;
+            .ok_or_else(|| anyhow::anyhow!("Native sync peer limits overflow usize"))?;
         if maximum_peers > MAX_SHADOW_SYNC_PEERS {
             anyhow::bail!(
-                "Shadow sync total peer limit {maximum_peers} exceeds the hard limit {MAX_SHADOW_SYNC_PEERS}"
+                "Native sync total peer limit {maximum_peers} exceeds the hard limit {MAX_SHADOW_SYNC_PEERS}"
             );
         }
 
         let mut unique = HashSet::with_capacity(self.connect.len());
         for address in &self.connect {
             if !unique.insert(*address) {
-                anyhow::bail!("duplicate shadow-sync outbound peer {address}");
+                anyhow::bail!("duplicate native-sync outbound peer {address}");
             }
             if self.listen == Some(*address) {
                 anyhow::bail!("Shadow-sync outbound peer {address} is the configured listener");
@@ -421,6 +455,8 @@ pub struct ShadowSyncDiagnostics {
     pub rejected_messages: u64,
     pub last_error: Option<String>,
 }
+
+pub type NativeSyncDiagnostics = ShadowSyncDiagnostics;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HeaderDeploymentEntry {
@@ -623,7 +659,13 @@ impl BoundedAddressBook {
         let Some(address) = wire.socket_addr() else {
             return AddressAdmission::Rejected;
         };
-        if wire.key != [0; 33]
+        let transport_key_valid = match self.network {
+            Network::Mainnet | Network::Testnet => matches!(wire.key[0], 0x02 | 0x03),
+            Network::Regtest | Network::Simnet => {
+                wire.key == [0; 33] || matches!(wire.key[0], 0x02 | 0x03)
+            }
+        };
+        if !transport_key_valid
             || wire.services & SERVICE_NETWORK == 0
             || !is_discoverable_address(self.network, self.listen, address)
         {
@@ -1276,6 +1318,81 @@ fn decode_compressed_public_key(encoded: &str) -> std::result::Result<[u8; 33], 
     Ok(key)
 }
 
+fn load_or_create_brontide_identity(data_dir: Option<&Path>) -> Result<BrontideIdentity> {
+    let Some(data_dir) = data_dir else {
+        return Ok(BrontideIdentity::generate());
+    };
+    fs::create_dir_all(data_dir).with_context(|| {
+        format!(
+            "failed to create Brontide identity directory {}",
+            data_dir.display()
+        )
+    })?;
+    let path = data_dir.join(BRONTIDE_IDENTITY_FILE);
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let private_key = generate_private_key();
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(mut file) => {
+                    file.write_all(&private_key).with_context(|| {
+                        format!("failed to write Brontide identity {}", path.display())
+                    })?;
+                    file.sync_all().with_context(|| {
+                        format!("failed to sync Brontide identity {}", path.display())
+                    })?;
+                    private_key.to_vec()
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => fs::read(&path)
+                    .with_context(|| {
+                        format!("failed to read raced Brontide identity {}", path.display())
+                    })?,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to create Brontide identity {}", path.display())
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read Brontide identity {}", path.display()));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path)
+            .with_context(|| format!("failed to stat Brontide identity {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "Brontide identity {} must not be accessible by group or other users",
+                path.display()
+            );
+        }
+    }
+
+    let private_key: [u8; 32] = raw.try_into().map_err(|raw: Vec<u8>| {
+        anyhow::anyhow!(
+            "Brontide identity {} has {} bytes; expected 32",
+            path.display(),
+            raw.len()
+        )
+    })?;
+    BrontideIdentity::from_private_key(private_key)
+        .map_err(|error| anyhow::anyhow!("invalid Brontide identity {}: {error}", path.display()))
+}
+
 impl NodeService {
     pub async fn run_shadow_sync_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
         self.config
@@ -1288,6 +1405,7 @@ impl NodeService {
         let shadow_sync_config = self.config.shadow_sync.clone();
         let rpc_bind = self.config.rpc_bind;
         let network = self.config.network;
+        let data_dir = self.config.data_dir.clone();
         let ban_list_persistent = self.config.data_dir.is_some();
         let address_book_persistent = shadow_sync_config.discovery && ban_list_persistent;
         let store = self.state.store.clone();
@@ -1307,7 +1425,7 @@ impl NodeService {
         let maximum_peers = shadow_sync_config
             .maximum_inbound
             .checked_add(shadow_sync_config.maximum_outbound)
-            .ok_or_else(|| anyhow::anyhow!("Shadow sync peer limits overflow usize"))?;
+            .ok_or_else(|| anyhow::anyhow!("Native sync peer limits overflow usize"))?;
         let sync_limits = SyncLimits {
             maximum_peers,
             ..SyncLimits::default()
@@ -1335,6 +1453,10 @@ impl NodeService {
         scheduler.set_stored_tip(stored_tip);
 
         let mut peer_config = LivePeerConfig::for_network(network);
+        if matches!(network, Network::Mainnet | Network::Testnet) {
+            peer_config.transport =
+                PeerTransport::Brontide(load_or_create_brontide_identity(data_dir.as_deref())?);
+        }
         peer_config.maximum_inbound = shadow_sync_config.maximum_inbound;
         peer_config.maximum_outbound = shadow_sync_config.maximum_outbound;
         peer_config.ban_score = HSD_BAN_SCORE;
@@ -1393,6 +1515,14 @@ impl NodeService {
         )?;
         for address in &shadow_sync_config.connect {
             address_book.insert_configured(*address, address_now, address_timestamp)?;
+            if let Some(key) = shadow_sync_config.connect_keys.get(address) {
+                address_book
+                    .entries
+                    .get_mut(address)
+                    .expect("configured address was inserted")
+                    .wire
+                    .key = *key;
+            }
         }
         let mut loaded_addresses = 0u64;
         let mut pruned_addresses = 0u64;
@@ -1428,7 +1558,7 @@ impl NodeService {
             let resolution = resolve_hsd_dns_seeds(network).await;
             dns_seed_failures = resolution.errors.len() as u64;
             for error in resolution.errors {
-                tracing::warn!(%error, "HNS DNS seed resolution failed");
+                tracing::warn!(%error, "HNS fixed-seed bootstrap failed");
             }
             for mut wire in resolution.addresses {
                 wire.time = address_timestamp;
@@ -1547,7 +1677,7 @@ impl NodeService {
             outbound = reconnects.len(),
             discovery = shadow_sync_config.discovery,
             known_addresses = address_book.len(),
-            "hsrd shadow-sync runtime started"
+            "hsrd native-sync runtime started"
         );
 
         let mut checkpoint_sequence = initial_sequence;
@@ -1574,13 +1704,13 @@ impl NodeService {
                 }
                 _ = poll.tick() => {
                     if rpc_task.is_finished() {
-                        let message = "Shadow sync RPC task terminated unexpectedly".to_owned();
+                        let message = "Native sync RPC task terminated unexpectedly".to_owned();
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
                     }
                     if listener_task.as_ref().is_some_and(|task| task.is_finished()) {
-                        let message = "Shadow sync P2P listener terminated unexpectedly".to_owned();
+                        let message = "Native sync P2P listener terminated unexpectedly".to_owned();
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
@@ -1903,7 +2033,7 @@ impl NodeService {
         }
         rpc_result?;
         listener_result?;
-        tracing::info!("hsrd shadow-sync runtime stopped");
+        tracing::info!("hsrd native-sync runtime stopped");
         Ok(())
     }
 
@@ -2643,6 +2773,7 @@ async fn serve_shadow_sync_rpc(
         .route("/api/v1/parity", get(handle_shadow_sync_parity))
         .route("/api/v1/peers", get(handle_shadow_sync_peers))
         .route("/api/v1/sync", get(handle_shadow_sync_sync))
+        .route("/api/v1/native-sync", get(handle_shadow_sync_diagnostics))
         .route("/api/v1/shadow-sync", get(handle_shadow_sync_diagnostics))
         .route("/api/v1/header-deployments", get(handle_header_deployments))
         .route(
@@ -2655,7 +2786,7 @@ async fn serve_shadow_sync_rpc(
             let _ = shutdown.changed().await;
         })
         .await
-        .context("Shadow sync RPC server failed")
+        .context("Native sync RPC server failed")
 }
 
 async fn shadow_sync_rpc_service(state: &ShadowSyncHttpState) -> Result<BasicRpcService> {
@@ -2667,11 +2798,11 @@ async fn shadow_sync_rpc_service(state: &ShadowSyncHttpState) -> Result<BasicRpc
     snapshot.node_status.release_stage = if node.config.mining_engine.enabled {
         "mining-engine-shadow".to_owned()
     } else {
-        "shadow-sync-live-p2p".to_owned()
+        "native-sync-live-p2p".to_owned()
     };
     snapshot.node_status.parity.configured = false;
     snapshot.node_status.parity.live_shadow_active = false;
-    snapshot.node_status.parity.state = "shadow-sync-network-no-hsd-oracle".to_owned();
+    snapshot.node_status.parity.state = "native-sync-network-no-hsd-oracle".to_owned();
     Ok(BasicRpcService::new(snapshot))
 }
 
@@ -3760,7 +3891,7 @@ async fn accept_peer_block(
             }
         };
         if !parent_known {
-            // Shadow sync is headers-first. A body without known header context is
+            // Native sync is headers-first. A body without known header context is
             // neither requested nor eligible for retention. Ask for headers,
             // apply a small protocol penalty, and drop the body. Once its own
             // header is canonical, a validated body can be durably retained even
@@ -4724,7 +4855,7 @@ where
 }
 
 async fn record_error(diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>, error: String) {
-    tracing::warn!(%error, "Shadow sync runtime error");
+    tracing::warn!(%error, "Native sync runtime error");
     update_diagnostics(diagnostics, |state| state.last_error = Some(error)).await;
 }
 
@@ -4772,6 +4903,46 @@ mod tests {
         Address, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Txid, Witness,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn keyed_net_address(address: SocketAddr, time: u64, services: u64) -> hns_p2p::NetAddress {
+        let mut wire = hns_p2p::NetAddress::from_socket_addr(address, time, services);
+        wire.key = [2; 33];
+        wire
+    }
+
+    #[test]
+    fn brontide_identity_is_restart_durable_and_private() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-brontide-identity-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let first = load_or_create_brontide_identity(Some(&path)).expect("create identity");
+        let second = load_or_create_brontide_identity(Some(&path)).expect("reload identity");
+        assert_eq!(first.public_key(), second.public_key());
+        assert_eq!(
+            fs::read(path.join(BRONTIDE_IDENTITY_FILE))
+                .expect("identity file")
+                .len(),
+            32
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path.join(BRONTIDE_IDENTITY_FILE))
+                    .expect("identity metadata")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+        fs::remove_dir_all(&path).expect("remove identity fixture");
+    }
 
     fn validator_coinbase_block(height: Height, output_count: usize) -> Block {
         let output = Output {
@@ -4893,7 +5064,7 @@ mod tests {
         let mut addresses = BoundedAddressBook::new(Network::Mainnet, None, 1).expect("book");
         assert!(addresses
             .insert_discovered(
-                hns_p2p::NetAddress::from_socket_addr(
+                keyed_net_address(
                     address,
                     timestamp - HSD_ADDRESS_TIMESTAMP_REFRESH_SECONDS - 1,
                     SERVICE_NETWORK,
@@ -4939,6 +5110,23 @@ mod tests {
         assert!(discovery
             .validate(AuthorityMode::Shadow, Network::Regtest)
             .is_err());
+
+        let address = "129.153.177.220:44806".parse().expect("seed socket");
+        let mut explicit = ShadowSyncConfig {
+            enabled: true,
+            connect: vec![address],
+            ..ShadowSyncConfig::default()
+        };
+        assert!(explicit
+            .validate(AuthorityMode::Native, Network::Mainnet)
+            .is_err());
+        explicit.connect_keys.insert(
+            address,
+            decode_compressed_public_key(HSD_MAINNET_BRONTIDE_SEEDS[0].1).expect("seed key"),
+        );
+        explicit
+            .validate(AuthorityMode::Native, Network::Mainnet)
+            .expect("keyed public peer");
     }
 
     #[test]
@@ -5030,11 +5218,7 @@ mod tests {
         for address in [valid, stale] {
             assert_eq!(
                 addresses.insert_discovered(
-                    hns_p2p::NetAddress::from_socket_addr(
-                        address,
-                        timestamp - 100,
-                        SERVICE_NETWORK,
-                    ),
+                    keyed_net_address(address, timestamp - 100, SERVICE_NETWORK,),
                     now,
                     timestamp,
                 ),
@@ -5133,7 +5317,7 @@ mod tests {
             let mut addresses = BoundedAddressBook::new(Network::Mainnet, None, 4).expect("book");
             assert!(addresses
                 .insert_discovered(
-                    hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK,),
+                    keyed_net_address(address, timestamp, SERVICE_NETWORK),
                     now,
                     timestamp,
                 )
@@ -5175,7 +5359,7 @@ mod tests {
         let second: SocketAddr = "1.1.1.1:12038".parse().expect("second");
         let third: SocketAddr = "9.9.9.9:12038".parse().expect("third");
 
-        let mut first_wire = hns_p2p::NetAddress::from_socket_addr(
+        let mut first_wire = keyed_net_address(
             first,
             timestamp + MAX_ADDR_FUTURE_SECONDS + 1,
             SERVICE_NETWORK,
@@ -5194,7 +5378,7 @@ mod tests {
             addresses.insert_discovered(first_wire, now, timestamp),
             AddressAdmission::Rejected
         );
-        let private = hns_p2p::NetAddress::from_socket_addr(
+        let private = keyed_net_address(
             "192.168.1.1:12038".parse().expect("private"),
             timestamp,
             SERVICE_NETWORK,
@@ -5203,7 +5387,7 @@ mod tests {
             addresses.insert_discovered(private, now, timestamp),
             AddressAdmission::Rejected
         );
-        let mut keyed = hns_p2p::NetAddress::from_socket_addr(second, timestamp, SERVICE_NETWORK);
+        let mut keyed = keyed_net_address(second, timestamp, SERVICE_NETWORK);
         keyed.key[0] = 1;
         assert_eq!(
             addresses.insert_discovered(keyed, now, timestamp),
@@ -5212,14 +5396,14 @@ mod tests {
 
         assert!(addresses
             .insert_discovered(
-                hns_p2p::NetAddress::from_socket_addr(second, timestamp - 2, SERVICE_NETWORK,),
+                keyed_net_address(second, timestamp - 2, SERVICE_NETWORK),
                 now,
                 timestamp,
             )
             .accepted());
         assert!(addresses
             .insert_discovered(
-                hns_p2p::NetAddress::from_socket_addr(third, timestamp - 1, SERVICE_NETWORK,),
+                keyed_net_address(third, timestamp - 1, SERVICE_NETWORK),
                 now,
                 timestamp,
             )
@@ -5245,7 +5429,7 @@ mod tests {
             let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, value)), 14038);
             assert!(addresses
                 .insert_discovered(
-                    hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK,),
+                    keyed_net_address(address, timestamp, SERVICE_NETWORK),
                     now,
                     timestamp,
                 )
@@ -5296,7 +5480,7 @@ mod tests {
         for address in [same_group, second_group, third_group] {
             assert!(addresses
                 .insert_discovered(
-                    hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK),
+                    keyed_net_address(address, timestamp, SERVICE_NETWORK),
                     now,
                     timestamp,
                 )
@@ -5490,7 +5674,7 @@ mod tests {
         for address in [banned, allowed] {
             assert!(addresses
                 .insert_discovered(
-                    hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK),
+                    keyed_net_address(address, timestamp, SERVICE_NETWORK),
                     now,
                     timestamp,
                 )
@@ -5561,7 +5745,7 @@ mod tests {
         let mut addresses = BoundedAddressBook::new(Network::Regtest, None, 4).expect("book");
         assert!(addresses
             .insert_discovered(
-                hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK),
+                keyed_net_address(address, timestamp, SERVICE_NETWORK),
                 now,
                 timestamp,
             )
@@ -6135,7 +6319,7 @@ mod tests {
         ));
 
         for path in [
-            "/api/v1/shadow-sync",
+            "/api/v1/native-sync",
             "/api/v1/header-deployments",
             "/api/v1/mining-engine",
         ] {
@@ -6157,7 +6341,7 @@ mod tests {
             let (_, body) = response.split_once("\r\n\r\n").expect("body split");
             let json: serde_json::Value = serde_json::from_str(body).expect("json response");
             assert!(json.is_object(), "{json}");
-            if path == "/api/v1/shadow-sync" {
+            if path == "/api/v1/native-sync" {
                 assert_eq!(json["observation_only"], true);
                 assert_eq!(json["active_state"], false);
                 assert_eq!(json["runtime_instance"], "test-runtime");

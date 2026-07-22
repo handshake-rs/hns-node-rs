@@ -337,7 +337,7 @@ impl MiningEngineConfig {
             );
         }
         if self.transaction_relay && !shadow_sync.enabled {
-            anyhow::bail!("Mining engine transaction relay requires the shadow-sync P2P runtime");
+            anyhow::bail!("Mining engine transaction relay requires the native-sync P2P runtime");
         }
         Ok(())
     }

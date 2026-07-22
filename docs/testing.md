@@ -154,7 +154,7 @@ Current evidence includes:
 - compact-block mempool filling, exact missing-index completion, duplicate-ID
   rejection, and a managed-peer TCP request/reconstruction regression through
   the normal validation path;
-- pinned HSD DNS seed/port selection, bounded address admission and eviction,
+- pinned HSD key-bearing fixed-seed/Brontide-port selection, bounded address admission and eviction,
   unroutable/service/key/timestamp filtering, and failed discovered-target
   rotation without displacement of explicit reconnect peers;
 - exact HSD address-group vectors for IPv4, IPv6, Hurricane Electric, 6to4,
@@ -167,7 +167,7 @@ Current evidence includes:
   IP-wide disconnect, outbound and inbound pre-handshake rejection, exact
   24-hour duration/expiry, discovery and relay filtering, bounded eviction,
   checksummed/network-bound ban codecs, and exact RocksDB close/reopen retention;
-- a seed-only optimized mainnet replay with no explicit sockets: 20 DNS
+- a historical seed-only optimized mainnet replay with no explicit sockets: 20 DNS
   endpoints, eight Ready peers after three failed-target rotations, 287 unique
   learned addresses, active/stored progress from 7,232 to 7,416, and exact
   best-header height agreement with the pinned HSD oracle;

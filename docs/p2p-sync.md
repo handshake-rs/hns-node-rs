@@ -2,19 +2,17 @@
 
 ## Scope
 
-The shadow-sync runtime gives `hsrd` a live, bounded Handshake network path while
-preserving its pre-authority status. The runtime can discover chain progress
-from explicit peers, validate and retain headers and block bodies, serve
-retained data, and resume from a durable checkpoint after restart.
+The native-sync runtime gives `hsrd` a live, bounded Handshake network path with
+no HSD runtime dependency. It discovers chain progress from authenticated
+peers, validates and retains headers and block bodies, connects active UTXO and
+name state, serves retained data, and resumes from a durable checkpoint.
 
-The default remains an **observation-only shadow path**. A
-`--shadow-sync-headers-only` qualification mode validates and durably indexes
-canonical headers without scheduling block bodies, which is useful with a
-pruned HSD reference or when proving checkpoint/deployment ancestry. An
-explicit `--shadow-sync-active-state --acknowledge-incomplete-consensus` mode
-additionally connects stored bodies to active UTXO/name state in bounded atomic
-batches. All modes are non-authoritative: shadow state cannot authorize mining
-templates, publish ASIC jobs, or mint the private mining capability.
+`--native-sync` downloads bodies and connects active state by default.
+`--native-sync-headers-only` narrows operation to canonical headers, while
+`--native-sync-observe-only` downloads bodies without connecting them. Native
+operation does not by itself grant mining authority: the separate readiness
+gate and the durable tip's complete consensus-authoritative status remain
+mandatory.
 
 ## Runtime flow
 
@@ -22,7 +20,7 @@ templates, publish ASIC jobs, or mint the private mining capability.
 explicit outbound peers / optional listener
                     |
                     v
-        bounded plaintext HNS peer sessions
+ authenticated Brontide HNS peer sessions
                     |
      VERSION / VERACK / SENDHEADERS / SENDCMPCT
                     |
@@ -43,10 +41,10 @@ explicit outbound peers / optional listener
   authenticated invalid / invalid-child classification
                     |
                     v
-       durable non-active shadow block storage
+        durable validated block storage
                     |
                     v
- optional bounded contextual state connector
+   bounded contextual active-state connector
                     |
                     v
         restartable sync checkpoint + diagnostics
@@ -87,7 +85,13 @@ The HSD fixture generator verifies subtle compatibility behavior:
   prefilled/missing transaction encodings;
 - exact 9-byte frame headers and network magic.
 
-The runtime currently uses plaintext TCP only. Brontide is not implemented.
+Mainnet and testnet wrap each complete nine-byte HNS frame plus payload in HSD's
+Brontide stream records. The implementation is pinned to Noise XK over
+secp256k1, HSD's Elligator-Squared encoding, SHA256/HKDF,
+ChaCha20-Poly1305, four-byte little-endian stream lengths, and key rotation
+after 1,000 AEAD records. Regtest and simnet retain plaintext TCP for local
+development. The fixture generator checks HSD's exact cipher, split-key,
+traffic, rotation, and fixed-seed vectors.
 
 ## Peer lifecycle
 
@@ -128,7 +132,7 @@ connection-local rather than becoming invented long-lived reputation.
 
 ## Queue and resource bounds
 
-The shadow-sync runtime rejects configurations outside hard ceilings:
+The native-sync runtime rejects configurations outside hard ceilings:
 
 | Resource | Hard ceiling |
 |---|---:|
@@ -254,8 +258,9 @@ the worker has height but not sufficient branch evidence to make a durable
 checkpoint decision. A body is then revalidated through the node's strict
 import path, where exact final-checkpoint ancestry selects the historical route
 or fails closed to full validation, and is stored as a non-active block/index
-record. The shadow-sync path explicitly clears UTXO, name-state, tree-root,
-undo, and active-chain status bits. Retaining an orphan completes the temporary
+record. Pre-connection body storage explicitly clears UTXO, name-state,
+tree-root, undo, and active-chain status bits; the native connector sets them
+only after contextual state validation commits. Retaining an orphan completes the temporary
 validation stage without advancing the contiguous stored-body tip.
 
 A body that does not match its header is a retryable bad peer response, not
@@ -297,11 +302,10 @@ blocks within HSD's recent 15-block window and never returns more transactions
 than the 16,662-transaction compact-block protocol bound. Non-capable peers and
 headers-only operation retain full-block behavior.
 
-## Optional active-state connector
+## Native active-state connector
 
-The active-state mode is opt-in while historical and live parity gates remain
-open. It requires the explicit incomplete-consensus acknowledgement and is
-bounded to 288 connected blocks per atomic reorganization by default, matching
+Active-state connection is the native-sync default and is bounded to 288
+connected blocks per atomic reorganization by default, matching
 mainnet's retained reorganization window (hard maximum 1,024). Straight-line
 IBD progress is additionally limited to eight connected blocks per supervisor
 slice so RPC, peer work, and shutdown are polled between small atomic commits.
@@ -315,8 +319,8 @@ stage runs on the full path.
 
 ```bash
 cargo run --locked -p hns-node -- \
-  --shadow-sync --connect 127.0.0.1:12038 \
-  --shadow-sync-active-state --acknowledge-incomplete-consensus \
+  --network mainnet --authority-mode native \
+  --native-sync --p2p-discovery \
   --active-state-connect-batch 288
 ```
 
@@ -394,7 +398,7 @@ solved-block publication capacity.
 
 ## Diagnostics
 
-The shadow-sync API exposes:
+The native-sync API exposes:
 
 ```text
 GET /api/v1/status
@@ -402,7 +406,7 @@ GET /api/v1/authority
 GET /api/v1/parity
 GET /api/v1/peers
 GET /api/v1/sync
-GET /api/v1/shadow-sync
+GET /api/v1/native-sync
 GET /api/v1/header-deployments
 ```
 
@@ -417,13 +421,13 @@ address-book availability, loaded/pruned counts, generation, dirty state,
 successful/failed flushes, decode failures, the last flush time, and its last
 storage error. API-v9 node status separately counts valid non-active blocks and
 durably failed blocks and exposes the active tip's resulting authenticated
-root/height. The shadow endpoint includes an opaque runtime instance so external
+root/height. The native endpoint includes an opaque runtime instance so external
 evidence can distinguish observations across restarts.
 
-`observation_only` is true in the default retention mode and false only when the
-explicit active-state connector is enabled. `active_state` reports that choice.
-`headers_only` reports the narrower no-body qualification mode. None of these
-values changes the authority mode or claims a live HSD oracle.
+`observation_only` is false for the native default and true only under
+`--native-sync-observe-only` or `--native-sync-headers-only`. `active_state`
+reports that choice, while `headers_only` reports the narrower no-body mode.
+None of these values changes the authority mode or claims a live HSD oracle.
 
 `scripts/compare-hsrd-hsd-shadow.py` consumes those diagnostics and a pinned
 operator-selected `hsd-cli`. It compares the canonical block at height `H` and
@@ -444,16 +448,19 @@ active block/root evidence rather than header-only evidence.
 
 ## Peer discovery
 
-`--p2p-discovery` opts into HSD's network DNS seeds and plaintext GETADDR/ADDR
-exchange. Mainnet resolves `hs-mainnet.bcoin.ninja` and `seed.htools.work` on
-port 12038; testnet resolves `hs-testnet.bcoin.ninja` on port 13038. Regtest and
-simnet have no HSD DNS seeds, so discovery alone is rejected there.
+`--p2p-discovery` opts into the key-bearing fixed-seed tables pinned from HSD,
+then uses GETADDR/ADDR for additional records. Mainnet starts with ten
+authenticated endpoints on port 44806; testnet starts with four on port 45806.
+Regtest and simnet have no fixed seeds, so discovery alone is rejected there.
 
 The address book has an operator-configured bound (4,096 by default,
-16,384 hard maximum). It accepts only keyless IP addresses advertising the
-network service, rejects unroutable public-network ranges and the configured
+16,384 hard maximum). Public networks accept only compressed-key-bearing IP
+addresses advertising the network service, rejects unroutable ranges and the configured
 listener, and normalizes missing or future timestamps with HSD's five-day
 fallback. Explicit `--connect` addresses are protected reconnect targets.
+On mainnet/testnet they use `KEYHEX@IP:PORT` so the remote Brontide static key
+is authenticated before VERSION; keyless public-network endpoints fail
+configuration. Regtest/simnet continue to accept plain `IP:PORT` targets.
 Discovered targets fill only unused outbound slots and rotate after three
 consecutive connection failures; they cannot displace explicit targets.
 Selection matches HSD's canonical network groups: IPv4 and embedded IPv4
@@ -479,10 +486,11 @@ For example, mainnet can bootstrap without hard-coded socket addresses:
 
 ```bash
 hsrd --network mainnet --data-dir /path/to/hsrd \
-  --shadow-sync --p2p-discovery
+  --authority-mode native --native-sync --p2p-discovery
 ```
 
-When `--data-dir` is configured, discovered addresses, services, timestamps,
+When `--data-dir` is configured, the permission-checked Brontide static identity
+is restart-durable. Discovered addresses, static keys, services, timestamps,
 attempt counts, last success, and last attempt are stored in the `peers` column
 family as one checksummed, versioned, network-bound snapshot. Explicit peers
 remain configuration and are never written into the cache. The runtime flushes
@@ -501,17 +509,16 @@ subthreshold scores are not persisted.
 
 ## Known limitations
 
-The shadow-sync runtime does not yet provide:
+The native-sync runtime does not yet provide:
 
-- Brontide transport;
 - long-lived subthreshold peer reputation;
 - sustained adversarial qualification of its bounded ordinary,
   claim/airdrop, and solved-block relay paths;
 - historical mainnet block-body and active-state replay qualification;
 - persistent pruning-horizon discovery plus full pruning and
   sustained-reorganization IBD qualification;
-- mining authority.
+- production mining authority before every readiness gate passes.
 
-Those omissions are reported rather than hidden. The comparison runner supplies
-the live observation mechanism, not the full-mainnet duration, pruning, or
-reorganization coverage required for sustained HSD shadow agreement.
+Those omissions are reported rather than hidden. The optional comparison runner
+supplies external qualification evidence; it is not in the native sync runtime
+or its consensus authority path.

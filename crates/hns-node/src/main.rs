@@ -1,13 +1,13 @@
 #![forbid(unsafe_code)]
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use hns_consensus::Network;
 use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
     init_logging, validate_node_config, AuthorityMode, MiningEngineConfig,
-    NameTreeCompactionConfig, NodeConfig, NodeService, ShadowSyncConfig, ShutdownSignal,
+    NameTreeCompactionConfig, NativeSyncConfig, NodeConfig, NodeService, ShutdownSignal,
     UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
 };
 use hns_store::DurabilityPolicy;
@@ -27,7 +27,7 @@ struct Cli {
     #[arg(long, env = "HSRD_LOG", default_value = "info")]
     log_filter: String,
 
-    #[arg(long, value_enum, default_value_t = AuthorityMode::Shadow)]
+    #[arg(long, value_enum, default_value_t = AuthorityMode::Native)]
     authority_mode: AuthorityMode,
 
     #[arg(long)]
@@ -48,18 +48,25 @@ struct Cli {
     #[arg(long)]
     prune_undo_history: bool,
 
-    /// Enable live, non-authoritative P2P and shadow synchronization.
-    #[arg(long)]
-    shadow_sync: bool,
+    /// Enable native P2P, headers, block-body, and active-state synchronization.
+    #[arg(long = "native-sync", alias = "shadow-sync")]
+    native_sync: bool,
 
-    /// Validate and persist only headers; do not schedule block-body downloads.
-    #[arg(long, requires = "shadow_sync")]
-    shadow_sync_headers_only: bool,
+    /// Validate and persist only headers; do not download or connect bodies.
+    #[arg(
+        long = "native-sync-headers-only",
+        alias = "shadow-sync-headers-only",
+        requires = "native_sync"
+    )]
+    native_sync_headers_only: bool,
 
-    /// Connect downloaded bodies to active state without granting mining authority.
-    /// Requires --acknowledge-incomplete-consensus while parity gates remain open.
-    #[arg(long)]
-    shadow_sync_active_state: bool,
+    /// Download bodies without connecting them to active state.
+    #[arg(
+        long,
+        requires = "native_sync",
+        conflicts_with = "native_sync_headers_only"
+    )]
+    native_sync_observe_only: bool,
 
     /// Maximum stored blocks connected in one atomic active-state batch.
     #[arg(long, default_value_t = 288)]
@@ -69,9 +76,9 @@ struct Cli {
     #[arg(long)]
     p2p_listen: Option<SocketAddr>,
 
-    /// Connect to an explicit Handshake peer. May be repeated.
+    /// Connect to a peer. Public networks require KEYHEX@IP:PORT; may be repeated.
     #[arg(long = "connect")]
-    p2p_connect: Vec<SocketAddr>,
+    p2p_connect: Vec<P2pConnectArg>,
 
     /// Bootstrap from HSD's key-bearing fixed seeds and learn peers through GETADDR/ADDR.
     #[arg(long)]
@@ -100,7 +107,7 @@ struct Cli {
     orphan_bytes: usize,
 
     #[arg(long, default_value_t = 250)]
-    shadow_sync_poll_ms: u64,
+    native_sync_poll_ms: u64,
 
     /// Enable the bounded mining engine for mempool, template, and publication work.
     #[arg(long)]
@@ -147,6 +154,16 @@ struct Cli {
 
 impl Cli {
     fn into_config(self) -> NodeConfig {
+        let connect = self
+            .p2p_connect
+            .iter()
+            .map(|peer| peer.address)
+            .collect::<Vec<_>>();
+        let connect_keys = self
+            .p2p_connect
+            .iter()
+            .filter_map(|peer| peer.key.map(|key| (peer.address, key)))
+            .collect::<BTreeMap<_, _>>();
         NodeConfig {
             network: self.network.into(),
             data_dir: self.data_dir,
@@ -162,13 +179,16 @@ impl Cli {
             undo_retention: UndoRetentionConfig {
                 prune_history: self.prune_undo_history,
             },
-            shadow_sync: ShadowSyncConfig {
-                enabled: self.shadow_sync,
-                headers_only: self.shadow_sync_headers_only,
-                connect_active_state: self.shadow_sync_active_state,
+            shadow_sync: NativeSyncConfig {
+                enabled: self.native_sync,
+                headers_only: self.native_sync_headers_only,
+                connect_active_state: self.native_sync
+                    && !self.native_sync_headers_only
+                    && !self.native_sync_observe_only,
                 active_state_connect_batch: self.active_state_connect_batch,
                 listen: self.p2p_listen,
-                connect: self.p2p_connect,
+                connect,
+                connect_keys,
                 discovery: self.p2p_discovery,
                 maximum_known_addresses: self.maximum_known_addresses,
                 maximum_inbound: self.maximum_inbound,
@@ -177,7 +197,7 @@ impl Cli {
                 validation_queue: self.validation_queue,
                 orphan_blocks: self.orphan_blocks,
                 orphan_bytes: self.orphan_bytes,
-                poll_interval: Duration::from_millis(self.shadow_sync_poll_ms),
+                poll_interval: Duration::from_millis(self.native_sync_poll_ms),
             },
             mining_engine: MiningEngineConfig {
                 enabled: self.mining_engine,
@@ -196,6 +216,44 @@ impl Cli {
                 publication_retry_interval: Duration::from_millis(self.publication_retry_ms),
             },
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct P2pConnectArg {
+    address: SocketAddr,
+    key: Option<[u8; 33]>,
+}
+
+impl FromStr for P2pConnectArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (key, address) = match value.split_once('@') {
+            Some((encoded_key, encoded_address)) => {
+                if encoded_key.len() != 66 {
+                    return Err(format!(
+                        "Brontide public key has {} hex characters; expected 66",
+                        encoded_key.len()
+                    ));
+                }
+                let mut key = [0u8; 33];
+                for (index, output) in key.iter_mut().enumerate() {
+                    let offset = index * 2;
+                    *output = u8::from_str_radix(&encoded_key[offset..offset + 2], 16)
+                        .map_err(|error| format!("invalid Brontide public key hex: {error}"))?;
+                }
+                if !matches!(key[0], 0x02 | 0x03) {
+                    return Err("Brontide public key must be compressed".to_owned());
+                }
+                (Some(key), encoded_address)
+            }
+            None => (None, value),
+        };
+        let address = address
+            .parse()
+            .map_err(|error| format!("invalid peer socket address: {error}"))?;
+        Ok(Self { address, key })
     }
 }
 
@@ -235,9 +293,9 @@ async fn main() -> anyhow::Result<()> {
             compact_name_tree_on_startup = config.name_tree_compaction.compact_on_startup,
             name_tree_compaction_interval = config.name_tree_compaction.startup_interval,
             prune_undo_history = config.undo_retention.prune_history,
-            shadow_sync = config.shadow_sync.enabled,
-            shadow_sync_headers_only = config.shadow_sync.headers_only,
-            shadow_sync_active_state = config.shadow_sync.connect_active_state,
+            native_sync = config.shadow_sync.enabled,
+            native_sync_headers_only = config.shadow_sync.headers_only,
+            native_sync_active_state = config.shadow_sync.connect_active_state,
             mining_engine = config.mining_engine.enabled,
             transaction_relay = config.mining_engine.transaction_relay,
             "configuration parsed successfully"
@@ -247,4 +305,27 @@ async fn main() -> anyhow::Result<()> {
 
     let node = NodeService::try_new(config)?;
     node.run_until_shutdown(ShutdownSignal::ctrl_c()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_peer_parser_preserves_brontide_key_and_socket() {
+        let peer = "02a58318ea330487308b1a4bd90bd196a466e99be64a3cf2f1fe7b5352154a25c2@129.153.177.220:44806"
+            .parse::<P2pConnectArg>()
+            .expect("keyed peer");
+        assert_eq!(
+            peer.address,
+            "129.153.177.220:44806".parse().expect("socket")
+        );
+        assert_eq!(peer.key.expect("key")[0], 0x02);
+
+        let local = "127.0.0.1:14038"
+            .parse::<P2pConnectArg>()
+            .expect("local peer");
+        assert!(local.key.is_none());
+        assert!("01aa@127.0.0.1:44806".parse::<P2pConnectArg>().is_err());
+    }
 }

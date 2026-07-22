@@ -109,7 +109,8 @@ The following remain untrusted and release-blocking:
   mid-commit process-crash/fault injection;
 - full-mainnet active-state IBD, pruning, and sustained
   alternate-chain/reorganization qualification;
-- Brontide and long-lived subthreshold peer reputation;
+- long-lived subthreshold peer reputation and sustained adversarial Brontide
+  qualification;
 - production template qualification, continuously supervised publication
   retry, and measured publication latency;
 - complete mainnet replay, invalid corpus, and sustained live HSD shadow
@@ -118,13 +119,16 @@ The following remain untrusted and release-blocking:
 ## Authority policy
 
 - `disabled`: no mining authority.
-- `shadow`: default; staged state and comparisons are diagnostic only.
+- `shadow`: legacy diagnostic mode; staged state never grants authority.
 - `hsd-verified`: reserved until the independent HSD verifier boundary exists;
   configuration currently fails closed.
+- `native`: the default mainnet synchronization mode; mining remains fail
+  closed until every readiness bit and the durable tip's authoritative status
+  pass.
 - `native-experimental`: requires the `experimental-authority` Cargo feature,
   explicit incomplete-consensus acknowledgement, and regtest/simnet.
 
-Live networking is accepted only in `disabled` or `shadow` mode.
+Live networking is accepted in `disabled`, `shadow`, or `native` mode.
 The mining engine cannot manufacture the private authority capability through its
 configuration, template cache, mempool, diagnostics, or durable intent queue.
 

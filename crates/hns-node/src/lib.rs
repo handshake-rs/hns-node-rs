@@ -8,7 +8,9 @@ pub use mining_engine::{
     MiningEngineConfig, MiningEngineDiagnostics, MiningPublicationAttempt, MiningPublicationResult,
     MiningTemplateRequest,
 };
-pub use shadow_sync::{ShadowSyncConfig, ShadowSyncDiagnostics};
+pub use shadow_sync::{
+    NativeSyncConfig, NativeSyncDiagnostics, ShadowSyncConfig, ShadowSyncDiagnostics,
+};
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -94,9 +96,13 @@ const MAX_UNDO_PRUNES_PER_BATCH: usize = 1_024;
 #[value(rename_all = "kebab-case")]
 pub enum AuthorityMode {
     Disabled,
-    #[default]
     Shadow,
     HsdVerified,
+    /// Native consensus and active-state operation. Mining remains fail closed
+    /// until every readiness gate is complete and the durable tip itself has
+    /// the full mining-authoritative status.
+    #[default]
+    Native,
     NativeExperimental,
 }
 
@@ -281,6 +287,7 @@ impl AuthorityMode {
             Self::Disabled => "disabled",
             Self::Shadow => "shadow",
             Self::HsdVerified => "hsd-verified",
+            Self::Native => "native",
             Self::NativeExperimental => "native-experimental",
         }
     }
@@ -308,7 +315,7 @@ impl Default for NodeConfig {
             data_dir: None,
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], 12037)),
             log_filter: "info".to_owned(),
-            authority_mode: AuthorityMode::Shadow,
+            authority_mode: AuthorityMode::Native,
             acknowledge_incomplete_consensus: false,
             storage_durability: DurabilityPolicy::Sync,
             name_tree_compaction: NameTreeCompactionConfig::default(),
@@ -321,7 +328,7 @@ impl Default for NodeConfig {
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     match config.authority_mode {
-        AuthorityMode::Disabled | AuthorityMode::Shadow => {}
+        AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::Native => {}
         AuthorityMode::HsdVerified => anyhow::bail!(
             "hsd-verified authority is not composed yet; use shadow mode until the independent verifier boundary exists"
         ),
@@ -344,7 +351,10 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         }
     }
 
-    if config.shadow_sync.connect_active_state && !config.acknowledge_incomplete_consensus {
+    if config.shadow_sync.connect_active_state
+        && !config.acknowledge_incomplete_consensus
+        && config.authority_mode != AuthorityMode::Native
+    {
         anyhow::bail!(
             "active-state synchronization requires --acknowledge-incomplete-consensus until historical and live parity gates pass"
         );
@@ -360,8 +370,13 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
 }
 
 fn authority_can_mine(config: &NodeConfig) -> bool {
-    matches!(config.authority_mode, AuthorityMode::NativeExperimental)
-        && validate_node_config(config).is_ok()
+    match config.authority_mode {
+        AuthorityMode::Native => {
+            consensus_readiness().complete() && validate_node_config(config).is_ok()
+        }
+        AuthorityMode::NativeExperimental => validate_node_config(config).is_ok(),
+        AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::HsdVerified => false,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -544,6 +559,7 @@ fn authority_info(config: &NodeConfig, durable: &DurableMiningState) -> RpcAutho
         AuthorityMode::HsdVerified => {
             blockers.push("hsd-verified authority boundary is not composed".to_owned())
         }
+        AuthorityMode::Native => {}
         AuthorityMode::NativeExperimental
             if !cfg!(any(feature = "experimental-authority", test)) =>
         {
@@ -2434,7 +2450,7 @@ impl NodeState {
         self.validate_import_against(&snapshot, request)
     }
 
-    /// Validate a canonical shadow-sync body whose header ancestry is already
+    /// Validate a canonical native-sync body whose header ancestry is already
     /// durable even when network delivery has not supplied its parent body.
     /// Active connection still uses `validate_import` and therefore requires
     /// the complete parent block/index chain.
@@ -8093,7 +8109,10 @@ mod tests {
         .is_err());
         let mut unacknowledged_active_sync = active_state_shadow_config();
         unacknowledged_active_sync.acknowledge_incomplete_consensus = false;
+        unacknowledged_active_sync.authority_mode = AuthorityMode::Shadow;
         assert!(validate_node_config(&unacknowledged_active_sync).is_err());
+        unacknowledged_active_sync.authority_mode = AuthorityMode::Native;
+        assert!(validate_node_config(&unacknowledged_active_sync).is_ok());
 
         let mut experimental = NodeService::new(experimental_authority_config());
         assert!(experimental.subscribe_mining_events().is_err());
@@ -8327,7 +8346,7 @@ mod tests {
         let json: Value = serde_json::from_str(response_body).expect("json response");
         assert_eq!(json["api_version"], HSRD_DIAGNOSTIC_API_VERSION);
         assert_eq!(json["release_stage"], "pre-authority");
-        assert_eq!(json["authority"]["mode"], "shadow");
+        assert_eq!(json["authority"]["mode"], "native");
         assert_eq!(json["parity"]["oracle_revision"], HSD_ORACLE_REVISION);
         assert_eq!(json["name_tree_compaction"]["compact_on_startup"], false);
         assert_eq!(

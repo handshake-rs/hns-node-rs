@@ -2,9 +2,9 @@
 
 The bounded, fail-closed mining engine builds on the durable chain snapshots.
 It does not change the authority
-boundary: shadow mode may inspect the mempool and build future templates, but it
-cannot publish authoritative jobs or accept solved candidates without the
-private `MiningAuthorityPermit` issued by `hns-node`.
+boundary: native synchronization may inspect the mempool and prepare future
+templates, but it cannot publish authoritative jobs or accept solved candidates
+without the private `MiningAuthorityPermit` issued by `hns-node`.
 
 ## Data flow
 
