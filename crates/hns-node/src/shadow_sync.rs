@@ -98,6 +98,11 @@ const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
 pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 8;
 const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
 const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Native IBD deliberately fails over stalled body reservations sooner than
+// HSD's conservative two-minute connection timeout. The request remains
+// single-flight, bounded, and independently validated after reassignment.
+const NATIVE_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const NATIVE_MAX_INFLIGHT_PER_PEER: usize = 32;
 const BRONTIDE_IDENTITY_FILE: &str = "p2p-identity-v1.key";
 
 // Key-bearing fixed seeds from the pinned HSD `lib/net/seeds` tables. HSD's
@@ -1428,6 +1433,8 @@ impl NodeService {
             .ok_or_else(|| anyhow::anyhow!("Native sync peer limits overflow usize"))?;
         let sync_limits = SyncLimits {
             maximum_peers,
+            maximum_inflight_per_peer: NATIVE_MAX_INFLIGHT_PER_PEER,
+            block_request_timeout: NATIVE_BLOCK_REQUEST_TIMEOUT,
             ..SyncLimits::default()
         };
         let mut scheduler = match durable_checkpoint.as_ref() {
@@ -1792,7 +1799,7 @@ impl NodeService {
                         .await
                         {
                             let error = error.context("active-state synchronization failed");
-                            record_error(&diagnostics, error.to_string()).await;
+                            record_error(&diagnostics, format!("{error:#}")).await;
                             terminal_error = Some(error);
                             break;
                         }
@@ -1806,7 +1813,7 @@ impl NodeService {
                         let error = error.context(
                             "failed to refresh canonical block-body work queue",
                         );
-                        record_error(&diagnostics, error.to_string()).await;
+                        record_error(&diagnostics, format!("{error:#}")).await;
                         terminal_error = Some(error);
                         break;
                     }
@@ -1818,7 +1825,7 @@ impl NodeService {
                         Ok(locator) => locator,
                         Err(error) => {
                             let error = error.context("failed to build synchronization locator");
-                            record_error(&diagnostics, error.to_string()).await;
+                            record_error(&diagnostics, format!("{error:#}")).await;
                             terminal_error = Some(error);
                             break;
                         }
@@ -1829,7 +1836,7 @@ impl NodeService {
                         Ok(dispatches) => dispatches,
                         Err(error) => {
                             let error = error.context("failed to batch synchronization actions");
-                            record_error(&diagnostics, error.to_string()).await;
+                            record_error(&diagnostics, format!("{error:#}")).await;
                             terminal_error = Some(error);
                             break;
                         }
@@ -1845,7 +1852,7 @@ impl NodeService {
                         )
                         .await
                         {
-                            record_error(&diagnostics, error.to_string()).await;
+                            record_error(&diagnostics, format!("{error:#}")).await;
                         }
                     }
                     refresh_diagnostics(
@@ -1919,7 +1926,7 @@ impl NodeService {
                         break;
                     };
                     if let Err(error) = handled {
-                        record_error(&diagnostics, error.to_string()).await;
+                        record_error(&diagnostics, format!("{error:#}")).await;
                     }
                     if shadow_sync_config.discovery {
                         fill_discovery_slots(
@@ -1952,7 +1959,7 @@ impl NodeService {
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
                     };
-                    if let Err(error) = handle_validation_result(
+                    let validation_result = handle_validation_result(
                         result,
                         &node,
                         &peers,
@@ -1961,9 +1968,33 @@ impl NodeService {
                         &mut orphan_pool,
                         &diagnostics,
                     )
-                    .await
+                    .await;
+                    if let Err(error) = &validation_result {
+                        record_error(&diagnostics, format!("{error:#}")).await;
+                    }
+                    // A newly durable body can close an earlier download gap.
+                    // Connect immediately instead of waiting for the periodic
+                    // supervisor tick, which otherwise caps IBD at one small
+                    // active-state slice per polling interval.
+                    if validation_result.is_ok()
+                        && shadow_sync_config.connect_active_state
+                        && active_state_full_slice_ready(&scheduler)
                     {
-                        record_error(&diagnostics, error.to_string()).await;
+                        if let Err(error) = connect_stored_active_state(
+                            &node,
+                            &peers,
+                            &mut scheduler,
+                            &mut orphan_pool,
+                            &diagnostics,
+                            shadow_sync_config.active_state_connect_batch,
+                        )
+                        .await
+                        {
+                            let error = error.context("event-driven active-state synchronization failed");
+                            record_error(&diagnostics, format!("{error:#}")).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
                     }
                     refresh_diagnostics(
                         &diagnostics,
@@ -2010,7 +2041,7 @@ impl NodeService {
         }
         checkpoint_sequence = checkpoint_sequence.saturating_add(1);
         if let Err(error) = persist_checkpoint(&checkpoint_store, &scheduler, checkpoint_sequence) {
-            record_error(&diagnostics, error.to_string()).await;
+            record_error(&diagnostics, format!("{error:#}")).await;
             if terminal_error.is_none() {
                 terminal_error = Some(error);
             }
@@ -4281,6 +4312,17 @@ pub(super) async fn connect_stored_active_state(
     Ok(())
 }
 
+fn active_state_full_slice_ready(scheduler: &SyncScheduler) -> bool {
+    let stored_count = scheduler
+        .stored_tip()
+        .map_or(0u64, |tip| u64::from(tip.height).saturating_add(1));
+    let active_count = scheduler
+        .active_tip()
+        .map_or(0u64, |tip| u64::from(tip.height).saturating_add(1));
+    stored_count.saturating_sub(active_count)
+        >= u64::try_from(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE).unwrap_or(u64::MAX)
+}
+
 fn discard_orphan_descendants(root: BlockHash, orphans: &mut BoundedOrphanPool) {
     let mut pending = vec![root];
     while let Some(parent) = pending.pop() {
@@ -4900,7 +4942,8 @@ mod tests {
     use super::*;
     use crate::NodeConfig;
     use hns_primitives::{
-        Address, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Txid, Witness,
+        Address, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Txid, Uint256,
+        Witness,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4908,6 +4951,31 @@ mod tests {
         let mut wire = hns_p2p::NetAddress::from_socket_addr(address, time, services);
         wire.key = [2; 33];
         wire
+    }
+
+    fn scheduler_tip(height: Height) -> ChainTip {
+        ChainTip {
+            hash: BlockHash::new([height as u8; 32]),
+            height,
+            chainwork: Uint256::from_u64(u64::from(height).saturating_add(1)),
+        }
+    }
+
+    #[test]
+    fn event_driven_connector_waits_for_a_full_storage_slice() {
+        let now = StdInstant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        scheduler.set_stored_tip(Some(scheduler_tip(6)));
+        assert!(!active_state_full_slice_ready(&scheduler));
+
+        scheduler.set_stored_tip(Some(scheduler_tip(7)));
+        assert!(active_state_full_slice_ready(&scheduler));
+
+        scheduler.set_active_tip(Some(scheduler_tip(7)));
+        scheduler.set_stored_tip(Some(scheduler_tip(14)));
+        assert!(!active_state_full_slice_ready(&scheduler));
+        scheduler.set_stored_tip(Some(scheduler_tip(15)));
+        assert!(active_state_full_slice_ready(&scheduler));
     }
 
     #[test]

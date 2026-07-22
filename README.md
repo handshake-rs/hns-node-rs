@@ -395,6 +395,10 @@ Still release-blocking:
 
 See [`docs/mining-engine.md`](docs/mining-engine.md).
 
+Release IBD and native mining-path measurement commands, current bounded
+results, and their qualification limits are in
+[`docs/performance.md`](docs/performance.md).
+
 ## Authority gates
 
 Native mainnet authority remains disabled until all readiness fields report

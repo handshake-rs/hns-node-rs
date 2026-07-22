@@ -204,12 +204,14 @@ consuming an attempt. A missing transport peer is removed from scheduler state
 immediately, while queue saturation retains the live peer for a later retry.
 Header-request admission is rolled back under the same rule.
 
-HSD uses a 60-second response deadline for `GETHEADERS` and a 120-second block
-deadline. The scheduler uses those defaults. A timed-out body batch requeues its
-per-block work and emits only one disconnect for the peer, matching HSD's
-connection-level stall handling instead of multiplying a score by the number
+HSD uses a 60-second response deadline for `GETHEADERS` and a conservative
+120-second block deadline. Native IBD retains the header deadline but fails a
+stalled block connection over after 15 seconds so one slow peer cannot pin the
+contiguous state frontier for two minutes. A timed-out body batch requeues its
+per-block work and emits only one disconnect for the peer, preserving HSD's
+connection-level stall accounting instead of multiplying a score by the number
 of hashes in the packet. Retry exhaustion remains tracked per block across
-peer assignments.
+peer assignments. At most 128 blocks are in flight globally and 32 per peer.
 
 The current scheduler keeps one in-flight request per block. A future latency
 optimization may use bounded, staggered hedged requests: ask the preferred peer
@@ -307,8 +309,11 @@ headers-only operation retain full-block behavior.
 Active-state connection is the native-sync default and is bounded to 288
 connected blocks per atomic reorganization by default, matching
 mainnet's retained reorganization window (hard maximum 1,024). Straight-line
-IBD progress is additionally limited to eight connected blocks per supervisor
-slice so RPC, peer work, and shutdown are polled between small atomic commits.
+IBD progress is limited to eight connected blocks per state transaction so
+RPC, peer work, and shutdown are polled between small atomic commits. A valid
+body completion triggers the next full state slice immediately; partial tails
+are flushed by the periodic poll. This retains batched storage work without
+making the polling interval a sustained throughput ceiling.
 Each batch uses the node's existing deployment, script, sequence-lock,
 claim/airdrop, covenant, UTXO, name-state, Urkel-root, undo, and reorganization
 pipeline; no second consensus implementation exists in the sync runtime. The

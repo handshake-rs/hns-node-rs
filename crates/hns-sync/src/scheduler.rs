@@ -357,6 +357,10 @@ impl SyncScheduler {
         self.bump_sequence();
     }
 
+    pub fn active_tip(&self) -> Option<&ChainTip> {
+        self.active_tip.as_ref()
+    }
+
     pub fn set_stored_tip(&mut self, tip: Option<ChainTip>) {
         self.stored_tip = tip;
         self.update_stage();

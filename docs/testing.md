@@ -519,3 +519,14 @@ Report count, P50, P95, P99, maximum, failure count, and unavailable evidence
 for header/block validation, state/root mutation, reorganization commit,
 storage, peer handshake, IBD, tip-to-job, candidate validation, and each
 publication target. Mean throughput alone is not a release gate.
+
+The native runtime supplies two reproducible release-build entry points:
+
+```bash
+python3 scripts/measure-hsrd-native-sync.py --self-test
+cargo run --locked --release -p hns-node --bin hsrd-performance-gate
+```
+
+The live sampler consumes `/api/v1/native-sync` without an HSD runtime. Current
+bounded results and explicit exclusions are recorded in
+[`performance.md`](performance.md).
