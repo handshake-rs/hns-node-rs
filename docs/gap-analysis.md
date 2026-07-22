@@ -257,8 +257,9 @@ These are substantial foundations, not a production full node.
 
 ### Mining authority
 
-- Continuous future-template lifecycle tied to live committed tips and the ASIC
-  gateway.
+- A deployed long-duration run of the implemented authority-only future-template
+  stream, durable exact gateway activation, immediate stale-job retirement, and
+  current-tip publication fence against physical ASICs.
 - End-to-end candidate validation against a historically qualified active state.
 - Complete historical mainnet replay against the pinned HSD oracle.
 - Positive and negative invalid corpora for every rule family.
