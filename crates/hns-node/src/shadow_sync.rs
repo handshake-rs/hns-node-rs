@@ -2821,6 +2821,10 @@ impl NodeService {
             generation,
             snapshot: mining_snapshot,
             authoritative,
+            synchronized: match (&best_header, &active_tip) {
+                (Some(best), Some(active)) => best == active,
+                _ => false,
+            },
         };
         let authority = authority_info(&self.config, &durable);
         let tip_validation = match active_tip.as_ref() {
@@ -2928,8 +2932,10 @@ async fn shadow_sync_rpc_service(state: &ShadowSyncHttpState) -> Result<BasicRpc
     let mut snapshot = node.rpc_snapshot()?;
     snapshot.network_active = diagnostics.enabled;
     snapshot.peer_count = diagnostics.peers.len();
-    snapshot.node_status.release_stage = if node.config.mining_engine.enabled {
-        "mining-engine-shadow".to_owned()
+    snapshot.node_status.release_stage = if node.config.mainnet_canary {
+        "mainnet-canary-gated".to_owned()
+    } else if node.config.mining_engine.enabled {
+        "mining-engine-observe".to_owned()
     } else {
         "native-sync-live-p2p".to_owned()
     };

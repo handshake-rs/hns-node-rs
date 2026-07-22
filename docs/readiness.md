@@ -120,7 +120,7 @@ Remaining:
 - pruning and RocksDB crash/fault qualification;
 - complete mainnet reorganization/root replay.
 
-## Live P2P and synchronization — shadow foundation implemented
+## Live P2P and synchronization — native foundation implemented
 
 Implemented:
 
@@ -176,17 +176,17 @@ Implemented:
 
 Remaining:
 
-- Brontide transport;
 - long-lived subthreshold reputation, broader peer-diversity controls, and
   adversarial network qualification;
 - full-mainnet replay and pruning-aware qualification of active-state IBD;
 - production-complete contextual transaction admission and relay;
-- sustained live HSD comparison campaigns across restarts, partitions, and
-  real reorganizations.
+- sustained native multi-peer campaigns across restarts, partitions, and real
+  reorganizations, with offline differential audits of retained history.
 
-This networking path remains non-authoritative. Active-state mode mutates the
-validated state only after an atomic batch commits and still cannot grant mining
-authority.
+This networking path grants no authority by itself. Active-state mode mutates
+validated state only after an atomic batch commits; the explicit mainnet canary
+still requires exact synchronization, durable authoritative status, and every
+consensus readiness bit.
 
 ## Mining engine — bounded foundation implemented
 
@@ -229,7 +229,7 @@ Implemented:
 
 Remaining:
 
-- full-mainnet active-state IBD and live HSD state/root qualification;
+- full-mainnet active-state IBD and offline HSD state/root qualification;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
 - native mainnet authority qualification.
 
@@ -243,8 +243,8 @@ Implemented:
 - deterministic bootstrapping/mining/degraded/fallback/draining/stopped modes;
 - fallback and recovery hysteresis with explicit hard and soft backlog limits;
 - process-wide authorization failure accounting;
-- authenticated private Core assignment/job streaming with live HSD parent
-  qualification and optional HSRD shadow agreement;
+- authenticated private Core assignment/job streaming with sole native-hsrd
+  parent qualification and no runtime HSD dependency;
 - exact signed assignment binding at the gateway plus durable capture envelopes,
   Core-side `ShareV2` construction/admission, and terminal receipt reconciliation;
 - network- and pinned-key-bound signed `CoreCaptureReceiptV1` plus ACK-only reconciliation;

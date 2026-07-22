@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 9;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 10;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const MAX_RPC_AUTHORIZATION_BYTES: usize = 4_096;
 
@@ -348,6 +348,9 @@ pub struct NodeConfig {
     pub rpc_authorization: Option<RpcAuthorizationHeader>,
     pub log_filter: String,
     pub authority_mode: AuthorityMode,
+    /// Explicit operator opt-in for the native mainnet mining canary. This is
+    /// necessary but never sufficient to issue a mining authority permit.
+    pub mainnet_canary: bool,
     pub acknowledge_incomplete_consensus: bool,
     pub storage_durability: DurabilityPolicy,
     pub name_tree_compaction: NameTreeCompactionConfig,
@@ -365,6 +368,7 @@ impl Default for NodeConfig {
             rpc_authorization: None,
             log_filter: "info".to_owned(),
             authority_mode: AuthorityMode::Native,
+            mainnet_canary: false,
             acknowledge_incomplete_consensus: false,
             storage_durability: DurabilityPolicy::Sync,
             name_tree_compaction: NameTreeCompactionConfig::default(),
@@ -400,6 +404,8 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         }
     }
 
+    validate_mainnet_canary_config(config)?;
+
     if config.shadow_sync.connect_active_state
         && !config.acknowledge_incomplete_consensus
         && config.authority_mode != AuthorityMode::Native
@@ -418,14 +424,52 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         .validate(&config.shadow_sync, config.authority_mode)
 }
 
-fn authority_can_mine(config: &NodeConfig) -> bool {
+fn validate_mainnet_canary_config(config: &NodeConfig) -> Result<()> {
+    if !config.mainnet_canary {
+        return Ok(());
+    }
+    if config.network != Network::Mainnet
+        || config.authority_mode != AuthorityMode::Native
+        || config.acknowledge_incomplete_consensus
+        || config.data_dir.as_ref().is_none_or(|path| {
+            !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+        })
+        || !config.rpc_bind.ip().is_loopback()
+        || config.rpc_authorization.is_none()
+        || config.storage_durability != DurabilityPolicy::Sync
+        || !config.shadow_sync.enabled
+        || config.shadow_sync.headers_only
+        || !config.shadow_sync.connect_active_state
+        || config.shadow_sync.maximum_outbound < 4
+        || (!config.shadow_sync.discovery && config.shadow_sync.connect_keys.len() < 2)
+        || !config.mining_engine.enabled
+        || !config.mining_engine.transaction_relay
+        || config.undo_retention.prune_history
+    {
+        anyhow::bail!(
+            "mainnet canary requires native authority, persistent sync-durable state, authenticated loopback RPC, full native active-state sync, at least four outbound slots with discovery or two pinned peers, the mining engine with transaction relay, retained undo history, and no incomplete-consensus bypass"
+        );
+    }
+    Ok(())
+}
+
+fn authority_can_mine_with_readiness(config: &NodeConfig, consensus_complete: bool) -> bool {
     match config.authority_mode {
         AuthorityMode::Native => {
-            consensus_readiness().complete() && validate_node_config(config).is_ok()
+            consensus_complete
+                && validate_node_config(config).is_ok()
+                && (config.network != Network::Mainnet || config.mainnet_canary)
         }
         AuthorityMode::NativeExperimental => validate_node_config(config).is_ok(),
         AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::HsdVerified => false,
     }
+}
+
+fn authority_can_mine(config: &NodeConfig) -> bool {
+    authority_can_mine_with_readiness(config, consensus_readiness().complete())
 }
 
 #[derive(Clone, Debug)]
@@ -445,13 +489,15 @@ fn issue_authority_permit(
     }
     let snapshot = durable.snapshot.as_ref()?;
 
-    // The only currently composed authority mode is the explicitly gated
-    // regtest/simnet experimental path. Future HSD-verified or native authority
-    // modes must require `durable.authoritative` and issue the same capability.
+    // The regtest/simnet experimental path may bypass completeness only behind
+    // its compile-time/runtime gates. Native mainnet never bypasses readiness,
+    // synchronization, or `durable.authoritative`.
     let experimental_bypass = matches!(config.authority_mode, AuthorityMode::NativeExperimental)
         && matches!(config.network, Network::Regtest | Network::Simnet)
         && config.acknowledge_incomplete_consensus;
-    if !durable.authoritative && !experimental_bypass {
+    if (!durable.authoritative || (config.network == Network::Mainnet && !durable.synchronized))
+        && !experimental_bypass
+    {
         return None;
     }
 
@@ -494,7 +540,6 @@ fn consensus_readiness() -> RpcConsensusReadiness {
         wal_durability: true,
         historical_replay: false,
         invalid_corpus: false,
-        live_shadow: false,
     }
 }
 
@@ -582,7 +627,6 @@ fn readiness_blockers(readiness: &RpcConsensusReadiness) -> Vec<String> {
             readiness.invalid_corpus,
             "invalid and mutated corpus parity",
         ),
-        (readiness.live_shadow, "sustained live shadow-node parity"),
     ];
 
     checks
@@ -623,12 +667,23 @@ fn authority_info(config: &NodeConfig, durable: &DurableMiningState) -> RpcAutho
     if durable.snapshot.is_some() && !durable.authoritative {
         blockers.push("current tip is staged but not consensus-authoritative".to_owned());
     }
+    if config.network == Network::Mainnet && !config.mainnet_canary {
+        blockers.push("mainnet mining canary is not explicitly enabled".to_owned());
+    }
+    if config.network == Network::Mainnet && !durable.synchronized {
+        blockers.push("best header and active-state tip are not synchronized".to_owned());
+    }
 
     blockers.sort();
     blockers.dedup();
 
     RpcAuthorityInfo {
         mode: config.authority_mode.as_str().to_owned(),
+        synchronized: durable.synchronized,
+        mainnet_canary_enabled: config.network == Network::Mainnet && config.mainnet_canary,
+        mainnet_canary_active: config.network == Network::Mainnet
+            && config.mainnet_canary
+            && can_authorize,
         experimental_feature_enabled: cfg!(any(feature = "experimental-authority", test)),
         experimental_bypass_active,
         incomplete_consensus_acknowledged: config.acknowledge_incomplete_consensus,
@@ -737,11 +792,11 @@ impl NodeService {
             );
         }
 
-        // Production authority remains disabled. On the explicitly gated
-        // regtest/simnet experimental path, recover a fully stored higher-work
-        // branch before exposing any mining generation. Shadow active-state
-        // recovery is driven by the bounded sync coordinator so it cannot
-        // bypass contextual-failure handling or the configured batch limit.
+        // Recover a fully stored higher-work branch only when the authority
+        // policy itself is complete. Native mainnet remains off unless its
+        // explicit canary and every readiness gate pass. Active-state recovery
+        // is driven by the bounded sync coordinator so it cannot bypass
+        // contextual-failure handling or the configured batch limit.
         if authority_can_mine(&config) {
             state.recover_best_stored_chain()?;
         }
@@ -1538,6 +1593,7 @@ struct DurableMiningState {
     generation: MiningGeneration,
     snapshot: Option<Arc<MiningSnapshot>>,
     authoritative: bool,
+    synchronized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2084,6 +2140,7 @@ impl NodeState {
     fn durable_mining_state(&self) -> Result<DurableMiningState> {
         let snapshot = self.store.snapshot()?;
         let generation = mining_generation_from_snapshot(&snapshot)?;
+        let best_header = best_header_tip_from_snapshot(&snapshot)?;
         let best_hash = snapshot
             .get(ColumnFamily::Meta, MetaKey::BestBlockHash.as_bytes())
             .context("failed to read durable mining tip")?
@@ -2102,10 +2159,20 @@ impl NodeState {
             }
             None => (None, false),
         };
+        let synchronized = match (&best_header, &mining_snapshot) {
+            (Some(header), Some(mining)) => {
+                header.hash == mining.tip.hash
+                    && header.height == mining.tip.height
+                    && header.chainwork == mining.chainwork
+            }
+            (None, None) => false,
+            _ => false,
+        };
         Ok(DurableMiningState {
             generation,
             snapshot: mining_snapshot,
             authoritative,
+            synchronized,
         })
     }
 
@@ -5196,6 +5263,32 @@ mod tests {
         }
     }
 
+    fn mainnet_canary_config() -> NodeConfig {
+        NodeConfig {
+            network: Network::Mainnet,
+            data_dir: Some(PathBuf::from("/tmp/hsrd-mainnet-canary-test")),
+            rpc_authorization: Some(
+                RpcAuthorizationHeader::new("Bearer mainnet-canary-test").expect("authorization"),
+            ),
+            authority_mode: AuthorityMode::Native,
+            mainnet_canary: true,
+            storage_durability: DurabilityPolicy::Sync,
+            shadow_sync: ShadowSyncConfig {
+                enabled: true,
+                connect_active_state: true,
+                discovery: true,
+                maximum_outbound: 4,
+                ..ShadowSyncConfig::default()
+            },
+            mining_engine: MiningEngineConfig {
+                enabled: true,
+                transaction_relay: true,
+                ..MiningEngineConfig::default()
+            },
+            ..NodeConfig::default()
+        }
+    }
+
     fn store_fixture_alternate(
         node: &mut NodeService,
         block: Block,
@@ -8279,6 +8372,68 @@ mod tests {
         assert!(authority.experimental_bypass_active);
         assert!(authority.can_authorize_mining_templates);
         assert!(authority.can_accept_mining_candidates);
+    }
+
+    #[test]
+    fn mainnet_canary_requires_explicit_hardened_config_and_complete_readiness() {
+        let config = mainnet_canary_config();
+        validate_node_config(&config).expect("hardened canary config");
+        assert!(!authority_can_mine(&config));
+        assert!(authority_can_mine_with_readiness(&config, true));
+
+        let mut not_enabled = config.clone();
+        not_enabled.mainnet_canary = false;
+        assert!(!authority_can_mine_with_readiness(&not_enabled, true));
+
+        for mut invalid in [
+            {
+                let mut value = config.clone();
+                value.rpc_authorization = None;
+                value
+            },
+            {
+                let mut value = config.clone();
+                value.rpc_bind = "0.0.0.0:12037".parse().expect("public RPC bind");
+                value
+            },
+            {
+                let mut value = config.clone();
+                value.data_dir = Some(PathBuf::from("relative-mainnet-state"));
+                value
+            },
+            {
+                let mut value = config.clone();
+                value.shadow_sync.connect_active_state = false;
+                value
+            },
+            {
+                let mut value = config.clone();
+                value.mining_engine.transaction_relay = false;
+                value
+            },
+            {
+                let mut value = config.clone();
+                value.acknowledge_incomplete_consensus = true;
+                value
+            },
+        ] {
+            assert!(validate_node_config(&invalid).is_err());
+            invalid.mainnet_canary = false;
+            assert!(validate_node_config(&invalid).is_ok());
+        }
+
+        let durable = DurableMiningState {
+            generation: 1,
+            snapshot: None,
+            authoritative: true,
+            synchronized: false,
+        };
+        let authority = authority_info(&config, &durable);
+        assert!(authority
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("not synchronized")));
+        assert!(!authority.mainnet_canary_active);
     }
 
     #[test]

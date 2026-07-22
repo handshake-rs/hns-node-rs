@@ -26,6 +26,12 @@ snapshot only when the RPC listener is protected with
 durable-tip gate passes. Because readiness is currently incomplete, this is a
 fail-closed integration boundary rather than a claim of mainnet mining authority.
 
+Native mainnet operation has a second explicit lock: `--mainnet-canary`. The
+flag is accepted only with the hardened native-sync/mining configuration and it
+cannot bypass synchronization, durable tip authority, or any consensus
+readiness bit. See [Native mainnet mining canary](docs/mainnet-canary.md) for
+the runnable sync command and its current fail-closed outcome.
+
 The current tree contains hardened authority, storage, transaction, covenant,
 and name-state foundations, a live native P2P/synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication

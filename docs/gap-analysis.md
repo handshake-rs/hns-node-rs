@@ -248,8 +248,8 @@ These are substantial foundations, not a production full node.
   and pruning qualification of the bounded restartable active-state connector.
 - Failed-branch pruning/retention policy, historical reorganizations, and
   RocksDB fault evidence.
-- Brontide, long-lived subthreshold reputation, broader peer-diversity controls
-  beyond implemented HSD network-prefix grouping, and adversarial network
+- Long-lived subthreshold reputation, broader peer-diversity controls beyond
+  implemented HSD network-prefix grouping, and adversarial Brontide network
   qualification.
 - Pruning-aware synchronization and sustained compact-relay WAN qualification.
 - Sustained multipath publication and reconnect/retry supervision under WAN
@@ -265,9 +265,9 @@ These are substantial foundations, not a production full node.
 - Positive and negative invalid corpora for every rule family.
 - Byte-for-byte UTXO, name-state, Urkel-root, deployment, undo, and
   reorganization parity.
-- Sustained live HSD shadow agreement evidence through restarts, partitions,
-  tip races, and real reorganizations; the comparison mechanism exists, but
-  the production-duration campaign does not.
+- Sustained native multi-peer evidence through restarts, partitions, tip races,
+  and real reorganizations, plus offline differential audits of retained
+  canonical history; no runtime HSD shadow is required.
 - Measured P50/P95/P99/maximum tip-to-job, candidate-validation, local-connect,
   and first-peer-acceptance latency.
 - Reproducible builds, external review, fuzzing, and published latency/recovery

@@ -46,6 +46,12 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = AuthorityMode::Native)]
     authority_mode: AuthorityMode,
 
+    /// Explicitly request the fail-closed native mainnet mining canary. This
+    /// never bypasses consensus readiness, full synchronization, or durable
+    /// tip authority.
+    #[arg(long)]
+    mainnet_canary: bool,
+
     #[arg(long)]
     acknowledge_incomplete_consensus: bool,
 
@@ -192,6 +198,7 @@ impl Cli {
             rpc_authorization,
             log_filter: self.log_filter,
             authority_mode: self.authority_mode,
+            mainnet_canary: self.mainnet_canary,
             acknowledge_incomplete_consensus: self.acknowledge_incomplete_consensus,
             storage_durability: self.storage_durability,
             name_tree_compaction: NameTreeCompactionConfig {
@@ -346,6 +353,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(
             network = %config.network,
             authority_mode = config.authority_mode.as_str(),
+            mainnet_canary = config.mainnet_canary,
             storage_durability = %config.storage_durability,
             compact_name_tree_on_startup = config.name_tree_compaction.compact_on_startup,
             name_tree_compaction_interval = config.name_tree_compaction.startup_interval,

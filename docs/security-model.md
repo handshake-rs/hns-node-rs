@@ -113,8 +113,8 @@ The following remain untrusted and release-blocking:
   qualification;
 - production template qualification, continuously supervised publication
   retry, and measured publication latency;
-- complete mainnet replay, invalid corpus, and sustained live HSD shadow
-  agreement.
+- complete mainnet replay, invalid corpus, sustained native multi-peer
+  qualification, and offline differential audits.
 
 ## Authority policy
 

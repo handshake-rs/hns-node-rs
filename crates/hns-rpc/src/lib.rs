@@ -138,7 +138,6 @@ pub struct RpcConsensusReadiness {
     pub wal_durability: bool,
     pub historical_replay: bool,
     pub invalid_corpus: bool,
-    pub live_shadow: bool,
 }
 
 impl RpcConsensusReadiness {
@@ -168,13 +167,15 @@ impl RpcConsensusReadiness {
             && self.wal_durability
             && self.historical_replay
             && self.invalid_corpus
-            && self.live_shadow
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcAuthorityInfo {
     pub mode: String,
+    pub synchronized: bool,
+    pub mainnet_canary_enabled: bool,
+    pub mainnet_canary_active: bool,
     pub experimental_feature_enabled: bool,
     pub experimental_bypass_active: bool,
     pub incomplete_consensus_acknowledged: bool,

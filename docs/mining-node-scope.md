@@ -62,20 +62,24 @@ under that authenticated assignment. A winning reconstruction returns through
 a reserved candidate-validation and multi-target publication lane; DAG and
 settlement reconciliation never gate job activation or block broadcast.
 
-This bridge remains a separate MeshMine integration deliverable. The node-side
-snapshot/event and prepared-job primitives now exist; production authority does
-not move until the bridge and the consensus/removal gates below are complete.
+The native bridge now acquires only the authority-permitted event stream,
+persists exact generation/job bindings in the gateway store, activates signed
+assignments through the gateway, retires work on tip loss/change, and rechecks
+authority before publication. Production authority still does not move until
+the consensus/removal gates below are complete.
 
 ## hsd removal gate
 
-`hsrd` progresses through fixture, historical replay, shadow, and authority
-stages. `hsd` is removed only when independently reproducible evidence shows:
+`hsrd` progresses through fixture, historical replay, native synchronization,
+and authority stages. HSD remains only a pinned offline oracle when
+independently reproducible evidence shows:
 
 1. identical accept/reject results for every historical mainnet block and the
    invalid/mutated corpus;
 2. identical block hash, height, chainwork, UTXO outcome, name-tree root,
    deployment state, and undo/reorg result at every boundary;
-3. stable live shadow agreement through ordinary operation and reorganizations;
+3. stable multi-peer native operation through restarts, partitions, and
+   reorganizations, with bounded offline differential audits of retained data;
 4. successful candidate construction/validation and multi-path publication;
 5. a reviewed migration and fallback plan that does not create ambiguous fork
    choice.

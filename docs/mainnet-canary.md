@@ -1,0 +1,62 @@
+# Native mainnet mining canary
+
+The mainnet canary is an explicit fail-closed authority profile. It uses native
+Brontide peers, native active-state synchronization, native templates, and the
+native MeshMine gateway bridge. HSD is not started or queried at runtime; its
+pinned source and fixtures remain offline development evidence only.
+
+`--mainnet-canary` is necessary but not sufficient to authorize work. Startup
+rejects the flag unless all of these operational constraints are present:
+
+- network `mainnet` and authority mode `native`;
+- a persistent data directory and sync WAL durability;
+- a mandatory authenticated loopback RPC listener;
+- full native block-body and active-state sync, not headers-only or observe-only;
+- at least four outbound slots and either key-bearing discovery or two pinned
+  Brontide peers;
+- the mining engine and transaction relay;
+- retained undo history; and
+- no incomplete-consensus acknowledgement or experimental feature bypass.
+
+Even after startup, the private mining permit remains unavailable until the
+best header exactly equals the active-state tip by hash, height, and chainwork,
+the tip has every durable validation/state/undo bit, no better chain is pending,
+and every native consensus readiness bit reports complete. Core independently
+requires the same atomic `getparentauthority` result. On mainnet it additionally
+requires `mainnet_canary_enabled=true`, `mainnet_canary_active=true`, exact
+header/block synchronization, a parent no older than 30 minutes, and at most a
+one-second qualification cache.
+
+The current source still reports incomplete historical replay, invalid-corpus,
+and contextual/state readiness. Therefore the command below can run a native
+mainnet node and accumulate qualification evidence, but it cannot yet activate
+an ASIC job. That refusal is the intended result until those gates are backed
+by real evidence and changed in source review.
+
+Create a private file containing one complete Authorization value, such as
+`Bearer <random-secret>`, then check the operational configuration:
+
+```sh
+cargo run --locked --release --manifest-path hsrd/Cargo.toml \
+  -p hns-node --bin hsrd -- \
+  --network mainnet \
+  --data-dir /absolute/path/hsrd-mainnet \
+  --rpc-bind 127.0.0.1:12037 \
+  --rpc-authorization-header-file /absolute/path/hsrd-authorization-header \
+  --authority-mode native \
+  --mainnet-canary \
+  --native-sync --p2p-discovery --maximum-outbound 8 \
+  --mining-engine --transaction-relay \
+  --check-config
+```
+
+Remove `--check-config` to start synchronization. Never add
+`--acknowledge-incomplete-consensus`; mainnet canary validation rejects it.
+Keep the Authorization value out of command-line arguments, logs, and shell
+history. An authenticated local client may inspect `getauthorityinfo` or the
+atomic `getparentauthority` response. ASIC service must be started only through
+`AuthoritativeHsrdMiningStream` and `HsrdGatewayActivationRequest`; the
+observed/staged stream cannot construct that capability.
+
+This profile is a bounded canary mechanism, not production eligibility,
+independent review, or permission to turn incomplete readiness flags on.

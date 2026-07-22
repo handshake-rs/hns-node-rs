@@ -2141,7 +2141,7 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../fixtures/hsd/p2p/wire-v1.json"))
                 .expect("hsrd p2p wire fixture");
-        assert_eq!(fixture["schema"], 3);
+        assert_eq!(fixture["schema"], 4);
         for case in fixture["frames"].as_array().expect("frame cases") {
             let id = case["id"].as_str().expect("frame id");
             let network = oracle_network(case["network"].as_str().expect("network"));
