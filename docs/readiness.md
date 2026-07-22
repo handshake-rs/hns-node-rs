@@ -209,12 +209,13 @@ Implemented:
 - mempool/template reconciliation on active-chain transitions;
 - atomic complete-context revalidation of retained transactions and orphans
   after direct active-chain connections;
+- contextual ordinary-transaction re-admission after disconnects and
+  reorganizations, with older disconnected name updates taking priority;
 - mining-engine readiness and queue diagnostics.
 
 Remaining:
 
 - complete HSD mempool standardness/replacement policy and claim/airdrop relay;
-- disconnected-transaction re-admission after reorganizations;
 - full-mainnet active-state IBD and live HSD state/root qualification;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
 - native mainnet authority qualification.

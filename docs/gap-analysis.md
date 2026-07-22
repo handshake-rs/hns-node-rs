@@ -182,6 +182,9 @@
 - Atomic post-connect rebuilding revalidates every retained transaction and
   orphan against the new active context, promotes newly resolvable dependencies,
   and advances the mempool generation once only when membership changes.
+- Disconnects and reorganizations re-admit eligible ordinary transactions from
+  disconnected blocks before the retained pool, then validate the result against
+  the final atomic chain snapshot and replacement-branch conflicts.
 - Deterministic ancestor-inclusive future templates with actual HNS block
   weight kept separate from HSD sigop-adjusted policy size, plus sigops, OPEN,
   UPDATE, RENEW, transaction-count, and exclusive-name limits.
@@ -245,7 +248,7 @@ These are substantial foundations, not a production full node.
 
 ### Mining authority
 
-- HSD replacement/policy parity and disconnected-transaction re-admission.
+- HSD replacement/policy parity.
 - Continuous future-template lifecycle tied to live committed tips and the ASIC
   gateway.
 - End-to-end candidate validation against a historically qualified active state.

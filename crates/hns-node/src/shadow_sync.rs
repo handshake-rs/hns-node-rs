@@ -2257,6 +2257,13 @@ impl NodeService {
             self.mining_events.block_syntax_validated(summary);
         }
 
+        let disconnected_transactions =
+            self.disconnected_mempool_transactions(&activation.disconnect)?;
+        let connected_transactions = activation
+            .connect
+            .iter()
+            .flat_map(|connect| connect.block.transactions.iter().cloned())
+            .collect::<Vec<_>>();
         let is_reorg = !activation.disconnect.is_empty();
         if is_reorg {
             self.mining_events
@@ -2267,8 +2274,12 @@ impl NodeService {
             connect: activation.connect,
         }) {
             Ok(reorg) => {
-                let mempool_generation = self.mining_engine_clear_mempool_for_chain_transition();
-                self.publish_durable_mining_state(&reorg.mining)?;
+                let mining_publication = self.publish_durable_mining_state(&reorg.mining);
+                let mempool_generation = self.mining_engine_reconcile_chain_transition(
+                    &disconnected_transactions,
+                    &connected_transactions,
+                );
+                mining_publication?;
                 self.mining_engine_publish_mempool_reconciled(
                     reorg.mining.generation,
                     mempool_generation,

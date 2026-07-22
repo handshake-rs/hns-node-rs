@@ -332,8 +332,7 @@ Implemented:
 - Explicit hard bounds for accepted transactions, bytes, orphans, ancestor and
   descendant graphs, template variants, and pending publication intents.
 - Immutable mempool generations, dependency indexes, deterministic package
-  construction, orphan promotion, confirmed-transaction reconciliation, and
-  fail-closed clearing on reorganizations.
+  construction, orphan promotion, and atomic active-chain reconciliation.
 - Structural, finality, sequence-lock, maturity, authorization, covenant-link,
   contextual, fee, and resource admission stages with explicit verifier
   completeness gates.
@@ -343,6 +342,9 @@ Implemented:
 - Atomic post-connect revalidation of every retained transaction and orphan
   against the new active context, with one monotonic generation update and
   fail-closed clearing on internal view failure.
+- Contextual ordinary-transaction re-admission after disconnects and
+  reorganizations, with older disconnected name updates considered before the
+  retained pool and replacement-branch conflicts removed transitively.
 - Deterministic ancestor-inclusive template selection with HNS weight, sigops,
   OPEN, UPDATE, RENEW, transaction-count, and exclusive-name limits.
 - HSD-derived subsidy and deterministic coinbase fixtures.
@@ -358,7 +360,6 @@ Implemented:
 Still release-blocking:
 
 - complete HSD mempool standardness/replacement policy and claim/airdrop relay;
-- disconnected-transaction re-admission after reorganizations;
 - qualified full-mainnet active-state IBD and the incremental production Urkel
   lifecycle;
 - sustained live HSD comparison evidence across restarts, partitions, and real

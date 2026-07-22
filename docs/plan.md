@@ -176,8 +176,8 @@ reserved low-latency paths.
    subthreshold reputation, broader peer-diversity controls, sustained
    compact-relay qualification, and adversarial WAN tests.
 6. **Mempool admission closure** — compose complete active-chain views,
-   scripts/deployments/claims/name context, disconnected-transaction
-   re-admission, policy replacement, and differential corpora.
+   scripts/deployments/claims/name context, policy replacement, and
+   differential corpora.
 7. **Mining composition** — continuously rebuild bounded future variants,
    activate jobs on committed tips, supervise publication retries, and bind the
    ASIC gateway without allowing shadow state to authorize work.

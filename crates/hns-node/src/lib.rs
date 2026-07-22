@@ -48,7 +48,7 @@ use hns_mining::{
 };
 use hns_primitives::{
     blake2b_256, hex_encode, Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState,
-    Reader, Uint256, Writer,
+    Reader, Transaction, Uint256, Writer,
 };
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
@@ -827,6 +827,13 @@ impl NodeService {
             });
         };
 
+        let disconnected_transactions =
+            self.disconnected_mempool_transactions(&activation.disconnect)?;
+        let connected_transactions = activation
+            .connect
+            .iter()
+            .flat_map(|connect| connect.block.transactions.iter().cloned())
+            .collect::<Vec<_>>();
         let is_reorg = !activation.disconnect.is_empty();
         if is_reorg {
             self.mining_events
@@ -835,8 +842,12 @@ impl NodeService {
 
         match self.state.apply_reorg(activation) {
             Ok(reorg) => {
-                let mempool_generation = self.mining_engine_clear_mempool_for_chain_transition();
-                self.publish_durable_mining_state(&reorg.mining)?;
+                let mining_publication = self.publish_durable_mining_state(&reorg.mining);
+                let mempool_generation = self.mining_engine_reconcile_chain_transition(
+                    &disconnected_transactions,
+                    &connected_transactions,
+                );
+                mining_publication?;
                 self.mining_engine_publish_mempool_reconciled(
                     reorg.mining.generation,
                     mempool_generation,
@@ -872,6 +883,42 @@ impl NodeService {
             .map(|acceptance| acceptance.record)
     }
 
+    fn disconnected_mempool_transactions(
+        &self,
+        disconnects: &[NodeBlockDisconnect],
+    ) -> Result<Vec<Transaction>> {
+        if !self.config.mining_engine.enabled {
+            return Ok(Vec::new());
+        }
+        let snapshot = self.state.store.snapshot()?;
+        let mut transactions = Vec::new();
+        for disconnect in disconnects.iter().rev() {
+            let record =
+                load_block_index_record(&snapshot, &disconnect.block_hash)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "disconnect block index {} is missing",
+                        disconnect.block_hash.to_hex()
+                    )
+                })?;
+            if record.height != disconnect.height {
+                anyhow::bail!(
+                    "disconnect block {} height mismatch: expected {}, got {}",
+                    disconnect.block_hash.to_hex(),
+                    disconnect.height,
+                    record.height
+                );
+            }
+            let block = load_block(&snapshot, &disconnect.block_hash)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "disconnect block body {} is missing",
+                    disconnect.block_hash.to_hex()
+                )
+            })?;
+            transactions.extend(block.transactions.into_iter().skip(1));
+        }
+        Ok(transactions)
+    }
+
     pub fn submit_mining_candidate(
         &mut self,
         candidate: SolvedMiningCandidate,
@@ -897,9 +944,13 @@ impl NodeService {
     }
 
     pub fn disconnect_block(&mut self, request: NodeBlockDisconnect) -> Result<BlockIndexRecord> {
+        let disconnected_transactions =
+            self.disconnected_mempool_transactions(std::slice::from_ref(&request))?;
         let disconnected = self.state.disconnect_block(request)?;
-        let mempool_generation = self.mining_engine_clear_mempool_for_chain_transition();
-        self.publish_durable_mining_state(&disconnected.mining)?;
+        let mining_publication = self.publish_durable_mining_state(&disconnected.mining);
+        let mempool_generation =
+            self.mining_engine_reconcile_chain_transition(&disconnected_transactions, &[]);
+        mining_publication?;
         self.mining_engine_publish_mempool_reconciled(
             disconnected.mining.generation,
             mempool_generation,
@@ -922,13 +973,24 @@ impl NodeService {
         if request.disconnect.is_empty() && request.connect.is_empty() {
             return Ok(NodeReorgSummary::default());
         }
+        let disconnected_transactions =
+            self.disconnected_mempool_transactions(&request.disconnect)?;
+        let connected_transactions = request
+            .connect
+            .iter()
+            .flat_map(|connect| connect.block.transactions.iter().cloned())
+            .collect::<Vec<_>>();
 
         self.mining_events
             .reorg_started(request.disconnect.len(), request.connect.len());
         match self.state.apply_reorg(request) {
             Ok(reorg) => {
-                let mempool_generation = self.mining_engine_clear_mempool_for_chain_transition();
-                self.publish_durable_mining_state(&reorg.mining)?;
+                let mining_publication = self.publish_durable_mining_state(&reorg.mining);
+                let mempool_generation = self.mining_engine_reconcile_chain_transition(
+                    &disconnected_transactions,
+                    &connected_transactions,
+                );
+                mining_publication?;
                 self.mining_engine_publish_mempool_reconciled(
                     reorg.mining.generation,
                     mempool_generation,
@@ -5241,6 +5303,78 @@ mod tests {
         assert_eq!(
             node.state.mempool.info().generation,
             previous_generation + 1
+        );
+    }
+
+    #[test]
+    fn reorg_readmits_disconnected_transaction_before_retained_child() {
+        let mut node = peer_transaction_node(200);
+        let funding = Outpoint {
+            txid: Txid::new([0xd3; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, funding.clone(), 10_000, 1);
+        let snapshot = node.state.store.snapshot().expect("active snapshot");
+        let tip = best_block_tip_from_snapshot(&snapshot)
+            .expect("active tip read")
+            .expect("active tip");
+        let tree_root = load_stored_name_tree_commit_root(&snapshot).expect("committed root");
+        drop(snapshot);
+
+        let parent = script_spend(funding, 9_000);
+        let parent_txid = parent.txid();
+        let mut old_block =
+            block_with_commitments(vec![coinbase_transaction_with_tag(201, 50), parent]);
+        old_block.header.prev_block = tip.hash;
+        old_block.header.tree_root = *tree_root.as_bytes();
+        old_block.header.nonce = 212;
+        let old_record = node
+            .connect_block(NodeBlockImport::fixture(old_block, 201, 202))
+            .expect("connect old tip");
+
+        let child = script_spend(
+            Outpoint {
+                txid: parent_txid,
+                index: 0,
+            },
+            8_000,
+        );
+        let child_txid = child.txid();
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(child)
+                .expect("child admission"),
+            hns_mempool::Admission::Accepted(txid) if txid == child_txid
+        ));
+        let previous_generation = node.state.mempool.info().generation;
+
+        let mut replacement = block_with_commitments(vec![coinbase_transaction_with_tag(202, 50)]);
+        replacement.header.prev_block = tip.hash;
+        replacement.header.tree_root = *tree_root.as_bytes();
+        replacement.header.nonce = 213;
+        node.apply_reorg(NodeReorg {
+            disconnect: vec![NodeBlockDisconnect {
+                block_hash: old_record.hash,
+                height: 201,
+            }],
+            connect: vec![NodeBlockImport::fixture(replacement, 201, 203)],
+        })
+        .expect("replace old tip");
+
+        assert_eq!(node.state.mempool.info().transaction_count, 2);
+        assert_eq!(
+            node.state.mempool.info().generation,
+            previous_generation + 1
+        );
+        assert!(node.state.mempool.transaction(&parent_txid).is_some());
+        assert!(node.state.mempool.transaction(&child_txid).is_some());
+        assert_eq!(
+            node.state
+                .mempool
+                .snapshot()
+                .entry(&child_txid)
+                .expect("retained child")
+                .parents,
+            vec![parent_txid]
         );
     }
 

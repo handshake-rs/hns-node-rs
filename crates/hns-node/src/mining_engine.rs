@@ -464,6 +464,14 @@ impl NodeService {
         &mut self,
         transactions: &[hns_primitives::Transaction],
     ) -> Option<u64> {
+        self.mining_engine_reconcile_chain_transition(&[], transactions)
+    }
+
+    pub(crate) fn mining_engine_reconcile_chain_transition(
+        &mut self,
+        disconnected_transactions: &[hns_primitives::Transaction],
+        connected_transactions: &[hns_primitives::Transaction],
+    ) -> Option<u64> {
         if !self.config.mining_engine.enabled {
             return None;
         }
@@ -486,8 +494,9 @@ impl NodeService {
             };
             self.state
                 .mempool
-                .reconcile_connected_with_context(
-                    transactions,
+                .reconcile_chain_transition_with_context(
+                    connected_transactions,
+                    disconnected_transactions,
                     &context,
                     &view,
                     self.state.state_engine.input_verifier(),
@@ -511,14 +520,6 @@ impl NodeService {
             self.mining_engine_template_cache().clear();
         }
         revalidation.changed.then_some(revalidation.generation)
-    }
-
-    pub(crate) fn mining_engine_clear_mempool_for_chain_transition(&mut self) -> Option<u64> {
-        if !self.config.mining_engine.enabled {
-            return None;
-        }
-        let removed = self.state.mempool.clear();
-        (removed > 0).then(|| self.state.mempool.info().generation)
     }
 
     pub(crate) fn mining_engine_publish_mempool_reconciled(

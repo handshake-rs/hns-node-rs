@@ -109,8 +109,8 @@ The following remain untrusted and release-blocking:
   alternate-chain/reorganization qualification;
 - Brontide, long-lived subthreshold peer reputation, complete HSD mempool
   standardness/replacement, and claim/airdrop relay;
-- disconnected-transaction re-admission, production template qualification,
-  continuously supervised publication retry, and measured publication latency;
+- production template qualification, continuously supervised publication
+  retry, and measured publication latency;
 - complete mainnet replay, invalid corpus, and sustained live HSD shadow
   agreement.
 

@@ -67,10 +67,8 @@ local connection from becoming a network publication source.
 - ancestor fee and weight accounting;
 - bounded orphan retention and deterministic oldest-first eviction;
 - HSD exclusive-name admission and deterministic accepted-name overlay replay;
-- atomic block-confirmation reconciliation and complete retained-pool
-  revalidation against each new direct active tip;
-- fail-closed clearing on reorganizations until disconnected transactions can
-  be contextually re-admitted;
+- atomic active-chain reconciliation with complete retained-pool revalidation
+  and contextual ordinary-transaction re-admission after disconnects;
 - explicit verifier-completeness gates.
 
 The compatibility `Mempool::submit` entrypoint rejects with
@@ -83,7 +81,10 @@ overlay. The compatibility entrypoint remains fail closed, and complete HSD
 standardness/replacement policy and claim/airdrop packets remain unfinished.
 Every direct active extension atomically rebuilds retained transactions and
 orphans through the same complete context, promoting newly resolvable inputs
-and advancing the generation once only when membership changes. The pinned
+and advancing the generation once only when membership changes. Disconnects
+and reorganizations additionally consider non-coinbase transactions from the
+disconnected blocks before the retained pool, preserving HSD's older-name-update
+priority while the final replacement-chain view rejects conflicts. The pinned
 height-62,517 case and the 39,086-39,101 -> 76,722 replacement history establish
 exact proof/accounting, parent-header-time, retained-value, and commit-advance
 behavior for bounded real mainnet claims, but they are not full-chain
@@ -153,8 +154,9 @@ failure.
 
 A direct active-chain extension removes included and conflicting transactions
 from the mempool and advances the mempool generation at most once. A disconnect
-or reorganization clears the mempool conservatively because contextual
-re-admission of disconnected transactions is not yet consensus complete.
+or reorganization atomically rebuilds the retained pool against the final chain
+snapshot and re-admits eligible ordinary transactions from disconnected blocks
+in oldest-block order. Internal view failures still clear the pool fail closed.
 Mining-template caches are cleared whenever the durable chain generation
 advances or an accepted mempool generation changes.
 

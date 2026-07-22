@@ -251,6 +251,7 @@ pub enum Admission {
 pub struct MempoolRevalidation {
     pub changed: bool,
     pub removed: usize,
+    pub readmitted: usize,
     pub promoted_orphans: usize,
     pub retained_transactions: usize,
     pub retained_orphans: usize,
@@ -569,11 +570,31 @@ impl MemoryMempool {
         input_verifier: &dyn TransactionInputVerifier,
         contextual_verifier: &dyn ContextualTransactionVerifier,
     ) -> Result<MempoolRevalidation, MempoolError> {
+        self.reconcile_chain_transition_with_context(
+            connected_transactions,
+            &[],
+            context,
+            view,
+            input_verifier,
+            contextual_verifier,
+        )
+    }
+
+    /// Rebuild the pool after an atomic chain transition. Transactions from
+    /// disconnected blocks are considered before the prior pool so their
+    /// older HSD name-state updates take precedence over newer conflicts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile_chain_transition_with_context<V: MempoolView>(
+        &mut self,
+        connected_transactions: &[Transaction],
+        disconnected_transactions: &[Transaction],
+        context: &MempoolContext,
+        view: &V,
+        input_verifier: &dyn TransactionInputVerifier,
+        contextual_verifier: &dyn ContextualTransactionVerifier,
+    ) -> Result<MempoolRevalidation, MempoolError> {
         let previous_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
         let previous_orphans = self.orphans.keys().copied().collect::<BTreeSet<_>>();
-        let previous_total = previous_transactions
-            .len()
-            .saturating_add(previous_orphans.len());
         let previous_generation = self.generation;
 
         let connected_txids = connected_transactions
@@ -610,20 +631,48 @@ impl MemoryMempool {
             .map(|(txid, orphan)| (orphan.sequence, *txid, orphan.transaction.clone()))
             .collect::<Vec<_>>();
         ordered_orphans.sort_by_key(|(sequence, txid, _)| (*sequence, *txid));
-        let mut discarded_orphans = ordered_orphans
+        let disconnected_txids = disconnected_transactions
             .iter()
-            .filter(|(_, _, transaction)| {
-                transaction
-                    .inputs
-                    .iter()
-                    .any(|input| connected_spends.contains(&input.previous_output))
-            })
-            .map(|(_, txid, _)| *txid)
+            .map(Transaction::txid)
+            .collect::<BTreeSet<_>>();
+        let mut candidates = disconnected_transactions
+            .iter()
+            .cloned()
+            .map(|transaction| (transaction, false))
+            .collect::<Vec<_>>();
+        candidates.extend(accepted.into_iter().map(|transaction| (transaction, false)));
+        candidates.extend(
+            ordered_orphans
+                .into_iter()
+                .map(|(_, _, transaction)| (transaction, true)),
+        );
+        let mut invalidated_transactions = previous_transactions
+            .difference(&connected_txids)
+            .filter(|txid| !source.entries.contains_key(txid))
+            .copied()
             .collect::<HashSet<_>>();
-
+        let mut candidate_txids = BTreeSet::new();
+        let mut seen = HashSet::new();
         let mut rebuilt = Self::with_limits(self.limits.clone())?;
-        for transaction in accepted {
+        for (transaction, allow_orphan) in candidates {
             let txid = transaction.txid();
+            if !seen.insert(txid) {
+                continue;
+            }
+            candidate_txids.insert(txid);
+            if connected_txids.contains(&txid) {
+                continue;
+            }
+            if disconnected_txids.contains(&txid) {
+                invalidated_transactions.remove(&txid);
+            }
+            if transaction.inputs.iter().any(|input| {
+                connected_spends.contains(&input.previous_output)
+                    || invalidated_transactions.contains(&input.previous_output.txid)
+            }) {
+                invalidated_transactions.insert(txid);
+                continue;
+            }
             match rebuilt.submit_checked(
                 transaction,
                 context,
@@ -632,67 +681,82 @@ impl MemoryMempool {
                 contextual_verifier,
             )? {
                 Admission::Accepted(_) => {}
+                Admission::Orphan(_) if allow_orphan => {}
                 Admission::Orphan(_) => {
                     rebuilt.remove_orphan(&txid);
+                    invalidated_transactions.insert(txid);
                 }
-                Admission::Rejected { .. } => {}
+                Admission::Rejected { .. } => {
+                    invalidated_transactions.insert(txid);
+                }
             }
         }
-        let invalidated_transactions = previous_transactions
-            .difference(&connected_txids)
-            .filter(|txid| !rebuilt.entries.contains_key(txid))
-            .copied()
-            .collect::<HashSet<_>>();
-        discarded_orphans.extend(
-            ordered_orphans
-                .iter()
-                .filter(|(_, _, transaction)| {
-                    transaction
-                        .inputs
-                        .iter()
-                        .any(|input| invalidated_transactions.contains(&input.previous_output.txid))
-                })
-                .map(|(_, txid, _)| *txid),
-        );
         loop {
-            let descendants = ordered_orphans
+            let descendants = rebuilt
+                .orphans
                 .iter()
-                .filter(|(_, txid, _)| !discarded_orphans.contains(txid))
-                .filter(|(_, _, transaction)| {
-                    transaction
-                        .inputs
-                        .iter()
-                        .any(|input| discarded_orphans.contains(&input.previous_output.txid))
+                .filter(|(_, orphan)| {
+                    orphan.transaction.inputs.iter().any(|input| {
+                        connected_spends.contains(&input.previous_output)
+                            || invalidated_transactions.contains(&input.previous_output.txid)
+                    })
                 })
-                .map(|(_, txid, _)| *txid)
+                .map(|(txid, _)| *txid)
                 .collect::<Vec<_>>();
             if descendants.is_empty() {
                 break;
             }
-            discarded_orphans.extend(descendants);
-        }
-        for (_, txid, transaction) in ordered_orphans {
-            if discarded_orphans.contains(&txid) {
-                continue;
+            for txid in descendants {
+                rebuilt.remove_orphan(&txid);
+                invalidated_transactions.insert(txid);
             }
-            let _ = rebuilt.submit_checked(
-                transaction,
-                context,
-                view,
-                input_verifier,
-                contextual_verifier,
-            )?;
         }
         rebuilt.promote_orphans(context, view, input_verifier, contextual_verifier)?;
+        invalidated_transactions.extend(
+            candidate_txids
+                .difference(&connected_txids)
+                .filter(|txid| {
+                    !rebuilt.entries.contains_key(txid) && !rebuilt.orphans.contains_key(txid)
+                })
+                .copied(),
+        );
+        loop {
+            let descendants =
+                rebuilt
+                    .orphans
+                    .iter()
+                    .filter(|(_, orphan)| {
+                        orphan.transaction.inputs.iter().any(|input| {
+                            invalidated_transactions.contains(&input.previous_output.txid)
+                        })
+                    })
+                    .map(|(txid, _)| *txid)
+                    .collect::<Vec<_>>();
+            if descendants.is_empty() {
+                break;
+            }
+            for txid in descendants {
+                rebuilt.remove_orphan(&txid);
+                invalidated_transactions.insert(txid);
+            }
+        }
 
         let retained_transactions = rebuilt.entries.keys().copied().collect::<BTreeSet<_>>();
         let retained_orphans = rebuilt.orphans.keys().copied().collect::<BTreeSet<_>>();
         let changed =
             retained_transactions != previous_transactions || retained_orphans != previous_orphans;
-        let retained_total = retained_transactions
-            .len()
-            .saturating_add(retained_orphans.len());
-        let removed = previous_total.saturating_sub(retained_total);
+        let previous_members = previous_transactions
+            .union(&previous_orphans)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let retained_members = retained_transactions
+            .union(&retained_orphans)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let removed = previous_members.difference(&retained_members).count();
+        let readmitted = disconnected_txids
+            .intersection(&retained_transactions)
+            .count();
         let promoted_orphans = previous_orphans
             .intersection(&retained_transactions)
             .count();
@@ -708,6 +772,7 @@ impl MemoryMempool {
         Ok(MempoolRevalidation {
             changed,
             removed,
+            readmitted,
             promoted_orphans,
             retained_transactions: retained_transactions.len(),
             retained_orphans: retained_orphans.len(),
@@ -1913,8 +1978,98 @@ mod tests {
     }
 
     #[test]
+    fn chain_transition_readmits_disconnected_parent_before_existing_child() {
+        let parent_input = outpoint(0xf6, 0);
+        let parent = transaction(parent_input.clone(), 15);
+        let parent_txid = parent.txid();
+        let parent_output = Outpoint {
+            txid: parent_txid,
+            index: 0,
+        };
+        let child = transaction(parent_output.clone(), 10);
+        let child_txid = child.txid();
+        let old_view = FixedView::with_coin(parent_output, 15);
+        let final_view = FixedView::with_coin(parent_input, 20);
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, child, &old_view),
+            Admission::Accepted(_)
+        ));
+        let previous_generation = pool.info().generation;
+
+        let summary = pool
+            .reconcile_chain_transition_with_context(
+                &[],
+                &[parent],
+                &MempoolContext::testing(3, 3),
+                &final_view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect("revalidation");
+        assert!(summary.changed);
+        assert_eq!(summary.removed, 0);
+        assert_eq!(summary.readmitted, 1);
+        assert_eq!(summary.retained_transactions, 2);
+        assert_eq!(summary.retained_orphans, 0);
+        assert_eq!(summary.generation, previous_generation + 1);
+        assert!(pool.transaction(&parent_txid).is_some());
+        assert!(pool.transaction(&child_txid).is_some());
+        assert_eq!(
+            pool.snapshot().entry(&child_txid).expect("child").parents,
+            vec![parent_txid]
+        );
+    }
+
+    #[test]
+    fn chain_transition_prefers_older_disconnected_name_update() {
+        let existing_input = outpoint(0xf7, 0);
+        let disconnected_input = outpoint(0xf8, 0);
+        let mut view = FixedView::with_coin(existing_input.clone(), 20);
+        view.coins.insert(
+            disconnected_input.clone(),
+            Coin {
+                outpoint: disconnected_input.clone(),
+                value: 20,
+                height: 1,
+                coinbase: false,
+                address: Address::new(0, vec![3; 20]).expect("address"),
+                covenant: covenant(),
+            },
+        );
+        let existing = open_transaction(existing_input, 15, b"older-wins");
+        let existing_txid = existing.txid();
+        let disconnected = open_transaction(disconnected_input, 14, b"older-wins");
+        let disconnected_txid = disconnected.txid();
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, existing, &view),
+            Admission::Accepted(_)
+        ));
+        let previous_generation = pool.info().generation;
+
+        let summary = pool
+            .reconcile_chain_transition_with_context(
+                &[],
+                &[disconnected],
+                &MempoolContext::testing(3, 3),
+                &view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect("revalidation");
+        assert!(summary.changed);
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.readmitted, 1);
+        assert_eq!(summary.retained_transactions, 1);
+        assert_eq!(summary.generation, previous_generation + 1);
+        assert!(pool.transaction(&existing_txid).is_none());
+        assert!(pool.transaction(&disconnected_txid).is_some());
+    }
+
+    #[test]
     fn connected_block_revalidation_failure_preserves_original_pool() {
-        let input = outpoint(0xf6, 0);
+        let input = outpoint(0xf9, 0);
         let view = FixedView::with_coin(input.clone(), 20);
         let transaction = transaction(input, 9);
         let txid = transaction.txid();
