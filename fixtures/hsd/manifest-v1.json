@@ -417,9 +417,12 @@
         "standardness",
         "dust",
         "absurd-fee",
+        "expiry",
+        "fee-eviction",
+        "descendant-package",
         "oracle"
       ],
-      "blake2b256": "0393b737a0a5e571f579fb015c4585008328e307925664b9eb315f5dff5e2e10"
+      "blake2b256": "49c9c10253e6a1965fafc59c116fbd033b7bad02fb144018ffa46c63565af601"
     }
   ]
 }

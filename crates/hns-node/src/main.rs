@@ -4,7 +4,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use hns_consensus::Network;
-use hns_mempool::MempoolLimits;
+use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
     init_logging, validate_node_config, AuthorityMode, MiningEngineConfig,
     NameTreeCompactionConfig, NodeConfig, NodeService, ShadowSyncConfig, ShutdownSignal,
@@ -129,6 +129,9 @@ struct Cli {
     #[arg(long, default_value_t = 25)]
     mempool_max_descendants: usize,
 
+    #[arg(long, default_value_t = HSD_MEMPOOL_EXPIRY_TIME)]
+    mempool_expiry_time: u64,
+
     #[arg(long, default_value_t = 16)]
     template_variants: usize,
 
@@ -186,6 +189,7 @@ impl Cli {
                     maximum_orphan_bytes: self.mempool_max_orphan_bytes,
                     maximum_ancestors: self.mempool_max_ancestors,
                     maximum_descendants: self.mempool_max_descendants,
+                    expiry_time: self.mempool_expiry_time,
                 },
                 maximum_template_variants: self.template_variants,
                 maximum_pending_publications: self.pending_publications,

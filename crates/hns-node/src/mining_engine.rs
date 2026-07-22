@@ -158,6 +158,7 @@ fn active_mempool_parameters<T: ReadSnapshot>(
         MempoolContext {
             next_height,
             parent_median_time,
+            current_time: super::current_unix_time()?,
             coinbase_maturity: network.params().coinbase_maturity,
             minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
             require_standard: matches!(network, Network::Mainnet),

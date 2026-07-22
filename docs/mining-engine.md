@@ -67,6 +67,8 @@ local connection from becoming a network publication source.
 - ancestor fee and weight accounting;
 - bounded orphan retention and deterministic oldest-first eviction;
 - HSD exclusive-name admission and deterministic accepted-name overlay replay;
+- HSD 72-hour dependency-root expiry and descendant-aware fee eviction to the
+  90% trim target;
 - atomic active-chain reconciliation with complete retained-pool revalidation
   and contextual ordinary-transaction re-admission after disconnects;
 - explicit verifier-completeness gates.
@@ -78,8 +80,8 @@ mining-engine peer boundary now does so for ordinary transactions using one
 immutable active-chain snapshot, deployment-derived name flags, HSD's 1,000
 minimum relay rate, the native script backend, and the live accepted-name
 overlay. The compatibility entrypoint remains fail closed, and complete HSD
-free-relay priority/rate limiting, expiry/fee-based eviction, and special
-claim/airdrop packets remain unfinished. Mainnet transaction/output and witness
+free-relay priority/rate limiting and special claim/airdrop packets remain
+unfinished. Mainnet transaction/output and witness
 standardness, standard script flags, dust, and absurd-fee checks are active.
 Every direct active extension atomically rebuilds retained transactions and
 orphans through the same complete context, promoting newly resolvable inputs
@@ -193,7 +195,7 @@ remain release-blocking:
 - deployment-scale Urkel compaction performance/priority qualification and
   RocksDB mid-commit process-crash/fault injection;
 - qualified full-mainnet active-state IBD and live HSD state comparison;
-- HSD free-relay priority/rate limiting, expiry/fee-based eviction, and special
-  claim/airdrop relay including replacement claims;
+- HSD free-relay priority/rate limiting and special claim/airdrop relay,
+  including replacement claims;
 - measured production template and solved-block latency;
 - native mainnet authority qualification.

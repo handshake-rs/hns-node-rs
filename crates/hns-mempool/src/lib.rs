@@ -39,6 +39,10 @@ pub const HSD_MAX_P2WSH_STACK: usize = 100;
 pub const HSD_MAX_P2WSH_PUSH: usize = 80;
 pub const HSD_MAX_P2WSH_SIZE: usize = 3_600;
 pub const HSD_ABSURD_FEE_FACTOR: Amount = 10_000;
+pub const HSD_MEMPOOL_MAX_SIZE: usize = 100 * 1_000_000;
+pub const HSD_MEMPOOL_EXPIRY_TIME: u64 = 72 * 60 * 60;
+pub const HSD_MEMPOOL_TRIM_NUMERATOR: usize = 9;
+pub const HSD_MEMPOOL_TRIM_DENOMINATOR: usize = 10;
 /// HSD's pinned default minimum relay fee in atomic units per 1,000 policy
 /// virtual bytes. Network-specific HSD defaults currently use this same value.
 pub const HSD_MINIMUM_RELAY_FEE_RATE: Amount = 1_000;
@@ -192,6 +196,9 @@ pub struct MempoolLimits {
     pub maximum_orphan_bytes: usize,
     pub maximum_ancestors: usize,
     pub maximum_descendants: usize,
+    /// Wall-clock lifetime for accepted root packages. HSD defaults to 72
+    /// hours and expires descendants atomically with their dependency root.
+    pub expiry_time: u64,
 }
 
 impl Default for MempoolLimits {
@@ -203,6 +210,7 @@ impl Default for MempoolLimits {
             maximum_orphan_bytes: DEFAULT_MAX_ORPHAN_BYTES,
             maximum_ancestors: DEFAULT_MAX_ANCESTORS,
             maximum_descendants: DEFAULT_MAX_DESCENDANTS,
+            expiry_time: HSD_MEMPOOL_EXPIRY_TIME,
         }
     }
 }
@@ -215,6 +223,7 @@ impl MempoolLimits {
             || self.maximum_orphan_bytes == 0
             || self.maximum_ancestors == 0
             || self.maximum_descendants == 0
+            || self.expiry_time == 0
         {
             return Err(MempoolError::Configuration(
                 "mempool bounds must be non-zero".to_owned(),
@@ -263,6 +272,9 @@ impl MempoolLimits {
 pub struct MempoolContext {
     pub next_height: Height,
     pub parent_median_time: u64,
+    /// Injected UNIX time used only for local relay expiry/rate policy. It is
+    /// deliberately separate from consensus median time.
+    pub current_time: u64,
     pub coinbase_maturity: u32,
     /// Minimum fee in native atomic units per 1,000 HSD policy virtual bytes.
     pub minimum_relay_fee_rate: Amount,
@@ -282,6 +294,7 @@ impl MempoolContext {
         Self {
             next_height,
             parent_median_time,
+            current_time: 0,
             coinbase_maturity: 0,
             minimum_relay_fee_rate: 0,
             require_standard: false,
@@ -350,6 +363,7 @@ pub struct MempoolEntry {
     pub ancestor_fee: Amount,
     pub ancestor_weight: usize,
     pub ancestor_policy_size: usize,
+    pub admitted_at: u64,
     pub sequence: u64,
 }
 
@@ -753,10 +767,16 @@ impl MemoryMempool {
         let accepted = source
             .entries
             .values()
-            .map(|entry| (entry.sequence, entry.txid))
+            .map(|entry| (entry.sequence, entry.txid, entry.admitted_at))
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .filter_map(|(_, txid)| source.transactions.get(&txid).cloned())
+            .filter_map(|(_, txid, admitted_at)| {
+                source
+                    .transactions
+                    .get(&txid)
+                    .cloned()
+                    .map(|transaction| (transaction, admitted_at))
+            })
             .collect::<Vec<_>>();
         let mut ordered_orphans = source
             .orphans
@@ -771,13 +791,17 @@ impl MemoryMempool {
         let mut candidates = disconnected_transactions
             .iter()
             .cloned()
-            .map(|transaction| (transaction, false))
+            .map(|transaction| (transaction, false, context.current_time))
             .collect::<Vec<_>>();
-        candidates.extend(accepted.into_iter().map(|transaction| (transaction, false)));
+        candidates.extend(
+            accepted
+                .into_iter()
+                .map(|(transaction, admitted_at)| (transaction, false, admitted_at)),
+        );
         candidates.extend(
             ordered_orphans
                 .into_iter()
-                .map(|(_, _, transaction)| (transaction, true)),
+                .map(|(_, _, transaction)| (transaction, true, context.current_time)),
         );
         let mut invalidated_transactions = previous_transactions
             .difference(&connected_txids)
@@ -787,7 +811,7 @@ impl MemoryMempool {
         let mut candidate_txids = BTreeSet::new();
         let mut seen = HashSet::new();
         let mut rebuilt = Self::with_limits(self.limits.clone())?;
-        for (transaction, allow_orphan) in candidates {
+        for (transaction, allow_orphan, admitted_at) in candidates {
             let txid = transaction.txid();
             if !seen.insert(txid) {
                 continue;
@@ -806,12 +830,13 @@ impl MemoryMempool {
                 invalidated_transactions.insert(txid);
                 continue;
             }
-            match rebuilt.submit_checked(
+            match rebuilt.submit_checked_at(
                 transaction,
                 context,
                 view,
                 input_verifier,
                 contextual_verifier,
+                admitted_at,
             )? {
                 Admission::Accepted(_) => {}
                 Admission::Orphan(_) if allow_orphan => {}
@@ -921,6 +946,26 @@ impl MemoryMempool {
         view: &V,
         input_verifier: &dyn TransactionInputVerifier,
         contextual_verifier: &dyn ContextualTransactionVerifier,
+    ) -> Result<Admission, MempoolError> {
+        self.submit_checked_at(
+            transaction,
+            context,
+            view,
+            input_verifier,
+            contextual_verifier,
+            context.current_time,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_checked_at<V: MempoolView>(
+        &mut self,
+        transaction: Transaction,
+        context: &MempoolContext,
+        view: &V,
+        input_verifier: &dyn TransactionInputVerifier,
+        contextual_verifier: &dyn ContextualTransactionVerifier,
+        admitted_at: u64,
     ) -> Result<Admission, MempoolError> {
         let txid = transaction.txid();
         if self.entries.contains_key(&txid) || self.orphans.contains_key(&txid) {
@@ -1064,16 +1109,10 @@ impl MemoryMempool {
         }
 
         let encoded_size = transaction.encode().len();
-        if self.entries.len() >= self.limits.maximum_transactions {
-            return Ok(rejected("mempool-full"));
-        }
         let projected_bytes = self
             .bytes
             .checked_add(encoded_size)
             .ok_or(MempoolError::WeightOverflow)?;
-        if projected_bytes > self.limits.maximum_bytes {
-            return Ok(rejected("mempool-full"));
-        }
 
         let CovenantMetrics {
             opens,
@@ -1128,6 +1167,7 @@ impl MemoryMempool {
             ancestor_fee,
             ancestor_weight,
             ancestor_policy_size,
+            admitted_at,
             sequence,
         };
 
@@ -1148,7 +1188,105 @@ impl MemoryMempool {
         self.entries.insert(txid, entry);
         self.transactions.insert(txid, transaction);
         self.advance_generation();
+        if !self.limit_size(txid, context.current_time) {
+            return Ok(rejected("mempool-full"));
+        }
         Ok(Admission::Accepted(txid))
+    }
+
+    /// Mirror HSD's `limitSize`: expire complete dependency-root packages
+    /// first, then trim an over-capacity pool to 90% by the lower-ranked roots.
+    /// A root's rank is the better of its own fee rate and the aggregate rate
+    /// of its complete descendant package, so a high-fee child protects its
+    /// low-fee ancestors from being separated.
+    fn limit_size(&mut self, added: Txid, now: u64) -> bool {
+        let mut expired = self
+            .entries
+            .values()
+            .filter(|entry| {
+                self.parents.get(&entry.txid).is_none_or(BTreeSet::is_empty)
+                    && now >= entry.admitted_at.saturating_add(self.limits.expiry_time)
+            })
+            .map(|entry| (entry.admitted_at, entry.txid))
+            .collect::<Vec<_>>();
+        expired.sort();
+        for (_, txid) in expired {
+            self.remove_transaction_without_generation(txid, true);
+        }
+
+        if self.entries.len() <= self.limits.maximum_transactions
+            && self.bytes <= self.limits.maximum_bytes
+        {
+            return self.entries.contains_key(&added);
+        }
+
+        let target_transactions = self
+            .limits
+            .maximum_transactions
+            .saturating_mul(HSD_MEMPOOL_TRIM_NUMERATOR)
+            / HSD_MEMPOOL_TRIM_DENOMINATOR;
+        let target_bytes = self
+            .limits
+            .maximum_bytes
+            .saturating_mul(HSD_MEMPOOL_TRIM_NUMERATOR)
+            / HSD_MEMPOOL_TRIM_DENOMINATOR;
+        let mut roots = Vec::new();
+        for entry in self.entries.values() {
+            if self
+                .parents
+                .get(&entry.txid)
+                .is_some_and(|parents| !parents.is_empty())
+            {
+                continue;
+            }
+            let (fee, policy_size) = self.eviction_rate(entry.txid);
+            roots.push((entry.txid, fee, policy_size, entry.admitted_at));
+        }
+        roots.sort_by(|left, right| {
+            let left_rate = u128::from(left.1) * (right.2 as u128);
+            let right_rate = u128::from(right.1) * (left.2 as u128);
+            left_rate
+                .cmp(&right_rate)
+                .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for (txid, _, _, _) in roots {
+            self.remove_transaction_without_generation(txid, true);
+            if self.entries.len() <= target_transactions && self.bytes <= target_bytes {
+                break;
+            }
+        }
+        self.entries.contains_key(&added)
+    }
+
+    fn eviction_rate(&self, txid: Txid) -> (Amount, usize) {
+        let entry = self
+            .entries
+            .get(&txid)
+            .expect("accepted eviction root has a mempool entry");
+        let descendants = self
+            .collect_descendants(txid)
+            .expect("accepted mempool descendants stay within configured bounds");
+        let (descendant_fee, descendant_size) =
+            descendants
+                .iter()
+                .fold((entry.fee, entry.policy_size), |(fee, size), descendant| {
+                    let child = self
+                        .entries
+                        .get(descendant)
+                        .expect("accepted descendant has a mempool entry");
+                    (
+                        fee.saturating_add(child.fee),
+                        size.saturating_add(child.policy_size),
+                    )
+                });
+        let descendant_rate = u128::from(descendant_fee) * (entry.policy_size as u128);
+        let own_rate = u128::from(entry.fee) * (descendant_size as u128);
+        if descendant_rate > own_rate {
+            (descendant_fee, descendant_size.max(1))
+        } else {
+            (entry.fee, entry.policy_size.max(1))
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1863,14 +2001,21 @@ mod tests {
     }
 
     fn submit(pool: &mut MemoryMempool, transaction: Transaction, view: &FixedView) -> Admission {
-        pool.submit_with_context(
-            transaction,
-            &MempoolContext::testing(2, 2),
-            view,
-            &AllowInputs,
-            &AllowContext,
-        )
-        .expect("admission")
+        submit_at(pool, transaction, view, 0)
+    }
+
+    fn submit_at(
+        pool: &mut MemoryMempool,
+        transaction: Transaction,
+        view: &FixedView,
+        current_time: u64,
+    ) -> Admission {
+        let context = MempoolContext {
+            current_time,
+            ..MempoolContext::testing(2, 2)
+        };
+        pool.submit_with_context(transaction, &context, view, &AllowInputs, &AllowContext)
+            .expect("admission")
     }
 
     #[test]
@@ -2486,6 +2631,206 @@ mod tests {
     }
 
     #[test]
+    fn hsd_expiry_evicts_an_old_dependency_root_and_all_descendants() {
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            expiry_time: 10,
+            maximum_transactions: 10,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+        let root_input = outpoint(0xe1, 0);
+        let root = transaction(root_input.clone(), 999);
+        let root_txid = root.txid();
+        assert!(matches!(
+            submit_at(&mut pool, root, &FixedView::with_coin(root_input, 1_000), 1),
+            Admission::Accepted(_)
+        ));
+        let child = transaction(
+            Outpoint {
+                txid: root_txid,
+                index: 0,
+            },
+            998,
+        );
+        let child_txid = child.txid();
+        assert!(matches!(
+            submit_at(&mut pool, child, &FixedView::default(), 2),
+            Admission::Accepted(_)
+        ));
+
+        let trigger_input = outpoint(0xe2, 0);
+        let trigger = transaction(trigger_input.clone(), 999);
+        let trigger_txid = trigger.txid();
+        assert!(matches!(
+            submit_at(
+                &mut pool,
+                trigger,
+                &FixedView::with_coin(trigger_input, 1_000),
+                11,
+            ),
+            Admission::Accepted(_)
+        ));
+        assert!(pool.transaction(&root_txid).is_none());
+        assert!(pool.transaction(&child_txid).is_none());
+        assert!(pool.transaction(&trigger_txid).is_some());
+        assert_eq!(pool.info().transaction_count, 1);
+    }
+
+    #[test]
+    fn hsd_chain_transition_revalidation_preserves_expiry_age() {
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            expiry_time: 10,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+        let input = outpoint(0xe9, 0);
+        let view = FixedView::with_coin(input.clone(), 1_000);
+        assert!(matches!(
+            submit_at(&mut pool, transaction(input, 999), &view, 1),
+            Admission::Accepted(_)
+        ));
+        let context = MempoolContext {
+            current_time: 11,
+            ..MempoolContext::testing(2, 2)
+        };
+        let revalidation = pool
+            .reconcile_chain_transition_with_context(
+                &[],
+                &[],
+                &context,
+                &view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect("expiry revalidation");
+        assert!(revalidation.changed);
+        assert_eq!(revalidation.removed, 1);
+        assert_eq!(revalidation.retained_transactions, 0);
+        assert_eq!(pool.info().transaction_count, 0);
+    }
+
+    #[test]
+    fn hsd_fee_eviction_uses_descendant_package_rate() {
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            maximum_transactions: 3,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+        let root_input = outpoint(0xe3, 0);
+        let root = transaction(root_input.clone(), 999);
+        let root_txid = root.txid();
+        assert!(matches!(
+            submit_at(&mut pool, root, &FixedView::with_coin(root_input, 1_000), 1),
+            Admission::Accepted(_)
+        ));
+        let child = transaction(
+            Outpoint {
+                txid: root_txid,
+                index: 0,
+            },
+            1,
+        );
+        let child_txid = child.txid();
+        assert!(matches!(
+            submit_at(&mut pool, child, &FixedView::default(), 2),
+            Admission::Accepted(_)
+        ));
+
+        let standalone_input = outpoint(0xe4, 0);
+        let standalone = transaction(standalone_input.clone(), 900);
+        let standalone_txid = standalone.txid();
+        assert!(matches!(
+            submit_at(
+                &mut pool,
+                standalone,
+                &FixedView::with_coin(standalone_input, 1_000),
+                3,
+            ),
+            Admission::Accepted(_)
+        ));
+        let candidate_input = outpoint(0xe5, 0);
+        let candidate = transaction(candidate_input.clone(), 998);
+        let candidate_txid = candidate.txid();
+        assert!(matches!(
+            submit_at(
+                &mut pool,
+                candidate,
+                &FixedView::with_coin(candidate_input, 1_000),
+                4,
+            ),
+            Admission::Rejected { reason } if reason == "mempool-full"
+        ));
+        assert!(pool.transaction(&root_txid).is_some());
+        assert!(pool.transaction(&child_txid).is_some());
+        assert!(pool.transaction(&standalone_txid).is_none());
+        assert!(pool.transaction(&candidate_txid).is_none());
+        assert_eq!(pool.info().transaction_count, 2);
+    }
+
+    #[test]
+    fn hsd_fee_eviction_retains_a_high_fee_new_candidate() {
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            maximum_transactions: 2,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+        for (byte, output_value, current_time) in [(0xe6, 999, 1), (0xe7, 998, 2)] {
+            let input = outpoint(byte, 0);
+            assert!(matches!(
+                submit_at(
+                    &mut pool,
+                    transaction(input.clone(), output_value),
+                    &FixedView::with_coin(input, 1_000),
+                    current_time,
+                ),
+                Admission::Accepted(_)
+            ));
+        }
+        let high_fee_input = outpoint(0xe8, 0);
+        let high_fee = transaction(high_fee_input.clone(), 900);
+        let high_fee_txid = high_fee.txid();
+        assert!(matches!(
+            submit_at(
+                &mut pool,
+                high_fee,
+                &FixedView::with_coin(high_fee_input, 1_000),
+                3,
+            ),
+            Admission::Accepted(_)
+        ));
+        assert_eq!(pool.info().transaction_count, 1);
+        assert!(pool.transaction(&high_fee_txid).is_some());
+    }
+
+    #[test]
+    fn hsd_equal_rate_eviction_removes_oldest_roots_first() {
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            maximum_transactions: 2,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+        let mut newest = None;
+        for (byte, current_time) in [(0xea, 1), (0xeb, 2), (0xec, 3)] {
+            let input = outpoint(byte, 0);
+            let candidate = transaction(input.clone(), 999);
+            newest = Some(candidate.txid());
+            assert!(matches!(
+                submit_at(
+                    &mut pool,
+                    candidate,
+                    &FixedView::with_coin(input, 1_000),
+                    current_time,
+                ),
+                Admission::Accepted(_)
+            ));
+        }
+        let newest = newest.expect("newest transaction");
+        assert_eq!(pool.info().transaction_count, 1);
+        assert!(pool.transaction(&newest).is_some());
+        assert_eq!(pool.entries()[0].admitted_at, 3);
+    }
+
+    #[test]
     fn conflicting_and_over_limit_transactions_fail_closed() {
         let input = outpoint(2, 0);
         let view = FixedView::with_coin(input.clone(), 20);
@@ -2496,6 +2841,7 @@ mod tests {
             maximum_orphan_bytes: 1_000_000,
             maximum_ancestors: 2,
             maximum_descendants: 2,
+            expiry_time: HSD_MEMPOOL_EXPIRY_TIME,
         })
         .expect("limits");
         let first = transaction(input.clone(), 10);

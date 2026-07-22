@@ -213,12 +213,14 @@ Implemented:
   reorganizations, with older disconnected name updates taking priority;
 - HSD mainnet standardness, all-network standard script flags, dust and
   absurd-fee policy pinned to the deterministic HSD oracle;
+- HSD 72-hour root-package expiry and descendant-aware fee eviction to its 90%
+  trim target;
 - mining-engine readiness and queue diagnostics.
 
 Remaining:
 
-- HSD free-relay priority/rate limiting, expiry/fee-based eviction, and special
-  claim/airdrop relay including replacement claims;
+- HSD free-relay priority/rate limiting and special claim/airdrop relay,
+  including replacement claims;
 - full-mainnet active-state IBD and live HSD state/root qualification;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
 - native mainnet authority qualification.

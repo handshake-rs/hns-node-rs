@@ -342,6 +342,8 @@ Implemented:
 - HSD mainnet transaction/output standardness, contextual witness-shape limits,
   standard script flags on every network, dust thresholds, and absurd-fee
   protection, pinned to the HSD policy oracle.
+- HSD 72-hour root-package expiry and descendant-aware fee eviction to the
+  90% trim target, with deterministic oldest-first equal-rate ordering.
 - Atomic post-connect revalidation of every retained transaction and orphan
   against the new active context, with one monotonic generation update and
   fail-closed clearing on internal view failure.
@@ -362,8 +364,8 @@ Implemented:
 
 Still release-blocking:
 
-- HSD free-relay priority/rate limiting, expiry/fee-based eviction, and special
-  claim/airdrop relay including replacement claims;
+- HSD free-relay priority/rate limiting and special claim/airdrop relay,
+  including replacement claims;
 - qualified full-mainnet active-state IBD and the incremental production Urkel
   lifecycle;
 - sustained live HSD comparison evidence across restarts, partitions, and real

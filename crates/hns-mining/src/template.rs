@@ -607,7 +607,8 @@ mod tests {
         ContextualTransactionVerifier, MemoryMempool, Mempool, MempoolContext, MempoolView,
         BYTES_PER_SIGOP, HSD_ABSURD_FEE_FACTOR, HSD_MAX_P2WSH_PUSH, HSD_MAX_P2WSH_SIZE,
         HSD_MAX_P2WSH_STACK, HSD_MAX_STANDARD_TX_VERSION, HSD_MAX_STANDARD_TX_WEIGHT,
-        HSD_MINIMUM_RELAY_FEE_RATE, MAX_TX_SIGOPS,
+        HSD_MEMPOOL_EXPIRY_TIME, HSD_MEMPOOL_MAX_SIZE, HSD_MEMPOOL_TRIM_DENOMINATOR,
+        HSD_MEMPOOL_TRIM_NUMERATOR, HSD_MINIMUM_RELAY_FEE_RATE, MAX_TX_SIGOPS,
     };
     use hns_primitives::{Coin, Height, Txid};
     use std::collections::HashMap;
@@ -733,7 +734,7 @@ mod tests {
             "../../../fixtures/hsd/mining/template-v1.json"
         ))
         .expect("hsrd mining fixture");
-        assert_eq!(fixture["schema"], 3);
+        assert_eq!(fixture["schema"], 4);
         let deterministic = &fixture["deterministicCoinbase"];
         let coinbase = create_coinbase(
             u32::try_from(deterministic["height"].as_u64().expect("height"))
@@ -857,6 +858,20 @@ mod tests {
             assert_eq!(case["name"], name);
             assert_eq!(case["accepted"], accepted);
         }
+        let dynamic = &fixture["mempoolDynamicPolicy"];
+        assert_eq!(dynamic["maximumSize"], HSD_MEMPOOL_MAX_SIZE);
+        assert_eq!(dynamic["expiryTime"], HSD_MEMPOOL_EXPIRY_TIME);
+        assert_eq!(
+            dynamic["trimTarget"]["numerator"],
+            HSD_MEMPOOL_TRIM_NUMERATOR
+        );
+        assert_eq!(
+            dynamic["trimTarget"]["denominator"],
+            HSD_MEMPOOL_TRIM_DENOMINATOR
+        );
+        assert_eq!(dynamic["dependencyRootsOnly"], true);
+        assert_eq!(dynamic["descendantPackageRate"], true);
+        assert_eq!(dynamic["equalRateOldestFirst"], true);
     }
 
     #[test]

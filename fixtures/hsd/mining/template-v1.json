@@ -1,5 +1,5 @@
 {
-  "schema": 3,
+  "schema": 4,
   "oracle": {
     "repository": "handshake-org/hsd",
     "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
@@ -223,5 +223,16 @@
         "accepted": false
       }
     ]
+  },
+  "mempoolDynamicPolicy": {
+    "maximumSize": 100000000,
+    "expiryTime": 259200,
+    "trimTarget": {
+      "numerator": 9,
+      "denominator": 10
+    },
+    "dependencyRootsOnly": true,
+    "descendantPackageRate": true,
+    "equalRateOldestFirst": true
   }
 }
