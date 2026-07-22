@@ -202,7 +202,7 @@ fn fixture_flags(names: &[String]) -> Result<ScriptFlags, Box<dyn Error>> {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err("hex value has odd length".into());
     }
     (0..value.len())

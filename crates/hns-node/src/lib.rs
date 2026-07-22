@@ -350,7 +350,9 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     }
 
     config.name_tree_compaction.validate()?;
-    config.shadow_sync.validate(config.authority_mode)?;
+    config
+        .shadow_sync
+        .validate(config.authority_mode, config.network)?;
     config
         .mining_engine
         .validate(&config.shadow_sync, config.authority_mode)
@@ -1787,7 +1789,7 @@ impl NodeState {
                                 hash.to_hex()
                             );
                         }
-                        let expected_resulting_committed = if height % tree_interval == 0 {
+                        let expected_resulting_committed = if height.is_multiple_of(tree_interval) {
                             undo.resulting_tree_root
                         } else {
                             undo.previous_committed_tree_root
@@ -1807,7 +1809,7 @@ impl NodeState {
                         tip_resulting_committed_tree_root = Some(resulting_committed_root);
                         Some(undo)
                     };
-                    if height % tree_interval == 0 {
+                    if height.is_multiple_of(tree_interval) {
                         let pin = name_tree_pins.remove(&height).ok_or_else(|| {
                             anyhow::anyhow!(
                                 "active interval height {height} is missing its name-tree snapshot pin"
@@ -2618,7 +2620,7 @@ impl NodeState {
             if window == 0 {
                 anyhow::bail!("deployment {} has a zero window", deployment.name());
             }
-            let period = if height % window == 0 {
+            let period = if height.is_multiple_of(window) {
                 Some(self.completed_deployment_period(snapshot, &parent, *deployment, window)?)
             } else {
                 None

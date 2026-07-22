@@ -1,6 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
@@ -24,7 +24,7 @@ use hns_consensus::{
 use hns_mempool::Admission;
 use hns_p2p::{
     Inventory, InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket, OutboundPriority,
-    P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot,
+    P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot, SERVICE_NETWORK,
 };
 use hns_primitives::{Block, BlockHash, Header, Height, Txid};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
@@ -55,6 +55,13 @@ const MAX_SERVED_HEADERS: usize = hns_p2p::MAX_HEADERS;
 const MAX_GETDATA_ITEMS: usize = 1_024;
 const LOCAL_ORPHAN_PEER: PeerId = PeerId(0);
 const MAX_RECONNECT_DELAY_SECONDS: u64 = 60;
+const MAX_DISCOVERY_CONNECT_FAILURES: u32 = 3;
+const MAX_KNOWN_PEER_ADDRESSES: usize = 16_384;
+const DEFAULT_KNOWN_PEER_ADDRESSES: usize = 4_096;
+const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ADDR_FUTURE_SECONDS: u64 = 10 * 60;
+const FALLBACK_ADDR_AGE_SECONDS: u64 = 5 * 24 * 60 * 60;
+const MIN_ADDR_TIMESTAMP: u64 = 100_000_000;
 const MAX_SHADOW_SYNC_PEERS: usize = 256;
 const MAX_SHADOW_SYNC_VALIDATION_WORKERS: usize = 128;
 const MAX_SHADOW_SYNC_VALIDATION_QUEUE: usize = 8_192;
@@ -65,6 +72,14 @@ pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 8;
 const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
 const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+const fn hsd_dns_seeds(network: Network) -> &'static [&'static str] {
+    match network {
+        Network::Mainnet => &["hs-mainnet.bcoin.ninja", "seed.htools.work"],
+        Network::Testnet => &["hs-testnet.bcoin.ninja"],
+        Network::Regtest | Network::Simnet => &[],
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShadowSyncConfig {
     pub enabled: bool,
@@ -74,6 +89,10 @@ pub struct ShadowSyncConfig {
     pub active_state_connect_batch: usize,
     pub listen: Option<SocketAddr>,
     pub connect: Vec<SocketAddr>,
+    /// Resolve HSD's network DNS seeds and learn bounded plaintext peers from
+    /// GETADDR/ADDR. Explicit `connect` peers remain pinned reconnect targets.
+    pub discovery: bool,
+    pub maximum_known_addresses: usize,
     pub maximum_inbound: usize,
     pub maximum_outbound: usize,
     pub validation_workers: usize,
@@ -92,6 +111,8 @@ impl Default for ShadowSyncConfig {
             active_state_connect_batch: 288,
             listen: None,
             connect: Vec::new(),
+            discovery: false,
+            maximum_known_addresses: DEFAULT_KNOWN_PEER_ADDRESSES,
             maximum_inbound: 32,
             maximum_outbound: 8,
             validation_workers: 4,
@@ -104,7 +125,7 @@ impl Default for ShadowSyncConfig {
 }
 
 impl ShadowSyncConfig {
-    pub fn validate(&self, authority_mode: AuthorityMode) -> Result<()> {
+    pub fn validate(&self, authority_mode: AuthorityMode, network: Network) -> Result<()> {
         if self.connect_active_state && !self.enabled {
             anyhow::bail!("active-state synchronization requires shadow sync to be enabled");
         }
@@ -133,15 +154,16 @@ impl ShadowSyncConfig {
                 self.active_state_connect_batch
             );
         }
-        if self.listen.is_none() && self.connect.is_empty() {
+        let has_discovery_endpoint = self.discovery && !hsd_dns_seeds(network).is_empty();
+        if self.listen.is_none() && self.connect.is_empty() && !has_discovery_endpoint {
             anyhow::bail!(
-                "Shadow sync requires an inbound listener, at least one explicit outbound peer, or both"
+                "Shadow sync requires an inbound listener, an explicit outbound peer, or DNS discovery on a seeded network"
             );
         }
         if self.listen.is_some() && self.maximum_inbound == 0 {
             anyhow::bail!("Shadow sync listener requires a non-zero maximum-inbound value");
         }
-        if !self.connect.is_empty() && self.maximum_outbound == 0 {
+        if (!self.connect.is_empty() || self.discovery) && self.maximum_outbound == 0 {
             anyhow::bail!("Shadow sync outbound peers require a non-zero maximum-outbound value");
         }
         if self.connect.len() > self.maximum_outbound {
@@ -149,6 +171,21 @@ impl ShadowSyncConfig {
                 "{} configured outbound peers exceed the maximum-outbound value {}",
                 self.connect.len(),
                 self.maximum_outbound
+            );
+        }
+        if self.maximum_known_addresses == 0
+            || self.maximum_known_addresses > MAX_KNOWN_PEER_ADDRESSES
+        {
+            anyhow::bail!(
+                "Shadow sync known-address limit {} must be within 1..={MAX_KNOWN_PEER_ADDRESSES}",
+                self.maximum_known_addresses
+            );
+        }
+        if self.connect.len() > self.maximum_known_addresses {
+            anyhow::bail!(
+                "{} configured outbound peers exceed the known-address limit {}",
+                self.connect.len(),
+                self.maximum_known_addresses
             );
         }
         if self.validation_workers == 0 || self.validation_queue == 0 {
@@ -225,6 +262,15 @@ pub struct ShadowSyncDiagnostics {
     pub runtime_instance: String,
     pub listen: Option<SocketAddr>,
     pub configured_outbound: Vec<SocketAddr>,
+    pub discovery_enabled: bool,
+    pub known_addresses: usize,
+    pub dns_seed_addresses: u64,
+    pub dns_seed_failures: u64,
+    pub discovery_connection_failures: u64,
+    pub received_addresses: u64,
+    pub accepted_addresses: u64,
+    pub rejected_addresses: u64,
+    pub served_addresses: u64,
     pub outbound_connected: usize,
     pub outbound_connecting: usize,
     pub outbound_reconnect_attempts: u64,
@@ -337,8 +383,277 @@ impl StatelessBlockValidator for HnsBodyValidator {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AddressAdmission {
+    Added,
+    Updated,
+    Rejected,
+}
+
+impl AddressAdmission {
+    const fn accepted(self) -> bool {
+        matches!(self, Self::Added | Self::Updated)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct KnownPeerAddress {
+    wire: hns_p2p::NetAddress,
+    configured: bool,
+    failures: u32,
+    eligible_at: Instant,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+struct BoundedAddressBook {
+    network: Network,
+    listen: Option<SocketAddr>,
+    maximum: usize,
+    sequence: u64,
+    entries: BTreeMap<SocketAddr, KnownPeerAddress>,
+}
+
+impl BoundedAddressBook {
+    fn new(network: Network, listen: Option<SocketAddr>, maximum: usize) -> Result<Self> {
+        if maximum == 0 || maximum > MAX_KNOWN_PEER_ADDRESSES {
+            anyhow::bail!(
+                "known-address limit {maximum} must be within 1..={MAX_KNOWN_PEER_ADDRESSES}"
+            );
+        }
+        Ok(Self {
+            network,
+            listen,
+            maximum,
+            sequence: 0,
+            entries: BTreeMap::new(),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn insert_configured(
+        &mut self,
+        address: SocketAddr,
+        now: Instant,
+        timestamp: u64,
+    ) -> Result<()> {
+        if self.entries.len() >= self.maximum && !self.entries.contains_key(&address) {
+            anyhow::bail!("configured outbound peers exceed the bounded address book");
+        }
+        self.sequence = self.sequence.saturating_add(1);
+        self.entries.insert(
+            address,
+            KnownPeerAddress {
+                wire: hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK),
+                configured: true,
+                failures: 0,
+                eligible_at: now,
+                sequence: self.sequence,
+            },
+        );
+        Ok(())
+    }
+
+    fn insert_discovered(
+        &mut self,
+        mut wire: hns_p2p::NetAddress,
+        now: Instant,
+        timestamp: u64,
+    ) -> AddressAdmission {
+        let Some(address) = wire.socket_addr() else {
+            return AddressAdmission::Rejected;
+        };
+        if wire.key != [0; 33]
+            || wire.services & SERVICE_NETWORK == 0
+            || !is_discoverable_address(self.network, self.listen, address)
+        {
+            return AddressAdmission::Rejected;
+        }
+        wire.time = normalize_peer_timestamp(wire.time, timestamp);
+
+        if let Some(existing) = self.entries.get_mut(&address) {
+            existing.wire.services |= wire.services;
+            if wire.time > existing.wire.time {
+                existing.wire.time = wire.time;
+            }
+            return AddressAdmission::Updated;
+        }
+
+        if self.entries.len() >= self.maximum {
+            let eviction = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.configured)
+                .min_by_key(|(address, entry)| (entry.wire.time, entry.sequence, **address))
+                .map(|(address, _)| *address);
+            let Some(eviction) = eviction else {
+                return AddressAdmission::Rejected;
+            };
+            self.entries.remove(&eviction);
+        }
+
+        self.sequence = self.sequence.saturating_add(1);
+        self.entries.insert(
+            address,
+            KnownPeerAddress {
+                wire,
+                configured: false,
+                failures: 0,
+                eligible_at: now,
+                sequence: self.sequence,
+            },
+        );
+        AddressAdmission::Added
+    }
+
+    fn connection_candidates(
+        &self,
+        tracked: &HashMap<SocketAddr, ReconnectState>,
+        now: Instant,
+        maximum: usize,
+    ) -> Vec<SocketAddr> {
+        let mut candidates = self
+            .entries
+            .iter()
+            .filter(|(address, entry)| {
+                !entry.configured && entry.eligible_at <= now && !tracked.contains_key(address)
+            })
+            .map(|(address, entry)| {
+                (
+                    entry.failures,
+                    std::cmp::Reverse(entry.wire.time),
+                    entry.sequence,
+                    *address,
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates
+            .into_iter()
+            .take(maximum)
+            .map(|(_, _, _, address)| address)
+            .collect()
+    }
+
+    fn note_failure(&mut self, address: SocketAddr, now: Instant) {
+        let Some(entry) = self.entries.get_mut(&address) else {
+            return;
+        };
+        entry.failures = entry.failures.saturating_add(1);
+        entry.eligible_at = now + reconnect_delay(entry.failures);
+    }
+
+    fn note_success(&mut self, address: SocketAddr, now: Instant, timestamp: u64) {
+        let Some(entry) = self.entries.get_mut(&address) else {
+            return;
+        };
+        entry.failures = 0;
+        entry.eligible_at = now;
+        entry.wire.time = timestamp;
+    }
+
+    fn advertised(&self, maximum: usize) -> Vec<hns_p2p::NetAddress> {
+        let mut entries = self
+            .entries
+            .values()
+            .filter(|entry| {
+                is_discoverable_address(
+                    self.network,
+                    self.listen,
+                    entry
+                        .wire
+                        .socket_addr()
+                        .expect("address-book key is an IP socket"),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| {
+            (
+                std::cmp::Reverse(entry.wire.time),
+                entry.sequence,
+                entry.wire.socket_addr(),
+            )
+        });
+        entries
+            .into_iter()
+            .take(maximum)
+            .map(|entry| entry.wire.clone())
+            .collect()
+    }
+}
+
+fn normalize_peer_timestamp(timestamp: u64, now: u64) -> u64 {
+    if timestamp <= MIN_ADDR_TIMESTAMP || timestamp > now.saturating_add(MAX_ADDR_FUTURE_SECONDS) {
+        now.saturating_sub(FALLBACK_ADDR_AGE_SECONDS)
+    } else {
+        timestamp
+    }
+}
+
+fn is_discoverable_address(
+    network: Network,
+    listen: Option<SocketAddr>,
+    address: SocketAddr,
+) -> bool {
+    if address.port() == 0 || listen == Some(address) {
+        return false;
+    }
+    match address.ip() {
+        IpAddr::V4(ip) => is_discoverable_ipv4(network, ip),
+        IpAddr::V6(ip) => is_discoverable_ipv6(network, ip),
+    }
+}
+
+fn is_discoverable_ipv4(network: Network, ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    if a == 0 || a >= 224 || ip.is_broadcast() {
+        return false;
+    }
+    if matches!(network, Network::Regtest | Network::Simnet) {
+        return true;
+    }
+    !(a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113))
+}
+
+fn is_discoverable_ipv6(network: Network, ip: Ipv6Addr) -> bool {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    if matches!(network, Network::Regtest | Network::Simnet) {
+        return true;
+    }
+    let segments = ip.segments();
+    let unique_local = segments[0] & 0xfe00 == 0xfc00;
+    let link_or_site_local = segments[0] & 0xffc0 == 0xfe80 || segments[0] & 0xffc0 == 0xfec0;
+    let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    !(unique_local || link_or_site_local || documentation)
+}
+
+const fn supports_addr_protocol(version: u32) -> bool {
+    version >= 3
+}
+
+fn admit_getaddr(peer: PeerId, inbound: bool, served: &mut HashSet<PeerId>) -> bool {
+    inbound && served.insert(peer)
+}
+
 #[derive(Clone, Debug)]
 struct ReconnectState {
+    persistent: bool,
     connected: bool,
     connecting: bool,
     failures: u32,
@@ -346,8 +661,9 @@ struct ReconnectState {
 }
 
 impl ReconnectState {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, persistent: bool) -> Self {
         Self {
+            persistent,
             connected: false,
             connecting: false,
             failures: 0,
@@ -355,7 +671,13 @@ impl ReconnectState {
         }
     }
 
-    fn connected(&mut self, now: Instant) {
+    fn transport_connected(&mut self, now: Instant) {
+        self.connected = true;
+        self.connecting = false;
+        self.next_attempt = now + Duration::from_secs(MAX_RECONNECT_DELAY_SECONDS);
+    }
+
+    fn ready(&mut self, now: Instant) {
         self.connected = true;
         self.connecting = false;
         self.failures = 0;
@@ -376,11 +698,41 @@ struct ConnectAttemptResult {
     result: std::result::Result<PeerId, String>,
 }
 
+#[derive(Debug, Default)]
+struct DnsSeedResolution {
+    addresses: Vec<SocketAddr>,
+    errors: Vec<String>,
+}
+
+async fn resolve_hsd_dns_seeds(network: Network) -> DnsSeedResolution {
+    let mut resolved = BTreeSet::new();
+    let mut errors = Vec::new();
+    for seed in hsd_dns_seeds(network) {
+        let lookup = tokio::time::timeout(
+            DNS_SEED_TIMEOUT,
+            tokio::net::lookup_host((*seed, network.params().port)),
+        )
+        .await;
+        match lookup {
+            Ok(Ok(addresses)) => resolved.extend(addresses),
+            Ok(Err(error)) => errors.push(format!("DNS seed {seed} failed: {error}")),
+            Err(_) => errors.push(format!(
+                "DNS seed {seed} exceeded the {} second timeout",
+                DNS_SEED_TIMEOUT.as_secs()
+            )),
+        }
+    }
+    DnsSeedResolution {
+        addresses: resolved.into_iter().collect(),
+        errors,
+    }
+}
+
 impl NodeService {
     pub async fn run_shadow_sync_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
         self.config
             .shadow_sync
-            .validate(self.config.authority_mode)?;
+            .validate(self.config.authority_mode, self.config.network)?;
         if !self.config.shadow_sync.enabled {
             return self.run_rpc_until_shutdown(shutdown).await;
         }
@@ -402,7 +754,6 @@ impl NodeService {
             .load()
             .map_err(|error| anyhow::anyhow!("failed to load sync checkpoint: {error}"))?;
         let scheduler_now = StdInstant::now();
-        let reconnect_now = Instant::now();
         let maximum_peers = shadow_sync_config
             .maximum_inbound
             .checked_add(shadow_sync_config.maximum_outbound)
@@ -457,6 +808,58 @@ impl NodeService {
         )
         .map_err(|error| anyhow::anyhow!("failed to initialize validation pipeline: {error}"))?;
 
+        let address_now = Instant::now();
+        let address_timestamp = unix_time();
+        let mut address_book = BoundedAddressBook::new(
+            network,
+            shadow_sync_config.listen,
+            shadow_sync_config.maximum_known_addresses,
+        )?;
+        for address in &shadow_sync_config.connect {
+            address_book.insert_configured(*address, address_now, address_timestamp)?;
+        }
+        let mut dns_seed_addresses = 0u64;
+        let mut dns_seed_failures = 0u64;
+        if shadow_sync_config.discovery {
+            let resolution = resolve_hsd_dns_seeds(network).await;
+            dns_seed_failures = resolution.errors.len() as u64;
+            for error in resolution.errors {
+                tracing::warn!(%error, "HNS DNS seed resolution failed");
+            }
+            for address in resolution.addresses {
+                let wire = hns_p2p::NetAddress::from_socket_addr(
+                    address,
+                    address_timestamp,
+                    SERVICE_NETWORK,
+                );
+                if address_book
+                    .insert_discovered(wire, address_now, address_timestamp)
+                    .accepted()
+                {
+                    dns_seed_addresses = dns_seed_addresses.saturating_add(1);
+                }
+            }
+            if shadow_sync_config.connect.is_empty()
+                && shadow_sync_config.listen.is_none()
+                && address_book.len() == 0
+            {
+                anyhow::bail!("HNS DNS discovery resolved no admissible peer addresses");
+            }
+        }
+
+        let mut reconnects = shadow_sync_config
+            .connect
+            .iter()
+            .copied()
+            .map(|address| (address, ReconnectState::new(address_now, true)))
+            .collect::<HashMap<_, _>>();
+        fill_discovery_slots(
+            &address_book,
+            &mut reconnects,
+            shadow_sync_config.maximum_outbound,
+            address_now,
+        );
+
         let initial_sequence = durable_checkpoint
             .as_ref()
             .map_or(0, |checkpoint| checkpoint.sequence);
@@ -468,6 +871,10 @@ impl NodeService {
             runtime_instance: runtime_instance_id(),
             listen: shadow_sync_config.listen,
             configured_outbound: shadow_sync_config.connect.clone(),
+            discovery_enabled: shadow_sync_config.discovery,
+            known_addresses: address_book.len(),
+            dns_seed_addresses,
+            dns_seed_failures,
             started_at: unix_time(),
             sync: scheduler.snapshot(),
             orphans: orphan_pool.snapshot(),
@@ -516,19 +923,15 @@ impl NodeService {
             None
         };
 
-        let mut reconnects = shadow_sync_config
-            .connect
-            .iter()
-            .copied()
-            .map(|address| (address, ReconnectState::new(reconnect_now)))
-            .collect::<HashMap<_, _>>();
         let (connect_results_tx, mut connect_results_rx) =
-            mpsc::channel::<ConnectAttemptResult>(shadow_sync_config.connect.len().max(1));
+            mpsc::channel::<ConnectAttemptResult>(shadow_sync_config.maximum_outbound.max(1));
 
         tracing::info!(
             rpc = %rpc_bind,
             p2p = ?shadow_sync_config.listen,
-            outbound = shadow_sync_config.connect.len(),
+            outbound = reconnects.len(),
+            discovery = shadow_sync_config.discovery,
+            known_addresses = address_book.len(),
             "hsrd shadow-sync runtime started"
         );
 
@@ -536,6 +939,7 @@ impl NodeService {
         let mut poll = tokio::time::interval(shadow_sync_config.poll_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         poll.tick().await;
+        let mut served_getaddr = HashSet::new();
         let mut shutdown_wait = Box::pin(shutdown.wait());
         let mut terminal_error: Option<anyhow::Error> = None;
 
@@ -554,6 +958,34 @@ impl NodeService {
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
+                    }
+
+                    // Start due sockets before potentially expensive local
+                    // active-state and canonical-body scans. Historical replay
+                    // must not starve peer bootstrap or reconnect scheduling.
+                    let connection_now = Instant::now();
+                    if shadow_sync_config.discovery {
+                        fill_discovery_slots(
+                            &address_book,
+                            &mut reconnects,
+                            shadow_sync_config.maximum_outbound,
+                            connection_now,
+                        );
+                    }
+                    let attempts = spawn_due_connections(
+                        &mut reconnects,
+                        &peers,
+                        &connect_results_tx,
+                        connection_now,
+                        shadow_sync_config.maximum_outbound,
+                    );
+                    if attempts > 0 {
+                        update_diagnostics(&diagnostics, |state| {
+                            state.outbound_reconnect_attempts = state
+                                .outbound_reconnect_attempts
+                                .saturating_add(attempts as u64);
+                        })
+                        .await;
                     }
 
                     if shadow_sync_config.connect_active_state {
@@ -586,21 +1018,6 @@ impl NodeService {
                         terminal_error = Some(error);
                         break;
                     }
-                    let attempts = spawn_due_connections(
-                        &mut reconnects,
-                        &peers,
-                        &connect_results_tx,
-                        Instant::now(),
-                    );
-                    if attempts > 0 {
-                        update_diagnostics(&diagnostics, |state| {
-                            state.outbound_reconnect_attempts = state
-                                .outbound_reconnect_attempts
-                                .saturating_add(attempts as u64);
-                        })
-                        .await;
-                    }
-
                     let locator_result = {
                         let node = node.lock().await;
                         node.shadow_sync_block_locator(MAX_LOCATOR_ENTRIES)
@@ -644,6 +1061,7 @@ impl NodeService {
                         &scheduler,
                         &orphan_pool,
                         &reconnects,
+                        &address_book,
                         checkpoint_sequence,
                     )
                     .await;
@@ -655,7 +1073,21 @@ impl NodeService {
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
                     };
-                    handle_connect_attempt_result(result, &mut reconnects, &diagnostics).await;
+                    handle_connect_attempt_result(
+                        result,
+                        &mut reconnects,
+                        &mut address_book,
+                        &diagnostics,
+                    )
+                    .await;
+                    if shadow_sync_config.discovery {
+                        fill_discovery_slots(
+                            &address_book,
+                            &mut reconnects,
+                            shadow_sync_config.maximum_outbound,
+                            Instant::now(),
+                        );
+                    }
                 }
                 event = peer_events.recv() => {
                     let Some(event) = event else {
@@ -676,6 +1108,9 @@ impl NodeService {
                             &validation,
                             &mut scheduler,
                             &mut reconnects,
+                            &mut address_book,
+                            &mut served_getaddr,
+                            shadow_sync_config.discovery,
                             shadow_sync_config.headers_only,
                             &diagnostics,
                         ) => Some(result),
@@ -686,12 +1121,21 @@ impl NodeService {
                     if let Err(error) = handled {
                         record_error(&diagnostics, error.to_string()).await;
                     }
+                    if shadow_sync_config.discovery {
+                        fill_discovery_slots(
+                            &address_book,
+                            &mut reconnects,
+                            shadow_sync_config.maximum_outbound,
+                            Instant::now(),
+                        );
+                    }
                     refresh_diagnostics(
                         &diagnostics,
                         &peers,
                         &scheduler,
                         &orphan_pool,
                         &reconnects,
+                        &address_book,
                         checkpoint_sequence,
                     )
                     .await;
@@ -722,6 +1166,7 @@ impl NodeService {
                         &scheduler,
                         &orphan_pool,
                         &reconnects,
+                        &address_book,
                         checkpoint_sequence,
                     )
                     .await;
@@ -1629,6 +2074,9 @@ async fn handle_peer_event(
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    addresses: &mut BoundedAddressBook,
+    served_getaddr: &mut HashSet<PeerId>,
+    discovery: bool,
     headers_only: bool,
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
 ) -> Result<()> {
@@ -1638,7 +2086,7 @@ async fn handle_peer_event(
         } => {
             if direction == PeerDirection::Outbound {
                 if let Some(state) = reconnects.get_mut(&address) {
-                    state.connected(Instant::now());
+                    state.transport_connected(Instant::now());
                 }
             }
         }
@@ -1646,6 +2094,32 @@ async fn handle_peer_event(
             scheduler
                 .register_peer(peer, version.services, version.height)
                 .map_err(|error| anyhow::anyhow!("failed to register sync peer: {error}"))?;
+            let snapshot = peers
+                .snapshots()
+                .await
+                .into_iter()
+                .find(|snapshot| snapshot.id == peer);
+            if let Some(snapshot) = snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.direction == PeerDirection::Outbound)
+            {
+                let now = Instant::now();
+                if let Some(state) = reconnects.get_mut(&snapshot.address) {
+                    state.ready(now);
+                    addresses.note_success(snapshot.address, now, unix_time());
+                }
+            }
+            if discovery
+                && supports_addr_protocol(version.version)
+                && snapshot.is_some_and(|snapshot| snapshot.direction == PeerDirection::Outbound)
+            {
+                peers
+                    .try_send(peer, Arc::new(Packet::GetAddr), OutboundPriority::Control)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to request peer addresses: {error}")
+                    })?;
+            }
         }
         PeerEvent::Disconnected {
             peer,
@@ -1654,10 +2128,9 @@ async fn handle_peer_event(
             reason,
         } => {
             scheduler.remove_peer(peer);
+            served_getaddr.remove(&peer);
             if direction == PeerDirection::Outbound {
-                if let Some(state) = reconnects.get_mut(&address) {
-                    state.failed(Instant::now());
-                }
+                note_reconnect_failure(address, reconnects, addresses, Instant::now());
             }
             tracing::debug!(?peer, %address, %reason, "HNS peer disconnected");
         }
@@ -1886,14 +2359,29 @@ async fn handle_peer_event(
                 }
             }
             Packet::GetAddr => {
+                let inbound = peers.snapshots().await.iter().any(|snapshot| {
+                    snapshot.id == peer && snapshot.direction == PeerDirection::Inbound
+                });
+                if !admit_getaddr(peer, inbound, served_getaddr) {
+                    return Ok(());
+                }
+                let advertised = addresses.advertised(hns_p2p::MAX_ADDR_ITEMS);
+                if advertised.is_empty() {
+                    return Ok(());
+                }
+                let count = advertised.len();
                 peers
                     .try_send(
                         peer,
-                        Arc::new(Packet::Addr(Vec::new())),
+                        Arc::new(Packet::Addr(advertised)),
                         OutboundPriority::Control,
                     )
                     .await
                     .map_err(|error| anyhow::anyhow!("failed to answer getaddr: {error}"))?;
+                update_diagnostics(diagnostics, |state| {
+                    state.served_addresses = state.served_addresses.saturating_add(count as u64);
+                })
+                .await;
             }
             Packet::Mempool => {
                 let inventory = {
@@ -1976,8 +2464,36 @@ async fn handle_peer_event(
                     }
                 }
             }
-            Packet::Addr(_)
-            | Packet::SendHeaders
+            Packet::Addr(items) => {
+                let version_supports_addr = peers.snapshots().await.iter().any(|snapshot| {
+                    snapshot.id == peer
+                        && snapshot
+                            .protocol_version
+                            .is_some_and(supports_addr_protocol)
+                });
+                if discovery && version_supports_addr {
+                    let received = items.len() as u64;
+                    let now = Instant::now();
+                    let timestamp = unix_time();
+                    let mut accepted = 0u64;
+                    for item in items {
+                        if addresses.insert_discovered(item, now, timestamp).accepted() {
+                            accepted = accepted.saturating_add(1);
+                        }
+                    }
+                    update_diagnostics(diagnostics, |state| {
+                        state.received_addresses =
+                            state.received_addresses.saturating_add(received);
+                        state.accepted_addresses =
+                            state.accepted_addresses.saturating_add(accepted);
+                        state.rejected_addresses = state
+                            .rejected_addresses
+                            .saturating_add(received.saturating_sub(accepted));
+                    })
+                    .await;
+                }
+            }
+            Packet::SendHeaders
             | Packet::FeeFilter(_)
             | Packet::SendCmpct { .. }
             | Packet::Unknown { .. }
@@ -2654,7 +3170,13 @@ fn spawn_due_connections(
     peers: &LivePeerManager,
     results: &mpsc::Sender<ConnectAttemptResult>,
     now: Instant,
+    maximum_outbound: usize,
 ) -> usize {
+    let occupied = reconnects
+        .values()
+        .filter(|state| state.connected || state.connecting)
+        .count();
+    let available = maximum_outbound.saturating_sub(occupied);
     let due = reconnects
         .iter_mut()
         .filter_map(|(address, state)| {
@@ -2664,6 +3186,7 @@ fn spawn_due_connections(
             state.connecting = true;
             Some(*address)
         })
+        .take(available)
         .collect::<Vec<_>>();
 
     for address in &due {
@@ -2681,26 +3204,69 @@ fn spawn_due_connections(
     due.len()
 }
 
+fn fill_discovery_slots(
+    addresses: &BoundedAddressBook,
+    reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    maximum_outbound: usize,
+    now: Instant,
+) -> usize {
+    let available = maximum_outbound.saturating_sub(reconnects.len());
+    let candidates = addresses.connection_candidates(reconnects, now, available);
+    let added = candidates.len();
+    for address in candidates {
+        reconnects.insert(address, ReconnectState::new(now, false));
+    }
+    added
+}
+
+fn note_reconnect_failure(
+    address: SocketAddr,
+    reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    addresses: &mut BoundedAddressBook,
+    now: Instant,
+) {
+    let retire = reconnects.get_mut(&address).is_some_and(|state| {
+        state.failed(now);
+        !state.persistent && state.failures >= MAX_DISCOVERY_CONNECT_FAILURES
+    });
+    if retire {
+        reconnects.remove(&address);
+        addresses.note_failure(address, now);
+    }
+}
+
 async fn handle_connect_attempt_result(
     result: ConnectAttemptResult,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    addresses: &mut BoundedAddressBook,
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
 ) {
-    let Some(state) = reconnects.get_mut(&result.address) else {
+    let Some(persistent) = reconnects
+        .get(&result.address)
+        .map(|state| state.persistent)
+    else {
         return;
     };
     match result.result {
         Ok(peer) => {
-            state.connected(Instant::now());
             tracing::debug!(?peer, address = %result.address, "outbound HNS peer connected");
         }
         Err(error) => {
-            state.failed(Instant::now());
-            record_error(
-                diagnostics,
-                format!("outbound peer {} failed: {error}", result.address),
-            )
-            .await;
+            note_reconnect_failure(result.address, reconnects, addresses, Instant::now());
+            if persistent {
+                record_error(
+                    diagnostics,
+                    format!("outbound peer {} failed: {error}", result.address),
+                )
+                .await;
+            } else {
+                update_diagnostics(diagnostics, |state| {
+                    state.discovery_connection_failures =
+                        state.discovery_connection_failures.saturating_add(1);
+                })
+                .await;
+                tracing::debug!(address = %result.address, %error, "discovered HNS peer failed");
+            }
         }
     }
 }
@@ -2711,6 +3277,7 @@ async fn refresh_diagnostics(
     scheduler: &SyncScheduler,
     orphans: &BoundedOrphanPool,
     reconnects: &HashMap<SocketAddr, ReconnectState>,
+    addresses: &BoundedAddressBook,
     checkpoint_sequence: u64,
 ) {
     let snapshots = peers.snapshots().await;
@@ -2719,6 +3286,7 @@ async fn refresh_diagnostics(
     state.sync = scheduler.snapshot();
     state.orphans = orphans.snapshot();
     state.checkpoint_sequence = checkpoint_sequence;
+    state.known_addresses = addresses.len();
     state.outbound_connected = reconnects.values().filter(|item| item.connected).count();
     state.outbound_connecting = reconnects.values().filter(|item| item.connecting).count();
 }
@@ -2835,13 +3403,17 @@ mod tests {
             connect: vec![peer],
             ..ShadowSyncConfig::default()
         };
-        assert!(config.validate(AuthorityMode::NativeExperimental).is_err());
+        assert!(config
+            .validate(AuthorityMode::NativeExperimental, Network::Regtest)
+            .is_err());
 
         let duplicate = ShadowSyncConfig {
             connect: vec![peer, peer],
             ..config
         };
-        assert!(duplicate.validate(AuthorityMode::Shadow).is_err());
+        assert!(duplicate
+            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .is_err());
     }
 
     #[test]
@@ -2850,14 +3422,16 @@ mod tests {
             enabled: true,
             ..ShadowSyncConfig::default()
         };
-        assert!(config.validate(AuthorityMode::Shadow).is_err());
+        assert!(config
+            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .is_err());
 
         let active_without_network = ShadowSyncConfig {
             connect_active_state: true,
             ..ShadowSyncConfig::default()
         };
         assert!(active_without_network
-            .validate(AuthorityMode::Shadow)
+            .validate(AuthorityMode::Shadow, Network::Regtest)
             .is_err());
 
         let headers_without_network = ShadowSyncConfig {
@@ -2865,7 +3439,7 @@ mod tests {
             ..ShadowSyncConfig::default()
         };
         assert!(headers_without_network
-            .validate(AuthorityMode::Shadow)
+            .validate(AuthorityMode::Shadow, Network::Regtest)
             .is_err());
 
         let headers_only_active_state = ShadowSyncConfig {
@@ -2876,7 +3450,7 @@ mod tests {
             ..ShadowSyncConfig::default()
         };
         assert!(headers_only_active_state
-            .validate(AuthorityMode::Shadow)
+            .validate(AuthorityMode::Shadow, Network::Regtest)
             .is_err());
     }
 
@@ -2885,6 +3459,149 @@ mod tests {
         assert_eq!(reconnect_delay(1), Duration::from_secs(1));
         assert_eq!(reconnect_delay(2), Duration::from_secs(2));
         assert_eq!(reconnect_delay(20), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn dns_discovery_uses_pinned_hsd_network_seeds() {
+        assert_eq!(
+            hsd_dns_seeds(Network::Mainnet),
+            &["hs-mainnet.bcoin.ninja", "seed.htools.work"]
+        );
+        assert_eq!(hsd_dns_seeds(Network::Testnet), &["hs-testnet.bcoin.ninja"]);
+        assert!(hsd_dns_seeds(Network::Regtest).is_empty());
+
+        let discovery = ShadowSyncConfig {
+            enabled: true,
+            discovery: true,
+            ..ShadowSyncConfig::default()
+        };
+        discovery
+            .validate(AuthorityMode::Shadow, Network::Mainnet)
+            .expect("mainnet has HSD DNS seeds");
+        assert!(discovery
+            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .is_err());
+    }
+
+    #[test]
+    fn addr_exchange_requires_v3_and_serves_one_inbound_request() {
+        assert!(!supports_addr_protocol(2));
+        assert!(supports_addr_protocol(3));
+
+        let peer = PeerId(7);
+        let mut served = HashSet::new();
+        assert!(!admit_getaddr(peer, false, &mut served));
+        assert!(served.is_empty());
+        assert!(admit_getaddr(peer, true, &mut served));
+        assert!(!admit_getaddr(peer, true, &mut served));
+        served.remove(&peer);
+        assert!(admit_getaddr(peer, true, &mut served));
+    }
+
+    #[test]
+    fn bounded_address_book_applies_hsd_admission_and_eviction_rules() {
+        let now = Instant::now();
+        let timestamp = 1_800_000_000;
+        let mut addresses = BoundedAddressBook::new(Network::Mainnet, None, 2).expect("book");
+        let first: SocketAddr = "8.8.8.8:12038".parse().expect("first");
+        let second: SocketAddr = "1.1.1.1:12038".parse().expect("second");
+        let third: SocketAddr = "9.9.9.9:12038".parse().expect("third");
+
+        let mut first_wire = hns_p2p::NetAddress::from_socket_addr(
+            first,
+            timestamp + MAX_ADDR_FUTURE_SECONDS + 1,
+            SERVICE_NETWORK,
+        );
+        assert_eq!(
+            addresses.insert_discovered(first_wire.clone(), now, timestamp),
+            AddressAdmission::Added
+        );
+        assert_eq!(
+            addresses.entries[&first].wire.time,
+            timestamp - FALLBACK_ADDR_AGE_SECONDS
+        );
+
+        first_wire.services = 0;
+        assert_eq!(
+            addresses.insert_discovered(first_wire, now, timestamp),
+            AddressAdmission::Rejected
+        );
+        let private = hns_p2p::NetAddress::from_socket_addr(
+            "192.168.1.1:12038".parse().expect("private"),
+            timestamp,
+            SERVICE_NETWORK,
+        );
+        assert_eq!(
+            addresses.insert_discovered(private, now, timestamp),
+            AddressAdmission::Rejected
+        );
+        let mut keyed = hns_p2p::NetAddress::from_socket_addr(second, timestamp, SERVICE_NETWORK);
+        keyed.key[0] = 1;
+        assert_eq!(
+            addresses.insert_discovered(keyed, now, timestamp),
+            AddressAdmission::Rejected
+        );
+
+        assert!(addresses
+            .insert_discovered(
+                hns_p2p::NetAddress::from_socket_addr(second, timestamp - 2, SERVICE_NETWORK,),
+                now,
+                timestamp,
+            )
+            .accepted());
+        assert!(addresses
+            .insert_discovered(
+                hns_p2p::NetAddress::from_socket_addr(third, timestamp - 1, SERVICE_NETWORK,),
+                now,
+                timestamp,
+            )
+            .accepted());
+        assert_eq!(addresses.len(), 2);
+        assert!(!addresses.entries.contains_key(&first));
+        assert!(addresses.entries.contains_key(&second));
+        assert!(addresses.entries.contains_key(&third));
+        assert_eq!(addresses.advertised(1).len(), 1);
+    }
+
+    #[test]
+    fn failed_discovery_targets_rotate_without_displacing_configured_peers() {
+        let now = Instant::now();
+        let timestamp = 1_800_000_000;
+        let configured: SocketAddr = "127.0.0.1:14038".parse().expect("configured");
+        let mut addresses = BoundedAddressBook::new(Network::Regtest, None, 4).expect("book");
+        addresses
+            .insert_configured(configured, now, timestamp)
+            .expect("configured address");
+        for value in [1, 2, 3] {
+            let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, value)), 14038);
+            assert!(addresses
+                .insert_discovered(
+                    hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK,),
+                    now,
+                    timestamp,
+                )
+                .accepted());
+        }
+        let mut reconnects = HashMap::from([(configured, ReconnectState::new(now, true))]);
+        assert_eq!(fill_discovery_slots(&addresses, &mut reconnects, 2, now), 1);
+        let discovered = reconnects
+            .iter()
+            .find_map(|(address, state)| (!state.persistent).then_some(*address))
+            .expect("discovered target");
+        let state = reconnects.get_mut(&discovered).expect("discovered state");
+        state.failed(now);
+        state.transport_connected(now);
+        assert_eq!(state.failures, 1, "TCP alone is not a successful peer");
+        state.ready(now);
+        assert_eq!(state.failures, 0, "a ready handshake resets failures");
+        for _ in 0..MAX_DISCOVERY_CONNECT_FAILURES {
+            note_reconnect_failure(discovered, &mut reconnects, &mut addresses, now);
+        }
+        assert!(!reconnects.contains_key(&discovered));
+        assert!(reconnects.contains_key(&configured));
+        assert_eq!(fill_discovery_slots(&addresses, &mut reconnects, 2, now), 1);
+        assert_eq!(reconnects.len(), 2);
+        assert!(!reconnects.contains_key(&discovered));
     }
 
     #[test]
@@ -3366,20 +4083,24 @@ mod tests {
             maximum_outbound: 1,
             ..ShadowSyncConfig::default()
         };
-        assert!(too_many_peers.validate(AuthorityMode::Shadow).is_err());
+        assert!(too_many_peers
+            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .is_err());
 
         let too_fast = ShadowSyncConfig {
             poll_interval: Duration::from_millis(1),
             ..too_many_peers
         };
-        assert!(too_fast.validate(AuthorityMode::Shadow).is_err());
+        assert!(too_fast
+            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .is_err());
 
         let zero_connector_batch = ShadowSyncConfig {
             active_state_connect_batch: 0,
             ..too_fast
         };
         assert!(zero_connector_batch
-            .validate(AuthorityMode::Shadow)
+            .validate(AuthorityMode::Shadow, Network::Regtest)
             .is_err());
 
         let oversized_connector_batch = ShadowSyncConfig {
@@ -3387,7 +4108,7 @@ mod tests {
             ..zero_connector_batch
         };
         assert!(oversized_connector_batch
-            .validate(AuthorityMode::Shadow)
+            .validate(AuthorityMode::Shadow, Network::Regtest)
             .is_err());
     }
 

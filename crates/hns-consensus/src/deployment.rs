@@ -544,7 +544,7 @@ pub fn advance_threshold_state(
 ) -> Result<ThresholdState, DeploymentError> {
     let (window, threshold) =
         deployment_parameters(activation_threshold, miner_window, deployment)?;
-    if next_height % window != 0 {
+    if !next_height.is_multiple_of(window) {
         return Ok(previous);
     }
 
@@ -1194,7 +1194,7 @@ mod tests {
 
         let mut cached = ThresholdState::Defined;
         for next_height in 1..=history.len() {
-            let period = (next_height % 3 == 0).then(|| {
+            let period = next_height.is_multiple_of(3).then(|| {
                 let completed = &history[next_height - 3..next_height];
                 DeploymentPeriod {
                     median_time_past: history[next_height - 1].median_time_past,

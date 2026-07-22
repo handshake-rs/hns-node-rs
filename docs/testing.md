@@ -141,6 +141,13 @@ Current evidence includes:
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,
   `noRelay`, ASCII handling, inventory, locators, headers, blocks, and rejects;
+- pinned HSD DNS seed/port selection, bounded address admission and eviction,
+  unroutable/service/key/timestamp filtering, and failed discovered-target
+  rotation without displacement of explicit reconnect peers;
+- a seed-only optimized mainnet replay with no explicit sockets: 20 DNS
+  endpoints, eight Ready peers after three failed-target rotations, 287 unique
+  learned addresses, active/stored progress from 7,232 to 7,416, and exact
+  best-header height agreement with the pinned HSD oracle;
 - maximum-size 2,000-header atomic protocol-batch import, including
   late-invalid and failed-commit rollback;
 - canonical-header derivation of BIP9 threshold states, next-block signaling,

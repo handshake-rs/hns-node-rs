@@ -382,12 +382,43 @@ states and script-policy effects with HSD's softfork view.
 match. This mode deliberately rejects `--state-file`, whose schema records
 active block/root evidence rather than header-only evidence.
 
+## Peer discovery
+
+`--p2p-discovery` opts into HSD's network DNS seeds and plaintext GETADDR/ADDR
+exchange. Mainnet resolves `hs-mainnet.bcoin.ninja` and `seed.htools.work` on
+port 12038; testnet resolves `hs-testnet.bcoin.ninja` on port 13038. Regtest and
+simnet have no HSD DNS seeds, so discovery alone is rejected there.
+
+The in-memory address book has an operator-configured bound (4,096 by default,
+16,384 hard maximum). It accepts only keyless IP addresses advertising the
+network service, rejects unroutable public-network ranges and the configured
+listener, and normalizes missing or future timestamps with HSD's five-day
+fallback. Explicit `--connect` addresses are protected reconnect targets.
+Discovered targets fill only unused outbound slots and rotate after three
+consecutive connection failures; they cannot displace explicit targets.
+Ready protocol-v3-or-newer outbound peers receive one `GETADDR`. A peer's first
+inbound `GETADDR` is answered with at most HSRD's 1,000-address wire bound;
+outbound or repeated requests are ignored, matching HSD's anti-scraping rule.
+Eligible discovery slots are refilled on every poll, and due sockets start
+before potentially expensive historical active-state or body-queue scans.
+Only a completed Ready handshake resets a target's connection-failure history.
+
+For example, mainnet can bootstrap without hard-coded socket addresses:
+
+```bash
+hsrd --network mainnet --shadow-sync --p2p-discovery
+```
+
+The API reports known/received/accepted/rejected/served addresses, resolved DNS
+addresses, DNS failures, and discovered connection failures. Address state and
+reputation are not durable yet; restart resolves seeds again and relearns peers.
+
 ## Known limitations
 
 The shadow-sync runtime does not yet provide:
 
 - Brontide transport;
-- DNS seed or address-manager discovery;
+- durable address-manager state;
 - durable peer scoring or bans;
 - transaction and mempool relay;
 - compact-block reconstruction;

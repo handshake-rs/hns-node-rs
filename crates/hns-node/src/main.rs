@@ -73,6 +73,14 @@ struct Cli {
     #[arg(long = "connect")]
     p2p_connect: Vec<SocketAddr>,
 
+    /// Resolve HSD's network DNS seeds and learn bounded peers through GETADDR/ADDR.
+    #[arg(long)]
+    p2p_discovery: bool,
+
+    /// Maximum explicit and discovered plaintext peer addresses retained in memory.
+    #[arg(long, default_value_t = 4_096)]
+    maximum_known_addresses: usize,
+
     #[arg(long, default_value_t = 32)]
     maximum_inbound: usize,
 
@@ -158,6 +166,8 @@ impl Cli {
                 active_state_connect_batch: self.active_state_connect_batch,
                 listen: self.p2p_listen,
                 connect: self.p2p_connect,
+                discovery: self.p2p_discovery,
+                maximum_known_addresses: self.maximum_known_addresses,
                 maximum_inbound: self.maximum_inbound,
                 maximum_outbound: self.maximum_outbound,
                 validation_workers: self.validation_workers,

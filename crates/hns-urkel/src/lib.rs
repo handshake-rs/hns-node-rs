@@ -1445,7 +1445,7 @@ impl BitPrefix {
                 self.bytes.len()
             )));
         }
-        if bit_len % 8 != 0 && !self.bytes.is_empty() {
+        if !bit_len.is_multiple_of(8) && !self.bytes.is_empty() {
             let used = bit_len % 8;
             let trailing_mask = (1u8 << (8 - used)) - 1;
             if self.bytes[self.bytes.len() - 1] & trailing_mask != 0 {
@@ -2162,7 +2162,7 @@ mod tests {
         for step in 0..1_000u64 {
             let index = next(&mut seed) % 128;
             let name_hash = mixed_key(index);
-            let value = if next(&mut seed) % 4 == 0 {
+            let value = if next(&mut seed).is_multiple_of(4) {
                 None
             } else {
                 Some(format!("mixed-{index}-{step}").into_bytes())
@@ -2192,7 +2192,7 @@ mod tests {
                 tree.get(&probe).map(ToOwned::to_owned),
                 "mixed proof step {step}"
             );
-            if step % 50 == 0 {
+            if step.is_multiple_of(50) {
                 let expected_nodes = tree.len().saturating_mul(2).saturating_sub(1);
                 assert_eq!(
                     validate_record_tree(root, |hash| Ok(records.get(&hash).cloned()))

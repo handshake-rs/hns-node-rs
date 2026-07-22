@@ -122,6 +122,9 @@
   timeout, ping/pong, priority-queue controls, and cancellation-safe partial
   frame reads across timer maintenance.
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
+- HSD DNS-seed bootstrap and bounded GETADDR/ADDR learning with routability,
+  service, key, timestamp, protected-explicit-peer, and failed-target rotation
+  rules; the address book remains process-local.
 - Headers-first synchronization with 2,000-header atomic protocol batches plus
   canonical-header BIP9/script-policy derivation and bounded
   pending/inflight/per-peer body requests, retry, timeout, and reassignment.

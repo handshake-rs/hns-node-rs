@@ -105,7 +105,7 @@ The following remain untrusted and release-blocking:
   mid-commit process-crash/fault injection;
 - full-mainnet active-state IBD, pruning, and sustained
   alternate-chain/reorganization qualification;
-- Brontide, durable peer reputation, discovery, compact blocks, and
+- Brontide, durable address-manager/reputation state, compact blocks, and
   production-complete contextual transaction relay;
 - disconnected-transaction re-admission, production template qualification,
   continuously supervised publication retry, and measured publication latency;

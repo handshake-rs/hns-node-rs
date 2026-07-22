@@ -1188,7 +1188,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
 
     let resulting_tree_root =
         stage_name_tree_with_overrides(snapshot, batch, inherited_tree_root, &name_overrides)?;
-    let resulting_committed_tree_root = if request.height % tree_interval == 0 {
+    let resulting_committed_tree_root = if request.height.is_multiple_of(tree_interval) {
         resulting_tree_root
     } else {
         inherited_committed_tree_root
@@ -1229,7 +1229,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         request.block_hash.as_bytes(),
         &undo.encode()?,
     )?;
-    if request.height % tree_interval == 0 {
+    if request.height.is_multiple_of(tree_interval) {
         stage_name_tree_snapshot_pin(
             snapshot,
             batch,

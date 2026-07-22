@@ -238,7 +238,7 @@ Implemented:
 
 - Exact bounded HNS frame and sync-relevant packet codecs with pinned HSD wire
   fixtures.
-- Live inbound and explicit outbound plaintext TCP sessions with VERSION,
+- Live inbound, explicit outbound, and opt-in discovered plaintext TCP sessions with VERSION,
   VERACK, SENDHEADERS, PING/PONG, self-connection rejection, handshake/idle
   timeouts, and byte counters. Partial frame reads remain pinned across timer
   maintenance so a ping tick cannot desynchronize a large block payload.
@@ -246,6 +246,10 @@ Implemented:
 - A bounded peer manager with connection limits, duplicate-address rejection,
   process-local scoring, disconnect thresholds, snapshots, and exponential
   outbound reconnect backoff.
+- Opt-in HSD DNS-seed bootstrap and GETADDR/ADDR learning through a bounded
+  in-memory address book. Discovery accepts only keyless, network-service,
+  routable addresses with HSD-normalized timestamps; repeatedly failing
+  discovered targets rotate without displacing explicit reconnect peers.
 - Headers-first synchronization with 2,000-header atomic protocol batches and an
   explicit headers-only checkpoint/deployment-ancestry qualification mode. A
   read-only diagnostic independently replays every canonical BIP9 window and
@@ -286,8 +290,8 @@ Implemented:
   local blocks. Contextual-invalid roots and known descendants are durably
   failed with atomic header fallback; local storage/backend faults stop sync
   without poisoning the branch.
-- Read-only bounded serving of headers, block inventory, retained bodies, empty
-  address responses, and empty mempool inventory responses.
+- Read-only bounded serving of headers, block inventory, retained bodies,
+  learned routable addresses, and empty mempool inventory responses.
 - Read-only peer and synchronization diagnostics.
 - Default observation-only storage plus an opt-in non-authoritative active-state
   connector. Neither mode can authorize mining work in `shadow` authority mode.
@@ -298,7 +302,7 @@ Implemented:
 
 Still release-blocking:
 
-- Brontide transport, DNS seed/address-manager discovery, durable bans, and
+- Brontide transport, durable address-manager state, durable bans, and
   long-lived peer reputation;
 - contextually complete transaction admission and compact-block reconstruction;
 - production qualification of contextual active-state IBD across full mainnet
