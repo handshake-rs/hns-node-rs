@@ -509,12 +509,51 @@ impl NodeService {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("mining template height exhausted"))?;
         let metadata = self.state.store.snapshot()?;
+        let canonical_tip =
+            read_canonical_hash(&metadata, snapshot.tip.height)?.ok_or_else(|| {
+                anyhow::anyhow!("durable mining tip is missing from the active chain")
+            })?;
+        if canonical_tip != snapshot.tip.hash {
+            anyhow::bail!(
+                "durable mining tip {} disagrees with active-chain height {}",
+                snapshot.tip.hash.to_hex(),
+                snapshot.tip.height
+            );
+        }
+        let tip_record =
+            super::load_header_record(&metadata, &snapshot.tip.hash)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "durable mining tip {} has no header record",
+                    snapshot.tip.hash.to_hex()
+                )
+            })?;
+        if tip_record.hash != snapshot.tip.hash
+            || tip_record.height != snapshot.tip.height
+            || tip_record.header.prev_block != snapshot.tip.parent_hash
+            || tip_record.header.tree_root != snapshot.tip.tree_root
+            || tip_record.header.time != snapshot.tip.time
+            || tip_record.header.bits != snapshot.tip.bits
+        {
+            anyhow::bail!(
+                "durable mining header context disagrees with {} at height {}",
+                snapshot.tip.hash.to_hex(),
+                snapshot.tip.height
+            );
+        }
+        let parent_median_time = self.state.median_time_past(&metadata, &tip_record)?;
+        if parent_median_time != snapshot.parent_median_time {
+            anyhow::bail!(
+                "durable mining median time {} disagrees with active-chain median time {parent_median_time} at height {}",
+                snapshot.parent_median_time,
+                snapshot.tip.height
+            );
+        }
         let deployments =
             self.state
                 .deployment_state_for_block(&metadata, next_height, snapshot.tip.hash)?;
         let expected_version =
             compute_block_version_from_state(self.config.network.deployments(), deployments)?;
-        drop(metadata);
+        let maximum_time = super::current_unix_time()?.saturating_add(super::MAX_FUTURE_BLOCK_TIME);
         for request in &requests {
             if request.version != expected_version {
                 anyhow::bail!(
@@ -522,7 +561,34 @@ impl NodeService {
                     request.version
                 );
             }
+            if request.minimum_time <= parent_median_time {
+                anyhow::bail!(
+                    "mining template minimum time {} does not exceed HSD parent median time {parent_median_time} at height {next_height}",
+                    request.minimum_time
+                );
+            }
+            if request.minimum_time > maximum_time {
+                anyhow::bail!(
+                    "mining template minimum time {} exceeds maximum consensus time {maximum_time} at height {next_height}",
+                    request.minimum_time
+                );
+            }
+            let mut lookup = |hash: &BlockHash| super::load_header_record(&metadata, hash);
+            let expected_bits = super::expected_bits_with_lookup(
+                self.config.network,
+                request.minimum_time,
+                Some(&tip_record),
+                &mut lookup,
+            )?;
+            if request.bits != expected_bits {
+                anyhow::bail!(
+                    "mining template bits {:#010x} disagree with HSD target {expected_bits:#010x} at height {next_height} for time {}",
+                    request.bits,
+                    request.minimum_time
+                );
+            }
         }
+        drop(metadata);
         let mempool = self.state.mempool.snapshot();
         let variants = requests.into_iter().map(|request| TemplateVariant {
             variant: request.variant,

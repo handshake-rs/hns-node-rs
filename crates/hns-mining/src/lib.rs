@@ -57,6 +57,9 @@ pub struct MiningSnapshot {
     pub network_id: u8,
     pub generation: MiningGeneration,
     pub tip: HeaderSummary,
+    /// Median timestamp of the active tip and up to ten ancestors. The next
+    /// block timestamp must be strictly greater than this HSD consensus floor.
+    pub parent_median_time: u64,
     /// Authenticated name-tree root resulting from the active tip. This is the
     /// root which the next block must commit to; `tip.tree_root` is the root
     /// inherited by the tip itself.
@@ -312,6 +315,10 @@ pub struct PreparedMiningJob {
     job_id: MiningJobId,
     snapshot_generation: MiningGeneration,
     header: MiningHeaderTemplate,
+    /// Last timestamp for which non-reset testnet target bits remain valid.
+    /// HSD changes the target after this boundary, so workers must receive a
+    /// rebuilt job rather than reconstructing the old header with a later time.
+    maximum_target_time: Option<u64>,
     transactions: Arc<[Transaction]>,
 }
 
@@ -353,6 +360,7 @@ impl PreparedMiningJob {
     ) -> Result<Self, MiningError> {
         if header.parent_hash != snapshot.tip.hash
             || header.tree_root != snapshot.next_tree_root
+            || header.minimum_time <= snapshot.parent_median_time
             || transactions.is_empty()
         {
             return Err(MiningError::InvalidJob);
@@ -373,6 +381,16 @@ impl PreparedMiningJob {
         };
         let network =
             Network::from_canonical_id(snapshot.network_id).ok_or(MiningError::InvalidJob)?;
+        let pow = network.params().pow;
+        let maximum_target_time = (pow.target_reset && header.bits != pow.bits).then(|| {
+            snapshot
+                .tip
+                .time
+                .saturating_add(u64::from(pow.target_spacing).saturating_mul(2))
+        });
+        if maximum_target_time.is_some_and(|maximum| header.minimum_time > maximum) {
+            return Err(MiningError::InvalidJob);
+        }
         if provisional.encode().len() > MAX_BLOCK_WEIGHT
             || block_weight(&provisional) > MAX_BLOCK_WEIGHT
             || HeaderConsensus::new(ConsensusParams::for_network(network))
@@ -391,6 +409,7 @@ impl PreparedMiningJob {
             job_id,
             snapshot_generation: snapshot.generation,
             header,
+            maximum_target_time,
             transactions,
         })
     }
@@ -407,14 +426,30 @@ impl PreparedMiningJob {
         &self.header
     }
 
+    pub const fn maximum_target_time(&self) -> Option<u64> {
+        self.maximum_target_time
+    }
+
     pub fn transactions(&self) -> &[Transaction] {
         &self.transactions
     }
 
     pub fn validate_for_snapshot(&self, snapshot: &MiningSnapshot) -> Result<(), MiningError> {
+        let network =
+            Network::from_canonical_id(snapshot.network_id).ok_or(MiningError::StaleJob)?;
+        let pow = network.params().pow;
+        let expected_maximum_target_time =
+            (pow.target_reset && self.header.bits != pow.bits).then(|| {
+                snapshot
+                    .tip
+                    .time
+                    .saturating_add(u64::from(pow.target_spacing).saturating_mul(2))
+            });
         if self.snapshot_generation != snapshot.generation
             || self.header.parent_hash != snapshot.tip.hash
             || self.header.tree_root != snapshot.next_tree_root
+            || self.header.minimum_time <= snapshot.parent_median_time
+            || self.maximum_target_time != expected_maximum_target_time
             || self.job_id
                 != job_id(
                     snapshot.network_id,
@@ -436,6 +471,9 @@ impl PreparedMiningJob {
         mask: [u8; 32],
     ) -> Result<Block, MiningError> {
         if time < self.header.minimum_time
+            || self
+                .maximum_target_time
+                .is_some_and(|maximum| time > maximum)
             || blake2b_256_many([
                 self.header.parent_hash.as_bytes().as_slice(),
                 mask.as_slice(),
@@ -670,6 +708,7 @@ mod tests {
                 time: 100,
                 bits: 0x207f_ffff,
             },
+            parent_median_time: 100,
             next_tree_root: [marker.wrapping_add(1); 32],
             chainwork: Uint256::from(u64::from(marker)),
         }
@@ -815,6 +854,50 @@ mod tests {
         let job = prepared(&snapshot, [9; 32]);
         assert!(job.reconstruct(1, 100, [0; NONCE_SIZE], [9; 32]).is_err());
         assert!(job.reconstruct(1, 101, [0; NONCE_SIZE], [8; 32]).is_err());
+    }
+
+    #[test]
+    fn testnet_target_reset_boundary_requires_a_rebuilt_job() {
+        let mut mining_snapshot = snapshot(1, 1);
+        mining_snapshot.network_id = Network::Testnet.canonical_id();
+        let pow = Network::Testnet.params().pow;
+        let mask = [9; 32];
+        let transactions = Arc::<[Transaction]>::from(vec![transaction()]);
+        let body = Block {
+            header: Header::default(),
+            transactions: transactions.to_vec(),
+        };
+        let job = PreparedMiningJob::new(
+            &mining_snapshot,
+            MiningHeaderTemplate {
+                parent_hash: mining_snapshot.tip.hash,
+                tree_root: mining_snapshot.next_tree_root,
+                reserved_root: [3; 32],
+                witness_root: hns_consensus::block_witness_root(&body),
+                merkle_root: hns_consensus::block_merkle_root(&body),
+                version: 0,
+                bits: pow.bits ^ 1,
+                minimum_time: mining_snapshot.parent_median_time + 1,
+                mask_hash: blake2b_256_many([
+                    mining_snapshot.tip.hash.as_bytes().as_slice(),
+                    mask.as_slice(),
+                ]),
+            },
+            transactions,
+        )
+        .expect("non-reset testnet job");
+        let reset_boundary = mining_snapshot
+            .tip
+            .time
+            .saturating_add(u64::from(pow.target_spacing).saturating_mul(2));
+        assert_eq!(job.maximum_target_time(), Some(reset_boundary));
+        assert!(job
+            .reconstruct(1, reset_boundary, [0; NONCE_SIZE], mask)
+            .is_ok());
+        assert!(matches!(
+            job.reconstruct(1, reset_boundary.saturating_add(1), [0; NONCE_SIZE], mask),
+            Err(MiningError::InvalidReconstruction)
+        ));
     }
 
     #[test]

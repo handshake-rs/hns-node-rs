@@ -99,8 +99,9 @@ Implemented:
 - Parent-derived active-chain deployment state with HSD period-boundary
   caching, atomic reorganization/restart persistence, and fail-closed cache
   validation before contextual name and claim/airdrop checks. Native template
-  assembly derives HSD's next-block version from that exact cache and rejects a
-  caller-selected mismatch.
+  assembly revalidates the canonical tip and durable parent MTP, derives HSD's
+  next-block version and time-dependent target from that exact context, and
+  rejects caller-selected mismatches or consensus-invalid time floors.
 - Strict header checkpoint enforcement and a fail-closed historical-script
   policy that requires verified checkpoint ancestry before allowing HSD's
   optional historical validation shortcut.
@@ -302,7 +303,7 @@ Implemented:
   without poisoning the branch.
 - Read-only bounded serving of headers, block inventory, retained full or
   compact bodies, requested block transactions, learned routable addresses,
-  and empty mempool inventory responses.
+  and accepted ordinary/claim/airdrop mempool inventory and payloads.
 - Read-only peer and synchronization diagnostics.
 - Default observation-only storage plus an opt-in non-authoritative active-state
   connector. Neither mode can authorize mining work in `shadow` authority mode.
@@ -315,7 +316,8 @@ Still release-blocking:
 
 - Brontide transport, long-lived subthreshold peer reputation, and broader
   adversarial network qualification;
-- contextually complete transaction admission and relay;
+- sustained adversarial qualification of the implemented ordinary,
+  claim/airdrop, and solved-block relay paths;
 - production qualification of contextual active-state IBD across full mainnet
   replay and sustained reorganizations;
 - pruning-aware synchronization, invalid-branch pruning policy, and production
@@ -362,6 +364,9 @@ Implemented:
 - Deterministic ancestor-inclusive template selection with HNS weight, sigops,
   OPEN, UPDATE, RENEW, transaction-count, and exclusive-name limits.
 - HSD-derived subsidy and deterministic coinbase fixtures.
+- Durable canonical-tip/MTP binding plus HSD-derived deployment version,
+  time-dependent target, consensus timestamp-floor validation, and testnet
+  target-reset job expiry.
 - Atomic bounded future-template variant replacement and exact chain/mempool
   generation activation.
 - Versioned checksummed solved-block publication intents.

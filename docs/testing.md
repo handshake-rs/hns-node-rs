@@ -499,6 +499,10 @@ A mismatch fails closed and cannot become a silent compatibility exception.
 - A failed multi-step reorganization preserves every durable key, root, epoch,
   and mining generation.
 - Mempool conflicts, dependencies, eviction, and template replacement.
+- Durable template snapshots recompute canonical parent MTP, deployment
+  version, and the time-dependent HSD target; stale time/version/bits rebuilds
+  fail atomically without replacing the prior template set, and non-reset
+  testnet jobs expire at HSD's timestamp-driven target-reset boundary.
 - Tip commit to job activation and candidate receipt to first accepted relay.
 - Priority isolation under sync, compaction, diagnostics, and slow-peer load.
 

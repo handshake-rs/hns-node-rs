@@ -130,11 +130,21 @@ packages, bounded to ten, charged against UPDATE and weight limits, and rendered
 into their exact same-index coinbase inputs/outputs. Only an initial
 `commitHeight == 1` claim fee increases the miner payout, matching HSD.
 
-The base header version is not an unconstrained variant field. Before template
-assembly, the node advances the parent-derived deployment cache for the next
-height, computes HSD's exact `computeBlockVersion` result, and rejects any
-caller-supplied mismatch. The canonical 168-period mainnet history pins this
-cached calculation against HSD through height 338,688.
+The base header version, target, and timestamp floor are not unconstrained
+variant fields. Each durable mining snapshot carries the median timestamp of
+the active tip and up to ten ancestors. Before template assembly, the node
+re-reads the canonical tip and exact header context, verifies that cached MTP,
+advances the parent-derived deployment cache for the next height, computes
+HSD's exact `computeBlockVersion` result, and computes HSD's next target for the
+requested minimum time. A time at or below parent MTP, a time beyond the
+consensus future limit, or any caller-supplied version/target mismatch rejects
+the entire atomic rebuild without replacing the prior template set. The
+prepared job also carries the last timestamp for which non-reset testnet target
+bits remain valid and rejects reconstruction beyond HSD's
+`parent.time + 2 * targetSpacing` reset boundary, forcing a template refresh.
+The canonical 168-period mainnet history pins the deployment calculation
+against HSD through height 338,688; the shared import/template target path is
+covered by the pinned difficulty vectors and native composition tests.
 
 `TemplateCoordinator` atomically replaces a bounded set of variants for one
 chain/mempool generation. If any variant fails, the previous set remains intact.

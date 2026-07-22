@@ -201,6 +201,9 @@ Implemented:
   policy maximum, and exact sigop-adjusted fee/package sizing;
 - HNS-aware future-template construction with deterministic package selection
   that retains actual weight for consensus block-fit accounting;
+- durable canonical-tip and parent-MTP binding with HSD-derived deployment
+  version, time-dependent target, timestamp-floor validation, and testnet
+  target-reset job expiry;
 - bounded atomic template-variant replacement and exact generation activation;
 - HSD-derived subsidy, deterministic coinbase, and sigop-policy fixtures;
 - versioned, checksummed, bounded solved-block publication intents;

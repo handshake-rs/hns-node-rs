@@ -3751,12 +3751,24 @@ fn mining_snapshot_for_hash(
         .try_into()
         .map_err(|_| anyhow::anyhow!("durable mining name-tree root has invalid length"))?;
     let authoritative = record.status.is_mining_authoritative();
+    let tip_record = load_header_record(snapshot, &hash)?
+        .ok_or_else(|| anyhow::anyhow!("mining header record is missing for {}", hash.to_hex()))?;
+    if tip_record.hash != hash || tip_record.height != record.height {
+        anyhow::bail!(
+            "mining header record disagrees with {} at height {}",
+            hash.to_hex(),
+            record.height
+        );
+    }
+    let mut lookup = |candidate: &BlockHash| load_header_record(snapshot, candidate);
+    let parent_median_time = median_time_past_with_lookup(&tip_record, &mut lookup)?;
 
     Ok((
         Arc::new(MiningSnapshot {
             network_id,
             generation,
             tip: HeaderSummary::from_block(&block, record.height),
+            parent_median_time,
             next_tree_root,
             chainwork: record.chainwork,
         }),
@@ -8117,7 +8129,7 @@ mod tests {
     }
 
     #[test]
-    fn mining_templates_require_the_cached_hsd_deployment_version() {
+    fn mining_templates_require_the_durable_hsd_header_context() {
         let mut node = NodeService::new(NodeConfig {
             network: Network::Regtest,
             mining_engine: MiningEngineConfig {
@@ -8156,9 +8168,59 @@ mod tests {
 
         request.version = 0;
         let template = node
-            .mining_engine_build_template(request)
+            .mining_engine_build_template(request.clone())
             .expect("HSD deployment version template");
         assert_eq!(template.header().version, 0);
+        assert_eq!(template.header().bits, Network::Regtest.params().pow.bits);
+        assert_eq!(template.header().minimum_time, 1);
+        assert_eq!(
+            node.mining_engine_diagnostics()
+                .expect("mining diagnostics")
+                .cached_template_variants,
+            1
+        );
+
+        request.bits ^= 1;
+        let error = node
+            .mining_engine_build_template(request.clone())
+            .expect_err("caller-selected difficulty bits");
+        assert!(
+            error
+                .to_string()
+                .contains("disagree with HSD target 0x207fffff"),
+            "{error}"
+        );
+        assert_eq!(
+            node.mining_engine_diagnostics()
+                .expect("diagnostics after rejected bits")
+                .cached_template_variants,
+            1,
+            "a rejected rebuild must preserve the prior template set"
+        );
+
+        request.bits = Network::Regtest.params().pow.bits;
+        request.minimum_time = 0;
+        let error = node
+            .mining_engine_build_template(request.clone())
+            .expect_err("time at parent median");
+        assert!(
+            error
+                .to_string()
+                .contains("does not exceed HSD parent median time 0"),
+            "{error}"
+        );
+
+        request.minimum_time = current_unix_time()
+            .expect("current time")
+            .saturating_add(MAX_FUTURE_BLOCK_TIME)
+            .saturating_add(60);
+        let error = node
+            .mining_engine_build_template(request)
+            .expect_err("far-future template time");
+        assert!(
+            error.to_string().contains("exceeds maximum consensus time"),
+            "{error}"
+        );
     }
 
     #[test]

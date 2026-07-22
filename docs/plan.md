@@ -136,6 +136,8 @@ reserved low-latency paths.
 - Native HSD transaction sigop accounting, the 16,000-sigop admission ceiling,
   and sigop-adjusted fee/package size without conflating it with block weight.
 - Deterministic ancestor-inclusive templates with HNS operation limits.
+- Canonical durable-tip/MTP binding with HSD-derived next version and
+  time-dependent target validation plus testnet target-reset job expiry.
 - Atomic bounded future-template variants tied to exact chain and mempool
   generations.
 - HSD-derived subsidy, deterministic coinbase, and mempool sigop-policy

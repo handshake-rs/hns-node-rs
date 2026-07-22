@@ -165,7 +165,7 @@ impl TemplateAssembler {
             .ok_or(MiningError::InvalidTemplateContext)?;
         let network = Network::from_canonical_id(request.snapshot.network_id)
             .ok_or(MiningError::InvalidTemplateContext)?;
-        if request.minimum_time <= request.snapshot.tip.time
+        if request.minimum_time <= request.snapshot.parent_median_time
             || request.mask_hash == [0; 32]
             || request.payout_address.validate().is_err()
         {
@@ -881,9 +881,44 @@ mod tests {
                 time: 100,
                 bits: 0x207f_ffff,
             },
+            parent_median_time: 100,
             next_tree_root: [3; 32],
             chainwork: 10u64.into(),
         }
+    }
+
+    #[test]
+    fn template_time_uses_parent_median_time_instead_of_raw_tip_time() {
+        let mut mining_snapshot = snapshot();
+        mining_snapshot.tip.time = 200;
+        mining_snapshot.parent_median_time = 100;
+        let pool = MemoryMempool::new();
+        let pool_snapshot = pool.snapshot();
+        let request = TemplateBuildRequest {
+            snapshot: &mining_snapshot,
+            mempool: &pool_snapshot,
+            payout_address: address(9),
+            coinbase_flags: Vec::new(),
+            version: 0,
+            bits: Network::Regtest.params().pow.bits,
+            minimum_time: 101,
+            reserved_root: [0; 32],
+            mask_hash: [8; 32],
+            policy: TemplatePolicy::default(),
+        };
+        let template = TemplateAssembler
+            .assemble(request.clone())
+            .expect("time above parent median");
+        assert_eq!(template.header().minimum_time, 101);
+        assert!(template.header().minimum_time <= mining_snapshot.tip.time);
+
+        let error = TemplateAssembler
+            .assemble(TemplateBuildRequest {
+                minimum_time: mining_snapshot.parent_median_time,
+                ..request
+            })
+            .expect_err("time at parent median");
+        assert!(matches!(error, MiningError::InvalidTemplateContext));
     }
 
     #[test]

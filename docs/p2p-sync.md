@@ -505,11 +505,11 @@ The shadow-sync runtime does not yet provide:
 
 - Brontide transport;
 - long-lived subthreshold peer reputation;
-- transaction and mempool relay;
+- sustained adversarial qualification of its bounded ordinary,
+  claim/airdrop, and solved-block relay paths;
 - historical mainnet block-body and active-state replay qualification;
 - persistent pruning-horizon discovery plus full pruning and
   sustained-reorganization IBD qualification;
-- solved-block fan-out;
 - mining authority.
 
 Those omissions are reported rather than hidden. The comparison runner supplies

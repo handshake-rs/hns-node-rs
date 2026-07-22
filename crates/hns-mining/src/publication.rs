@@ -149,6 +149,7 @@ mod tests {
                 time: 100,
                 bits: 0x207f_ffff,
             },
+            parent_median_time: 100,
             next_tree_root: [3; 32],
             chainwork: 1u64.into(),
         };
