@@ -24,7 +24,7 @@ explicit outbound peers / optional listener
                     v
         bounded plaintext HNS peer sessions
                     |
-          VERSION / VERACK / SENDHEADERS
+     VERSION / VERACK / SENDHEADERS / SENDCMPCT
                     |
                     v
           headers-first synchronization
@@ -72,8 +72,9 @@ The maximum payload is eight million bytes and is checked before allocation.
 Packet and collection limits are explicit. The codec covers the
 sync-relevant HNS packet set, including VERSION, VERACK, PING/PONG, ADDR,
 INV/GETDATA/NOTFOUND, GETBLOCKS/GETHEADERS/HEADERS, BLOCK, TX, REJECT,
-SENDHEADERS, MEMPOOL, and the bounded opaque forms required to reject or ignore
-unsupported traffic safely.
+SENDHEADERS, MEMPOOL, SENDCMPCT, CMPCTBLOCK, GETBLOCKTXN, and BLOCKTXN.
+Remaining bounded opaque forms are retained only where safe rejection or ignore
+behavior is intentional.
 
 The HSD fixture generator verifies subtle compatibility behavior:
 
@@ -82,6 +83,8 @@ The HSD fixture generator verifies subtle compatibility behavior:
 - HSD `noRelay` interpretation;
 - HSD ASCII high-bit clearing;
 - locator, inventory, header, block, and reject encodings;
+- compact-block negotiation, 48-bit short IDs, differential indexes, and
+  prefilled/missing transaction encodings;
 - exact 9-byte frame headers and network magic.
 
 The runtime currently uses plaintext TCP only. Brontide is not implemented.
@@ -134,6 +137,8 @@ The shadow-sync runtime rejects configurations outside hard ceilings:
 | Validation input/results queue | 8,192 |
 | Retained orphan blocks | 8,192 |
 | Retained orphan bytes | 1 GiB |
+| Pending compact blocks per peer | 15 |
+| Pending compact blocks globally | 128 |
 | Active-state blocks per atomic batch | 1,024 |
 | Polling interval | at least 10 ms |
 
@@ -263,6 +268,35 @@ queued work for every affected descendant, the failed branch remains excluded
 after restart, its orphan descendants are discarded, and the remote peer earns
 a score of 100. Local orphan re-submission is never penalized as a network peer.
 
+### Compact-block relay
+
+On Ready, the runtime advertises compact-block version 1 in request-only mode.
+A peer becomes compact-capable only after sending a valid version-1-or-earlier
+`SENDCMPCT`; unsupported versions are ignored. Body dispatch then requests the
+compact inventory kind from capable peers and retains full-block requests for
+all other peers.
+
+Incoming compact blocks derive the BIP152 SipHash key from the encoded HNS
+header and the peer's eight-byte nonce, then resolve 48-bit short IDs from the
+mining engine's bounded mempool snapshot. Complete reconstructions enter the
+normal stateless validation and ordered import path. Otherwise the runtime
+sends one exact differential-index `GETBLOCKTXN` and fills the missing slots
+from the owning peer's `BLOCKTXN` response. Pending reconstructions are bounded
+to 15 per peer and 128 globally, use HSD's 30-second block-transaction response
+deadline, and are removed on disconnect.
+
+Malformed layouts and unavailable requested blocks use HSD's score-100 path.
+Duplicate compact short IDs, mismatched responses, and other recoverable
+reconstruction failures earn 10 points and fall back to the already reserved
+full-block request without widening scheduler admission. A different peer
+cannot complete or cancel another peer's pending reconstruction.
+
+For negotiated peers, compact `GETDATA` requests are served with a fresh random
+nonce and the coinbase prefilled. `GETBLOCKTXN` is answered only for retained
+blocks within HSD's recent 15-block window and never returns more transactions
+than the 16,662-transaction compact-block protocol bound. Non-capable peers and
+headers-only operation retain full-block behavior.
+
 ## Optional active-state connector
 
 The active-state mode is opt-in while historical and live parity gates remain
@@ -337,7 +371,7 @@ Ready peers may request:
 
 - headers following a locator;
 - block inventory following a locator;
-- retained block bodies;
+- retained full or compact block bodies and recent missing block transactions;
 - an empty address response;
 - bounded transaction inventory and accepted mempool transactions when the mining engine
   is enabled.
@@ -364,7 +398,9 @@ GET /api/v1/header-deployments
 
 Diagnostics include configured endpoints, reconnect attempts, live peer
 snapshots, synchronization stage, best/active/stored tips, queue depths, orphan
-usage, received/served counts, durably failed-body count, checkpoint sequence,
+usage, compact-capable peers, pending/received/reconstructed/fallback compact
+blocks, served compact blocks and block transactions, ordinary received/served
+counts, durably failed-body count, checkpoint sequence,
 active-state connection/reorganization counts, contextual-failure count, and
 the last supervisor error. Discovery diagnostics additionally expose durable
 address-book availability, loaded/pruned counts, generation, dirty state,
@@ -460,7 +496,6 @@ The shadow-sync runtime does not yet provide:
 - Brontide transport;
 - long-lived subthreshold peer reputation;
 - transaction and mempool relay;
-- compact-block reconstruction;
 - historical mainnet block-body and active-state replay qualification;
 - persistent pruning-horizon discovery plus full pruning and
   sustained-reorganization IBD qualification;

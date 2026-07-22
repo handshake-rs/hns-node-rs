@@ -15,6 +15,10 @@ pub const MAX_FRAME_PAYLOAD_SIZE: usize = 8_000_000;
 pub const MAX_INVENTORY_ITEMS: usize = 50_000;
 pub const MAX_LOCATOR_HASHES: usize = MAX_INVENTORY_ITEMS;
 pub const MAX_HEADERS: usize = 2_000;
+/// HSD's compact-block hash-DoS bound, derived from the one-megabyte base
+/// block size, the 236-byte HNS header, one transaction-count byte, and the
+/// 60-byte minimum serialized transaction size.
+pub const MAX_COMPACT_BLOCK_TRANSACTIONS: usize = 16_662;
 
 /// HSD does not impose a dedicated ADDR item-count assertion, so the frame
 /// bound is the ultimate protocol limit. HSRD intentionally applies a much

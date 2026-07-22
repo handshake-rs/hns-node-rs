@@ -366,6 +366,18 @@ impl NodeService {
         self.state.mempool.transaction(txid).cloned()
     }
 
+    pub(crate) fn mining_engine_mempool_transactions(
+        &self,
+        maximum: usize,
+    ) -> Vec<hns_primitives::Transaction> {
+        let snapshot = self.state.mempool.snapshot();
+        snapshot
+            .txids()
+            .take(maximum)
+            .filter_map(|txid| snapshot.transaction(&txid).cloned())
+            .collect()
+    }
+
     /// Peer transaction admission remains deliberately fail closed until the
     /// complete contextual consensus verifier is composed. Keeping the method
     /// at the mutable service boundary makes the eventual verifier swap local

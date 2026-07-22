@@ -150,6 +150,10 @@ Implemented:
 - HSD-shaped per-peer `GETDATA` inventories with atomic failed-admission
   rollback, HSD's 60/120-second header/block deadlines, and one disconnect per
   expired peer batch rather than per-hash score multiplication;
+- HSD version-1 compact-block negotiation, exact witness short IDs and
+  differential indexes, bounded mempool-assisted reconstruction with
+  `GETBLOCKTXN`/`BLOCKTXN` completion and full-block fallback, plus bounded
+  recent-block compact serving;
 - restart-durable out-of-parent-order canonical-body retention after a strict
   best-header-path recheck, with the contiguous and active tips pinned at the
   first gap while ordinary imports and reorgs retain the parent-body invariant;
@@ -176,7 +180,7 @@ Remaining:
 - long-lived subthreshold reputation, broader peer-diversity controls, and
   adversarial network qualification;
 - full-mainnet replay and pruning-aware qualification of active-state IBD;
-- compact blocks and production-complete contextual transaction relay;
+- production-complete contextual transaction admission and relay;
 - sustained live HSD comparison campaigns across restarts, partitions, and
   real reorganizations.
 

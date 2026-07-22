@@ -24,8 +24,10 @@ pub use runtime::{
 };
 pub use wire::{
     decode_frame, encode_frame, peer_address_group, AddressHost, AsyncFrameReader,
-    AsyncFrameWriter, AsyncPeerTransport, Frame, Inventory, InventoryKind, LocatorPacket,
-    NetAddress, NetworkMagic, Packet, PacketType, PeerAddressGroup, RejectPacket, VersionPacket,
+    AsyncFrameWriter, AsyncPeerTransport, CompactBlock, CompactBlockError,
+    CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse, Frame, Inventory,
+    InventoryKind, LocatorPacket, NetAddress, NetworkMagic, Packet, PacketType, PeerAddressGroup,
+    PrefilledTransaction, RejectPacket, VersionPacket,
 };
 
 pub trait PeerManager {

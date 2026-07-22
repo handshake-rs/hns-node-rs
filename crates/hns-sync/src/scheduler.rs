@@ -377,6 +377,19 @@ impl SyncScheduler {
         self.tracked.contains(hash)
     }
 
+    /// Check whether a body may currently arrive from `peer` without
+    /// consuming its scheduler reservation. Compact-block reconstruction uses
+    /// this before retaining a partial response; the completed block still
+    /// passes through [`Self::receive_block`] exactly once.
+    pub fn peer_can_deliver_block(&self, peer: PeerId, hash: &BlockHash) -> bool {
+        if let Some(inflight) = self.inflight.get(hash) {
+            return inflight.request.peer == Some(peer);
+        }
+        self.pending
+            .get(hash)
+            .is_some_and(|pending| pending.peer_can_deliver(peer))
+    }
+
     pub fn request_headers_from(
         &mut self,
         peer: PeerId,
@@ -1501,6 +1514,8 @@ mod tests {
         scheduler
             .announce_block(PeerId(1), hash, 5)
             .expect("announce");
+        assert!(scheduler.peer_can_deliver_block(PeerId(1), &hash));
+        assert!(!scheduler.peer_can_deliver_block(PeerId(2), &hash));
         assert!(scheduler.receive_block(PeerId(2), hash, now).is_err());
         assert!(scheduler.receive_block(PeerId(1), hash, now).is_ok());
     }

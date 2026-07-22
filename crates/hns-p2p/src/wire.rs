@@ -1,15 +1,20 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use hns_consensus::Network;
-use hns_primitives::{Block, BlockHash, Header, Reader, Transaction, Txid, Writer};
+use hns_primitives::{
+    blake2b_256_many, Block, BlockHash, Header, Reader, Transaction, Txid, Writer,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     constants::{
-        FRAME_HEADER_SIZE, MAX_ADDR_ITEMS, MAX_FRAME_PAYLOAD_SIZE, MAX_HEADERS,
-        MAX_INVENTORY_ITEMS, MAX_LOCATOR_HASHES, MAX_REJECT_REASON_SIZE, MAX_USER_AGENT_SIZE,
-        NET_ADDRESS_SIZE,
+        FRAME_HEADER_SIZE, MAX_ADDR_ITEMS, MAX_COMPACT_BLOCK_TRANSACTIONS, MAX_FRAME_PAYLOAD_SIZE,
+        MAX_HEADERS, MAX_INVENTORY_ITEMS, MAX_LOCATOR_HASHES, MAX_REJECT_REASON_SIZE,
+        MAX_USER_AGENT_SIZE, NET_ADDRESS_SIZE,
     },
     P2pError,
 };
@@ -496,6 +501,580 @@ pub struct RejectPacket {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefilledTransaction {
+    /// Differential index, matching HSD/BIP152 wire encoding.
+    pub index: usize,
+    pub transaction: Transaction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactBlock {
+    pub header: Header,
+    pub key_nonce: [u8; 8],
+    pub short_ids: Vec<u64>,
+    pub prefilled: Vec<PrefilledTransaction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactBlockRequest {
+    pub block_hash: BlockHash,
+    /// Absolute transaction indexes. The wire codec converts them to and from
+    /// BIP152 differential indexes.
+    pub indexes: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactBlockResponse {
+    pub block_hash: BlockHash,
+    pub transactions: Vec<Transaction>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompactBlockReconstruction {
+    header: Header,
+    available: Vec<Option<usize>>,
+    transactions: Vec<Option<Transaction>>,
+    short_id_indexes: HashMap<u64, usize>,
+    filled: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum CompactBlockError {
+    #[error("malformed compact block: {0}")]
+    Malformed(String),
+    #[error("compact block short-id collision: {0:#014x}")]
+    ShortIdCollision(u64),
+    #[error("compact block response hash does not match the pending block")]
+    ResponseHashMismatch,
+    #[error("compact block response has {actual} transactions; expected {expected}")]
+    ResponseCountMismatch { expected: usize, actual: usize },
+    #[error("compact block reconstruction is incomplete")]
+    Incomplete,
+}
+
+impl CompactBlock {
+    pub fn from_block(block: &Block) -> Self {
+        Self::from_block_with_nonce(block, rand::random())
+    }
+
+    pub fn from_block_with_nonce(block: &Block, key_nonce: [u8; 8]) -> Self {
+        let mut compact = Self {
+            header: block.header.clone(),
+            key_nonce,
+            short_ids: Vec::with_capacity(block.transactions.len().saturating_sub(1)),
+            prefilled: Vec::with_capacity(usize::from(!block.transactions.is_empty())),
+        };
+        let siphash_key = compact.siphash_key();
+        compact.short_ids = block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|transaction| Self::short_id_with_key(&transaction.witness_hash(), &siphash_key))
+            .collect();
+        if let Some(coinbase) = block.transactions.first() {
+            compact.prefilled.push(PrefilledTransaction {
+                index: 0,
+                transaction: coinbase.clone(),
+            });
+        }
+        compact
+    }
+
+    pub fn hash(&self) -> BlockHash {
+        self.header.hash()
+    }
+
+    pub fn total_transactions(&self) -> usize {
+        self.short_ids.len().saturating_add(self.prefilled.len())
+    }
+
+    pub fn short_id(&self, witness_hash: &[u8; 32]) -> u64 {
+        Self::short_id_with_key(witness_hash, &self.siphash_key())
+    }
+
+    fn siphash_key(&self) -> [u8; 16] {
+        let header = self.header.encode();
+        let hash = blake2b_256_many([header.as_slice(), self.key_nonce.as_slice()]);
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&hash[..16]);
+        key
+    }
+
+    fn short_id_with_key(witness_hash: &[u8; 32], key: &[u8; 16]) -> u64 {
+        siphash24(witness_hash, key) & 0x0000_ffff_ffff_ffff
+    }
+
+    pub fn reconstruct(
+        &self,
+        mempool: &[Transaction],
+    ) -> Result<CompactBlockReconstruction, CompactBlockError> {
+        let total = self.validate_layout()?;
+        let mut reconstruction = CompactBlockReconstruction {
+            header: self.header.clone(),
+            available: vec![None; total],
+            transactions: Vec::with_capacity(total),
+            short_id_indexes: HashMap::with_capacity(self.short_ids.len()),
+            filled: 0,
+        };
+
+        let mut previous = None;
+        for prefilled in &self.prefilled {
+            let index = absolute_prefilled_index(previous, prefilled.index)?;
+            if index >= total {
+                return Err(CompactBlockError::Malformed(format!(
+                    "prefilled index {index} exceeds transaction count {total}"
+                )));
+            }
+            previous = Some(index);
+            reconstruction.insert(index, prefilled.transaction.clone())?;
+        }
+
+        let mut offset = 0usize;
+        for (relative, short_id) in self.short_ids.iter().copied().enumerate() {
+            while reconstruction
+                .available
+                .get(relative.saturating_add(offset))
+                .is_some_and(Option::is_some)
+            {
+                offset = offset.saturating_add(1);
+            }
+            let index = relative.checked_add(offset).ok_or_else(|| {
+                CompactBlockError::Malformed("short-id index overflow".to_owned())
+            })?;
+            if index >= total {
+                return Err(CompactBlockError::Malformed(
+                    "short-id layout exceeds transaction count".to_owned(),
+                ));
+            }
+            if reconstruction
+                .short_id_indexes
+                .insert(short_id, index)
+                .is_some()
+            {
+                return Err(CompactBlockError::ShortIdCollision(short_id));
+            }
+        }
+        reconstruction.fill_mempool(self, mempool);
+        Ok(reconstruction)
+    }
+
+    fn validate_layout(&self) -> Result<usize, CompactBlockError> {
+        let total = self.total_transactions();
+        if total == 0 {
+            return Err(CompactBlockError::Malformed(
+                "empty short-id and prefilled vectors".to_owned(),
+            ));
+        }
+        if total > MAX_COMPACT_BLOCK_TRANSACTIONS {
+            return Err(CompactBlockError::Malformed(format!(
+                "transaction count {total} exceeds {MAX_COMPACT_BLOCK_TRANSACTIONS}"
+            )));
+        }
+        if self
+            .short_ids
+            .iter()
+            .any(|short_id| *short_id > 0x0000_ffff_ffff_ffff)
+        {
+            return Err(CompactBlockError::Malformed(
+                "short ID exceeds 48 bits".to_owned(),
+            ));
+        }
+
+        let mut previous = None;
+        for prefilled in &self.prefilled {
+            let index = absolute_prefilled_index(previous, prefilled.index)?;
+            if index >= total {
+                return Err(CompactBlockError::Malformed(format!(
+                    "prefilled index {index} exceeds transaction count {total}"
+                )));
+            }
+            previous = Some(index);
+        }
+        Ok(total)
+    }
+
+    fn write_to(&self, writer: &mut Writer) -> Result<(), P2pError> {
+        self.validate_layout()
+            .map_err(|error| P2pError::MalformedPacket(error.to_string()))?;
+        self.header.write_to(writer);
+        writer.write_bytes(&self.key_nonce);
+        writer.write_varint(self.short_ids.len() as u64);
+        for short_id in &self.short_ids {
+            writer.write_u32(*short_id as u32);
+            writer.write_u16((*short_id >> 32) as u16);
+        }
+        writer.write_varint(self.prefilled.len() as u64);
+        for prefilled in &self.prefilled {
+            writer.write_varint(prefilled.index as u64);
+            prefilled.transaction.write_to(writer);
+        }
+        Ok(())
+    }
+
+    fn read_from(reader: &mut Reader<'_>) -> Result<Self, P2pError> {
+        let header = primitive(Header::read_from(reader))?;
+        let key_nonce = read_array::<8>(reader)?;
+        let short_id_count = read_count(
+            reader,
+            "compact-block short IDs",
+            MAX_COMPACT_BLOCK_TRANSACTIONS,
+        )?;
+        let mut short_ids = Vec::with_capacity(short_id_count);
+        for _ in 0..short_id_count {
+            let low = u64::from(primitive(reader.read_u32())?);
+            let high = u64::from(primitive(reader.read_u16())?);
+            short_ids.push((high << 32) | low);
+        }
+        let maximum_prefilled = MAX_COMPACT_BLOCK_TRANSACTIONS.saturating_sub(short_id_count);
+        let prefilled_count = read_count(
+            reader,
+            "compact-block prefilled transactions",
+            maximum_prefilled,
+        )?;
+        let total = short_id_count.saturating_add(prefilled_count);
+        let mut prefilled = Vec::with_capacity(prefilled_count);
+        let mut previous = None;
+        for _ in 0..prefilled_count {
+            let index = read_bounded_index(reader, "compact-block prefilled index")?;
+            let absolute = absolute_prefilled_index(previous, index)
+                .map_err(|error| P2pError::MalformedPacket(error.to_string()))?;
+            if absolute >= total {
+                return Err(P2pError::MalformedPacket(format!(
+                    "compact-block prefilled index {absolute} exceeds transaction count {total}"
+                )));
+            }
+            previous = Some(absolute);
+            prefilled.push(PrefilledTransaction {
+                index,
+                transaction: primitive(Transaction::read_from(reader))?,
+            });
+        }
+        let compact = Self {
+            header,
+            key_nonce,
+            short_ids,
+            prefilled,
+        };
+        compact
+            .validate_layout()
+            .map_err(|error| P2pError::MalformedPacket(error.to_string()))?;
+        Ok(compact)
+    }
+}
+
+impl CompactBlockReconstruction {
+    pub fn is_complete(&self) -> bool {
+        self.filled == self.available.len()
+    }
+
+    pub fn missing_request(&self) -> CompactBlockRequest {
+        CompactBlockRequest {
+            block_hash: self.header.hash(),
+            indexes: self
+                .available
+                .iter()
+                .enumerate()
+                .filter_map(|(index, transaction)| transaction.is_none().then_some(index))
+                .collect(),
+        }
+    }
+
+    pub fn fill_missing(
+        &mut self,
+        response: CompactBlockResponse,
+    ) -> Result<(), CompactBlockError> {
+        if response.block_hash != self.header.hash() {
+            return Err(CompactBlockError::ResponseHashMismatch);
+        }
+        let missing = self.available.iter().filter(|item| item.is_none()).count();
+        if response.transactions.len() != missing {
+            return Err(CompactBlockError::ResponseCountMismatch {
+                expected: missing,
+                actual: response.transactions.len(),
+            });
+        }
+        for (index, transaction) in self
+            .available
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.is_none().then_some(index))
+            .zip(response.transactions)
+            .collect::<Vec<_>>()
+        {
+            self.insert(index, transaction)?;
+        }
+        Ok(())
+    }
+
+    pub fn into_block(self) -> Result<Block, CompactBlockError> {
+        if !self.is_complete() {
+            return Err(CompactBlockError::Incomplete);
+        }
+        let mut resolved = self.transactions;
+        let mut transactions = Vec::with_capacity(self.available.len());
+        for item in self.available {
+            let index = item.ok_or(CompactBlockError::Incomplete)?;
+            let transaction = resolved
+                .get_mut(index)
+                .and_then(Option::take)
+                .ok_or_else(|| {
+                    CompactBlockError::Malformed(
+                        "multiple compact-block slots reference one transaction".to_owned(),
+                    )
+                })?;
+            transactions.push(transaction);
+        }
+        Ok(Block {
+            header: self.header,
+            transactions,
+        })
+    }
+
+    fn fill_mempool(&mut self, compact: &CompactBlock, mempool: &[Transaction]) {
+        if self.is_complete() {
+            return;
+        }
+        let mut matched = HashSet::new();
+        let siphash_key = compact.siphash_key();
+        for transaction in mempool {
+            let short_id =
+                CompactBlock::short_id_with_key(&transaction.witness_hash(), &siphash_key);
+            let Some(index) = self.short_id_indexes.get(&short_id).copied() else {
+                continue;
+            };
+            if !matched.insert(index) {
+                if self.available[index].take().is_some() {
+                    self.filled = self.filled.saturating_sub(1);
+                }
+                continue;
+            }
+            if self.available[index].is_none() && self.insert(index, transaction.clone()).is_err() {
+                return;
+            }
+            if self.is_complete() {
+                return;
+            }
+        }
+    }
+
+    fn insert(&mut self, index: usize, transaction: Transaction) -> Result<(), CompactBlockError> {
+        let slot = self.available.get_mut(index).ok_or_else(|| {
+            CompactBlockError::Malformed(format!("transaction index {index} is out of bounds"))
+        })?;
+        if slot.is_some() {
+            return Err(CompactBlockError::Malformed(format!(
+                "transaction index {index} is filled more than once"
+            )));
+        }
+        let resolved = self.transactions.len();
+        self.transactions.push(Some(transaction));
+        *slot = Some(resolved);
+        self.filled = self.filled.saturating_add(1);
+        Ok(())
+    }
+}
+
+impl CompactBlockRequest {
+    pub fn from_block(block: &Block, indexes: Vec<usize>) -> Self {
+        Self {
+            block_hash: block.hash(),
+            indexes,
+        }
+    }
+
+    fn write_to(&self, writer: &mut Writer) -> Result<(), P2pError> {
+        validate_absolute_indexes(&self.indexes)?;
+        writer.write_bytes(self.block_hash.as_bytes());
+        writer.write_varint(self.indexes.len() as u64);
+        for (position, index) in self.indexes.iter().copied().enumerate() {
+            let differential = if position == 0 {
+                index
+            } else {
+                index - self.indexes[position - 1] - 1
+            };
+            writer.write_varint(differential as u64);
+        }
+        Ok(())
+    }
+
+    fn read_from(reader: &mut Reader<'_>) -> Result<Self, P2pError> {
+        let block_hash = BlockHash::new(primitive(reader.read_hash())?);
+        let count = read_count(
+            reader,
+            "compact-block requested indexes",
+            MAX_COMPACT_BLOCK_TRANSACTIONS,
+        )?;
+        let mut indexes = Vec::with_capacity(count);
+        let mut previous = None;
+        for _ in 0..count {
+            let differential = read_bounded_index(reader, "compact-block requested index")?;
+            let absolute = absolute_prefilled_index(previous, differential)
+                .map_err(|error| P2pError::MalformedPacket(error.to_string()))?;
+            indexes.push(absolute);
+            previous = Some(absolute);
+        }
+        Ok(Self {
+            block_hash,
+            indexes,
+        })
+    }
+}
+
+impl CompactBlockResponse {
+    pub fn from_block(block: &Block, request: &CompactBlockRequest) -> Self {
+        let transactions = request
+            .indexes
+            .iter()
+            .map_while(|index| block.transactions.get(*index).cloned())
+            .collect();
+        Self {
+            block_hash: request.block_hash,
+            transactions,
+        }
+    }
+
+    fn write_to(&self, writer: &mut Writer) -> Result<(), P2pError> {
+        check_count(
+            "compact-block response transactions",
+            self.transactions.len(),
+            MAX_COMPACT_BLOCK_TRANSACTIONS,
+        )?;
+        writer.write_bytes(self.block_hash.as_bytes());
+        writer.write_varint(self.transactions.len() as u64);
+        for transaction in &self.transactions {
+            transaction.write_to(writer);
+        }
+        Ok(())
+    }
+
+    fn read_from(reader: &mut Reader<'_>) -> Result<Self, P2pError> {
+        let block_hash = BlockHash::new(primitive(reader.read_hash())?);
+        let count = read_count(
+            reader,
+            "compact-block response transactions",
+            MAX_COMPACT_BLOCK_TRANSACTIONS,
+        )?;
+        let mut transactions = Vec::with_capacity(count);
+        for _ in 0..count {
+            transactions.push(primitive(Transaction::read_from(reader))?);
+        }
+        Ok(Self {
+            block_hash,
+            transactions,
+        })
+    }
+}
+
+fn absolute_prefilled_index(
+    previous: Option<usize>,
+    differential: usize,
+) -> Result<usize, CompactBlockError> {
+    let index = match previous {
+        Some(previous) => previous
+            .checked_add(1)
+            .and_then(|value| value.checked_add(differential))
+            .ok_or_else(|| {
+                CompactBlockError::Malformed("differential index overflow".to_owned())
+            })?,
+        None => differential,
+    };
+    if index > u16::MAX as usize {
+        return Err(CompactBlockError::Malformed(format!(
+            "transaction index {index} exceeds 65535"
+        )));
+    }
+    Ok(index)
+}
+
+fn read_bounded_index(reader: &mut Reader<'_>, context: &'static str) -> Result<usize, P2pError> {
+    let index = primitive(reader.read_varint())?;
+    if index > u64::from(u16::MAX) {
+        return Err(P2pError::LimitExceeded {
+            context,
+            limit: usize::from(u16::MAX),
+            actual: usize::try_from(index).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(index as usize)
+}
+
+fn validate_absolute_indexes(indexes: &[usize]) -> Result<(), P2pError> {
+    check_count(
+        "compact-block requested indexes",
+        indexes.len(),
+        MAX_COMPACT_BLOCK_TRANSACTIONS,
+    )?;
+    let mut previous = None;
+    for index in indexes {
+        if *index > usize::from(u16::MAX) {
+            return Err(P2pError::LimitExceeded {
+                context: "compact-block requested index",
+                limit: usize::from(u16::MAX),
+                actual: *index,
+            });
+        }
+        if previous.is_some_and(|previous| *index <= previous) {
+            return Err(P2pError::MalformedPacket(
+                "compact-block requested indexes must be strictly increasing".to_owned(),
+            ));
+        }
+        previous = Some(*index);
+    }
+    Ok(())
+}
+
+fn siphash24(message: &[u8], key: &[u8]) -> u64 {
+    debug_assert_eq!(key.len(), 16);
+    let k0 = u64::from_le_bytes(key[..8].try_into().expect("eight-byte SipHash key half"));
+    let k1 = u64::from_le_bytes(key[8..].try_into().expect("eight-byte SipHash key half"));
+    let mut v0 = 0x736f_6d65_7073_6575 ^ k0;
+    let mut v1 = 0x646f_7261_6e64_6f6d ^ k1;
+    let mut v2 = 0x6c79_6765_6e65_7261 ^ k0;
+    let mut v3 = 0x7465_6462_7974_6573 ^ k1;
+
+    let mut chunks = message.chunks_exact(8);
+    for chunk in &mut chunks {
+        let value = u64::from_le_bytes(chunk.try_into().expect("eight-byte SipHash message chunk"));
+        v3 ^= value;
+        for _ in 0..2 {
+            siphash_round(&mut v0, &mut v1, &mut v2, &mut v3);
+        }
+        v0 ^= value;
+    }
+    let mut tail = (message.len() as u64) << 56;
+    for (offset, byte) in chunks.remainder().iter().enumerate() {
+        tail |= u64::from(*byte) << (offset * 8);
+    }
+    v3 ^= tail;
+    for _ in 0..2 {
+        siphash_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    }
+    v0 ^= tail;
+    v2 ^= 0xff;
+    for _ in 0..4 {
+        siphash_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    }
+    v0 ^ v1 ^ v2 ^ v3
+}
+
+fn siphash_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+    *v0 = v0.wrapping_add(*v1);
+    *v1 = v1.rotate_left(13);
+    *v1 ^= *v0;
+    *v0 = v0.rotate_left(32);
+    *v2 = v2.wrapping_add(*v3);
+    *v3 = v3.rotate_left(16);
+    *v3 ^= *v2;
+    *v0 = v0.wrapping_add(*v3);
+    *v3 = v3.rotate_left(21);
+    *v3 ^= *v0;
+    *v2 = v2.wrapping_add(*v1);
+    *v1 = v1.rotate_left(17);
+    *v1 ^= *v2;
+    *v2 = v2.rotate_left(32);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Packet {
     Version(VersionPacket),
     Verack,
@@ -519,6 +1098,9 @@ pub enum Packet {
         mode: u8,
         version: u64,
     },
+    CmpctBlock(CompactBlock),
+    GetBlockTxn(CompactBlockRequest),
+    BlockTxn(CompactBlockResponse),
     Unknown {
         packet_type: PacketType,
         payload: Vec<u8>,
@@ -547,6 +1129,9 @@ impl Packet {
             Self::Mempool => PacketType::Mempool,
             Self::FeeFilter(_) => PacketType::FeeFilter,
             Self::SendCmpct { .. } => PacketType::SendCmpct,
+            Self::CmpctBlock(_) => PacketType::CmpctBlock,
+            Self::GetBlockTxn(_) => PacketType::GetBlockTxn,
+            Self::BlockTxn(_) => PacketType::BlockTxn,
             Self::Unknown { packet_type, .. } => *packet_type,
         }
     }
@@ -624,6 +1209,9 @@ impl Packet {
                 writer.write_u8(*mode);
                 writer.write_u64(*version);
             }
+            Self::CmpctBlock(block) => block.write_to(&mut writer)?,
+            Self::GetBlockTxn(request) => request.write_to(&mut writer)?,
+            Self::BlockTxn(response) => response.write_to(&mut writer)?,
             Self::Unknown { payload, .. } => writer.write_bytes(payload),
         }
         let payload = writer.finish();
@@ -746,13 +1334,15 @@ impl Packet {
                 mode: primitive(reader.read_u8())?,
                 version: primitive(reader.read_u64())?,
             },
+            PacketType::CmpctBlock => Self::CmpctBlock(CompactBlock::read_from(&mut reader)?),
+            PacketType::GetBlockTxn => {
+                Self::GetBlockTxn(CompactBlockRequest::read_from(&mut reader)?)
+            }
+            PacketType::BlockTxn => Self::BlockTxn(CompactBlockResponse::read_from(&mut reader)?),
             PacketType::FilterLoad
             | PacketType::FilterAdd
             | PacketType::FilterClear
             | PacketType::MerkleBlock
-            | PacketType::CmpctBlock
-            | PacketType::GetBlockTxn
-            | PacketType::BlockTxn
             | PacketType::GetProof
             | PacketType::Proof
             | PacketType::Claim
@@ -1018,6 +1608,7 @@ fn read_array<const N: usize>(reader: &mut Reader<'_>) -> Result<[u8; N], P2pErr
 mod tests {
     use super::*;
     use crate::constants::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SERVICE_NETWORK};
+    use hns_primitives::{Address, Covenant, CovenantKind, Input, Outpoint, Output, Witness};
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -1272,6 +1863,41 @@ mod tests {
         }
     }
 
+    fn oracle_transaction(tag: u8) -> Transaction {
+        Transaction {
+            version: u32::from(tag),
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    txid: Txid::new([tag; 32]),
+                    index: u32::from(tag),
+                },
+                sequence: 0xffff_ff00 + u32::from(tag),
+                witness: Witness {
+                    items: vec![vec![tag, tag + 1]],
+                },
+            }],
+            outputs: vec![Output {
+                value: 1_000 + u64::from(tag),
+                address: Address {
+                    version: 0,
+                    hash: vec![0; 20],
+                },
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: u32::from(tag),
+        }
+    }
+
+    fn oracle_compact_source() -> Block {
+        Block {
+            header: oracle_header(),
+            transactions: (1..=3).map(oracle_transaction).collect(),
+        }
+    }
+
     fn oracle_packet(id: &str) -> Packet {
         match id {
             "version-main" => Packet::Version(VersionPacket {
@@ -1329,6 +1955,19 @@ mod tests {
                 mode: 1,
                 version: 2,
             },
+            "cmpctblock-regtest" => Packet::CmpctBlock(CompactBlock::from_block_with_nonce(
+                &oracle_compact_source(),
+                [1, 2, 3, 4, 5, 6, 7, 8],
+            )),
+            "getblocktxn-regtest" => {
+                let block = oracle_compact_source();
+                Packet::GetBlockTxn(CompactBlockRequest::from_block(&block, vec![1, 2]))
+            }
+            "blocktxn-regtest" => {
+                let block = oracle_compact_source();
+                let request = CompactBlockRequest::from_block(&block, vec![1, 2]);
+                Packet::BlockTxn(CompactBlockResponse::from_block(&block, &request))
+            }
             other => panic!("unhandled oracle packet {other}"),
         }
     }
@@ -1341,6 +1980,44 @@ mod tests {
             "simnet" => NetworkMagic::Simnet,
             other => panic!("unknown oracle network {other}"),
         }
+    }
+
+    #[test]
+    fn compact_block_reconstruction_fills_mempool_and_requested_transactions() {
+        let block = oracle_compact_source();
+        let compact = CompactBlock::from_block_with_nonce(&block, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut reconstruction = compact
+            .reconstruct(&[block.transactions[1].clone()])
+            .expect("initialize compact block");
+        assert!(!reconstruction.is_complete());
+        let request = reconstruction.missing_request();
+        assert_eq!(request.block_hash, block.hash());
+        assert_eq!(request.indexes, vec![2]);
+        let encoded = Packet::GetBlockTxn(request.clone())
+            .encode_payload()
+            .expect("encode request");
+        assert_eq!(
+            Packet::decode(PacketType::GetBlockTxn, &encoded).expect("decode request"),
+            Packet::GetBlockTxn(request.clone())
+        );
+
+        reconstruction
+            .fill_missing(CompactBlockResponse::from_block(&block, &request))
+            .expect("fill response");
+        assert_eq!(reconstruction.into_block().expect("full block"), block);
+
+        let mut collision = compact.clone();
+        collision.short_ids[1] = collision.short_ids[0];
+        assert!(matches!(
+            collision.reconstruct(&[]),
+            Err(CompactBlockError::ShortIdCollision(_))
+        ));
+
+        let malformed = CompactBlockRequest {
+            block_hash: block.hash(),
+            indexes: vec![2, 2],
+        };
+        assert!(Packet::GetBlockTxn(malformed).encode_payload().is_err());
     }
 
     #[test]
@@ -1361,6 +2038,11 @@ mod tests {
             assert_eq!(
                 packet.encode_payload().expect("payload"),
                 expected_payload,
+                "{id}"
+            );
+            assert_eq!(
+                Packet::decode(packet.packet_type(), &expected_payload).expect("decode payload"),
+                packet,
                 "{id}"
             );
             let frame = Frame::from_packet(&packet).expect("frame");

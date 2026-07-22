@@ -23,9 +23,10 @@ use hns_consensus::{
 };
 use hns_mempool::Admission;
 use hns_p2p::{
-    normalize_peer_ip, peer_address_group, Inventory, InventoryKind, LivePeerConfig,
-    LivePeerManager, LocatorPacket, OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent,
-    PeerId, PeerSnapshot, SERVICE_NETWORK,
+    normalize_peer_ip, peer_address_group, CompactBlock, CompactBlockError,
+    CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse, Inventory,
+    InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket, OutboundPriority, P2pError,
+    Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot, SERVICE_NETWORK,
 };
 use hns_primitives::{blake2b_256, Block, BlockHash, Header, Height, Reader, Txid, Writer};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
@@ -61,6 +62,9 @@ const MAX_GETDATA_ITEMS: usize = 1_024;
 const LOCAL_ORPHAN_PEER: PeerId = PeerId(0);
 const MAX_RECONNECT_DELAY_SECONDS: u64 = 60;
 const MAX_DISCOVERY_CONNECT_FAILURES: u32 = 3;
+const MAX_PENDING_COMPACT_BLOCKS_PER_PEER: usize = 15;
+const MAX_PENDING_COMPACT_BLOCKS: usize = 128;
+const COMPACT_BLOCK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_KNOWN_PEER_ADDRESSES: usize = 16_384;
 const DEFAULT_KNOWN_PEER_ADDRESSES: usize = 4_096;
 const ADDRESS_BOOK_KEY: &[u8] = b"address-book/v1";
@@ -318,6 +322,13 @@ pub struct ShadowSyncDiagnostics {
     pub outbound_connecting: usize,
     pub outbound_address_groups: usize,
     pub outbound_reconnect_attempts: u64,
+    pub compact_peers: usize,
+    pub pending_compact_blocks: usize,
+    pub received_compact_blocks: u64,
+    pub reconstructed_compact_blocks: u64,
+    pub compact_block_fallbacks: u64,
+    pub served_compact_blocks: u64,
+    pub served_block_transactions: u64,
     pub started_at: u64,
     pub peers: Vec<PeerSnapshot>,
     pub sync: SyncSnapshot,
@@ -1076,6 +1087,13 @@ struct ReconnectState {
     next_attempt: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct PendingCompactBlock {
+    peer: PeerId,
+    received_at: Instant,
+    reconstruction: CompactBlockReconstruction,
+}
+
 impl ReconnectState {
     fn new(now: Instant, persistent: bool) -> Self {
         Self {
@@ -1430,6 +1448,8 @@ impl NodeService {
         peer_state_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         peer_state_flush.tick().await;
         let mut served_getaddr = HashSet::new();
+        let mut compact_peers = HashSet::new();
+        let mut pending_compact_blocks = HashMap::new();
         let mut shutdown_wait = Box::pin(shutdown.wait());
         let mut terminal_error: Option<anyhow::Error> = None;
 
@@ -1454,6 +1474,38 @@ impl NodeService {
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
+                    }
+
+                    let compact_now = Instant::now();
+                    let expired_peers = pending_compact_blocks
+                        .values()
+                        .filter_map(|pending: &PendingCompactBlock| {
+                            (compact_now.duration_since(pending.received_at)
+                                >= COMPACT_BLOCK_RESPONSE_TIMEOUT)
+                                .then_some(pending.peer)
+                        })
+                        .collect::<HashSet<_>>();
+                    if !expired_peers.is_empty() {
+                        let before = pending_compact_blocks.len();
+                        pending_compact_blocks
+                            .retain(|_, pending| !expired_peers.contains(&pending.peer));
+                        let expired = before.saturating_sub(pending_compact_blocks.len());
+                        update_diagnostics(&diagnostics, |state| {
+                            state.compact_block_fallbacks = state
+                                .compact_block_fallbacks
+                                .saturating_add(expired as u64);
+                        })
+                        .await;
+                        for peer in expired_peers {
+                            scheduler.remove_peer(peer);
+                            if let Err(error) = peers.disconnect(peer).await {
+                                tracing::debug!(
+                                    ?peer,
+                                    %error,
+                                    "compact-block response timeout raced peer disconnect"
+                                );
+                            }
+                        }
                     }
 
                     // Start due sockets before potentially expensive local
@@ -1546,6 +1598,7 @@ impl NodeService {
                         if let Err(error) = apply_sync_dispatch(
                             dispatch,
                             &peers,
+                            &compact_peers,
                             &checkpoint_store,
                             &mut scheduler,
                             &mut checkpoint_sequence,
@@ -1563,6 +1616,8 @@ impl NodeService {
                         &reconnects,
                         &address_book,
                         &ban_list,
+                        &compact_peers,
+                        &pending_compact_blocks,
                         checkpoint_sequence,
                     )
                     .await;
@@ -1613,6 +1668,8 @@ impl NodeService {
                             &mut address_book,
                             &ban_list,
                             &mut served_getaddr,
+                            &mut compact_peers,
+                            &mut pending_compact_blocks,
                             shadow_sync_config.discovery,
                             shadow_sync_config.headers_only,
                             &diagnostics,
@@ -1642,6 +1699,8 @@ impl NodeService {
                         &reconnects,
                         &address_book,
                         &ban_list,
+                        &compact_peers,
+                        &pending_compact_blocks,
                         checkpoint_sequence,
                     )
                     .await;
@@ -1674,6 +1733,8 @@ impl NodeService {
                         &reconnects,
                         &address_book,
                         &ban_list,
+                        &compact_peers,
+                        &pending_compact_blocks,
                         checkpoint_sequence,
                     )
                     .await;
@@ -2610,6 +2671,8 @@ async fn handle_peer_event(
     addresses: &mut BoundedAddressBook,
     bans: &PeerBanBook,
     served_getaddr: &mut HashSet<PeerId>,
+    compact_peers: &mut HashSet<PeerId>,
+    pending_compact_blocks: &mut HashMap<BlockHash, PendingCompactBlock>,
     discovery: bool,
     headers_only: bool,
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
@@ -2644,6 +2707,17 @@ async fn handle_peer_event(
                     addresses.note_success(snapshot.address, now, unix_time(), version.services);
                 }
             }
+            peers
+                .try_send(
+                    peer,
+                    Arc::new(Packet::SendCmpct {
+                        mode: 0,
+                        version: 1,
+                    }),
+                    OutboundPriority::Control,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to negotiate compact blocks: {error}"))?;
             if discovery
                 && supports_addr_protocol(version.version)
                 && snapshot.is_some_and(|snapshot| snapshot.direction == PeerDirection::Outbound)
@@ -2664,6 +2738,8 @@ async fn handle_peer_event(
         } => {
             scheduler.remove_peer(peer);
             served_getaddr.remove(&peer);
+            compact_peers.remove(&peer);
+            pending_compact_blocks.retain(|_, pending| pending.peer != peer);
             if direction == PeerDirection::Outbound {
                 note_reconnect_failure(address, reconnects, Instant::now());
             }
@@ -2754,6 +2830,13 @@ async fn handle_peer_event(
                 }
             }
             Packet::Block(block) => {
+                let hash = block.hash();
+                if pending_compact_blocks
+                    .get(&hash)
+                    .is_some_and(|pending| pending.peer == peer)
+                {
+                    pending_compact_blocks.remove(&hash);
+                }
                 update_diagnostics(diagnostics, |state| {
                     state.received_blocks = state.received_blocks.saturating_add(1);
                     if headers_only {
@@ -2851,15 +2934,60 @@ async fn handle_peer_event(
                                 None => not_found.push(item),
                             }
                         }
-                        InventoryKind::Block
-                        | InventoryKind::FilteredBlock
-                        | InventoryKind::CompactBlock => {
+                        InventoryKind::Block | InventoryKind::FilteredBlock => {
                             let hash = BlockHash::new(item.hash);
                             let block = {
                                 let node = node.lock().await;
                                 node.shadow_sync_block(&hash)?
                             };
                             match block {
+                                Some(block) => {
+                                    peers
+                                        .try_send(
+                                            peer,
+                                            Arc::new(Packet::Block(block)),
+                                            OutboundPriority::Normal,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            anyhow::anyhow!("failed to serve block: {error}")
+                                        })?;
+                                    update_diagnostics(diagnostics, |state| {
+                                        state.served_blocks = state.served_blocks.saturating_add(1);
+                                    })
+                                    .await;
+                                }
+                                None => not_found.push(item),
+                            }
+                        }
+                        InventoryKind::CompactBlock => {
+                            let hash = BlockHash::new(item.hash);
+                            let block = {
+                                let node = node.lock().await;
+                                node.shadow_sync_block(&hash)?
+                            };
+                            match block {
+                                Some(block) if compact_peers.contains(&peer) => {
+                                    peers
+                                        .try_send(
+                                            peer,
+                                            Arc::new(Packet::CmpctBlock(CompactBlock::from_block(
+                                                &block,
+                                            ))),
+                                            OutboundPriority::Normal,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            anyhow::anyhow!(
+                                                "failed to serve compact block: {error}"
+                                            )
+                                        })?;
+                                    update_diagnostics(diagnostics, |state| {
+                                        state.served_compact_blocks =
+                                            state.served_compact_blocks.saturating_add(1);
+                                    })
+                                    .await;
+                                }
                                 Some(block) => {
                                     peers
                                         .try_send(
@@ -2980,6 +3108,42 @@ async fn handle_peer_event(
                     }
                 }
             }
+            Packet::SendCmpct { mode, version } => {
+                if mode <= 1 && version <= 1 {
+                    compact_peers.insert(peer);
+                }
+            }
+            Packet::CmpctBlock(compact) => {
+                handle_compact_block(
+                    peer,
+                    compact,
+                    node,
+                    peers,
+                    validation,
+                    scheduler,
+                    compact_peers,
+                    pending_compact_blocks,
+                    headers_only,
+                    diagnostics,
+                )
+                .await?;
+            }
+            Packet::GetBlockTxn(request) => {
+                serve_block_transactions(peer, request, node, peers, diagnostics).await?;
+            }
+            Packet::BlockTxn(response) => {
+                handle_block_transactions(
+                    peer,
+                    response,
+                    node,
+                    peers,
+                    validation,
+                    scheduler,
+                    pending_compact_blocks,
+                    diagnostics,
+                )
+                .await?;
+            }
             Packet::Reject(reject) => {
                 tracing::debug!(
                     ?peer,
@@ -3033,7 +3197,6 @@ async fn handle_peer_event(
             }
             Packet::SendHeaders
             | Packet::FeeFilter(_)
-            | Packet::SendCmpct { .. }
             | Packet::Unknown { .. }
             | Packet::Version(_)
             | Packet::Verack
@@ -3054,6 +3217,219 @@ async fn import_header_packet(
 
     let mut node = node.lock().await;
     node.shadow_sync_import_headers(headers)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_compact_block(
+    peer: PeerId,
+    compact: CompactBlock,
+    node: &Arc<Mutex<NodeService>>,
+    peers: &LivePeerManager,
+    validation: &ValidationSubmitter,
+    scheduler: &mut SyncScheduler,
+    compact_peers: &HashSet<PeerId>,
+    pending: &mut HashMap<BlockHash, PendingCompactBlock>,
+    headers_only: bool,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) -> Result<()> {
+    let hash = compact.hash();
+    update_diagnostics(diagnostics, |state| {
+        state.received_compact_blocks = state.received_compact_blocks.saturating_add(1);
+        if headers_only {
+            state.rejected_messages = state.rejected_messages.saturating_add(1);
+        }
+    })
+    .await;
+    if headers_only {
+        return Ok(());
+    }
+    if !compact_peers.contains(&peer) {
+        scheduler.remove_peer(peer);
+        peers.disconnect(peer).await?;
+        anyhow::bail!("peer {peer:?} sent compact block without negotiation");
+    }
+    if !scheduler.peer_can_deliver_block(peer, &hash) {
+        scheduler.remove_peer(peer);
+        peers.disconnect(peer).await?;
+        anyhow::bail!(
+            "peer {peer:?} sent unsolicited compact block {}",
+            hash.to_hex()
+        );
+    }
+    if pending.contains_key(&hash) {
+        return Ok(());
+    }
+    let per_peer = pending.values().filter(|item| item.peer == peer).count();
+    if per_peer >= MAX_PENDING_COMPACT_BLOCKS_PER_PEER
+        || pending.len() >= MAX_PENDING_COMPACT_BLOCKS
+    {
+        peers.disconnect(peer).await?;
+        anyhow::bail!("peer {peer:?} exceeded the pending compact-block bound");
+    }
+
+    let mempool = {
+        let node = node.lock().await;
+        node.mining_engine_mempool_transactions(hns_p2p::MAX_COMPACT_BLOCK_TRANSACTIONS)
+    };
+    let reconstruction = match compact.reconstruct(&mempool) {
+        Ok(reconstruction) => reconstruction,
+        Err(CompactBlockError::ShortIdCollision(short_id)) => {
+            penalize_peer(peers, peer, 10, "compact-block short-id collision").await?;
+            request_full_block_fallback(peer, hash, peers, diagnostics).await?;
+            tracing::debug!(?peer, %short_id, block = %hash.to_hex(), "compact-block short-id collision");
+            return Ok(());
+        }
+        Err(error) => {
+            penalize_peer(peers, peer, 100, "malformed compact block").await?;
+            anyhow::bail!("peer {peer:?} sent malformed compact block: {error}");
+        }
+    };
+
+    if reconstruction.is_complete() {
+        let block = reconstruction
+            .into_block()
+            .map_err(|error| anyhow::anyhow!("failed to finalize compact block: {error}"))?;
+        update_diagnostics(diagnostics, |state| {
+            state.reconstructed_compact_blocks =
+                state.reconstructed_compact_blocks.saturating_add(1);
+            state.received_blocks = state.received_blocks.saturating_add(1);
+        })
+        .await;
+        return accept_peer_block(peer, block, node, peers, validation, scheduler).await;
+    }
+
+    let request = reconstruction.missing_request();
+    pending.insert(
+        hash,
+        PendingCompactBlock {
+            peer,
+            received_at: Instant::now(),
+            reconstruction,
+        },
+    );
+    if let Err(error) = peers
+        .try_send(
+            peer,
+            Arc::new(Packet::GetBlockTxn(request)),
+            OutboundPriority::Control,
+        )
+        .await
+    {
+        pending.remove(&hash);
+        request_full_block_fallback(peer, hash, peers, diagnostics).await?;
+        tracing::debug!(?peer, block = %hash.to_hex(), %error, "compact transaction request fell back to full body");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_block_transactions(
+    peer: PeerId,
+    response: CompactBlockResponse,
+    node: &Arc<Mutex<NodeService>>,
+    peers: &LivePeerManager,
+    validation: &ValidationSubmitter,
+    scheduler: &mut SyncScheduler,
+    pending: &mut HashMap<BlockHash, PendingCompactBlock>,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) -> Result<()> {
+    let hash = response.block_hash;
+    let Some(expected_peer) = pending.get(&hash).map(|pending| pending.peer) else {
+        return Ok(());
+    };
+    if expected_peer != peer {
+        tracing::debug!(?peer, ?expected_peer, block = %hash.to_hex(), "ignoring unsolicited blocktxn response");
+        return Ok(());
+    }
+    let mut item = pending
+        .remove(&hash)
+        .expect("pending compact block remains present");
+    if let Err(error) = item.reconstruction.fill_missing(response) {
+        penalize_peer(peers, peer, 10, "incomplete blocktxn response").await?;
+        request_full_block_fallback(peer, hash, peers, diagnostics).await?;
+        tracing::debug!(?peer, block = %hash.to_hex(), %error, "compact block fell back to full body");
+        return Ok(());
+    }
+    let block = item
+        .reconstruction
+        .into_block()
+        .map_err(|error| anyhow::anyhow!("failed to finalize compact block: {error}"))?;
+    update_diagnostics(diagnostics, |state| {
+        state.reconstructed_compact_blocks = state.reconstructed_compact_blocks.saturating_add(1);
+        state.received_blocks = state.received_blocks.saturating_add(1);
+    })
+    .await;
+    accept_peer_block(peer, block, node, peers, validation, scheduler).await
+}
+
+async fn request_full_block_fallback(
+    peer: PeerId,
+    hash: BlockHash,
+    peers: &LivePeerManager,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) -> Result<()> {
+    peers
+        .try_send(
+            peer,
+            Arc::new(Packet::GetData(vec![Inventory::block(hash)])),
+            OutboundPriority::Control,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to request full-block fallback: {error}"))?;
+    update_diagnostics(diagnostics, |state| {
+        state.compact_block_fallbacks = state.compact_block_fallbacks.saturating_add(1);
+    })
+    .await;
+    Ok(())
+}
+
+async fn serve_block_transactions(
+    peer: PeerId,
+    request: CompactBlockRequest,
+    node: &Arc<Mutex<NodeService>>,
+    peers: &LivePeerManager,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) -> Result<()> {
+    let block_hash = request.block_hash;
+    let block = {
+        let node = node.lock().await;
+        let Some(record) = node.shadow_sync_header_record(&block_hash)? else {
+            drop(node);
+            penalize_peer(peers, peer, 100, "getblocktxn requested an unknown block").await?;
+            anyhow::bail!("peer {peer:?} requested transactions for unknown block");
+        };
+        let active_height = node.shadow_sync_active_tip()?.map_or(0, |tip| tip.height);
+        if record.height.saturating_add(15) < active_height {
+            return Ok(());
+        }
+        node.shadow_sync_block(&block_hash)?
+    };
+    let Some(block) = block else {
+        penalize_peer(
+            peers,
+            peer,
+            100,
+            "getblocktxn requested an unavailable block",
+        )
+        .await?;
+        anyhow::bail!("peer {peer:?} requested transactions for unavailable block");
+    };
+    let response = CompactBlockResponse::from_block(&block, &request);
+    let count = response.transactions.len();
+    peers
+        .try_send(
+            peer,
+            Arc::new(Packet::BlockTxn(response)),
+            OutboundPriority::Normal,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to serve blocktxn: {error}"))?;
+    update_diagnostics(diagnostics, |state| {
+        state.served_block_transactions =
+            state.served_block_transactions.saturating_add(count as u64);
+    })
+    .await;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3567,6 +3943,7 @@ fn dispatch_failure_is_stale(error: &P2pError) -> bool {
 async fn apply_sync_dispatch(
     dispatch: SyncDispatch,
     peers: &LivePeerManager,
+    compact_peers: &HashSet<PeerId>,
     checkpoints: &StoredSyncCheckpoint<hns_store::StoreHandle>,
     scheduler: &mut SyncScheduler,
     checkpoint_sequence: &mut u64,
@@ -3617,7 +3994,14 @@ async fn apply_sync_dispatch(
             }
             let inventory = requests
                 .iter()
-                .map(|request| Inventory::block(request.hash))
+                .map(|request| Inventory {
+                    kind: if compact_peers.contains(&peer) {
+                        InventoryKind::CompactBlock
+                    } else {
+                        InventoryKind::Block
+                    },
+                    hash: request.hash.into_inner(),
+                })
                 .collect::<Vec<_>>();
             let result = peers
                 .try_send(
@@ -3867,6 +4251,8 @@ async fn refresh_diagnostics(
     reconnects: &HashMap<SocketAddr, ReconnectState>,
     addresses: &BoundedAddressBook,
     bans: &PeerBanBook,
+    compact_peers: &HashSet<PeerId>,
+    pending_compact_blocks: &HashMap<BlockHash, PendingCompactBlock>,
     checkpoint_sequence: u64,
 ) {
     let snapshots = peers.snapshots().await;
@@ -3889,6 +4275,8 @@ async fn refresh_diagnostics(
         .map(|(address, _)| peer_address_group(address.ip()))
         .collect::<HashSet<_>>()
         .len();
+    state.compact_peers = compact_peers.len();
+    state.pending_compact_blocks = pending_compact_blocks.len();
 }
 
 async fn flush_address_book(
@@ -4650,6 +5038,143 @@ mod tests {
             vec![explicit, second_group],
             "simultaneous discovered attempts must reserve unique groups"
         );
+    }
+
+    #[tokio::test]
+    async fn compact_block_requests_missing_transactions_over_peer_and_reconstructs() {
+        assert_eq!(
+            COMPACT_BLOCK_RESPONSE_TIMEOUT,
+            Duration::from_secs(30),
+            "HSD disconnects a peer after a 30-second blocktxn stall"
+        );
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis header");
+        let mut block = linked_validator_block(1, &genesis.header);
+        block.transactions.push(Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    txid: Txid::new([0x44; 32]),
+                    index: 0,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: block.transactions[0].outputs.clone(),
+            locktime: 0,
+        });
+        block.header.merkle_root = block_merkle_root(&block);
+        block.header.witness_root = block_witness_root(&block);
+        block.header.nonce = 0;
+        while !block.header.verify_pow() {
+            block.header.nonce = block.header.nonce.checked_add(1).expect("regtest nonce");
+        }
+        service
+            .shadow_sync_import_headers(vec![block.header.clone()])
+            .expect("block header");
+        let node = Arc::new(Mutex::new(service));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let accepted = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        let (peers, _events) = LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+            .expect("peer manager");
+        let peer = peers.connect(address).await.expect("connect");
+        let server = accepted.await.expect("accept task");
+        let mut reader = hns_p2p::AsyncFrameReader::new(server, hns_p2p::NetworkMagic::Regtest);
+        assert!(matches!(
+            reader.read_packet().await.expect("version packet"),
+            Packet::Version(_)
+        ));
+
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        scheduler
+            .register_peer(peer, SERVICE_NETWORK, 1)
+            .expect("register peer");
+        scheduler
+            .announce_block(peer, block.hash(), 1)
+            .expect("announce block");
+        let (validation, mut results) =
+            spawn_validation_pipeline(Arc::new(HnsBodyValidator::new(Network::Regtest)), 1, 8)
+                .expect("validation pipeline");
+        let compact = CompactBlock::from_block_with_nonce(&block, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let compact_peers = HashSet::from([peer]);
+        let mut pending = HashMap::new();
+        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
+
+        handle_compact_block(
+            peer,
+            compact,
+            &node,
+            &peers,
+            &validation,
+            &mut scheduler,
+            &compact_peers,
+            &mut pending,
+            false,
+            &diagnostics,
+        )
+        .await
+        .expect("partial compact block");
+        assert_eq!(pending.len(), 1);
+        let request = match tokio::time::timeout(Duration::from_secs(1), reader.read_packet())
+            .await
+            .expect("getblocktxn timeout")
+            .expect("getblocktxn packet")
+        {
+            Packet::GetBlockTxn(request) => request,
+            packet => panic!("expected getblocktxn, got {packet:?}"),
+        };
+        assert_eq!(request.block_hash, block.hash());
+        assert_eq!(request.indexes, vec![1]);
+
+        let response = CompactBlockResponse::from_block(&block, &request);
+        handle_block_transactions(
+            PeerId(u64::MAX),
+            response.clone(),
+            &node,
+            &peers,
+            &validation,
+            &mut scheduler,
+            &mut pending,
+            &diagnostics,
+        )
+        .await
+        .expect("ignore another peer's blocktxn response");
+        assert_eq!(pending.len(), 1);
+
+        handle_block_transactions(
+            peer,
+            response,
+            &node,
+            &peers,
+            &validation,
+            &mut scheduler,
+            &mut pending,
+            &diagnostics,
+        )
+        .await
+        .expect("blocktxn response");
+        assert!(pending.is_empty());
+        let validated = tokio::time::timeout(Duration::from_secs(1), results.recv())
+            .await
+            .expect("validation timeout")
+            .expect("validation result")
+            .expect("valid reconstructed block");
+        assert_eq!(validated.block, block);
+        let state = diagnostics.read().await.clone();
+        assert_eq!(state.received_compact_blocks, 1);
+        assert_eq!(state.reconstructed_compact_blocks, 1);
+        assert_eq!(state.received_blocks, 1);
+        assert_eq!(state.compact_block_fallbacks, 0);
+
+        peers.disconnect_all().await;
     }
 
     #[test]

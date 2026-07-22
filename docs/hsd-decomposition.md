@@ -41,7 +41,7 @@ update those values, but it may not approximate or omit them.
 |---|---|
 | `lib/mempool/mempool.js`, entry types, contract state | Retain validation, conflicts, ancestors/descendants, claims, airdrops, covenant/update limits, fee/weight ordering, connect/disconnect/reorg reconciliation, and bounded orphans. Remove wallet/address indexes and broad query conveniences. |
 | `lib/mempool/fees.js` | Historical fee estimation is optional. Exact entry fees and package rates used by template ordering are mandatory. |
-| `lib/net/bip152.js` | Compact-block support is a later propagation optimization, not a prerequisite for initial correctness. Full block relay remains mandatory. |
+| `lib/net/bip152.js` | Retain exact compact-block negotiation, witness short IDs, differential indexes, bounded reconstruction/fallback, and recent-block serving. Full block relay remains the compatibility and failure fallback. |
 | `lib/workers/*` | Preserve bounded parallel stateless verification, but use native Rust worker pools and immutable inputs rather than porting the child-process protocol. |
 | `lib/blockchain/migrations.js`, `lib/migrations/*` | Implement explicit `hsrd` schema migrations and import tools. Do not inherit unrelated `hsd` product schema merely for compatibility. |
 | `lib/node/fullnode.js` | Recompose only chain, store, minimal mempool, P2P/sync, mining, metrics, and bounded control. Its DNS, HTTP, and broad RPC components are separable constructors and are not mining dependencies. |

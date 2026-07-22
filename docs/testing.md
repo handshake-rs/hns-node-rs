@@ -141,6 +141,12 @@ Current evidence includes:
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,
   `noRelay`, ASCII handling, inventory, locators, headers, blocks, and rejects;
+- byte-for-byte pinned-HSD SENDCMPCT, CMPCTBLOCK, GETBLOCKTXN, and BLOCKTXN
+  frames, including header/nonce-derived witness short IDs and differential
+  transaction indexes;
+- compact-block mempool filling, exact missing-index completion, duplicate-ID
+  rejection, and a managed-peer TCP request/reconstruction regression through
+  the normal validation path;
 - pinned HSD DNS seed/port selection, bounded address admission and eviction,
   unroutable/service/key/timestamp filtering, and failed discovered-target
   rotation without displacement of explicit reconnect peers;

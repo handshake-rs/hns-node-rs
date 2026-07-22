@@ -136,6 +136,9 @@
 - HSD-shaped per-peer `GETDATA` batching, atomic failed-admission rollback,
   60/120-second header/block deadlines, and one connection-level action per
   expired block batch.
+- HSD version-1 compact-block negotiation and exact BIP152 wire behavior,
+  bounded witness-short-ID/mempool reconstruction, missing-transaction
+  completion, collision fallback, and recent-block serving.
 - Cross-stage body reservations and pruning-aware per-hash `notfound` evidence;
   honest unavailability fails over without contaminating peer or invalid-block
   counters, cross-peer cancellation is rejected, and the canonical acquisition
@@ -230,7 +233,7 @@ These are substantial foundations, not a production full node.
 - Brontide, long-lived subthreshold reputation, broader peer-diversity controls
   beyond implemented HSD network-prefix grouping, and adversarial network
   qualification.
-- Compact-block reconstruction and pruning-aware synchronization.
+- Pruning-aware synchronization and sustained compact-relay WAN qualification.
 - Production-complete contextual peer transaction admission and relay.
 - Sustained multipath publication and reconnect/retry supervision under WAN
   partitions and queue saturation.

@@ -278,6 +278,10 @@ Implemented:
   120-second behavior; one expired block batch disconnects its peer once while
   retaining per-block retry accounting. A valid response already in transit
   remains admissible if it wins the timeout/disconnect race.
+- HSD-compatible `SENDCMPCT` negotiation and BIP152 `CMPCTBLOCK`,
+  `GETBLOCKTXN`, and `BLOCKTXN` codecs. Negotiated peers use witness-hash
+  short IDs, bounded mempool-assisted reconstruction, exact missing-transaction
+  requests, collision fallback, and recent-block compact serving.
 - Bounded oldest-first orphan retention for non-canonical descendants only
   after the block's header context is known and the body passes stateless
   validation. Bodies with no known header context are dropped after requesting
@@ -296,8 +300,9 @@ Implemented:
   local blocks. Contextual-invalid roots and known descendants are durably
   failed with atomic header fallback; local storage/backend faults stop sync
   without poisoning the branch.
-- Read-only bounded serving of headers, block inventory, retained bodies,
-  learned routable addresses, and empty mempool inventory responses.
+- Read-only bounded serving of headers, block inventory, retained full or
+  compact bodies, requested block transactions, learned routable addresses,
+  and empty mempool inventory responses.
 - Read-only peer and synchronization diagnostics.
 - Default observation-only storage plus an opt-in non-authoritative active-state
   connector. Neither mode can authorize mining work in `shadow` authority mode.
@@ -310,7 +315,7 @@ Still release-blocking:
 
 - Brontide transport, long-lived subthreshold peer reputation, and broader
   adversarial network qualification;
-- contextually complete transaction admission and compact-block reconstruction;
+- contextually complete transaction admission and relay;
 - production qualification of contextual active-state IBD across full mainnet
   replay and sustained reorganizations;
 - pruning-aware synchronization, invalid-branch pruning policy, and production
