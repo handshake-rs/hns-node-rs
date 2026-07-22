@@ -127,7 +127,8 @@ Implemented:
 - exact bounded HNS frames and sync-relevant packets with HSD oracle fixtures;
 - inbound/outbound plaintext sessions and VERSION/VERACK negotiation;
 - process-local self-connection detection, service checks, timeouts, ping/pong,
-  and priority outbound lanes;
+  priority outbound lanes, and cancellation-safe partial frame reads across
+  timer maintenance;
 - bounded peer registration, scoring, disconnect, diagnostics, and reconnect;
 - headers-first acquisition, 2,000-header atomic durable protocol batches,
   best-work retention, and independent canonical-header derivation of BIP9
@@ -136,6 +137,9 @@ Implemented:
   an orphan-horizon canonical window, and pruning-aware `notfound` failover
   that does not fabricate failures or let canonical acquisition alone overrun
   the retained-orphan count bound;
+- HSD-shaped per-peer `GETDATA` inventories with atomic failed-admission
+  rollback, HSD's 60/120-second header/block deadlines, and one disconnect per
+  expired peer batch rather than per-hash score multiplication;
 - bounded known-header orphan handling;
 - parallel stateless body validation with ordered results;
 - durable permanent-invalid and invalid-child status, atomic best-header

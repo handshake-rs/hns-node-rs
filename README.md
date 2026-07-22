@@ -238,7 +238,8 @@ Implemented:
   fixtures.
 - Live inbound and explicit outbound plaintext TCP sessions with VERSION,
   VERACK, SENDHEADERS, PING/PONG, self-connection rejection, handshake/idle
-  timeouts, and byte counters.
+  timeouts, and byte counters. Partial frame reads remain pinned across timer
+  maintenance so a ping tick cannot desynchronize a large block payload.
 - Bounded critical, control, and normal outbound queues.
 - A bounded peer manager with connection limits, duplicate-address rejection,
   process-local scoring, disconnect thresholds, snapshots, and exponential
@@ -252,12 +253,16 @@ Implemented:
   The canonical download window never exceeds the configured orphan-count
   horizon, so that downloader alone cannot create count-bound eviction churn
   when a low body is delayed.
+  Selected hashes are coalesced into one bounded HSD-shaped `GETDATA` inventory
+  per peer. Failed queue admission atomically restores the exact scheduler
+  reservations without consuming a retry; transport-stale peers are removed
+  immediately, while queue pressure retains the live peer for a clean retry.
   Honest `notfound` responses exclude that peer only for the unavailable hash,
   fail over without consuming validation/transport retries, and remain distinct
-  from invalid-block evidence; timeouts and invalid responses retain their
-  separate retry, penalty, and reassignment behavior. A valid response already
-  in transit remains admissible after its request times out even while that
-  peer is in reassignment backoff.
+  from invalid-block evidence. Header and block deadlines match HSD's 60- and
+  120-second behavior; one expired block batch disconnects its peer once while
+  retaining per-block retry accounting. A valid response already in transit
+  remains admissible if it wins the timeout/disconnect race.
 - Bounded oldest-first orphan retention only after the block's header context is
   known and the body passes stateless validation. Bodies with no known header
   context are dropped after requesting headers.

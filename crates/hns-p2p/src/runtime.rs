@@ -428,107 +428,118 @@ where
             idle_deadline.min(handshake_deadline)
         };
 
-        tokio::select! {
-            frame = reader.read_frame() => {
-                let frame = frame?;
-                last_receive = Instant::now();
-                {
-                    let mut state = snapshot.write().await;
-                    state.last_receive = Some(unix_time());
-                    state.bytes_received = state.bytes_received.saturating_add(
-                        (crate::constants::FRAME_HEADER_SIZE + frame.payload.len()) as u64,
-                    );
-                }
-                let packet = frame.decode_packet()?;
-                if let Packet::Pong(nonce) = &packet {
-                    if let Some((expected, sent)) = challenge {
-                        if *nonce == expected {
-                            let elapsed = sent.elapsed().as_millis();
-                            snapshot.write().await.ping_millis = Some(elapsed.min(u128::from(u64::MAX)) as u64);
-                            challenge = None;
+        // `AsyncReadExt::read_exact` is not cancellation safe. Keep the same
+        // frame future alive when maintenance timers fire; recreating it after
+        // a partially consumed large payload would interpret payload bytes as
+        // the next nine-byte frame header and desynchronize the connection.
+        let frame = {
+            let mut frame_read = Box::pin(reader.read_frame());
+            loop {
+                tokio::select! {
+                    frame = &mut frame_read => break frame?,
+                    _ = ping.tick(), if handshake.is_ready() => {
+                        if let Some((_, sent)) = challenge {
+                            if sent.elapsed() >= config.pong_timeout {
+                                return Err(P2pError::Timeout("peer did not answer ping".to_owned()));
+                            }
+                        } else {
+                            nonce_counter = nonce_counter.wrapping_add(1);
+                            let nonce = nonce_counter.to_le_bytes();
+                            challenge = Some((nonce, Instant::now()));
+                            control_tx
+                                .send(Arc::new(Packet::Ping(nonce)))
+                                .await
+                                .map_err(|_| P2pError::PeerUnavailable(id))?;
+                        }
+                    }
+                    _ = sleep_until(deadline) => {
+                        if !handshake.is_ready() && Instant::now() >= handshake_deadline {
+                            return Err(P2pError::Timeout("peer handshake timed out".to_owned()));
+                        }
+                        return Err(P2pError::Timeout("peer idle timeout expired".to_owned()));
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return Err(P2pError::Disconnected("peer was disconnected locally".to_owned()));
                         }
                     }
                 }
+            }
+        };
 
-                let update = handshake.receive(&packet)?;
-                // HSD's inbound side waits for the remote version before sending
-                // its own introduction. Queue local VERSION before VERACK so the
-                // peer observes the same handshake ordering.
-                if direction == PeerDirection::Inbound
-                    && matches!(&packet, Packet::Version(_))
-                    && !handshake.local_version_sent()
-                {
-                    let version = handshake.local_version(local_version.clone())?;
-                    control_tx
-                        .send(Arc::new(version))
-                        .await
-                        .map_err(|_| P2pError::PeerUnavailable(id))?;
+        last_receive = Instant::now();
+        {
+            let mut state = snapshot.write().await;
+            state.last_receive = Some(unix_time());
+            state.bytes_received = state
+                .bytes_received
+                .saturating_add((crate::constants::FRAME_HEADER_SIZE + frame.payload.len()) as u64);
+        }
+        let packet = frame.decode_packet()?;
+        if let Packet::Pong(nonce) = &packet {
+            if let Some((expected, sent)) = challenge {
+                if *nonce == expected {
+                    let elapsed = sent.elapsed().as_millis();
+                    snapshot.write().await.ping_millis =
+                        Some(elapsed.min(u128::from(u64::MAX)) as u64);
+                    challenge = None;
                 }
-                for response in update.responses {
-                    control_tx
-                        .send(Arc::new(response))
-                        .await
-                        .map_err(|_| P2pError::PeerUnavailable(id))?;
-                }
-                if let Some(version) = handshake.remote_version() {
-                    let mut state = snapshot.write().await;
-                    state.protocol_version = Some(version.version);
-                    state.services = version.services;
-                    state.advertised_height = Some(version.height);
-                    state.agent = Some(version.agent.clone());
-                    state.no_relay = version.no_relay;
-                }
-                if update.became_ready {
-                    snapshot.write().await.state = PeerState::Ready;
-                    control_tx
-                        .send(Arc::new(Packet::SendHeaders))
-                        .await
-                        .map_err(|_| P2pError::PeerUnavailable(id))?;
-                    let version = handshake
-                        .remote_version()
-                        .cloned()
-                        .ok_or_else(|| P2pError::Protocol("ready handshake has no remote version".to_owned()))?;
-                    events
-                        .send(PeerEvent::Ready { peer: id, version })
-                        .await
-                        .map_err(|_| P2pError::EventChannelClosed)?;
-                }
+            }
+        }
 
-                if handshake.is_ready()
-                    && !matches!(&packet, Packet::Version(_) | Packet::Verack | Packet::Ping(_) | Packet::Pong(_))
-                {
-                    events
-                        .send(PeerEvent::Packet { peer: id, packet })
-                        .await
-                        .map_err(|_| P2pError::EventChannelClosed)?;
-                }
-            }
-            _ = ping.tick(), if handshake.is_ready() => {
-                if let Some((_, sent)) = challenge {
-                    if sent.elapsed() >= config.pong_timeout {
-                        return Err(P2pError::Timeout("peer did not answer ping".to_owned()));
-                    }
-                } else {
-                    nonce_counter = nonce_counter.wrapping_add(1);
-                    let nonce = nonce_counter.to_le_bytes();
-                    challenge = Some((nonce, Instant::now()));
-                    control_tx
-                        .send(Arc::new(Packet::Ping(nonce)))
-                        .await
-                        .map_err(|_| P2pError::PeerUnavailable(id))?;
-                }
-            }
-            _ = sleep_until(deadline) => {
-                if !handshake.is_ready() && Instant::now() >= handshake_deadline {
-                    return Err(P2pError::Timeout("peer handshake timed out".to_owned()));
-                }
-                return Err(P2pError::Timeout("peer idle timeout expired".to_owned()));
-            }
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() {
-                    return Err(P2pError::Disconnected("peer was disconnected locally".to_owned()));
-                }
-            }
+        let update = handshake.receive(&packet)?;
+        // HSD's inbound side waits for the remote version before sending
+        // its own introduction. Queue local VERSION before VERACK so the
+        // peer observes the same handshake ordering.
+        if direction == PeerDirection::Inbound
+            && matches!(&packet, Packet::Version(_))
+            && !handshake.local_version_sent()
+        {
+            let version = handshake.local_version(local_version.clone())?;
+            control_tx
+                .send(Arc::new(version))
+                .await
+                .map_err(|_| P2pError::PeerUnavailable(id))?;
+        }
+        for response in update.responses {
+            control_tx
+                .send(Arc::new(response))
+                .await
+                .map_err(|_| P2pError::PeerUnavailable(id))?;
+        }
+        if let Some(version) = handshake.remote_version() {
+            let mut state = snapshot.write().await;
+            state.protocol_version = Some(version.version);
+            state.services = version.services;
+            state.advertised_height = Some(version.height);
+            state.agent = Some(version.agent.clone());
+            state.no_relay = version.no_relay;
+        }
+        if update.became_ready {
+            snapshot.write().await.state = PeerState::Ready;
+            control_tx
+                .send(Arc::new(Packet::SendHeaders))
+                .await
+                .map_err(|_| P2pError::PeerUnavailable(id))?;
+            let version = handshake.remote_version().cloned().ok_or_else(|| {
+                P2pError::Protocol("ready handshake has no remote version".to_owned())
+            })?;
+            events
+                .send(PeerEvent::Ready { peer: id, version })
+                .await
+                .map_err(|_| P2pError::EventChannelClosed)?;
+        }
+
+        if handshake.is_ready()
+            && !matches!(
+                &packet,
+                Packet::Version(_) | Packet::Verack | Packet::Ping(_) | Packet::Pong(_)
+            )
+        {
+            events
+                .send(PeerEvent::Packet { peer: id, packet })
+                .await
+                .map_err(|_| P2pError::EventChannelClosed)?;
         }
     }
 }
@@ -612,7 +623,24 @@ pub(crate) fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::duplex;
+    use crate::{
+        wire::{encode_frame, Frame, NetAddress, PacketType},
+        PROTOCOL_VERSION, SERVICE_NETWORK,
+    };
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    fn test_version(nonce: [u8; 8]) -> VersionPacket {
+        VersionPacket {
+            version: PROTOCOL_VERSION,
+            services: SERVICE_NETWORK,
+            time: 1_700_000_000,
+            remote: NetAddress::default(),
+            nonce,
+            agent: "/hsrd-runtime-test/".to_owned(),
+            height: 10,
+            no_relay: false,
+        }
+    }
 
     #[tokio::test]
     async fn critical_completion_waits_for_peer_writer_socket_write() {
@@ -658,5 +686,88 @@ mod tests {
         drop(control_tx);
         drop(normal_tx);
         writer.await.expect("writer join").expect("writer result");
+    }
+
+    #[tokio::test]
+    async fn maintenance_tick_does_not_cancel_a_partial_frame_read() {
+        let (peer_io, mut remote_io) = duplex(256 * 1024);
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let peer = PeerId(1);
+        let snapshot = Arc::new(RwLock::new(PeerSnapshot::new(
+            peer,
+            "127.0.0.1:12038".parse().expect("peer address"),
+            PeerDirection::Inbound,
+        )));
+        let config = PeerRuntimeConfig {
+            handshake_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+            ping_interval: Duration::from_millis(20),
+            pong_timeout: Duration::from_millis(200),
+            ..PeerRuntimeConfig::default()
+        };
+        let reader = tokio::spawn(peer_reader(
+            peer,
+            PeerDirection::Inbound,
+            test_version([1; 8]),
+            AsyncFrameReader::new(peer_io, NetworkMagic::Regtest),
+            config,
+            events_tx,
+            Arc::clone(&snapshot),
+            control_tx,
+            shutdown_rx,
+        ));
+
+        for packet in [Packet::Version(test_version([2; 8])), Packet::Verack] {
+            let frame = Frame::from_packet(&packet).expect("handshake frame");
+            remote_io
+                .write_all(&encode_frame(NetworkMagic::Regtest, &frame).expect("handshake bytes"))
+                .await
+                .expect("write handshake");
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("ready timeout")
+            .expect("ready event");
+        assert!(matches!(ready, PeerEvent::Ready { peer: target, .. } if target == peer));
+
+        let packet = Packet::Unknown {
+            packet_type: PacketType::Unknown(250),
+            payload: vec![0x5a; 128 * 1024],
+        };
+        let frame = Frame::from_packet(&packet).expect("large frame");
+        let encoded = encode_frame(NetworkMagic::Regtest, &frame).expect("large frame bytes");
+        let split = crate::constants::FRAME_HEADER_SIZE + 64;
+        remote_io
+            .write_all(&encoded[..split])
+            .await
+            .expect("write partial frame");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        remote_io
+            .write_all(&encoded[split..])
+            .await
+            .expect("finish partial frame");
+
+        let received = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("packet timeout")
+            .expect("packet event");
+        assert!(matches!(
+            received,
+            PeerEvent::Packet {
+                peer: target,
+                packet: received,
+            } if target == peer && received == packet
+        ));
+        assert!((0..4).any(
+            |_| matches!(control_rx.try_recv(), Ok(packet) if matches!(&*packet, Packet::Ping(_)))
+        ));
+
+        shutdown_tx.send(true).expect("shutdown reader");
+        assert!(matches!(
+            reader.await.expect("reader join"),
+            Err(P2pError::Disconnected(_))
+        ));
     }
 }

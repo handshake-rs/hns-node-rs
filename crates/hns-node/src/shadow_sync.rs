@@ -24,16 +24,16 @@ use hns_consensus::{
 use hns_mempool::Admission;
 use hns_p2p::{
     Inventory, InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket, OutboundPriority,
-    Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot,
+    P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot,
 };
 use hns_primitives::{Block, BlockHash, Header, Height, Txid};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
 use hns_store::mark_clean_shutdown;
 use hns_sync::{
-    spawn_validation_pipeline, BoundedOrphanPool, OrderedValidationResult, OrphanLimits,
-    OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction, SyncCheckpoint,
-    SyncLimits, SyncScheduler, SyncSnapshot, ValidationFailureKind, ValidationRejection,
-    ValidationRequest, ValidationSubmitter,
+    spawn_validation_pipeline, BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult,
+    OrphanLimits, OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction,
+    SyncCheckpoint, SyncLimits, SyncScheduler, SyncSnapshot, ValidationFailureKind,
+    ValidationRejection, ValidationRequest, ValidationSubmitter,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -614,13 +614,23 @@ impl NodeService {
                             break;
                         }
                     };
-                    let actions = scheduler.poll(StdInstant::now(), &locator);
-                    for action in actions {
-                        if let Err(error) = apply_sync_action(
-                            action,
+                    let dispatches = match batch_sync_actions(
+                        scheduler.poll(StdInstant::now(), &locator),
+                    ) {
+                        Ok(dispatches) => dispatches,
+                        Err(error) => {
+                            let error = error.context("failed to batch synchronization actions");
+                            record_error(&diagnostics, error.to_string()).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    };
+                    for dispatch in dispatches {
+                        if let Err(error) = apply_sync_dispatch(
+                            dispatch,
                             &peers,
                             &checkpoint_store,
-                            &scheduler,
+                            &mut scheduler,
                             &mut checkpoint_sequence,
                         )
                         .await
@@ -2410,71 +2420,189 @@ async fn penalize_peer(
     score: u32,
     reason: &str,
 ) -> Result<i32> {
-    let total = peers
-        .penalize(peer, score)
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to penalize peer: {error}"))?;
+    let total = peers.penalize(peer, score).await?;
     tracing::debug!(?peer, score, total, %reason, "penalized HNS peer");
     if total >= 100 {
-        peers
-            .disconnect(peer)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to disconnect peer: {error}"))?;
+        peers.disconnect(peer).await?;
     }
     Ok(total)
 }
 
-async fn apply_sync_action(
-    action: SyncAction,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SyncDispatch {
+    Action(SyncAction),
+    BlockBatch {
+        peer: PeerId,
+        requests: Vec<BlockDownloadRequest>,
+    },
+}
+
+fn flush_block_dispatches(
+    dispatches: &mut Vec<SyncDispatch>,
+    batches: &mut Vec<(PeerId, Vec<BlockDownloadRequest>)>,
+) {
+    for (peer, requests) in batches.drain(..) {
+        dispatches.extend(requests.chunks(MAX_GETDATA_ITEMS).map(|requests| {
+            SyncDispatch::BlockBatch {
+                peer,
+                requests: requests.to_vec(),
+            }
+        }));
+    }
+}
+
+/// HSD's `Peer#getBlock` sends one `GETDATA` inventory per peer for a selected
+/// hash batch. Preserve non-block action boundaries while coalescing the
+/// scheduler's per-hash reservations into the same bounded wire shape.
+fn batch_sync_actions(actions: Vec<SyncAction>) -> Result<Vec<SyncDispatch>> {
+    let mut dispatches = Vec::with_capacity(actions.len());
+    let mut batches: Vec<(PeerId, Vec<BlockDownloadRequest>)> = Vec::new();
+
+    for action in actions {
+        match action {
+            SyncAction::RequestBlock(request) => {
+                let peer = request
+                    .peer
+                    .ok_or_else(|| anyhow::anyhow!("block request has no selected peer"))?;
+                if let Some((_, requests)) = batches
+                    .iter_mut()
+                    .find(|(batch_peer, _)| *batch_peer == peer)
+                {
+                    requests.push(request);
+                } else {
+                    batches.push((peer, vec![request]));
+                }
+            }
+            action => {
+                flush_block_dispatches(&mut dispatches, &mut batches);
+                dispatches.push(SyncDispatch::Action(action));
+            }
+        }
+    }
+    flush_block_dispatches(&mut dispatches, &mut batches);
+    Ok(dispatches)
+}
+
+fn dispatch_failure_is_stale(error: &P2pError) -> bool {
+    matches!(
+        error,
+        P2pError::PeerUnavailable(_) | P2pError::Disconnected(_)
+    )
+}
+
+async fn apply_sync_dispatch(
+    dispatch: SyncDispatch,
     peers: &LivePeerManager,
     checkpoints: &StoredSyncCheckpoint<hns_store::StoreHandle>,
-    scheduler: &SyncScheduler,
+    scheduler: &mut SyncScheduler,
     checkpoint_sequence: &mut u64,
 ) -> Result<()> {
-    match action {
-        SyncAction::RequestHeaders {
+    match dispatch {
+        SyncDispatch::Action(SyncAction::RequestHeaders {
             peer,
             locator,
             stop,
-        } => peers
-            .try_send(
-                peer,
-                Arc::new(Packet::GetHeaders(LocatorPacket { locator, stop })),
-                OutboundPriority::Control,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to request headers: {error}")),
-        SyncAction::RequestBlock(request) => {
-            let peer = request
-                .peer
-                .ok_or_else(|| anyhow::anyhow!("block request has no selected peer"))?;
-            peers
+        }) => {
+            if !scheduler.contains_peer(peer) {
+                return Ok(());
+            }
+            let result = peers
                 .try_send(
                     peer,
-                    Arc::new(Packet::GetData(vec![Inventory::block(request.hash)])),
+                    Arc::new(Packet::GetHeaders(LocatorPacket { locator, stop })),
                     OutboundPriority::Control,
                 )
-                .await
-                .map_err(|error| anyhow::anyhow!("failed to request block: {error}"))
+                .await;
+            if let Err(error) = result {
+                scheduler.rollback_header_dispatch(peer);
+                if dispatch_failure_is_stale(&error) {
+                    scheduler.remove_peer(peer);
+                }
+                anyhow::bail!("failed to request headers: {error}");
+            }
+            Ok(())
         }
-        SyncAction::Penalize {
+        SyncDispatch::BlockBatch { peer, requests } => {
+            // An earlier action in this poll may have discovered that the
+            // transport already dropped the peer. `remove_peer` atomically
+            // requeued all of its reservations, so this stale batch is done.
+            if !scheduler.contains_peer(peer) {
+                return Ok(());
+            }
+            if requests.is_empty() {
+                anyhow::bail!("block request batch is empty");
+            }
+            if requests.len() > MAX_GETDATA_ITEMS {
+                anyhow::bail!(
+                    "block request batch has {} items; maximum is {MAX_GETDATA_ITEMS}",
+                    requests.len()
+                );
+            }
+            if requests.iter().any(|request| request.peer != Some(peer)) {
+                anyhow::bail!("block request batch contains a mismatched peer");
+            }
+            let inventory = requests
+                .iter()
+                .map(|request| Inventory::block(request.hash))
+                .collect::<Vec<_>>();
+            let result = peers
+                .try_send(
+                    peer,
+                    Arc::new(Packet::GetData(inventory)),
+                    OutboundPriority::Control,
+                )
+                .await;
+            if let Err(error) = result {
+                let rollback = scheduler.rollback_block_dispatch(peer, &requests);
+                if dispatch_failure_is_stale(&error) {
+                    scheduler.remove_peer(peer);
+                }
+                if let Err(rollback) = rollback {
+                    anyhow::bail!(
+                        "failed to request block batch ({error}) and roll back scheduler state: {rollback}"
+                    );
+                }
+                anyhow::bail!(
+                    "failed to request {}-block batch from {peer:?}: {error}",
+                    requests.len()
+                );
+            }
+            Ok(())
+        }
+        SyncDispatch::Action(SyncAction::Penalize {
             peer,
             score,
             reason,
-        } => {
-            penalize_peer(peers, peer, score, &reason).await?;
+        }) => {
+            if !scheduler.contains_peer(peer) {
+                return Ok(());
+            }
+            if let Err(error) = penalize_peer(peers, peer, score, &reason).await {
+                if error
+                    .downcast_ref::<P2pError>()
+                    .is_some_and(dispatch_failure_is_stale)
+                {
+                    scheduler.remove_peer(peer);
+                }
+                return Err(error);
+            }
             Ok(())
         }
-        SyncAction::Disconnect { peer, reason } => {
+        SyncDispatch::Action(SyncAction::Disconnect { peer, reason }) => {
+            if !scheduler.contains_peer(peer) {
+                return Ok(());
+            }
             tracing::debug!(?peer, %reason, "disconnecting HNS peer");
-            peers
-                .disconnect(peer)
-                .await
-                .map_err(|error| anyhow::anyhow!("failed to disconnect peer: {error}"))
+            let result = peers.disconnect(peer).await;
+            scheduler.remove_peer(peer);
+            result.map_err(|error| anyhow::anyhow!("failed to disconnect peer: {error}"))
         }
-        SyncAction::PersistCheckpoint => {
+        SyncDispatch::Action(SyncAction::PersistCheckpoint) => {
             *checkpoint_sequence = checkpoint_sequence.saturating_add(1);
             persist_checkpoint(checkpoints, scheduler, *checkpoint_sequence)
+        }
+        SyncDispatch::Action(SyncAction::RequestBlock(_)) => {
+            anyhow::bail!("unbatched block request reached the dispatcher")
         }
     }
 }
@@ -2949,6 +3077,55 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(requested, vec![0, 1]);
+    }
+
+    #[test]
+    fn block_download_actions_batch_by_peer_without_crossing_action_boundaries() {
+        let first_peer = PeerId(1);
+        let second_peer = PeerId(2);
+        let request = |peer, byte, height| BlockDownloadRequest {
+            hash: BlockHash::new([byte; 32]),
+            height,
+            peer: Some(peer),
+            attempt: 1,
+        };
+        let actions = vec![
+            SyncAction::RequestHeaders {
+                peer: first_peer,
+                locator: vec![BlockHash::new([9; 32])],
+                stop: BlockHash::ZERO,
+            },
+            SyncAction::RequestBlock(request(first_peer, 1, 1)),
+            SyncAction::RequestBlock(request(second_peer, 2, 2)),
+            SyncAction::RequestBlock(request(first_peer, 3, 3)),
+            SyncAction::PersistCheckpoint,
+        ];
+
+        let dispatches = batch_sync_actions(actions).expect("batched actions");
+        assert_eq!(dispatches.len(), 4);
+        assert!(matches!(
+            &dispatches[0],
+            SyncDispatch::Action(SyncAction::RequestHeaders { peer, .. })
+                if *peer == first_peer
+        ));
+        assert!(matches!(
+            &dispatches[1],
+            SyncDispatch::BlockBatch { peer, requests }
+                if *peer == first_peer
+                    && requests.iter().map(|request| request.height).collect::<Vec<_>>()
+                        == vec![1, 3]
+        ));
+        assert!(matches!(
+            &dispatches[2],
+            SyncDispatch::BlockBatch { peer, requests }
+                if *peer == second_peer
+                    && requests.iter().map(|request| request.height).collect::<Vec<_>>()
+                        == vec![2]
+        ));
+        assert!(matches!(
+            &dispatches[3],
+            SyncDispatch::Action(SyncAction::PersistCheckpoint)
+        ));
     }
 
     #[test]

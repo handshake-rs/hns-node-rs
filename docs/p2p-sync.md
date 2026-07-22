@@ -98,6 +98,11 @@ Each live peer has:
 - a local misbehavior score;
 - handshake, idle, ping, and pong timeouts.
 
+The in-progress frame read is retained when ping, idle, or shutdown maintenance
+runs. Tokio's exact-read future is not cancellation safe after consuming a
+partial header or payload, so dropping and recreating that future would lose
+stream bytes and eventually report a false network-magic mismatch.
+
 Outbound peers must advertise `SERVICE_NETWORK`. Duplicate socket addresses are
 rejected. One unpredictable process-local nonce is shared by local sessions, so
 an outbound connection that reaches the node's own listener observes the same
@@ -171,9 +176,20 @@ qualification evidence in headers-only mode.
 ## Block-body synchronization
 
 Canonical headers without stored bodies enter a bounded pending queue. Requests
-are limited globally and per peer. Timeouts increase peer failures, requeue work
-onto other eligible peers, and eventually disconnect a peer after the retry
-budget is exhausted.
+are limited globally and per peer. All hashes selected for one peer in a poll
+are encoded in one bounded HSD-shaped `GETDATA` inventory. Polling reserves the
+individual hashes before transport admission; if that single packet cannot
+enter the outbound queue, the exact batch is atomically restored without
+consuming an attempt. A missing transport peer is removed from scheduler state
+immediately, while queue saturation retains the live peer for a later retry.
+Header-request admission is rolled back under the same rule.
+
+HSD uses a 60-second response deadline for `GETHEADERS` and a 120-second block
+deadline. The scheduler uses those defaults. A timed-out body batch requeues its
+per-block work and emits only one disconnect for the peer, matching HSD's
+connection-level stall handling instead of multiplying a score by the number
+of hashes in the packet. Retry exhaustion remains tracked per block across
+peer assignments.
 
 The current scheduler keeps one in-flight request per block. A future latency
 optimization may use bounded, staggered hedged requests: ask the preferred peer
@@ -203,9 +219,9 @@ inflight request, records it separately, excludes that peer for the hash for
 the rest of that peer connection, and immediately permits another peer without
 consuming the transport or validation retry budget. An unsolicited or
 cross-peer `notfound` cannot cancel another peer's request.
-A request timeout still delays new assignment to that peer, but an already
-in-transit response for the bounded pending hash remains admissible and fully
-validated instead of being discarded during backoff.
+An already in-transit response for a bounded pending hash remains admissible and
+fully validated if it reaches the scheduler before the timeout's peer
+disconnect is applied.
 
 The stateless validation worker first authenticates both body roots against the
 known header. Above the final checkpoint it then verifies full block-body

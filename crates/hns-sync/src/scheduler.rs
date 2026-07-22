@@ -30,8 +30,10 @@ impl Default for SyncLimits {
             maximum_inflight_blocks: 128,
             maximum_inflight_per_peer: 16,
             maximum_retries: 3,
-            block_request_timeout: Duration::from_secs(20),
-            headers_request_timeout: Duration::from_secs(15),
+            // Match HSD's `Peer.BLOCK_TIMEOUT` and the doubled 30-second
+            // response deadline attached to `GETHEADERS`.
+            block_request_timeout: Duration::from_secs(120),
+            headers_request_timeout: Duration::from_secs(60),
             checkpoint_interval: Duration::from_secs(30),
         }
     }
@@ -324,6 +326,23 @@ impl SyncScheduler {
         });
         self.recalculate_target();
         self.bump_sequence();
+    }
+
+    pub fn contains_peer(&self, peer: PeerId) -> bool {
+        self.peers.contains_key(&peer)
+    }
+
+    /// Release a header request which never entered the peer's outbound
+    /// queue so the next poll can retry it without waiting for a timeout.
+    pub fn rollback_header_dispatch(&mut self, peer: PeerId) -> bool {
+        let Some(state) = self.peers.get_mut(&peer) else {
+            return false;
+        };
+        if state.headers_requested_at.take().is_none() {
+            return false;
+        }
+        self.bump_sequence();
+        true
     }
 
     pub fn set_best_header(&mut self, tip: Option<ChainTip>) {
@@ -631,6 +650,67 @@ impl SyncScheduler {
         Ok(())
     }
 
+    /// Roll back a block-request batch which never entered the peer's
+    /// outbound queue. Polling reserves every request as inflight before the
+    /// transport is touched; a queue-admission race must therefore restore
+    /// the exact pending work without consuming a network retry attempt.
+    pub fn rollback_block_dispatch(
+        &mut self,
+        peer: PeerId,
+        requests: &[BlockDownloadRequest],
+    ) -> Result<(), SyncError> {
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            if request.peer != Some(peer) {
+                return Err(SyncError::UnexpectedBlock(format!(
+                    "block {} dispatch peer {:?} disagrees with batch peer {peer:?}",
+                    request.hash.to_hex(),
+                    request.peer
+                )));
+            }
+            if !seen.insert(request.hash) {
+                return Err(SyncError::UnexpectedBlock(format!(
+                    "block dispatch batch repeats {}",
+                    request.hash.to_hex()
+                )));
+            }
+            let Some(inflight) = self.inflight.get(&request.hash) else {
+                return Err(SyncError::UnexpectedBlock(format!(
+                    "cannot roll back non-inflight block {}",
+                    request.hash.to_hex()
+                )));
+            };
+            if inflight.request != *request {
+                return Err(SyncError::UnexpectedBlock(format!(
+                    "block {} dispatch no longer matches its inflight request",
+                    request.hash.to_hex()
+                )));
+            }
+        }
+
+        let mut pending = Vec::with_capacity(requests.len());
+        for request in requests {
+            let inflight = self
+                .inflight
+                .remove(&request.hash)
+                .expect("dispatch rollback was validated above");
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.inflight.remove(&request.hash);
+            }
+            pending.push((
+                inflight.request.hash,
+                inflight.request.height,
+                inflight.attempts.saturating_sub(1),
+            ));
+        }
+        for (hash, height, attempts) in pending {
+            self.requeue(hash, height, attempts, None);
+        }
+        self.update_stage();
+        self.bump_sequence();
+        Ok(())
+    }
+
     pub fn reject_block(
         &mut self,
         peer: Option<PeerId>,
@@ -823,9 +903,8 @@ impl SyncScheduler {
             }) {
                 state.headers_requested_at = None;
                 state.failures = state.failures.saturating_add(1);
-                actions.push(SyncAction::Penalize {
+                actions.push(SyncAction::Disconnect {
                     peer: *peer,
-                    score: 5,
                     reason: "headers request timed out".to_owned(),
                 });
             }
@@ -841,6 +920,7 @@ impl SyncScheduler {
                     .then_some(*hash)
             })
             .collect::<Vec<_>>();
+        let mut disconnects = BTreeMap::new();
         for hash in expired {
             let Some(item) = self.inflight.remove(&hash) else {
                 continue;
@@ -850,11 +930,9 @@ impl SyncScheduler {
                     state.inflight.remove(&hash);
                     state.failures = state.failures.saturating_add(1);
                 }
-                actions.push(SyncAction::Penalize {
-                    peer,
-                    score: 10,
-                    reason: format!("block {} request timed out", hash.to_hex()),
-                });
+                disconnects
+                    .entry(peer)
+                    .or_insert_with(|| format!("block {} request timed out", hash.to_hex()));
             }
             if item.attempts < self.limits.maximum_retries {
                 let retry_backoff = item
@@ -873,10 +951,17 @@ impl SyncScheduler {
                 // can reconsider it after the peer is disconnected.
                 self.tracked.remove(&hash);
                 self.unavailable_by.remove(&hash);
-                actions.push(SyncAction::Disconnect {
+                disconnects.insert(
                     peer,
-                    reason: format!("block {} exhausted retry budget", hash.to_hex()),
-                });
+                    format!("block {} exhausted retry budget", hash.to_hex()),
+                );
+            }
+        }
+        for (peer, reason) in disconnects {
+            if !actions.iter().any(
+                |action| matches!(action, SyncAction::Disconnect { peer: queued, .. } if *queued == peer),
+            ) {
+                actions.push(SyncAction::Disconnect { peer, reason });
             }
         }
     }
@@ -1046,7 +1131,7 @@ mod tests {
         let actions = scheduler.poll(now + Duration::from_millis(11), &[tip(2, 8).hash]);
         assert!(actions.iter().any(|action| matches!(
             action,
-            SyncAction::Penalize {
+            SyncAction::Disconnect {
                 peer: PeerId(1),
                 ..
             }
@@ -1086,6 +1171,101 @@ mod tests {
     }
 
     #[test]
+    fn failed_outbound_batch_rolls_back_without_consuming_attempts() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 2,
+            maximum_inflight_per_peer: 2,
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        let peer = PeerId(1);
+        scheduler
+            .register_peer(peer, SERVICE_NETWORK, 10)
+            .expect("peer");
+        let first = BlockHash::new([3; 32]);
+        let second = BlockHash::new([4; 32]);
+        scheduler.queue_block(first, 1).expect("first body");
+        scheduler.queue_block(second, 2).expect("second body");
+
+        let requests = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .filter_map(|action| match action {
+                SyncAction::RequestBlock(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.attempt == 1));
+        assert_eq!(scheduler.snapshot().inflight_blocks, 2);
+
+        scheduler
+            .rollback_block_dispatch(peer, &requests)
+            .expect("dispatch rollback");
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 2);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.tracked_blocks, 2);
+        assert_eq!(snapshot.peers[0].inflight_blocks, 0);
+        assert_eq!(snapshot.failed_blocks, 0);
+
+        let retried = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .filter_map(|action| match action {
+                SyncAction::RequestBlock(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retried.len(), 2);
+        assert!(retried.iter().all(|request| request.attempt == 1));
+    }
+
+    #[test]
+    fn expired_block_batch_disconnects_peer_once() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 2,
+            maximum_inflight_per_peer: 2,
+            block_request_timeout: Duration::from_millis(10),
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        let peer = PeerId(1);
+        scheduler
+            .register_peer(peer, SERVICE_NETWORK, 10)
+            .expect("peer");
+        scheduler
+            .queue_block(BlockHash::new([5; 32]), 1)
+            .expect("first body");
+        scheduler
+            .queue_block(BlockHash::new([6; 32]), 2)
+            .expect("second body");
+        assert_eq!(
+            scheduler
+                .poll(now, &[])
+                .into_iter()
+                .filter(|action| matches!(action, SyncAction::RequestBlock(_)))
+                .count(),
+            2
+        );
+
+        let actions = scheduler.poll(now + Duration::from_millis(11), &[]);
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, SyncAction::Disconnect { peer: target, .. } if *target == peer))
+                .count(),
+            1
+        );
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 2);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.failed_blocks, 0);
+    }
+
+    #[test]
     fn late_block_response_is_accepted_during_request_backoff() {
         let now = Instant::now();
         let limits = SyncLimits {
@@ -1113,7 +1293,7 @@ mod tests {
         let timeout = scheduler.poll(now + Duration::from_millis(11), &[]);
         assert!(timeout.iter().any(|action| matches!(
             action,
-            SyncAction::Penalize {
+            SyncAction::Disconnect {
                 peer: PeerId(1),
                 ..
             }
@@ -1341,7 +1521,13 @@ mod tests {
             .request_headers_from(PeerId(1), now, &locator, BlockHash::ZERO)
             .expect("second")
             .is_none());
+        assert!(scheduler.rollback_header_dispatch(PeerId(1)));
+        assert!(scheduler
+            .request_headers_from(PeerId(1), now, &locator, BlockHash::ZERO)
+            .expect("after rollback")
+            .is_some());
         scheduler.note_headers_response(PeerId(1), 0);
+        assert!(!scheduler.rollback_header_dispatch(PeerId(1)));
         assert!(scheduler
             .request_headers_from(PeerId(1), now, &locator, BlockHash::ZERO)
             .expect("after response")

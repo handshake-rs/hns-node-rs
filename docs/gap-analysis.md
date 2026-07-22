@@ -119,11 +119,15 @@
 - Exact bounded HNS framing and sync packet behavior with pinned HSD wire
   fixtures.
 - Live inbound/outbound plaintext peers with handshake, service, self-connect,
-  timeout, ping/pong, and priority-queue controls.
+  timeout, ping/pong, priority-queue controls, and cancellation-safe partial
+  frame reads across timer maintenance.
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
 - Headers-first synchronization with 2,000-header atomic protocol batches plus
   canonical-header BIP9/script-policy derivation and bounded
   pending/inflight/per-peer body requests, retry, timeout, and reassignment.
+- HSD-shaped per-peer `GETDATA` batching, atomic failed-admission rollback,
+  60/120-second header/block deadlines, and one connection-level action per
+  expired block batch.
 - Cross-stage body reservations and pruning-aware per-hash `notfound` evidence;
   honest unavailability fails over without contaminating peer or invalid-block
   counters, cross-peer cancellation is rejected, and the canonical acquisition

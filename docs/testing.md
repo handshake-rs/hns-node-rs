@@ -221,7 +221,8 @@ Tests must cover:
 Tests and fault harnesses should cover:
 
 - exact frame boundary handling, wrong magic, unknown packet types, truncation,
-  oversized payloads, and oversized collection counts;
+  oversized payloads, oversized collection counts, and partial large-frame
+  continuation across a ping maintenance tick;
 - inbound/outbound capacity races and duplicate-address registration;
 - process-local self-connection detection through the node's own listener;
 - handshake, idle, ping, pong, request, and reconnect timeouts;
@@ -229,6 +230,8 @@ Tests and fault harnesses should cover:
 - late-invalid header batches with full current-batch rollback;
 - known and unknown header/body ordering;
 - bounded pending/inflight/per-peer body requests and reassignment;
+- per-peer `GETDATA` batching, failed-admission retry rollback, HSD-aligned
+  header/block deadlines, and one disconnect action for a timed-out batch;
 - stateless validation result ordering despite out-of-order worker completion;
 - orphan count/byte eviction and local resubmission;
 - checkpoint corruption, stale checkpoint recovery, and `Validating` restart;
