@@ -270,6 +270,12 @@ pub trait SignatureVerifier: Send + Sync {
         signature: &[u8; 64],
         public_key: &[u8; 33],
     ) -> Result<bool, ScriptError>;
+
+    /// Whether this backend performs complete production signature
+    /// verification. Test doubles and unavailable backends remain fail closed.
+    fn is_consensus_complete(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -324,6 +330,10 @@ impl SignatureVerifier for NativeSignatureVerifier {
             .verify(message, signature, public_key)
             .map_err(map_secp_error)
     }
+
+    fn is_consensus_complete(&self) -> bool {
+        true
+    }
 }
 
 fn map_secp_error(error: SecpError) -> ScriptError {
@@ -359,6 +369,10 @@ impl<V: SignatureVerifier> TransactionInputVerifier for WitnessProgramVerifier<V
     ) -> Result<(), ConsensusError> {
         verify_witness_program(transaction, input_index, coin, self.flags, &self.signatures)
             .map_err(|error| ConsensusError::Authorization(error.to_string()))
+    }
+
+    fn is_consensus_complete(&self) -> bool {
+        self.flags.contains(ScriptFlags::MANDATORY) && self.signatures.is_consensus_complete()
     }
 }
 
@@ -1370,6 +1384,21 @@ mod tests {
                 items: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn verifier_completeness_requires_native_signature_backend() {
+        let unavailable = WitnessProgramVerifier::mandatory(UnavailableSignatureVerifier);
+        assert!(!unavailable.is_consensus_complete());
+        let native = WitnessProgramVerifier::mandatory(
+            NativeSignatureVerifier::new().expect("native signature verifier"),
+        );
+        assert!(native.is_consensus_complete());
+        let incomplete_flags = WitnessProgramVerifier::new(
+            NativeSignatureVerifier::new().expect("native signature verifier"),
+            ScriptFlags::NONE,
+        );
+        assert!(!incomplete_flags.is_consensus_complete());
     }
 
     #[test]

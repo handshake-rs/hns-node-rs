@@ -31,6 +31,9 @@ pub const MAX_ORPHAN_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PACKAGE_MEMBERS: usize = 1_000;
 pub const MAX_TX_SIGOPS: u32 = MAX_BLOCK_SIGOPS / 5;
 pub const BYTES_PER_SIGOP: usize = 20;
+/// HSD's pinned default minimum relay fee in atomic units per 1,000 policy
+/// virtual bytes. Network-specific HSD defaults currently use this same value.
+pub const HSD_MINIMUM_RELAY_FEE_RATE: Amount = 1_000;
 
 /// HSD's mempool fee/ranking size is the larger of serialized transaction
 /// weight and its sigop cost, rounded up to virtual bytes. Consensus block-fit
@@ -164,6 +167,9 @@ pub trait ContextualTransactionVerifier: Send + Sync {
         transaction: &Transaction,
         input_coins: &[Coin],
         context: &MempoolContext,
+        // Already accepted name-covenant transactions in deterministic
+        // admission order. Contextual name validation replays this overlay.
+        accepted_name_transactions: &[&Transaction],
     ) -> Result<(), ConsensusError>;
 
     fn is_consensus_complete(&self) -> bool {
@@ -180,6 +186,7 @@ impl ContextualTransactionVerifier for RejectUnverifiedContext {
         _transaction: &Transaction,
         _input_coins: &[Coin],
         _context: &MempoolContext,
+        _accepted_name_transactions: &[&Transaction],
     ) -> Result<(), ConsensusError> {
         Err(ConsensusError::Authorization(
             "contextual mempool verifier is not configured".to_owned(),
@@ -433,6 +440,7 @@ pub struct MemoryMempool {
     parents: HashMap<Txid, BTreeSet<Txid>>,
     children: HashMap<Txid, BTreeSet<Txid>>,
     exclusive_names: HashMap<Txid, Vec<[u8; 32]>>,
+    exclusive_name_owners: HashMap<[u8; 32], Txid>,
     bytes: usize,
     orphan_bytes: usize,
     generation: u64,
@@ -461,6 +469,7 @@ impl MemoryMempool {
             parents: HashMap::new(),
             children: HashMap::new(),
             exclusive_names: HashMap::new(),
+            exclusive_name_owners: HashMap::new(),
             bytes: 0,
             orphan_bytes: 0,
             generation: 0,
@@ -556,6 +565,17 @@ impl MemoryMempool {
         if is_coinbase(&transaction) {
             return Ok(rejected("coinbase"));
         }
+        let covenant_metrics = match covenant_metrics(&transaction) {
+            Ok(metrics) => metrics,
+            Err(error) => return Ok(rejected(error.to_string())),
+        };
+        if covenant_metrics
+            .exclusive_names
+            .iter()
+            .any(|name| self.exclusive_name_owners.contains_key(name))
+        {
+            return Ok(rejected("name-already-in-mempool"));
+        }
         if !is_final_transaction(
             &transaction,
             context.next_height,
@@ -625,7 +645,13 @@ impl MemoryMempool {
         if let Err(error) = verify_transaction_covenant_links(&transaction, &input_coins) {
             return Ok(rejected(error.to_string()));
         }
-        if let Err(error) = contextual_verifier.verify(&transaction, &input_coins, context) {
+        let accepted_name_transactions = self.accepted_name_transactions();
+        if let Err(error) = contextual_verifier.verify(
+            &transaction,
+            &input_coins,
+            context,
+            &accepted_name_transactions,
+        ) {
             return Ok(rejected(error.to_string()));
         }
 
@@ -676,7 +702,7 @@ impl MemoryMempool {
             updates,
             renewals,
             exclusive_names,
-        } = covenant_metrics(&transaction)?;
+        } = covenant_metrics;
         let ancestor_fee = ancestors.iter().try_fold(fee, |total, ancestor| {
             total
                 .checked_add(
@@ -736,6 +762,9 @@ impl MemoryMempool {
         }
         self.parents.insert(txid, direct_parents);
         self.children.entry(txid).or_default();
+        for name in &exclusive_names {
+            self.exclusive_name_owners.insert(*name, txid);
+        }
         self.exclusive_names.insert(txid, exclusive_names);
         self.bytes = projected_bytes;
         self.entries.insert(txid, entry);
@@ -796,6 +825,7 @@ impl MemoryMempool {
         self.parents.clear();
         self.children.clear();
         self.exclusive_names.clear();
+        self.exclusive_name_owners.clear();
         self.bytes = 0;
         self.orphan_bytes = 0;
         self.advance_generation();
@@ -950,6 +980,26 @@ impl MemoryMempool {
         })
     }
 
+    fn accepted_name_transactions(&self) -> Vec<&Transaction> {
+        let mut ordered = self
+            .entries
+            .iter()
+            .filter_map(|(txid, entry)| {
+                let transaction = self.transactions.get(txid)?;
+                transaction
+                    .outputs
+                    .iter()
+                    .any(|output| output.covenant.kind.is_name())
+                    .then_some((entry.sequence, *txid, transaction))
+            })
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(sequence, txid, _)| (*sequence, *txid));
+        ordered
+            .into_iter()
+            .map(|(_, _, transaction)| transaction)
+            .collect()
+    }
+
     fn collect_ancestors(
         &self,
         direct_parents: &BTreeSet<Txid>,
@@ -1039,7 +1089,13 @@ impl MemoryMempool {
             }
         }
         self.refresh_cached_ancestry(&affected_descendants);
-        self.exclusive_names.remove(&txid);
+        if let Some(names) = self.exclusive_names.remove(&txid) {
+            for name in names {
+                if self.exclusive_name_owners.get(&name) == Some(&txid) {
+                    self.exclusive_name_owners.remove(&name);
+                }
+            }
+        }
         true
     }
 
@@ -1243,7 +1299,7 @@ mod tests {
 
     use super::*;
     use hns_consensus::{ConsensusError, TransactionInputVerifier};
-    use hns_primitives::{Address, Covenant, Input, Output, Witness};
+    use hns_primitives::{sha3_256, Address, Covenant, Input, Output, Witness};
 
     fn covenant() -> Covenant {
         Covenant {
@@ -1342,9 +1398,49 @@ mod tests {
             _transaction: &Transaction,
             _input_coins: &[Coin],
             _context: &MempoolContext,
+            _accepted_name_transactions: &[&Transaction],
         ) -> Result<(), ConsensusError> {
             Ok(())
         }
+    }
+
+    struct RequireNameOverlay;
+
+    impl ContextualTransactionVerifier for RequireNameOverlay {
+        fn verify(
+            &self,
+            transaction: &Transaction,
+            _input_coins: &[Coin],
+            _context: &MempoolContext,
+            accepted_name_transactions: &[&Transaction],
+        ) -> Result<(), ConsensusError> {
+            let name = transaction
+                .outputs
+                .first()
+                .and_then(|output| output.covenant.item(2))
+                .unwrap_or_default();
+            let expected = usize::from(name == b"overlay-two");
+            if accepted_name_transactions.len() != expected {
+                return Err(ConsensusError::ContextualCovenant(format!(
+                    "expected {expected} accepted name transactions, got {}",
+                    accepted_name_transactions.len()
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    fn open_transaction(previous_output: Outpoint, value: u64, name: &[u8]) -> Transaction {
+        let mut transaction = transaction(previous_output, value);
+        transaction.outputs[0].covenant = Covenant {
+            kind: CovenantKind::Open,
+            items: vec![
+                sha3_256(name).to_vec(),
+                0u32.to_le_bytes().to_vec(),
+                name.to_vec(),
+            ],
+        };
+        transaction
     }
 
     fn submit(pool: &mut MemoryMempool, transaction: Transaction, view: &FixedView) -> Admission {
@@ -1364,6 +1460,81 @@ mod tests {
         assert!(matches!(
             pool.submit(transaction(outpoint(1, 0), 9)).expect("submit"),
             Admission::Rejected { reason } if reason == "verified-mempool-context-required"
+        ));
+    }
+
+    #[test]
+    fn contextual_verifier_receives_name_transactions_in_admission_order() {
+        let first_input = outpoint(0xd1, 0);
+        let second_input = outpoint(0xd2, 0);
+        let mut view = FixedView::with_coin(first_input.clone(), 20);
+        let second_coin = Coin {
+            outpoint: second_input.clone(),
+            value: 20,
+            height: 1,
+            coinbase: false,
+            address: Address::new(0, vec![3; 20]).expect("address"),
+            covenant: covenant(),
+        };
+        view.coins.insert(second_input.clone(), second_coin);
+        let mut pool = MemoryMempool::new();
+        let context = MempoolContext::testing(2, 2);
+        assert!(matches!(
+            pool.submit_with_context(
+                open_transaction(first_input, 15, b"overlay-one"),
+                &context,
+                &view,
+                &AllowInputs,
+                &RequireNameOverlay,
+            )
+            .expect("first name admission"),
+            Admission::Accepted(_)
+        ));
+        assert!(matches!(
+            pool.submit_with_context(
+                open_transaction(second_input, 15, b"overlay-two"),
+                &context,
+                &view,
+                &AllowInputs,
+                &RequireNameOverlay,
+            )
+            .expect("second name admission"),
+            Admission::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn exclusive_name_index_releases_when_transaction_is_removed() {
+        let first_input = outpoint(0xe1, 0);
+        let replacement_input = outpoint(0xe2, 0);
+        let mut view = FixedView::with_coin(first_input.clone(), 20);
+        view.coins.insert(
+            replacement_input.clone(),
+            Coin {
+                outpoint: replacement_input.clone(),
+                value: 20,
+                height: 1,
+                coinbase: false,
+                address: Address::new(0, vec![3; 20]).expect("address"),
+                covenant: covenant(),
+            },
+        );
+        let first = open_transaction(first_input, 15, b"exclusive-name");
+        let first_txid = first.txid();
+        let replacement = open_transaction(replacement_input, 15, b"exclusive-name");
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, first, &view),
+            Admission::Accepted(txid) if txid == first_txid
+        ));
+        assert!(matches!(
+            submit(&mut pool, replacement.clone(), &view),
+            Admission::Rejected { reason } if reason == "name-already-in-mempool"
+        ));
+        assert_eq!(pool.remove_transaction(first_txid, false), 1);
+        assert!(matches!(
+            submit(&mut pool, replacement, &view),
+            Admission::Accepted(_)
         ));
     }
 

@@ -211,7 +211,8 @@ Implemented:
 
 Remaining:
 
-- production-complete contextual mempool admission and peer transaction relay;
+- complete HSD mempool standardness/replacement policy, claim/airdrop relay,
+  and post-tip contextual revalidation;
 - disconnected-transaction re-admission after reorganizations;
 - full-mainnet active-state IBD and live HSD state/root qualification;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;

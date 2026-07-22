@@ -376,9 +376,12 @@ Ready peers may request:
 - bounded transaction inventory and accepted mempool transactions when the mining engine
   is enabled.
 
-Serving is read-only. Mining-engine peer transaction admission remains fail closed
-until the complete contextual verifier is composed; unsupported relay behavior
-is not silently emulated. Requests are bounded below the wire protocol maxima
+Serving is read-only. When explicitly enabled, ordinary peer transactions are
+admitted against one immutable active-chain UTXO/deployment/name snapshot with
+the native script verifier, HSD's minimum relay fee, deterministic name-overlay
+replay, and bounded orphan promotion. The compatibility admission API remains
+fail closed; HSD standardness/replacement parity and special claim/airdrop relay
+are not silently emulated. Requests are bounded below the wire protocol maxima
 to limit local work and queue occupation. Ordinary serving uses noncritical
 lanes and cannot consume solved-block publication capacity.
 

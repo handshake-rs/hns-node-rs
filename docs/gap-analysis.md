@@ -175,8 +175,10 @@
   relative locks, native resolved-coin sigop accounting and the HSD 16,000
   transaction-policy ceiling, input authorization, covenant linkage,
   contextual checks, value, fees, and resource limits.
-- Explicit verifier-completeness gates; compatibility and peer transaction
-  entrypoints fail closed until complete contextual consensus is composed.
+- Explicit verifier-completeness gates; the compatibility entrypoint remains
+  fail closed, while ordinary peer admission composes an immutable active-chain
+  view, native scripts, deployment-derived name flags, accepted-name overlay,
+  HSD exclusive-name conflicts, minimum relay fees, and orphan promotion.
 - Deterministic ancestor-inclusive future templates with actual HNS block
   weight kept separate from HSD sigop-adjusted policy size, plus sigops, OPEN,
   UPDATE, RENEW, transaction-count, and exclusive-name limits.
@@ -234,13 +236,14 @@ These are substantial foundations, not a production full node.
   beyond implemented HSD network-prefix grouping, and adversarial network
   qualification.
 - Pruning-aware synchronization and sustained compact-relay WAN qualification.
-- Production-complete contextual peer transaction admission and relay.
+- Complete HSD mempool standardness/replacement policy, claim/airdrop relay,
+  and contextual revalidation after active-tip changes.
 - Sustained multipath publication and reconnect/retry supervision under WAN
   partitions and queue saturation.
 
 ### Mining authority
 
-- Contextually complete mempool admission, replacement/policy parity, and
+- HSD replacement/policy parity, post-tip contextual revalidation, and
   disconnected-transaction re-admission.
 - Continuous future-template lifecycle tied to live committed tips and the ASIC
   gateway.

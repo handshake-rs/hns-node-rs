@@ -4461,12 +4461,13 @@ mod tests {
         block_merkle_root, block_witness_root, ConsensusError, TransactionInputVerifier,
     };
     use hns_primitives::{
-        Address, Covenant, CovenantKind, Header, Input, Outpoint, Output, Transaction, Txid,
-        Witness,
+        sha3_256, Address, Amount, Covenant, CovenantKind, Header, Input, Outpoint, Output,
+        Transaction, Txid, Witness,
     };
     use hns_rpc::{JsonRpcRequest, RpcService};
     use hns_state::{
-        name_tree_snapshot_pin_key, RejectSpecialCoinbaseIssuance, StateEngine, StateView,
+        name_tree_snapshot_pin_key, write_coin_to_batch, RejectSpecialCoinbaseIssuance,
+        StateEngine, StateView,
     };
     use hns_store::ReadSnapshot;
     use serde_json::{json, Value};
@@ -4836,6 +4837,66 @@ mod tests {
         records
     }
 
+    fn peer_transaction_node(tip_height: Height) -> NodeService {
+        let config = NodeConfig {
+            network: Network::Regtest,
+            shadow_sync: ShadowSyncConfig {
+                enabled: true,
+                listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                ..ShadowSyncConfig::default()
+            },
+            mining_engine: MiningEngineConfig {
+                enabled: true,
+                transaction_relay: true,
+                ..MiningEngineConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        let mut node = NodeService::new(config);
+        connect_fixture_chain(&mut node, tip_height, None);
+        node
+    }
+
+    fn install_script_coin(node: &NodeService, outpoint: Outpoint, value: Amount, height: Height) {
+        let script = [0x51];
+        let coin = Coin {
+            outpoint,
+            value,
+            height,
+            coinbase: false,
+            address: Address::new(0, sha3_256(&script).to_vec()).expect("script address"),
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        };
+        let mut batch = node.state.store.batch();
+        write_coin_to_batch(&mut batch, &coin).expect("stage funding coin");
+        node.state.store.commit(batch).expect("commit funding coin");
+    }
+
+    fn script_spend(previous_output: Outpoint, output_value: Amount) -> Transaction {
+        Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output,
+                sequence: u32::MAX,
+                witness: Witness {
+                    items: vec![vec![0x51]],
+                },
+            }],
+            outputs: vec![Output {
+                value: output_value,
+                address: Address::new(0, sha3_256(&[0x51]).to_vec()).expect("script address"),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: 0,
+        }
+    }
+
     fn put_unreachable_name_node(store: &StoreHandle, byte: u8) -> [u8; 32] {
         let key = [byte; 32];
         let mut batch = store.batch();
@@ -5033,6 +5094,105 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.result.expect("result")["size"], 0);
+    }
+
+    #[test]
+    fn peer_transaction_admission_uses_active_utxos_and_native_scripts() {
+        let mut node = peer_transaction_node(0);
+        let valid_outpoint = Outpoint {
+            txid: Txid::new([0xa1; 32]),
+            index: 0,
+        };
+        let invalid_outpoint = Outpoint {
+            txid: Txid::new([0xa2; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, valid_outpoint.clone(), 10_000, 0);
+        install_script_coin(&node, invalid_outpoint.clone(), 10_000, 0);
+
+        let valid = script_spend(valid_outpoint, 9_000);
+        let valid_txid = valid.txid();
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(valid)
+                .expect("valid peer admission"),
+            hns_mempool::Admission::Accepted(txid) if txid == valid_txid
+        ));
+
+        let mut invalid = script_spend(invalid_outpoint, 9_000);
+        invalid.inputs[0].witness.items[0] = vec![0x00];
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(invalid)
+                .expect("invalid peer admission"),
+            hns_mempool::Admission::Rejected { reason }
+                if reason.contains("witness program")
+        ));
+        assert_eq!(node.state.mempool.info().transaction_count, 1);
+    }
+
+    #[test]
+    fn peer_transaction_admission_promotes_dependency_ordered_orphans() {
+        let mut node = peer_transaction_node(0);
+        let funding = Outpoint {
+            txid: Txid::new([0xb1; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, funding.clone(), 30_000, 0);
+        let parent = script_spend(funding, 28_000);
+        let parent_txid = parent.txid();
+        let child = script_spend(
+            Outpoint {
+                txid: parent_txid,
+                index: 0,
+            },
+            26_000,
+        );
+        let child_txid = child.txid();
+
+        assert_eq!(
+            node.mining_engine_accept_peer_transaction(child)
+                .expect("orphan admission"),
+            hns_mempool::Admission::Orphan(child_txid)
+        );
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(parent)
+                .expect("parent admission"),
+            hns_mempool::Admission::Accepted(txid) if txid == parent_txid
+        ));
+        assert!(node.state.mempool.orphan(&child_txid).is_none());
+        assert!(node.state.mempool.transaction(&child_txid).is_some());
+        assert_eq!(node.state.mempool.info().transaction_count, 2);
+    }
+
+    #[test]
+    fn peer_transaction_admission_enforces_hsd_exclusive_name_contracts() {
+        let mut node = peer_transaction_node(200);
+        let first_outpoint = Outpoint {
+            txid: Txid::new([0xc1; 32]),
+            index: 0,
+        };
+        let second_outpoint = Outpoint {
+            txid: Txid::new([0xc2; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, first_outpoint.clone(), 10_000, 1);
+        install_script_coin(&node, second_outpoint.clone(), 10_000, 1);
+        let name = b"peercontextoverlay";
+        let mut first = open_transaction(name, first_outpoint);
+        first.inputs[0].witness.items = vec![vec![0x51]];
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(first)
+                .expect("first OPEN admission"),
+            hns_mempool::Admission::Accepted(_)
+        ));
+
+        let mut duplicate = open_transaction(name, second_outpoint);
+        duplicate.inputs[0].witness.items = vec![vec![0x51]];
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(duplicate)
+                .expect("duplicate OPEN admission"),
+            hns_mempool::Admission::Rejected { reason }
+                if reason == "name-already-in-mempool"
+        ));
     }
 
     #[test]

@@ -79,9 +79,11 @@ produce a mining authority capability. Candidate-derived contextual failures
 may poison the exact durable branch; local store/tree/backend/chain-view faults
 instead stop synchronization without changing branch validity. The mining
 engine may build diagnostic future templates from a durable active snapshot,
-but peer transaction admission remains fail closed and solved-block staging,
-connection, and publication require the same private authority capability as
-the existing authoritative mining boundary.
+and explicitly enabled ordinary peer transaction relay admits only through a
+complete native script verifier and one immutable active UTXO/deployment/name
+snapshot. Relay does not grant authority. Solved-block staging, connection, and
+publication require the same private authority capability as the existing
+authoritative mining boundary.
 
 API-v9 exposes the active tip's next-header interval-committed root for external
 qualification. `compare-hsrd-hsd-shadow.py` reads that material and a pinned
@@ -105,8 +107,8 @@ The following remain untrusted and release-blocking:
   mid-commit process-crash/fault injection;
 - full-mainnet active-state IBD, pruning, and sustained
   alternate-chain/reorganization qualification;
-- Brontide, long-lived subthreshold peer reputation, and
-  production-complete contextual transaction relay;
+- Brontide, long-lived subthreshold peer reputation, and complete HSD mempool
+  standardness/replacement, claim/airdrop relay, and post-tip revalidation;
 - disconnected-transaction re-admission, production template qualification,
   continuously supervised publication retry, and measured publication latency;
 - complete mainnet replay, invalid corpus, and sustained live HSD shadow

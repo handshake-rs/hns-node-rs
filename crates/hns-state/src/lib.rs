@@ -1487,6 +1487,52 @@ fn apply_verified_claims<T: ReadSnapshot>(
     Ok(())
 }
 
+/// Validate an ordinary mempool candidate against the durable active name
+/// state plus all previously accepted name-covenant transactions. The overlay
+/// is replayed in caller-supplied admission order and never mutates storage.
+/// Claims remain restricted to the dedicated coinbase issuance path.
+pub fn verify_mempool_name_context<T: ReadSnapshot>(
+    snapshot: &T,
+    accepted_name_transactions: &[&Transaction],
+    candidate: &Transaction,
+    height: Height,
+    network: Network,
+    name_flags: NameFlags,
+) -> Result<(), StateError> {
+    let input_verifier = RejectUnverifiedInputs;
+    let issuance_verifier = RejectSpecialCoinbaseIssuance;
+    let services = StateServices {
+        network,
+        name_flags,
+        name_flags_valid: true,
+        historical_validation: HistoricalValidationPlan::full(),
+        input_verifier: &input_verifier,
+        issuance_verifier: &issuance_verifier,
+    };
+    let context = SnapshotChainContext::new(snapshot, height, HistoricalValidationPlan::full());
+    let mut changes = NameStateChanges::default();
+    for transaction in accepted_name_transactions {
+        apply_transaction_name_covenants(
+            snapshot,
+            transaction,
+            height,
+            services,
+            &context,
+            &mut changes,
+            false,
+        )?;
+    }
+    apply_transaction_name_covenants(
+        snapshot,
+        candidate,
+        height,
+        services,
+        &context,
+        &mut changes,
+        false,
+    )
+}
+
 fn apply_transaction_name_covenants<T: ReadSnapshot>(
     snapshot: &T,
     transaction: &Transaction,

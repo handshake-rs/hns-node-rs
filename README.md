@@ -337,6 +337,9 @@ Implemented:
 - Structural, finality, sequence-lock, maturity, authorization, covenant-link,
   contextual, fee, and resource admission stages with explicit verifier
   completeness gates.
+- Ordinary peer transactions admitted against one immutable active-chain UTXO,
+  median-time, deployment, and name-state snapshot, including deterministic
+  mempool name-overlay replay, exclusive-name conflicts, and orphan promotion.
 - Deterministic ancestor-inclusive template selection with HNS weight, sigops,
   OPEN, UPDATE, RENEW, transaction-count, and exclusive-name limits.
 - HSD-derived subsidy and deterministic coinbase fixtures.
@@ -351,7 +354,8 @@ Implemented:
 
 Still release-blocking:
 
-- production-complete contextual peer transaction admission;
+- complete HSD mempool standardness/replacement policy, claim and airdrop relay,
+  and contextual revalidation after every active-tip change;
 - disconnected-transaction re-admission after reorganizations;
 - qualified full-mainnet active-state IBD and the incremental production Urkel
   lifecycle;

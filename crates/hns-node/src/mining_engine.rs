@@ -4,16 +4,23 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use hns_chain::BlockIndexRecord;
-use hns_consensus::compute_block_version_from_state;
-use hns_mempool::{Mempool, MempoolInfo, MempoolLimits};
+use hns_chain::{read_canonical_hash, BlockIndexRecord};
+use hns_consensus::{
+    compute_block_version_from_state, ConsensusError, NameFlags, Network, SequenceLockView,
+    MEDIAN_TIMESPAN,
+};
+use hns_mempool::{
+    ContextualTransactionVerifier, Mempool, MempoolContext, MempoolInfo, MempoolLimits,
+    MempoolView, HSD_MINIMUM_RELAY_FEE_RATE,
+};
 use hns_mining::{
     MiningTemplate, PreparedMiningJob, SolvedBlockPublicationIntent, SolvedMiningCandidate,
     TemplateCacheKey, TemplatePolicy, TemplateVariant, MAX_TEMPLATE_VARIANTS,
     PUBLICATION_KEY_PREFIX,
 };
 use hns_p2p::{BroadcastReport, LivePeerManager, Packet};
-use hns_primitives::{Address, BlockHash};
+use hns_primitives::{Address, BlockHash, Coin, Height, Outpoint, Transaction};
+use hns_state::{decode_coin, encode_outpoint_key, verify_mempool_name_context};
 use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +29,107 @@ use super::{issue_authority_permit, AuthorityMode, NodeService, ShadowSyncConfig
 pub const DEFAULT_MAX_PENDING_PUBLICATIONS: usize = 64;
 pub const MAX_PENDING_PUBLICATIONS: usize = 1_024;
 pub const MIN_PUBLICATION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+struct ActiveMempoolView<'a, T> {
+    snapshot: &'a T,
+}
+
+impl<T: ReadSnapshot> ActiveMempoolView<'_, T> {
+    const fn new(snapshot: &T) -> ActiveMempoolView<'_, T> {
+        ActiveMempoolView { snapshot }
+    }
+}
+
+impl<T: ReadSnapshot> SequenceLockView for ActiveMempoolView<'_, T> {
+    fn coin_height(&self, outpoint: &Outpoint) -> Result<Option<Height>, ConsensusError> {
+        Ok(self.coin(outpoint)?.map(|coin| coin.height))
+    }
+
+    fn median_time_past(&self, height: Height) -> Result<u64, ConsensusError> {
+        let mut times = Vec::with_capacity(MEDIAN_TIMESPAN);
+        let mut cursor = height;
+        for _ in 0..MEDIAN_TIMESPAN {
+            let hash = read_canonical_hash(self.snapshot, cursor)
+                .map_err(|error| ConsensusError::View(error.to_string()))?
+                .ok_or_else(|| {
+                    ConsensusError::View(format!(
+                        "active chain has no canonical header at height {cursor}"
+                    ))
+                })?;
+            let record = super::load_header_record(self.snapshot, &hash)
+                .map_err(|error| ConsensusError::View(error.to_string()))?
+                .ok_or_else(|| {
+                    ConsensusError::View(format!(
+                        "canonical header {} is missing at height {cursor}",
+                        hash.to_hex()
+                    ))
+                })?;
+            if record.hash != hash || record.height != cursor {
+                return Err(ConsensusError::View(format!(
+                    "canonical header payload disagrees with height {cursor}"
+                )));
+            }
+            times.push(record.header.time);
+            if cursor == 0 {
+                break;
+            }
+            cursor -= 1;
+        }
+        times.sort_unstable();
+        Ok(times[times.len() / 2])
+    }
+}
+
+impl<T: ReadSnapshot> MempoolView for ActiveMempoolView<'_, T> {
+    fn coin(&self, outpoint: &Outpoint) -> Result<Option<Coin>, ConsensusError> {
+        let Some(bytes) = self
+            .snapshot
+            .get(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))
+            .map_err(|error| ConsensusError::View(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let coin = decode_coin(&bytes).map_err(|error| ConsensusError::View(error.to_string()))?;
+        if coin.outpoint != *outpoint {
+            return Err(ConsensusError::View(format!(
+                "UTXO payload disagrees with requested outpoint {outpoint:?}"
+            )));
+        }
+        Ok(Some(coin))
+    }
+}
+
+struct ActiveContextualTransactionVerifier<'a, T> {
+    snapshot: &'a T,
+    network: Network,
+    name_flags: NameFlags,
+}
+
+impl<T: ReadSnapshot + Sync> ContextualTransactionVerifier
+    for ActiveContextualTransactionVerifier<'_, T>
+{
+    fn verify(
+        &self,
+        transaction: &Transaction,
+        _input_coins: &[Coin],
+        context: &MempoolContext,
+        accepted_name_transactions: &[&Transaction],
+    ) -> Result<(), ConsensusError> {
+        verify_mempool_name_context(
+            self.snapshot,
+            accepted_name_transactions,
+            transaction,
+            context.next_height,
+            self.network,
+            self.name_flags,
+        )
+        .map_err(|error| ConsensusError::ContextualCovenant(error.to_string()))
+    }
+
+    fn is_consensus_complete(&self) -> bool {
+        true
+    }
+}
 
 /// The mining engine may build diagnostic templates in shadow mode, but
 /// transaction relay and solved-block publication remain
@@ -196,7 +304,7 @@ impl NodeService {
         }
         if self.config.mining_engine.transaction_relay {
             blockers.push(
-                "transaction relay remains fail-closed until contextual consensus admission is complete"
+                "transaction relay is limited to ordinary transactions until HSD standardness and claim/airdrop relay parity are complete"
                     .to_owned(),
             );
         }
@@ -378,10 +486,9 @@ impl NodeService {
             .collect()
     }
 
-    /// Peer transaction admission remains deliberately fail closed until the
-    /// complete contextual consensus verifier is composed. Keeping the method
-    /// at the mutable service boundary makes the eventual verifier swap local
-    /// and prevents the P2P runtime from owning consensus policy.
+    /// Admit an ordinary peer transaction against one immutable active-chain
+    /// snapshot and the pool's deterministic in-memory name-state overlay.
+    /// The P2P runtime remains policy-free and only relays accepted inventory.
     pub fn mining_engine_accept_peer_transaction(
         &mut self,
         transaction: hns_primitives::Transaction,
@@ -391,11 +498,60 @@ impl NodeService {
                 reason: "mining_engine-transaction-relay-disabled".to_owned(),
             });
         }
+
+        let snapshot = self
+            .state
+            .store
+            .snapshot()
+            .context("failed to open active mempool context")?;
+        let Some(tip) = super::best_block_tip_from_snapshot(&snapshot)? else {
+            return Ok(hns_mempool::Admission::Rejected {
+                reason: "active-chain-context-unavailable".to_owned(),
+            });
+        };
+        let next_height = tip
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("active-chain height exhausted"))?;
+        let tip_record = super::load_header_record(&snapshot, &tip.hash)?.ok_or_else(|| {
+            anyhow::anyhow!("active tip {} has no header record", tip.hash.to_hex())
+        })?;
+        if tip_record.hash != tip.hash || tip_record.height != tip.height {
+            anyhow::bail!(
+                "active tip header payload disagrees with {} at height {}",
+                tip.hash.to_hex(),
+                tip.height
+            );
+        }
+        let parent_median_time = self.state.median_time_past(&snapshot, &tip_record)?;
+        let deployments =
+            self.state
+                .deployment_state_for_block(&snapshot, next_height, tip.hash)?;
+        let context = MempoolContext {
+            next_height,
+            parent_median_time,
+            coinbase_maturity: self.config.network.params().coinbase_maturity,
+            minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
+            require_complete_verifiers: true,
+        };
+        let view = ActiveMempoolView::new(&snapshot);
+        let contextual_verifier = ActiveContextualTransactionVerifier {
+            snapshot: &snapshot,
+            network: self.config.network,
+            name_flags: deployments.name_flags,
+        };
         let admission = self
             .state
             .mempool
-            .submit(transaction)
+            .submit_with_context(
+                transaction,
+                &context,
+                &view,
+                self.state.state_engine.input_verifier(),
+                &contextual_verifier,
+            )
             .map_err(|error| anyhow::anyhow!("peer transaction admission failed: {error}"))?;
+        drop(snapshot);
         if matches!(admission, hns_mempool::Admission::Accepted(_)) {
             self.mining_engine_template_cache().clear();
             let durable = self.state.durable_mining_state()?;

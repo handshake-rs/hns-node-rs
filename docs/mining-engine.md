@@ -66,6 +66,7 @@ local connection from becoming a network publication source.
 - package construction in dependency order;
 - ancestor fee and weight accounting;
 - bounded orphan retention and deterministic oldest-first eviction;
+- HSD exclusive-name admission and deterministic accepted-name overlay replay;
 - block-confirmation reconciliation;
 - fail-closed clearing on reorganizations until disconnected transactions can
   be contextually re-admitted;
@@ -73,9 +74,13 @@ local connection from becoming a network publication source.
 
 The compatibility `Mempool::submit` entrypoint rejects with
 `verified-mempool-context-required`. Production admission must use
-`submit_with_context` with complete input and contextual verifiers. Mining-engine
-peer relay therefore remains deliberately fail closed while the documented
-broader claim-history and historical-qualification gaps remain. The pinned
+`submit_with_context` with complete input and contextual verifiers. The
+mining-engine peer boundary now does so for ordinary transactions using one
+immutable active-chain snapshot, deployment-derived name flags, HSD's 1,000
+minimum relay rate, the native script backend, and the live accepted-name
+overlay. The compatibility entrypoint remains fail closed, and complete HSD
+standardness/replacement policy, claim/airdrop packets, and contextual
+revalidation after active-tip changes remain unfinished. The pinned
 height-62,517 case and the 39,086-39,101 -> 76,722 replacement history establish
 exact proof/accounting, parent-header-time, retained-value, and commit-advance
 behavior for bounded real mainnet claims, but they are not full-chain
@@ -181,6 +186,7 @@ remain release-blocking:
 - deployment-scale Urkel compaction performance/priority qualification and
   RocksDB mid-commit process-crash/fault injection;
 - qualified full-mainnet active-state IBD and live HSD state comparison;
-- contextually complete peer transaction admission;
+- complete HSD mempool standardness/replacement policy, claim/airdrop relay,
+  and post-tip contextual revalidation;
 - measured production template and solved-block latency;
 - native mainnet authority qualification.
