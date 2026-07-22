@@ -415,8 +415,10 @@ pub struct HistoricalValidationPlan {
     pub header_context: bool,
     pub deployment_state: bool,
     pub absolute_finality: bool,
+    pub coinbase_height: bool,
     pub claim_airdrop_sanity: bool,
     pub claim_airdrop_cryptography: bool,
+    pub block_sigops: bool,
     pub sequence_locks: bool,
     pub input_values: bool,
     pub covenant_links: bool,
@@ -436,8 +438,10 @@ impl HistoricalValidationPlan {
             header_context: true,
             deployment_state: true,
             absolute_finality: true,
+            coinbase_height: true,
             claim_airdrop_sanity: true,
             claim_airdrop_cryptography: true,
+            block_sigops: true,
             sequence_locks: true,
             input_values: true,
             covenant_links: true,
@@ -457,8 +461,10 @@ impl HistoricalValidationPlan {
             header_context: true,
             deployment_state: true,
             absolute_finality: true,
+            coinbase_height: true,
             claim_airdrop_sanity: true,
             claim_airdrop_cryptography: false,
+            block_sigops: false,
             sequence_locks: false,
             input_values: false,
             covenant_links: false,
@@ -716,7 +722,7 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
-    use crate::{is_final_transaction, validate_block_finality};
+    use crate::{is_final_transaction, validate_block_finality, validate_coinbase_height};
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -985,7 +991,7 @@ mod tests {
     #[test]
     fn network_constants_match_hsd_fixture() {
         let fixture = fixture();
-        assert_eq!(fixture.schema, 2);
+        assert_eq!(fixture.schema, 3);
         assert_eq!(
             ScriptFlags::MANDATORY.bits(),
             fixture.script_flags.mandatory
@@ -1203,6 +1209,8 @@ mod tests {
                 policy.requires_script_verification(case.height),
                 case.plan.scripts
             );
+            assert!(case.plan.coinbase_height);
+            assert_eq!(case.plan.block_sigops, !case.plan.historical);
         }
     }
 
@@ -1299,6 +1307,9 @@ mod tests {
                 validate_block_finality(&block, case.height, case.parent_median_time_past,).is_ok(),
                 case.accepted
             );
+            validate_coinbase_height(&block, case.height)
+                .expect("canonical historical coinbase height");
+            assert!(validate_coinbase_height(&block, case.height + 1).is_err());
             assert!(case.accepted);
         }
 

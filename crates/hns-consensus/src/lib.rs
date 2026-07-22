@@ -46,7 +46,8 @@ pub use name::{
     verify_renewal_commitment, NameContext, NameFlags, NameMutation, NameParams, ReservedName,
 };
 pub use script::{
-    verify_witness_program, NativeSignatureVerifier, ScriptError, ScriptFlags, SignatureVerifier,
+    count_script_sigops, transaction_sigops, verify_witness_program, witness_program_sigops,
+    NativeSignatureVerifier, ScriptError, ScriptFlags, SignatureVerifier,
     UnavailableSignatureVerifier, WitnessProgramVerifier,
 };
 pub use sighash::{
@@ -919,6 +920,23 @@ pub fn validate_block_finality(
     Ok(())
 }
 
+/// HSD commits the candidate height directly in the coinbase transaction's
+/// locktime field. This contextual check is distinct from ordinary transaction
+/// finality: coinbase finality is skipped, but its height commitment is always
+/// required, including on checkpoint-backed historical blocks.
+pub fn validate_coinbase_height(block: &Block, block_height: Height) -> Result<(), ConsensusError> {
+    let coinbase = block
+        .transactions
+        .first()
+        .ok_or(ConsensusError::InvalidBlock("block has no coinbase"))?;
+    if coinbase.locktime != block_height {
+        return Err(ConsensusError::InvalidBlock(
+            "coinbase height does not match candidate height",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_block_covenant_limits(block: &Block) -> Result<(), ConsensusError> {
     let mut opens = 0u32;
     let mut updates = 0u32;
@@ -1750,6 +1768,19 @@ mod tests {
 
         assert!(!is_final_transaction(&block.transactions[0], 1, 0));
         validate_block_finality(&block, 1, 0).expect("coinbase finality is not checked");
+    }
+
+    #[test]
+    fn coinbase_height_is_a_separate_contextual_commitment() {
+        let mut coinbase = coinbase(vec![output(50)]);
+        coinbase.locktime = 7;
+        let block = block_with_roots(vec![coinbase]);
+
+        validate_coinbase_height(&block, 7).expect("matching coinbase height");
+        assert!(matches!(
+            validate_coinbase_height(&block, 8).expect_err("mismatched coinbase height"),
+            ConsensusError::InvalidBlock("coinbase height does not match candidate height")
+        ));
     }
 
     #[test]

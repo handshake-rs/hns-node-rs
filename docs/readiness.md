@@ -20,12 +20,16 @@ Implemented:
 - HSD sighash, sequence-lock, CLTV, and CSV behavior.
 - Broad bounded version-zero witness/script interpreter.
 - Exact results for all 876 cases in HSD's pinned upstream script corpus.
+- Exact HSD witness-program sigop counting and atomic contextual enforcement of
+  the 80,000-sigop block maximum from resolved active-state coins.
 - Exact HSD deployment/checkpoint constants, BIP9 transitions, block-version
   signaling, deployment effects, cached next-block versions, and a
-  checkpoint-backed historical validation-stage plan.
+  checkpoint-backed historical validation-stage plan that distinguishes the
+  always-on candidate coinbase height from checkpoint-skipped block sigops.
 - Canonical mainnet block-1 finality parity: ordinary transaction finality
   excludes the coinbase, including HSD's accepted non-final-looking historical
-  coinbase vector.
+  coinbase vector, while the independent coinbase-height commitment remains
+  enforced.
 - Active-chain deployment caches and parent-derived contextual name,
   DNSSEC-claim, and full airdrop validation across connect/reorg/restart.
 - Strict header checkpoint enforcement in native peer and candidate imports.
@@ -57,8 +61,8 @@ Implemented:
 Remaining:
 
 - historical replay qualification;
-- non-script historical exceptions and broader independent invalid/fuzz
-  corpora;
+- remaining non-script historical exceptions and broader independent
+  invalid/fuzz corpora;
 - independently sourced live DNSSEC-proof evidence for historical-policy
   qualification and complete historical claim replay beyond the pinned
   initial, multi-generation, and terminal histories; mainnet's claim period
@@ -70,8 +74,8 @@ Remaining:
 Implemented:
 
 - UTXO connect/disconnect and undo.
-- Authorization, relative locks, covenant linkage, and contextual name checks
-  before spend mutation.
+- Relative locks, contextual sigop limits, authorization, covenant linkage, and
+  contextual name checks before spend mutation.
 - Exact HSD `NameState` encoding.
 - Correctness-first exact Urkel roots plus canonical bounded HSD proof
   encoding, decoding, and native inclusion/non-inclusion verification.

@@ -197,9 +197,11 @@
         "historical",
         "pruning",
         "script-flags",
+        "coinbase-height",
+        "block-sigops",
         "validation-plan"
       ],
-      "blake2b256": "36b93ab7d5bf2d5304c30a152cc0d13e3e2b60329826dae4f084d1353309f08b"
+      "blake2b256": "a90d0f6a56e68eeb4df86476c8a52adf35bbfe377ac1a3f03a21aaa195d32963"
     },
     {
       "id": "mainnet-deployment-history-v1",
@@ -258,11 +260,12 @@
       },
       "tags": [
         "script-execution",
+        "sigops",
         "flags",
         "mutation-corpus",
         "oracle"
       ],
-      "blake2b256": "0e33ec3f3ede4667a2ef1cebf2130ccdcc0b0447add46daf585e73ed19a01b46"
+      "blake2b256": "0836df2b1256ae6160a9108bc4c67af04022a844ec3648978c04c720193b45bb"
     },
     {
       "id": "covenant-linkage-v1",

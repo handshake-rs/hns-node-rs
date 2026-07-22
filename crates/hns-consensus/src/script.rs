@@ -1,6 +1,6 @@
 use hns_primitives::{
     blake2b_160, blake2b_256, hash160, hash256, keccak_256, ripemd160, sha1, sha256, sha3_256,
-    Coin, Transaction, MAX_SCRIPT_STACK,
+    Address, Coin, Transaction, Witness, MAX_SCRIPT_STACK,
 };
 use hns_secp256k1::{Secp256k1Verifier, SecpError};
 
@@ -142,6 +142,120 @@ impl ScriptFlags {
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
+}
+
+/// Count HSD witness sigops without executing the script. Malformed trailing
+/// pushes terminate the scan after the valid prefix, matching
+/// `Script#getSigops`: the block-level limit is a cheap contextual bound and
+/// script execution remains responsible for rejecting the malformed program.
+pub fn count_script_sigops(script: &[u8]) -> u32 {
+    let mut total = 0u32;
+    let mut offset = 0usize;
+    let mut last_opcode = None;
+
+    while offset < script.len() {
+        let opcode = script[offset];
+        offset += 1;
+        let data_length = match opcode {
+            0x01..=0x4b => Some(usize::from(opcode)),
+            OP_PUSHDATA1 => {
+                let Some(length) = script.get(offset).copied() else {
+                    break;
+                };
+                offset += 1;
+                Some(usize::from(length))
+            }
+            OP_PUSHDATA2 => {
+                let Some(bytes) = script.get(offset..offset.saturating_add(2)) else {
+                    break;
+                };
+                let Ok(bytes) = <[u8; 2]>::try_from(bytes) else {
+                    break;
+                };
+                offset += 2;
+                Some(usize::from(u16::from_le_bytes(bytes)))
+            }
+            OP_PUSHDATA4 => {
+                let Some(bytes) = script.get(offset..offset.saturating_add(4)) else {
+                    break;
+                };
+                let Ok(bytes) = <[u8; 4]>::try_from(bytes) else {
+                    break;
+                };
+                offset += 4;
+                let Ok(length) = usize::try_from(u32::from_le_bytes(bytes)) else {
+                    break;
+                };
+                Some(length)
+            }
+            _ => None,
+        };
+        if let Some(data_length) = data_length {
+            let Some(end) = offset.checked_add(data_length) else {
+                break;
+            };
+            if end > script.len() {
+                break;
+            }
+            offset = end;
+        }
+
+        match opcode {
+            OP_CHECKSIG | OP_CHECKSIGVERIFY => total = total.saturating_add(1),
+            OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
+                let sigops = match last_opcode {
+                    Some(opcode @ OP_1..=OP_16) => u32::from(opcode - 0x50),
+                    _ => MAX_MULTISIG_PUBKEYS as u32,
+                };
+                total = total.saturating_add(sigops);
+            }
+            _ => {}
+        }
+        last_opcode = Some(opcode);
+    }
+
+    total
+}
+
+pub fn witness_program_sigops(address: &Address, witness: &Witness) -> u32 {
+    if address.version != 0 {
+        return 0;
+    }
+    match address.hash.len() {
+        20 => 1,
+        32 => witness
+            .items
+            .last()
+            .map_or(0, |script| count_script_sigops(script)),
+        _ => 0,
+    }
+}
+
+pub fn transaction_sigops(
+    transaction: &Transaction,
+    input_coins: &[Coin],
+) -> Result<u32, ConsensusError> {
+    if crate::is_coinbase(transaction) {
+        return Ok(0);
+    }
+    if transaction.inputs.len() != input_coins.len() {
+        return Err(ConsensusError::InvalidTransaction(
+            "resolved input count does not match transaction inputs",
+        ));
+    }
+
+    transaction
+        .inputs
+        .iter()
+        .zip(input_coins)
+        .try_fold(0u32, |total, (input, coin)| {
+            if input.previous_output != coin.outpoint {
+                return Err(ConsensusError::InvalidTransaction(
+                    "resolved input coin does not match transaction outpoint",
+                ));
+            }
+            Ok(total.saturating_add(witness_program_sigops(&coin.address, &input.witness)))
+        })
 }
 
 pub trait SignatureVerifier: Send + Sync {
@@ -1344,6 +1458,26 @@ mod tests {
     }
 
     #[test]
+    fn sigop_count_matches_hsd_witness_program_rules() {
+        let pubkey_hash = Address::new(0, vec![0x11; 20]).expect("pubkey-hash address");
+        assert_eq!(witness_program_sigops(&pubkey_hash, &Witness::default()), 1);
+
+        let script_hash = Address::new(0, vec![0x22; 32]).expect("script-hash address");
+        let witness = Witness {
+            items: vec![vec![OP_1 + 1, OP_CHECKMULTISIG, OP_CHECKSIG]],
+        };
+        assert_eq!(witness_program_sigops(&script_hash, &witness), 3);
+        assert_eq!(
+            count_script_sigops(&[OP_CHECKSIG, OP_PUSHDATA1]),
+            1,
+            "a malformed trailing push retains the valid-prefix count"
+        );
+
+        let future_program = Address::new(1, vec![0x33; 32]).expect("future witness address");
+        assert_eq!(witness_program_sigops(&future_program, &witness), 0);
+    }
+
+    #[test]
     fn script_number_encoding_handles_negative_zero_rules() {
         for value in [-2, -1, 0, 1, 2, 127, 128, 255, 256] {
             let encoded = encode_script_number(value);
@@ -1371,6 +1505,7 @@ mod tests {
         previous_value: u64,
         address_version: u8,
         address_hash: String,
+        sigops: u32,
         flags: Vec<String>,
         result: String,
     }
@@ -1381,7 +1516,7 @@ mod tests {
             "../../../fixtures/hsd/scripts/execution-v1.json"
         ))
         .expect("script execution fixture");
-        assert_eq!(fixture.schema, 1);
+        assert_eq!(fixture.schema, 2);
         let signatures = NativeSignatureVerifier::new().expect("native signature verifier");
 
         for vector in fixture.vectors {
@@ -1415,6 +1550,19 @@ mod tests {
                 },
             };
             let flags = fixture_flags(&vector.flags);
+            assert_eq!(
+                count_script_sigops(&decode_hex(&vector.script_raw)),
+                vector.sigops,
+                "{} script sigops",
+                vector.id
+            );
+            assert_eq!(
+                transaction_sigops(&transaction, std::slice::from_ref(&coin))
+                    .unwrap_or_else(|error| panic!("{} transaction sigops: {error}", vector.id)),
+                vector.sigops,
+                "{} transaction sigops",
+                vector.id
+            );
             let observed = match verify_witness_program(&transaction, 0, &coin, flags, &signatures)
             {
                 Ok(()) => "OK",

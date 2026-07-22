@@ -8,13 +8,13 @@ use std::{
 
 use hns_chain::{read_canonical_hash, HeaderRecord};
 use hns_consensus::{
-    is_reserved, maybe_expire_name, name_lifecycle, verify_airdrop_output,
+    is_reserved, maybe_expire_name, name_lifecycle, transaction_sigops, verify_airdrop_output,
     verify_and_apply_name_covenant, verify_claim_output, verify_sequence_locks,
     verify_transaction_covenant_links, AirdropFlags, ClaimFlags, ConsensusError, CovenantLinkError,
     DeploymentState, NameContext, NameFlags, NativeAirdropSignatureVerifier,
     NativeSignatureVerifier, Network, OpenSslDnssecVerifier, RejectUnverifiedInputs,
-    SequenceLockView, TransactionInputVerifier, VerifiedClaim, WitnessProgramVerifier, MAX_MONEY,
-    MEDIAN_TIMESPAN,
+    SequenceLockView, TransactionInputVerifier, VerifiedClaim, WitnessProgramVerifier,
+    MAX_BLOCK_SIGOPS, MAX_MONEY, MEDIAN_TIMESPAN,
 };
 use hns_primitives::{
     blake2b_256, Address, AirdropSignatureVerifier, Amount, Block, BlockHash, Coin, Covenant,
@@ -821,6 +821,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     let mut pending_created = HashMap::new();
     let mut name_state_changes = NameStateChanges::default();
     let mut total_fees = 0u64;
+    let mut block_sigops = 0u32;
 
     apply_verified_claims(
         snapshot,
@@ -853,6 +854,18 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
                 &input_coins,
                 &chain_context,
             )?;
+            block_sigops = block_sigops
+                .checked_add(transaction_sigops(transaction, &input_coins)?)
+                .ok_or(StateError::BlockSigopsExceeded {
+                    actual: u32::MAX,
+                    maximum: MAX_BLOCK_SIGOPS,
+                })?;
+            if block_sigops > MAX_BLOCK_SIGOPS {
+                return Err(StateError::BlockSigopsExceeded {
+                    actual: block_sigops,
+                    maximum: MAX_BLOCK_SIGOPS,
+                });
+            }
             verify_transaction_inputs(services.input_verifier, transaction, &input_coins)?;
             verify_transaction_covenant_links(transaction, &input_coins)?;
 
@@ -2414,6 +2427,8 @@ pub enum StateError {
     OutputValueOverflow,
     #[error("block transaction fee total overflow")]
     FeeValueOverflow,
+    #[error("block sigop count {actual} exceeds consensus maximum {maximum}")]
+    BlockSigopsExceeded { actual: u32, maximum: u32 },
     #[error("block subsidy, fees, and verified issuance overflow")]
     CoinbaseRewardOverflow,
     #[error("coinbase value {coinbase} exceeds verified maximum {maximum}")]
@@ -2469,6 +2484,7 @@ impl StateError {
                 | Self::InputValueOverflow
                 | Self::OutputValueOverflow
                 | Self::FeeValueOverflow
+                | Self::BlockSigopsExceeded { .. }
                 | Self::CoinbaseRewardOverflow
                 | Self::CoinbaseValueExceedsReward { .. }
                 | Self::InputValueBelowOutput { .. }
@@ -4335,6 +4351,64 @@ mod tests {
             Err(StateError::InputValueBelowOutput { .. })
         ));
         assert!(engine.coin(&funding_outpoint).expect("coin").is_some());
+    }
+
+    #[test]
+    fn block_sigop_limit_is_contextual_and_atomic() {
+        let store = MemoryStore::new();
+        let mut engine = engine(store);
+        let funding = coinbase(vec![Output {
+            value: 100,
+            address: Address::new(0, vec![0x55; 32]).expect("script-hash address"),
+            covenant: covenant(),
+        }]);
+        let funding_outpoint = Outpoint {
+            txid: funding.txid(),
+            index: 0,
+        };
+        let funding_block = block(12, vec![funding]);
+        engine
+            .connect_block(ConnectBlock {
+                block_hash: funding_block.hash(),
+                height: 0,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &funding_block,
+            })
+            .expect("funding");
+
+        // With no preceding OP_1..OP_16, HSD assigns the conservative maximum
+        // of 20 sigops to each CHECKMULTISIG opcode.
+        let checkmultisig_count =
+            usize::try_from(MAX_BLOCK_SIGOPS / 20 + 1).expect("sigop fixture length");
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: funding_outpoint.clone(),
+                sequence: u32::MAX,
+                witness: Witness {
+                    items: vec![vec![0xae; checkmultisig_count]],
+                },
+            }],
+            outputs: vec![output(90)],
+            locktime: 0,
+        };
+        let candidate = block(13, vec![coinbase(Vec::new()), spend]);
+        assert!(matches!(
+            engine.connect_block(ConnectBlock {
+                block_hash: candidate.hash(),
+                height: 1,
+                coinbase_maturity: 0,
+                block_reward: 100,
+                block: &candidate,
+            }),
+            Err(StateError::BlockSigopsExceeded {
+                actual: 80_020,
+                maximum: MAX_BLOCK_SIGOPS,
+            })
+        ));
+        assert!(engine.coin(&funding_outpoint).expect("coin").is_some());
+        assert!(engine.load_undo(&candidate.hash()).expect("undo").is_none());
     }
 
     #[test]

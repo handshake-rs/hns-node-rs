@@ -686,7 +686,7 @@ impl NodeService {
         Ok(())
     }
 
-    fn shadow_sync_ensure_genesis_header(&mut self) -> Result<HeaderRecord> {
+    pub(super) fn shadow_sync_ensure_genesis_header(&mut self) -> Result<HeaderRecord> {
         let params = self.config.network.params();
         if let Some(record) = self
             .state

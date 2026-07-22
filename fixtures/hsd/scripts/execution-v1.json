@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "oracle": {
     "repository": "handshake-org/hsd",
     "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
@@ -17,6 +17,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -30,6 +31,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "ea546b5e7b6c4628c5d1e2d49d58caa61de6f8a14f7eb96c0ceaa225b2fba93f",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -44,6 +46,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "021d48ab245f8ca055b90164ae412e8e45476a8160d77a0d4a1d71ce0b9a39fb",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -57,6 +60,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "00e2554847c29f8f1d2b577b0ebdeba9f6f010532a4134804630ccfcde4659b9",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -70,6 +74,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "a0ffd5d143846128dc9bc090963f2863f493619d9953e6ef3b079c0a0a2e89bc",
+      "sigops": 0,
       "flags": [],
       "result": "DISABLED_OPCODE"
     },
@@ -83,6 +88,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "3090b9ec1b11e09754d9ae70d7a258c18cc06029b3cda2f17d1e6aeb5d585ccb",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -94,6 +100,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "07c3a07eb18a0ca1d2a199e5023f11dd2be8abe64887b18dc5608954c2146602",
+      "sigops": 0,
       "flags": [],
       "result": "UNBALANCED_CONDITIONAL"
     },
@@ -107,6 +114,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "fce78d8bd4272021b2efc52d2042f13b5d092fa2726a86e7cc380b5f857af992",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -121,6 +129,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "73e2660b57efd3cca53353f6ff7bf13cadfcf7a71ff0b52182372b299987c9b9",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -136,6 +145,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "3592be13333d4536c16d4d83dabf043874b1867638f433e73ab698417e4dfae5",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -152,6 +162,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "83e51506d481f3e03f6213dd1005f8bcf4358ed649a5d38e1fd30709671b9b19",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -170,6 +181,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "de3cbd8da74d606c73ec324fbc280f11809d15018233122da935f623b983439e",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -186,6 +198,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "480efdbf2d01e0798cb59561a385e18db4ff51e618123f514537532f0b466dd2",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -200,6 +213,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "2bd5d88e5e799f10c7f5478db25c5c4cda6872b36e0a2238b9d576f886371d52",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -214,6 +228,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "0cef317db148362aadee4de380167da320251f3e2ff6788e45b36152d5b32b35",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -228,6 +243,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "60f1c909d3d123a65f3d90adbaedd1c242db372ad36e7bb9fef97b44296a1ebf",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -242,6 +258,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "0cef317db148362aadee4de380167da320251f3e2ff6788e45b36152d5b32b35",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -256,6 +273,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "60f1c909d3d123a65f3d90adbaedd1c242db372ad36e7bb9fef97b44296a1ebf",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -270,6 +288,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "0cef317db148362aadee4de380167da320251f3e2ff6788e45b36152d5b32b35",
+      "sigops": 0,
       "flags": [
         "MINIMALDATA"
       ],
@@ -285,6 +304,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "b983e010eed2477514cfe5ca9921ef353f8e8b43d7f09546e62157090f0016b1",
+      "sigops": 0,
       "flags": [],
       "result": "INVALID_STACK_OPERATION"
     },
@@ -298,6 +318,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "26e29bcb6e324ba3456781cc2eaa7ccb66b66b17eca1e7acb6e1b72ab1247f77",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -311,6 +332,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "679b88b217c975c3891feba24dc51b8c2b4a5fe53e8db2c1f108da80317a31e5",
+      "sigops": 0,
       "flags": [],
       "result": "UNKNOWN_ERROR"
     },
@@ -326,6 +348,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "74de7857b59356c2ab4c796005cff2cc4ad414eb56f7e49ddaf080faed480c46",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -341,6 +364,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "303ebadc3b65c3367eedabff34fc3362b8b1c6719c317c1ad8ec4af4b74d7ec8",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -354,6 +378,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "2ae26dcfa74d7644f86977204ab20dbe2b89404e7af1d6f4d87c80e915c7a574",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -367,6 +392,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "4b6eb0d8a7689d6806ba12f905d73c82f2b868a507b2a0b3a91da7489d5758ff",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -380,6 +406,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "975250792fd1c29f500fcdd4eef4ae4eefe3bdd969a0760d17c5f3811fd153f8",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -393,6 +420,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "e684d7a63f8c68abee5a6b08dc4fc5dcec10c016e4e8ecd694f822a360996f9b",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -406,6 +434,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "ae559e8f9fc12877b5acb3c529ea02d30f71386f72ac9bc0a5b4ef3f7c4d4437",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -419,6 +448,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "d767c37d7805e2cbdab2ee4d415096828fd1bb96dcfa7b46b660c7ddef717435",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -432,6 +462,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "8d15bae4a86f6a72634f7280d07e0964f832b371a365b4ca3e458fd8941e2817",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -445,6 +476,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "96748b88c25ca906f1211f5ffb773cf5248537ab5f61520b620b7e5243b4eea3",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -458,6 +490,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "8e4482affd50c48b909dcf865551e3cf595617f896ac5272922760d56f30f19f",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -469,6 +502,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "02c4dbc3c9000ef1b4b6367d83b993cf764fd2acf24a38a1c0a5e1006b9c6153",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -480,6 +514,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "02c4dbc3c9000ef1b4b6367d83b993cf764fd2acf24a38a1c0a5e1006b9c6153",
+      "sigops": 0,
       "flags": [
         "MINIMALDATA"
       ],
@@ -495,6 +530,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "db42be9d58213fee35c471713a4a1de4c1a8654f58008c14836e9a5274278f4d",
+      "sigops": 0,
       "flags": [
         "MINIMALIF"
       ],
@@ -510,6 +546,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "db42be9d58213fee35c471713a4a1de4c1a8654f58008c14836e9a5274278f4d",
+      "sigops": 0,
       "flags": [
         "MINIMALIF"
       ],
@@ -523,6 +560,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "78f767ab9331330b6788e07997f26441c82a3fd6166c07b0828e2916c5d2ec12",
+      "sigops": 0,
       "flags": [
         "DISCOURAGE_UPGRADABLE_NOPS"
       ],
@@ -538,6 +576,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "95a15e7534cfe7c2c273f4c939e2a27f3f5220cf559ab7ba8ac63becd181fe12",
+      "sigops": 0,
       "flags": [
         "DISCOURAGE_UPGRADABLE_NOPS"
       ],
@@ -551,6 +590,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "1f88fad8751b9916c771ef10c0534099f501005c3cec1851776a9cf17fab78a2",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -562,6 +602,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "1f88fad8751b9916c771ef10c0534099f501005c3cec1851776a9cf17fab78a2",
+      "sigops": 0,
       "flags": [],
       "result": "UNSATISFIED_LOCKTIME"
     },
@@ -573,6 +614,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "a2a9467f44f1a2970fc94331061cd3cb0f22282f5ef97ef732ae441e75994866",
+      "sigops": 0,
       "flags": [],
       "result": "UNSATISFIED_LOCKTIME"
     },
@@ -584,6 +626,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "b84f11e9417da70a4ff0bc2b78e5556cb2f049ffdb7ff7fc833dc867a4a15578",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -595,6 +638,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "b84f11e9417da70a4ff0bc2b78e5556cb2f049ffdb7ff7fc833dc867a4a15578",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -606,6 +650,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "5b94e0d84b5fdbb594d0eccdfa1c20db3febb11e24927305727ee1b2743e15dc",
+      "sigops": 0,
       "flags": [],
       "result": "UNSATISFIED_LOCKTIME"
     },
@@ -617,6 +662,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "478dcf39602e01fc61af9dd6537ab8fa05ec298e110c046161986aef2869ccd6",
+      "sigops": 0,
       "flags": [],
       "result": "OK"
     },
@@ -630,6 +676,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "f3adbaab95b0a15f3ecf145e81abd63a60359a48a3471744d9bfb4463190dbf2",
+      "sigops": 1,
       "flags": [],
       "result": "OK"
     },
@@ -643,6 +690,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "7de4461bd2c4a3d61850f9e998bbc238d5822a195f4fec75df66be764aa9f75e",
+      "sigops": 1,
       "flags": [],
       "result": "OK"
     },
@@ -656,6 +704,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "660ef419d79d8da28424f64f2dfe988f91a3a369665070478c7f0b1f369ca968",
+      "sigops": 1,
       "flags": [],
       "result": "OK"
     },
@@ -669,6 +718,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "660ef419d79d8da28424f64f2dfe988f91a3a369665070478c7f0b1f369ca968",
+      "sigops": 1,
       "flags": [
         "NULLFAIL"
       ],
@@ -685,6 +735,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "f6f154926221be6ed4eebcf236ac4ece5ee6aa393b25f1c6c974bb9decd268a1",
+      "sigops": 1,
       "flags": [],
       "result": "OK"
     },
@@ -696,6 +747,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "746d5e6e5645e4e6da497002f4caad7b96c1318cfd8f4e9c0cba23f9e8b2498e",
+      "sigops": 20,
       "flags": [],
       "result": "OK"
     },
@@ -707,6 +759,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "f35e560e05de779f2669b9f513c2a7ab81dfeb100e2f4ee1fb17354bfa2740ca",
+      "sigops": 0,
       "flags": [],
       "result": "OP_RETURN"
     },
@@ -718,6 +771,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "e5a73514ffed2f2f59b5112f4ae50cb138f1658633d354ac36c7c1bc019259d2",
+      "sigops": 0,
       "flags": [],
       "result": "BAD_OPCODE"
     },
@@ -732,6 +786,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "1b7669b6873fca871ebebdb4f785a33031d773ed90973e667cfd676afd778057",
+      "sigops": 0,
       "flags": [],
       "result": "EQUALVERIFY"
     },
@@ -745,6 +800,7 @@
       "previousValue": 1,
       "addressVersion": 0,
       "addressHash": "f4355fcab6343d039c123990a05bb05eb023de94a52812caceeb933688e6b866",
+      "sigops": 0,
       "flags": [],
       "result": "VERIFY"
     }

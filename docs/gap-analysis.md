@@ -21,20 +21,24 @@
 ### Validation and state foundation
 
 - Header PoW, parent linkage, HNS difficulty, timestamp bounds, block syntax and
-  commitments, ordinary subsidy-plus-fee accounting, absolute finality, UTXO
+  commitments, candidate coinbase-height binding, ordinary subsidy-plus-fee
+  accounting, absolute finality, contextual 80,000-sigop enforcement, UTXO
   connect/disconnect, coinbase maturity, duplicate/missing spend checks, value
   conservation, and output-collision checks.
 - HSD signature hashing, relative locks, CLTV, and CSV.
 - Bounded witness/script interpreter matching all 876 pinned upstream HSD
-  execution cases, plus 56 committed focused execution/error vectors.
+  execution cases, plus 56 committed focused execution/error vectors with
+  exact HSD sigop counts.
 - Exact HSD BIP9 transitions, block-version selection, deployment effects,
   network checkpoint tables, strict header checkpoint enforcement, and a
   checkpoint-ancestry-gated historical validation policy with an HSD-executed
-  stage-by-stage full/historical route matrix.
+  stage-by-stage full/historical route matrix, including always-on coinbase
+  height and checkpoint-skipped contextual sigops.
 - Canonical-mainnet replay of all 168 completed deployment periods through
   height 338,688, including real median times, signal counts, threshold states,
   deployment effects, next-block versions, the historical boundary, and the
-  exact accepted block-1 coinbase-finality exception.
+  exact accepted block-1 coinbase-finality exception with its separate valid
+  height commitment.
 - Active blocks derive name and issuance flags from their parent, cache all
   four threshold states atomically, retain branch caches across reorganization,
   and fail startup on missing or inconsistent active-chain cache entries.
@@ -164,8 +168,9 @@ These are substantial foundations, not a production full node.
 
 ### Consensus and authenticated state
 
-- Historical checkpoint-fast-path replay qualification and non-script
-  historical exceptions.
+- Historical checkpoint-fast-path replay qualification and remaining
+  non-script historical exceptions beyond the now-pinned coinbase-height and
+  block-sigop routes.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
 - Independently sourced live DNSSEC-proof evidence for historical-policy

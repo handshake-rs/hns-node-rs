@@ -13,7 +13,8 @@ checks:
   coordination;
 - fixture-only chainwork restrictions;
 - authority-mode safety tokens;
-- authorization, covenant, name-transition, and spend-staging order;
+- sigop-limit, authorization, covenant, name-transition, and spend-staging
+  order;
 - correct pre-state root validation before transaction mutation;
 - null-state deletion and durable root binding;
 - non-authoritative network wiring, active-state acknowledgement/batch bounds,
@@ -92,7 +93,11 @@ Current evidence includes:
 - 56 HSD-executed witness-program cases spanning control flow, stack and
   numeric operations, hashes, native `CHECKSIG`/`CHECKMULTISIG`, CLTV/CSV,
   disabled/unknown opcodes, and policy flags with normalized HSD rejection
-  codes;
+  codes plus exact per-program sigop counts;
+- an HSD-executed full/historical validation-route matrix proving that
+  candidate coinbase height remains checked under checkpoints while contextual
+  block sigops follow the full-input route, with native block-1 height evidence
+  and an atomic 80,020-sigop rejection;
 - 33 covenant-linkage accepted/rejected cases;
 - exact HSD `NameState` encoding vectors;
 - 28 exact HSD contextual name-transition cases: 15 accepted lifecycle,

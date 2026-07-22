@@ -49,10 +49,14 @@ reserved low-latency paths.
 
 - HSD signature hashing and relative locks.
 - Complete pinned-HSD interpreter parity across all 876 upstream script cases.
+- Exact HSD witness-program sigop accounting with the contextual 80,000-sigop
+  block ceiling enforced before active-state mutation.
 - Exact HSD BIP9 deployment selection, checkpoint tables/enforcement, and a
   fail-closed checkpoint-backed historical policy plus a stage-by-stage HSD
-  validation-route plan. Broader non-script assumptions remain disabled in the
-  native runtime pending historical replay qualification.
+  validation-route plan, including always-on candidate coinbase-height binding
+  and checkpoint-skipped contextual sigops. Broader non-script assumptions
+  remain disabled in the native runtime pending historical replay
+  qualification.
 - Exact vendored native secp256k1 verification backend.
 - Authorization and lock checks before state mutation.
 

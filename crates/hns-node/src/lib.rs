@@ -34,10 +34,10 @@ use hns_chain::{
     StoredBlockIndex, StoredHeaderIndex,
 };
 use hns_consensus::{
-    advance_threshold_state, expected_next_bits, validate_block_finality, ConsensusParams,
-    Deployment, DeploymentPeriod, DeploymentState, DifficultyPoint, HeaderConsensus, HeaderParent,
-    HeaderValidationContext, NameFlags, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
-    MEDIAN_TIMESPAN,
+    advance_threshold_state, expected_next_bits, validate_block_finality, validate_coinbase_height,
+    ConsensusParams, Deployment, DeploymentPeriod, DeploymentState, DifficultyPoint,
+    HeaderConsensus, HeaderParent, HeaderValidationContext, NameFlags, Network, ThresholdState,
+    MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
 };
 use hns_mempool::{MemoryMempool, Mempool};
 use hns_mining::{
@@ -2379,6 +2379,11 @@ impl NodeState {
         )
         .map_err(|error| anyhow::anyhow!("transaction finality validation failed: {error}"))?;
 
+        if matches!(request.validation, ImportValidationPolicy::Strict) {
+            validate_coinbase_height(&request.block, request.height)
+                .map_err(|error| anyhow::anyhow!("coinbase height validation failed: {error}"))?;
+        }
+
         validate_branch_extension(snapshot, request, chainwork, self.network)?;
 
         Ok(ValidatedImport {
@@ -4103,6 +4108,24 @@ mod tests {
         }
     }
 
+    fn decode_hex(value: &str) -> Vec<u8> {
+        fn nibble(value: u8) -> u8 {
+            match value {
+                b'0'..=b'9' => value - b'0',
+                b'a'..=b'f' => value - b'a' + 10,
+                b'A'..=b'F' => value - b'A' + 10,
+                _ => panic!("invalid fixture hex"),
+            }
+        }
+
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
+    }
+
     fn transaction() -> Transaction {
         Transaction {
             version: 1,
@@ -4450,6 +4473,38 @@ mod tests {
     }
 
     #[test]
+    fn strict_mainnet_block_one_keeps_coinbase_finality_and_height_distinct() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/chains/mainnet-deployment-history-v1.json"
+        ))
+        .expect("mainnet deployment fixture");
+        let case = &fixture["historicalFinalityCases"][0];
+        let block = Block::decode(&decode_hex(case["raw"].as_str().expect("raw block one")))
+            .expect("canonical mainnet block one");
+        assert_eq!(block.transactions[0].locktime, 1);
+        assert!(!hns_consensus::is_final_transaction(
+            &block.transactions[0],
+            1,
+            0
+        ));
+
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Mainnet,
+            ..NodeConfig::default()
+        });
+        node.shadow_sync_ensure_genesis_header()
+            .expect("canonical mainnet genesis header");
+        let error = node
+            .state
+            .validate_import(&NodeBlockImport::from_peer(block, 1))
+            .expect_err("the parent block body was not seeded");
+        assert!(
+            error.to_string().contains("block parent index"),
+            "canonical block one must pass strict header, body, finality, and coinbase-height checks before parent-body activation context: {error}"
+        );
+    }
+
+    #[test]
     fn node_connect_block_commits_indexes_state_and_metadata_atomically() {
         let mut node = NodeService::new(NodeConfig {
             network: Network::Regtest,
@@ -4699,7 +4754,9 @@ mod tests {
             .connect_block(NodeBlockImport::fixture(parent, 0, 1))
             .expect("fixture parent");
 
-        let mut child = block_with_commitments(vec![coinbase_transaction_with_address(12, 50)]);
+        let mut coinbase = coinbase_transaction_with_address(12, 50);
+        coinbase.locktime = 1;
+        let mut child = block_with_commitments(vec![coinbase]);
         child.header.prev_block = parent_record.hash;
         child.header.bits = Network::Regtest.params().pow.bits;
         child.header.time = 1;
@@ -4711,6 +4768,46 @@ mod tests {
             .connect_block(NodeBlockImport::from_peer(child, 1))
             .expect("peer child");
         assert_eq!(child_record.chainwork, Uint256::from(3u64));
+    }
+
+    #[test]
+    fn peer_block_rejects_wrong_coinbase_height_before_storage() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let parent = block_with_commitments(vec![coinbase_transaction_with_address(15, 50)]);
+        let parent_record = node
+            .connect_block(NodeBlockImport::fixture(parent, 0, 1))
+            .expect("fixture parent");
+
+        let mut child = block_with_commitments(vec![coinbase_transaction_with_address(16, 50)]);
+        child.header.prev_block = parent_record.hash;
+        child.header.bits = Network::Regtest.params().pow.bits;
+        child.header.time = 1;
+        while !child.header.verify_pow() {
+            child.header.nonce = child.header.nonce.checked_add(1).expect("nonce space");
+        }
+        let child_hash = child.hash();
+
+        let error = node
+            .connect_block(NodeBlockImport::from_peer(child, 1))
+            .expect_err("wrong coinbase height");
+        assert!(error.to_string().contains("coinbase height"), "{error}");
+        assert_eq!(
+            node.state()
+                .best_block_tip()
+                .expect("tip")
+                .expect("tip")
+                .hash,
+            parent_record.hash
+        );
+        assert!(node
+            .state()
+            .blocks
+            .load_block(&child_hash)
+            .expect("child lookup")
+            .is_none());
     }
 
     #[test]
