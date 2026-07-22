@@ -11,10 +11,10 @@ use hns_consensus::{
     is_reserved, maybe_expire_name, name_lifecycle, transaction_sigops, verify_airdrop_output,
     verify_and_apply_name_covenant, verify_claim_output, verify_sequence_locks,
     verify_transaction_covenant_links, AirdropFlags, ClaimFlags, ConsensusError, CovenantLinkError,
-    DeploymentState, NameContext, NameFlags, NativeAirdropSignatureVerifier,
-    NativeSignatureVerifier, Network, OpenSslDnssecVerifier, RejectUnverifiedInputs,
-    SequenceLockView, TransactionInputVerifier, VerifiedClaim, WitnessProgramVerifier,
-    MAX_BLOCK_SIGOPS, MAX_MONEY, MEDIAN_TIMESPAN,
+    DeploymentState, HistoricalValidationPlan, NameContext, NameFlags,
+    NativeAirdropSignatureVerifier, NativeSignatureVerifier, Network, OpenSslDnssecVerifier,
+    RejectUnverifiedInputs, SequenceLockView, TransactionInputVerifier, VerifiedClaim,
+    WitnessProgramVerifier, MAX_BLOCK_SIGOPS, MAX_MONEY, MEDIAN_TIMESPAN,
 };
 use hns_primitives::{
     blake2b_256, Address, AirdropSignatureVerifier, Amount, Block, BlockHash, Coin, Covenant,
@@ -93,6 +93,11 @@ pub struct StateSummary {
     /// Authenticated name-tree root after this block's name transitions. This is
     /// the root the next block must commit to.
     pub resulting_tree_root: TreeRoot,
+    /// Exact full or checkpoint-backed validation route selected by the chain
+    /// coordinator. The state engine currently honors only HSD's narrow
+    /// historical BID/REDEEM contextual exception; every broader historical
+    /// assumption remains checked by the normal path.
+    pub historical_validation: HistoricalValidationPlan,
     pub validation: StateValidationSummary,
 }
 
@@ -466,6 +471,10 @@ pub struct StateServices<'a> {
     pub network: Network,
     pub name_flags: NameFlags,
     pub name_flags_valid: bool,
+    /// Branch-specific historical route selected only after the caller has
+    /// established checkpoint ancestry. Standalone state engines use the full
+    /// fail-closed route.
+    pub historical_validation: HistoricalValidationPlan,
     pub input_verifier: &'a dyn TransactionInputVerifier,
     pub issuance_verifier: &'a dyn CoinbaseIssuanceVerifier,
 }
@@ -477,6 +486,7 @@ impl fmt::Debug for StateServices<'_> {
             .field("network", &self.network)
             .field("name_flags", &self.name_flags)
             .field("name_flags_valid", &self.name_flags_valid)
+            .field("historical_validation", &self.historical_validation)
             .field("input_verifier", &"<transaction-input-verifier>")
             .field("issuance_verifier", &"<coinbase-issuance-verifier>")
             .finish()
@@ -636,6 +646,7 @@ impl<S: Store> StoredStateEngine<S> {
             network: self.network,
             name_flags: self.name_flags,
             name_flags_valid: self.name_flags_valid,
+            historical_validation: HistoricalValidationPlan::full(),
             input_verifier: self.input_verifier(),
             issuance_verifier: self.issuance_verifier(),
         }
@@ -734,6 +745,7 @@ pub fn connect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
             network: Network::Mainnet,
             name_flags: NameFlags::NONE,
             name_flags_valid: false,
+            historical_validation: HistoricalValidationPlan::full(),
             input_verifier: &RejectUnverifiedInputs,
             issuance_verifier: &RejectSpecialCoinbaseIssuance,
         },
@@ -754,6 +766,7 @@ pub fn connect_block_to_batch_with_verifier<T: ReadSnapshot, B: WriteBatch>(
             network: Network::Mainnet,
             name_flags: NameFlags::NONE,
             name_flags_valid: false,
+            historical_validation: HistoricalValidationPlan::full(),
             input_verifier,
             issuance_verifier: &RejectSpecialCoinbaseIssuance,
         },
@@ -792,7 +805,8 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         .transactions
         .first()
         .ok_or(StateError::MissingCoinbase)?;
-    let chain_context = SnapshotChainContext::new(snapshot);
+    let chain_context =
+        SnapshotChainContext::new(snapshot, request.height, services.historical_validation);
     let has_claim = coinbase
         .outputs
         .iter()
@@ -1025,6 +1039,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         names_changed: undo.previous_name_states.len(),
         inherited_tree_root,
         resulting_tree_root,
+        historical_validation: services.historical_validation,
         validation: StateValidationSummary {
             relative_locks_valid: true,
             // Every non-coinbase input in this block reached the configured
@@ -1457,11 +1472,21 @@ fn check_coinbase_maturity(
 
 struct SnapshotChainContext<'a, T: ReadSnapshot> {
     snapshot: &'a T,
+    candidate_height: Height,
+    historical_validation: HistoricalValidationPlan,
 }
 
 impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
-    const fn new(snapshot: &'a T) -> Self {
-        Self { snapshot }
+    const fn new(
+        snapshot: &'a T,
+        candidate_height: Height,
+        historical_validation: HistoricalValidationPlan,
+    ) -> Self {
+        Self {
+            snapshot,
+            candidate_height,
+            historical_validation,
+        }
     }
 
     fn header_at(&self, height: Height) -> Result<Option<HeaderRecord>, StateError> {
@@ -1529,6 +1554,12 @@ impl<T: ReadSnapshot> NameContext for SnapshotChainContext<'_, T> {
         let canonical = read_canonical_hash(self.snapshot, record.height)
             .map_err(|error| ConsensusError::View(error.to_string()))?;
         Ok((canonical == Some(*hash)).then_some(record.height))
+    }
+
+    fn is_historical_height(&self, height: Height) -> bool {
+        height == self.candidate_height
+            && self.historical_validation.historical
+            && !self.historical_validation.bid_redeem_context
     }
 }
 
@@ -1635,6 +1666,7 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
         names_changed: undo.previous_name_states.len(),
         inherited_tree_root: current_tree_root,
         resulting_tree_root: restored_tree_root,
+        historical_validation: HistoricalValidationPlan::full(),
         validation: StateValidationSummary {
             name_state_connected: true,
             tree_root_valid: true,
@@ -2713,6 +2745,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn checkpoint_route_composes_only_historical_bid_redeem_name_context() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let snapshot = store.snapshot().expect("snapshot");
+        let input_verifier = AllowAllInputVerifier;
+        let issuance_verifier = RejectSpecialCoinbaseIssuance;
+        let height = 100;
+        let name = b"historicalbid";
+        let name_hash = NameHash::new(hns_primitives::sha3_256(name));
+        let transactions = [
+            coinbase(vec![Output {
+                value: 0,
+                address: address(),
+                covenant: Covenant {
+                    kind: CovenantKind::Bid,
+                    items: vec![
+                        name_hash.as_bytes().to_vec(),
+                        1u32.to_le_bytes().to_vec(),
+                        name.to_vec(),
+                        vec![0x55; 32],
+                    ],
+                },
+            }]),
+            coinbase(vec![Output {
+                value: 0,
+                address: address(),
+                covenant: Covenant {
+                    kind: CovenantKind::Redeem,
+                    items: vec![name_hash.as_bytes().to_vec(), 1u32.to_le_bytes().to_vec()],
+                },
+            }]),
+        ];
+        let full_services = StateServices {
+            network: Network::Mainnet,
+            name_flags: NameFlags::NONE,
+            name_flags_valid: true,
+            historical_validation: HistoricalValidationPlan::full(),
+            input_verifier: &input_verifier,
+            issuance_verifier: &issuance_verifier,
+        };
+        let full_context =
+            SnapshotChainContext::new(&snapshot, height, HistoricalValidationPlan::full());
+        let historical_plan = HistoricalValidationPlan::hsd_checkpointed();
+        let historical_context = SnapshotChainContext::new(&snapshot, height, historical_plan);
+
+        for transaction in &transactions {
+            let mut full_changes = NameStateChanges::default();
+            let error = apply_transaction_name_covenants(
+                &snapshot,
+                transaction,
+                height,
+                full_services,
+                &full_context,
+                &mut full_changes,
+                false,
+            )
+            .expect_err("a BID/REDEEM without NameState must fail on the full route");
+            assert!(
+                matches!(
+                    error,
+                    StateError::Consensus(ConsensusError::ContextualCovenant(_))
+                ),
+                "unexpected full-route error: {error:?}"
+            );
+
+            let mut historical_changes = NameStateChanges::default();
+            apply_transaction_name_covenants(
+                &snapshot,
+                transaction,
+                height,
+                StateServices {
+                    historical_validation: historical_plan,
+                    ..full_services
+                },
+                &historical_context,
+                &mut historical_changes,
+                false,
+            )
+            .expect("checkpoint-backed BID/REDEEM context bypass");
+            assert!(historical_changes.current.is_empty());
+        }
+        assert!(historical_context.is_historical_height(height));
+        assert!(!historical_context.is_historical_height(height + 1));
+    }
+
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct NameTreeFixture {
@@ -3270,6 +3388,7 @@ mod tests {
             network: Network::Regtest,
             name_flags: NameFlags::NONE,
             name_flags_valid: true,
+            historical_validation: HistoricalValidationPlan::full(),
             input_verifier: &input_verifier,
             issuance_verifier: &issuance_verifier,
         };

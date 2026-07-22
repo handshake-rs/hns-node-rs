@@ -27,6 +27,9 @@ Implemented:
   checkpoint-backed historical validation-stage plan that distinguishes the
   always-on transaction-start and candidate-coinbase-height checks from
   checkpoint-skipped block sigops.
+- Branch-specific final-checkpoint header evidence composes only HSD's
+  historical BID/REDEEM NameState-read exception into active state; missing or
+  mismatched evidence selects full contextual validation.
 - Exact per-network HSD `txStart` values and strict mainnet enforcement before
   height 2,016: only the coinbase, exactly one output, and no covenant.
 - Canonical mainnet block-1 finality parity: ordinary transaction finality

@@ -97,13 +97,19 @@ Implemented:
 - Strict header checkpoint enforcement and a fail-closed historical-script
   policy that requires verified checkpoint ancestry before allowing HSD's
   optional historical validation shortcut.
+- Active-state connection composes HSD's exact historical BID/REDEEM
+  NameState-read exception only when the candidate and final configured
+  checkpoint are bound to the same best validated header path. A strictly
+  validated final-checkpoint block supplies its own binding; missing,
+  mismatched, failed, or alternate-branch evidence selects the full route.
 - An HSD-executed historical validation-plan matrix pins which body, header,
   deployment, finality, transaction-start, claim/airdrop, input, covenant,
   reward, and script stages are checked or assumed at the checkpoint boundary.
   HSD's always-on mainnet pre-height-2,016 restriction permits only one
   ordinary coinbase output and is enforced before any historical shortcut. The
-  native runtime keeps the broader non-script assumptions disabled until
-  historical replay is independently qualified.
+  native runtime records the selected route in each state result but keeps
+  every broader historical assumption disabled until historical replay is
+  independently qualified.
 - Exact bounded HSD Claim envelope encoding, blob-only Claim hashes, and the
   checksummed ownership TXT payload codec for all four network prefixes.
 - Compression-free DNSKEY/DS/TXT/RRSIG ownership-proof parsing, exact HSD

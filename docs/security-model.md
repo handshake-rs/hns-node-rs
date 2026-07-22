@@ -89,7 +89,8 @@ during a probe are retried rather than classified as divergence.
 
 The following remain untrusted and release-blocking:
 
-- non-script historical exceptions and historical replay qualification;
+- historical exceptions beyond the branch-gated BID/REDEEM context rule, and
+  complete historical replay qualification;
 - independent script fuzz/invalid evidence beyond the complete pinned HSD
   upstream corpus;
 - current/live claim-proof evidence and complete historical claim replay beyond

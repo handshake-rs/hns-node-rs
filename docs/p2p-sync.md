@@ -199,7 +199,10 @@ IBD progress is additionally limited to eight connected blocks per supervisor
 slice so RPC, peer work, and shutdown are polled between small atomic commits.
 Each batch uses the node's existing deployment, script, sequence-lock,
 claim/airdrop, covenant, UTXO, name-state, Urkel-root, undo, and reorganization
-pipeline; no second consensus implementation exists in the sync runtime.
+pipeline; no second consensus implementation exists in the sync runtime. For
+historical BID/REDEEM context, the connector uses the HSD exception only after
+the candidate and exact final checkpoint are bound to the same best validated
+header path. All other historical shortcuts remain disabled.
 
 ```bash
 cargo run --locked -p hns-node -- \

@@ -55,8 +55,10 @@ reserved low-latency paths.
   fail-closed checkpoint-backed historical policy plus a stage-by-stage HSD
   validation-route plan, including always-on candidate coinbase-height binding,
   the mainnet pre-height-2,016 transaction/coinbase restriction, and
-  checkpoint-skipped contextual sigops. Broader non-script assumptions remain
-  disabled in the native runtime pending historical replay qualification.
+  checkpoint-skipped contextual sigops. Active state now composes only the
+  HSD-exact BID/REDEEM NameState-read exception behind branch-specific final
+  checkpoint header evidence; broader historical assumptions remain disabled
+  pending replay qualification.
 - Exact vendored native secp256k1 verification backend.
 - Authorization and lock checks before state mutation.
 

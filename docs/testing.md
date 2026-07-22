@@ -305,6 +305,13 @@ exact validation-stage plan on both sides of checkpoint height 258,026:
 NODE_BACKEND=js npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
 ```
 
+Node regressions decode HSD's real height-258,026 header and require both the
+candidate and that exact final checkpoint to occupy the same best validated
+header path before selecting the historical plan. State regressions then prove
+that only BID/REDEEM skips the absent-NameState contextual read; the same
+transaction fails on the full route. Missing, unverified, alternate-branch,
+post-checkpoint, and checkpoint-free-network cases all remain fail-closed.
+
 An operator with a synchronized mainnet HSD node can reproduce the compact
 fixture without embedding an API key or machine path:
 

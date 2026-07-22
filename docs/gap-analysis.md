@@ -35,6 +35,11 @@
   checkpoint-ancestry-gated historical validation policy with an HSD-executed
   stage-by-stage full/historical route matrix, including always-on transaction
   start and coinbase height plus checkpoint-skipped contextual sigops.
+- Active-state connection selects HSD's historical BID/REDEEM contextual
+  exception only for candidates on the best validated header path through the
+  exact final configured checkpoint. Missing or branch-mismatched evidence
+  keeps full contextual validation, and the selected route is returned as
+  explicit state-transition evidence.
 - Canonical-mainnet replay of all 168 completed deployment periods through
   height 338,688, including real median times, signal counts, threshold states,
   deployment effects, next-block versions, the historical boundary, and the
@@ -173,8 +178,8 @@ These are substantial foundations, not a production full node.
 ### Consensus and authenticated state
 
 - Historical checkpoint-fast-path replay qualification and remaining
-  non-script historical exceptions beyond the now-pinned coinbase-height and
-  block-sigop routes.
+  historical exceptions beyond the now-composed BID/REDEEM context rule and
+  pinned coinbase-height/block-sigop routes.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
 - Independently sourced live DNSSEC-proof evidence for historical-policy
