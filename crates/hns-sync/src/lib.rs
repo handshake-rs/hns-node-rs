@@ -79,8 +79,10 @@ pub struct SyncMetrics {
     pub target_height: Option<Height>,
     pub pending_blocks: usize,
     pub inflight_blocks: usize,
+    pub tracked_blocks: usize,
     pub validated_blocks: u64,
     pub failed_blocks: u64,
+    pub unavailable_blocks: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -130,7 +130,10 @@ Implemented:
 - headers-first acquisition, 2,000-header atomic durable protocol batches,
   best-work retention, and independent canonical-header derivation of BIP9
   states plus mandatory script/lock/name policy;
-- bounded pending/inflight/per-peer block scheduling with retry and timeout;
+- bounded cross-stage body reservations with per-peer requests, retry/timeout,
+  an orphan-horizon canonical window, and pruning-aware `notfound` failover
+  that does not fabricate failures or let canonical acquisition alone overrun
+  the retained-orphan count bound;
 - bounded known-header orphan handling;
 - parallel stateless body validation with ordered results;
 - durable permanent-invalid and invalid-child status, atomic best-header

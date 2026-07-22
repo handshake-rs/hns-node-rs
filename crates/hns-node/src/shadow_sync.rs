@@ -1308,13 +1308,25 @@ impl NodeService {
         let start_height = contiguous
             .as_ref()
             .map_or(0, |tip| tip.height.saturating_add(1));
+        let body_window = Height::try_from(self.config.shadow_sync.orphan_blocks)
+            .context("orphan block horizon exceeds the canonical height range")?;
+        if body_window == 0 {
+            anyhow::bail!("orphan block horizon is zero");
+        }
+        // Never let the canonical downloader alone schedule more future bodies
+        // than the orphan pool's count horizon. Advancing the contiguous
+        // stored tip slides this window forward without the deterministic
+        // count-bound eviction/redownload churn of an unbounded range.
+        let last_height = start_height
+            .saturating_add(body_window.saturating_sub(1))
+            .min(best.height);
         let mut queued = 0usize;
         let mut available = scheduler.available_pending_slots();
         if available == 0 {
             return Ok(0);
         }
 
-        for height in start_height..=best.height {
+        for height in start_height..=last_height {
             if available == 0 {
                 break;
             }
@@ -1324,7 +1336,7 @@ impl NodeService {
             else {
                 break;
             };
-            if self.shadow_sync_has_block(&hash)? || scheduler.is_queued_or_inflight(&hash) {
+            if self.shadow_sync_has_block(&hash)? || scheduler.is_tracked_block(&hash) {
                 continue;
             }
             if scheduler
@@ -1933,7 +1945,11 @@ async fn handle_peer_event(
             Packet::NotFound(items) => {
                 for item in items {
                     if let Some(hash) = item.block_hash() {
-                        scheduler.reject_block(Some(peer), hash, true, StdInstant::now());
+                        scheduler
+                            .note_block_unavailable(peer, hash)
+                            .map_err(|error| {
+                                anyhow::anyhow!("peer returned invalid notfound response: {error}")
+                            })?;
                     }
                 }
             }
@@ -2041,7 +2057,7 @@ async fn accept_peer_block(
             hash.to_hex()
         );
     }
-    if !scheduler.is_queued_or_inflight(&hash) {
+    if !scheduler.is_tracked_block(&hash) {
         scheduler
             .announce_block(peer, hash, record.height)
             .map_err(|error| anyhow::anyhow!("failed to queue delivered block: {error}"))?;
@@ -2058,7 +2074,9 @@ async fn accept_peer_block(
         })
         .await
     {
-        let _ = scheduler.queue_block(hash, record.height);
+        scheduler
+            .requeue_tracked_block(hash, record.height)
+            .context("failed to preserve body work after validation queue rejection")?;
         return Err(anyhow::anyhow!("validation queue rejected block: {error}"));
     }
     Ok(())
@@ -2128,8 +2146,29 @@ async fn submit_released_orphans(
             })
             .await
         {
-            let _ = orphans.insert_with_evictions(retry);
-            let _ = scheduler.queue_block(hash, record.height);
+            let outcome = match orphans.insert_with_evictions(retry) {
+                Ok(outcome) => outcome,
+                Err(insert_error) => {
+                    scheduler
+                        .requeue_tracked_block(hash, record.height)
+                        .context("failed to requeue released orphan after retention failure")?;
+                    anyhow::bail!(
+                        "validation queue rejected block ({error}) and orphan retention failed: {insert_error}"
+                    );
+                }
+            };
+            for evicted in outcome.evicted {
+                let evicted_hash = evicted.hash();
+                let node = node.lock().await;
+                if let Some(evicted_record) = node.shadow_sync_header_record(&evicted_hash)? {
+                    if !node.shadow_sync_has_block(&evicted_hash)? {
+                        scheduler
+                            .requeue_tracked_block(evicted_hash, evicted_record.height)
+                            .context("failed to requeue orphan evicted during queue recovery")?;
+                    }
+                }
+            }
+            scheduler.complete_orphan_validation();
             return Err(anyhow::anyhow!("failed to submit released orphan: {error}"));
         }
     }
@@ -2154,17 +2193,25 @@ async fn handle_validation_result(
                     || node.shadow_sync_has_block(&validated.block.header.prev_block)?
             };
             if !parent_available {
-                let outcome = orphans
-                    .insert_with_evictions(validated.block)
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to retain validated orphan: {error}")
-                    })?;
+                let outcome = match orphans.insert_with_evictions(validated.block) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        scheduler
+                            .requeue_tracked_block(hash, validated.height)
+                            .context("failed to requeue unretained validated orphan")?;
+                        return Err(anyhow::anyhow!(
+                            "failed to retain validated orphan: {error}"
+                        ));
+                    }
+                };
                 for evicted in outcome.evicted {
                     let evicted_hash = evicted.hash();
                     let node = node.lock().await;
                     if let Some(record) = node.shadow_sync_header_record(&evicted_hash)? {
                         if !node.shadow_sync_has_block(&evicted_hash)? {
-                            let _ = scheduler.queue_block(evicted_hash, record.height);
+                            scheduler
+                                .requeue_tracked_block(evicted_hash, record.height)
+                                .context("failed to requeue evicted orphan body")?;
                         }
                     }
                 }
@@ -2840,6 +2887,68 @@ mod tests {
                 .height as usize,
             MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE
         );
+    }
+
+    #[test]
+    fn canonical_body_queue_is_bounded_to_orphan_horizon() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            shadow_sync: ShadowSyncConfig {
+                enabled: true,
+                orphan_blocks: 2,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..ShadowSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis");
+        let params = Network::Regtest.params();
+        let mut previous = genesis.header;
+        let mut headers = Vec::new();
+        for _ in 0..4 {
+            let mut header = Header {
+                prev_block: previous.hash(),
+                time: previous.time + 1,
+                bits: params.pow.bits,
+                ..Header::default()
+            };
+            while !header.verify_pow() {
+                header.nonce = header.nonce.checked_add(1).expect("regtest nonce space");
+            }
+            previous = header.clone();
+            headers.push(header);
+        }
+        service
+            .shadow_sync_import_headers(headers)
+            .expect("canonical headers");
+
+        let now = StdInstant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        scheduler
+            .register_peer(PeerId(1), hns_p2p::SERVICE_NETWORK, 4)
+            .expect("peer");
+        scheduler.set_best_header(service.shadow_sync_best_header_tip().expect("best header"));
+        assert_eq!(
+            service
+                .shadow_sync_queue_missing_canonical_bodies(&mut scheduler)
+                .expect("body queue"),
+            2
+        );
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 2);
+        assert_eq!(snapshot.tracked_blocks, 2);
+
+        let requested = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .filter_map(|action| match action {
+                SyncAction::RequestBlock(request) => Some(request.height),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requested, vec![0, 1]);
     }
 
     #[test]

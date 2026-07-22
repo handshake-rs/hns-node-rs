@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -73,6 +73,9 @@ pub struct PeerSyncSnapshot {
     pub ready: bool,
     pub inflight_blocks: usize,
     pub failures: u32,
+    /// Honest block `notfound` responses observed from this peer. These are
+    /// availability evidence, not validation or protocol failures.
+    pub unavailable_blocks: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,8 +87,12 @@ pub struct SyncSnapshot {
     pub target_height: Option<Height>,
     pub pending_blocks: usize,
     pub inflight_blocks: usize,
+    /// All reserved body work, including pending, inflight, validating, and
+    /// statelessly validated orphan bodies.
+    pub tracked_blocks: usize,
     pub validated_blocks: u64,
     pub failed_blocks: u64,
+    pub unavailable_blocks: u64,
     pub sequence: u64,
     pub peers: Vec<PeerSyncSnapshot>,
 }
@@ -118,6 +125,7 @@ struct PeerSyncState {
     inflight: BTreeSet<BlockHash>,
     headers_requested_at: Option<Instant>,
     failures: u32,
+    unavailable_blocks: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -136,13 +144,16 @@ struct PeerRetryBackoff {
 }
 
 impl PendingBlock {
+    fn peer_can_deliver(&self, peer: PeerId) -> bool {
+        self.announced_by.is_empty() || self.announced_by.contains(&peer)
+    }
+
     fn peer_is_eligible(&self, peer: PeerId, now: Instant) -> bool {
-        let announced = self.announced_by.is_empty() || self.announced_by.contains(&peer);
         let retry_ready = self
             .retry_backoff
             .as_ref()
             .is_none_or(|backoff| backoff.peer != peer || now >= backoff.eligible_at);
-        announced && retry_ready
+        self.peer_can_deliver(peer) && retry_ready
     }
 }
 
@@ -162,12 +173,21 @@ pub struct SyncScheduler {
     pending_order: VecDeque<BlockHash>,
     pending: HashMap<BlockHash, PendingBlock>,
     inflight: HashMap<BlockHash, InflightBlock>,
+    /// One bounded reservation per body across every scheduler/validator/
+    /// orphan state. Moving a request between those states cannot lose its
+    /// capacity slot or admit a duplicate download.
+    tracked: HashSet<BlockHash>,
+    /// Connection-local negative block availability learned from `notfound`.
+    /// Entries are bounded by pending/inflight work and prevent repeatedly
+    /// assigning a pruned hash to the same peer.
+    unavailable_by: HashMap<BlockHash, BTreeSet<PeerId>>,
     best_header: Option<ChainTip>,
     active_tip: Option<ChainTip>,
     stored_tip: Option<ChainTip>,
     target_height: Option<Height>,
     validated_blocks: u64,
     failed_blocks: u64,
+    unavailable_blocks: u64,
     sequence: u64,
     last_checkpoint: Instant,
 }
@@ -183,12 +203,15 @@ impl SyncScheduler {
             pending_order: VecDeque::new(),
             pending: HashMap::new(),
             inflight: HashMap::new(),
+            tracked: HashSet::new(),
+            unavailable_by: HashMap::new(),
             best_header: None,
             active_tip: None,
             stored_tip: None,
             target_height: None,
             validated_blocks: 0,
             failed_blocks: 0,
+            unavailable_blocks: 0,
             sequence: 0,
             last_checkpoint: now,
         })
@@ -249,6 +272,7 @@ impl SyncScheduler {
                 inflight: BTreeSet::new(),
                 headers_requested_at: None,
                 failures: 0,
+                unavailable_blocks: 0,
             },
         );
         self.recalculate_target();
@@ -294,6 +318,10 @@ impl SyncScheduler {
                 pending.retry_backoff = None;
             }
         }
+        self.unavailable_by.retain(|_, unavailable| {
+            unavailable.remove(&peer);
+            !unavailable.is_empty()
+        });
         self.recalculate_target();
         self.bump_sequence();
     }
@@ -323,11 +351,11 @@ impl SyncScheduler {
     pub fn available_pending_slots(&self) -> usize {
         self.limits
             .maximum_pending_blocks
-            .saturating_sub(self.pending.len())
+            .saturating_sub(self.tracked.len())
     }
 
-    pub fn is_queued_or_inflight(&self, hash: &BlockHash) -> bool {
-        self.pending.contains_key(hash) || self.inflight.contains_key(hash)
+    pub fn is_tracked_block(&self, hash: &BlockHash) -> bool {
+        self.tracked.contains(hash)
     }
 
     pub fn request_headers_from(
@@ -379,7 +407,7 @@ impl SyncScheduler {
         hash: BlockHash,
         height: Height,
     ) -> Result<bool, SyncError> {
-        if self.pending.contains_key(&hash) || self.inflight.contains_key(&hash) {
+        if self.tracked.contains(&hash) {
             if let Some(pending) = self.pending.get_mut(&hash) {
                 // An empty set represents wildcard eligibility for canonical
                 // queued/retried work. A later inventory announcement must not
@@ -390,11 +418,11 @@ impl SyncScheduler {
             }
             return Ok(false);
         }
-        if self.pending.len() >= self.limits.maximum_pending_blocks {
+        if self.tracked.len() >= self.limits.maximum_pending_blocks {
             return Err(SyncError::LimitExceeded {
-                context: "pending blocks",
+                context: "tracked blocks",
                 limit: self.limits.maximum_pending_blocks,
-                actual: self.pending.len().saturating_add(1),
+                actual: self.tracked.len().saturating_add(1),
             });
         }
         let mut announced_by = BTreeSet::new();
@@ -409,6 +437,7 @@ impl SyncScheduler {
                 attempts: 0,
             },
         );
+        self.tracked.insert(hash);
         self.pending_order.push_back(hash);
         self.update_stage();
         self.bump_sequence();
@@ -416,14 +445,14 @@ impl SyncScheduler {
     }
 
     pub fn queue_block(&mut self, hash: BlockHash, height: Height) -> Result<bool, SyncError> {
-        if self.pending.contains_key(&hash) || self.inflight.contains_key(&hash) {
+        if self.tracked.contains(&hash) {
             return Ok(false);
         }
-        if self.pending.len() >= self.limits.maximum_pending_blocks {
+        if self.tracked.len() >= self.limits.maximum_pending_blocks {
             return Err(SyncError::LimitExceeded {
-                context: "pending blocks",
+                context: "tracked blocks",
                 limit: self.limits.maximum_pending_blocks,
-                actual: self.pending.len().saturating_add(1),
+                actual: self.tracked.len().saturating_add(1),
             });
         }
         self.pending.insert(
@@ -436,6 +465,7 @@ impl SyncScheduler {
                 attempts: 0,
             },
         );
+        self.tracked.insert(hash);
         self.pending_order.push_back(hash);
         self.update_stage();
         self.bump_sequence();
@@ -467,7 +497,7 @@ impl SyncScheduler {
         &mut self,
         peer: PeerId,
         hash: BlockHash,
-        now: Instant,
+        _now: Instant,
     ) -> Result<BlockDownloadRequest, SyncError> {
         if let Some(inflight) = self.inflight.remove(&hash) {
             if inflight.request.peer != Some(peer) {
@@ -489,13 +519,15 @@ impl SyncScheduler {
         }
 
         // HSD peers may deliver an announced block before our scheduled
-        // GETDATA reaches them. Accept it only when it was already pending and
-        // the sender is an eligible announcer.
+        // GETDATA reaches them, or answer just after a request timeout moved
+        // the hash back to pending. Accept either only for bounded tracked
+        // work and an eligible announcer; retry backoff controls new request
+        // assignment, not an already-in-transit response.
         if let Some(pending) = self.pending.remove(&hash) {
-            if !pending.peer_is_eligible(peer, now) {
+            if !pending.peer_can_deliver(peer) {
                 self.pending.insert(hash, pending);
                 return Err(SyncError::UnexpectedBlock(format!(
-                    "peer {:?} sent pending block {} without being eligible",
+                    "peer {:?} sent pending block {} without announcement eligibility",
                     peer,
                     hash.to_hex()
                 )));
@@ -519,9 +551,84 @@ impl SyncScheduler {
 
     pub fn complete_block(&mut self, hash: BlockHash) {
         self.pending.remove(&hash);
+        if let Some(inflight) = self.inflight.remove(&hash) {
+            if let Some(peer) = inflight.request.peer {
+                if let Some(state) = self.peers.get_mut(&peer) {
+                    state.inflight.remove(&hash);
+                }
+            }
+        }
+        self.tracked.remove(&hash);
+        self.unavailable_by.remove(&hash);
         self.validated_blocks = self.validated_blocks.saturating_add(1);
         self.update_stage();
         self.bump_sequence();
+    }
+
+    /// Return already-reserved body work to the pending queue without
+    /// treating local queue/worker availability as a peer or block failure.
+    pub fn requeue_tracked_block(
+        &mut self,
+        hash: BlockHash,
+        height: Height,
+    ) -> Result<(), SyncError> {
+        if !self.tracked.contains(&hash) {
+            return Err(SyncError::UnexpectedBlock(format!(
+                "cannot requeue untracked block {}",
+                hash.to_hex()
+            )));
+        }
+        self.requeue(hash, height, 0, None);
+        self.update_stage();
+        self.bump_sequence();
+        Ok(())
+    }
+
+    /// Record an honest `notfound` response for the peer that owns the
+    /// corresponding inflight request. The hash is immediately eligible for
+    /// another peer, the unavailable peer is excluded for the remainder of
+    /// that connection, and neither validation-failure nor retry counters
+    /// advance.
+    pub fn note_block_unavailable(
+        &mut self,
+        peer: PeerId,
+        hash: BlockHash,
+    ) -> Result<(), SyncError> {
+        let Some(inflight) = self.inflight.get(&hash) else {
+            return Err(SyncError::UnexpectedBlock(format!(
+                "peer {peer:?} reported unrequested block {} unavailable",
+                hash.to_hex()
+            )));
+        };
+        if inflight.request.peer != Some(peer) {
+            return Err(SyncError::UnexpectedBlock(format!(
+                "peer {peer:?} reported block {} unavailable while it was assigned to {:?}",
+                hash.to_hex(),
+                inflight.request.peer
+            )));
+        }
+
+        let inflight = self
+            .inflight
+            .remove(&hash)
+            .expect("inflight request was checked above");
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.inflight.remove(&hash);
+            state.unavailable_blocks = state.unavailable_blocks.saturating_add(1);
+        }
+        self.unavailable_by.entry(hash).or_default().insert(peer);
+        self.unavailable_blocks = self.unavailable_blocks.saturating_add(1);
+        // Selecting a peer that legitimately lacks a pruned block does not
+        // consume the transport/validation retry budget.
+        self.requeue(
+            hash,
+            inflight.request.height,
+            inflight.attempts.saturating_sub(1),
+            None,
+        );
+        self.update_stage();
+        self.bump_sequence();
+        Ok(())
     }
 
     pub fn reject_block(
@@ -561,6 +668,9 @@ impl SyncScheduler {
                 let retry_backoff = peer.map(|peer| self.retry_backoff(peer, attempts, now));
                 self.requeue(hash, height, attempts, retry_backoff);
             }
+        } else {
+            self.tracked.remove(&hash);
+            self.unavailable_by.remove(&hash);
         }
         self.update_stage();
         self.bump_sequence();
@@ -664,8 +774,10 @@ impl SyncScheduler {
             target_height: self.target_height,
             pending_blocks: self.pending.len(),
             inflight_blocks: self.inflight.len(),
+            tracked_blocks: self.tracked.len(),
             validated_blocks: self.validated_blocks,
             failed_blocks: self.failed_blocks,
+            unavailable_blocks: self.unavailable_blocks,
             sequence: self.sequence,
             peers: self
                 .peers
@@ -677,6 +789,7 @@ impl SyncScheduler {
                     ready: state.ready,
                     inflight_blocks: state.inflight.len(),
                     failures: state.failures,
+                    unavailable_blocks: state.unavailable_blocks,
                 })
                 .collect(),
         }
@@ -691,8 +804,10 @@ impl SyncScheduler {
             target_height: self.target_height,
             pending_blocks: self.pending.len(),
             inflight_blocks: self.inflight.len(),
+            tracked_blocks: self.tracked.len(),
             validated_blocks: self.validated_blocks,
             failed_blocks: self.failed_blocks,
+            unavailable_blocks: self.unavailable_blocks,
             ..SyncMetrics::default()
         }
     }
@@ -753,6 +868,11 @@ impl SyncScheduler {
                     retry_backoff,
                 );
             } else if let Some(peer) = item.request.peer {
+                // The terminal request has left every scheduler/validator/
+                // orphan stage. Release its reservation so canonical queueing
+                // can reconsider it after the peer is disconnected.
+                self.tracked.remove(&hash);
+                self.unavailable_by.remove(&hash);
                 actions.push(SyncAction::Disconnect {
                     peer,
                     reason: format!("block {} exhausted retry budget", hash.to_hex()),
@@ -784,10 +904,13 @@ impl SyncScheduler {
         attempts: u8,
         retry_backoff: Option<PeerRetryBackoff>,
     ) {
-        if self.pending.len() >= self.limits.maximum_pending_blocks {
+        if !self.tracked.contains(&hash) && self.tracked.len() >= self.limits.maximum_pending_blocks
+        {
             self.failed_blocks = self.failed_blocks.saturating_add(1);
+            self.unavailable_by.remove(&hash);
             return;
         }
+        self.tracked.insert(hash);
         self.pending.insert(
             hash,
             PendingBlock {
@@ -826,6 +949,7 @@ impl SyncScheduler {
     }
 
     fn select_block_peer(&self, pending: &PendingBlock, now: Instant) -> Option<PeerId> {
+        let unavailable = self.unavailable_by.get(&pending.hash);
         self.peers
             .iter()
             .filter(|(peer, state)| {
@@ -833,6 +957,7 @@ impl SyncScheduler {
                     && state.services & SERVICE_NETWORK != 0
                     && state.inflight.len() < self.limits.maximum_inflight_per_peer
                     && pending.peer_is_eligible(**peer, now)
+                    && unavailable.is_none_or(|unavailable| !unavailable.contains(peer))
             })
             .min_by_key(|(_, state)| (state.inflight.len(), state.failures))
             .map(|(peer, _)| *peer)
@@ -956,6 +1081,54 @@ mod tests {
         )));
         assert_eq!(scheduler.snapshot().pending_blocks, 0);
         assert_eq!(scheduler.snapshot().inflight_blocks, 0);
+        assert_eq!(scheduler.snapshot().tracked_blocks, 0);
+        assert_eq!(scheduler.available_pending_slots(), 8_192);
+    }
+
+    #[test]
+    fn late_block_response_is_accepted_during_request_backoff() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 1,
+            maximum_inflight_per_peer: 1,
+            block_request_timeout: Duration::from_millis(10),
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        scheduler
+            .register_peer(PeerId(1), SERVICE_NETWORK, 5)
+            .expect("peer");
+        let hash = BlockHash::new([16; 32]);
+        scheduler.queue_block(hash, 5).expect("queue");
+        let request = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) if request.hash == hash => Some(request),
+                _ => None,
+            })
+            .expect("request");
+        assert_eq!(request.attempt, 1);
+
+        let timeout = scheduler.poll(now + Duration::from_millis(11), &[]);
+        assert!(timeout.iter().any(|action| matches!(
+            action,
+            SyncAction::Penalize {
+                peer: PeerId(1),
+                ..
+            }
+        )));
+        assert_eq!(scheduler.snapshot().pending_blocks, 1);
+
+        let late = scheduler
+            .receive_block(PeerId(1), hash, now + Duration::from_millis(12))
+            .expect("late response");
+        assert_eq!(late.hash, hash);
+        assert_eq!(late.attempt, 1);
+        assert_eq!(scheduler.snapshot().pending_blocks, 0);
+        assert!(scheduler.is_tracked_block(&hash));
+        scheduler.complete_block(hash);
+        assert!(!scheduler.is_tracked_block(&hash));
     }
 
     #[test]
@@ -1213,6 +1386,151 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_block_fails_over_without_blaming_or_reselecting_peer() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 1,
+            maximum_inflight_per_peer: 1,
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        scheduler
+            .register_peer(PeerId(1), SERVICE_NETWORK, 5)
+            .expect("peer 1");
+        scheduler
+            .register_peer(PeerId(2), SERVICE_NETWORK, 5)
+            .expect("peer 2");
+        let hash = BlockHash::new([10; 32]);
+        scheduler.queue_block(hash, 5).expect("queue");
+
+        let first = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) if request.hash == hash => Some(request),
+                _ => None,
+            })
+            .expect("first request");
+        assert_eq!(first.peer, Some(PeerId(1)));
+        assert_eq!(first.attempt, 1);
+
+        scheduler
+            .note_block_unavailable(PeerId(1), hash)
+            .expect("honest notfound");
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.failed_blocks, 0);
+        assert_eq!(snapshot.unavailable_blocks, 1);
+        assert_eq!(snapshot.peers[0].failures, 0);
+        assert_eq!(snapshot.peers[0].unavailable_blocks, 1);
+
+        let second = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) if request.hash == hash => Some(request),
+                _ => None,
+            })
+            .expect("alternate request");
+        assert_eq!(second.peer, Some(PeerId(2)));
+        assert_eq!(second.attempt, 1);
+
+        scheduler
+            .note_block_unavailable(PeerId(2), hash)
+            .expect("second honest notfound");
+        assert!(!scheduler.poll(now, &[]).iter().any(|action| matches!(
+            action,
+            SyncAction::RequestBlock(request) if request.hash == hash
+        )));
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.failed_blocks, 0);
+        assert_eq!(snapshot.unavailable_blocks, 2);
+    }
+
+    #[test]
+    fn unsolicited_notfound_cannot_cancel_another_peers_request() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 1,
+            maximum_inflight_per_peer: 1,
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        scheduler
+            .register_peer(PeerId(1), SERVICE_NETWORK, 5)
+            .expect("peer 1");
+        scheduler
+            .register_peer(PeerId(2), SERVICE_NETWORK, 5)
+            .expect("peer 2");
+        let hash = BlockHash::new([12; 32]);
+        scheduler.queue_block(hash, 5).expect("queue");
+        let request = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) if request.hash == hash => Some(request),
+                _ => None,
+            })
+            .expect("request");
+        assert_eq!(request.peer, Some(PeerId(1)));
+
+        assert!(scheduler.note_block_unavailable(PeerId(2), hash).is_err());
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 0);
+        assert_eq!(snapshot.inflight_blocks, 1);
+        assert_eq!(snapshot.failed_blocks, 0);
+        assert_eq!(snapshot.unavailable_blocks, 0);
+        assert!(snapshot
+            .peers
+            .iter()
+            .all(|peer| peer.failures == 0 && peer.unavailable_blocks == 0));
+    }
+
+    #[test]
+    fn body_reservation_survives_validation_and_retry_without_capacity_overflow() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_pending_blocks: 2,
+            maximum_inflight_blocks: 1,
+            maximum_inflight_per_peer: 1,
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        scheduler
+            .register_peer(PeerId(1), SERVICE_NETWORK, 5)
+            .expect("peer");
+        let first = BlockHash::new([13; 32]);
+        let second = BlockHash::new([14; 32]);
+        let extra = BlockHash::new([15; 32]);
+        scheduler.queue_block(first, 1).expect("first");
+        scheduler.queue_block(second, 2).expect("second");
+
+        let request = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) if request.hash == first => Some(request),
+                _ => None,
+            })
+            .expect("request");
+        scheduler
+            .receive_block(PeerId(1), first, now)
+            .expect("validation reservation");
+        assert_eq!(scheduler.available_pending_slots(), 0);
+        assert!(scheduler.queue_block(extra, 3).is_err());
+
+        scheduler.retry_validation_failure(first, request.height, request.attempt, None, now);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 2);
+        assert_eq!(snapshot.tracked_blocks, 2);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.failed_blocks, 0);
+        assert!(!scheduler.queue_block(first, 1).expect("duplicate"));
+    }
+
+    #[test]
     fn local_validation_failure_retries_without_blaming_peer() {
         let now = Instant::now();
         let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
@@ -1257,7 +1575,7 @@ mod tests {
 
         scheduler.reject_block(None, hash, false, now);
 
-        assert!(!scheduler.is_queued_or_inflight(&hash));
+        assert!(!scheduler.is_tracked_block(&hash));
         assert_eq!(scheduler.snapshot().pending_blocks, 0);
         assert_eq!(scheduler.snapshot().failed_blocks, 1);
     }

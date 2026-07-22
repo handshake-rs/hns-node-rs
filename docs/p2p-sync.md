@@ -189,7 +189,23 @@ after requesting headers and applying a small protocol penalty; arbitrary
 unvalidated bodies are never retained. If the block's own header is known but
 its parent body is not yet available, the body is statelessly validated before
 entering the bounded orphan pool. Orphans are evicted oldest-first when limits
-are reached.
+are reached. One bounded reservation follows each body across pending, network
+inflight, validation, and orphan retention, preventing duplicate downloads and
+preserving retry capacity while those states overlap.
+Canonical acquisition is limited to the configured orphan-count horizon beyond
+the contiguous stored-body tip; the window slides only as that tip advances, so
+the canonical downloader alone cannot create deterministic count-bound
+future-body eviction/redownload churn.
+
+A requested block `notfound` response is availability evidence, not proof of a
+bad block or peer. The scheduler accepts it only from the peer that owns the
+inflight request, records it separately, excludes that peer for the hash for
+the rest of that peer connection, and immediately permits another peer without
+consuming the transport or validation retry budget. An unsolicited or
+cross-peer `notfound` cannot cancel another peer's request.
+A request timeout still delays new assignment to that peer, but an already
+in-transit response for the bounded pending hash remains admissible and fully
+validated instead of being discarded during backoff.
 
 The stateless validation worker first authenticates both body roots against the
 known header. Above the final checkpoint it then verifies full block-body
@@ -353,7 +369,8 @@ The shadow-sync runtime does not yet provide:
 - transaction and mempool relay;
 - compact-block reconstruction;
 - historical mainnet block-body and active-state replay qualification;
-- pruning-aware and sustained-reorganization IBD qualification;
+- persistent pruning-horizon discovery plus full pruning and
+  sustained-reorganization IBD qualification;
 - solved-block fan-out;
 - mining authority.
 

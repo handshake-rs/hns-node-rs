@@ -142,6 +142,11 @@ Current evidence includes:
 - durable invalid/invalid-child propagation, best-header fallback across
   restart, body/header mismatch retry, and non-attribution of validator-worker
   failures;
+- pruning-aware `notfound` failover without peer/block blame, rejection of
+  cross-peer `notfound` cancellation, and capacity reservations that survive
+  pending/inflight/validation transitions without duplicate work, plus an
+  orphan-horizon canonical queue bound and acceptance of an already-in-transit
+  response during post-timeout reassignment backoff;
 - bounded active-state restart resumption, eight-block cooperative direct
   slices, full-bound atomic fork connection, contextual-invalid ancestor
   persistence, and proof that local state faults do not poison stored branches

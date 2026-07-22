@@ -243,8 +243,16 @@ Implemented:
   read-only diagnostic independently replays every canonical BIP9 window and
   reports current threshold states, next-block version, mandatory script/lock/
   name effects, and the final-checkpoint historical-script binding. Bounded
-  pending, global inflight, and per-peer block requests retain timeout, retry,
-  penalty, and reassignment behavior.
+  body-work reservations span pending, inflight, validator, and orphan states.
+  The canonical download window never exceeds the configured orphan-count
+  horizon, so that downloader alone cannot create count-bound eviction churn
+  when a low body is delayed.
+  Honest `notfound` responses exclude that peer only for the unavailable hash,
+  fail over without consuming validation/transport retries, and remain distinct
+  from invalid-block evidence; timeouts and invalid responses retain their
+  separate retry, penalty, and reassignment behavior. A valid response already
+  in transit remains admissible after its request times out even while that
+  peer is in reassignment backoff.
 - Bounded oldest-first orphan retention only after the block's header context is
   known and the body passes stateless validation. Bodies with no known header
   context are dropped after requesting headers.

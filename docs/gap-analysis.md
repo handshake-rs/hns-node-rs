@@ -120,6 +120,10 @@
 - Headers-first synchronization with 2,000-header atomic protocol batches plus
   canonical-header BIP9/script-policy derivation and bounded
   pending/inflight/per-peer body requests, retry, timeout, and reassignment.
+- Cross-stage body reservations and pruning-aware per-hash `notfound` evidence;
+  honest unavailability fails over without contaminating peer or invalid-block
+  counters, cross-peer cancellation is rejected, and the canonical acquisition
+  window cannot by itself exceed retained-orphan count capacity.
 - Bounded orphan retention only for statelessly valid bodies with known header
   context; unknown-context bodies are dropped after requesting headers.
 - Blocking validation workers with ordered result delivery.
@@ -198,8 +202,8 @@ These are substantial foundations, not a production full node.
 
 ### Chain and network qualification
 
-- Full-mainnet replay, sustained fork, and pruning qualification of the bounded
-  restartable active-state connector.
+- Full-mainnet replay, sustained fork, persistent pruning-horizon discovery,
+  and pruning qualification of the bounded restartable active-state connector.
 - Failed-branch pruning/retention policy, historical reorganizations, and
   RocksDB fault evidence.
 - Brontide, address-manager/DNS-seed discovery, durable bans/reputation, and

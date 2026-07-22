@@ -152,6 +152,10 @@ an authoritative durable tip.
   currently process-local and are not trusted after restart.
 - The synchronization checkpoint is checksummed and reconciled with durable
   chain/body state rather than trusted as consensus.
+- A block `notfound` is accepted only from its assigned request peer and is
+  tracked as bounded per-hash availability evidence. It cannot mark a block
+  invalid, blame the peer, consume the validation retry budget, or cancel a
+  request owned by another peer.
 - Header-derived deployment diagnostics walk only the validated canonical
   ancestry and bind any historical-script assumption to the exact final
   configured checkpoint; they do not confer body, state, or mining authority.
