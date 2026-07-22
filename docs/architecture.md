@@ -40,7 +40,7 @@ header context
 checkpoint
 activation/deployment state
 body presence
-body syntax and commitments
+body-stage satisfaction and commitments
 absolute finality
 relative sequence locks
 scripts/witness authorization
@@ -58,13 +58,18 @@ active-chain membership
 has succeeded. It must never be interpreted as contextual name-state validity.
 The authoritative mining snapshot requires every consensus and state stage;
 the pre-authority staged snapshot is separate and diagnostic only.
+For exact hardcoded-checkpoint ancestry, a durable stage may be satisfied by
+HSD's historical assumption rather than local execution. Checkpoint status,
+height/hash, and canonical header ancestry are the provenance; arbitrary or
+partial historical plans are rejected.
 
 ## Staged chain events
 
 - `CandidateTipSeen`: bounded header/parent evidence arrived; useful only to stop
   obviously obsolete work, never to authorize a new job.
-- `BlockSyntaxValidated`: bounded body syntax and commitments passed. It does not
-  claim scripts, covenants, name state, or complete consensus.
+- `BlockSyntaxValidated`: the bounded full body stage, or the retained
+  historical commitment/name-limit subset, passed preflight. It does not claim
+  scripts, covenants, name state, or complete consensus.
 - `TipStaged`: the current pre-authority state subset committed durably, but the
   generation is excluded from the authoritative mining snapshot channel.
 - `TipCommitted`: every release-gated consensus and state condition passed; this

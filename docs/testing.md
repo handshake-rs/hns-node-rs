@@ -307,10 +307,17 @@ NODE_BACKEND=js npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
 
 Node regressions decode HSD's real height-258,026 header and require both the
 candidate and that exact final checkpoint to occupy the same best validated
-header path before selecting the historical plan. State regressions then prove
-that only BID/REDEEM skips the absent-NameState contextual read; the same
-transaction fails on the full route. Missing, unverified, alternate-branch,
-post-checkpoint, and checkpoint-free-network cases all remain fail-closed.
+header path before selecting the historical plan. Consensus regressions split
+full body sanity from the historical commitment/name-limit stages and prove a
+malformed exclusive covenant returns an error rather than panicking. State
+regressions prove the BID/REDEEM NameState exception; coordinated maturity,
+sequence-lock, sigop, script, value, covenant-link, and reward assumptions; and
+the retained HSD special-proof sanity path, including a sane but
+cryptographically invalid airdrop, HSD's malformed-key hardening behavior, and
+a canonical ownership proof whose altered DNSSEC signature still passes the
+retained parent-time check. An altered partial plan is rejected. Missing,
+unverified, alternate-branch, post-checkpoint, and checkpoint-free-network cases
+all remain fail-closed.
 
 An operator with a synchronized mainnet HSD node can reproduce the compact
 fixture without embedding an API key or machine path:

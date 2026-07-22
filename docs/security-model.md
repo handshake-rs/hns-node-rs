@@ -27,6 +27,10 @@ The current foundation verifies or records evidence for:
   non-claim transition families, including historical shortcuts and hardening;
 - parent-derived deployment-state caches composed into active node name,
   DNSSEC-claim, and faucet checks with restart/reorg validation;
+- a single branch-evidenced HSD historical validation plan carried from body
+  import through state connection, retaining commitments, name limits,
+  deployment/finality/height, proof-sanity/allocation, UTXO, and mutating-name
+  checks while making only HSD's coordinated checkpoint assumptions;
 - ICANN-rooted DNSSEC claim verification and HSD claim output/commit/deflation
   accounting;
 - checkpoint-linked block 62,517 claim evidence validating two real mainnet
@@ -89,8 +93,8 @@ during a probe are retried rather than classified as divergence.
 
 The following remain untrusted and release-blocking:
 
-- historical exceptions beyond the branch-gated BID/REDEEM context rule, and
-  complete historical replay qualification;
+- full-mainnet replay and independent invalid-corpus qualification of the
+  branch-gated historical route;
 - independent script fuzz/invalid evidence beyond the complete pinned HSD
   upstream corpus;
 - current/live claim-proof evidence and complete historical claim replay beyond

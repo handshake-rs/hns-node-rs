@@ -723,6 +723,17 @@ impl HeaderConsensus {
     pub fn validate_block_body(&self, block: &Block) -> Result<BlockValidation, ConsensusError> {
         validate_block_body(block)
     }
+
+    pub fn validate_block_commitments(
+        &self,
+        block: &Block,
+    ) -> Result<BlockValidation, ConsensusError> {
+        validate_block_commitments(block)
+    }
+
+    pub fn validate_block_name_limits(&self, block: &Block) -> Result<(), ConsensusError> {
+        validate_block_name_limits(block)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -735,6 +746,19 @@ pub struct BlockValidation {
 }
 
 pub fn validate_block_body(block: &Block) -> Result<BlockValidation, ConsensusError> {
+    validate_block_body_sanity(block)?;
+    validate_block_name_limits(block)?;
+    let validation = validate_block_commitments(block)?;
+    if validation.merkle_root == [0; 32] {
+        return Err(ConsensusError::InvalidBlock("merkle root is zero"));
+    }
+    Ok(validation)
+}
+
+/// HSD's non-contextual `Block.checkBody` stage without the separately routed
+/// merkle/witness commitments or name DoS limits. Checkpoint-backed historical
+/// blocks assume this stage only after their header ancestry is established.
+pub fn validate_block_body_sanity(block: &Block) -> Result<(), ConsensusError> {
     if block.transactions.is_empty() {
         return Err(ConsensusError::InvalidBlock("block has no transactions"));
     }
@@ -746,7 +770,6 @@ pub fn validate_block_body(block: &Block) -> Result<BlockValidation, ConsensusEr
     }
 
     let base_size = block_base_size(block);
-    let witness_size = block_witness_size(block);
     let weight = block_weight(block);
 
     if base_size > MAX_BLOCK_BASE_SIZE {
@@ -775,13 +798,17 @@ pub fn validate_block_body(block: &Block) -> Result<BlockValidation, ConsensusEr
         }
     }
 
-    validate_block_covenant_limits(block)?;
+    Ok(())
+}
 
+/// Verify only the two transaction-body commitments retained by HSD's
+/// checkpoint route. Size, transaction sanity, and coinbase-shape checks are
+/// deliberately owned by [`validate_block_body_sanity`].
+pub fn validate_block_commitments(block: &Block) -> Result<BlockValidation, ConsensusError> {
+    let base_size = block_base_size(block);
+    let witness_size = block_witness_size(block);
+    let weight = block_weight(block);
     let merkle_root = block_merkle_root(block);
-
-    if merkle_root == [0; 32] {
-        return Err(ConsensusError::InvalidBlock("merkle root is zero"));
-    }
 
     if block.header.merkle_root != merkle_root {
         return Err(ConsensusError::InvalidBlock("merkle root mismatch"));
@@ -800,6 +827,12 @@ pub fn validate_block_body(block: &Block) -> Result<BlockValidation, ConsensusEr
         merkle_root,
         witness_root,
     })
+}
+
+/// Enforce HSD's always-on block-level covenant/name DoS limits. This stage is
+/// retained even when checkpoint ancestry permits body-sanity assumptions.
+pub fn validate_block_name_limits(block: &Block) -> Result<(), ConsensusError> {
+    validate_block_covenant_limits(block)
 }
 
 /// Enforce HSD's pre-`txStart` block restriction. Before the network-specific
@@ -1005,13 +1038,13 @@ fn validate_block_covenant_limits(block: &Block) -> Result<(), ConsensusError> {
                     | CovenantKind::Finalize
                     | CovenantKind::Revoke
             ) {
-                let name_hash: [u8; 32] =
-                    output.covenant.items[0]
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| {
-                            ConsensusError::InvalidBlock("name covenant hash has invalid length")
-                        })?;
+                let name_hash: [u8; 32] = output
+                    .covenant
+                    .item(0)
+                    .and_then(|item| item.try_into().ok())
+                    .ok_or(ConsensusError::InvalidBlock(
+                        "name covenant hash has invalid length",
+                    ))?;
                 if !exclusive_names.insert(name_hash) {
                     return Err(ConsensusError::InvalidBlock(
                         "block contains duplicate exclusive name updates",
@@ -1725,6 +1758,37 @@ mod tests {
         assert!(matches!(
             error,
             ConsensusError::InvalidBlock("first transaction is not coinbase")
+        ));
+    }
+
+    #[test]
+    fn historical_body_route_keeps_commitments_and_name_limits_separate() {
+        let previous_output = Outpoint {
+            txid: Txid::new([0x45; 32]),
+            index: 0,
+        };
+        let block = block_with_roots(vec![transaction(previous_output, vec![output(25)])]);
+
+        validate_block_commitments(&block).expect("historical commitments");
+        validate_block_name_limits(&block).expect("historical name limits");
+        assert!(matches!(
+            validate_block_body_sanity(&block).expect_err("full body sanity"),
+            ConsensusError::InvalidBlock("first transaction is not coinbase")
+        ));
+        assert!(validate_block_body(&block).is_err());
+    }
+
+    #[test]
+    fn historical_name_limits_reject_malformed_exclusive_hash_without_panicking() {
+        let mut malformed = output(1);
+        malformed.covenant = Covenant {
+            kind: CovenantKind::Open,
+            items: Vec::new(),
+        };
+        let block = block_with_roots(vec![coinbase(vec![malformed])]);
+        assert!(matches!(
+            validate_block_name_limits(&block).expect_err("malformed name hash"),
+            ConsensusError::InvalidBlock("name covenant hash has invalid length")
         ));
     }
 

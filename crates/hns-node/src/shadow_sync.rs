@@ -14,9 +14,9 @@ use axum::{
 };
 use hns_chain::{BlockIndexRecord, ChainTip, HeaderImport, HeaderIndex, HeaderRecord};
 use hns_consensus::{
-    block_merkle_root, block_witness_root, validate_coinbase_height, validate_transaction_start,
-    ConsensusParams, HeaderConsensus, HeaderParent, HeaderValidationContext, Network,
-    MAX_FUTURE_BLOCK_TIME,
+    block_merkle_root, block_witness_root, is_hsd_historical_block, validate_coinbase_height,
+    validate_transaction_start, ConsensusParams, HeaderConsensus, HeaderParent,
+    HeaderValidationContext, Network, MAX_FUTURE_BLOCK_TIME,
 };
 use hns_mempool::Admission;
 use hns_p2p::{
@@ -276,9 +276,15 @@ impl StatelessBlockValidator for HnsBodyValidator {
         }
         validate_transaction_start(block, height, self.network)
             .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
-        self.consensus
-            .validate_block_body(block)
-            .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
+        if is_hsd_historical_block(self.network, true, height) {
+            self.consensus
+                .validate_block_name_limits(block)
+                .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
+        } else {
+            self.consensus
+                .validate_block_body(block)
+                .map_err(|error| ValidationRejection::invalid_block(error.to_string()))?;
+        }
         validate_coinbase_height(block, height)
             .map_err(|error| ValidationRejection::invalid_block(error.to_string()))
     }
@@ -2349,7 +2355,7 @@ mod tests {
     use super::*;
     use crate::NodeConfig;
     use hns_primitives::{
-        Address, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Witness,
+        Address, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Txid, Witness,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2468,6 +2474,34 @@ mod tests {
             .expect_err("wrong coinbase height");
         assert_eq!(rejection.kind, ValidationFailureKind::InvalidBlock);
         assert!(rejection.reason.contains("coinbase height"));
+    }
+
+    #[test]
+    fn body_validator_defers_historical_sanity_to_checkpoint_bound_import() {
+        let historical_height = Network::Mainnet.params().tx_start;
+        let mut historical = validator_coinbase_block(historical_height, 1);
+        historical.transactions[0].inputs[0].previous_output = Outpoint {
+            txid: Txid::new([0x44; 32]),
+            index: 0,
+        };
+        historical.header.merkle_root = block_merkle_root(&historical);
+        historical.header.witness_root = block_witness_root(&historical);
+        HnsBodyValidator::new(Network::Mainnet)
+            .validate(&historical, historical_height)
+            .expect("historical worker retains commitments, limits, and height rules");
+
+        let current_height = Network::Mainnet.last_checkpoint() + 1;
+        let mut current = historical;
+        current.transactions[0].locktime = current_height;
+        current.header.merkle_root = block_merkle_root(&current);
+        current.header.witness_root = block_witness_root(&current);
+        let rejection = HnsBodyValidator::new(Network::Mainnet)
+            .validate(&current, current_height)
+            .expect_err("post-checkpoint body sanity remains mandatory");
+        assert_eq!(rejection.kind, ValidationFailureKind::InvalidBlock);
+        assert!(rejection
+            .reason
+            .contains("first transaction is not coinbase"));
     }
 
     #[tokio::test]

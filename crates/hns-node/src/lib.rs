@@ -907,9 +907,11 @@ impl NodeService {
         for connect in &request.connect {
             let summary = HeaderSummary::from_block(&connect.block, connect.height);
             self.mining_events.candidate_tip_seen(summary.clone());
-            HeaderConsensus::new(ConsensusParams::for_network(self.config.network))
-                .validate_block_body(&connect.block)
-                .map_err(|error| anyhow::anyhow!("reorg block body validation failed: {error}"))?;
+            self.state
+                .validate_import_syntax(connect)
+                .map_err(|error| {
+                    anyhow::anyhow!("reorg block syntax validation failed before staging: {error}")
+                })?;
             self.mining_events.block_syntax_validated(summary);
         }
 
@@ -1359,6 +1361,7 @@ struct DurableMiningState {
 struct ValidatedImport {
     chainwork: Uint256,
     status: BlockStatus,
+    historical_validation: HistoricalValidationPlan,
 }
 
 #[derive(Clone, Debug)]
@@ -2300,6 +2303,54 @@ impl NodeState {
         self.validate_import_against(&snapshot, request)
     }
 
+    /// Preflight only the context-independent portion represented by the
+    /// `BlockSyntaxValidated` event. Reorg parents may exist solely in the
+    /// pending connect sequence, so parent/state checks remain in the staged
+    /// overlay where they can see preceding candidates.
+    fn validate_import_syntax(&self, request: &NodeBlockImport) -> Result<()> {
+        let strict = matches!(request.validation, ImportValidationPolicy::Strict);
+        if strict {
+            validate_transaction_start(&request.block, request.height, self.network)
+                .map_err(|error| anyhow::anyhow!("transaction-start validation failed: {error}"))?;
+        }
+        let status = BlockStatus {
+            header_context_valid: true,
+            checkpoint_valid: strict,
+            body_present: true,
+            ..BlockStatus::default()
+        };
+        let historical_validation = self.historical_validation_plan_for_block(
+            request.height,
+            request.block.hash(),
+            &status,
+        )?;
+        self.validate_block_body_for_plan(&request.block, historical_validation)
+    }
+
+    fn validate_block_body_for_plan(
+        &self,
+        block: &Block,
+        historical_validation: HistoricalValidationPlan,
+    ) -> Result<()> {
+        let consensus = HeaderConsensus::new(ConsensusParams::for_network(self.network));
+        if historical_validation.body_sanity {
+            consensus
+                .validate_block_body(block)
+                .map_err(|error| anyhow::anyhow!("block body validation failed: {error}"))?;
+        } else {
+            if !historical_validation.body_commitments || !historical_validation.name_limits {
+                anyhow::bail!("historical validation route omits a required body stage");
+            }
+            consensus
+                .validate_block_commitments(block)
+                .map_err(|error| anyhow::anyhow!("block commitment validation failed: {error}"))?;
+            consensus
+                .validate_block_name_limits(block)
+                .map_err(|error| anyhow::anyhow!("block name-limit validation failed: {error}"))?;
+        }
+        Ok(())
+    }
+
     fn validate_import_against<T: ReadSnapshot>(
         &self,
         snapshot: &T,
@@ -2369,14 +2420,25 @@ impl NodeState {
             ImportValidationPolicy::Fixture { chainwork } => (chainwork, true),
         };
 
-        if matches!(request.validation, ImportValidationPolicy::Strict) {
+        let strict = matches!(request.validation, ImportValidationPolicy::Strict);
+        if strict {
             validate_transaction_start(&request.block, request.height, self.network)
                 .map_err(|error| anyhow::anyhow!("transaction-start validation failed: {error}"))?;
         }
 
-        HeaderConsensus::new(ConsensusParams::for_network(self.network))
-            .validate_block_body(&request.block)
-            .map_err(|error| anyhow::anyhow!("block body validation failed: {error}"))?;
+        let mut status = BlockStatus {
+            header_context_valid,
+            checkpoint_valid: strict,
+            body_present: true,
+            ..BlockStatus::default()
+        };
+        let historical_validation = self.historical_validation_plan_for_block(
+            request.height,
+            request.block.hash(),
+            &status,
+        )?;
+        self.validate_block_body_for_plan(&request.block, historical_validation)?;
+        status.body_syntax_valid = true;
 
         validate_block_finality(
             &request.block,
@@ -2385,7 +2447,7 @@ impl NodeState {
         )
         .map_err(|error| anyhow::anyhow!("transaction finality validation failed: {error}"))?;
 
-        if matches!(request.validation, ImportValidationPolicy::Strict) {
+        if strict {
             validate_coinbase_height(&request.block, request.height)
                 .map_err(|error| anyhow::anyhow!("coinbase height validation failed: {error}"))?;
         }
@@ -2395,13 +2457,10 @@ impl NodeState {
         Ok(ValidatedImport {
             chainwork,
             status: BlockStatus {
-                header_context_valid,
-                checkpoint_valid: matches!(request.validation, ImportValidationPolicy::Strict),
-                body_present: true,
-                body_syntax_valid: true,
                 absolute_finality_valid: true,
-                ..BlockStatus::default()
+                ..status
             },
+            historical_validation,
         })
     }
 
@@ -2658,11 +2717,7 @@ impl NodeState {
         validate_active_extension(snapshot, request, validated.chainwork)?;
 
         let block_hash = request.block.hash();
-        let historical_validation = self.historical_validation_plan_for_block(
-            request.height,
-            block_hash,
-            &validated.status,
-        )?;
+        let historical_validation = validated.historical_validation;
         let mut status = validated.status;
         let raw_record = RawBlockRecord::from_block(&request.block, request.source);
 

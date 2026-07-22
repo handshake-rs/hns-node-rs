@@ -173,8 +173,13 @@ entering the bounded orphan pool. Orphans are evicted oldest-first when limits
 are reached.
 
 The stateless validation worker first authenticates both body roots against the
-known header, then verifies block-body syntax. A valid body is revalidated
-through the node's strict import path and stored as a non-active block/index
+known header. Above the final checkpoint it then verifies full block-body
+syntax. At HSD historical heights it instead retains the always-on transaction
+start, name DoS limits, and coinbase-height checks while deferring body sanity;
+the worker has height but not sufficient branch evidence to make a durable
+checkpoint decision. A body is then revalidated through the node's strict
+import path, where exact final-checkpoint ancestry selects the historical route
+or fails closed to full validation, and is stored as a non-active block/index
 record. The shadow-sync path explicitly clears UTXO, name-state, tree-root,
 undo, and active-chain status bits. Retaining an orphan completes the temporary
 validation stage without advancing the contiguous stored-body tip.
@@ -199,10 +204,11 @@ IBD progress is additionally limited to eight connected blocks per supervisor
 slice so RPC, peer work, and shutdown are polled between small atomic commits.
 Each batch uses the node's existing deployment, script, sequence-lock,
 claim/airdrop, covenant, UTXO, name-state, Urkel-root, undo, and reorganization
-pipeline; no second consensus implementation exists in the sync runtime. For
-historical BID/REDEEM context, the connector uses the HSD exception only after
-the candidate and exact final checkpoint are bound to the same best validated
-header path. All other historical shortcuts remain disabled.
+pipeline; no second consensus implementation exists in the sync runtime. The
+connector carries the one HSD historical/full route chosen by strict import.
+The historical route is available only after the candidate and exact final
+checkpoint are bound to the same best validated header path; otherwise every
+stage runs on the full path.
 
 ```bash
 cargo run --locked -p hns-node -- \

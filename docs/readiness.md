@@ -24,12 +24,15 @@ Implemented:
   the 80,000-sigop block maximum from resolved active-state coins.
 - Exact HSD deployment/checkpoint constants, BIP9 transitions, block-version
   signaling, deployment effects, cached next-block versions, and a
-  checkpoint-backed historical validation-stage plan that distinguishes the
-  always-on transaction-start and candidate-coinbase-height checks from
-  checkpoint-skipped block sigops.
-- Branch-specific final-checkpoint header evidence composes only HSD's
-  historical BID/REDEEM NameState-read exception into active state; missing or
-  mismatched evidence selects full contextual validation.
+  checkpoint-backed historical validation-stage plan carried from block import
+  through active state. It distinguishes retained commitments, name limits,
+  deployment/finality/height, special-proof sanity, allocation/UTXO, and
+  mutating covenant checks from HSD's coordinated checkpoint assumptions for
+  body sanity, proof cryptography/binding, maturity/value/reward, sequence
+  locks, block sigops, covenant links, scripts, and BID/REDEEM context.
+- Branch-specific final-checkpoint header evidence is mandatory for that route;
+  missing, mismatched, failed, alternate-branch, post-checkpoint, or
+  checkpoint-free evidence selects full validation.
 - Exact per-network HSD `txStart` values and strict mainnet enforcement before
   height 2,016: only the coinbase, exactly one output, and no covenant.
 - Canonical mainnet block-1 finality parity: ordinary transaction finality
@@ -66,9 +69,8 @@ Implemented:
 
 Remaining:
 
-- historical replay qualification;
-- remaining non-script historical exceptions and broader independent
-  invalid/fuzz corpora;
+- full-mainnet qualification of the composed historical route and broader
+  independent invalid/fuzz corpora;
 - independently sourced live DNSSEC-proof evidence for historical-policy
   qualification and complete historical claim replay beyond the pinned
   initial, multi-generation, and terminal histories; mainnet's claim period
@@ -112,7 +114,7 @@ Remaining:
 
 - deployment-scale compaction performance/priority qualification and RocksDB
   mid-commit process-crash/fault injection;
-- complete historical contextual claim/airdrop behavior;
+- full-mainnet qualification of historical contextual claim/airdrop behavior;
 - pruning and RocksDB crash/fault qualification;
 - complete mainnet reorganization/root replay.
 

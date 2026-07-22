@@ -17,11 +17,11 @@ use hns_consensus::{
     WitnessProgramVerifier, MAX_BLOCK_SIGOPS, MAX_MONEY, MEDIAN_TIMESPAN,
 };
 use hns_primitives::{
-    blake2b_256, Address, AirdropSignatureVerifier, Amount, Block, BlockHash, Coin, Covenant,
-    CovenantKind, DnssecVerifier, Height, NameHash, NameLifecycleState, NameState, Outpoint,
-    PrimitiveError, Reader, Transaction, UnavailableAirdropSignatureVerifier, Writer,
-    AIRDROP_TREE_LEAVES, MAX_ADDRESS_HASH_SIZE, MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE,
-    MAX_TX_SIZE,
+    blake2b_256, Address, AirdropKey, AirdropProof, AirdropSignatureVerifier, Amount, Block,
+    BlockHash, Coin, Covenant, CovenantKind, DnssecVerifier, Height, NameHash, NameLifecycleState,
+    NameState, Outpoint, OwnershipProof, PrimitiveError, Reader, Transaction,
+    UnavailableAirdropSignatureVerifier, Writer, AIRDROP_TREE_LEAVES, MAX_ADDRESS_HASH_SIZE,
+    MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_TX_SIZE,
 };
 use hns_store::{
     ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES,
@@ -68,9 +68,10 @@ pub struct DisconnectBlock {
     pub height: Height,
 }
 
-/// Explicit state-validation evidence returned to the chain coordinator. These
-/// flags describe only work actually performed by this state transition; they
-/// are intentionally narrower than full block-consensus validity.
+/// Explicit state-validation evidence returned to the chain coordinator. A
+/// true flag means the stage was either performed or was satisfied by the
+/// exact checkpoint-backed route recorded in [`StateSummary::historical_validation`].
+/// These flags remain narrower than full block-consensus validity.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateValidationSummary {
     pub relative_locks_valid: bool,
@@ -94,9 +95,8 @@ pub struct StateSummary {
     /// the root the next block must commit to.
     pub resulting_tree_root: TreeRoot,
     /// Exact full or checkpoint-backed validation route selected by the chain
-    /// coordinator. The state engine currently honors only HSD's narrow
-    /// historical BID/REDEEM contextual exception; every broader historical
-    /// assumption remains checked by the normal path.
+    /// coordinator. Historical assumptions are honored only when this equals
+    /// HSD's complete canonical checkpoint plan.
     pub historical_validation: HistoricalValidationPlan,
     pub validation: StateValidationSummary,
 }
@@ -277,20 +277,23 @@ pub trait StateEngine {
     fn disconnect_block(&mut self, request: DisconnectBlock) -> Result<StateSummary, StateError>;
 }
 
-/// Result from the dedicated coinbase claim/airdrop boundary. A production
-/// implementation must account for every conjured unit and authenticate every
-/// special input against the historical HNS datasets.
+/// Result from the dedicated coinbase claim/airdrop boundary. On the full
+/// route, a production implementation accounts for every conjured unit and
+/// authenticates every special input against the historical HNS datasets. On
+/// the canonical historical route, the exact plan records which cryptographic
+/// and value checks are checkpoint-backed assumptions.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CoinbaseIssuanceSummary {
     pub conjured: Amount,
     pub claims_and_airdrops_valid: bool,
-    /// HSD allocation-field positions authenticated by this verifier. The
-    /// state engine atomically rejects already-spent positions and records the
-    /// newly spent positions in block undo.
+    /// HSD allocation-field positions derived by this verifier. The state
+    /// engine atomically rejects already-spent positions and records newly
+    /// spent positions in block undo.
     pub airdrop_positions: Vec<u32>,
-    /// Fully authenticated claims keyed to their same-index coinbase outputs.
-    /// The state engine applies these transitions to the name tree only after
-    /// every special issuance input has passed atomically.
+    /// Claims keyed to their same-index coinbase outputs. Full-route entries
+    /// are cryptographically authenticated; historical entries are decoded
+    /// and time-checked while their bindings are checkpoint-backed. The state
+    /// engine applies them only after every special input has passed atomically.
     pub claims: Vec<CoinbaseClaim>,
 }
 
@@ -308,6 +311,20 @@ pub trait CoinbaseIssuanceVerifier: Send + Sync {
         parent_time: u64,
         network: Network,
     ) -> Result<CoinbaseIssuanceSummary, StateError>;
+
+    /// HSD's checkpoint route retains special-proof format, time, deployment,
+    /// and allocation-bit checks while assuming Merkle/signature cryptography
+    /// and output-value binding. Verifiers which do not implement that exact
+    /// route remain conservatively full-verification by default.
+    fn verify_historical_coinbase(
+        &self,
+        transaction: &Transaction,
+        height: Height,
+        parent_time: u64,
+        network: Network,
+    ) -> Result<CoinbaseIssuanceSummary, StateError> {
+        self.verify_coinbase(transaction, height, parent_time, network)
+    }
 }
 
 /// Fail-closed verifier which accepts only an ordinary coinbase with no claim
@@ -464,6 +481,135 @@ impl CoinbaseIssuanceVerifier for AirdropCoinbaseIssuanceVerifier {
             claims,
         })
     }
+
+    fn verify_historical_coinbase(
+        &self,
+        transaction: &Transaction,
+        height: Height,
+        parent_time: u64,
+        network: Network,
+    ) -> Result<CoinbaseIssuanceSummary, StateError> {
+        let mut airdrop_positions = Vec::with_capacity(transaction.inputs.len().saturating_sub(1));
+        let mut claims = Vec::new();
+        for input_index in 1..transaction.inputs.len() {
+            let input = &transaction.inputs[input_index];
+            if input.witness.items.len() != 1 {
+                return Err(StateError::AirdropVerification(format!(
+                    "coinbase input {input_index} must contain exactly one proof item"
+                )));
+            }
+            let output = transaction.outputs.get(input_index).ok_or_else(|| {
+                StateError::AirdropVerification(format!(
+                    "coinbase input {input_index} has no same-index output"
+                ))
+            })?;
+            if output.covenant.kind == CovenantKind::Claim {
+                let proof = OwnershipProof::decode(&input.witness.items[0])
+                    .map_err(|error| StateError::ClaimVerification(error.to_string()))?;
+                if !proof.verify_time(parent_time) {
+                    return Err(StateError::ClaimVerification(
+                        "ownership proof signatures do not cover the parent block time".to_owned(),
+                    ));
+                }
+                claims.push(CoinbaseClaim {
+                    output_index: input_index,
+                    claim: checkpoint_assumed_claim(output)?,
+                });
+                continue;
+            }
+
+            if self.flags.airstop {
+                return Err(StateError::AirdropVerification(
+                    "airdrop issuance is disabled by the active airstop deployment".to_owned(),
+                ));
+            }
+            let proof = AirdropProof::decode(&input.witness.items[0])
+                .map_err(|error| StateError::AirdropVerification(error.to_string()))?;
+            if !proof.is_sane() {
+                return Err(StateError::AirdropVerification(
+                    "airdrop proof is structurally non-sane".to_owned(),
+                ));
+            }
+            if height >= network.params().goosig_stop {
+                let key = proof
+                    .key()
+                    .map_err(|error| StateError::AirdropVerification(error.to_string()))?;
+                if matches!(key, AirdropKey::Goo { .. }) {
+                    return Err(StateError::AirdropVerification(
+                        "GooSig airdrop keys are disabled at this height".to_owned(),
+                    ));
+                }
+            }
+            // HSD's `proof.isWeak()` returns false when a key cannot be
+            // decoded. Key decoding is independently mandatory only after the
+            // GooSig cutoff above.
+            if self.flags.hardening && proof.key().is_ok_and(|key| key.is_weak()) {
+                return Err(StateError::AirdropVerification(
+                    "weak RSA airdrop key is disabled by hardening".to_owned(),
+                ));
+            }
+            airdrop_positions.push(
+                proof
+                    .position()
+                    .map_err(|error| StateError::AirdropVerification(error.to_string()))?,
+            );
+        }
+
+        Ok(CoinbaseIssuanceSummary {
+            // HSD's historical route does not use issuance values for reward
+            // accounting. The hardcoded checkpoint authenticates them.
+            conjured: 0,
+            claims_and_airdrops_valid: true,
+            airdrop_positions,
+            claims,
+        })
+    }
+}
+
+fn checkpoint_assumed_claim(output: &hns_primitives::Output) -> Result<VerifiedClaim, StateError> {
+    if output.covenant.kind != CovenantKind::Claim {
+        return Err(StateError::ClaimVerification(
+            "historical claim covenant is malformed".to_owned(),
+        ));
+    }
+    let name_hash = output
+        .covenant
+        .item_hash(0)
+        .map(NameHash::new)
+        .ok_or_else(|| {
+            StateError::ClaimVerification("historical claim name hash is missing".to_owned())
+        })?;
+    let name = output
+        .covenant
+        .item(2)
+        .ok_or_else(|| {
+            StateError::ClaimVerification("historical claim name is missing".to_owned())
+        })?
+        .to_vec();
+    let weak = output
+        .covenant
+        .item_u8(3)
+        .map(|flags| flags & 1 != 0)
+        .ok_or_else(|| {
+            StateError::ClaimVerification("historical claim flags are missing".to_owned())
+        })?;
+    let commit_hash = output.covenant.item_hash(4).ok_or_else(|| {
+        StateError::ClaimVerification("historical claim commit hash is missing".to_owned())
+    })?;
+    let commit_height = output.covenant.item_u32(5).ok_or_else(|| {
+        StateError::ClaimVerification("historical claim commit height is missing".to_owned())
+    })?;
+
+    Ok(VerifiedClaim {
+        name_hash,
+        name,
+        weak,
+        commit_hash,
+        commit_height,
+        value: output.value,
+        fee: 0,
+        conjured: 0,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -779,6 +925,12 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     request: ConnectBlock<'_>,
     services: StateServices<'_>,
 ) -> Result<StateSummary, StateError> {
+    let route = services.historical_validation;
+    let checkpointed = route == HistoricalValidationPlan::hsd_checkpointed();
+    if route != HistoricalValidationPlan::full() && !checkpointed {
+        return Err(StateError::InvalidHistoricalValidationPlan);
+    }
+
     if request.block_hash != request.block.hash() {
         return Err(StateError::BlockHashMismatch {
             expected: request.block_hash,
@@ -819,14 +971,26 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     } else {
         0
     };
-    let issuance = services.issuance_verifier.verify_coinbase(
-        coinbase,
-        request.height,
-        parent_time,
-        services.network,
-    )?;
+    let assumes = |checked: bool| checkpointed && !checked;
+    let issuance = if assumes(route.claim_airdrop_cryptography) {
+        services.issuance_verifier.verify_historical_coinbase(
+            coinbase,
+            request.height,
+            parent_time,
+            services.network,
+        )?
+    } else {
+        services.issuance_verifier.verify_coinbase(
+            coinbase,
+            request.height,
+            parent_time,
+            services.network,
+        )?
+    };
     stage_airdrop_positions(snapshot, batch, &issuance.airdrop_positions)?;
-    let coinbase_value = transaction_output_value(coinbase)?;
+    let coinbase_value = (!assumes(route.coinbase_reward))
+        .then(|| transaction_output_value(coinbase))
+        .transpose()?;
 
     let mut spent_coins = Vec::new();
     let mut spent_outpoints = HashSet::new();
@@ -856,45 +1020,59 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
                 transaction,
                 request.height,
                 request.coinbase_maturity,
+                !assumes(route.input_values),
             )?;
             let input_coins = resolved
                 .iter()
                 .map(|resolved| resolved.coin.clone())
                 .collect::<Vec<_>>();
 
-            verify_transaction_sequence_locks(
-                transaction,
-                request.height,
-                &input_coins,
-                &chain_context,
-            )?;
-            block_sigops = block_sigops
-                .checked_add(transaction_sigops(transaction, &input_coins)?)
-                .ok_or(StateError::BlockSigopsExceeded {
-                    actual: u32::MAX,
-                    maximum: MAX_BLOCK_SIGOPS,
-                })?;
-            if block_sigops > MAX_BLOCK_SIGOPS {
-                return Err(StateError::BlockSigopsExceeded {
-                    actual: block_sigops,
-                    maximum: MAX_BLOCK_SIGOPS,
-                });
+            if !assumes(route.sequence_locks) {
+                verify_transaction_sequence_locks(
+                    transaction,
+                    request.height,
+                    &input_coins,
+                    &chain_context,
+                )?;
             }
-            verify_transaction_inputs(services.input_verifier, transaction, &input_coins)?;
-            verify_transaction_covenant_links(transaction, &input_coins)?;
+            if !assumes(route.block_sigops) {
+                block_sigops = block_sigops
+                    .checked_add(transaction_sigops(transaction, &input_coins)?)
+                    .ok_or(StateError::BlockSigopsExceeded {
+                        actual: u32::MAX,
+                        maximum: MAX_BLOCK_SIGOPS,
+                    })?;
+                if block_sigops > MAX_BLOCK_SIGOPS {
+                    return Err(StateError::BlockSigopsExceeded {
+                        actual: block_sigops,
+                        maximum: MAX_BLOCK_SIGOPS,
+                    });
+                }
+            }
+            if !assumes(route.scripts) {
+                verify_transaction_inputs(services.input_verifier, transaction, &input_coins)?;
+            }
+            if !assumes(route.covenant_links) {
+                verify_transaction_covenant_links(transaction, &input_coins)?;
+            }
 
-            let input_value = input_coins.iter().try_fold(0u64, |total, coin| {
-                total
-                    .checked_add(coin.value)
-                    .ok_or(StateError::InputValueOverflow)
-            })?;
-            let output_value = transaction_output_value(transaction)?;
-            if input_value < output_value {
-                return Err(StateError::InputValueBelowOutput {
-                    input: input_value,
-                    output: output_value,
-                });
-            }
+            let fee = if assumes(route.input_values) {
+                None
+            } else {
+                let input_value = input_coins.iter().try_fold(0u64, |total, coin| {
+                    total
+                        .checked_add(coin.value)
+                        .ok_or(StateError::InputValueOverflow)
+                })?;
+                let output_value = transaction_output_value(transaction)?;
+                if input_value < output_value {
+                    return Err(StateError::InputValueBelowOutput {
+                        input: input_value,
+                        output: output_value,
+                    });
+                }
+                Some(input_value - output_value)
+            };
 
             apply_transaction_name_covenants(
                 snapshot,
@@ -913,9 +1091,11 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
                 &mut spent_coins,
                 resolved,
             )?;
-            total_fees = total_fees
-                .checked_add(input_value - output_value)
-                .ok_or(StateError::FeeValueOverflow)?;
+            if let Some(fee) = fee {
+                total_fees = total_fees
+                    .checked_add(fee)
+                    .ok_or(StateError::FeeValueOverflow)?;
+            }
         } else {
             apply_transaction_name_covenants(
                 snapshot,
@@ -963,16 +1143,18 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         }
     }
 
-    let maximum_coinbase = request
-        .block_reward
-        .checked_add(total_fees)
-        .and_then(|value| value.checked_add(issuance.conjured))
-        .ok_or(StateError::CoinbaseRewardOverflow)?;
-    if coinbase_value > maximum_coinbase {
-        return Err(StateError::CoinbaseValueExceedsReward {
-            coinbase: coinbase_value,
-            maximum: maximum_coinbase,
-        });
+    if let Some(coinbase_value) = coinbase_value {
+        let maximum_coinbase = request
+            .block_reward
+            .checked_add(total_fees)
+            .and_then(|value| value.checked_add(issuance.conjured))
+            .ok_or(StateError::CoinbaseRewardOverflow)?;
+        if coinbase_value > maximum_coinbase {
+            return Err(StateError::CoinbaseValueExceedsReward {
+                coinbase: coinbase_value,
+                maximum: maximum_coinbase,
+            });
+        }
     }
 
     let mut name_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
@@ -1074,6 +1256,7 @@ fn resolve_transaction_inputs<T: ReadSnapshot>(
     transaction: &Transaction,
     spend_height: Height,
     coinbase_maturity: u32,
+    check_maturity: bool,
 ) -> Result<Vec<ResolvedInput>, StateError> {
     let mut resolved = Vec::with_capacity(transaction.inputs.len());
     for input in &transaction.inputs {
@@ -1087,7 +1270,9 @@ fn resolve_transaction_inputs<T: ReadSnapshot>(
                 ResolvedCoinSource::Existing,
             ),
         };
-        check_coinbase_maturity(&coin, spend_height, coinbase_maturity)?;
+        if check_maturity {
+            check_coinbase_maturity(&coin, spend_height, coinbase_maturity)?;
+        }
         resolved.push(ResolvedInput { coin, source });
     }
     Ok(resolved)
@@ -1163,7 +1348,7 @@ fn apply_verified_claims<T: ReadSnapshot>(
             .all(|(index, claim)| *index == claim.output_index)
     {
         return Err(StateError::ClaimVerification(
-            "authenticated claim set does not match coinbase claim outputs".to_owned(),
+            "verified claim set does not match coinbase claim outputs".to_owned(),
         ));
     }
     if claims.is_empty() {
@@ -2437,6 +2622,8 @@ pub enum StateError {
     MissingCoinbase,
     #[error("deployment-derived name flags are unavailable for contextual covenant validation")]
     DeploymentStateUnavailable,
+    #[error("state validation requires the exact full or canonical HSD checkpoint plan")]
+    InvalidHistoricalValidationPlan,
     #[error("coinbase claim/airdrop issuance is disabled by the configured state service")]
     UnsupportedCoinbaseIssuance,
     #[error("airdrop issuance verification failed: {0}")]
@@ -2831,6 +3018,124 @@ mod tests {
         assert!(!historical_context.is_historical_height(height + 1));
     }
 
+    #[test]
+    fn checkpoint_route_coordinates_all_hsd_input_assumptions() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let previous = Outpoint {
+            txid: Txid::new([0x61; 32]),
+            index: 0,
+        };
+        let coin = Coin {
+            outpoint: previous.clone(),
+            value: 1,
+            height: 100,
+            coinbase: true,
+            address: Address::new(0, vec![0x55; 32]).expect("script-hash address"),
+            covenant: Covenant {
+                kind: CovenantKind::Bid,
+                items: vec![
+                    vec![0x63; 32],
+                    1u32.to_le_bytes().to_vec(),
+                    b"historical-assumption".to_vec(),
+                    vec![0x64; 32],
+                ],
+            },
+        };
+        let mut initial = store.batch();
+        write_coin_to_batch(&mut initial, &coin).expect("seed coin");
+        store.commit(initial).expect("commit seed coin");
+
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: previous.clone(),
+                sequence: 1,
+                witness: Witness {
+                    // HSD conservatively counts 20 sigops for each bare
+                    // CHECKMULTISIG without a preceding small integer.
+                    items: vec![vec![
+                        0xae;
+                        usize::try_from(MAX_BLOCK_SIGOPS / 20 + 1)
+                            .expect("sigop fixture length")
+                    ]],
+                },
+            }],
+            outputs: vec![output(2)],
+            locktime: 0,
+        };
+        let mut candidate = block(0x62, vec![coinbase(vec![output(10)]), spend]);
+        candidate.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let candidate_hash = candidate.hash();
+        let issuance = RejectSpecialCoinbaseIssuance;
+        let full_services = StateServices {
+            network: Network::Mainnet,
+            name_flags: NameFlags::NONE,
+            name_flags_valid: true,
+            historical_validation: HistoricalValidationPlan::full(),
+            input_verifier: &RejectUnverifiedInputs,
+            issuance_verifier: &issuance,
+        };
+        let request = ConnectBlock {
+            block_hash: candidate_hash,
+            height: 100,
+            coinbase_maturity: 100,
+            block_reward: 0,
+            block: &candidate,
+        };
+
+        let snapshot = store.snapshot().expect("full snapshot");
+        let mut rejected = store.batch();
+        assert!(matches!(
+            connect_block_to_batch_with_services(
+                &snapshot,
+                &mut rejected,
+                request.clone(),
+                full_services,
+            ),
+            Err(StateError::PrematureCoinbaseSpend { .. })
+        ));
+
+        let historical_plan = HistoricalValidationPlan::hsd_checkpointed();
+        let mut incomplete_plan = historical_plan;
+        incomplete_plan.scripts = true;
+        let mut invalid_route = store.batch();
+        assert!(matches!(
+            connect_block_to_batch_with_services(
+                &snapshot,
+                &mut invalid_route,
+                request.clone(),
+                StateServices {
+                    historical_validation: incomplete_plan,
+                    ..full_services
+                },
+            ),
+            Err(StateError::InvalidHistoricalValidationPlan)
+        ));
+
+        let mut historical = store.batch();
+        let summary = connect_block_to_batch_with_services(
+            &snapshot,
+            &mut historical,
+            request,
+            StateServices {
+                historical_validation: historical_plan,
+                ..full_services
+            },
+        )
+        .expect("coordinated checkpoint route");
+        assert_eq!(summary.historical_validation, historical_plan);
+        assert!(summary.validation.relative_locks_valid);
+        assert!(summary.validation.scripts_valid);
+        assert!(summary.validation.covenant_links_valid);
+        drop(snapshot);
+        store.commit(historical).expect("commit historical route");
+        assert_eq!(
+            engine(store).coin(&previous).expect("read spent coin"),
+            None
+        );
+    }
+
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct NameTreeFixture {
@@ -2938,6 +3243,7 @@ mod tests {
 
     #[derive(Deserialize)]
     struct AirdropFixture {
+        proofs: Vec<AirdropFixtureProof>,
         faucet: AirdropFixtureProof,
     }
 
@@ -3019,6 +3325,7 @@ mod tests {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct MainnetClaimContextFixture {
+        parent_time: u64,
         context_headers: Vec<MainnetClaimHeaderFixture>,
     }
 
@@ -4556,6 +4863,77 @@ mod tests {
     }
 
     #[test]
+    fn historical_airdrop_route_retains_sanity_but_assumes_proof_cryptography() {
+        let fixture: AirdropFixture =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        let proof = &fixture.proofs[0];
+        let verifier = AirdropCoinbaseIssuanceVerifier::faucet_only(DeploymentState::from_states(
+            [ThresholdState::Defined; 4],
+        ));
+        let mut transaction = coinbase(vec![output(0)]);
+        transaction.inputs.push(Input {
+            previous_output: Outpoint::null(),
+            sequence: u32::MAX,
+            witness: Witness {
+                items: vec![decode_fixture_bytes(&proof.raw)],
+            },
+        });
+        transaction.outputs.push(Output {
+            value: proof.value - proof.fee,
+            address: Address::new(proof.version, decode_fixture_bytes(&proof.address))
+                .expect("airdrop address"),
+            covenant: covenant(),
+        });
+
+        assert!(matches!(
+            verifier.verify_coinbase(&transaction, 0, 0, Network::Regtest),
+            Err(StateError::AirdropVerification(_))
+        ));
+        let historical = verifier
+            .verify_historical_coinbase(&transaction, 0, 0, Network::Regtest)
+            .expect("checkpoint-backed airdrop sanity route");
+        assert_eq!(historical.conjured, 0);
+        assert_eq!(historical.airdrop_positions, vec![proof.position]);
+        assert!(historical.claims.is_empty());
+        assert!(historical.claims_and_airdrops_valid);
+    }
+
+    #[test]
+    fn historical_airdrop_hardening_matches_hsd_malformed_key_behavior() {
+        let fixture: AirdropFixture =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
+                .expect("airdrop fixture");
+        let mut proof =
+            AirdropProof::decode(&decode_fixture_bytes(&fixture.proofs[0].raw)).expect("proof");
+        proof.key = vec![0xff];
+        assert!(proof.is_sane());
+        assert!(proof.key().is_err());
+
+        let verifier =
+            AirdropCoinbaseIssuanceVerifier::faucet_only(DeploymentState::from_states([
+                ThresholdState::Active,
+                ThresholdState::Defined,
+                ThresholdState::Defined,
+                ThresholdState::Defined,
+            ]));
+        let mut transaction = coinbase(vec![output(0)]);
+        transaction.inputs.push(Input {
+            previous_output: Outpoint::null(),
+            sequence: u32::MAX,
+            witness: Witness {
+                items: vec![proof.encode().expect("malformed-key proof encoding")],
+            },
+        });
+        transaction.outputs.push(output(0));
+
+        let historical = verifier
+            .verify_historical_coinbase(&transaction, 0, 0, Network::Regtest)
+            .expect("HSD treats an undecodable key as non-weak before GooSig stop");
+        assert_eq!(historical.airdrop_positions, vec![proof.index]);
+    }
+
+    #[test]
     fn faucet_issuance_spends_rejects_duplicates_and_undoes_hsd_position() {
         let fixture: AirdropFixture =
             serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
@@ -4745,6 +5123,73 @@ mod tests {
             .name_state(&name_hash)
             .expect("name state read")
             .is_none());
+    }
+
+    #[test]
+    fn historical_claim_route_retains_time_but_assumes_dnssec_cryptography() {
+        let fixture: MainnetClaimHistoryFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-history-v1.json"
+        ))
+        .expect("mainnet claim history fixture");
+        let historical = Block::decode(&decode_fixture_bytes(&fixture.block.raw))
+            .expect("canonical mainnet claim block");
+        let mut coinbase = historical.transactions[0].clone();
+        let claim_input = coinbase
+            .outputs
+            .iter()
+            .position(|output| output.covenant.kind == CovenantKind::Claim)
+            .expect("claim output");
+        let proof_raw = &mut coinbase.inputs[claim_input].witness.items[0];
+        *proof_raw.last_mut().expect("ownership proof byte") ^= 1;
+        let altered = OwnershipProof::decode(proof_raw).expect("altered ownership proof codec");
+        assert!(altered.verify_time(fixture.canonical_context.parent_time));
+
+        let verifier = AirdropCoinbaseIssuanceVerifier::native(DeploymentState::from_states(
+            [ThresholdState::Defined; 4],
+        ))
+        .expect("native issuance verifier");
+        assert!(matches!(
+            verifier.verify_coinbase(
+                &coinbase,
+                fixture.block.height,
+                fixture.canonical_context.parent_time,
+                Network::Mainnet,
+            ),
+            Err(StateError::ClaimVerification(_))
+        ));
+        let assumed = verifier
+            .verify_historical_coinbase(
+                &coinbase,
+                fixture.block.height,
+                fixture.canonical_context.parent_time,
+                Network::Mainnet,
+            )
+            .expect("checkpoint-backed claim format/time route");
+        assert_eq!(assumed.conjured, 0);
+        assert_eq!(assumed.claims.len(), fixture.block.claims.len());
+        assert!(assumed.airdrop_positions.is_empty());
+        assert!(assumed.claims_and_airdrops_valid);
+
+        let mut checkpoint_shape = coinbase;
+        checkpoint_shape.outputs[claim_input].covenant.items[1] = fixture
+            .block
+            .height
+            .saturating_add(1)
+            .to_le_bytes()
+            .to_vec();
+        checkpoint_shape.outputs[claim_input]
+            .covenant
+            .items
+            .push(vec![0xaa]);
+        let assumed = verifier
+            .verify_historical_coinbase(
+                &checkpoint_shape,
+                fixture.block.height,
+                fixture.canonical_context.parent_time,
+                Network::Mainnet,
+            )
+            .expect("HSD historical route leaves full claim covenant shape assumed");
+        assert_eq!(assumed.claims.len(), fixture.block.claims.len());
     }
 
     #[test]

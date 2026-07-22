@@ -55,10 +55,14 @@ reserved low-latency paths.
   fail-closed checkpoint-backed historical policy plus a stage-by-stage HSD
   validation-route plan, including always-on candidate coinbase-height binding,
   the mainnet pre-height-2,016 transaction/coinbase restriction, and
-  checkpoint-skipped contextual sigops. Active state now composes only the
-  HSD-exact BID/REDEEM NameState-read exception behind branch-specific final
-  checkpoint header evidence; broader historical assumptions remain disabled
-  pending replay qualification.
+  checkpoint-skipped contextual sigops. Block import now carries the single
+  branch-specific plan through active state: the HSD historical route retains
+  commitments, name limits, deployment/finality/height checks, special-proof
+  sanity and allocation spending, UTXO existence, and mutating covenant context
+  while checkpoint-assuming body sanity, proof cryptography/binding, maturity,
+  values/reward, sequence locks, sigops, covenant links, scripts, and
+  BID/REDEEM context. Missing exact final-checkpoint ancestry selects the full
+  route.
 - Exact vendored native secp256k1 verification backend.
 - Authorization and lock checks before state mutation.
 

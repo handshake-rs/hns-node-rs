@@ -97,19 +97,25 @@ Implemented:
 - Strict header checkpoint enforcement and a fail-closed historical-script
   policy that requires verified checkpoint ancestry before allowing HSD's
   optional historical validation shortcut.
-- Active-state connection composes HSD's exact historical BID/REDEEM
-  NameState-read exception only when the candidate and final configured
-  checkpoint are bound to the same best validated header path. A strictly
-  validated final-checkpoint block supplies its own binding; missing,
-  mismatched, failed, or alternate-branch evidence selects the full route.
+- Block import carries one HSD-exact historical/full plan through active-state
+  connection only when the candidate and final configured checkpoint are bound
+  to the same best validated header path. A strictly validated final-checkpoint
+  block supplies its own binding; missing, mismatched, failed, alternate-branch,
+  post-checkpoint, or checkpoint-free evidence selects the full route.
 - An HSD-executed historical validation-plan matrix pins which body, header,
   deployment, finality, transaction-start, claim/airdrop, input, covenant,
   reward, and script stages are checked or assumed at the checkpoint boundary.
   HSD's always-on mainnet pre-height-2,016 restriction permits only one
   ordinary coinbase output and is enforced before any historical shortcut. The
-  native runtime records the selected route in each state result but keeps
-  every broader historical assumption disabled until historical replay is
-  independently qualified.
+  historical route retains body commitments, name DoS limits, header and
+  deployment context, absolute finality, transaction start, coinbase height,
+  special-proof format/time/deployment checks, allocation-bit spending, UTXO
+  existence, and mutating name-covenant context. It applies HSD's coordinated
+  checkpoint assumptions for body sanity, proof cryptography/output binding,
+  maturity/value/reward checks, sequence locks, contextual sigops, covenant
+  links, scripts, and BID/REDEEM NameState reads. The runtime records the exact
+  route in each state result; full-mainnet replay remains an independent
+  qualification and authority gate.
 - Exact bounded HSD Claim envelope encoding, blob-only Claim hashes, and the
   checksummed ownership TXT payload codec for all four network prefixes.
 - Compression-free DNSKEY/DS/TXT/RRSIG ownership-proof parsing, exact HSD

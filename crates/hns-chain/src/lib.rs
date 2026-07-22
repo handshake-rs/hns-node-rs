@@ -17,6 +17,10 @@ pub struct ChainTip {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+/// Durable validation-stage satisfaction. For a block on the hardcoded
+/// checkpoint ancestry, a stage bit may be satisfied by HSD's exact historical
+/// assumption rather than local execution; `checkpoint_valid`, the block
+/// height/hash, and canonical header ancestry provide that provenance.
 pub struct BlockStatus {
     pub header_context_valid: bool,
     pub checkpoint_valid: bool,
@@ -59,8 +63,9 @@ impl BlockStatus {
     const FAILED: u32 = 1 << 16;
 
     /// Every consensus validation stage represented by the durable status
-    /// schema has completed. Persistence and active-chain membership are kept
-    /// separate so side-chain validation remains representable.
+    /// schema is satisfied either by execution or by an authenticated HSD
+    /// historical assumption. Persistence and active-chain membership are
+    /// kept separate so side-chain validation remains representable.
     pub fn is_consensus_valid(&self) -> bool {
         self.header_context_valid
             && self.checkpoint_valid

@@ -175,13 +175,13 @@ Schema version 13 preserves the existing `u32` status layout:
 | 1 | `checkpoint_valid` | checkpoint policy passed |
 | 2 | `deployment_state_valid` | activation/deployment context passed |
 | 3 | `body_present` | raw body is durable |
-| 4 | `body_syntax_valid` | block/transaction syntax and commitments passed |
+| 4 | `body_syntax_valid` | full syntax, or the checkpoint-backed historical commitment/name-limit body stage, is satisfied |
 | 5 | `absolute_finality_valid` | height/time locktime passed |
-| 6 | `relative_locks_valid` | relative sequence locks passed |
-| 7 | `scripts_valid` | configured witness/script authorization passed |
-| 8 | `covenant_links_valid` | non-coinbase input/output linkage passed |
+| 6 | `relative_locks_valid` | relative locks executed or checkpoint-satisfied |
+| 7 | `scripts_valid` | witness/script authorization executed or checkpoint-satisfied |
+| 8 | `covenant_links_valid` | non-coinbase linkage executed or checkpoint-satisfied |
 | 9 | `covenants_context_valid` | configured contextual name transitions passed |
-| 10 | `claims_and_airdrops_valid` | special issuance proof/accounting passed |
+| 10 | `claims_and_airdrops_valid` | full issuance proof/accounting, or historical sanity/allocation/context, is satisfied |
 | 11 | `utxo_connected` | UTXO mutation is connected |
 | 12 | `name_state_connected` | name-state mutation is connected |
 | 13 | `tree_root_valid` | header pre-state root and durable resulting root passed |
@@ -189,10 +189,15 @@ Schema version 13 preserves the existing `u32` status layout:
 | 15 | `active_chain` | record belongs to the active chain |
 | 16 | `failed` | permanent invalidity was observed |
 
-Shadow bodies set only evidence justified by their validation path. In
-particular, body presence or syntax validity does not imply scripts, contextual
-covenants, claims/airdrops, UTXO connection, name-state connection, root
-validity, undo availability, or active-chain membership.
+For a block on exact hardcoded-checkpoint ancestry, a true stage bit may mean
+the stage is satisfied by HSD's canonical historical assumption rather than
+locally executed. `checkpoint_valid` together with the record height/hash and
+canonical header ancestry supplies that provenance; the state engine rejects
+arbitrary partial historical plans. Shadow bodies set only evidence justified
+by their validation path. In particular, body presence or syntax-stage
+validity does not imply scripts, contextual covenants, claims/airdrops, UTXO
+connection, name-state connection, root validity, undo availability, or
+active-chain membership.
 
 ## Handshake name-root timing
 
