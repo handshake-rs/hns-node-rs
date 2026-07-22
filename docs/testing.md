@@ -153,6 +153,9 @@ Current evidence includes:
   pending/inflight/validation transitions without duplicate work, plus an
   orphan-horizon canonical queue bound and acceptance of an already-in-transit
   response during post-timeout reassignment backoff;
+- canonical child-before-parent body storage while ordinary import fails closed,
+  contiguous progress remains at the gap, and the retained body survives a
+  RocksDB close/reopen;
 - bounded active-state restart resumption, eight-block cooperative direct
   slices, full-bound atomic fork connection, contextual-invalid ancestor
   persistence, and proof that local state faults do not poison stored branches

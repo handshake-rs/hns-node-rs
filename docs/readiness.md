@@ -136,11 +136,14 @@ Implemented:
 - bounded cross-stage body reservations with per-peer requests, retry/timeout,
   an orphan-horizon canonical window, and pruning-aware `notfound` failover
   that does not fabricate failures or let canonical acquisition alone overrun
-  the retained-orphan count bound;
+  the configured count bound;
 - HSD-shaped per-peer `GETDATA` inventories with atomic failed-admission
   rollback, HSD's 60/120-second header/block deadlines, and one disconnect per
   expired peer batch rather than per-hash score multiplication;
-- bounded known-header orphan handling;
+- restart-durable out-of-parent-order canonical-body retention after a strict
+  best-header-path recheck, with the contiguous and active tips pinned at the
+  first gap while ordinary imports and reorgs retain the parent-body invariant;
+- bounded known-header orphan handling for non-canonical descendants;
 - parallel stateless body validation with ordered results;
 - durable permanent-invalid and invalid-child status, atomic best-header
   fallback, restart recovery, and separate retry paths for uncommitted body

@@ -251,8 +251,11 @@ Implemented:
   name effects, and the final-checkpoint historical-script binding. Bounded
   body-work reservations span pending, inflight, validator, and orphan states.
   The canonical download window never exceeds the configured orphan-count
-  horizon, so that downloader alone cannot create count-bound eviction churn
-  when a low body is delayed.
+  horizon, so that downloader alone cannot create an unbounded durable
+  future-body range when a low body is delayed. A strictly validated canonical
+  body is stored as non-active before its parent body arrives; the contiguous
+  and active tips remain pinned at the first gap. Non-canonical descendants
+  continue to use bounded in-memory orphan retention.
   Selected hashes are coalesced into one bounded HSD-shaped `GETDATA` inventory
   per peer. Failed queue admission atomically restores the exact scheduler
   reservations without consuming a retry; transport-stale peers are removed
@@ -263,9 +266,10 @@ Implemented:
   120-second behavior; one expired block batch disconnects its peer once while
   retaining per-block retry accounting. A valid response already in transit
   remains admissible if it wins the timeout/disconnect race.
-- Bounded oldest-first orphan retention only after the block's header context is
-  known and the body passes stateless validation. Bodies with no known header
-  context are dropped after requesting headers.
+- Bounded oldest-first orphan retention for non-canonical descendants only
+  after the block's header context is known and the body passes stateless
+  validation. Bodies with no known header context are dropped after requesting
+  headers.
 - CPU-heavy stateless body validation through blocking workers and ordered
   result delivery.
 - Header-committed permanent invalidity is atomically retained in durable

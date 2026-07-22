@@ -2355,6 +2355,31 @@ impl NodeState {
         self.validate_import_against(&snapshot, request)
     }
 
+    /// Validate a canonical shadow-sync body whose header ancestry is already
+    /// durable even when network delivery has not supplied its parent body.
+    /// Active connection still uses `validate_import` and therefore requires
+    /// the complete parent block/index chain.
+    fn validate_canonical_shadow_import(
+        &self,
+        request: &NodeBlockImport,
+    ) -> Result<ValidatedImport> {
+        let hash = request.block.hash();
+        if self
+            .chain
+            .canonical_hash(request.height)
+            .map_err(|error| anyhow::anyhow!("failed to read canonical shadow header: {error}"))?
+            != Some(hash)
+        {
+            anyhow::bail!(
+                "shadow body {} is not the canonical header at height {}",
+                hash.to_hex(),
+                request.height
+            );
+        }
+        let snapshot = self.store.snapshot()?;
+        self.validate_import_against_policy(&snapshot, request, false)
+    }
+
     /// Preflight only the context-independent portion represented by the
     /// `BlockSyntaxValidated` event. Reorg parents may exist solely in the
     /// pending connect sequence, so parent/state checks remain in the staged
@@ -2407,6 +2432,15 @@ impl NodeState {
         &self,
         snapshot: &T,
         request: &NodeBlockImport,
+    ) -> Result<ValidatedImport> {
+        self.validate_import_against_policy(snapshot, request, true)
+    }
+
+    fn validate_import_against_policy<T: ReadSnapshot>(
+        &self,
+        snapshot: &T,
+        request: &NodeBlockImport,
+        require_parent_body: bool,
     ) -> Result<ValidatedImport> {
         let parent = if request.height == 0 {
             None
@@ -2504,7 +2538,13 @@ impl NodeState {
                 .map_err(|error| anyhow::anyhow!("coinbase height validation failed: {error}"))?;
         }
 
-        validate_branch_extension(snapshot, request, chainwork, self.network)?;
+        validate_branch_extension(
+            snapshot,
+            request,
+            chainwork,
+            self.network,
+            require_parent_body,
+        )?;
 
         Ok(ValidatedImport {
             chainwork,
@@ -4202,6 +4242,7 @@ fn validate_branch_extension(
     request: &NodeBlockImport,
     chainwork: Uint256,
     network: Network,
+    require_parent_body: bool,
 ) -> Result<()> {
     if request.height == 0 {
         if matches!(request.validation, ImportValidationPolicy::Strict) {
@@ -4222,9 +4263,10 @@ fn validate_branch_extension(
     }
 
     let parent_hash = request.block.header.prev_block;
-    let parent = load_block_index_record(snapshot, &parent_hash)?
-        .ok_or_else(|| anyhow::anyhow!("block parent index {} is missing", parent_hash.to_hex()))?;
-    let expected_height = parent
+    let parent_header = load_header_record(snapshot, &parent_hash)?.ok_or_else(|| {
+        anyhow::anyhow!("block parent header {} is missing", parent_hash.to_hex())
+    })?;
+    let expected_height = parent_header
         .height
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("branch height exhausted"))?;
@@ -4232,11 +4274,20 @@ fn validate_branch_extension(
         anyhow::bail!(
             "block height {} does not extend parent height {}",
             request.height,
-            parent.height
+            parent_header.height
         );
     }
-    if chainwork <= parent.chainwork {
+    if chainwork <= parent_header.chainwork {
         anyhow::bail!("block chainwork must increase over its parent");
+    }
+    if !require_parent_body {
+        return Ok(());
+    }
+
+    let parent = load_block_index_record(snapshot, &parent_hash)?
+        .ok_or_else(|| anyhow::anyhow!("block parent index {} is missing", parent_hash.to_hex()))?;
+    if parent.height != parent_header.height || parent.chainwork != parent_header.chainwork {
+        anyhow::bail!("block parent index disagrees with its header record");
     }
     if load_raw_block_record(snapshot, &parent_hash)?.is_none() {
         anyhow::bail!("block parent body {} is missing", parent_hash.to_hex());

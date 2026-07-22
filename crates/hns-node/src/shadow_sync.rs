@@ -1076,6 +1076,14 @@ impl NodeService {
             .map_err(|error| anyhow::anyhow!("failed to load header: {error}"))
     }
 
+    fn shadow_sync_is_canonical_header(&self, hash: BlockHash, height: Height) -> Result<bool> {
+        self.state
+            .chain
+            .canonical_hash(height)
+            .map(|canonical| canonical == Some(hash))
+            .map_err(|error| anyhow::anyhow!("failed to read canonical header: {error}"))
+    }
+
     fn shadow_sync_block(&self, hash: &BlockHash) -> Result<Option<Block>> {
         self.state
             .blocks
@@ -1087,9 +1095,14 @@ impl NodeService {
         &mut self,
         block: Block,
         height: Height,
+        canonical: bool,
     ) -> Result<BlockIndexRecord> {
         let request = NodeBlockImport::from_peer(block, height);
-        let validated = self.state.validate_import(&request)?;
+        let validated = if canonical {
+            self.state.validate_canonical_shadow_import(&request)?
+        } else {
+            self.state.validate_import(&request)?
+        };
         let stored = self.state.store_validated_alternate(request, validated)?;
         Ok(stored.record)
     }
@@ -1323,10 +1336,10 @@ impl NodeService {
         if body_window == 0 {
             anyhow::bail!("orphan block horizon is zero");
         }
-        // Never let the canonical downloader alone schedule more future bodies
-        // than the orphan pool's count horizon. Advancing the contiguous
-        // stored tip slides this window forward without the deterministic
-        // count-bound eviction/redownload churn of an unbounded range.
+        // Canonical validated bodies are durable even when a lower parent body
+        // has not arrived, but the downloader must not create an unbounded
+        // future-body range on disk. Advancing the contiguous stored tip slides
+        // this focused window forward.
         let last_height = start_height
             .saturating_add(body_window.saturating_sub(1))
             .min(best.height);
@@ -2027,9 +2040,9 @@ async fn accept_peer_block(
         if !parent_known {
             // Shadow sync is headers-first. A body without known header context is
             // neither requested nor eligible for retention. Ask for headers,
-            // apply a small protocol penalty, and drop the body. The bounded
-            // orphan pool is reserved for statelessly valid bodies whose own
-            // header is known but whose parent body has not arrived yet.
+            // apply a small protocol penalty, and drop the body. Once its own
+            // header is canonical, a validated body can be durably retained even
+            // if network delivery has not supplied its parent body yet.
             request_headers_from_peer(peer, node, peers, scheduler).await?;
             penalize_peer(peers, peer, 10, "block arrived before header context").await?;
             anyhow::bail!(
@@ -2197,12 +2210,15 @@ async fn handle_validation_result(
     match result {
         Ok(validated) => {
             let hash = validated.block.hash();
-            let parent_available = {
+            let (parent_available, canonical) = {
                 let node = node.lock().await;
-                validated.block.header == node.config.network.params().genesis_header()
-                    || node.shadow_sync_has_block(&validated.block.header.prev_block)?
+                (
+                    validated.block.header == node.config.network.params().genesis_header()
+                        || node.shadow_sync_has_block(&validated.block.header.prev_block)?,
+                    node.shadow_sync_is_canonical_header(hash, validated.height)?,
+                )
             };
-            if !parent_available {
+            if !parent_available && !canonical {
                 let outcome = match orphans.insert_with_evictions(validated.block) {
                     Ok(outcome) => outcome,
                     Err(error) => {
@@ -2229,9 +2245,16 @@ async fn handle_validation_result(
                 return Ok(());
             }
 
+            // Canonical header ancestry is already independently validated and
+            // `store_shadow_block` deliberately writes a non-active record. It
+            // therefore does not need the parent body: retaining it immediately
+            // makes an out-of-order download window restart-durable, while the
+            // contiguous stored tip and active-state connector remain pinned at
+            // the first missing body. Non-canonical descendants still use the
+            // bounded in-memory orphan pool above.
             let stored = {
                 let mut node = node.lock().await;
-                node.shadow_sync_store_shadow_block(validated.block, validated.height)?
+                node.shadow_sync_store_shadow_block(validated.block, validated.height, canonical)?
             };
             scheduler.complete_block(hash);
             {
@@ -2789,6 +2812,21 @@ mod tests {
         block
     }
 
+    fn linked_validator_block(height: Height, parent: &Header) -> Block {
+        let mut block = validator_coinbase_block(height, 1);
+        block.header.prev_block = parent.hash();
+        block.header.time = parent.time.saturating_add(1);
+        block.header.bits = Network::Regtest.params().pow.bits;
+        while !block.header.verify_pow() {
+            block.header.nonce = block
+                .header
+                .nonce
+                .checked_add(1)
+                .expect("regtest nonce space");
+        }
+        block
+    }
+
     #[test]
     fn shadow_sync_rejects_authority_modes_and_duplicate_peers() {
         let peer: SocketAddr = "127.0.0.1:14038".parse().expect("peer");
@@ -2920,6 +2958,141 @@ mod tests {
         assert!(rejection
             .reason
             .contains("first transaction is not coinbase"));
+    }
+
+    #[tokio::test]
+    async fn canonical_body_is_stored_out_of_parent_body_order() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            shadow_sync: ShadowSyncConfig {
+                enabled: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..ShadowSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis");
+        let first = linked_validator_block(1, &genesis.header);
+        let second = linked_validator_block(2, &first.header);
+        service
+            .shadow_sync_import_headers(vec![first.header.clone(), second.header.clone()])
+            .expect("canonical headers");
+        let second_hash = second.hash();
+        let first_hash = first.hash();
+        let ordinary_error = service
+            .accept_block(NodeBlockImport::from_peer(second.clone(), 2))
+            .expect_err("ordinary import still requires the parent body");
+        assert!(ordinary_error.to_string().contains("parent index"));
+        let node = Arc::new(Mutex::new(service));
+
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+                .expect("peer manager");
+        let (validation, _validation_results) =
+            spawn_validation_pipeline(Arc::new(HnsBodyValidator::new(Network::Regtest)), 1, 8)
+                .expect("validation pipeline");
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        scheduler
+            .queue_block(second_hash, 2)
+            .expect("second body reservation");
+        scheduler.begin_local_validation(second_hash);
+        let mut orphans = BoundedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 8,
+            maximum_bytes: 1_024 * 1_024,
+        })
+        .expect("orphan pool");
+        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
+
+        handle_validation_result(
+            Ok(hns_sync::ValidatedBlock {
+                sequence: 0,
+                peer: PeerId(1),
+                height: 2,
+                block: second,
+            }),
+            &node,
+            &peers,
+            &validation,
+            &mut scheduler,
+            &mut orphans,
+            &diagnostics,
+        )
+        .await
+        .expect("store out-of-order canonical body");
+
+        let node = node.lock().await;
+        assert!(node
+            .shadow_sync_has_block(&second_hash)
+            .expect("second body lookup"));
+        assert!(!node
+            .shadow_sync_has_block(&first_hash)
+            .expect("first body lookup"));
+        assert_eq!(
+            node.shadow_sync_contiguous_body_tip(None)
+                .expect("contiguous body tip"),
+            None
+        );
+        drop(node);
+        assert!(!scheduler.is_tracked_block(&second_hash));
+        assert_eq!(orphans.snapshot().blocks, 0);
+        assert_eq!(diagnostics.read().await.stored_bodies, 1);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn out_of_order_canonical_body_survives_rocksdb_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-shadow-out-of-order-{}-{}",
+            std::process::id(),
+            current_unix_time().expect("time")
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let config = NodeConfig {
+            network: Network::Regtest,
+            data_dir: Some(path.clone()),
+            shadow_sync: ShadowSyncConfig {
+                enabled: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..ShadowSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        };
+        let second_hash;
+        let first_hash;
+
+        {
+            let mut service = NodeService::try_new(config.clone()).expect("open first node");
+            let genesis = service
+                .shadow_sync_ensure_genesis_header()
+                .expect("genesis");
+            let first = linked_validator_block(1, &genesis.header);
+            let second = linked_validator_block(2, &first.header);
+            second_hash = second.hash();
+            first_hash = first.hash();
+            service
+                .shadow_sync_import_headers(vec![first.header.clone(), second.header.clone()])
+                .expect("canonical headers");
+            service
+                .shadow_sync_store_shadow_block(second, 2, true)
+                .expect("store out-of-order canonical body");
+            mark_clean_shutdown(&service.state.store).expect("clean first shutdown");
+        }
+
+        {
+            let service = NodeService::try_new(config).expect("reopen node");
+            assert!(service
+                .shadow_sync_has_block(&second_hash)
+                .expect("reopened second body"));
+            assert!(!service
+                .shadow_sync_has_block(&first_hash)
+                .expect("reopened first body"));
+            mark_clean_shutdown(&service.state.store).expect("clean second shutdown");
+        }
+
+        std::fs::remove_dir_all(&path).expect("remove test store");
     }
 
     #[test]

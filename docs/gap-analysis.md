@@ -131,9 +131,14 @@
 - Cross-stage body reservations and pruning-aware per-hash `notfound` evidence;
   honest unavailability fails over without contaminating peer or invalid-block
   counters, cross-peer cancellation is rejected, and the canonical acquisition
-  window cannot by itself exceed retained-orphan count capacity.
-- Bounded orphan retention only for statelessly valid bodies with known header
-  context; unknown-context bodies are dropped after requesting headers.
+  window cannot by itself exceed its configured count capacity.
+- Atomic out-of-parent-order canonical-body retention after a fail-closed
+  best-header-path recheck, with restart persistence and contiguous-tip gap
+  tracking; ordinary imports, active connection, and reorganization retain the
+  complete parent-body invariant.
+- Bounded orphan retention only for statelessly valid non-canonical bodies with
+  known header context; unknown-context bodies are dropped after requesting
+  headers.
 - Blocking validation workers with ordered result delivery.
 - Durable non-active body retention, contiguous-body recovery, restart
   checkpointing, and bounded read-only serving.

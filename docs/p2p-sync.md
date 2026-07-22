@@ -202,16 +202,23 @@ accounting.
 An unsolicited block is accepted only when it was already pending and the
 sender was an eligible announcer. A body with no known header context is dropped
 after requesting headers and applying a small protocol penalty; arbitrary
-unvalidated bodies are never retained. If the block's own header is known but
-its parent body is not yet available, the body is statelessly validated before
-entering the bounded orphan pool. Orphans are evicted oldest-first when limits
-are reached. One bounded reservation follows each body across pending, network
-inflight, validation, and orphan retention, preventing duplicate downloads and
-preserving retry capacity while those states overlap.
+unvalidated bodies are never retained. When the block is on the durable
+canonical header path, strict import validation rechecks that binding and may
+atomically store its body and non-active index before its parent body arrives.
+Ordinary block acceptance, active-state connection, and reorganization still
+require the complete parent body/index chain. The contiguous stored tip stops at
+the first gap and advances across already stored successors when the missing
+body arrives, including after restart. A non-canonical descendant without its
+parent body instead enters the bounded, oldest-first in-memory orphan pool after
+stateless validation.
+
+One bounded reservation follows each body across pending, network inflight,
+validation, durable canonical retention, or orphan retention, preventing
+duplicate downloads and preserving retry capacity while those states overlap.
 Canonical acquisition is limited to the configured orphan-count horizon beyond
 the contiguous stored-body tip; the window slides only as that tip advances, so
-the canonical downloader alone cannot create deterministic count-bound
-future-body eviction/redownload churn.
+the canonical downloader alone cannot create an unbounded durable future-body
+range.
 
 A requested block `notfound` response is availability evidence, not proof of a
 bad block or peer. The scheduler accepts it only from the peer that owns the
