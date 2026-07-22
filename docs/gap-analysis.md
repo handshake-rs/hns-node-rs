@@ -122,6 +122,9 @@
   timeout, ping/pong, priority-queue controls, and cancellation-safe partial
   frame reads across timer maintenance.
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
+- HSD score-100/24-hour normalized-IP bans with IP-wide live disconnect,
+  pre-handshake inbound/outbound rejection, bounded restart persistence,
+  expiry compaction, and diagnostics.
 - HSD DNS-seed bootstrap and bounded GETADDR/ADDR learning with routability,
   service, key, timestamp, protected-explicit-peer, and failed-target rotation
   rules, plus a versioned, checksummed, network-bound address-book snapshot
@@ -224,7 +227,8 @@ These are substantial foundations, not a production full node.
   and pruning qualification of the bounded restartable active-state connector.
 - Failed-branch pruning/retention policy, historical reorganizations, and
   RocksDB fault evidence.
-- Brontide, durable bans/reputation, and broader peer-diversity controls.
+- Brontide, long-lived subthreshold reputation, broader peer/address-group
+  diversity controls, and adversarial network qualification.
 - Compact-block reconstruction and pruning-aware synchronization.
 - Production-complete contextual peer transaction admission and relay.
 - Sustained multipath publication and reconnect/retry supervision under WAN

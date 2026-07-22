@@ -23,8 +23,9 @@ use hns_consensus::{
 };
 use hns_mempool::Admission;
 use hns_p2p::{
-    Inventory, InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket, OutboundPriority,
-    P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot, SERVICE_NETWORK,
+    normalize_peer_ip, Inventory, InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket,
+    OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot,
+    SERVICE_NETWORK,
 };
 use hns_primitives::{blake2b_256, Block, BlockHash, Header, Height, Reader, Txid, Writer};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
@@ -48,6 +49,10 @@ use super::{
     json_rpc_error, median_time_past_with_lookup, AuthorityMode, ChainActivationFailure,
     FailedBlockMutation, FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
     ShutdownSignal,
+};
+use crate::peer_bans::{
+    load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
+    HSD_BAN_TIME_SECONDS, MAX_PEER_BANS,
 };
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
@@ -289,6 +294,19 @@ pub struct ShadowSyncDiagnostics {
     pub address_book_dirty: bool,
     pub last_address_book_flush: Option<u64>,
     pub address_book_last_error: Option<String>,
+    pub ban_list_persistent: bool,
+    pub banned_addresses: usize,
+    pub loaded_bans: u64,
+    pub pruned_bans: u64,
+    pub expired_bans: u64,
+    pub ban_events: u64,
+    pub ban_list_sequence: u64,
+    pub ban_list_flushes: u64,
+    pub ban_list_flush_failures: u64,
+    pub ban_list_decode_failures: u64,
+    pub ban_list_dirty: bool,
+    pub last_ban_list_flush: Option<u64>,
+    pub ban_list_last_error: Option<String>,
     pub dns_seed_addresses: u64,
     pub dns_seed_failures: u64,
     pub discovery_connection_failures: u64,
@@ -579,14 +597,19 @@ impl BoundedAddressBook {
     fn connection_candidates(
         &self,
         tracked: &HashMap<SocketAddr, ReconnectState>,
+        bans: &PeerBanBook,
         now: Instant,
+        timestamp: u64,
         maximum: usize,
     ) -> Vec<SocketAddr> {
         let mut candidates = self
             .entries
             .iter()
             .filter(|(address, entry)| {
-                !entry.configured && entry.eligible_at <= now && !tracked.contains_key(address)
+                !entry.configured
+                    && entry.eligible_at <= now
+                    && !tracked.contains_key(address)
+                    && !bans.is_banned(address.ip(), timestamp)
             })
             .map(|(address, entry)| {
                 (
@@ -603,6 +626,17 @@ impl BoundedAddressBook {
             .take(maximum)
             .map(|(_, _, _, address)| address)
             .collect()
+    }
+
+    fn remove_discovered_ip(&mut self, address: IpAddr) -> usize {
+        let address = normalize_peer_ip(address);
+        let before = self.entries.len();
+        self.entries.retain(|candidate, entry| {
+            entry.configured || normalize_peer_ip(candidate.ip()) != address
+        });
+        let removed = before.saturating_sub(self.entries.len());
+        self.dirty |= removed > 0;
+        removed
     }
 
     fn note_attempt(&mut self, address: SocketAddr, now: Instant, timestamp: u64) {
@@ -643,19 +677,22 @@ impl BoundedAddressBook {
         }
     }
 
-    fn advertised(&self, maximum: usize) -> Vec<hns_p2p::NetAddress> {
+    fn advertised(
+        &self,
+        maximum: usize,
+        bans: &PeerBanBook,
+        timestamp: u64,
+    ) -> Vec<hns_p2p::NetAddress> {
         let mut entries = self
             .entries
             .values()
             .filter(|entry| {
-                is_discoverable_address(
-                    self.network,
-                    self.listen,
-                    entry
-                        .wire
-                        .socket_addr()
-                        .expect("address-book key is an IP socket"),
-                )
+                let address = entry
+                    .wire
+                    .socket_addr()
+                    .expect("address-book key is an IP socket");
+                is_discoverable_address(self.network, self.listen, address)
+                    && !bans.is_banned(address.ip(), timestamp)
             })
             .collect::<Vec<_>>();
         entries.sort_by_key(|entry| {
@@ -1099,8 +1136,8 @@ impl NodeService {
         let shadow_sync_config = self.config.shadow_sync.clone();
         let rpc_bind = self.config.rpc_bind;
         let network = self.config.network;
-        let address_book_persistent =
-            shadow_sync_config.discovery && self.config.data_dir.is_some();
+        let ban_list_persistent = self.config.data_dir.is_some();
+        let address_book_persistent = shadow_sync_config.discovery && ban_list_persistent;
         let store = self.state.store.clone();
         let node = Arc::new(Mutex::new(self));
 
@@ -1148,9 +1185,35 @@ impl NodeService {
         let mut peer_config = LivePeerConfig::for_network(network);
         peer_config.maximum_inbound = shadow_sync_config.maximum_inbound;
         peer_config.maximum_outbound = shadow_sync_config.maximum_outbound;
+        peer_config.ban_score = HSD_BAN_SCORE;
+        peer_config.ban_time = Duration::from_secs(HSD_BAN_TIME_SECONDS);
         let (peers, mut peer_events) = LivePeerManager::new(peer_config)
             .map_err(|error| anyhow::anyhow!("failed to initialize live peers: {error}"))?;
         peers.set_local_height(active_tip.as_ref().map_or(0, |tip| tip.height));
+
+        let ban_timestamp = unix_time();
+        let mut ban_list = PeerBanBook::new(network, MAX_PEER_BANS)?;
+        let mut loaded_bans = 0u64;
+        let mut pruned_bans = 0u64;
+        let mut ban_list_decode_failures = 0u64;
+        if ban_list_persistent {
+            let PeerBanLoad {
+                book,
+                loaded,
+                pruned,
+                decode_error,
+            } = load_peer_bans(&store, network, MAX_PEER_BANS, ban_timestamp)?;
+            ban_list = book;
+            loaded_bans = loaded as u64;
+            pruned_bans = pruned as u64;
+            if let Some(error) = decode_error {
+                ban_list_decode_failures = 1;
+                tracing::warn!(%error, "discarding invalid durable HNS peer-ban list");
+            }
+        }
+        peers
+            .replace_bans(ban_list.active_bans(ban_timestamp))
+            .await;
 
         {
             let node = node.lock().await;
@@ -1245,8 +1308,10 @@ impl NodeService {
         fill_discovery_slots(
             &address_book,
             &mut reconnects,
+            &ban_list,
             shadow_sync_config.maximum_outbound,
             address_now,
+            address_timestamp,
         );
 
         let initial_sequence = durable_checkpoint
@@ -1268,6 +1333,13 @@ impl NodeService {
             address_book_sequence: address_book.durable_sequence,
             address_book_decode_failures,
             address_book_dirty: address_book.dirty,
+            ban_list_persistent,
+            banned_addresses: ban_list.len(),
+            loaded_bans,
+            pruned_bans,
+            ban_list_sequence: ban_list.durable_sequence(),
+            ban_list_decode_failures,
+            ban_list_dirty: ban_list.is_dirty(),
             dns_seed_addresses,
             dns_seed_failures,
             started_at: unix_time(),
@@ -1334,9 +1406,9 @@ impl NodeService {
         let mut poll = tokio::time::interval(shadow_sync_config.poll_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         poll.tick().await;
-        let mut address_book_flush = tokio::time::interval(ADDRESS_BOOK_FLUSH_INTERVAL);
-        address_book_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        address_book_flush.tick().await;
+        let mut peer_state_flush = tokio::time::interval(ADDRESS_BOOK_FLUSH_INTERVAL);
+        peer_state_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        peer_state_flush.tick().await;
         let mut served_getaddr = HashSet::new();
         let mut shutdown_wait = Box::pin(shutdown.wait());
         let mut terminal_error: Option<anyhow::Error> = None;
@@ -1344,8 +1416,11 @@ impl NodeService {
         loop {
             tokio::select! {
                 _ = &mut shutdown_wait => break,
-                _ = address_book_flush.tick(), if address_book_persistent => {
-                    flush_address_book(&store, &mut address_book, &diagnostics).await;
+                _ = peer_state_flush.tick(), if ban_list_persistent => {
+                    if address_book_persistent {
+                        flush_address_book(&store, &mut address_book, &diagnostics).await;
+                    }
+                    flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
                 }
                 _ = poll.tick() => {
                     if rpc_task.is_finished() {
@@ -1369,13 +1444,16 @@ impl NodeService {
                         fill_discovery_slots(
                             &address_book,
                             &mut reconnects,
+                            &ban_list,
                             shadow_sync_config.maximum_outbound,
                             connection_now,
+                            unix_time(),
                         );
                     }
                     let attempts = spawn_due_connections(
                         &mut reconnects,
                         &mut address_book,
+                        &ban_list,
                         &peers,
                         &connect_results_tx,
                         connection_now,
@@ -1464,6 +1542,7 @@ impl NodeService {
                         &orphan_pool,
                         &reconnects,
                         &address_book,
+                        &ban_list,
                         checkpoint_sequence,
                     )
                     .await;
@@ -1485,8 +1564,10 @@ impl NodeService {
                         fill_discovery_slots(
                             &address_book,
                             &mut reconnects,
+                            &ban_list,
                             shadow_sync_config.maximum_outbound,
                             Instant::now(),
+                            unix_time(),
                         );
                     }
                 }
@@ -1510,6 +1591,7 @@ impl NodeService {
                             &mut scheduler,
                             &mut reconnects,
                             &mut address_book,
+                            &ban_list,
                             &mut served_getaddr,
                             shadow_sync_config.discovery,
                             shadow_sync_config.headers_only,
@@ -1526,8 +1608,10 @@ impl NodeService {
                         fill_discovery_slots(
                             &address_book,
                             &mut reconnects,
+                            &ban_list,
                             shadow_sync_config.maximum_outbound,
                             Instant::now(),
+                            unix_time(),
                         );
                     }
                     refresh_diagnostics(
@@ -1537,6 +1621,7 @@ impl NodeService {
                         &orphan_pool,
                         &reconnects,
                         &address_book,
+                        &ban_list,
                         checkpoint_sequence,
                     )
                     .await;
@@ -1568,15 +1653,39 @@ impl NodeService {
                         &orphan_pool,
                         &reconnects,
                         &address_book,
+                        &ban_list,
                         checkpoint_sequence,
                     )
                     .await;
                 }
             }
+            maintain_peer_bans(
+                &store,
+                &peers,
+                &mut ban_list,
+                &mut address_book,
+                &mut reconnects,
+                &diagnostics,
+                ban_list_persistent,
+            )
+            .await;
         }
 
+        maintain_peer_bans(
+            &store,
+            &peers,
+            &mut ban_list,
+            &mut address_book,
+            &mut reconnects,
+            &diagnostics,
+            ban_list_persistent,
+        )
+        .await;
         if address_book_persistent {
             flush_address_book(&store, &mut address_book, &diagnostics).await;
+        }
+        if ban_list_persistent {
+            flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
         }
         checkpoint_sequence = checkpoint_sequence.saturating_add(1);
         if let Err(error) = persist_checkpoint(&checkpoint_store, &scheduler, checkpoint_sequence) {
@@ -2479,6 +2588,7 @@ async fn handle_peer_event(
     scheduler: &mut SyncScheduler,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
     addresses: &mut BoundedAddressBook,
+    bans: &PeerBanBook,
     served_getaddr: &mut HashSet<PeerId>,
     discovery: bool,
     headers_only: bool,
@@ -2770,7 +2880,7 @@ async fn handle_peer_event(
                 if !admit_getaddr(peer, inbound, served_getaddr) {
                     return Ok(());
                 }
-                let advertised = addresses.advertised(hns_p2p::MAX_ADDR_ITEMS);
+                let advertised = addresses.advertised(hns_p2p::MAX_ADDR_ITEMS, bans, unix_time());
                 if advertised.is_empty() {
                     return Ok(());
                 }
@@ -2882,7 +2992,10 @@ async fn handle_peer_event(
                     let timestamp = unix_time();
                     let mut accepted = 0u64;
                     for item in items {
-                        if addresses.insert_discovered(item, now, timestamp).accepted() {
+                        let banned = item
+                            .socket_addr()
+                            .is_some_and(|address| bans.is_banned(address.ip(), timestamp));
+                        if !banned && addresses.insert_discovered(item, now, timestamp).accepted() {
                             accepted = accepted.saturating_add(1);
                         }
                     }
@@ -3366,9 +3479,6 @@ async fn penalize_peer(
 ) -> Result<i32> {
     let total = peers.penalize(peer, score).await?;
     tracing::debug!(?peer, score, total, %reason, "penalized HNS peer");
-    if total >= 100 {
-        peers.disconnect(peer).await?;
-    }
     Ok(total)
 }
 
@@ -3573,29 +3683,15 @@ fn persist_checkpoint(
 fn spawn_due_connections(
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
     addresses: &mut BoundedAddressBook,
+    bans: &PeerBanBook,
     peers: &LivePeerManager,
     results: &mpsc::Sender<ConnectAttemptResult>,
     now: Instant,
     maximum_outbound: usize,
 ) -> usize {
-    let occupied = reconnects
-        .values()
-        .filter(|state| state.connected || state.connecting)
-        .count();
-    let available = maximum_outbound.saturating_sub(occupied);
-    let due = reconnects
-        .iter_mut()
-        .filter_map(|(address, state)| {
-            if state.connected || state.connecting || state.next_attempt > now {
-                return None;
-            }
-            state.connecting = true;
-            Some(*address)
-        })
-        .take(available)
-        .collect::<Vec<_>>();
-
     let timestamp = unix_time();
+    let due = take_due_connection_targets(reconnects, bans, now, timestamp, maximum_outbound);
+
     for address in &due {
         addresses.note_attempt(*address, now, timestamp);
     }
@@ -3614,14 +3710,61 @@ fn spawn_due_connections(
     due.len()
 }
 
+fn take_due_connection_targets(
+    reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    bans: &PeerBanBook,
+    now: Instant,
+    timestamp: u64,
+    maximum_outbound: usize,
+) -> Vec<SocketAddr> {
+    let occupied = reconnects
+        .values()
+        .filter(|state| state.connected || state.connecting)
+        .count();
+    let available = maximum_outbound.saturating_sub(occupied);
+    let mut eligible = reconnects
+        .iter()
+        .filter_map(|(address, state)| {
+            if state.connected
+                || state.connecting
+                || state.next_attempt > now
+                || bans.is_banned(address.ip(), timestamp)
+            {
+                return None;
+            }
+            Some((!state.persistent, state.next_attempt, *address))
+        })
+        .collect::<Vec<_>>();
+    eligible.sort();
+    let due = eligible
+        .into_iter()
+        .take(available)
+        .map(|(_, _, address)| address)
+        .collect::<Vec<_>>();
+
+    for address in &due {
+        reconnects
+            .get_mut(address)
+            .expect("due connection target remains tracked")
+            .connecting = true;
+    }
+    due
+}
+
 fn fill_discovery_slots(
     addresses: &BoundedAddressBook,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    bans: &PeerBanBook,
     maximum_outbound: usize,
     now: Instant,
+    timestamp: u64,
 ) -> usize {
-    let available = maximum_outbound.saturating_sub(reconnects.len());
-    let candidates = addresses.connection_candidates(reconnects, now, available);
+    let active_targets = reconnects
+        .keys()
+        .filter(|address| !bans.is_banned(address.ip(), timestamp))
+        .count();
+    let available = maximum_outbound.saturating_sub(active_targets);
+    let candidates = addresses.connection_candidates(reconnects, bans, now, timestamp, available);
     let added = candidates.len();
     for address in candidates {
         let mut state = ReconnectState::new(now, false);
@@ -3680,6 +3823,7 @@ async fn handle_connect_attempt_result(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn refresh_diagnostics(
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
     peers: &LivePeerManager,
@@ -3687,6 +3831,7 @@ async fn refresh_diagnostics(
     orphans: &BoundedOrphanPool,
     reconnects: &HashMap<SocketAddr, ReconnectState>,
     addresses: &BoundedAddressBook,
+    bans: &PeerBanBook,
     checkpoint_sequence: u64,
 ) {
     let snapshots = peers.snapshots().await;
@@ -3698,6 +3843,9 @@ async fn refresh_diagnostics(
     state.known_addresses = addresses.len();
     state.address_book_sequence = addresses.durable_sequence;
     state.address_book_dirty = addresses.dirty;
+    state.banned_addresses = bans.len();
+    state.ban_list_sequence = bans.durable_sequence();
+    state.ban_list_dirty = bans.is_dirty();
     state.outbound_connected = reconnects.values().filter(|item| item.connected).count();
     state.outbound_connecting = reconnects.values().filter(|item| item.connecting).count();
 }
@@ -3733,6 +3881,112 @@ async fn flush_address_book(
             })
             .await;
             tracing::warn!(%error, "failed to persist HNS address book");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maintain_peer_bans(
+    store: &StoreHandle,
+    peers: &LivePeerManager,
+    bans: &mut PeerBanBook,
+    addresses: &mut BoundedAddressBook,
+    reconnects: &mut HashMap<SocketAddr, ReconnectState>,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    persistent: bool,
+) {
+    let timestamp = unix_time();
+    let pending = peers.take_pending_bans().await;
+    let expired = bans.remove_expired(timestamp);
+    let mut accepted = 0u64;
+    let mut banned_addresses = BTreeSet::new();
+
+    for ban in pending {
+        match bans.ban(&ban) {
+            Ok(_) => {
+                accepted = accepted.saturating_add(1);
+                banned_addresses.insert(normalize_peer_ip(ban.address));
+                tracing::warn!(
+                    address = %ban.address,
+                    score = ban.score,
+                    ban_until = ban.ban_until,
+                    "banned HNS peer IP"
+                );
+            }
+            Err(error) => {
+                let error = error.to_string();
+                update_diagnostics(diagnostics, |state| {
+                    state.ban_list_last_error = Some(error.clone());
+                })
+                .await;
+                tracing::warn!(%error, "discarding invalid HNS peer-ban event");
+            }
+        }
+    }
+
+    for address in &banned_addresses {
+        addresses.remove_discovered_ip(*address);
+    }
+    if !banned_addresses.is_empty() {
+        reconnects.retain(|address, state| {
+            state.persistent || !banned_addresses.contains(&normalize_peer_ip(address.ip()))
+        });
+    }
+
+    let changed = accepted > 0 || expired > 0;
+    if changed {
+        peers.replace_bans(bans.active_bans(timestamp)).await;
+        let banned = bans.len();
+        let sequence = bans.durable_sequence();
+        let dirty = bans.is_dirty();
+        let known_addresses = addresses.len();
+        update_diagnostics(diagnostics, |state| {
+            state.ban_events = state.ban_events.saturating_add(accepted);
+            state.expired_bans = state.expired_bans.saturating_add(expired as u64);
+            state.banned_addresses = banned;
+            state.ban_list_sequence = sequence;
+            state.ban_list_dirty = dirty;
+            state.known_addresses = known_addresses;
+        })
+        .await;
+        if persistent {
+            flush_peer_bans(store, bans, diagnostics).await;
+        }
+    }
+}
+
+async fn flush_peer_bans(
+    store: &StoreHandle,
+    bans: &mut PeerBanBook,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) {
+    let timestamp = unix_time();
+    match persist_peer_bans(store, bans, timestamp) {
+        Ok(flushed) => {
+            let count = bans.len();
+            let sequence = bans.durable_sequence();
+            let dirty = bans.is_dirty();
+            update_diagnostics(diagnostics, |state| {
+                state.banned_addresses = count;
+                state.ban_list_sequence = sequence;
+                state.ban_list_dirty = dirty;
+                if flushed {
+                    state.ban_list_flushes = state.ban_list_flushes.saturating_add(1);
+                    state.last_ban_list_flush = Some(timestamp);
+                    state.ban_list_last_error = None;
+                }
+            })
+            .await;
+        }
+        Err(error) => {
+            let error = error.to_string();
+            update_diagnostics(diagnostics, |state| {
+                state.ban_list_flush_failures = state.ban_list_flush_failures.saturating_add(1);
+                state.ban_list_dirty = true;
+                state.ban_list_last_error = Some(error.clone());
+            })
+            .await;
+            tracing::warn!(%error, "failed to persist HNS peer-ban list");
         }
     }
 }
@@ -4100,7 +4354,11 @@ mod tests {
         assert!(restored.dirty, "pruning must schedule a compacted flush");
 
         let mut reconnects = HashMap::new();
-        assert_eq!(fill_discovery_slots(&restored, &mut reconnects, 1, now), 1);
+        let bans = PeerBanBook::new(Network::Mainnet, 4).expect("bans");
+        assert_eq!(
+            fill_discovery_slots(&restored, &mut reconnects, &bans, 1, now, timestamp),
+            1
+        );
         assert_eq!(reconnects[&valid].failures, 2);
         restored.note_attempt(valid, now, timestamp);
         note_reconnect_failure(valid, &mut reconnects, now);
@@ -4242,7 +4500,8 @@ mod tests {
         assert!(!addresses.entries.contains_key(&first));
         assert!(addresses.entries.contains_key(&second));
         assert!(addresses.entries.contains_key(&third));
-        assert_eq!(addresses.advertised(1).len(), 1);
+        let bans = PeerBanBook::new(Network::Mainnet, 4).expect("bans");
+        assert_eq!(addresses.advertised(1, &bans, timestamp).len(), 1);
     }
 
     #[test]
@@ -4265,7 +4524,11 @@ mod tests {
                 .accepted());
         }
         let mut reconnects = HashMap::from([(configured, ReconnectState::new(now, true))]);
-        assert_eq!(fill_discovery_slots(&addresses, &mut reconnects, 2, now), 1);
+        let bans = PeerBanBook::new(Network::Regtest, 4).expect("bans");
+        assert_eq!(
+            fill_discovery_slots(&addresses, &mut reconnects, &bans, 2, now, timestamp),
+            1
+        );
         let discovered = reconnects
             .iter()
             .find_map(|(address, state)| (!state.persistent).then_some(*address))
@@ -4282,9 +4545,136 @@ mod tests {
         }
         assert!(!reconnects.contains_key(&discovered));
         assert!(reconnects.contains_key(&configured));
-        assert_eq!(fill_discovery_slots(&addresses, &mut reconnects, 2, now), 1);
+        assert_eq!(
+            fill_discovery_slots(&addresses, &mut reconnects, &bans, 2, now, timestamp),
+            1
+        );
         assert_eq!(reconnects.len(), 2);
         assert!(!reconnects.contains_key(&discovered));
+    }
+
+    #[test]
+    fn banned_ips_are_not_discovered_reconnected_or_advertised() {
+        let now = Instant::now();
+        let timestamp = 1_800_000_000;
+        let banned: SocketAddr = "10.0.0.1:14038".parse().expect("banned peer");
+        let allowed: SocketAddr = "10.0.0.2:14038".parse().expect("allowed peer");
+        let configured: SocketAddr = "10.0.0.1:15038".parse().expect("configured peer");
+        let mut addresses = BoundedAddressBook::new(Network::Regtest, None, 4).expect("book");
+        addresses
+            .insert_configured(configured, now, timestamp)
+            .expect("configured address");
+        for address in [banned, allowed] {
+            assert!(addresses
+                .insert_discovered(
+                    hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK),
+                    now,
+                    timestamp,
+                )
+                .accepted());
+        }
+
+        let mut bans = PeerBanBook::new(Network::Regtest, 4).expect("bans");
+        bans.ban(&hns_p2p::PeerBan {
+            address: banned.ip(),
+            banned_at: timestamp,
+            ban_until: timestamp + HSD_BAN_TIME_SECONDS,
+            score: HSD_BAN_SCORE as i32,
+        })
+        .expect("ban");
+
+        let mut reconnects = HashMap::from([(configured, ReconnectState::new(now, true))]);
+        assert_eq!(
+            fill_discovery_slots(&addresses, &mut reconnects, &bans, 2, now, timestamp),
+            1
+        );
+        assert_eq!(reconnects.len(), 2);
+        assert!(reconnects.contains_key(&configured));
+        assert!(reconnects.contains_key(&allowed));
+        assert!(!reconnects.contains_key(&banned));
+        assert_eq!(
+            take_due_connection_targets(&mut reconnects, &bans, now, timestamp, 1),
+            vec![allowed]
+        );
+        reconnects
+            .get_mut(&allowed)
+            .expect("allowed target")
+            .connecting = false;
+        assert_eq!(
+            take_due_connection_targets(
+                &mut reconnects,
+                &bans,
+                now,
+                timestamp + HSD_BAN_TIME_SECONDS + 1,
+                1,
+            ),
+            vec![configured],
+            "the explicit target must regain priority after its ban expires"
+        );
+        let advertised = addresses.advertised(4, &bans, timestamp);
+        assert!(advertised.iter().all(|address| address
+            .socket_addr()
+            .is_some_and(|address| address.ip() != banned.ip())));
+
+        assert_eq!(addresses.remove_discovered_ip(banned.ip()), 1);
+        assert!(addresses.entries.contains_key(&configured));
+        assert!(!addresses.entries.contains_key(&banned));
+    }
+
+    #[tokio::test]
+    async fn threshold_peer_ban_is_applied_flushed_and_restored() {
+        let timestamp = unix_time();
+        let now = Instant::now();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let accepted = tokio::spawn(async move { listener.accept().await.expect("accept").0 });
+        let (manager, _events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest)).expect("manager");
+        let peer = manager.connect(address).await.expect("connect");
+        let server = accepted.await.expect("accept task");
+
+        let store = StoreHandle::memory();
+        let mut bans = PeerBanBook::new(Network::Regtest, 4).expect("bans");
+        let mut addresses = BoundedAddressBook::new(Network::Regtest, None, 4).expect("book");
+        assert!(addresses
+            .insert_discovered(
+                hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK),
+                now,
+                timestamp,
+            )
+            .accepted());
+        let mut reconnects = HashMap::from([(address, ReconnectState::new(now, false))]);
+        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
+
+        assert_eq!(
+            manager.penalize(peer, HSD_BAN_SCORE).await.expect("ban"),
+            100
+        );
+        maintain_peer_bans(
+            &store,
+            &manager,
+            &mut bans,
+            &mut addresses,
+            &mut reconnects,
+            &diagnostics,
+            true,
+        )
+        .await;
+
+        assert!(bans.is_banned(address.ip(), timestamp));
+        assert!(!addresses.entries.contains_key(&address));
+        assert!(!reconnects.contains_key(&address));
+        let state = diagnostics.read().await.clone();
+        assert_eq!(state.ban_events, 1);
+        assert_eq!(state.ban_list_flushes, 1);
+        assert_eq!(state.banned_addresses, 1);
+        assert!(!state.ban_list_dirty);
+        let restored = load_peer_bans(&store, Network::Regtest, 4, unix_time()).expect("restore");
+        assert_eq!((restored.loaded, restored.pruned), (1, 0));
+        assert!(restored.book.is_banned(address.ip(), unix_time()));
+
+        drop(server);
+        manager.disconnect_all().await;
     }
 
     #[test]

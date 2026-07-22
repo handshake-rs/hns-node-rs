@@ -147,6 +147,10 @@ Current evidence includes:
 - versioned, checksummed, network-bound address-book codecs, HSD stale-entry
   pruning, restored attempt/cooldown rotation, no-op clean flushes, compacted
   generations, and exact RocksDB close/reopen retention;
+- HSD score-100 threshold crossing without subthreshold persistence, normalized
+  IP-wide disconnect, outbound and inbound pre-handshake rejection, exact
+  24-hour duration/expiry, discovery and relay filtering, bounded eviction,
+  checksummed/network-bound ban codecs, and exact RocksDB close/reopen retention;
 - a seed-only optimized mainnet replay with no explicit sockets: 20 DNS
   endpoints, eight Ready peers after three failed-target rotations, 287 unique
   learned addresses, active/stored progress from 7,232 to 7,416, and exact
@@ -241,6 +245,9 @@ Tests and fault harnesses should cover:
 - handshake, idle, ping, pong, request, and reconnect timeouts;
 - corrupt/network-mismatched address-book rejection, HSD stale pruning, and
   attempt/success metadata retention across RocksDB reopen;
+- corrupt/network-mismatched ban-list rejection, bounded eviction, exact HSD
+  expiry boundaries, IP-wide admission races, and restart enforcement before
+  socket or VERSION work;
 - priority-lane isolation and queue saturation;
 - late-invalid header batches with full current-batch rollback;
 - known and unknown header/body ordering;

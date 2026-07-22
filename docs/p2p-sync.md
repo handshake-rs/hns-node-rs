@@ -109,8 +109,19 @@ an outbound connection that reaches the node's own listener observes the same
 nonce and fails the VERSION self-connection check. Peer limits are checked both
 before a connection attempt and under the registration lock after connection.
 
-A score of 100 disconnects the peer. The current score is process-local; durable
-bans and a persistent peer database are future work.
+Misbehavior score is connection-local, matching HSD. Crossing score 100 creates
+a 24-hour ban for the normalized IP address, disconnects every live session
+from that IP, and rejects both outbound sockets and inbound registration before
+the VERSION handshake. An explicit `--connect` target does not bypass a ban.
+The HSD expiry boundary is preserved: the address remains banned while the
+current Unix second is equal to `ban_until` and becomes eligible after it.
+
+With `--data-dir`, the bounded 16,384-entry IP ban list is written immediately,
+retried with the peer-state flush cadence after a storage failure, compacted as
+entries expire, and flushed again at shutdown. Its record is checksummed,
+versioned, and network-bound. Corrupt record bytes are reported and replaced;
+a store read failure aborts startup. Subthreshold scores deliberately remain
+connection-local rather than becoming invented long-lived reputation.
 
 ## Queue and resource bounds
 
@@ -399,6 +410,10 @@ listener, and normalizes missing or future timestamps with HSD's five-day
 fallback. Explicit `--connect` addresses are protected reconnect targets.
 Discovered targets fill only unused outbound slots and rotate after three
 consecutive connection failures; they cannot displace explicit targets.
+Active bans exclude every port on the IP from ADDR admission, selection, socket
+attempts, and GETADDR replies. Learned endpoints for a newly banned IP are
+removed; explicit endpoints remain configured but dormant until expiry and do
+not consume a discovery slot while banned.
 Ready protocol-v3-or-newer outbound peers receive one `GETADDR`. A peer's first
 inbound `GETADDR` is answered with at most HSRD's 1,000-address wire bound;
 outbound or repeated requests are ignored, matching HSD's anti-scraping rule.
@@ -424,17 +439,18 @@ reported and replaced from fresh discovery; a store read failure aborts
 startup. Without `--data-dir`, discovery remains deliberately process-local and
 performs no meaningless memory-store flushes.
 
-The API reports persistence availability, loaded and pruned counts, generation,
-dirty/flush state and errors, known/received/accepted/rejected/served addresses,
-resolved DNS addresses, DNS failures, and discovered connection failures. Peer
-scores and bans remain process-local.
+The API reports address- and ban-persistence availability, loaded, pruned, and
+expired counts, generations, dirty/flush state and errors, active banned IPs,
+ban events, known/received/accepted/rejected/served addresses, resolved DNS
+addresses, DNS failures, and discovered connection failures. Connection-local
+subthreshold scores are not persisted.
 
 ## Known limitations
 
 The shadow-sync runtime does not yet provide:
 
 - Brontide transport;
-- durable peer scoring or bans;
+- long-lived subthreshold peer reputation and address-group diversity;
 - transaction and mempool relay;
 - compact-block reconstruction;
 - historical mainnet block-body and active-state replay qualification;

@@ -171,8 +171,9 @@ reserved low-latency paths.
 4. **Active-state IBD** — qualify the implemented bounded connector through full
    mainnet replay, pruning, sustained reorganizations, and live state/root
    comparison without changing the authority boundary.
-5. **Network hardening** — Brontide, durable bans/reputation, peer diversity,
-   compact blocks, and adversarial WAN tests.
+5. **Network hardening** — extend the implemented durable HSD threshold bans
+   with Brontide, long-lived subthreshold reputation, peer/address-group
+   diversity, compact blocks, and adversarial WAN tests.
 6. **Mempool admission closure** — compose complete active-chain views,
    scripts/deployments/claims/name context, disconnected-transaction
    re-admission, policy replacement, and differential corpora.

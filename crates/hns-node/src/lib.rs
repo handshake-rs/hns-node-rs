@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod mining_engine;
+mod peer_bans;
 mod shadow_sync;
 
 pub use mining_engine::{

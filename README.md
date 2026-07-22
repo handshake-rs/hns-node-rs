@@ -244,10 +244,12 @@ Implemented:
   maintenance so a ping tick cannot desynchronize a large block payload.
 - Bounded critical, control, and normal outbound queues.
 - A bounded peer manager with connection limits, duplicate-address rejection,
-  process-local scoring, disconnect thresholds, snapshots, and exponential
-  outbound reconnect backoff.
-- Opt-in HSD DNS-seed bootstrap and GETADDR/ADDR learning through a bounded
-  in-memory address book. Discovery accepts only keyless, network-service,
+  connection-local scoring, HSD's score-100/24-hour normalized-IP ban policy,
+  pre-handshake inbound/outbound enforcement, snapshots, and exponential
+  outbound reconnect backoff. Ban records are restart-durable when a data
+  directory is configured.
+- Opt-in HSD DNS-seed bootstrap and GETADDR/ADDR learning through a bounded,
+  restart-durable address book. Discovery accepts only keyless, network-service,
   routable addresses with HSD-normalized timestamps; repeatedly failing
   discovered targets rotate without displacing explicit reconnect peers.
 - Headers-first synchronization with 2,000-header atomic protocol batches and an
@@ -302,8 +304,8 @@ Implemented:
 
 Still release-blocking:
 
-- Brontide transport, durable address-manager state, durable bans, and
-  long-lived peer reputation;
+- Brontide transport, long-lived subthreshold peer reputation, address-group
+  diversity, and broader adversarial network qualification;
 - contextually complete transaction admission and compact-block reconstruction;
 - production qualification of contextual active-state IBD across full mainnet
   replay and sustained reorganizations;

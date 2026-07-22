@@ -105,8 +105,8 @@ The following remain untrusted and release-blocking:
   mid-commit process-crash/fault injection;
 - full-mainnet active-state IBD, pruning, and sustained
   alternate-chain/reorganization qualification;
-- Brontide, durable peer reputation/bans, compact blocks, and
-  production-complete contextual transaction relay;
+- Brontide, long-lived subthreshold peer reputation, address-group diversity,
+  compact blocks, and production-complete contextual transaction relay;
 - disconnected-transaction re-admission, production template qualification,
   continuously supervised publication retry, and measured publication latency;
 - complete mainnet replay, invalid corpus, and sustained live HSD shadow
@@ -150,8 +150,11 @@ an authoritative durable tip.
   after stateless validation and within count/byte bounds.
 - Discovered peer addresses and their attempt/success history use a bounded,
   checksummed, network-bound cache; it is selection input, never consensus
-  input. Peer scores/bans, live reconnect timers, inflight requests, and orphan
-  bodies remain process-local and are not trusted after restart.
+  input. Score 100 creates a bounded, checksummed, network-bound 24-hour IP-ban
+  record and is enforced before inbound or outbound handshake work; neither
+  addresses nor bans can authorize chain state. Subthreshold connection scores,
+  live reconnect timers, inflight requests, and orphan bodies remain
+  process-local and are not trusted after restart.
 - The synchronization checkpoint is checksummed and reconciled with durable
   chain/body state rather than trusted as consensus.
 - A block `notfound` is accepted only from its assigned request peer and is

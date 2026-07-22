@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
@@ -35,6 +35,8 @@ pub struct LivePeerConfig {
     pub event_capacity: usize,
     pub connect_timeout: Duration,
     pub critical_broadcast_timeout: Duration,
+    pub ban_score: u32,
+    pub ban_time: Duration,
     pub protocol_version: u32,
     pub services: u64,
     pub user_agent: String,
@@ -51,6 +53,8 @@ impl LivePeerConfig {
             event_capacity: 1_024,
             connect_timeout: Duration::from_secs(10),
             critical_broadcast_timeout: Duration::from_millis(250),
+            ban_score: 100,
+            ban_time: Duration::from_secs(24 * 60 * 60),
             protocol_version: PROTOCOL_VERSION,
             services: SERVICE_NETWORK,
             user_agent: DEFAULT_USER_AGENT.to_owned(),
@@ -75,6 +79,16 @@ impl LivePeerConfig {
                 "connect and critical broadcast timeouts must be non-zero".to_owned(),
             ));
         }
+        if self.ban_time.as_secs() == 0 {
+            return Err(P2pError::Configuration(
+                "peer ban time must be at least one second".to_owned(),
+            ));
+        }
+        if self.ban_score == 0 || self.ban_score > i32::MAX as u32 {
+            return Err(P2pError::Configuration(
+                "peer ban score must be within 1..=i32::MAX".to_owned(),
+            ));
+        }
         if self.user_agent.len() > u8::MAX as usize || !self.user_agent.is_ascii() {
             return Err(P2pError::Configuration(
                 "user agent must be ASCII and fit in one byte".to_owned(),
@@ -93,6 +107,14 @@ pub struct BroadcastReport {
     pub failed: Vec<(PeerId, String)>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeerBan {
+    pub address: IpAddr,
+    pub banned_at: u64,
+    pub ban_until: u64,
+    pub score: i32,
+}
+
 #[derive(Clone, Debug)]
 pub struct LivePeerManager {
     config: LivePeerConfig,
@@ -102,6 +124,8 @@ pub struct LivePeerManager {
     local_height: Arc<AtomicU32>,
     local_nonce: [u8; 8],
     registration_lock: Arc<Mutex<()>>,
+    banned: Arc<RwLock<HashMap<IpAddr, u64>>>,
+    pending_bans: Arc<Mutex<Vec<PeerBan>>>,
 }
 
 impl LivePeerManager {
@@ -124,6 +148,8 @@ impl LivePeerManager {
                 // observe its own nonce and fail the VERSION handshake.
                 local_nonce: seed.rotate_left(23).to_le_bytes(),
                 registration_lock: Arc::new(Mutex::new(())),
+                banned: Arc::new(RwLock::new(HashMap::new())),
+                pending_bans: Arc::new(Mutex::new(Vec::new())),
             },
             receiver,
         ))
@@ -135,6 +161,37 @@ impl LivePeerManager {
 
     pub fn set_local_height(&self, height: u32) {
         self.local_height.store(height, Ordering::Release);
+    }
+
+    pub async fn replace_bans(&self, bans: Vec<(IpAddr, u64)>) {
+        let _registration = self.registration_lock.lock().await;
+        let now = unix_time();
+        let mut state = self.banned.write().await;
+        state.clear();
+        state.extend(bans.into_iter().filter_map(|(address, ban_until)| {
+            (now <= ban_until).then_some((normalize_peer_ip(address), ban_until))
+        }));
+        let active = state.keys().copied().collect::<Vec<_>>();
+        drop(state);
+        self.disconnect_ips(&active).await;
+    }
+
+    pub async fn is_banned(&self, address: IpAddr) -> bool {
+        let address = normalize_peer_ip(address);
+        let now = unix_time();
+        let mut banned = self.banned.write().await;
+        let Some(ban_until) = banned.get(&address).copied() else {
+            return false;
+        };
+        if now > ban_until {
+            banned.remove(&address);
+            return false;
+        }
+        true
+    }
+
+    pub async fn take_pending_bans(&self) -> Vec<PeerBan> {
+        std::mem::take(&mut *self.pending_bans.lock().await)
     }
 
     pub async fn connect(&self, address: SocketAddr) -> Result<PeerId, P2pError> {
@@ -337,8 +394,49 @@ impl LivePeerManager {
             .ok_or(P2pError::PeerUnavailable(peer))?;
         let delta = i32::try_from(score).unwrap_or(i32::MAX);
         let mut snapshot = handle.snapshot.write().await;
+        let previous = snapshot.score;
         snapshot.score = snapshot.score.saturating_add(delta);
-        Ok(snapshot.score)
+        let total = snapshot.score;
+        let address = normalize_peer_ip(snapshot.address.ip());
+        drop(snapshot);
+
+        let threshold = i32::try_from(self.config.ban_score).unwrap_or(i32::MAX);
+        if previous < threshold && total >= threshold {
+            // Serialize installation with final stream registration. A racing
+            // stream is therefore either rejected by `ensure_capacity` or is
+            // present when the IP-wide disconnect snapshot is taken.
+            let _registration = self.registration_lock.lock().await;
+            let banned_at = unix_time();
+            let ban_until = banned_at.saturating_add(self.config.ban_time.as_secs());
+            self.banned.write().await.insert(address, ban_until);
+            self.pending_bans.lock().await.push(PeerBan {
+                address,
+                banned_at,
+                ban_until,
+                score: total,
+            });
+            self.disconnect_ips(&[address]).await;
+        }
+        Ok(total)
+    }
+
+    async fn disconnect_ips(&self, addresses: &[IpAddr]) {
+        if addresses.is_empty() {
+            return;
+        }
+        let handles = self
+            .peers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let address = normalize_peer_ip(handle.snapshot().await.address.ip());
+            if addresses.contains(&address) {
+                handle.disconnect();
+            }
+        }
     }
 
     pub async fn disconnect(&self, peer: PeerId) -> Result<(), P2pError> {
@@ -371,6 +469,19 @@ impl LivePeerManager {
         direction: PeerDirection,
         address: SocketAddr,
     ) -> Result<(), P2pError> {
+        let ip = normalize_peer_ip(address.ip());
+        let now = unix_time();
+        let mut banned = self.banned.write().await;
+        if let Some(ban_until) = banned.get(&ip).copied() {
+            if now <= ban_until {
+                return Err(P2pError::BannedAddress {
+                    address: ip,
+                    ban_until,
+                });
+            }
+            banned.remove(&ip);
+        }
+        drop(banned);
         let snapshots = self.snapshots().await;
         if snapshots.iter().any(|peer| peer.address == address) {
             return Err(P2pError::DuplicatePeer(address));
@@ -445,6 +556,15 @@ impl LivePeerManager {
                 .await;
         });
         Ok(id)
+    }
+}
+
+pub fn normalize_peer_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        address => address,
     }
 }
 
@@ -531,12 +651,79 @@ mod tests {
         .await
         .expect("packet");
         assert_eq!(packet, Packet::GetAddr);
+
+        assert_eq!(
+            client_manager
+                .penalize(client_peer, 99)
+                .await
+                .expect("score"),
+            99
+        );
+        assert!(client_manager.take_pending_bans().await.is_empty());
+        assert!(!client_manager.is_banned(address.ip()).await);
+        assert_eq!(
+            client_manager.penalize(client_peer, 1).await.expect("ban"),
+            100
+        );
+        let pending = client_manager.take_pending_bans().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].address, address.ip());
+        assert_eq!(pending[0].score, 100);
+        assert_eq!(
+            pending[0].ban_until.saturating_sub(pending[0].banned_at),
+            24 * 60 * 60
+        );
+        assert!(client_manager.is_banned(address.ip()).await);
+        let error = client_manager
+            .connect(address)
+            .await
+            .expect_err("ban must reject before socket work");
+        assert!(matches!(error, P2pError::BannedAddress { .. }));
         client_manager.disconnect_all().await;
         server_manager.disconnect_all().await;
     }
 
     #[tokio::test]
+    async fn ban_admission_is_ip_wide_for_inbound_and_expires() {
+        let config = LivePeerConfig::for_network(Network::Regtest);
+        let (manager, _events) = LivePeerManager::new(config).expect("manager");
+        let address: IpAddr = "127.0.0.1".parse().expect("IP");
+        manager
+            .replace_bans(vec![(address, unix_time().saturating_add(60))])
+            .await;
+
+        let outbound = manager
+            .connect("127.0.0.1:1".parse().expect("outbound"))
+            .await
+            .expect_err("outbound ban");
+        assert!(matches!(outbound, P2pError::BannedAddress { .. }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener_address = listener.local_addr().expect("listener address");
+        let client = TcpStream::connect(listener_address).await.expect("connect");
+        let (server, peer_address) = listener.accept().await.expect("accept");
+        let inbound = manager
+            .accept_stream(server, peer_address)
+            .await
+            .expect_err("inbound ban");
+        assert!(matches!(inbound, P2pError::BannedAddress { .. }));
+        drop(client);
+
+        manager
+            .replace_bans(vec![(address, unix_time().saturating_sub(1))])
+            .await;
+        assert!(!manager.is_banned(address).await);
+    }
+
+    #[tokio::test]
     async fn peer_limits_fail_closed() {
+        let mut invalid_ban_time = LivePeerConfig::for_network(Network::Regtest);
+        invalid_ban_time.ban_time = Duration::from_nanos(1);
+        assert!(matches!(
+            LivePeerManager::new(invalid_ban_time),
+            Err(P2pError::Configuration(_))
+        ));
+
         let mut config = LivePeerConfig::for_network(Network::Regtest);
         config.maximum_outbound = 0;
         config.maximum_inbound = 1;

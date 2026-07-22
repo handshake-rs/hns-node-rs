@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
 };
 
@@ -18,7 +18,7 @@ pub mod wire;
 
 pub use constants::*;
 pub use handshake::{HandshakeUpdate, PeerDirection, PeerHandshake, PeerState};
-pub use manager::{BroadcastReport, LivePeerConfig, LivePeerManager};
+pub use manager::{normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, PeerBan};
 pub use runtime::{
     OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot,
 };
@@ -127,6 +127,8 @@ pub enum P2pError {
     Disconnected(String),
     #[error("peer address {0} is already registered")]
     DuplicatePeer(SocketAddr),
+    #[error("peer IP {address} is banned until {ban_until}")]
+    BannedAddress { address: IpAddr, ban_until: u64 },
     #[error("peer event channel is closed")]
     EventChannelClosed,
     #[error("{context} limit exceeded: limit {limit}, actual {actual}")]

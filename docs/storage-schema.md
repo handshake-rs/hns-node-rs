@@ -152,10 +152,16 @@ cannot promote a block or grant authority.
   selection sequence. Explicit operator peers are configuration, not cache
   data. The cache is refreshed every 120 seconds and at clean runtime shutdown;
   invalid records are discarded and replaced without becoming consensus input.
+  `ban-list/v1` separately stores at most 16,384 normalized IP bans with their
+  creation, expiry, and stable sequence metadata. It is persisted immediately
+  when score 100 is crossed, compacted on HSD-style expiry, retried on the same
+  120-second cadence, and flushed at shutdown. The record has independent
+  version, checksum, generation, and network binding; earliest-expiring bans
+  are evicted first if the hard bound is reached.
 - `orphans`, `mempool_persist`: reserved operational records as those
-  subsystems mature. Live peer scores/bans, socket reconnect timers, inflight
-  requests, orphan bodies, and the mining-engine mempool/template cache remain
-  process-local and bounded in memory.
+  subsystems mature. Subthreshold per-connection peer scores, socket reconnect
+  timers, inflight requests, orphan bodies, and the mining-engine
+  mempool/template cache remain process-local and bounded in memory.
 
 Null name states are represented by absence. Persisting a null state is treated
 as corruption by the correctness-first root rebuild.
@@ -267,9 +273,11 @@ The shadow-sync checkpoint records:
 - target peer height;
 - update time.
 
-It does not persist in-memory validation jobs, peer scores, inflight requests,
-or orphan bodies. A `Validating` checkpoint resumes as block download, and the
-contiguous stored-body tip is recomputed from canonical durable data.
+It does not persist in-memory validation jobs, subthreshold peer scores,
+inflight requests, or orphan bodies. Peer bans are an independent operational
+record rather than checkpoint authority. A `Validating` checkpoint resumes as
+block download, and the contiguous stored-body tip is recomputed from canonical
+durable data.
 
 ## Fixture integrity
 
