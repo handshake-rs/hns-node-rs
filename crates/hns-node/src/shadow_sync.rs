@@ -21,7 +21,7 @@ use hns_consensus::{
     validate_transaction_start, ConsensusParams, DeploymentState, HeaderConsensus, HeaderParent,
     HeaderValidationContext, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
 };
-use hns_mempool::{Admission, AirdropAdmission};
+use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
 use hns_p2p::{
     normalize_peer_ip, peer_address_group, CompactBlock, CompactBlockError,
     CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse, Inventory,
@@ -346,6 +346,9 @@ pub struct ShadowSyncDiagnostics {
     pub received_transactions: u64,
     pub served_transactions: u64,
     pub rejected_transactions: u64,
+    pub received_claims: u64,
+    pub served_claims: u64,
+    pub rejected_claims: u64,
     pub received_airdrops: u64,
     pub served_airdrops: u64,
     pub rejected_airdrops: u64,
@@ -2812,7 +2815,7 @@ async fn handle_peer_event(
                 for item in items {
                     if matches!(
                         item.kind,
-                        InventoryKind::Transaction | InventoryKind::Airdrop
+                        InventoryKind::Transaction | InventoryKind::Claim | InventoryKind::Airdrop
                     ) {
                         if relay_seen.len() >= MAX_GETDATA_ITEMS || !relay_seen.insert(item.clone())
                         {
@@ -2829,6 +2832,9 @@ async fn handle_peer_event(
                                     InventoryKind::Transaction => node
                                         .mining_engine_mempool_transaction(&Txid::new(item.hash))
                                         .is_none(),
+                                    InventoryKind::Claim => {
+                                        node.mining_engine_mempool_claim(&item.hash).is_none()
+                                    }
                                     InventoryKind::Airdrop => {
                                         node.mining_engine_mempool_airdrop(&item.hash).is_none()
                                     }
@@ -2987,6 +2993,37 @@ async fn handle_peer_event(
                                     update_diagnostics(diagnostics, |state| {
                                         state.served_transactions =
                                             state.served_transactions.saturating_add(1);
+                                    })
+                                    .await;
+                                }
+                                None => not_found.push(item),
+                            }
+                        }
+                        InventoryKind::Claim => {
+                            let claim = {
+                                let node = node.lock().await;
+                                if node.config.mining_engine.enabled
+                                    && node.config.mining_engine.transaction_relay
+                                {
+                                    node.mining_engine_mempool_claim(&item.hash)
+                                } else {
+                                    None
+                                }
+                            };
+                            match claim {
+                                Some(claim) => {
+                                    peers
+                                        .try_send(
+                                            peer,
+                                            Arc::new(Packet::Claim(claim)),
+                                            OutboundPriority::Normal,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            anyhow::anyhow!("failed to serve claim: {error}")
+                                        })?;
+                                    update_diagnostics(diagnostics, |state| {
+                                        state.served_claims = state.served_claims.saturating_add(1);
                                     })
                                     .await;
                                 }
@@ -3196,6 +3233,36 @@ async fn handle_peer_event(
                     }
                     Admission::Orphan(txid) => {
                         tracing::debug!(?peer, txid = %txid.to_hex(), "peer transaction retained as orphan");
+                    }
+                }
+            }
+            Packet::Claim(claim) => {
+                update_diagnostics(diagnostics, |state| {
+                    state.received_claims = state.received_claims.saturating_add(1);
+                })
+                .await;
+                let admission = {
+                    let mut node = node.lock().await;
+                    node.mining_engine_accept_peer_claim(claim)?
+                };
+                match admission {
+                    ClaimAdmission::Accepted(hash) => {
+                        let report = peers
+                            .broadcast(
+                                Arc::new(Packet::Inv(vec![Inventory::claim(hash)])),
+                                OutboundPriority::Normal,
+                            )
+                            .await;
+                        if report.failed.len() == report.attempted && report.attempted > 0 {
+                            tracing::debug!(?peer, "claim inventory relay reached no peer queue");
+                        }
+                    }
+                    ClaimAdmission::Rejected { reason } => {
+                        update_diagnostics(diagnostics, |state| {
+                            state.rejected_claims = state.rejected_claims.saturating_add(1);
+                        })
+                        .await;
+                        tracing::debug!(?peer, %reason, "peer claim rejected");
                     }
                 }
             }

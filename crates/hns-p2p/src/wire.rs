@@ -5,7 +5,8 @@ use std::{
 
 use hns_consensus::Network;
 use hns_primitives::{
-    blake2b_256_many, AirdropProof, Block, BlockHash, Header, Reader, Transaction, Txid, Writer,
+    blake2b_256_many, AirdropProof, Block, BlockHash, Claim, Header, Reader, Transaction, Txid,
+    Writer,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1105,6 +1106,7 @@ pub enum Packet {
     SendHeaders,
     Block(Block),
     Tx(Transaction),
+    Claim(Claim),
     Airdrop(AirdropProof),
     Reject(RejectPacket),
     Mempool,
@@ -1140,6 +1142,7 @@ impl Packet {
             Self::SendHeaders => PacketType::SendHeaders,
             Self::Block(_) => PacketType::Block,
             Self::Tx(_) => PacketType::Tx,
+            Self::Claim(_) => PacketType::Claim,
             Self::Airdrop(_) => PacketType::Airdrop,
             Self::Reject(_) => PacketType::Reject,
             Self::Mempool => PacketType::Mempool,
@@ -1201,6 +1204,11 @@ impl Packet {
             }
             Self::Block(block) => writer.write_bytes(&block.encode()),
             Self::Tx(transaction) => writer.write_bytes(&transaction.encode()),
+            Self::Claim(claim) => writer.write_bytes(
+                &claim
+                    .encode()
+                    .map_err(|error| P2pError::MalformedPacket(error.to_string()))?,
+            ),
             Self::Airdrop(proof) => writer.write_bytes(
                 &proof
                     .encode()
@@ -1331,6 +1339,11 @@ impl Packet {
                     .map(Self::Tx)
                     .map_err(|error| P2pError::MalformedPacket(error.to_string()));
             }
+            PacketType::Claim => {
+                return Claim::decode(payload)
+                    .map(Self::Claim)
+                    .map_err(|error| P2pError::MalformedPacket(error.to_string()));
+            }
             PacketType::Airdrop => {
                 return AirdropProof::decode(payload)
                     .map(Self::Airdrop)
@@ -1371,7 +1384,6 @@ impl Packet {
             | PacketType::MerkleBlock
             | PacketType::GetProof
             | PacketType::Proof
-            | PacketType::Claim
             | PacketType::Unknown(_) => {
                 return Ok(Self::Unknown {
                     packet_type,
@@ -2001,6 +2013,19 @@ mod tests {
                 let raw = decode_hex(fixture["faucet"]["raw"].as_str().expect("faucet raw"));
                 Packet::Airdrop(AirdropProof::decode(&raw).expect("faucet proof"))
             }
+            "claim-main" => {
+                let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../fixtures/hsd/claims/mainnet-history-v1.json"
+                ))
+                .expect("claim fixture");
+                Packet::Claim(Claim {
+                    blob: decode_hex(
+                        fixture["block"]["claims"][0]["proofRaw"]
+                            .as_str()
+                            .expect("claim proof"),
+                    ),
+                })
+            }
             other => panic!("unhandled oracle packet {other}"),
         }
     }
@@ -2036,6 +2061,41 @@ mod tests {
         let mut trailing = raw;
         trailing.push(0);
         assert!(Packet::decode(PacketType::Airdrop, &trailing).is_err());
+    }
+
+    #[test]
+    fn claim_packet_uses_the_exact_hsd_envelope_payload() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-history-v1.json"
+        ))
+        .expect("claim fixture");
+        let claim = Claim {
+            blob: decode_hex(
+                fixture["block"]["claims"][0]["proofRaw"]
+                    .as_str()
+                    .expect("claim proof"),
+            ),
+        };
+        let payload = claim.encode().expect("claim payload");
+        assert_eq!(
+            Packet::Claim(claim.clone()).packet_type(),
+            PacketType::Claim
+        );
+        assert_eq!(
+            Packet::Claim(claim.clone())
+                .encode_payload()
+                .expect("claim payload"),
+            payload
+        );
+        assert_eq!(
+            Packet::decode(PacketType::Claim, &payload).expect("claim packet"),
+            Packet::Claim(claim.clone())
+        );
+        assert_eq!(Inventory::claim(claim.hash()).kind, InventoryKind::Claim);
+
+        let mut trailing = payload;
+        trailing.push(0);
+        assert!(Packet::decode(PacketType::Claim, &trailing).is_err());
     }
 
     #[test]
@@ -2081,7 +2141,7 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../fixtures/hsd/p2p/wire-v1.json"))
                 .expect("hsrd p2p wire fixture");
-        assert_eq!(fixture["schema"], 2);
+        assert_eq!(fixture["schema"], 3);
         for case in fixture["frames"].as_array().expect("frame cases") {
             let id = case["id"].as_str().expect("frame id");
             let network = oracle_network(case["network"].as_str().expect("network"));

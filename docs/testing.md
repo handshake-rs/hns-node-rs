@@ -81,14 +81,17 @@ Current evidence includes:
   revalidation, duplicate rejection, inventory/GETDATA access, connected
   removal, disconnected-coinbase readmission, and a byte-identical HSD
   fee-bearing airdrop coinbase;
-- HSD Claim envelope encoding and blob-only hashes, strict length/trailing
-  failures, checksummed ownership TXT payloads for every network prefix, all
+- an exact typed HSD CLAIM frame, envelope encoding and blob-only hashes,
+  strict length/trailing failures, checksummed ownership TXT payloads for every
+  network prefix, all
   four upstream signed DNSKEY/DS/TXT/RRSIG proofs, their exact codec/sanity/
   window/weak outputs, SHA-256 and legacy GOST94 historical-anchor results,
   and direct GOST94 boundary/multiblock vectors;
 - checkpoint-linked canonical mainnet block 62,517 with two real DNSSEC claim
   witnesses, full raw body metrics, exact parent-header-time context, native
-  proof mutation/hardening rejection, and claim coinbase connect/disconnect;
+  proof mutation/hardening rejection, native contextual mempool admission,
+  hash/name inventory, connected removal, disconnected-coinbase readmission,
+  and a byte-identical HSD fee-bearing claim coinbase;
 - checkpoint-linked mainnet replacement history spanning seven predecessor
   blocks at heights 39,086-39,101 and the ten-claim replacement block 76,722,
   with exact value preservation, commit advancement, native state replay, and
@@ -192,8 +195,9 @@ Current evidence includes:
   header-derived deployment/script-policy comparison, divergence,
   restart/reorganization counters, hash normalization, and checksummed evidence
   chaining;
-- HSD subsidy boundaries, deterministic ordinary coinbase bytes, and schema-v6
-  airdrop entry size/rate/weight plus special coinbase bytes.
+- HSD subsidy boundaries, deterministic ordinary coinbase bytes, and schema-v7
+  airdrop/claim entry size, rate, memory and weight policy plus exact special
+  coinbase bytes.
 
 ## Native secp256k1 smoke gate
 
@@ -290,6 +294,9 @@ Tests and fault harnesses should cover:
   rejection, and sigop-adjusted minimum-fee accounting;
 - one-generation advancement for a block reconciliation and conservative
   clearing on disconnect/reorganization;
+- native claim proof/time/deployment/state admission, shared ordinary-name
+  exclusion, fee-rate eviction after ordinary roots, and connected/disconnected
+  claim reconciliation;
 - deterministic package ranking by HSD sigop-adjusted policy size while actual
   HNS weight independently controls block fit, plus sigops, OPEN, UPDATE,
   RENEW, transaction-count, and exclusive-name limits;

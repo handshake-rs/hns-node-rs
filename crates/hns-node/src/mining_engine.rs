@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use hns_chain::{read_canonical_hash, BlockIndexRecord};
 use hns_consensus::{
     compute_block_version_from_state, ConsensusError, NameFlags, NativeSignatureVerifier, Network,
-    ScriptFlags, SequenceLockView, WitnessProgramVerifier, MEDIAN_TIMESPAN,
+    ScriptFlags, SequenceLockView, VerifiedClaim, WitnessProgramVerifier, MEDIAN_TIMESPAN,
 };
 use hns_mempool::{
-    AirdropAdmission, AirdropMempoolContext, AirdropMempoolView, ContextualTransactionVerifier,
+    AirdropAdmission, AirdropMempoolContext, AirdropMempoolView, ClaimAdmission,
+    ClaimContextValidation, ClaimMempoolContext, ClaimMempoolView, ContextualTransactionVerifier,
     Mempool, MempoolContext, MempoolInfo, MempoolLimits, MempoolView, HSD_MINIMUM_RELAY_FEE_RATE,
 };
 use hns_mining::{
@@ -19,9 +20,12 @@ use hns_mining::{
     PUBLICATION_KEY_PREFIX,
 };
 use hns_p2p::{BroadcastReport, LivePeerManager, Packet};
-use hns_primitives::{Address, AirdropProof, BlockHash, Coin, Height, Outpoint, Transaction};
+use hns_primitives::{
+    Address, AirdropProof, BlockHash, Claim, Coin, Height, Outpoint, Output, Transaction,
+};
 use hns_state::{
-    airdrop_position_spent, decode_coin, encode_outpoint_key, verify_mempool_name_context,
+    airdrop_position_spent, decode_coin, encode_outpoint_key, verify_mempool_claim_context,
+    verify_mempool_name_context,
 };
 use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
 use serde::{Deserialize, Serialize};
@@ -105,6 +109,34 @@ impl<T: ReadSnapshot> AirdropMempoolView for ActiveMempoolView<'_, T> {
     fn airdrop_position_spent(&self, position: u32) -> Result<bool, ConsensusError> {
         airdrop_position_spent(self.snapshot, position)
             .map_err(|error| ConsensusError::View(error.to_string()))
+    }
+}
+
+impl<T: ReadSnapshot> ClaimMempoolView for ActiveMempoolView<'_, T> {
+    fn verify_claim_context(
+        &self,
+        output: &Output,
+        claim: &VerifiedClaim,
+        context: &ClaimMempoolContext,
+    ) -> Result<ClaimContextValidation, ConsensusError> {
+        match verify_mempool_claim_context(
+            self.snapshot,
+            output,
+            claim,
+            context.next_height,
+            context.network,
+            if context.hardening {
+                NameFlags::HARDENED
+            } else {
+                NameFlags::from_bits(0)
+            },
+        ) {
+            Ok(()) => Ok(ClaimContextValidation::Valid),
+            Err(error) if error.is_consensus_invalid() => Ok(ClaimContextValidation::Rejected {
+                reason: "invalid-covenant".to_owned(),
+            }),
+            Err(error) => Err(ConsensusError::View(error.to_string())),
+        }
     }
 }
 
@@ -201,6 +233,38 @@ fn active_airdrop_parameters<T: ReadSnapshot>(
         airstop: deployments.has_airstop,
         hardening: deployments.name_flags.contains(NameFlags::HARDENED),
         goosig_disabled: next_height >= network.params().goosig_stop,
+    }))
+}
+
+fn active_claim_parameters<T: ReadSnapshot>(
+    state: &super::NodeState,
+    network: Network,
+    snapshot: &T,
+) -> Result<Option<ClaimMempoolContext>> {
+    let Some(tip) = super::best_block_tip_from_snapshot(snapshot)? else {
+        return Ok(None);
+    };
+    let next_height = tip
+        .height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("active-chain height exhausted"))?;
+    let tip_record = super::load_header_record(snapshot, &tip.hash)?
+        .ok_or_else(|| anyhow::anyhow!("active tip {} has no header record", tip.hash.to_hex()))?;
+    if tip_record.hash != tip.hash || tip_record.height != tip.height {
+        anyhow::bail!(
+            "active tip header payload disagrees with {} at height {}",
+            tip.hash.to_hex(),
+            tip.height
+        );
+    }
+    let deployments = state.deployment_state_for_block(snapshot, next_height, tip.hash)?;
+    Ok(Some(ClaimMempoolContext {
+        next_height,
+        transaction_start: network.params().tx_start,
+        current_time: super::current_unix_time()?,
+        parent_time: tip_record.header.time,
+        network,
+        hardening: deployments.name_flags.contains(NameFlags::HARDENED),
     }))
 }
 
@@ -384,10 +448,6 @@ impl NodeService {
         if !can_publish {
             blockers.push("no mining-authority permit is available".to_owned());
         }
-        if self.config.mining_engine.transaction_relay {
-            blockers
-                .push("transaction relay does not yet admit or mine HSD DNSSEC claims".to_owned());
-        }
         blockers.sort();
         blockers.dedup();
         let cached_template_variants = self.mining_engine_template_cache().len();
@@ -538,6 +598,32 @@ impl NodeService {
                 name_flags,
             };
             let input_verifier = active_mempool_input_verifier()?;
+            let claim_context =
+                active_claim_parameters(&self.state, self.config.network, &snapshot)?.ok_or_else(
+                    || anyhow::anyhow!("connected chain has no claim mempool context"),
+                )?;
+            // Expire retained claims before rebuilding ordinary transactions so
+            // an invalid claim cannot keep blocking an otherwise valid name
+            // transaction during this transition.
+            let before_claim_revalidation = self.state.mempool.info();
+            let claims_revalidated = self
+                .state
+                .mempool
+                .revalidate_claims_with_context(&claim_context, &view, &self.claim_dnssec)
+                .map_err(|error| anyhow::anyhow!("claim revalidation failed: {error}"))?;
+            let after_claim_revalidation = self.state.mempool.info();
+            let claim_revalidation_removed = before_claim_revalidation
+                .transaction_count
+                .saturating_add(before_claim_revalidation.orphan_count)
+                .saturating_add(before_claim_revalidation.claim_count)
+                .saturating_add(before_claim_revalidation.airdrop_count)
+                .saturating_sub(
+                    after_claim_revalidation
+                        .transaction_count
+                        .saturating_add(after_claim_revalidation.orphan_count)
+                        .saturating_add(after_claim_revalidation.claim_count)
+                        .saturating_add(after_claim_revalidation.airdrop_count),
+                );
             let mut revalidation = self
                 .state
                 .mempool
@@ -550,6 +636,29 @@ impl NodeService {
                     &contextual_verifier,
                 )
                 .map_err(|error| anyhow::anyhow!("post-connect revalidation failed: {error}"))?;
+            if claims_revalidated {
+                revalidation.changed = true;
+                revalidation.removed = revalidation
+                    .removed
+                    .saturating_add(claim_revalidation_removed);
+                revalidation.retained_claims = self.state.mempool.info().claim_count;
+                revalidation.generation = self.state.mempool.info().generation;
+            }
+            if self
+                .state
+                .mempool
+                .reconcile_claims_with_context(
+                    disconnected_transactions,
+                    &claim_context,
+                    &view,
+                    &self.claim_dnssec,
+                )
+                .map_err(|error| anyhow::anyhow!("claim revalidation failed: {error}"))?
+            {
+                revalidation.changed = true;
+                revalidation.retained_claims = self.state.mempool.info().claim_count;
+                revalidation.generation = self.state.mempool.info().generation;
+            }
             let airdrop_context =
                 active_airdrop_parameters(&self.state, self.config.network, &snapshot)?
                     .ok_or_else(|| {
@@ -610,6 +719,11 @@ impl NodeService {
             .map(hns_p2p::Inventory::transaction)
             .chain(
                 snapshot
+                    .claims()
+                    .map(|entry| hns_p2p::Inventory::claim(entry.hash)),
+            )
+            .chain(
+                snapshot
                     .airdrops()
                     .map(|entry| hns_p2p::Inventory::airdrop(entry.hash)),
             )
@@ -622,6 +736,10 @@ impl NodeService {
         txid: &hns_primitives::Txid,
     ) -> Option<hns_primitives::Transaction> {
         self.state.mempool.transaction(txid).cloned()
+    }
+
+    pub fn mining_engine_mempool_claim(&self, hash: &[u8; 32]) -> Option<Claim> {
+        self.state.mempool.claim(hash).cloned()
     }
 
     pub fn mining_engine_mempool_airdrop(&self, hash: &[u8; 32]) -> Option<AirdropProof> {
@@ -693,6 +811,48 @@ impl NodeService {
                     .mempool_reconciled(durable.generation, mempool_generation)
                     .map_err(|error| {
                         anyhow::anyhow!("failed to publish mempool admission: {error}")
+                    })?;
+            }
+        }
+        Ok(admission)
+    }
+
+    /// Admit a peer DNSSEC ownership claim against the same immutable active
+    /// snapshot used by block connection, including canonical commit ancestry
+    /// and post-deflation replacement rules.
+    pub fn mining_engine_accept_peer_claim(&mut self, claim: Claim) -> Result<ClaimAdmission> {
+        if !self.config.mining_engine.enabled || !self.config.mining_engine.transaction_relay {
+            return Ok(ClaimAdmission::Rejected {
+                reason: "mining_engine-transaction-relay-disabled".to_owned(),
+            });
+        }
+        let snapshot = self
+            .state
+            .store
+            .snapshot()
+            .context("failed to open active claim mempool context")?;
+        let Some(context) = active_claim_parameters(&self.state, self.config.network, &snapshot)?
+        else {
+            return Ok(ClaimAdmission::Rejected {
+                reason: "active-chain-context-unavailable".to_owned(),
+            });
+        };
+        let view = ActiveMempoolView::new(&snapshot);
+        let admission = self
+            .state
+            .mempool
+            .submit_claim_with_context(claim, &context, &view, &self.claim_dnssec)
+            .map_err(|error| anyhow::anyhow!("peer claim admission failed: {error}"))?;
+        drop(snapshot);
+        if matches!(admission, ClaimAdmission::Accepted(_)) {
+            self.mining_engine_template_cache().clear();
+            let durable = self.state.durable_mining_state()?;
+            let mempool_generation = self.state.mempool.info().generation;
+            if durable.generation > 0 && mempool_generation > 0 {
+                self.mining_events
+                    .mempool_reconciled(durable.generation, mempool_generation)
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to publish claim mempool admission: {error}")
                     })?;
             }
         }

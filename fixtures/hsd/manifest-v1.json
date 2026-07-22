@@ -395,14 +395,17 @@
       "tags": [
         "p2p",
         "wire",
+        "claim",
+        "ownership",
+        "dnssec",
         "airdrop",
         "oracle"
       ],
-      "blake2b256": "18a4a459e1637ad6e894d6653046f4cbf0ac973c5185b99942110576c3965e72"
+      "blake2b256": "62ee994ba4567d9205c225f937a70a94fb3eacef7a51a333a2e71ce88867fea5"
     },
     {
       "id": "mining-template-v1",
-      "network": "regtest",
+      "network": "all",
       "kind": "mining-template",
       "path": "mining/template-v1.json",
       "expectation": {
@@ -423,11 +426,14 @@
         "descendant-package",
         "free-priority",
         "rate-limiting",
+        "claim",
+        "dnssec",
+        "claim-replacement",
         "airdrop",
         "special-coinbase",
         "oracle"
       ],
-      "blake2b256": "18fb7fa5eaf3e8888a4ef30efd52874c156717f38bfaa89a73b6641bc17b35a4"
+      "blake2b256": "259aa80f00d4590d1622fb367171e0a0799d75ba4427f1ebbd130e50c6884f2d"
     }
   ]
 }

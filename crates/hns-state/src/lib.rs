@@ -1533,6 +1533,51 @@ pub fn verify_mempool_name_context<T: ReadSnapshot>(
     )
 }
 
+/// Validate one authenticated DNSSEC claim against the immutable active-chain
+/// name state and canonical commit ancestry. This deliberately reuses the
+/// exact claim transition applied during block connection; the synthetic
+/// transaction is discarded after validation and never reaches storage.
+pub fn verify_mempool_claim_context<T: ReadSnapshot>(
+    snapshot: &T,
+    output: &hns_primitives::Output,
+    claim: &VerifiedClaim,
+    height: Height,
+    network: Network,
+    name_flags: NameFlags,
+) -> Result<(), StateError> {
+    let input_verifier = RejectUnverifiedInputs;
+    let issuance_verifier = RejectSpecialCoinbaseIssuance;
+    let services = StateServices {
+        network,
+        name_flags,
+        name_flags_valid: true,
+        historical_validation: HistoricalValidationPlan::full(),
+        input_verifier: &input_verifier,
+        issuance_verifier: &issuance_verifier,
+    };
+    let context = SnapshotChainContext::new(snapshot, height, HistoricalValidationPlan::full());
+    let transaction = Transaction {
+        version: 0,
+        inputs: Vec::new(),
+        outputs: vec![output.clone()],
+        locktime: height,
+    };
+    let claims = [CoinbaseClaim {
+        output_index: 0,
+        claim: claim.clone(),
+    }];
+    let mut changes = NameStateChanges::default();
+    apply_verified_claims(
+        snapshot,
+        &transaction,
+        height,
+        services,
+        &context,
+        &mut changes,
+        &claims,
+    )
+}
+
 fn apply_transaction_name_covenants<T: ReadSnapshot>(
     snapshot: &T,
     transaction: &Transaction,
@@ -5497,6 +5542,57 @@ mod tests {
                 .name_state(&name_hash)
                 .expect("restored name state read")
                 .is_none());
+        }
+    }
+
+    #[test]
+    fn mempool_claim_context_reuses_exact_mainnet_state_transition() {
+        let fixture: MainnetClaimHistoryFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-history-v1.json"
+        ))
+        .expect("mainnet claim history fixture");
+        let historical = Block::decode(&decode_fixture_bytes(&fixture.block.raw))
+            .expect("canonical mainnet claim block");
+        let coinbase = &historical.transactions[0];
+        let verifier = AirdropCoinbaseIssuanceVerifier::native(DeploymentState::from_states(
+            [ThresholdState::Defined; 4],
+        ))
+        .expect("native issuance verifier");
+        let issuance = verifier
+            .verify_coinbase(
+                coinbase,
+                fixture.block.height,
+                fixture.canonical_context.parent_time,
+                Network::Mainnet,
+            )
+            .expect("canonical mainnet claim authentication");
+
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        seed_mainnet_claim_headers(&store, &fixture.canonical_context);
+        let snapshot = store.snapshot().expect("claim context snapshot");
+        for claim in &issuance.claims {
+            let output = &coinbase.outputs[claim.output_index];
+            verify_mempool_claim_context(
+                &snapshot,
+                output,
+                &claim.claim,
+                fixture.block.height,
+                Network::Mainnet,
+                NameFlags::NONE,
+            )
+            .expect("canonical claim mempool context");
+            if claim.claim.weak {
+                assert!(verify_mempool_claim_context(
+                    &snapshot,
+                    output,
+                    &claim.claim,
+                    fixture.block.height,
+                    Network::Mainnet,
+                    NameFlags::HARDENED,
+                )
+                .is_err());
+            }
         }
     }
 

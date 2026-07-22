@@ -4,7 +4,9 @@ use hns_consensus::{
     block_merkle_root, block_subsidy, block_witness_root, validate_block_body, Network,
     MAX_BLOCK_OPENS, MAX_BLOCK_RENEWALS, MAX_BLOCK_SIGOPS, MAX_BLOCK_UPDATES,
 };
-use hns_mempool::{minimum_policy_fee, AirdropMempoolEntry, MempoolPackage, MempoolSnapshot};
+use hns_mempool::{
+    minimum_policy_fee, AirdropMempoolEntry, ClaimMempoolEntry, MempoolPackage, MempoolSnapshot,
+};
 use hns_primitives::{
     blake2b_256_many, Address, Block, Covenant, CovenantKind, Header, Input, Outpoint, Output,
     Transaction, Witness, MAX_BLOCK_WEIGHT,
@@ -85,6 +87,7 @@ pub struct TemplateBuildRequest<'a> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TemplateMetrics {
     pub transaction_count: usize,
+    pub claim_count: usize,
     pub airdrop_count: usize,
     pub selected_packages: usize,
     pub fees: u64,
@@ -172,12 +175,44 @@ impl TemplateAssembler {
         let mut selected = HashSet::new();
         let mut selected_transactions = Vec::new();
         let mut selected_names = HashSet::new();
+        let mut selected_claims = Vec::new();
         let mut selected_airdrops = Vec::new();
         let mut metrics = TemplateMetrics {
             weight: request.policy.reserved_weight,
             sigops: request.policy.reserved_sigops,
             ..TemplateMetrics::default()
         };
+
+        let mut claims = request.mempool.claims().cloned().collect::<Vec<_>>();
+        claims.sort_by(|left, right| {
+            compare_fee_rates(right.fee, right.policy_size, left.fee, left.policy_size)
+                .then_with(|| left.hash.cmp(&right.hash))
+        });
+        for entry in claims {
+            if selected_claims.len() >= 10 {
+                break;
+            }
+            if metrics
+                .weight
+                .checked_add(entry.coinbase_weight)
+                .is_none_or(|weight| weight > request.policy.maximum_weight)
+                || metrics.updates.saturating_add(1) > request.policy.maximum_updates
+            {
+                continue;
+            }
+            if entry.commit_height == 1 {
+                metrics.fees = metrics
+                    .fees
+                    .checked_add(entry.fee)
+                    .ok_or(MiningError::TemplateArithmetic)?;
+            }
+            metrics.weight = metrics
+                .weight
+                .checked_add(entry.coinbase_weight)
+                .ok_or(MiningError::TemplateArithmetic)?;
+            metrics.updates = metrics.updates.saturating_add(1);
+            selected_claims.push(entry);
+        }
 
         let mut airdrops = request.mempool.airdrops().cloned().collect::<Vec<_>>();
         airdrops.sort_by(|left, right| {
@@ -276,6 +311,7 @@ impl TemplateAssembler {
             reward,
             request.payout_address,
             request.coinbase_flags,
+            &selected_claims,
             &selected_airdrops,
         )?;
         let mut transactions = Vec::with_capacity(selected_transactions.len().saturating_add(1));
@@ -300,6 +336,7 @@ impl TemplateAssembler {
             return Err(MiningError::InvalidTemplateBody);
         }
         metrics.transaction_count = block.transactions.len();
+        metrics.claim_count = selected_claims.len();
         metrics.airdrop_count = selected_airdrops.len();
         metrics.weight = body.weight;
         let header = MiningHeaderTemplate {
@@ -338,6 +375,7 @@ fn create_coinbase(
     reward: u64,
     payout_address: Address,
     coinbase_flags: Vec<u8>,
+    claims: &[ClaimMempoolEntry],
     airdrops: &[AirdropMempoolEntry],
 ) -> Result<Transaction, MiningError> {
     if coinbase_flags.len() > hns_consensus::MAX_COINBASE_WITNESS_SIZE {
@@ -364,6 +402,33 @@ fn create_coinbase(
         }],
         locktime: height,
     };
+    for entry in claims {
+        coinbase.inputs.push(Input {
+            previous_output: Outpoint::null(),
+            sequence: u32::MAX,
+            witness: Witness {
+                items: vec![entry.claim.blob.clone()],
+            },
+        });
+        coinbase.outputs.push(Output {
+            value: entry
+                .value
+                .checked_sub(entry.fee)
+                .ok_or(MiningError::TemplateArithmetic)?,
+            address: entry.address.clone(),
+            covenant: Covenant {
+                kind: CovenantKind::Claim,
+                items: vec![
+                    entry.name_hash.to_vec(),
+                    height.to_le_bytes().to_vec(),
+                    entry.name.clone(),
+                    vec![u8::from(entry.weak)],
+                    entry.commit_hash.to_vec(),
+                    entry.commit_height.to_le_bytes().to_vec(),
+                ],
+            },
+        });
+    }
     for entry in airdrops {
         let raw = entry
             .proof
@@ -670,11 +735,13 @@ impl Default for TemplateCoordinator {
 mod tests {
     use super::*;
     use hns_consensus::{
-        transaction_weight, ConsensusError, Network, SequenceLockView, TransactionInputVerifier,
+        transaction_weight, ConsensusError, Network, OpenSslDnssecVerifier, SequenceLockView,
+        TransactionInputVerifier, VerifiedClaim,
     };
     use hns_mempool::{
         sigop_adjusted_virtual_size, standard_output_dust_threshold, Admission, AirdropAdmission,
-        AirdropMempoolContext, AirdropMempoolView, ContextualTransactionVerifier, MemoryMempool,
+        AirdropMempoolContext, AirdropMempoolView, ClaimAdmission, ClaimContextValidation,
+        ClaimMempoolContext, ClaimMempoolView, ContextualTransactionVerifier, MemoryMempool,
         Mempool, MempoolContext, MempoolView, BYTES_PER_SIGOP, HSD_ABSURD_FEE_FACTOR,
         HSD_FREE_DECAY_SECONDS, HSD_FREE_RELAY_MULTIPLIER, HSD_FREE_THRESHOLD,
         HSD_LIMIT_FREE_RELAY, HSD_MAX_P2WSH_PUSH, HSD_MAX_P2WSH_SIZE, HSD_MAX_P2WSH_STACK,
@@ -682,7 +749,9 @@ mod tests {
         HSD_MEMPOOL_MAX_SIZE, HSD_MEMPOOL_TRIM_DENOMINATOR, HSD_MEMPOOL_TRIM_NUMERATOR,
         HSD_MINIMUM_RELAY_FEE_RATE, MAX_TX_SIGOPS,
     };
-    use hns_primitives::{AirdropProof, Coin, Height, Txid, UnavailableAirdropSignatureVerifier};
+    use hns_primitives::{
+        AirdropProof, Claim, Coin, Height, Txid, UnavailableAirdropSignatureVerifier,
+    };
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -709,6 +778,17 @@ mod tests {
     impl AirdropMempoolView for View {
         fn airdrop_position_spent(&self, _position: u32) -> Result<bool, ConsensusError> {
             Ok(false)
+        }
+    }
+
+    impl ClaimMempoolView for View {
+        fn verify_claim_context(
+            &self,
+            _output: &Output,
+            _claim: &VerifiedClaim,
+            _context: &ClaimMempoolContext,
+        ) -> Result<ClaimContextValidation, ConsensusError> {
+            Ok(ClaimContextValidation::Valid)
         }
     }
 
@@ -812,7 +892,7 @@ mod tests {
             "../../../fixtures/hsd/mining/template-v1.json"
         ))
         .expect("hsrd mining fixture");
-        assert_eq!(fixture["schema"], 6);
+        assert_eq!(fixture["schema"], 7);
         let deterministic = &fixture["deterministicCoinbase"];
         let coinbase = create_coinbase(
             u32::try_from(deterministic["height"].as_u64().expect("height"))
@@ -823,6 +903,7 @@ mod tests {
             deterministic["reward"].as_u64().expect("reward"),
             address(9),
             b"hsrd".to_vec(),
+            &[],
             &[],
         )
         .expect("coinbase");
@@ -961,6 +1042,119 @@ mod tests {
         assert_eq!(dynamic["freeRelayMultiplier"], HSD_FREE_RELAY_MULTIPLIER);
         assert_eq!(dynamic["strictFreeThreshold"], true);
         assert_eq!(dynamic["strictRateLimitThreshold"], true);
+
+        let special_claim = &fixture["specialClaimPolicy"];
+        let claim_vector = &special_claim["claim"];
+        let claim = Claim::decode(&decode_hex(
+            claim_vector["raw"].as_str().expect("claim raw"),
+        ))
+        .expect("claim");
+        assert_eq!(
+            hns_primitives::hex_encode(&claim.blob),
+            claim_vector["blob"].as_str().expect("claim blob")
+        );
+        let claim_height = u32::try_from(special_claim["height"].as_u64().expect("claim height"))
+            .expect("claim height fits u32");
+        let parent_time = special_claim["parentTime"]
+            .as_u64()
+            .expect("claim parent time");
+        let mut claim_pool = MemoryMempool::new();
+        assert!(matches!(
+            claim_pool
+                .submit_claim_with_context(
+                    claim,
+                    &ClaimMempoolContext {
+                        next_height: claim_height,
+                        transaction_start: 0,
+                        current_time: parent_time,
+                        parent_time,
+                        network: Network::Mainnet,
+                        hardening: false,
+                    },
+                    &View::default(),
+                    &OpenSslDnssecVerifier,
+                )
+                .expect("claim admission"),
+            ClaimAdmission::Accepted(_)
+        ));
+        let claim_entry = claim_pool
+            .claim_entries()
+            .into_iter()
+            .next()
+            .expect("claim entry");
+        assert_eq!(
+            hns_primitives::hex_encode(&claim_entry.hash),
+            claim_vector["hash"].as_str().expect("claim hash")
+        );
+        assert_eq!(
+            std::str::from_utf8(&claim_entry.name).expect("claim name"),
+            claim_vector["name"].as_str().expect("fixture claim name")
+        );
+        assert_eq!(
+            hns_primitives::hex_encode(&claim_entry.name_hash),
+            claim_vector["nameHash"].as_str().expect("claim name hash")
+        );
+        assert_eq!(claim_entry.value, claim_vector["value"]);
+        assert_eq!(claim_entry.fee, claim_vector["fee"]);
+        assert_eq!(claim_entry.weak, claim_vector["weak"]);
+        assert_eq!(
+            hns_primitives::hex_encode(&claim_entry.commit_hash),
+            claim_vector["commitHash"].as_str().expect("commit hash")
+        );
+        assert_eq!(
+            claim_entry.commit_height as u64,
+            claim_vector["commitHeight"]
+        );
+        assert_eq!(claim_entry.inception, claim_vector["inception"]);
+        assert_eq!(claim_entry.expiration, claim_vector["expiration"]);
+        assert_eq!(claim_entry.address.version as u64, claim_vector["version"]);
+        assert_eq!(
+            hns_primitives::hex_encode(&claim_entry.address.hash),
+            claim_vector["address"].as_str().expect("claim address")
+        );
+        assert_eq!(claim_entry.policy_size as u64, claim_vector["policySize"]);
+        assert_eq!(claim_entry.memory_usage as u64, claim_vector["memoryUsage"]);
+        assert_eq!(
+            claim_entry.coinbase_weight as u64,
+            claim_vector["coinbaseWeight"]
+        );
+        let mut claim_mining_snapshot = snapshot();
+        claim_mining_snapshot.network_id = Network::Mainnet.canonical_id();
+        claim_mining_snapshot.tip.height = claim_height - 1;
+        claim_mining_snapshot.tip.time = parent_time;
+        let claim_mempool_snapshot = claim_pool.snapshot();
+        let claim_template = TemplateAssembler
+            .assemble(TemplateBuildRequest {
+                snapshot: &claim_mining_snapshot,
+                mempool: &claim_mempool_snapshot,
+                payout_address: address(9),
+                coinbase_flags: b"hsrd".to_vec(),
+                version: 1,
+                bits: 0x207f_ffff,
+                minimum_time: parent_time + 1,
+                reserved_root: [0; 32],
+                mask_hash: [8; 32],
+                policy: TemplatePolicy::default(),
+            })
+            .expect("claim template");
+        let expected_claim_coinbase = &special_claim["deterministicCoinbase"];
+        let claim_coinbase = &claim_template.transactions()[0];
+        assert_eq!(
+            hns_primitives::hex_encode(&claim_coinbase.encode()),
+            expected_claim_coinbase["raw"]
+                .as_str()
+                .expect("claim coinbase raw")
+        );
+        assert_eq!(claim_template.metrics().claim_count, 1);
+        assert_eq!(claim_template.metrics().airdrop_count, 0);
+        assert_eq!(
+            claim_coinbase.outputs[0].value,
+            expected_claim_coinbase["payoutValue"]
+        );
+        assert_eq!(
+            claim_coinbase.outputs[1].value,
+            expected_claim_coinbase["claimValue"]
+        );
 
         let special = &fixture["specialAirdropPolicy"];
         let proof_vector = &special["proof"];

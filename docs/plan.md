@@ -143,6 +143,9 @@ reserved low-latency paths.
 - Typed HSD airdrop wire/inventory serving, native deployment/bitfield-aware
   proof admission, connected/disconnected reconciliation, fee-rate ranking,
   and exact ten-proof coinbase/template assembly.
+- Typed HSD DNSSEC claim wire/inventory serving, native contextual admission,
+  shared claim/name replacement policy, connected/disconnected reconciliation,
+  fee-rate ranking, and exact pre-airdrop ten-claim coinbase assembly.
 - Versioned and checksummed durable publication intents.
 - Local candidate admission before network publication.
 - Parallel critical fan-out with writer-completion acknowledgment and retry only for locally accepted active blocks.

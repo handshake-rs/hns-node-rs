@@ -10,14 +10,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use hns_consensus::{
-    is_coinbase, is_final_transaction, transaction_sigops, transaction_weight,
-    validate_transaction_sanity, verify_airdrop_output, verify_sequence_locks,
-    verify_transaction_covenant_links, AirdropFlags, ConsensusError, SequenceLockView,
-    TransactionInputVerifier, COIN, MAX_BLOCK_SIGOPS, WITNESS_SCALE_FACTOR,
+    is_coinbase, is_final_transaction, reserved_name, transaction_sigops, transaction_weight,
+    validate_transaction_sanity, verify_airdrop_output, verify_claim_output, verify_sequence_locks,
+    verify_transaction_covenant_links, AirdropFlags, ClaimConsensusError, ClaimFlags,
+    ConsensusError, Network, SequenceLockView, TransactionInputVerifier, VerifiedClaim, COIN,
+    MAX_BLOCK_SIGOPS, WITNESS_SCALE_FACTOR,
 };
 use hns_primitives::{
-    Address, AirdropProof, AirdropSignatureVerifier, Amount, Coin, Covenant, CovenantKind, Height,
-    Outpoint, Output, Transaction, Txid, MAX_BLOCK_WEIGHT,
+    hash_name, Address, AirdropProof, AirdropSignatureVerifier, Amount, Claim, Coin, Covenant,
+    CovenantKind, DnssecVerifier, Height, Outpoint, Output, OwnershipProof, Transaction, Txid,
+    MAX_BLOCK_WEIGHT,
 };
 use serde::{Deserialize, Serialize};
 
@@ -392,6 +394,60 @@ pub trait AirdropMempoolView {
     fn airdrop_position_spent(&self, position: u32) -> Result<bool, ConsensusError>;
 }
 
+/// Active-chain name-state and commit-ancestry validation required after a
+/// DNSSEC proof has been authenticated and bound to its exact claim output.
+pub trait ClaimMempoolView {
+    fn verify_claim_context(
+        &self,
+        output: &Output,
+        claim: &VerifiedClaim,
+        context: &ClaimMempoolContext,
+    ) -> Result<ClaimContextValidation, ConsensusError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ClaimContextValidation {
+    Valid,
+    Rejected { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimMempoolContext {
+    pub next_height: Height,
+    pub transaction_start: Height,
+    pub current_time: u64,
+    pub parent_time: u64,
+    pub network: Network,
+    pub hardening: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimMempoolEntry {
+    pub hash: [u8; 32],
+    pub name_hash: [u8; 32],
+    pub name: Vec<u8>,
+    pub address: Address,
+    pub value: Amount,
+    pub fee: Amount,
+    pub policy_size: usize,
+    pub coinbase_weight: usize,
+    pub memory_usage: usize,
+    pub weak: bool,
+    pub commit_hash: [u8; 32],
+    pub commit_height: Height,
+    pub inception: u64,
+    pub expiration: u64,
+    pub admitted_at: u64,
+    pub sequence: u64,
+    pub claim: Claim,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ClaimAdmission {
+    Accepted([u8; 32]),
+    Rejected { reason: String },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AirdropMempoolContext {
     pub next_height: Height,
@@ -456,6 +512,7 @@ impl MempoolEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolInfo {
     pub transaction_count: usize,
+    pub claim_count: usize,
     pub airdrop_count: usize,
     pub bytes: usize,
     pub total_fee: Amount,
@@ -479,6 +536,7 @@ pub struct MempoolRevalidation {
     pub promoted_orphans: usize,
     pub retained_transactions: usize,
     pub retained_orphans: usize,
+    pub retained_claims: usize,
     pub retained_airdrops: usize,
     pub generation: u64,
 }
@@ -520,6 +578,7 @@ pub struct MempoolSnapshot {
     transactions: BTreeMap<Txid, Transaction>,
     parents: BTreeMap<Txid, BTreeSet<Txid>>,
     exclusive_names: BTreeMap<Txid, Vec<[u8; 32]>>,
+    claims: BTreeMap<[u8; 32], ClaimMempoolEntry>,
     airdrops: BTreeMap<[u8; 32], AirdropMempoolEntry>,
 }
 
@@ -546,6 +605,14 @@ impl MempoolSnapshot {
 
     pub fn txids(&self) -> impl Iterator<Item = Txid> + '_ {
         self.entries.keys().copied()
+    }
+
+    pub fn claim(&self, hash: &[u8; 32]) -> Option<&ClaimMempoolEntry> {
+        self.claims.get(hash)
+    }
+
+    pub fn claims(&self) -> impl Iterator<Item = &ClaimMempoolEntry> {
+        self.claims.values()
     }
 
     pub fn airdrop(&self, hash: &[u8; 32]) -> Option<&AirdropMempoolEntry> {
@@ -686,6 +753,8 @@ pub struct MemoryMempool {
     children: HashMap<Txid, BTreeSet<Txid>>,
     exclusive_names: HashMap<Txid, Vec<[u8; 32]>>,
     exclusive_name_owners: HashMap<[u8; 32], Txid>,
+    claims: HashMap<[u8; 32], ClaimMempoolEntry>,
+    claim_names: HashMap<[u8; 32], [u8; 32]>,
     airdrops: HashMap<[u8; 32], AirdropMempoolEntry>,
     airdrop_positions: HashMap<u32, [u8; 32]>,
     bytes: usize,
@@ -719,6 +788,8 @@ impl MemoryMempool {
             children: HashMap::new(),
             exclusive_names: HashMap::new(),
             exclusive_name_owners: HashMap::new(),
+            claims: HashMap::new(),
+            claim_names: HashMap::new(),
             airdrops: HashMap::new(),
             airdrop_positions: HashMap::new(),
             bytes: 0,
@@ -736,6 +807,16 @@ impl MemoryMempool {
 
     pub fn transaction(&self, txid: &Txid) -> Option<&Transaction> {
         self.transactions.get(txid)
+    }
+
+    pub fn claim(&self, hash: &[u8; 32]) -> Option<&Claim> {
+        self.claims.get(hash).map(|entry| &entry.claim)
+    }
+
+    pub fn claim_entries(&self) -> Vec<ClaimMempoolEntry> {
+        let mut entries = self.claims.values().cloned().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (entry.sequence, entry.hash));
+        entries
     }
 
     pub fn airdrop(&self, hash: &[u8; 32]) -> Option<&AirdropProof> {
@@ -785,12 +866,221 @@ impl MemoryMempool {
                 .iter()
                 .map(|(txid, names)| (*txid, names.clone()))
                 .collect(),
+            claims: self
+                .claims
+                .iter()
+                .map(|(hash, entry)| (*hash, entry.clone()))
+                .collect(),
             airdrops: self
                 .airdrops
                 .iter()
                 .map(|(hash, entry)| (*hash, entry.clone()))
                 .collect(),
         }
+    }
+
+    /// Admit one HSD DNSSEC ownership claim against the exact next-block
+    /// deployment, parent-time, active name state, and canonical commit
+    /// ancestry. Claims are coinbase inputs, not ordinary transactions.
+    pub fn submit_claim_with_context<V: ClaimMempoolView>(
+        &mut self,
+        claim: Claim,
+        context: &ClaimMempoolContext,
+        view: &V,
+        dnssec: &dyn DnssecVerifier,
+    ) -> Result<ClaimAdmission, MempoolError> {
+        if context.next_height < context.transaction_start {
+            return Ok(rejected_claim("no-tx-allowed-yet"));
+        }
+        let encoded = match claim.encode() {
+            Ok(encoded) => encoded,
+            Err(_) => return Ok(rejected_claim("bad-claim-proof")),
+        };
+        let hash = claim.hash();
+        let txid = Txid::new(hash);
+        if self.claims.contains_key(&hash)
+            || self.airdrops.contains_key(&hash)
+            || self.entries.contains_key(&txid)
+            || self.orphans.contains_key(&txid)
+        {
+            return Ok(rejected_claim("txn-already-in-mempool"));
+        }
+        let authenticated = match authenticate_claim(&claim, context, dnssec) {
+            Ok(authenticated) => authenticated,
+            Err(reason) => return Ok(rejected_claim(reason)),
+        };
+        let name_hash = *authenticated.verified.name_hash.as_bytes();
+        if self.claim_names.contains_key(&name_hash)
+            || self.exclusive_name_owners.contains_key(&name_hash)
+        {
+            return Ok(rejected_claim("name-already-in-mempool"));
+        }
+        match view
+            .verify_claim_context(&authenticated.output, &authenticated.verified, context)
+            .map_err(|error| MempoolError::View(error.to_string()))?
+        {
+            ClaimContextValidation::Valid => {}
+            ClaimContextValidation::Rejected { reason } => {
+                return Ok(rejected_claim(reason));
+            }
+        }
+
+        let memory_usage = 500usize
+            .checked_add(claim.blob.len())
+            .ok_or(MempoolError::WeightOverflow)?;
+        let projected_bytes = self
+            .bytes
+            .checked_add(memory_usage)
+            .ok_or(MempoolError::WeightOverflow)?;
+        let policy_size = encoded.len().div_ceil(WITNESS_SCALE_FACTOR);
+        let coinbase_weight = claim_coinbase_weight(
+            claim.blob.len(),
+            &authenticated.output,
+            authenticated.verified.name.len(),
+        );
+        let sequence = self.take_sequence();
+        self.claim_names.insert(name_hash, hash);
+        self.claims.insert(
+            hash,
+            ClaimMempoolEntry {
+                hash,
+                name_hash,
+                name: authenticated.verified.name,
+                address: authenticated.output.address,
+                value: authenticated.verified.value,
+                fee: authenticated.verified.fee,
+                policy_size,
+                coinbase_weight,
+                memory_usage,
+                weak: authenticated.verified.weak,
+                commit_hash: authenticated.verified.commit_hash,
+                commit_height: authenticated.verified.commit_height,
+                inception: authenticated.inception,
+                expiration: authenticated.expiration,
+                admitted_at: context.current_time,
+                sequence,
+                claim,
+            },
+        );
+        self.bytes = projected_bytes;
+        self.advance_generation();
+        if !self.limit_size_claim(hash, context.current_time) {
+            return Ok(rejected_claim("mempool-full"));
+        }
+        Ok(ClaimAdmission::Accepted(hash))
+    }
+
+    /// Revalidate every retained claim after an active-chain transition.
+    /// This catches proof-window expiry, deployment changes, claim-period
+    /// closure, commit reorgs, and name-state replacement conflicts.
+    pub fn revalidate_claims_with_context<V: ClaimMempoolView>(
+        &mut self,
+        context: &ClaimMempoolContext,
+        view: &V,
+        dnssec: &dyn DnssecVerifier,
+    ) -> Result<bool, MempoolError> {
+        let before_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
+        let before_claims = self.claims.keys().copied().collect::<BTreeSet<_>>();
+        let before_airdrops = self.airdrops.keys().copied().collect::<BTreeSet<_>>();
+        let mut invalid = Vec::new();
+        for entry in self.claims.values() {
+            let valid = if context.next_height < context.transaction_start {
+                false
+            } else {
+                match authenticate_claim(&entry.claim, context, dnssec) {
+                    Ok(authenticated)
+                        if authenticated.verified.name_hash.as_bytes() == &entry.name_hash =>
+                    {
+                        matches!(
+                            view.verify_claim_context(
+                                &authenticated.output,
+                                &authenticated.verified,
+                                context,
+                            )
+                            .map_err(|error| MempoolError::View(error.to_string()))?,
+                            ClaimContextValidation::Valid
+                        )
+                    }
+                    _ => false,
+                }
+            };
+            if !valid {
+                invalid.push(entry.hash);
+            }
+        }
+        for hash in &invalid {
+            self.remove_claim_without_generation(hash);
+        }
+        self.enforce_size_limit(context.current_time);
+        let changed = self.entries.keys().copied().collect::<BTreeSet<_>>() != before_transactions
+            || self.claims.keys().copied().collect::<BTreeSet<_>>() != before_claims
+            || self.airdrops.keys().copied().collect::<BTreeSet<_>>() != before_airdrops;
+        if changed {
+            self.advance_generation();
+        }
+        Ok(changed)
+    }
+
+    /// Re-admit claims recovered from disconnected coinbases after the active
+    /// name state and canonical commit index have been atomically rewound.
+    /// Older disconnected claims take precedence over retained name conflicts.
+    pub fn reconcile_claims_with_context<V: ClaimMempoolView>(
+        &mut self,
+        disconnected_transactions: &[Transaction],
+        context: &ClaimMempoolContext,
+        view: &V,
+        dnssec: &dyn DnssecVerifier,
+    ) -> Result<bool, MempoolError> {
+        let before_claims = self.claims.keys().copied().collect::<BTreeSet<_>>();
+        let before_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
+        let before_generation = self.generation;
+        self.revalidate_claims_with_context(context, view, dnssec)?;
+        for coinbase in disconnected_transactions
+            .iter()
+            .filter(|transaction| is_coinbase(transaction))
+        {
+            for (index, input) in coinbase.inputs.iter().enumerate().skip(1) {
+                let Some(output) = coinbase.outputs.get(index) else {
+                    continue;
+                };
+                if output.covenant.kind != CovenantKind::Claim {
+                    continue;
+                }
+                let Some(blob) = input.witness.items.first() else {
+                    continue;
+                };
+                let claim = Claim { blob: blob.clone() };
+                let hash = claim.hash();
+                if self.claims.contains_key(&hash) {
+                    continue;
+                }
+                let Some(name_hash) = output.covenant.item_hash(0) else {
+                    continue;
+                };
+                let mut candidate = self.clone();
+                if let Some(conflict) = candidate.claim_names.get(&name_hash).copied() {
+                    candidate.remove_claim_without_generation(&conflict);
+                }
+                if let Some(conflict) = candidate.exclusive_name_owners.get(&name_hash).copied() {
+                    candidate.remove_transaction_without_generation(conflict, true);
+                }
+                if matches!(
+                    candidate.submit_claim_with_context(claim, context, view, dnssec)?,
+                    ClaimAdmission::Accepted(_)
+                ) {
+                    *self = candidate;
+                }
+            }
+        }
+        let after_claims = self.claims.keys().copied().collect::<BTreeSet<_>>();
+        let after_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
+        let changed = before_claims != after_claims
+            || before_transactions != after_transactions
+            || self.generation != before_generation;
+        if changed && self.generation == before_generation {
+            self.advance_generation();
+        }
+        Ok(changed)
     }
 
     /// Admit one HSD airdrop/faucet proof against the active deployment flags
@@ -813,7 +1103,12 @@ impl MemoryMempool {
         let hash = proof
             .hash()
             .map_err(|error| MempoolError::Consensus(error.to_string()))?;
-        if self.airdrops.contains_key(&hash) || self.entries.contains_key(&Txid::new(hash)) {
+        let txid = Txid::new(hash);
+        if self.airdrops.contains_key(&hash)
+            || self.claims.contains_key(&hash)
+            || self.entries.contains_key(&txid)
+            || self.orphans.contains_key(&txid)
+        {
             return Ok(rejected_airdrop("txn-already-in-mempool"));
         }
         if !proof.is_sane() {
@@ -1090,6 +1385,7 @@ impl MemoryMempool {
     ) -> Result<MempoolRevalidation, MempoolError> {
         let previous_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
         let previous_orphans = self.orphans.keys().copied().collect::<BTreeSet<_>>();
+        let previous_claims = self.claims.keys().copied().collect::<BTreeSet<_>>();
         let previous_airdrops = self.airdrops.keys().copied().collect::<BTreeSet<_>>();
         let previous_generation = self.generation;
 
@@ -1162,11 +1458,19 @@ impl MemoryMempool {
         let mut rebuilt = Self::with_limits(self.limits.clone())?;
         rebuilt.free_count = self.free_count;
         rebuilt.last_free_time = self.last_free_time;
+        rebuilt.claims = source.claims.clone();
+        rebuilt.claim_names = source.claim_names.clone();
         rebuilt.airdrops = source.airdrops.clone();
         rebuilt.airdrop_positions = source.airdrop_positions.clone();
-        rebuilt.bytes = rebuilt.airdrops.values().fold(0usize, |total, entry| {
-            total.saturating_add(entry.memory_usage)
-        });
+        rebuilt.bytes = rebuilt
+            .claims
+            .values()
+            .fold(0usize, |total, entry| {
+                total.saturating_add(entry.memory_usage)
+            })
+            .saturating_add(rebuilt.airdrops.values().fold(0usize, |total, entry| {
+                total.saturating_add(entry.memory_usage)
+            }));
         rebuilt.next_sequence = self.next_sequence;
         for (transaction, allow_orphan, admitted_at, charge_free_relay) in candidates {
             let txid = transaction.txid();
@@ -1259,9 +1563,11 @@ impl MemoryMempool {
 
         let retained_transactions = rebuilt.entries.keys().copied().collect::<BTreeSet<_>>();
         let retained_orphans = rebuilt.orphans.keys().copied().collect::<BTreeSet<_>>();
+        let retained_claims = rebuilt.claims.keys().copied().collect::<BTreeSet<_>>();
         let retained_airdrops = rebuilt.airdrops.keys().copied().collect::<BTreeSet<_>>();
         let changed = retained_transactions != previous_transactions
             || retained_orphans != previous_orphans
+            || retained_claims != previous_claims
             || retained_airdrops != previous_airdrops;
         let previous_members = previous_transactions
             .union(&previous_orphans)
@@ -1274,6 +1580,7 @@ impl MemoryMempool {
         let removed = previous_members
             .difference(&retained_members)
             .count()
+            .saturating_add(previous_claims.difference(&retained_claims).count())
             .saturating_add(previous_airdrops.difference(&retained_airdrops).count());
         let readmitted = disconnected_txids
             .intersection(&retained_transactions)
@@ -1297,6 +1604,7 @@ impl MemoryMempool {
             promoted_orphans,
             retained_transactions: retained_transactions.len(),
             retained_orphans: retained_orphans.len(),
+            retained_claims: retained_claims.len(),
             retained_airdrops: retained_airdrops.len(),
             generation,
         })
@@ -1334,7 +1642,11 @@ impl MemoryMempool {
         charge_free_relay: bool,
     ) -> Result<Admission, MempoolError> {
         let txid = transaction.txid();
-        if self.entries.contains_key(&txid) || self.orphans.contains_key(&txid) {
+        if self.entries.contains_key(&txid)
+            || self.orphans.contains_key(&txid)
+            || self.claims.contains_key(txid.as_bytes())
+            || self.airdrops.contains_key(txid.as_bytes())
+        {
             return Ok(rejected("duplicate"));
         }
         if let Err(error) = validate_transaction_sanity(&transaction) {
@@ -1352,11 +1664,9 @@ impl MemoryMempool {
             Ok(metrics) => metrics,
             Err(error) => return Ok(rejected(error.to_string())),
         };
-        if covenant_metrics
-            .exclusive_names
-            .iter()
-            .any(|name| self.exclusive_name_owners.contains_key(name))
-        {
+        if covenant_metrics.exclusive_names.iter().any(|name| {
+            self.exclusive_name_owners.contains_key(name) || self.claim_names.contains_key(name)
+        }) {
             return Ok(rejected("name-already-in-mempool"));
         }
         if !is_final_transaction(
@@ -1607,6 +1917,11 @@ impl MemoryMempool {
         self.entries.contains_key(&added)
     }
 
+    fn limit_size_claim(&mut self, added: [u8; 32], now: u64) -> bool {
+        self.enforce_size_limit(now);
+        self.claims.contains_key(&added)
+    }
+
     fn limit_size_airdrop(&mut self, added: [u8; 32], now: u64) -> bool {
         self.enforce_size_limit(now);
         self.airdrops.contains_key(&added)
@@ -1673,6 +1988,36 @@ impl MemoryMempool {
             return;
         }
 
+        let mut claims = self
+            .claims
+            .values()
+            .map(|entry| {
+                (
+                    entry.hash,
+                    entry.fee,
+                    entry.policy_size.max(1),
+                    entry.sequence,
+                )
+            })
+            .collect::<Vec<_>>();
+        claims.sort_by(|left, right| {
+            let left_rate = u128::from(left.1) * (right.2 as u128);
+            let right_rate = u128::from(right.1) * (left.2 as u128);
+            left_rate
+                .cmp(&right_rate)
+                .then_with(|| left.3.cmp(&right.3))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        for (hash, _, _, _) in claims {
+            self.remove_claim_without_generation(&hash);
+            if self.member_count() <= target_transactions && self.bytes <= target_bytes {
+                break;
+            }
+        }
+        if self.member_count() <= target_transactions && self.bytes <= target_bytes {
+            return;
+        }
+
         let mut airdrops = self
             .airdrops
             .values()
@@ -1702,7 +2047,10 @@ impl MemoryMempool {
     }
 
     fn member_count(&self) -> usize {
-        self.entries.len().saturating_add(self.airdrops.len())
+        self.entries
+            .len()
+            .saturating_add(self.claims.len())
+            .saturating_add(self.airdrops.len())
     }
 
     fn eviction_rate(&self, txid: Txid) -> (Amount, usize) {
@@ -1780,6 +2128,7 @@ impl MemoryMempool {
             .entries
             .len()
             .saturating_add(self.orphans.len())
+            .saturating_add(self.claims.len())
             .saturating_add(self.airdrops.len());
         self.free_count = 0.0;
         self.last_free_time = 0;
@@ -1794,12 +2143,33 @@ impl MemoryMempool {
         self.children.clear();
         self.exclusive_names.clear();
         self.exclusive_name_owners.clear();
+        self.claims.clear();
+        self.claim_names.clear();
         self.airdrops.clear();
         self.airdrop_positions.clear();
         self.bytes = 0;
         self.orphan_bytes = 0;
         self.advance_generation();
         removed
+    }
+
+    pub fn remove_claim(&mut self, hash: &[u8; 32]) -> bool {
+        let removed = self.remove_claim_without_generation(hash);
+        if removed {
+            self.advance_generation();
+        }
+        removed
+    }
+
+    fn remove_claim_without_generation(&mut self, hash: &[u8; 32]) -> bool {
+        let Some(entry) = self.claims.remove(hash) else {
+            return false;
+        };
+        if self.claim_names.get(&entry.name_hash) == Some(hash) {
+            self.claim_names.remove(&entry.name_hash);
+        }
+        self.bytes = self.bytes.saturating_sub(entry.memory_usage);
+        true
     }
 
     pub fn remove_airdrop(&mut self, hash: &[u8; 32]) -> bool {
@@ -1840,11 +2210,20 @@ impl MemoryMempool {
             .filter(|transaction| is_coinbase(transaction))
         {
             for (index, input) in coinbase.inputs.iter().enumerate().skip(1) {
-                if coinbase
-                    .outputs
-                    .get(index)
-                    .is_none_or(|output| output.covenant.kind != CovenantKind::None)
-                {
+                let Some(output) = coinbase.outputs.get(index) else {
+                    continue;
+                };
+                if output.covenant.kind == CovenantKind::Claim {
+                    let Some(name_hash) = output.covenant.item_hash(0) else {
+                        continue;
+                    };
+                    let Some(hash) = self.claim_names.get(&name_hash).copied() else {
+                        continue;
+                    };
+                    removed += usize::from(self.remove_claim_without_generation(&hash));
+                    continue;
+                }
+                if output.covenant.kind != CovenantKind::None {
                     continue;
                 }
                 let Some(raw) = input.witness.items.first() else {
@@ -2189,12 +2568,19 @@ impl Mempool for MemoryMempool {
     fn info(&self) -> MempoolInfo {
         MempoolInfo {
             transaction_count: self.entries.len(),
+            claim_count: self.claims.len(),
             airdrop_count: self.airdrops.len(),
             bytes: self.bytes,
             total_fee: self
                 .entries
                 .values()
                 .fold(0u64, |total, entry| total.saturating_add(entry.fee))
+                .saturating_add(
+                    self.claims
+                        .values()
+                        .filter(|entry| entry.commit_height == 1)
+                        .fold(0u64, |total, entry| total.saturating_add(entry.fee)),
+                )
                 .saturating_add(
                     self.airdrops
                         .values()
@@ -2241,10 +2627,122 @@ fn rejected(reason: impl Into<String>) -> Admission {
     }
 }
 
+fn rejected_claim(reason: impl Into<String>) -> ClaimAdmission {
+    ClaimAdmission::Rejected {
+        reason: reason.into(),
+    }
+}
+
 fn rejected_airdrop(reason: impl Into<String>) -> AirdropAdmission {
     AirdropAdmission::Rejected {
         reason: reason.into(),
     }
+}
+
+struct AuthenticatedClaim {
+    output: Output,
+    verified: VerifiedClaim,
+    inception: u64,
+    expiration: u64,
+}
+
+fn authenticate_claim(
+    claim: &Claim,
+    context: &ClaimMempoolContext,
+    dnssec: &dyn DnssecVerifier,
+) -> Result<AuthenticatedClaim, &'static str> {
+    let proof = OwnershipProof::decode(&claim.blob).map_err(|_| "bad-claim-proof")?;
+    if !proof.is_sane() {
+        return Err("bad-claim-proof");
+    }
+    let name = proof.name().ok_or("bad-claim-proof")?;
+    let reserved = reserved_name(name).ok_or("bad-claim-proof")?;
+    let data = proof
+        .claim_data(context.network.claim_prefix())
+        .map_err(|_| "bad-claim-data")?
+        .ok_or("bad-claim-data")?;
+    if context.network == Network::Mainnet
+        && context.next_height
+            < context
+                .network
+                .params()
+                .deflation_height
+                .saturating_add(100)
+        && data.commit_height != 1
+    {
+        return Err("bad-claim-replacement");
+    }
+    if data.commit_height == 1 && data.fee > 1_000 * COIN {
+        return Err("absurdly-high-fee");
+    }
+    if data.version == 31 {
+        return Err("bad-claim-nulldata");
+    }
+    let (inception, expiration) = proof.window();
+    if context.parent_time < u64::from(inception) || context.parent_time > u64::from(expiration) {
+        return Err("bad-claim-time");
+    }
+    let name = reserved.name;
+    let name_hash = hash_name(std::str::from_utf8(&name).map_err(|_| "bad-claim-proof")?)
+        .map_err(|_| "bad-claim-proof")?;
+    let address = Address::new(data.version, data.address.clone()).map_err(|_| "bad-claim-data")?;
+    let output = Output {
+        value: reserved
+            .value
+            .checked_sub(data.fee)
+            .ok_or("bad-claim-data")?,
+        address,
+        covenant: Covenant {
+            kind: CovenantKind::Claim,
+            items: vec![
+                name_hash.as_bytes().to_vec(),
+                context.next_height.to_le_bytes().to_vec(),
+                name,
+                vec![u8::from(proof.is_weak())],
+                data.commit_hash.to_vec(),
+                data.commit_height.to_le_bytes().to_vec(),
+            ],
+        },
+    };
+    let verified = verify_claim_output(
+        &claim.blob,
+        &output,
+        context.next_height,
+        context.parent_time,
+        context.network,
+        ClaimFlags {
+            hardened: context.hardening,
+        },
+        dnssec,
+    )
+    .map_err(|error| match error {
+        ClaimConsensusError::WeakDisabled => "invalid-covenant",
+        ClaimConsensusError::InitialFee => "absurdly-high-fee",
+        ClaimConsensusError::InvalidTime => "bad-claim-time",
+        ClaimConsensusError::Data(_) | ClaimConsensusError::MissingData => "bad-claim-data",
+        _ => "bad-claim-proof",
+    })?;
+    Ok(AuthenticatedClaim {
+        output,
+        verified,
+        inception: u64::from(inception),
+        expiration: u64::from(expiration),
+    })
+}
+
+/// HSD `BlockClaim.getWeight`: one count-byte delta, the ownership proof's
+/// witness varbytes, and the base input/output contribution at scale four.
+fn claim_coinbase_weight(proof_size: usize, output: &Output, name_size: usize) -> usize {
+    let address_size = 2usize.saturating_add(output.address.hash.len());
+    let base_size = 1usize
+        .saturating_add(8)
+        .saturating_add(address_size)
+        .saturating_add(90)
+        .saturating_add(name_size);
+    1usize
+        .saturating_add(varint_size(proof_size as u64))
+        .saturating_add(proof_size)
+        .saturating_add(base_size.saturating_mul(WITNESS_SCALE_FACTOR))
 }
 
 /// HSD `BlockAirdrop.getWeight`: one count-byte delta, the special input's
@@ -2349,10 +2847,25 @@ mod tests {
     use hns_primitives::MAX_BLOCK_WEIGHT;
 
     use super::*;
-    use hns_consensus::{ConsensusError, TransactionInputVerifier};
+    use hns_consensus::{ConsensusError, OpenSslDnssecVerifier, TransactionInputVerifier};
     use hns_primitives::{
-        sha3_256, Address, Covenant, Input, Output, UnavailableAirdropSignatureVerifier, Witness,
+        sha3_256, Address, Block, Covenant, Input, Output, UnavailableAirdropSignatureVerifier,
+        Witness,
     };
+
+    fn decode_fixture_hex(raw: &str) -> Vec<u8> {
+        raw.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let nibble = |byte| match byte {
+                    b'0'..=b'9' => byte - b'0',
+                    b'a'..=b'f' => byte - b'a' + 10,
+                    _ => panic!("invalid fixture hex"),
+                };
+                (nibble(pair[0]) << 4) | nibble(pair[1])
+            })
+            .collect()
+    }
 
     fn covenant() -> Covenant {
         Covenant {
@@ -2373,21 +2886,34 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../fixtures/hsd/airdrops/codec-v1.json"))
                 .expect("airdrop fixture");
-        let raw = fixture["faucet"]["raw"]
-            .as_str()
-            .expect("faucet raw")
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                let nibble = |byte| match byte {
-                    b'0'..=b'9' => byte - b'0',
-                    b'a'..=b'f' => byte - b'a' + 10,
-                    _ => panic!("invalid fixture hex"),
-                };
-                (nibble(pair[0]) << 4) | nibble(pair[1])
-            })
-            .collect::<Vec<_>>();
+        let raw = decode_fixture_hex(fixture["faucet"]["raw"].as_str().expect("faucet raw"));
         AirdropProof::decode(&raw).expect("faucet proof")
+    }
+
+    fn fixture_claim_block() -> (serde_json::Value, Block) {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/claims/mainnet-history-v1.json"
+        ))
+        .expect("mainnet claim fixture");
+        let block = Block::decode(&decode_fixture_hex(
+            fixture["block"]["raw"].as_str().expect("claim block raw"),
+        ))
+        .expect("mainnet claim block");
+        (fixture, block)
+    }
+
+    fn claim_context(fixture: &serde_json::Value) -> ClaimMempoolContext {
+        ClaimMempoolContext {
+            next_height: u32::try_from(fixture["block"]["height"].as_u64().expect("height"))
+                .expect("height fits u32"),
+            transaction_start: 0,
+            current_time: 100,
+            parent_time: fixture["canonicalContext"]["parentTime"]
+                .as_u64()
+                .expect("parent time"),
+            network: Network::Mainnet,
+            hardening: false,
+        }
     }
 
     fn airdrop_context() -> AirdropMempoolContext {
@@ -2466,6 +2992,62 @@ mod tests {
         fn airdrop_position_spent(&self, position: u32) -> Result<bool, ConsensusError> {
             Ok(self.spent_airdrops.contains(&position))
         }
+    }
+
+    impl ClaimMempoolView for FixedView {
+        fn verify_claim_context(
+            &self,
+            _output: &Output,
+            _claim: &VerifiedClaim,
+            _context: &ClaimMempoolContext,
+        ) -> Result<ClaimContextValidation, ConsensusError> {
+            Ok(ClaimContextValidation::Valid)
+        }
+    }
+
+    #[test]
+    fn claim_admission_indexes_revalidates_and_reconciles_coinbases() {
+        let (fixture, block) = fixture_claim_block();
+        let coinbase = block.transactions[0].clone();
+        let blob = coinbase.inputs[1].witness.items[0].clone();
+        let claim = Claim { blob };
+        let hash = claim.hash();
+        let context = claim_context(&fixture);
+        let view = FixedView::default();
+        let dnssec = OpenSslDnssecVerifier;
+        let mut pool = MemoryMempool::new();
+        assert_eq!(
+            pool.submit_claim_with_context(claim.clone(), &context, &view, &dnssec)
+                .expect("claim admission"),
+            ClaimAdmission::Accepted(hash)
+        );
+        assert_eq!(pool.info().claim_count, 1);
+        assert_eq!(pool.info().bytes, 500 + claim.blob.len());
+        assert!(matches!(
+            pool.submit_claim_with_context(claim.clone(), &context, &view, &dnssec)
+                .expect("duplicate claim"),
+            ClaimAdmission::Rejected { reason } if reason == "txn-already-in-mempool"
+        ));
+
+        let mut bounded = MemoryMempool::with_limits(MempoolLimits {
+            maximum_bytes: 500 + claim.blob.len() - 1,
+            ..MempoolLimits::default()
+        })
+        .expect("bounded claim pool");
+        assert!(matches!(
+            bounded
+                .submit_claim_with_context(claim, &context, &view, &dnssec)
+                .expect("bounded claim admission"),
+            ClaimAdmission::Rejected { reason } if reason == "mempool-full"
+        ));
+        assert_eq!(bounded.info().claim_count, 0);
+
+        assert_eq!(pool.remove_confirmed(std::slice::from_ref(&coinbase)), 1);
+        assert_eq!(pool.info().claim_count, 0);
+        assert!(pool
+            .reconcile_claims_with_context(&[coinbase], &context, &view, &dnssec)
+            .expect("claim disconnect reconciliation"));
+        assert_eq!(pool.info().claim_count, 2);
     }
 
     #[test]

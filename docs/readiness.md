@@ -219,11 +219,13 @@ Implemented:
   limiter;
 - typed HSD airdrop wire/inventory/GETDATA relay, deployment- and bitfield-aware
   native admission, reorg reconciliation, and fee-ranked coinbase assembly;
+- typed HSD DNSSEC claim wire/inventory/GETDATA relay, native contextual
+  admission and replacement policy, reorg reconciliation, and fee-ranked
+  pre-airdrop coinbase assembly;
 - mining-engine readiness and queue diagnostics.
 
 Remaining:
 
-- HSD DNSSEC claim relay and claim/name replacement admission;
 - full-mainnet active-state IBD and live HSD state/root qualification;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
 - native mainnet authority qualification.

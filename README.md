@@ -355,6 +355,10 @@ Implemented:
 - Typed HSD airdrop wire/inventory/GETDATA relay, native deployment- and
   allocation-field-aware admission, reorg reconciliation, and fee-ranked
   ten-proof coinbase assembly.
+- Typed HSD DNSSEC claim wire/inventory/GETDATA relay, native proof and exact
+  active-name/commit-ancestry admission, shared name-conflict replacement,
+  connected/disconnected reconciliation, and HSD-ordered ten-claim coinbase
+  assembly before airdrops.
 - Deterministic ancestor-inclusive template selection with HNS weight, sigops,
   OPEN, UPDATE, RENEW, transaction-count, and exclusive-name limits.
 - HSD-derived subsidy and deterministic coinbase fixtures.
@@ -369,7 +373,6 @@ Implemented:
 
 Still release-blocking:
 
-- HSD DNSSEC claim relay and claim/name replacement admission;
 - qualified full-mainnet active-state IBD and the incremental production Urkel
   lifecycle;
 - sustained live HSD comparison evidence across restarts, partitions, and real

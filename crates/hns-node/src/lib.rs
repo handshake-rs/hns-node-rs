@@ -39,7 +39,7 @@ use hns_consensus::{
     validate_transaction_start, ConsensusParams, Deployment, DeploymentPeriod, DeploymentState,
     DifficultyPoint, HeaderConsensus, HeaderParent, HeaderValidationContext,
     HistoricalScriptPolicy, HistoricalValidationPlan, NameFlags, NativeAirdropSignatureVerifier,
-    Network, ThresholdState, MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
+    Network, OpenSslDnssecVerifier, ThresholdState, MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
 };
 use hns_mempool::{MemoryMempool, Mempool};
 use hns_mining::{
@@ -613,6 +613,7 @@ pub struct NodeService {
     state: NodeState,
     mining_events: MiningEventHub,
     mining_engine_templates: Mutex<TemplateCoordinator>,
+    claim_dnssec: OpenSslDnssecVerifier,
     airdrop_signatures: NativeAirdropSignatureVerifier,
 }
 
@@ -657,6 +658,7 @@ impl NodeService {
 
         let mempool_info = state.mempool.info();
         if mempool_info.transaction_count == 0
+            && mempool_info.claim_count == 0
             && mempool_info.airdrop_count == 0
             && mempool_info.orphan_count == 0
         {
@@ -731,6 +733,7 @@ impl NodeService {
             state,
             mining_events,
             mining_engine_templates,
+            claim_dnssec: OpenSslDnssecVerifier,
             airdrop_signatures,
         })
     }
