@@ -605,7 +605,8 @@ mod tests {
     use hns_mempool::{
         sigop_adjusted_virtual_size, standard_output_dust_threshold, Admission,
         ContextualTransactionVerifier, MemoryMempool, Mempool, MempoolContext, MempoolView,
-        BYTES_PER_SIGOP, HSD_ABSURD_FEE_FACTOR, HSD_MAX_P2WSH_PUSH, HSD_MAX_P2WSH_SIZE,
+        BYTES_PER_SIGOP, HSD_ABSURD_FEE_FACTOR, HSD_FREE_DECAY_SECONDS, HSD_FREE_RELAY_MULTIPLIER,
+        HSD_FREE_THRESHOLD, HSD_LIMIT_FREE_RELAY, HSD_MAX_P2WSH_PUSH, HSD_MAX_P2WSH_SIZE,
         HSD_MAX_P2WSH_STACK, HSD_MAX_STANDARD_TX_VERSION, HSD_MAX_STANDARD_TX_WEIGHT,
         HSD_MEMPOOL_EXPIRY_TIME, HSD_MEMPOOL_MAX_SIZE, HSD_MEMPOOL_TRIM_DENOMINATOR,
         HSD_MEMPOOL_TRIM_NUMERATOR, HSD_MINIMUM_RELAY_FEE_RATE, MAX_TX_SIGOPS,
@@ -734,7 +735,7 @@ mod tests {
             "../../../fixtures/hsd/mining/template-v1.json"
         ))
         .expect("hsrd mining fixture");
-        assert_eq!(fixture["schema"], 4);
+        assert_eq!(fixture["schema"], 5);
         let deterministic = &fixture["deterministicCoinbase"];
         let coinbase = create_coinbase(
             u32::try_from(deterministic["height"].as_u64().expect("height"))
@@ -872,6 +873,16 @@ mod tests {
         assert_eq!(dynamic["dependencyRootsOnly"], true);
         assert_eq!(dynamic["descendantPackageRate"], true);
         assert_eq!(dynamic["equalRateOldestFirst"], true);
+        assert_eq!(dynamic["freeThreshold"], HSD_FREE_THRESHOLD);
+        assert_eq!(dynamic["relayPriority"], true);
+        assert_eq!(dynamic["limitFree"], true);
+        assert_eq!(dynamic["limitFreeRelay"], HSD_LIMIT_FREE_RELAY);
+        assert_eq!(dynamic["freeDecay"]["numerator"], 599);
+        assert_eq!(dynamic["freeDecay"]["denominator"], 600);
+        assert_eq!(dynamic["freeDecaySeconds"], HSD_FREE_DECAY_SECONDS);
+        assert_eq!(dynamic["freeRelayMultiplier"], HSD_FREE_RELAY_MULTIPLIER);
+        assert_eq!(dynamic["strictFreeThreshold"], true);
+        assert_eq!(dynamic["strictRateLimitThreshold"], true);
     }
 
     #[test]

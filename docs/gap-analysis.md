@@ -183,6 +183,8 @@
   script flags on all networks, exact dust thresholds, and absurd-fee rejection.
 - HSD 72-hour dependency-root expiry and low-fee root-package eviction to the
   90% target, using descendant-package rates to keep dependencies atomic.
+- HSD confirmed-coin free priority and the default 10-minute exponential
+  low-fee relay limiter with strict HSD threshold comparisons.
 - Atomic post-connect rebuilding revalidates every retained transaction and
   orphan against the new active context, promotes newly resolvable dependencies,
   and advances the mempool generation once only when membership changes.
@@ -246,14 +248,13 @@ These are substantial foundations, not a production full node.
   beyond implemented HSD network-prefix grouping, and adversarial network
   qualification.
 - Pruning-aware synchronization and sustained compact-relay WAN qualification.
-- HSD free-relay priority/rate limiting and special claim/airdrop relay,
-  including replacement claims.
+- Special HSD claim/airdrop relay, including replacement claims.
 - Sustained multipath publication and reconnect/retry supervision under WAN
   partitions and queue saturation.
 
 ### Mining authority
 
-- Remaining HSD free-relay limiting and special-packet replacement.
+- Remaining HSD special-packet relay and replacement.
 - Continuous future-template lifecycle tied to live committed tips and the ASIC
   gateway.
 - End-to-end candidate validation against a historically qualified active state.

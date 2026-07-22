@@ -420,9 +420,11 @@
         "expiry",
         "fee-eviction",
         "descendant-package",
+        "free-priority",
+        "rate-limiting",
         "oracle"
       ],
-      "blake2b256": "49c9c10253e6a1965fafc59c116fbd033b7bad02fb144018ffa46c63565af601"
+      "blake2b256": "8165136bbba0b925161e7bee8a47875ea0f593d97987e7822a0b225791802702"
     }
   ]
 }

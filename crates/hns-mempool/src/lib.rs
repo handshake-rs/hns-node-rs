@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use hns_consensus::{
     is_coinbase, is_final_transaction, transaction_sigops, transaction_weight,
     validate_transaction_sanity, verify_sequence_locks, verify_transaction_covenant_links,
-    ConsensusError, SequenceLockView, TransactionInputVerifier, MAX_BLOCK_SIGOPS,
+    ConsensusError, SequenceLockView, TransactionInputVerifier, COIN, MAX_BLOCK_SIGOPS,
     WITNESS_SCALE_FACTOR,
 };
 use hns_primitives::{
@@ -43,6 +43,10 @@ pub const HSD_MEMPOOL_MAX_SIZE: usize = 100 * 1_000_000;
 pub const HSD_MEMPOOL_EXPIRY_TIME: u64 = 72 * 60 * 60;
 pub const HSD_MEMPOOL_TRIM_NUMERATOR: usize = 9;
 pub const HSD_MEMPOOL_TRIM_DENOMINATOR: usize = 10;
+pub const HSD_FREE_THRESHOLD: Amount = COIN * 144 / 250;
+pub const HSD_LIMIT_FREE_RELAY: u64 = 15;
+pub const HSD_FREE_DECAY_SECONDS: u64 = 600;
+pub const HSD_FREE_RELAY_MULTIPLIER: u64 = 10 * 1_000;
 /// HSD's pinned default minimum relay fee in atomic units per 1,000 policy
 /// virtual bytes. Network-specific HSD defaults currently use this same value.
 pub const HSD_MINIMUM_RELAY_FEE_RATE: Amount = 1_000;
@@ -69,6 +73,30 @@ pub fn minimum_policy_fee(policy_size: usize, rate: Amount) -> Amount {
     } else {
         u64::try_from(fee).unwrap_or(u64::MAX)
     }
+}
+
+fn transaction_priority(
+    transaction: &Transaction,
+    input_coins: &[Coin],
+    mempool_parents: &BTreeSet<Txid>,
+    next_height: Height,
+    policy_size: usize,
+) -> u128 {
+    let weighted_value =
+        transaction
+            .inputs
+            .iter()
+            .zip(input_coins)
+            .fold(0u128, |total, (input, coin)| {
+                if mempool_parents.contains(&input.previous_output.txid)
+                    || coin.height > next_height
+                {
+                    return total;
+                }
+                let age = u128::from(next_height - coin.height);
+                total.saturating_add(u128::from(coin.value).saturating_mul(age))
+            });
+    weighted_value / (policy_size.max(1) as u128)
 }
 
 fn standardness_rejection(transaction: &Transaction) -> Option<&'static str> {
@@ -284,6 +312,13 @@ pub struct MempoolContext {
     /// HSD's default wallet-safety ceiling rejects fees above 10,000 times the
     /// minimum relay fee for the transaction's policy size.
     pub reject_absurd_fees: bool,
+    /// Require HSD's confirmed-coin age/value priority for transactions below
+    /// the minimum relay fee.
+    pub relay_priority: bool,
+    /// Apply HSD's exponentially decaying low-fee relay rate limiter.
+    pub limit_free: bool,
+    /// Thousand-policy-bytes per minute, matching HSD's option unit.
+    pub limit_free_relay: u64,
     /// Production admission sets this to true. Tests and oracle harnesses may
     /// explicitly disable it while retaining every other admission check.
     pub require_complete_verifiers: bool,
@@ -299,6 +334,9 @@ impl MempoolContext {
             minimum_relay_fee_rate: 0,
             require_standard: false,
             reject_absurd_fees: false,
+            relay_priority: false,
+            limit_free: false,
+            limit_free_relay: HSD_LIMIT_FREE_RELAY,
             require_complete_verifiers: false,
         }
     }
@@ -601,6 +639,8 @@ pub struct MemoryMempool {
     exclusive_name_owners: HashMap<[u8; 32], Txid>,
     bytes: usize,
     orphan_bytes: usize,
+    free_count: f64,
+    last_free_time: u64,
     generation: u64,
     next_sequence: u64,
 }
@@ -630,6 +670,8 @@ impl MemoryMempool {
             exclusive_name_owners: HashMap::new(),
             bytes: 0,
             orphan_bytes: 0,
+            free_count: 0.0,
+            last_free_time: 0,
             generation: 0,
             next_sequence: 1,
         })
@@ -791,17 +833,17 @@ impl MemoryMempool {
         let mut candidates = disconnected_transactions
             .iter()
             .cloned()
-            .map(|transaction| (transaction, false, context.current_time))
+            .map(|transaction| (transaction, false, context.current_time, true))
             .collect::<Vec<_>>();
         candidates.extend(
             accepted
                 .into_iter()
-                .map(|(transaction, admitted_at)| (transaction, false, admitted_at)),
+                .map(|(transaction, admitted_at)| (transaction, false, admitted_at, false)),
         );
         candidates.extend(
             ordered_orphans
                 .into_iter()
-                .map(|(_, _, transaction)| (transaction, true, context.current_time)),
+                .map(|(_, _, transaction)| (transaction, true, context.current_time, true)),
         );
         let mut invalidated_transactions = previous_transactions
             .difference(&connected_txids)
@@ -811,7 +853,9 @@ impl MemoryMempool {
         let mut candidate_txids = BTreeSet::new();
         let mut seen = HashSet::new();
         let mut rebuilt = Self::with_limits(self.limits.clone())?;
-        for (transaction, allow_orphan, admitted_at) in candidates {
+        rebuilt.free_count = self.free_count;
+        rebuilt.last_free_time = self.last_free_time;
+        for (transaction, allow_orphan, admitted_at, charge_free_relay) in candidates {
             let txid = transaction.txid();
             if !seen.insert(txid) {
                 continue;
@@ -837,6 +881,7 @@ impl MemoryMempool {
                 input_verifier,
                 contextual_verifier,
                 admitted_at,
+                charge_free_relay,
             )? {
                 Admission::Accepted(_) => {}
                 Admission::Orphan(_) if allow_orphan => {}
@@ -954,6 +999,7 @@ impl MemoryMempool {
             input_verifier,
             contextual_verifier,
             context.current_time,
+            true,
         )
     }
 
@@ -966,6 +1012,7 @@ impl MemoryMempool {
         input_verifier: &dyn TransactionInputVerifier,
         contextual_verifier: &dyn ContextualTransactionVerifier,
         admitted_at: u64,
+        charge_free_relay: bool,
     ) -> Result<Admission, MempoolError> {
         let txid = transaction.txid();
         if self.entries.contains_key(&txid) || self.orphans.contains_key(&txid) {
@@ -1092,7 +1139,27 @@ impl MemoryMempool {
         let policy_size = sigop_adjusted_virtual_size(&transaction, sigops);
         let minimum_fee = minimum_policy_fee(policy_size, context.minimum_relay_fee_rate);
         if fee < minimum_fee {
-            return Ok(rejected("insufficient-fee"));
+            if context.relay_priority
+                && transaction_priority(
+                    &transaction,
+                    &input_coins,
+                    &direct_parents,
+                    context.next_height,
+                    policy_size,
+                ) <= u128::from(HSD_FREE_THRESHOLD)
+            {
+                return Ok(rejected("insufficient priority"));
+            }
+            if context.limit_free
+                && charge_free_relay
+                && !self.allow_free_relay(
+                    policy_size,
+                    context.current_time,
+                    context.limit_free_relay,
+                )
+            {
+                return Ok(rejected("rate limited free transaction"));
+            }
         }
         if context.reject_absurd_fees && fee > minimum_fee.saturating_mul(HSD_ABSURD_FEE_FACTOR) {
             return Ok(rejected("absurdly-high-fee"));
@@ -1192,6 +1259,23 @@ impl MemoryMempool {
             return Ok(rejected("mempool-full"));
         }
         Ok(Admission::Accepted(txid))
+    }
+
+    fn allow_free_relay(&mut self, policy_size: usize, now: u64, limit: u64) -> bool {
+        let elapsed = if now >= self.last_free_time {
+            (now - self.last_free_time) as f64
+        } else {
+            -((self.last_free_time - now) as f64)
+        };
+        let decay = 1.0 - 1.0 / HSD_FREE_DECAY_SECONDS as f64;
+        self.free_count *= decay.powf(elapsed);
+        self.last_free_time = now;
+        let threshold = limit.saturating_mul(HSD_FREE_RELAY_MULTIPLIER) as f64;
+        if self.free_count > threshold {
+            return false;
+        }
+        self.free_count += policy_size as f64;
+        true
     }
 
     /// Mirror HSD's `limitSize`: expire complete dependency-root packages
@@ -1331,6 +1415,8 @@ impl MemoryMempool {
     /// re-admitted through the complete consensus verifier.
     pub fn clear(&mut self) -> usize {
         let removed = self.entries.len().saturating_add(self.orphans.len());
+        self.free_count = 0.0;
+        self.last_free_time = 0;
         if removed == 0 {
             return 0;
         }
@@ -2479,6 +2565,7 @@ mod tests {
             Address::new(0, vec![0x66; 32]).expect("script-hash address");
         let context = MempoolContext {
             minimum_relay_fee_rate: 3,
+            relay_priority: true,
             ..MempoolContext::testing(2, 2)
         };
         let mut underpaying = transaction(input.clone(), 950);
@@ -2491,7 +2578,7 @@ mod tests {
         assert!(matches!(
             pool.submit_with_context(underpaying, &context, &view, &AllowInputs, &AllowContext)
                 .expect("underpaying admission"),
-            Admission::Rejected { reason } if reason == "insufficient-fee"
+            Admission::Rejected { reason } if reason == "insufficient priority"
         ));
 
         let mut exact_fee = transaction(input, 940);
@@ -2503,6 +2590,133 @@ mod tests {
                 .expect("exact-fee admission"),
             Admission::Accepted(_)
         ));
+    }
+
+    #[test]
+    fn hsd_free_relay_priority_is_strictly_above_the_threshold() {
+        let input = outpoint(0xed, 0);
+        let prototype = transaction(input.clone(), 0);
+        let prototype_coin = FixedView::with_coin(input.clone(), 1)
+            .coins
+            .remove(&input)
+            .expect("prototype coin");
+        let sigops = transaction_sigops(&prototype, &[prototype_coin]).expect("sigops");
+        let policy_size = sigop_adjusted_virtual_size(&prototype, sigops);
+        let context = MempoolContext {
+            minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
+            relay_priority: true,
+            ..MempoolContext::testing(2, 2)
+        };
+        for (priority, accepted) in [(HSD_FREE_THRESHOLD, false), (HSD_FREE_THRESHOLD + 1, true)] {
+            let value = priority.saturating_mul(policy_size as u64);
+            let candidate = transaction(input.clone(), value);
+            let admission = MemoryMempool::new()
+                .submit_with_context(
+                    candidate,
+                    &context,
+                    &FixedView::with_coin(input.clone(), value),
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("priority admission");
+            assert_eq!(matches!(admission, Admission::Accepted(_)), accepted);
+            if !accepted {
+                assert!(matches!(
+                    admission,
+                    Admission::Rejected { reason } if reason == "insufficient priority"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn hsd_free_relay_limiter_uses_strict_threshold_and_ten_minute_decay() {
+        let mut pool = MemoryMempool::new();
+        let threshold = HSD_LIMIT_FREE_RELAY.saturating_mul(HSD_FREE_RELAY_MULTIPLIER);
+        pool.free_count = threshold as f64;
+        pool.last_free_time = 100;
+        assert!(pool.allow_free_relay(1, 100, HSD_LIMIT_FREE_RELAY));
+        assert!(!pool.allow_free_relay(1, 100, HSD_LIMIT_FREE_RELAY));
+        assert!(pool.allow_free_relay(1, 700, HSD_LIMIT_FREE_RELAY));
+        let expected = (threshold as f64 + 1.0)
+            * (1.0 - 1.0 / HSD_FREE_DECAY_SECONDS as f64).powf(HSD_FREE_DECAY_SECONDS as f64)
+            + 1.0;
+        assert!((pool.free_count - expected).abs() < 1e-9);
+
+        let context = MempoolContext {
+            current_time: 1_000,
+            minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
+            limit_free: true,
+            limit_free_relay: 0,
+            ..MempoolContext::testing(2, 2)
+        };
+        let first_input = outpoint(0xee, 0);
+        let first = transaction(first_input.clone(), 1_000);
+        let mut admissions = MemoryMempool::new();
+        assert!(matches!(
+            admissions
+                .submit_with_context(
+                    first,
+                    &context,
+                    &FixedView::with_coin(first_input, 1_000),
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("first free admission"),
+            Admission::Accepted(_)
+        ));
+        let second_input = outpoint(0xef, 0);
+        assert!(matches!(
+            admissions
+                .submit_with_context(
+                    transaction(second_input.clone(), 1_000),
+                    &context,
+                    &FixedView::with_coin(second_input, 1_000),
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("second free admission"),
+            Admission::Rejected { reason } if reason == "rate limited free transaction"
+        ));
+    }
+
+    #[test]
+    fn hsd_revalidation_does_not_recharge_retained_free_transactions() {
+        let mut pool = MemoryMempool::new();
+        let input = outpoint(0xf0, 0);
+        let view = FixedView::with_coin(input.clone(), 1_000);
+        let context = MempoolContext {
+            current_time: 1_000,
+            minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
+            limit_free: true,
+            limit_free_relay: 0,
+            ..MempoolContext::testing(2, 2)
+        };
+        assert!(matches!(
+            pool.submit_with_context(
+                transaction(input, 1_000),
+                &context,
+                &view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect("free admission"),
+            Admission::Accepted(_)
+        ));
+        let charged = pool.free_count;
+        let result = pool
+            .reconcile_chain_transition_with_context(
+                &[],
+                &[],
+                &context,
+                &view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect("retained free revalidation");
+        assert!(!result.changed);
+        assert_eq!(result.retained_transactions, 1);
+        assert_eq!(pool.free_count, charged);
     }
 
     #[test]

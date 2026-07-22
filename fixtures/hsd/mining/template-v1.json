@@ -1,5 +1,5 @@
 {
-  "schema": 4,
+  "schema": 5,
   "oracle": {
     "repository": "handshake-org/hsd",
     "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
@@ -233,6 +233,18 @@
     },
     "dependencyRootsOnly": true,
     "descendantPackageRate": true,
-    "equalRateOldestFirst": true
+    "equalRateOldestFirst": true,
+    "freeThreshold": 576000,
+    "relayPriority": true,
+    "limitFree": true,
+    "limitFreeRelay": 15,
+    "freeDecay": {
+      "numerator": 599,
+      "denominator": 600
+    },
+    "freeDecaySeconds": 600,
+    "freeRelayMultiplier": 10000,
+    "strictFreeThreshold": true,
+    "strictRateLimitThreshold": true
   }
 }
