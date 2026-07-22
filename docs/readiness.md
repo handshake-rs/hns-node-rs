@@ -100,7 +100,7 @@ Implemented:
 - Validated mark-and-sweep compaction retaining the current, undo, and pinned
   root union, including idempotence and failed-commit atomicity evidence.
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
-  atomic checksummed last-run checkpoint, API-v9 diagnostics, and unclean
+  atomic checksummed last-run checkpoint, API-v10 diagnostics, and unclean
   RocksDB reopen evidence.
 - Exact HSD undo-retention horizons with opt-in atomic retirement, bounded
   startup catch-up, pruning-aware pin/compaction validation, and deep-reorg
@@ -168,7 +168,7 @@ Implemented:
   eight-block shutdown-responsive direct slices, full-bound atomic
   reorganizations, exact contextual-invalid ancestry, and fail-closed
   local-fault separation;
-- API-v9 next-header committed-root material plus a pinned-source, race-safe external HSD
+- API-v10 next-header committed-root material plus a pinned-source, race-safe external HSD
   block/root comparator with checksummed bounded evidence and explicit
   restart/reorganization accounting;
 - bounded read-only header, inventory, block, and transaction serving;
@@ -261,7 +261,7 @@ Remaining:
   recovery in one release process;
 - measured P50/P95/P99/max end-to-end latency under real hardware and WAN load.
 
-## Differential and shadow qualification — fixtures expanded
+## Differential and native qualification — fixtures expanded
 
 Implemented:
 
@@ -287,18 +287,20 @@ Implemented:
 Remaining:
 
 - complete mainnet replay and invalid corpora at every state boundary;
-- long-duration live shadow comparison evidence through restarts, partitions,
-  and reorganizations;
+- long-duration native multi-peer evidence through restarts, partitions, and
+  reorganizations, plus offline differential audits;
 - production mempool/template/publication differential and latency evidence.
 
 ## Authority and HSD removal — blocked by design
 
-- Default mode is `shadow`.
-- Live networking is allowed only in `disabled` or `shadow` mode.
-- Downloaded bodies remain non-active and cannot create authoritative jobs.
-- Shadow templates do not bypass the private authority capability.
-- Native experimental authority is feature-gated, explicitly acknowledged, and
-  restricted to regtest/simnet.
+- Default mode is `native`; HSD is not a runtime dependency.
+- Native networking may connect downloaded bodies to active state, but neither
+  synchronization nor staged templates can create a mining permit.
+- Mainnet additionally requires the explicit hardened canary profile, exact
+  header/active-state synchronization, durable authority, and every readiness
+  bit.
+- Native experimental authority remains feature-gated, explicitly
+  acknowledged, and restricted to regtest/simnet.
 
 Promote `hsrd` only after every readiness gate is reproducibly satisfied and
 reviewed.

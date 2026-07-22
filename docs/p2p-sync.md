@@ -425,7 +425,7 @@ active-state connection/reorganization counts, contextual-failure count, and
 the last supervisor error. Discovery diagnostics additionally expose durable
 address-book availability, loaded/pruned counts, generation, dirty state,
 successful/failed flushes, decode failures, the last flush time, and its last
-storage error. API-v9 node status separately counts valid non-active blocks and
+storage error. API-v10 node status separately counts valid non-active blocks and
 durably failed blocks and exposes the active tip's resulting authenticated
 root/height. The native endpoint includes an opaque runtime instance so external
 evidence can distinguish observations across restarts.

@@ -1,0 +1,25 @@
+[Unit]
+Description=MeshMine native hsrd mainnet canary sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/MeshMine
+ExecStart=%h/Documents/MeshMine/hsrd/target/release/hsrd --network mainnet --data-dir %h/.local/share/hsrd/mainnet-canary --rpc-bind 127.0.0.1:12047 --rpc-authorization-header-file %h/.config/hsrd/mainnet-canary.authorization --authority-mode native --mainnet-canary --native-sync --p2p-discovery --maximum-outbound 8 --mining-engine --transaction-relay
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+KillSignal=SIGTERM
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/hsrd/mainnet-canary
+ReadOnlyPaths=%h/Documents/MeshMine/hsrd/target/release/hsrd
+ReadOnlyPaths=%h/.config/hsrd/mainnet-canary.authorization
+
+[Install]
+WantedBy=default.target

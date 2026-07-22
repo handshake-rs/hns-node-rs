@@ -103,13 +103,13 @@ reserved low-latency paths.
   and network-interval pins, with restart, malformed-pin, idempotence, and
   failed-commit atomicity coverage.
 - Opt-in HSD-shaped startup compaction scheduling, a checksummed atomic
-  last-run checkpoint, forced coordinator maintenance, API-v9 diagnostics, and
+  last-run checkpoint, forced coordinator maintenance, API-v10 diagnostics, and
   unclean RocksDB reopen evidence.
 - Opt-in HSD-horizon undo retirement with atomic checkpoints, bounded startup
   catch-up, pruning-aware pinned roots, and fail-closed deep-reorg handling.
 - Correct pre-state header commitment and durable resulting-root semantics.
 
-### Live shadow networking
+### Native mainnet networking
 
 - Exact bounded HNS wire codecs and pinned HSD wire fixtures.
 - Bounded inbound/outbound peers, handshake/timeouts, scoring, and reconnect.
@@ -120,10 +120,10 @@ reserved low-latency paths.
 - Explicitly acknowledged bounded active-state batches through the existing
   contextual state/reorg pipeline, with restart resumption and exact
   contextual-invalid ancestry that excludes local fault classes.
-- External pinned-HSD canonical block/next-header root comparison using API-v9
+- Optional offline pinned-HSD canonical block/next-header root comparison using API-v10
   material, coherent-tip retries, and a bounded checksummed evidence checkpoint
   that counts restarts and reorganizations without influencing authority.
-- Durable non-active shadow bodies and restartable checkpoints.
+- Durable native block bodies and restartable checkpoints.
 - Bounded read-only header/body/transaction serving and diagnostics.
 - Reserved critical outbound queues and parallel fan-out.
 

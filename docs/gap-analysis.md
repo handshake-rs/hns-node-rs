@@ -78,7 +78,7 @@
   and pinned-root reachable union. Malformed pins and failed commits preserve
   every node.
 - Opt-in height-gated startup scheduling and forced serialized maintenance with
-  an atomic checksummed last-run checkpoint, API-v9 status, and unclean RocksDB
+  an atomic checksummed last-run checkpoint, API-v10 status, and unclean RocksDB
   reopen evidence.
 - Exact HSD `pruneAfterHeight`/`keepBlocks` constants and opt-in atomic undo
   retirement, including startup catch-up, pruning-aware pinned-root compaction,
@@ -160,7 +160,7 @@
   contextual state/reorg pipeline, with restart resumption, exact failed-root
   attribution, local-fault separation, shutdown-responsive eight-block direct
   slices, and full-configured-bound atomic reorganizations.
-- API-v9 next-header committed-root diagnostics and a pinned-source external HSD comparator
+- API-v10 next-header committed-root diagnostics and a pinned-source external HSD comparator
   with coherent-tip retries, provisional/confirmed root labels, and bounded
   checksummed restart/reorganization evidence.
 - Non-authoritative diagnostics; network data cannot grant mining authority.

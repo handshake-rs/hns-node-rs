@@ -29,7 +29,7 @@ snapshots only.
   native runtime also exposes `/api/v1/peers`, `/api/v1/sync`, and
   `/api/v1/native-sync`. `/api/v1/shadow-sync` is a read-only compatibility
   alias.
-- API-v9 node status reports whether startup name-tree compaction is enabled,
+- API-v10 node status reports whether startup name-tree compaction is enabled,
   its height interval, and the last checkpoint's height, tip, retained roots,
   and before/retained/deleted node counts. It also reports whether undo
   retirement is enabled, the exact network `pruneAfterHeight` and `keepBlocks`

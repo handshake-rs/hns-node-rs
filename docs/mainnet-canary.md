@@ -58,5 +58,25 @@ atomic `getparentauthority` response. ASIC service must be started only through
 `AuthoritativeHsrdMiningStream` and `HsrdGatewayActivationRequest`; the
 observed/staged stream cannot construct that capability.
 
+For restart-surviving operation, build the release binary and install the
+provided user-service unit:
+
+```sh
+cargo build --locked --release --manifest-path hsrd/Cargo.toml \
+  -p hns-node --bin hsrd
+install -d -m 700 "$HOME/.config/systemd/user" \
+  "$HOME/.config/hsrd" "$HOME/.local/share/hsrd/mainnet-canary"
+install -m 600 hsrd/deploy/meshmine-hsrd-mainnet-canary.service \
+  "$HOME/.config/systemd/user/meshmine-hsrd-mainnet-canary.service"
+systemctl --user daemon-reload
+systemctl --user enable --now meshmine-hsrd-mainnet-canary.service
+```
+
+Create the mode-0600 Authorization-value file before starting the unit. The
+service has no HSD argument or dependency, is restricted to its state and auth
+paths, restarts on failure, and delivers SIGTERM for a clean checkpoint and
+shutdown marker. Review the `%h/Documents/MeshMine` paths if the checkout lives
+elsewhere.
+
 This profile is a bounded canary mechanism, not production eligibility,
 independent review, or permission to turn incomplete readiness flags on.

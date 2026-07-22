@@ -1,13 +1,15 @@
-# Live HSD shadow parity
+# Optional offline HSD differential parity
 
-Live comparison is an external qualification boundary. It reads hsrd's
-non-authoritative active state and a separately running pinned HSD node; it
-does not feed HSD answers into consensus, change fork choice, or grant a mining
-capability.
+This legacy-named comparison tool is optional offline qualification. Native
+mainnet operation neither launches nor queries HSD and does not require this
+tool to remain running. When an operator deliberately runs a bounded audit, it
+reads hsrd's non-authoritative active state and a separately running pinned HSD
+node; it never feeds HSD answers into consensus, changes fork choice, or grants
+a mining capability.
 
 ## Comparison material
 
-API-v9 `/api/v1/status` exposes the active block hash/height and
+API-v10 `/api/v1/status` exposes the active block hash/height and
 `active_state_resulting_root`. The latter is the interval-committed name-tree
 root that the next block must place in its header. HSD applies name changes to
 a working transaction every block but commits that transaction only at the

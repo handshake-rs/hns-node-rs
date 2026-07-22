@@ -4696,6 +4696,33 @@ impl ShutdownSignal {
     }
 
     pub async fn wait(self) {
+        #[cfg(unix)]
+        {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut terminate) => {
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "failed to wait for ctrl-c shutdown signal");
+                            }
+                        }
+                        signal = terminate.recv() => {
+                            if signal.is_none() {
+                                tracing::warn!("SIGTERM shutdown stream closed unexpectedly");
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to install SIGTERM shutdown handler");
+                    if let Err(error) = tokio::signal::ctrl_c().await {
+                        tracing::warn!(%error, "failed to wait for ctrl-c shutdown signal");
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
         if let Err(error) = tokio::signal::ctrl_c().await {
             tracing::warn!(%error, "failed to wait for ctrl-c shutdown signal");
         }
