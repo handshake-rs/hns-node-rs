@@ -32,7 +32,7 @@ use hns_urkel::{
 };
 use serde::{Deserialize, Serialize};
 
-const BLOCK_UNDO_VERSION: u32 = 5;
+const BLOCK_UNDO_VERSION: u32 = 6;
 const NAME_TREE_SNAPSHOT_PIN_VERSION: u32 = 1;
 pub const NAME_TREE_SNAPSHOT_PIN_PREFIX: &[u8] = b"name-tree-snapshot/v1/";
 const NAME_TREE_SNAPSHOT_PIN_BODY_SIZE: usize = 4 + 4 + 32 + 32;
@@ -88,12 +88,15 @@ pub struct StateSummary {
     pub coins_created: usize,
     pub coins_spent: usize,
     pub names_changed: usize,
-    /// Authenticated name-tree root committed by this block header. Handshake
-    /// commits to the parent/pre-state root, not the resulting post-state root.
+    /// Working authenticated name-tree root before this block's transitions.
+    /// HSD commits this working tree only at `tree_interval` boundaries.
     pub inherited_tree_root: TreeRoot,
-    /// Authenticated name-tree root after this block's name transitions. This is
-    /// the root the next block must commit to.
+    /// Working authenticated name-tree root after this block's transitions.
     pub resulting_tree_root: TreeRoot,
+    /// Interval-committed root checked against this block header.
+    pub inherited_committed_tree_root: TreeRoot,
+    /// Interval-committed root inherited by the next block.
+    pub resulting_committed_tree_root: TreeRoot,
     /// Exact full or checkpoint-backed validation route selected by the chain
     /// coordinator. Historical assumptions are honored only when this equals
     /// HSD's complete canonical checkpoint plan.
@@ -113,6 +116,8 @@ pub struct BlockUndo {
     pub height: Height,
     pub previous_tree_root: TreeRoot,
     pub resulting_tree_root: TreeRoot,
+    pub previous_committed_tree_root: TreeRoot,
+    pub resulting_committed_tree_root: TreeRoot,
     pub spent_coins: Vec<Coin>,
     pub created_coins: Vec<Outpoint>,
     pub airdrop_positions: Vec<u32>,
@@ -127,6 +132,8 @@ impl BlockUndo {
         writer.write_u32(self.height);
         writer.write_bytes(self.previous_tree_root.as_bytes());
         writer.write_bytes(self.resulting_tree_root.as_bytes());
+        writer.write_bytes(self.previous_committed_tree_root.as_bytes());
+        writer.write_bytes(self.resulting_committed_tree_root.as_bytes());
         writer.write_varint(self.spent_coins.len() as u64);
 
         for coin in &self.spent_coins {
@@ -164,6 +171,8 @@ impl BlockUndo {
         let height = reader.read_u32()?;
         let previous_tree_root = TreeRoot::new(reader.read_hash()?);
         let resulting_tree_root = TreeRoot::new(reader.read_hash()?);
+        let previous_committed_tree_root = TreeRoot::new(reader.read_hash()?);
+        let resulting_committed_tree_root = TreeRoot::new(reader.read_hash()?);
         let spent_count = reader.read_varint_usize("spent coins")?;
         let mut spent_coins = Vec::with_capacity(spent_count);
         for _ in 0..spent_count {
@@ -196,6 +205,8 @@ impl BlockUndo {
             height,
             previous_tree_root,
             resulting_tree_root,
+            previous_committed_tree_root,
+            resulting_committed_tree_root,
             spent_coins,
             created_coins,
             airdrop_positions,
@@ -938,17 +949,26 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         });
     }
 
-    // Handshake commits each block header to the authenticated name-tree root
-    // inherited from its parent. The current block's covenant transitions are
-    // applied only after this comparison and produce the root committed by the
-    // following block.
+    let tree_interval = services.network.params().names.tree_interval;
+    if tree_interval == 0 {
+        return Err(StateError::Codec(
+            "network name-tree snapshot interval is zero".to_owned(),
+        ));
+    }
+
+    // HSD applies name transitions to its working transaction every block but
+    // commits that transaction to the header-visible tree only at name-tree
+    // interval boundaries. Keep both roots durable so restart, reorg, mining,
+    // and historical replay all observe the same timing.
     let inherited_tree_root = load_stored_name_tree_root(snapshot)?;
     validate_persisted_name_tree_root(snapshot, inherited_tree_root)?;
+    let inherited_committed_tree_root = load_stored_name_tree_commit_root(snapshot)?;
+    validate_persisted_name_tree_root(snapshot, inherited_committed_tree_root)?;
     let committed_tree_root = TreeRoot::new(request.block.header.tree_root);
-    if committed_tree_root != inherited_tree_root {
+    if committed_tree_root != inherited_committed_tree_root {
         return Err(StateError::HeaderTreeRootMismatch {
             committed: committed_tree_root,
-            inherited: inherited_tree_root,
+            inherited: inherited_committed_tree_root,
         });
     }
 
@@ -1168,10 +1188,20 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
 
     let resulting_tree_root =
         stage_name_tree_with_overrides(snapshot, batch, inherited_tree_root, &name_overrides)?;
+    let resulting_committed_tree_root = if request.height % tree_interval == 0 {
+        resulting_tree_root
+    } else {
+        inherited_committed_tree_root
+    };
     batch.put(
         ColumnFamily::Meta,
         MetaKey::NameTreeRoot.as_bytes(),
         resulting_tree_root.as_bytes(),
+    )?;
+    batch.put(
+        ColumnFamily::Meta,
+        MetaKey::NameTreeCommitRoot.as_bytes(),
+        resulting_committed_tree_root.as_bytes(),
     )?;
 
     let previous_name_states = name_state_changes
@@ -1187,6 +1217,8 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         height: request.height,
         previous_tree_root: inherited_tree_root,
         resulting_tree_root,
+        previous_committed_tree_root: inherited_committed_tree_root,
+        resulting_committed_tree_root,
         spent_coins,
         created_coins,
         airdrop_positions: issuance.airdrop_positions.clone(),
@@ -1197,12 +1229,6 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         request.block_hash.as_bytes(),
         &undo.encode()?,
     )?;
-    let tree_interval = services.network.params().names.tree_interval;
-    if tree_interval == 0 {
-        return Err(StateError::Codec(
-            "network name-tree snapshot interval is zero".to_owned(),
-        ));
-    }
     if request.height % tree_interval == 0 {
         stage_name_tree_snapshot_pin(
             snapshot,
@@ -1210,7 +1236,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
             &NameTreeSnapshotPin {
                 height: request.height,
                 block_hash: request.block_hash,
-                root: resulting_tree_root,
+                root: resulting_committed_tree_root,
             },
         )?;
     }
@@ -1221,6 +1247,8 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         names_changed: undo.previous_name_states.len(),
         inherited_tree_root,
         resulting_tree_root,
+        inherited_committed_tree_root,
+        resulting_committed_tree_root,
         historical_validation: services.historical_validation,
         validation: StateValidationSummary {
             relative_locks_valid: true,
@@ -1802,6 +1830,14 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
             actual: current_tree_root,
         });
     }
+    let current_committed_tree_root = load_stored_name_tree_commit_root(snapshot)?;
+    validate_persisted_name_tree_root(snapshot, current_committed_tree_root)?;
+    if current_committed_tree_root != undo.resulting_committed_tree_root {
+        return Err(StateError::UndoResultingCommittedTreeRootMismatch {
+            expected: undo.resulting_committed_tree_root,
+            actual: current_committed_tree_root,
+        });
+    }
 
     for outpoint in &undo.created_coins {
         batch.delete(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))?;
@@ -1842,6 +1878,12 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
         MetaKey::NameTreeRoot.as_bytes(),
         restored_tree_root.as_bytes(),
     )?;
+    validate_persisted_name_tree_root(snapshot, undo.previous_committed_tree_root)?;
+    batch.put(
+        ColumnFamily::Meta,
+        MetaKey::NameTreeCommitRoot.as_bytes(),
+        undo.previous_committed_tree_root.as_bytes(),
+    )?;
     stage_remove_name_tree_snapshot_pin(snapshot, batch, undo)?;
     batch.delete(ColumnFamily::Undo, request.block_hash.as_bytes())?;
 
@@ -1851,6 +1893,8 @@ pub fn disconnect_block_to_batch<T: ReadSnapshot, B: WriteBatch>(
         names_changed: undo.previous_name_states.len(),
         inherited_tree_root: current_tree_root,
         resulting_tree_root: restored_tree_root,
+        inherited_committed_tree_root: current_committed_tree_root,
+        resulting_committed_tree_root: undo.previous_committed_tree_root,
         historical_validation: HistoricalValidationPlan::full(),
         validation: StateValidationSummary {
             name_state_connected: true,
@@ -2097,7 +2141,7 @@ fn stage_remove_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
     let pin = NameTreeSnapshotPin::decode(&raw)?;
     if pin.height != undo.height
         || pin.block_hash != undo.block_hash
-        || pin.root != undo.resulting_tree_root
+        || pin.root != undo.resulting_committed_tree_root
     {
         return Err(StateError::NameTreeSnapshotPinInvariant {
             height: undo.height,
@@ -2112,7 +2156,8 @@ fn retained_name_tree_roots<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<BTreeSet<TreeRoot>, StateError> {
     let current_root = load_stored_name_tree_root(snapshot)?;
-    let mut roots = BTreeSet::from([current_root]);
+    let committed_root = load_stored_name_tree_commit_root(snapshot)?;
+    let mut roots = BTreeSet::from([current_root, committed_root]);
     let mut undos = BTreeMap::new();
     for (key, raw) in snapshot.scan_prefix(ColumnFamily::Undo, b"")? {
         let undo = BlockUndo::decode(&raw)?;
@@ -2123,12 +2168,14 @@ fn retained_name_tree_roots<T: ReadSnapshot>(
         }
         roots.insert(undo.previous_tree_root);
         roots.insert(undo.resulting_tree_root);
+        roots.insert(undo.previous_committed_tree_root);
+        roots.insert(undo.resulting_committed_tree_root);
         undos.insert(undo.block_hash, undo);
     }
 
     for pin in load_name_tree_snapshot_pins(snapshot)? {
         if let Some(undo) = undos.get(&pin.block_hash) {
-            if undo.height != pin.height || undo.resulting_tree_root != pin.root {
+            if undo.height != pin.height || undo.resulting_committed_tree_root != pin.root {
                 return Err(StateError::NameTreeSnapshotPinInvariant {
                     height: pin.height,
                     reason: "pin disagrees with its block undo".to_owned(),
@@ -2150,9 +2197,9 @@ fn retained_name_tree_roots<T: ReadSnapshot>(
             let expected_root = match pin.height.checked_add(1) {
                 Some(next_height) => match load_canonical_header(snapshot, next_height)? {
                     Some(next) => TreeRoot::new(next.header.tree_root),
-                    None => current_root,
+                    None => committed_root,
                 },
-                None => current_root,
+                None => committed_root,
             };
             if pin.root != expected_root {
                 return Err(StateError::NameTreeSnapshotPinInvariant {
@@ -2291,6 +2338,20 @@ pub fn load_stored_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeR
     let root: [u8; 32] = bytes
         .try_into()
         .map_err(|bytes: Vec<u8>| StateError::InvalidStoredTreeRootLength(bytes.len()))?;
+    Ok(TreeRoot::new(root))
+}
+
+/// Load the durable HSD interval-committed root used by block headers. This
+/// can lag the working [`load_stored_name_tree_root`] between tree intervals.
+pub fn load_stored_name_tree_commit_root<T: ReadSnapshot>(
+    snapshot: &T,
+) -> Result<TreeRoot, StateError> {
+    let bytes = snapshot
+        .get(ColumnFamily::Meta, MetaKey::NameTreeCommitRoot.as_bytes())?
+        .ok_or(StateError::MissingStoredTreeCommitRoot)?;
+    let root: [u8; 32] = bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| StateError::InvalidStoredTreeCommitRootLength(bytes.len()))?;
     Ok(TreeRoot::new(root))
 }
 
@@ -2567,6 +2628,10 @@ pub enum StateError {
     MissingStoredTreeRoot,
     #[error("durable name-tree-root metadata must contain 32 bytes, got {0}")]
     InvalidStoredTreeRootLength(usize),
+    #[error("durable name-tree-commit-root metadata is missing")]
+    MissingStoredTreeCommitRoot,
+    #[error("durable name-tree-commit-root metadata must contain 32 bytes, got {0}")]
+    InvalidStoredTreeCommitRootLength(usize),
     #[error("durable name-tree root {stored:?} does not match materialized name state {actual:?}")]
     StoredTreeRootMismatch { stored: TreeRoot, actual: TreeRoot },
     #[error("durable urkel node key {0:?} maps to conflicting record bytes")]
@@ -2586,6 +2651,13 @@ pub enum StateError {
         "undo expects current name-tree root {expected:?}, but the bound state root is {actual:?}"
     )]
     UndoResultingTreeRootMismatch {
+        expected: TreeRoot,
+        actual: TreeRoot,
+    },
+    #[error(
+        "undo expects current committed name-tree root {expected:?}, but the durable commit root is {actual:?}"
+    )]
+    UndoResultingCommittedTreeRootMismatch {
         expected: TreeRoot,
         actual: TreeRoot,
     },
@@ -2750,6 +2822,7 @@ mod tests {
         }
         .is_consensus_invalid());
         assert!(!StateError::MissingStoredTreeRoot.is_consensus_invalid());
+        assert!(!StateError::MissingStoredTreeCommitRoot.is_consensus_invalid());
         assert!(
             !StateError::ChainView("missing historical context".to_owned()).is_consensus_invalid()
         );
@@ -2863,15 +2936,105 @@ mod tests {
     }
 
     fn engine(store: MemoryStore) -> StoredStateEngine<MemoryStore> {
+        engine_for_network(store, Network::Regtest)
+    }
+
+    fn engine_for_network(store: MemoryStore, network: Network) -> StoredStateEngine<MemoryStore> {
         StoredStateEngine::with_services(
             store,
-            Network::Regtest,
+            network,
             NameFlags::NONE,
             true,
             Arc::new(AllowAllInputVerifier),
             Arc::new(RejectSpecialCoinbaseIssuance),
         )
         .expect("test engine")
+    }
+
+    #[test]
+    fn mainnet_2024_open_state_waits_for_tree_interval_commitment() {
+        let store = MemoryStore::new();
+        let mut state = engine_for_network(store.clone(), Network::Mainnet);
+        let mut opening = block(2_024, vec![coinbase(vec![open_output(b"sad")])]);
+        opening.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let opening_summary = state
+            .connect_block(ConnectBlock {
+                block_hash: opening.hash(),
+                height: 2_024,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &opening,
+            })
+            .expect("connect canonical-height OPEN shape");
+        assert_ne!(opening_summary.resulting_tree_root, TreeRoot::ZERO);
+        assert_eq!(
+            opening_summary.resulting_committed_tree_root,
+            TreeRoot::ZERO
+        );
+
+        let mut incorrectly_committed = block(2_025, vec![coinbase(Vec::new())]);
+        incorrectly_committed.header.tree_root = *opening_summary.resulting_tree_root.as_bytes();
+        assert!(matches!(
+            state.connect_block(ConnectBlock {
+                block_hash: incorrectly_committed.hash(),
+                height: 2_025,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &incorrectly_committed,
+            }),
+            Err(StateError::HeaderTreeRootMismatch { .. })
+        ));
+
+        let mut next = block(2_026, vec![coinbase(Vec::new())]);
+        next.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let next_summary = state
+            .connect_block(ConnectBlock {
+                block_hash: next.hash(),
+                height: 2_025,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &next,
+            })
+            .expect("connect post-OPEN block with retained commitment");
+        assert_eq!(
+            next_summary.resulting_tree_root,
+            opening_summary.resulting_tree_root
+        );
+        assert_eq!(next_summary.resulting_committed_tree_root, TreeRoot::ZERO);
+
+        let mut interval = block(2_052, vec![coinbase(Vec::new())]);
+        interval.header.tree_root = *TreeRoot::ZERO.as_bytes();
+        let interval_summary = state
+            .connect_block(ConnectBlock {
+                block_hash: interval.hash(),
+                height: 2_052,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &interval,
+            })
+            .expect("commit working tree at the mainnet interval");
+        assert_eq!(
+            interval_summary.resulting_committed_tree_root,
+            opening_summary.resulting_tree_root
+        );
+
+        let mut after_interval = block(2_053, vec![coinbase(Vec::new())]);
+        after_interval.header.tree_root = *opening_summary.resulting_tree_root.as_bytes();
+        state
+            .connect_block(ConnectBlock {
+                block_hash: after_interval.hash(),
+                height: 2_053,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &after_interval,
+            })
+            .expect("inherit newly committed interval root");
+
+        let snapshot = store.snapshot().expect("post-interval snapshot");
+        assert_eq!(
+            load_stored_name_tree_commit_root(&snapshot).expect("commit root"),
+            opening_summary.resulting_tree_root
+        );
     }
 
     fn address() -> Address {
@@ -3506,12 +3669,13 @@ mod tests {
         let ordinary_reward_and_fees = output_value
             .checked_sub(issuance.conjured)
             .expect("ordinary coinbase component");
-        let inherited_tree_root = {
+        let inherited_committed_tree_root = {
             let snapshot = engine.store().snapshot().expect("pre-claim snapshot");
-            verify_stored_name_tree_root(&snapshot).expect("pre-claim tree root")
+            verify_stored_name_tree_root(&snapshot).expect("pre-claim tree root");
+            load_stored_name_tree_commit_root(&snapshot).expect("pre-claim commit root")
         };
         let mut candidate = block(expected.height, vec![coinbase]);
-        candidate.header.tree_root = *inherited_tree_root.as_bytes();
+        candidate.header.tree_root = *inherited_committed_tree_root.as_bytes();
         let summary = engine
             .connect_block(ConnectBlock {
                 block_hash: candidate.hash(),
@@ -3871,7 +4035,7 @@ mod tests {
             .expect("connect second block");
 
         let mut third = block(132, vec![coinbase(vec![open_output(b"compactgamma")])]);
-        third.header.tree_root = *second_summary.resulting_tree_root.as_bytes();
+        third.header.tree_root = *second_summary.resulting_committed_tree_root.as_bytes();
         let third_hash = third.hash();
         let third_summary = state
             .connect_block(ConnectBlock {

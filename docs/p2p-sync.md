@@ -273,7 +273,7 @@ not guess a peer attribution for delayed contextual failures.
 
 ## Restart and checkpoint semantics
 
-A versioned sync checkpoint (retained by the current schema 13/profile `hsrd-mining-v9`) contains:
+A versioned sync checkpoint (retained by the current schema 14/profile `hsrd-mining-v10`) contains:
 
 - monotonically increasing sequence;
 - stage;
@@ -332,7 +332,7 @@ Diagnostics include configured endpoints, reconnect attempts, live peer
 snapshots, synchronization stage, best/active/stored tips, queue depths, orphan
 usage, received/served counts, durably failed-body count, checkpoint sequence,
 active-state connection/reorganization counts, contextual-failure count, and
-the last supervisor error. API-v8 node status separately counts valid non-active
+the last supervisor error. API-v9 node status separately counts valid non-active
 blocks and durably failed blocks and exposes the active tip's resulting
 authenticated root/height. The shadow endpoint includes an opaque runtime
 instance so external evidence can distinguish observations across restarts.

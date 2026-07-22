@@ -57,10 +57,10 @@ use hns_rpc::{
 };
 use hns_state::{
     connect_block_to_batch_with_services, decode_coin, decode_name_state,
-    disconnect_block_to_batch, load_name_tree_snapshot_pins, stage_name_tree_node_compaction,
-    validate_persisted_name_tree, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
-    BlockUndo, ConnectBlock, DisconnectBlock, NameTreeCompactionSummary, NameTreeSnapshotPin,
-    StateError, StateServices, StoredStateEngine,
+    disconnect_block_to_batch, load_name_tree_snapshot_pins, load_stored_name_tree_commit_root,
+    stage_name_tree_node_compaction, validate_persisted_name_tree, verify_stored_name_tree_root,
+    AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock,
+    NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_clean_shutdown, mark_unclean_start, open_store,
@@ -71,7 +71,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 8;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 9;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 
 const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
@@ -1523,6 +1523,13 @@ impl NodeState {
         validate_persisted_name_tree(&snapshot, durable_name_tree_root).map_err(|error| {
             anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
         })?;
+        let durable_name_tree_commit_root =
+            load_stored_name_tree_commit_root(&snapshot).map_err(|error| {
+                anyhow::anyhow!("durable name-tree commit invariant failed: {error}")
+            })?;
+        validate_persisted_name_tree(&snapshot, durable_name_tree_commit_root).map_err(
+            |error| anyhow::anyhow!("durable committed name-tree invariant failed: {error}"),
+        )?;
         let active_tip = best_block_tip_from_snapshot(&snapshot)?;
         let best_header = best_header_tip_from_snapshot(&snapshot)?;
         let undo_pruning_checkpoint = load_undo_pruning_checkpoint(&snapshot)?;
@@ -1561,6 +1568,12 @@ impl NodeState {
                     anyhow::bail!(
                         "empty active chain has non-empty durable name-tree root {:?}",
                         durable_name_tree_root
+                    );
+                }
+                if durable_name_tree_commit_root.as_bytes() != &[0; 32] {
+                    anyhow::bail!(
+                        "empty active chain has non-empty durable committed name-tree root {:?}",
+                        durable_name_tree_commit_root
                     );
                 }
                 if !name_tree_pins.is_empty() {
@@ -1616,7 +1629,9 @@ impl NodeState {
                 let mut previous_hash = BlockHash::ZERO;
                 let mut previous_work = Uint256::ZERO;
                 let mut previous_retained_tree_root = None;
+                let mut previous_retained_committed_tree_root = None;
                 let mut tip_resulting_tree_root = None;
+                let mut tip_resulting_committed_tree_root = None;
                 for (position, (height_key, hash_bytes)) in heights.iter().enumerate() {
                     let height = decode_height_key(height_key)?;
                     if usize::try_from(height).ok() != Some(position) {
@@ -1715,7 +1730,9 @@ impl NodeState {
                             );
                         }
                         previous_retained_tree_root = None;
+                        previous_retained_committed_tree_root = None;
                         tip_resulting_tree_root = None;
+                        tip_resulting_committed_tree_root = None;
                         None
                     } else {
                         if !record.status.undo_present {
@@ -1742,13 +1759,16 @@ impl NodeState {
                                 hash.to_hex()
                             );
                         }
-                        if block.header.tree_root != *undo.previous_tree_root.as_bytes() {
+                        if block.header.tree_root != *undo.previous_committed_tree_root.as_bytes() {
                             anyhow::bail!(
                                 "active block {} header root disagrees with undo pre-state",
                                 hash.to_hex()
                             );
                         }
-                        if height == 0 && undo.previous_tree_root.as_bytes() != &[0; 32] {
+                        if height == 0
+                            && (undo.previous_tree_root.as_bytes() != &[0; 32]
+                                || undo.previous_committed_tree_root.as_bytes() != &[0; 32])
+                        {
                             anyhow::bail!("active genesis undo has a non-empty pre-state root");
                         }
                         if previous_retained_tree_root
@@ -1759,9 +1779,32 @@ impl NodeState {
                                 hash.to_hex()
                             );
                         }
+                        if previous_retained_committed_tree_root.is_some_and(|root| {
+                            undo.previous_committed_tree_root.as_bytes() != &root
+                        }) {
+                            anyhow::bail!(
+                                "active block {} breaks retained committed name-tree root continuity",
+                                hash.to_hex()
+                            );
+                        }
+                        let expected_resulting_committed = if height % tree_interval == 0 {
+                            undo.resulting_tree_root
+                        } else {
+                            undo.previous_committed_tree_root
+                        };
+                        if undo.resulting_committed_tree_root != expected_resulting_committed {
+                            anyhow::bail!(
+                                "active block {} has invalid name-tree interval commitment timing",
+                                hash.to_hex()
+                            );
+                        }
                         let resulting_root = *undo.resulting_tree_root.as_bytes();
+                        let resulting_committed_root =
+                            *undo.resulting_committed_tree_root.as_bytes();
                         previous_retained_tree_root = Some(resulting_root);
+                        previous_retained_committed_tree_root = Some(resulting_committed_root);
                         tip_resulting_tree_root = Some(resulting_root);
+                        tip_resulting_committed_tree_root = Some(resulting_committed_root);
                         Some(undo)
                     };
                     if height % tree_interval == 0 {
@@ -1771,7 +1814,7 @@ impl NodeState {
                             )
                         })?;
                         let expected_pin_root = match undo.as_ref() {
-                            Some(undo) => *undo.resulting_tree_root.as_bytes(),
+                            Some(undo) => *undo.resulting_committed_tree_root.as_bytes(),
                             None if position + 1 < heights.len() => {
                                 let next_hash = block_hash_from_bytes(&heights[position + 1].1)?;
                                 let next = load_header_record(&snapshot, &next_hash)?.ok_or_else(
@@ -1788,7 +1831,7 @@ impl NodeState {
                                 }
                                 next.header.tree_root
                             }
-                            None => *durable_name_tree_root.as_bytes(),
+                            None => *durable_name_tree_commit_root.as_bytes(),
                         };
                         if pin.block_hash != hash || pin.root.as_bytes() != &expected_pin_root {
                             anyhow::bail!(
@@ -1812,6 +1855,15 @@ impl NodeState {
                     if durable_name_tree_root.as_bytes() != &tip_resulting_tree_root {
                         anyhow::bail!(
                             "durable name-tree root does not match the active tip's resulting root"
+                        );
+                    }
+                }
+                if let Some(tip_resulting_committed_tree_root) = tip_resulting_committed_tree_root {
+                    if durable_name_tree_commit_root.as_bytes()
+                        != &tip_resulting_committed_tree_root
+                    {
+                        anyhow::bail!(
+                            "durable name-tree commit root does not match the active tip's resulting committed root"
                         );
                     }
                 }
@@ -2075,7 +2127,7 @@ impl NodeState {
         stage_best_header_if_more_work(&snapshot, &mut batch, block_hash, validated.chainwork)?;
         drop(snapshot);
         self.store.commit(batch)?;
-        self.refresh_indexes()?;
+        self.cache_committed_block_records(std::slice::from_ref(&record))?;
 
         Ok(StoredBlockMutation {
             record,
@@ -2583,7 +2635,7 @@ impl NodeState {
         )?;
         drop(snapshot);
         self.store.commit(batch)?;
-        self.refresh_indexes()?;
+        self.cache_committed_block_records(std::slice::from_ref(&record))?;
 
         Ok(NodeBlockMutation {
             record,
@@ -2751,7 +2803,7 @@ impl NodeState {
         )?;
         drop(snapshot);
         self.store.commit(batch)?;
-        self.refresh_indexes()?;
+        self.cache_committed_block_records(std::slice::from_ref(&record))?;
 
         Ok(NodeBlockMutation {
             record,
@@ -2797,7 +2849,7 @@ impl NodeState {
             );
         }
 
-        if block.header.tree_root != *undo.previous_tree_root.as_bytes() {
+        if block.header.tree_root != *undo.previous_committed_tree_root.as_bytes() {
             anyhow::bail!("disconnect undo previous root does not match block header commitment");
         }
 
@@ -2980,7 +3032,13 @@ impl NodeState {
             .commit(batch)
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
-        self.refresh_indexes()
+        let committed_records = summary
+            .disconnected
+            .iter()
+            .chain(&summary.connected)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.cache_committed_block_records(&committed_records)
             .map_err(ChainActivationFailure::Internal)?;
 
         Ok(NodeReorgMutation {
@@ -2996,6 +3054,80 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to refresh header index: {error}"))?;
         self.blocks = StoredBlockIndex::new(self.store.clone())
             .map_err(|error| anyhow::anyhow!("failed to refresh block index: {error}"))?;
+        Ok(())
+    }
+
+    /// Publish the exact records written by a successful block commit into the
+    /// in-memory indexes without rebuilding them from the complete durable
+    /// header/block sets. The durable batch is already authoritative here. If
+    /// an incremental cache invariant ever rejects a committed record, reload
+    /// both indexes as a correctness-first recovery path.
+    fn cache_committed_block_records(&mut self, records: &[BlockIndexRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let headers = records
+            .iter()
+            .map(|record| {
+                let block = self
+                    .blocks
+                    .load_block(&record.hash)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to load committed block {} for cache publication: {error}",
+                            record.hash.to_hex()
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "committed block {} has no durable body for cache publication",
+                            record.hash.to_hex()
+                        )
+                    })?;
+                if block.hash() != record.hash {
+                    anyhow::bail!(
+                        "committed block body hash {} disagrees with index {}",
+                        block.hash().to_hex(),
+                        record.hash.to_hex()
+                    );
+                }
+                Ok(HeaderRecord {
+                    hash: record.hash,
+                    height: record.height,
+                    chainwork: record.chainwork,
+                    header: block.header,
+                    status: record.status.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let incremental = (|| -> Result<()> {
+            for header in headers {
+                self.chain.cache_record(header).map_err(|error| {
+                    anyhow::anyhow!("failed to publish committed header cache record: {error}")
+                })?;
+            }
+            for record in records {
+                self.blocks.cache_record(record.clone()).map_err(|error| {
+                    anyhow::anyhow!("failed to publish committed block cache record: {error}")
+                })?;
+            }
+            Ok(())
+        })();
+
+        if let Err(incremental_error) = incremental {
+            tracing::warn!(
+                error = %incremental_error,
+                records = records.len(),
+                "incremental index publication failed; rebuilding durable indexes"
+            );
+            self.refresh_indexes().with_context(|| {
+                format!(
+                    "failed to rebuild indexes after incremental publication error: {incremental_error}"
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -3492,9 +3624,9 @@ fn mining_snapshot_for_hash(
     let block = load_block(snapshot, &hash)?
         .ok_or_else(|| anyhow::anyhow!("mining raw block is missing for {}", hash.to_hex()))?;
     let raw_tree_root = snapshot
-        .get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())
-        .context("failed to read durable mining name-tree root")?
-        .ok_or_else(|| anyhow::anyhow!("durable mining name-tree root is missing"))?;
+        .get(ColumnFamily::Meta, MetaKey::NameTreeCommitRoot.as_bytes())
+        .context("failed to read durable mining name-tree commit root")?
+        .ok_or_else(|| anyhow::anyhow!("durable mining name-tree commit root is missing"))?;
     let next_tree_root: [u8; 32] = raw_tree_root
         .as_slice()
         .try_into()
@@ -4270,7 +4402,7 @@ pub fn init_logging(filter: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_chain::{read_canonical_hash, HeaderImport};
+    use hns_chain::{read_canonical_hash, BlockIndex, HeaderImport};
     use hns_consensus::{
         block_merkle_root, block_witness_root, ConsensusError, TransactionInputVerifier,
     };
@@ -4629,7 +4761,8 @@ mod tests {
                 ));
             }
             let snapshot = node.state.store.snapshot().expect("name-tree snapshot");
-            let tree_root = verify_stored_name_tree_root(&snapshot).expect("name-tree root");
+            let tree_root =
+                load_stored_name_tree_commit_root(&snapshot).expect("name-tree commit root");
             drop(snapshot);
             let mut block = block_with_commitments(transactions);
             block.header.prev_block = previous;
@@ -4762,6 +4895,48 @@ mod tests {
             .store_validated_alternate(request, validated)
             .expect("store alternate")
             .record
+    }
+
+    #[test]
+    fn valid_block_commit_publishes_targeted_caches_without_full_index_rescan() {
+        let store = StoreHandle::memory();
+        let mut state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let block = block_with_commitments(vec![coinbase_transaction_with_address(49, 50)]);
+        let hash = block.hash();
+        let request = NodeBlockImport::fixture(block, 0, 1);
+        let validated = state.validate_import(&request).expect("validated block");
+
+        // This unrelated malformed record makes a complete header-index reload
+        // fail. A valid committed block only needs to publish its own durable
+        // header/block records into the already validated in-memory indexes.
+        let mut poison = store.batch();
+        poison
+            .put(ColumnFamily::Headers, &[0xfe; 32], &[0x01])
+            .expect("poison header");
+        store.commit(poison).expect("commit poison");
+
+        let stored = state
+            .store_validated_alternate(request, validated)
+            .expect("targeted cache publication");
+        assert_eq!(stored.record.hash, hash);
+        assert_eq!(
+            state
+                .chain
+                .header(&hash)
+                .expect("cached header")
+                .unwrap()
+                .hash,
+            hash
+        );
+        assert_eq!(
+            state.blocks.block(&hash).expect("cached block").unwrap(),
+            stored.record
+        );
+        assert!(
+            StoredHeaderIndex::new(store).is_err(),
+            "poison must prove that a full durable-index scan would fail"
+        );
     }
 
     #[test]
@@ -5011,6 +5186,93 @@ mod tests {
             Some(2)
         );
         assert!(node.mining_snapshot().is_none());
+    }
+
+    #[test]
+    fn mining_snapshot_uses_interval_committed_name_root() {
+        let mut node = NodeService::new(active_state_shadow_config());
+        let store = node.state.store.clone();
+        node.state.state_engine = StoredStateEngine::with_services(
+            store,
+            Network::Regtest,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+        .expect("fixture input verifier");
+        let records = connect_fixture_chain(&mut node, 200, None);
+        let spend_txid = node
+            .state
+            .blocks
+            .load_block(&records[198].hash)
+            .expect("load spend source")
+            .expect("spend source block")
+            .transactions[0]
+            .txid();
+
+        let mut opening = block_with_commitments(vec![
+            coinbase_transaction_with_tag(201, 50),
+            open_transaction(
+                b"mining-interval-root",
+                Outpoint {
+                    txid: spend_txid,
+                    index: 0,
+                },
+            ),
+        ]);
+        opening.header.prev_block = records[200].hash;
+        opening.header.nonce = 211;
+        let opening = node
+            .connect_block(NodeBlockImport::fixture(opening, 201, 202))
+            .expect("connect non-interval OPEN");
+
+        let snapshot = node.state.store.snapshot().expect("post-OPEN snapshot");
+        let working_root = verify_stored_name_tree_root(&snapshot).expect("working root");
+        let committed_root = load_stored_name_tree_commit_root(&snapshot).expect("committed root");
+        assert_ne!(working_root, committed_root);
+        assert_eq!(committed_root.as_bytes(), &[0; 32]);
+        drop(snapshot);
+        assert_eq!(
+            node.observed_mining_snapshot()
+                .expect("observed snapshot")
+                .expect("active mining snapshot")
+                .next_tree_root,
+            *committed_root.as_bytes()
+        );
+
+        let mut previous = opening.hash;
+        for height in 202..=205 {
+            let snapshot = node.state.store.snapshot().expect("pre-block snapshot");
+            let header_root =
+                load_stored_name_tree_commit_root(&snapshot).expect("header commit root");
+            drop(snapshot);
+            let mut block = block_with_commitments(vec![coinbase_transaction_with_tag(height, 50)]);
+            block.header.prev_block = previous;
+            block.header.tree_root = *header_root.as_bytes();
+            block.header.nonce = height.saturating_add(10);
+            previous = node
+                .connect_block(NodeBlockImport::fixture(
+                    block,
+                    height,
+                    u64::from(height) + 1,
+                ))
+                .unwrap_or_else(|error| panic!("connect interval height {height}: {error}"))
+                .hash;
+        }
+
+        let snapshot = node.state.store.snapshot().expect("interval snapshot");
+        let resulting_commit =
+            load_stored_name_tree_commit_root(&snapshot).expect("resulting commit root");
+        assert_eq!(resulting_commit, working_root);
+        drop(snapshot);
+        assert_eq!(
+            node.observed_mining_snapshot()
+                .expect("observed snapshot")
+                .expect("active mining snapshot")
+                .next_tree_root,
+            *working_root.as_bytes()
+        );
     }
 
     #[test]

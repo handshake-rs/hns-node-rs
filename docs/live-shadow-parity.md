@@ -7,10 +7,11 @@ capability.
 
 ## Comparison material
 
-API-v8 `/api/v1/status` exposes the active block hash/height and
-`active_state_resulting_root`. The latter is the authenticated name-tree root
-after applying the active tip. Handshake block `H` commits the root inherited
-from `H-1`, so comparison at hsrd height `H` uses:
+API-v9 `/api/v1/status` exposes the active block hash/height and
+`active_state_resulting_root`. The latter is the interval-committed name-tree
+root that the next block must place in its header. HSD applies name changes to
+a working transaction every block but commits that transaction only at the
+network `treeInterval`; comparison at hsrd height `H` therefore uses:
 
 - HSD's canonical block hash at `H`; and
 - the `treeroot` committed by HSD's canonical header at `H+1`.

@@ -24,8 +24,8 @@ bounded mempool, future-template, and durable solved-block publication
 foundation. Network data remains non-authoritative, and the mining engine cannot
 authorize jobs or publish solved blocks without the private authority capability. An explicitly
 acknowledged active-state sync mode can now connect downloaded bodies through
-the same atomic consensus pipeline, but it remains non-authoritative. API-v8
-exposes the exact post-tip authenticated root, and the external comparison
+the same atomic consensus pipeline, but it remains non-authoritative. API-v9
+exposes the exact next-header interval-committed root, and the external comparison
 runner can check it against a pinned live HSD node without feeding oracle data
 back into consensus.
 
@@ -47,13 +47,15 @@ Implemented:
 - Separate durable best-header and active-best-block bindings.
 - Strict greater-work activation; equal-work branches preserve the existing
   first-seen tip.
-- Schema version **13**, storage profile **`hsrd-mining-v9`**, explicit clean
-  reindex behavior, durable name-tree-root/content-addressed-node and HSD
+- Schema version **14**, storage profile **`hsrd-mining-v10`**, explicit clean
+  reindex behavior, durable working and interval-committed name-tree-root
+  bindings/content-addressed nodes and HSD
   airdrop-field bindings, versioned checksummed network-interval name-tree
   snapshot pins, hash-keyed deployment-state caches, and a checksummed
   synchronization checkpoint.
-- Startup checks that compare durable name-tree-root metadata against the
-  materialized name-state column family.
+- Startup checks that compare the durable working name-tree root against the
+  materialized name-state column family and validate the separately retained
+  interval-committed root.
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
   block/header undo status and advances a checksummed checkpoint; startup
@@ -194,7 +196,7 @@ Implemented:
   commits leave all records unchanged.
 - HSD-shaped opt-in startup scheduling with a nonzero block-height interval
   (10,000 by default), a checksummed last-run checkpoint committed in the same
-  batch as deletions, manual serialized maintenance, and API-v8 status counts.
+  batch as deletions, manual serialized maintenance, and API-v9 status counts.
 - Optional HSD-shaped undo retirement preserves heights through
   `pruneAfterHeight` and the newest `keepBlocks`, advances a checksummed
   checkpoint in the same batch as each status/undo deletion, preserves
@@ -408,9 +410,11 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 
 ## Storage migration
 
-Schema version 13 and storage profile `hsrd-mining-v9` add checksummed
-network-interval name-tree snapshot pins and retained-root node compaction to
-schema 12's content-addressed authenticated nodes and path-local proof reads.
+Schema version 14 and storage profile `hsrd-mining-v10` add HSD's separate
+working and interval-committed name-tree roots to schema 13's checksummed
+network-interval snapshot pins, retained-root node compaction,
+content-addressed authenticated nodes, and path-local proof reads. Block undo
+version 6 carries both root pairs across disconnect and restart recovery.
 The optional undo-retirement checkpoint uses the existing snapshots namespace;
 once present, `--prune-undo-history` is required on subsequent opens. Existing
 pre-authority databases must be reindexed. No implicit in-place migration is

@@ -9,8 +9,9 @@
 - Exact unsigned 256-bit chainwork and durable header/block/raw-body indexes.
 - Memory and RocksDB stores behind typed traits, atomic batches, true RocksDB
   snapshots, and a read-your-writes reorganization overlay.
-- Schema version 13, profile `hsrd-mining-v9`, network, genesis, epoch,
-  mandatory name-tree-root/content-addressed-node and HSD airdrop-field
+- Schema version 14, profile `hsrd-mining-v10`, network, genesis, epoch,
+  mandatory working/interval-committed name-tree-root bindings,
+  content-addressed nodes, and HSD airdrop-field
   bindings, checksummed network-interval root pins, hash-keyed deployment-state
   caches, checksummed sync checkpoint, and a bounded checksummed solved-block
   publication namespace.
@@ -74,7 +75,7 @@
   and pinned-root reachable union. Malformed pins and failed commits preserve
   every node.
 - Opt-in height-gated startup scheduling and forced serialized maintenance with
-  an atomic checksummed last-run checkpoint, API-v8 status, and unclean RocksDB
+  an atomic checksummed last-run checkpoint, API-v9 status, and unclean RocksDB
   reopen evidence.
 - Exact HSD `pruneAfterHeight`/`keepBlocks` constants and opt-in atomic undo
   retirement, including startup catch-up, pruning-aware pinned-root compaction,
@@ -136,7 +137,7 @@
   contextual state/reorg pipeline, with restart resumption, exact failed-root
   attribution, local-fault separation, shutdown-responsive eight-block direct
   slices, and full-configured-bound atomic reorganizations.
-- API-v8 post-tip root diagnostics and a pinned-source external HSD comparator
+- API-v9 next-header committed-root diagnostics and a pinned-source external HSD comparator
   with coherent-tip retries, provisional/confirmed root labels, and bounded
   checksummed restart/reorganization evidence.
 - Non-authoritative diagnostics; network data cannot grant mining authority.

@@ -83,7 +83,7 @@ but peer transaction admission remains fail closed and solved-block staging,
 connection, and publication require the same private authority capability as
 the existing authoritative mining boundary.
 
-API-v8 exposes the active tip's resulting authenticated root for external
+API-v9 exposes the active tip's next-header interval-committed root for external
 qualification. `compare-hsrd-hsd-shadow.py` reads that material and a pinned
 HSD node, but its observations and evidence checkpoint never enter the store,
 fork-choice logic, validation services, mining event hub, or authority permit.

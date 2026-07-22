@@ -37,7 +37,8 @@ reserved low-latency paths.
 - Sequence-consistent RocksDB snapshots.
 - Atomic read-your-writes multi-block reorganizations.
 - Separate best-header and active-block bindings.
-- Schema 13/profile `hsrd-mining-v9`, durable name-tree-root,
+- Schema 14/profile `hsrd-mining-v10`, durable working and interval-committed
+  name-tree roots,
   content-addressed authenticated nodes, and HSD airdrop-field bindings,
   checksummed network-interval root pins, hash-keyed deployment-state caches, a
   checksummed synchronization checkpoint, and a versioned solved-block
@@ -102,7 +103,7 @@ reserved low-latency paths.
   and network-interval pins, with restart, malformed-pin, idempotence, and
   failed-commit atomicity coverage.
 - Opt-in HSD-shaped startup compaction scheduling, a checksummed atomic
-  last-run checkpoint, forced coordinator maintenance, API-v8 diagnostics, and
+  last-run checkpoint, forced coordinator maintenance, API-v9 diagnostics, and
   unclean RocksDB reopen evidence.
 - Opt-in HSD-horizon undo retirement with atomic checkpoints, bounded startup
   catch-up, pruning-aware pinned roots, and fail-closed deep-reorg handling.
@@ -119,7 +120,7 @@ reserved low-latency paths.
 - Explicitly acknowledged bounded active-state batches through the existing
   contextual state/reorg pipeline, with restart resumption and exact
   contextual-invalid ancestry that excludes local fault classes.
-- External pinned-HSD canonical block/post-tip root comparison using API-v8
+- External pinned-HSD canonical block/next-header root comparison using API-v9
   material, coherent-tip retries, and a bounded checksummed evidence checkpoint
   that counts restarts and reorganizations without influencing authority.
 - Durable non-active shadow bodies and restartable checkpoints.

@@ -7,10 +7,10 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **13** and the storage profile is
-**`hsrd-mining-v9`**. This is an intentional clean-reindex boundary.
+The current persistent schema version is **14** and the storage profile is
+**`hsrd-mining-v10`**. This is an intentional clean-reindex boundary.
 
-Version 13 contains the authority, state, shadow-synchronization, and mining
+Version 14 contains the authority, state, shadow-synchronization, and mining
 publication schema, durable HSD airdrop duplicate prevention, active-chain
 deployment-state persistence, content-addressed authenticated name nodes, and
 durable interval-root retention metadata:
@@ -18,9 +18,11 @@ durable interval-root retention metadata:
 - granular block-status bit assignments;
 - spent output address in the UTXO `Coin` codec;
 - expanded HSD-compatible `NameState` encoding;
-- block undo version 5 with previous/resulting name-tree roots and airdrop
-  positions to clear on disconnect;
-- mandatory 32-byte `name-tree-root` metadata binding;
+- block undo version 6 with previous/resulting working and interval-committed
+  name-tree roots plus airdrop positions to clear on disconnect;
+- mandatory 32-byte `name-tree-root` working-state metadata binding;
+- mandatory 32-byte `name-tree-commit-root` binding for HSD's last
+  `treeInterval` commitment used by candidate headers and mining templates;
 - canonical content-addressed `name_tree_nodes` records keyed by their exact
   HSD/Urkel node hash and staged atomically with name-state/root changes;
 - versioned, checksummed `name-tree-snapshot/v1/<height-be>` records written in
@@ -83,13 +85,18 @@ The `meta` column family currently contains:
 - `mining-generation`
 - `chain-epoch`
 - `name-tree-root`
+- `name-tree-commit-root`
 - `airdrop-field`
 - `sync-checkpoint`
 - `clean-shutdown`
 
-The `name-tree-root` value is exactly 32 bytes and must equal the root rebuilt
-from materialized non-null `name_state` records at every committed active
-state.
+The `name-tree-root` value is exactly 32 bytes and must equal the working root
+rebuilt from materialized non-null `name_state` records after every active
+block. `name-tree-commit-root` is also exactly 32 bytes; it advances to the
+working root only when the connected height is divisible by the network's
+name-tree interval. Candidate headers and mining templates use this committed
+root between boundaries, matching HSD's durable tree versus in-memory
+transaction split.
 
 The `airdrop-field` follows HSD's bit order: position zero is the high bit of
 byte zero. A special issuance sets its authenticated position in the same
@@ -167,7 +174,7 @@ path. The queue is bounded by configuration and by a hard maximum.
 
 ## Block status bit layout
 
-Schema version 13 preserves the existing `u32` status layout:
+Schema version 14 preserves the existing `u32` status layout:
 
 | Bit | Field | Meaning |
 |---:|---|---|
@@ -266,7 +273,7 @@ exact bytes before fixture use.
 
 ## Migration policy
 
-Schema 13/profile `hsrd-mining-v9` requires an explicit clean reindex from every
+Schema 14/profile `hsrd-mining-v10` requires an explicit clean reindex from every
 prior handoff. No automatic in-place migration is attempted while `hsrd`
 remains pre-authority. A failed or interrupted reindex must not modify the
 previous database.
@@ -304,7 +311,7 @@ coordinator.
 The node coordinator exposes forced maintenance and HSD-shaped opt-in startup
 scheduling. A nonzero height interval (10,000 by default) prevents repeated
 work at the same tip. The deletion set and checksummed height/tip/count
-checkpoint commit in one batch; malformed checkpoints fail startup. API-v8
+checkpoint commit in one batch; malformed checkpoints fail startup. API-v9
 status reports the configured policy and last result. Unclean RocksDB reopen
 tests verify that the checkpoint and compacted node set remain synchronized.
 

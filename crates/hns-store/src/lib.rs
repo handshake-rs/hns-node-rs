@@ -13,11 +13,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v9";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v10";
 
 /// HSD's MSB-first spent-allocation field contains 216,199 airdrop positions
 /// followed by 1,358 faucet positions.
@@ -272,6 +272,7 @@ pub enum MetaKey {
     MiningGeneration,
     StorageProfile,
     NameTreeRoot,
+    NameTreeCommitRoot,
     AirdropField,
     SyncCheckpoint,
     ChainEpoch,
@@ -289,6 +290,7 @@ impl MetaKey {
             Self::MiningGeneration => b"mining-generation",
             Self::StorageProfile => b"storage-profile",
             Self::NameTreeRoot => b"name-tree-root",
+            Self::NameTreeCommitRoot => b"name-tree-commit-root",
             Self::AirdropField => b"airdrop-field",
             Self::SyncCheckpoint => b"sync-checkpoint",
             Self::ChainEpoch => b"chain-epoch",
@@ -328,6 +330,8 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
     let schema = snapshot.get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())?;
     let profile = snapshot.get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())?;
     let name_tree_root = snapshot.get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())?;
+    let name_tree_commit_root =
+        snapshot.get(ColumnFamily::Meta, MetaKey::NameTreeCommitRoot.as_bytes())?;
     let airdrop_field = snapshot.get(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes())?;
 
     match schema {
@@ -363,6 +367,18 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
                     name_tree_root.len()
                 )));
             }
+            let name_tree_commit_root = name_tree_commit_root.ok_or_else(|| {
+                StoreError::Schema(
+                    "schema marker exists without a durable name-tree-commit-root binding; a clean reindex is required"
+                        .to_owned(),
+                )
+            })?;
+            if name_tree_commit_root.len() != 32 {
+                return Err(StoreError::Schema(format!(
+                    "durable name-tree-commit-root binding must contain 32 bytes, got {}; a clean reindex is required",
+                    name_tree_commit_root.len()
+                )));
+            }
             let airdrop_field = airdrop_field.ok_or_else(|| {
                 StoreError::Schema(
                     "schema marker exists without a durable airdrop-field binding; a clean reindex is required"
@@ -380,6 +396,7 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
         None => {
             if profile.is_some()
                 || name_tree_root.is_some()
+                || name_tree_commit_root.is_some()
                 || airdrop_field.is_some()
                 || !snapshot_is_empty(&snapshot)?
             {
@@ -403,6 +420,11 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
             batch.put(
                 ColumnFamily::Meta,
                 MetaKey::NameTreeRoot.as_bytes(),
+                &[0; 32],
+            )?;
+            batch.put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
                 &[0; 32],
             )?;
             batch.put(
@@ -1117,6 +1139,12 @@ mod tests {
         );
         assert_eq!(
             snapshot
+                .get(ColumnFamily::Meta, MetaKey::NameTreeCommitRoot.as_bytes())
+                .expect("commit root"),
+            Some(vec![0; 32])
+        );
+        assert_eq!(
+            snapshot
                 .get(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes())
                 .expect("airdrop field"),
             Some(vec![0; AIRDROP_FIELD_BYTES])
@@ -1288,6 +1316,13 @@ mod tests {
                 &[0; 32],
             )
             .expect("root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                &[0; 32],
+            )
+            .expect("commit root");
         missing.commit(batch).expect("commit missing-field store");
         assert!(matches!(
             initialize_schema(&missing),
@@ -1320,6 +1355,13 @@ mod tests {
         batch
             .put(
                 ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                &[0; 32],
+            )
+            .expect("commit root");
+        batch
+            .put(
+                ColumnFamily::Meta,
                 MetaKey::AirdropField.as_bytes(),
                 &[0; AIRDROP_FIELD_BYTES - 1],
             )
@@ -1330,6 +1372,78 @@ mod tests {
         assert!(matches!(
             initialize_schema(&malformed),
             Err(StoreError::Schema(message)) if message.contains(&AIRDROP_FIELD_BYTES.to_string())
+        ));
+    }
+
+    #[test]
+    fn initialize_schema_rejects_missing_or_malformed_name_tree_commit_root() {
+        let missing = MemoryStore::new();
+        let mut batch = missing.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION),
+            )
+            .expect("schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )
+            .expect("profile");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                &[0; 32],
+            )
+            .expect("root");
+        missing
+            .commit(batch)
+            .expect("commit missing commit-root store");
+        assert!(matches!(
+            initialize_schema(&missing),
+            Err(StoreError::Schema(message)) if message.contains("name-tree-commit-root")
+        ));
+
+        let malformed = MemoryStore::new();
+        let mut batch = malformed.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(SCHEMA_VERSION),
+            )
+            .expect("schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                STORAGE_PROFILE,
+            )
+            .expect("profile");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                &[0; 32],
+            )
+            .expect("root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                &[0; 31],
+            )
+            .expect("commit root");
+        malformed
+            .commit(batch)
+            .expect("commit malformed commit-root store");
+        assert!(matches!(
+            initialize_schema(&malformed),
+            Err(StoreError::Schema(message)) if message.contains("32 bytes")
         ));
     }
 

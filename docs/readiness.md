@@ -98,7 +98,7 @@ Implemented:
 - Validated mark-and-sweep compaction retaining the current, undo, and pinned
   root union, including idempotence and failed-commit atomicity evidence.
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
-  atomic checksummed last-run checkpoint, API-v8 diagnostics, and unclean
+  atomic checksummed last-run checkpoint, API-v9 diagnostics, and unclean
   RocksDB reopen evidence.
 - Exact HSD undo-retention horizons with opt-in atomic retirement, bounded
   startup catch-up, pruning-aware pin/compaction validation, and deep-reorg
@@ -145,7 +145,7 @@ Implemented:
   eight-block shutdown-responsive direct slices, full-bound atomic
   reorganizations, exact contextual-invalid ancestry, and fail-closed
   local-fault separation;
-- API-v8 post-tip root material plus a pinned-source, race-safe external HSD
+- API-v9 next-header committed-root material plus a pinned-source, race-safe external HSD
   block/root comparator with checksummed bounded evidence and explicit
   restart/reorganization accounting;
 - bounded read-only header, inventory, block, and transaction serving;
