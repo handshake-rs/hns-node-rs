@@ -525,12 +525,12 @@ fn consensus_readiness() -> RpcConsensusReadiness {
         signature_backend: true,
         input_authorization_fail_closed: true,
         relative_sequence_locks: true,
-        scripts: false,
+        scripts: true,
         covenant_linkage: true,
-        contextual_covenants: false,
-        claims_and_airdrops: false,
-        name_state: false,
-        urkel_roots: false,
+        contextual_covenants: true,
+        claims_and_airdrops: true,
+        name_state: true,
+        urkel_roots: true,
         sequence_consistent_snapshots: true,
         durable_store_identity: true,
         side_chain_storage: true,
@@ -8461,6 +8461,25 @@ mod tests {
             .iter()
             .any(|blocker| blocker.contains("not synchronized")));
         assert!(!authority.mainnet_canary_active);
+    }
+
+    #[test]
+    fn native_functional_readiness_leaves_only_external_qualification_gates() {
+        let readiness = consensus_readiness();
+        assert!(readiness.scripts);
+        assert!(readiness.contextual_covenants);
+        assert!(readiness.claims_and_airdrops);
+        assert!(readiness.name_state);
+        assert!(readiness.urkel_roots);
+        assert!(!readiness.historical_replay);
+        assert!(!readiness.invalid_corpus);
+        assert_eq!(
+            readiness_blockers(&readiness),
+            vec![
+                "complete historical mainnet replay".to_owned(),
+                "invalid and mutated corpus parity".to_owned(),
+            ]
+        );
     }
 
     #[test]
