@@ -211,11 +211,14 @@ Implemented:
   after direct active-chain connections;
 - contextual ordinary-transaction re-admission after disconnects and
   reorganizations, with older disconnected name updates taking priority;
+- HSD mainnet standardness, all-network standard script flags, dust and
+  absurd-fee policy pinned to the deterministic HSD oracle;
 - mining-engine readiness and queue diagnostics.
 
 Remaining:
 
-- complete HSD mempool standardness/replacement policy and claim/airdrop relay;
+- HSD free-relay priority/rate limiting, expiry/fee-based eviction, and special
+  claim/airdrop relay including replacement claims;
 - full-mainnet active-state IBD and live HSD state/root qualification;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
 - native mainnet authority qualification.

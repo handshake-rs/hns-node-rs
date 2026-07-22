@@ -15,7 +15,9 @@ use hns_consensus::{
     ConsensusError, SequenceLockView, TransactionInputVerifier, MAX_BLOCK_SIGOPS,
     WITNESS_SCALE_FACTOR,
 };
-use hns_primitives::{Amount, Coin, CovenantKind, Height, Outpoint, Transaction, Txid};
+use hns_primitives::{
+    Amount, Coin, CovenantKind, Height, Outpoint, Output, Transaction, Txid, MAX_BLOCK_WEIGHT,
+};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_TRANSACTIONS: usize = 50_000;
@@ -31,6 +33,12 @@ pub const MAX_ORPHAN_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PACKAGE_MEMBERS: usize = 1_000;
 pub const MAX_TX_SIGOPS: u32 = MAX_BLOCK_SIGOPS / 5;
 pub const BYTES_PER_SIGOP: usize = 20;
+pub const HSD_MAX_STANDARD_TX_VERSION: u32 = 0;
+pub const HSD_MAX_STANDARD_TX_WEIGHT: usize = MAX_BLOCK_WEIGHT / 10;
+pub const HSD_MAX_P2WSH_STACK: usize = 100;
+pub const HSD_MAX_P2WSH_PUSH: usize = 80;
+pub const HSD_MAX_P2WSH_SIZE: usize = 3_600;
+pub const HSD_ABSURD_FEE_FACTOR: Amount = 10_000;
 /// HSD's pinned default minimum relay fee in atomic units per 1,000 policy
 /// virtual bytes. Network-specific HSD defaults currently use this same value.
 pub const HSD_MINIMUM_RELAY_FEE_RATE: Amount = 1_000;
@@ -56,6 +64,123 @@ pub fn minimum_policy_fee(policy_size: usize, rate: Amount) -> Amount {
         rate
     } else {
         u64::try_from(fee).unwrap_or(u64::MAX)
+    }
+}
+
+fn standardness_rejection(transaction: &Transaction) -> Option<&'static str> {
+    if transaction.version > HSD_MAX_STANDARD_TX_VERSION {
+        return Some("version");
+    }
+    if transaction_weight(transaction) > HSD_MAX_STANDARD_TX_WEIGHT {
+        return Some("tx-size");
+    }
+    let mut nulldata = 0usize;
+    for output in &transaction.outputs {
+        let address = &output.address;
+        let is_nulldata = address.version == 31;
+        if address.version != 0 && !is_nulldata {
+            return Some("address");
+        }
+        if is_nulldata {
+            nulldata = nulldata.saturating_add(1);
+            continue;
+        }
+        if matches!(output.covenant.kind, CovenantKind::Unknown(_)) {
+            return Some("covenant");
+        }
+        if matches!(output.covenant.kind, CovenantKind::None | CovenantKind::Bid) {
+            let dust_threshold = standard_output_dust_threshold(output, HSD_MINIMUM_RELAY_FEE_RATE);
+            if output.value < dust_threshold {
+                return Some("dust");
+            }
+        }
+    }
+    (nulldata > 1).then_some("multi-op-return")
+}
+
+pub fn standard_output_dust_threshold(output: &Output, rate: Amount) -> Amount {
+    if !matches!(output.covenant.kind, CovenantKind::None | CovenantKind::Bid)
+        || output.address.version == 31
+    {
+        return 0;
+    }
+    minimum_policy_fee(output.encode().len().saturating_add(67), rate).saturating_mul(3)
+}
+
+fn has_standard_inputs(transaction: &Transaction, input_coins: &[Coin]) -> bool {
+    transaction
+        .inputs
+        .iter()
+        .zip(input_coins)
+        .all(|(input, coin)| standard_witness(&input.witness.items, &coin.address))
+}
+
+fn standard_witness(items: &[Vec<u8>], address: &hns_primitives::Address) -> bool {
+    if items.is_empty() {
+        return true;
+    }
+    if address.version == 0 && address.hash.len() == 20 {
+        return items.len() == 2 && items[0].len() == 65 && items[1].len() == 33;
+    }
+    if address.version == 0 && address.hash.len() == 32 {
+        let Some((redeem, arguments)) = items.split_last() else {
+            return false;
+        };
+        if arguments.len() > HSD_MAX_P2WSH_STACK
+            || arguments
+                .iter()
+                .any(|argument| argument.len() > HSD_MAX_P2WSH_PUSH)
+            || redeem.len() > HSD_MAX_P2WSH_SIZE
+        {
+            return false;
+        }
+        if redeem.len() == 35 && redeem[0] == 33 && redeem[34] == 0xac {
+            return arguments.len() == 1 && arguments[0].len() == 65;
+        }
+        if redeem.len() == 25
+            && redeem[0] == 0x76
+            && redeem[1] == 0xc0
+            && redeem[2] == 20
+            && redeem[23] == 0x88
+            && redeem[24] == 0xac
+        {
+            return arguments.len() == 2 && arguments[0].len() == 65 && arguments[1].len() == 33;
+        }
+        if let Some(required) = standard_multisig_required(redeem) {
+            return arguments.len() == required.saturating_add(1)
+                && arguments.first().is_some_and(Vec::is_empty)
+                && arguments[1..].iter().all(|signature| signature.len() == 65);
+        }
+        return true;
+    }
+    items.len() <= HSD_MAX_P2WSH_STACK && items.iter().all(|item| item.len() <= HSD_MAX_P2WSH_PUSH)
+}
+
+fn standard_multisig_required(script: &[u8]) -> Option<usize> {
+    if script.len() < 4 || *script.last()? != 0xae {
+        return None;
+    }
+    let required = small_integer(*script.first()?)?;
+    let total = small_integer(script[script.len().checked_sub(2)?])?;
+    if required == 0 || total == 0 || required > total {
+        return None;
+    }
+    let mut cursor = 1usize;
+    for _ in 0..total {
+        if script.get(cursor).copied() != Some(33) {
+            return None;
+        }
+        cursor = cursor.checked_add(34)?;
+    }
+    (cursor.checked_add(2)? == script.len() && small_integer(*script.get(cursor)?) == Some(total))
+        .then_some(required)
+}
+
+fn small_integer(opcode: u8) -> Option<usize> {
+    match opcode {
+        0x00 => Some(0),
+        0x51..=0x60 => Some(usize::from(opcode - 0x50)),
+        _ => None,
     }
 }
 
@@ -141,6 +266,12 @@ pub struct MempoolContext {
     pub coinbase_maturity: u32,
     /// Minimum fee in native atomic units per 1,000 HSD policy virtual bytes.
     pub minimum_relay_fee_rate: Amount,
+    /// HSD enables transaction/output and witness-shape standardness on
+    /// mainnet and leaves it configurable on the other networks.
+    pub require_standard: bool,
+    /// HSD's default wallet-safety ceiling rejects fees above 10,000 times the
+    /// minimum relay fee for the transaction's policy size.
+    pub reject_absurd_fees: bool,
     /// Production admission sets this to true. Tests and oracle harnesses may
     /// explicitly disable it while retaining every other admission check.
     pub require_complete_verifiers: bool,
@@ -153,6 +284,8 @@ impl MempoolContext {
             parent_median_time,
             coinbase_maturity: 0,
             minimum_relay_fee_rate: 0,
+            require_standard: false,
+            reject_absurd_fees: false,
             require_complete_verifiers: false,
         }
     }
@@ -799,6 +932,11 @@ impl MemoryMempool {
         if is_coinbase(&transaction) {
             return Ok(rejected("coinbase"));
         }
+        if context.require_standard {
+            if let Some(reason) = standardness_rejection(&transaction) {
+                return Ok(rejected(reason));
+            }
+        }
         let covenant_metrics = match covenant_metrics(&transaction) {
             Ok(metrics) => metrics,
             Err(error) => return Ok(rejected(error.to_string())),
@@ -839,6 +977,9 @@ impl MemoryMempool {
                 || !contextual_verifier.is_consensus_complete())
         {
             return Ok(rejected("consensus-verifier-incomplete"));
+        }
+        if context.require_standard && !has_standard_inputs(&transaction, &input_coins) {
+            return Ok(rejected("bad-txns-nonstandard-inputs"));
         }
 
         for coin in &input_coins {
@@ -907,6 +1048,9 @@ impl MemoryMempool {
         let minimum_fee = minimum_policy_fee(policy_size, context.minimum_relay_fee_rate);
         if fee < minimum_fee {
             return Ok(rejected("insufficient-fee"));
+        }
+        if context.reject_absurd_fees && fee > minimum_fee.saturating_mul(HSD_ABSURD_FEE_FACTOR) {
+            return Ok(rejected("absurdly-high-fee"));
         }
 
         let ancestors = self.collect_ancestors(&direct_parents)?;
@@ -2213,6 +2357,131 @@ mod tests {
             pool.submit_with_context(exact_fee, &context, &view, &AllowInputs, &AllowContext)
                 .expect("exact-fee admission"),
             Admission::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn hsd_standardness_and_absurd_fee_policy_are_enforced() {
+        let input = outpoint(0xfa, 0);
+        let view = FixedView::with_coin(input.clone(), 20_000_000);
+        let standard_context = MempoolContext {
+            require_standard: true,
+            ..MempoolContext::testing(2, 2)
+        };
+        let mut candidate = transaction(input, 3_000);
+        assert!(matches!(
+            MemoryMempool::new()
+                .submit_with_context(
+                    candidate.clone(),
+                    &standard_context,
+                    &view,
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("version policy"),
+            Admission::Rejected { reason } if reason == "version"
+        ));
+
+        candidate.version = 0;
+        candidate.outputs[0].address = Address::new(1, vec![3; 20]).expect("unknown address");
+        assert!(matches!(
+            MemoryMempool::new()
+                .submit_with_context(
+                    candidate.clone(),
+                    &standard_context,
+                    &view,
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("address policy"),
+            Admission::Rejected { reason } if reason == "address"
+        ));
+
+        candidate.outputs[0].address = Address::new(0, vec![3; 20]).expect("address");
+        candidate.outputs[0].value = 1;
+        assert!(matches!(
+            MemoryMempool::new()
+                .submit_with_context(
+                    candidate.clone(),
+                    &standard_context,
+                    &view,
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("dust policy"),
+            Admission::Rejected { reason } if reason == "dust"
+        ));
+
+        candidate.outputs = vec![
+            Output {
+                value: 0,
+                address: Address::new(31, vec![1; 2]).expect("nulldata"),
+                covenant: covenant(),
+            },
+            Output {
+                value: 0,
+                address: Address::new(31, vec![2; 2]).expect("nulldata"),
+                covenant: covenant(),
+            },
+        ];
+        assert!(matches!(
+            MemoryMempool::new()
+                .submit_with_context(
+                    candidate.clone(),
+                    &standard_context,
+                    &view,
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("nulldata policy"),
+            Admission::Rejected { reason } if reason == "multi-op-return"
+        ));
+
+        candidate.outputs = vec![output(3_000)];
+        candidate.inputs[0].witness.items = vec![vec![0; 65]];
+        assert!(matches!(
+            MemoryMempool::new()
+                .submit_with_context(
+                    candidate.clone(),
+                    &standard_context,
+                    &view,
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("input policy"),
+            Admission::Rejected { reason } if reason == "bad-txns-nonstandard-inputs"
+        ));
+
+        candidate.inputs[0].witness.items = vec![vec![0; 65], vec![2; 33]];
+        assert!(matches!(
+            MemoryMempool::new()
+                .submit_with_context(
+                    candidate.clone(),
+                    &standard_context,
+                    &view,
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("standard admission"),
+            Admission::Accepted(_)
+        ));
+
+        let absurd_context = MempoolContext {
+            minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
+            reject_absurd_fees: true,
+            ..standard_context
+        };
+        assert!(matches!(
+            MemoryMempool::new()
+                .submit_with_context(
+                    candidate,
+                    &absurd_context,
+                    &view,
+                    &AllowInputs,
+                    &AllowContext,
+                )
+                .expect("absurd fee policy"),
+            Admission::Rejected { reason } if reason == "absurdly-high-fee"
         ));
     }
 

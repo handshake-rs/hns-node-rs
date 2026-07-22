@@ -6,8 +6,8 @@ use std::{
 use anyhow::{Context, Result};
 use hns_chain::{read_canonical_hash, BlockIndexRecord};
 use hns_consensus::{
-    compute_block_version_from_state, ConsensusError, NameFlags, Network, SequenceLockView,
-    MEDIAN_TIMESPAN,
+    compute_block_version_from_state, ConsensusError, NameFlags, NativeSignatureVerifier, Network,
+    ScriptFlags, SequenceLockView, WitnessProgramVerifier, MEDIAN_TIMESPAN,
 };
 use hns_mempool::{
     ContextualTransactionVerifier, Mempool, MempoolContext, MempoolInfo, MempoolLimits,
@@ -160,10 +160,21 @@ fn active_mempool_parameters<T: ReadSnapshot>(
             parent_median_time,
             coinbase_maturity: network.params().coinbase_maturity,
             minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
+            require_standard: matches!(network, Network::Mainnet),
+            reject_absurd_fees: true,
             require_complete_verifiers: true,
         },
         deployments.name_flags,
     )))
+}
+
+fn active_mempool_input_verifier() -> Result<WitnessProgramVerifier<NativeSignatureVerifier>> {
+    let signatures = NativeSignatureVerifier::new()
+        .map_err(|error| anyhow::anyhow!("native mempool signature backend failed: {error}"))?;
+    Ok(WitnessProgramVerifier::new(
+        signatures,
+        ScriptFlags::STANDARD,
+    ))
 }
 
 /// The mining engine may build diagnostic templates in shadow mode, but
@@ -492,6 +503,7 @@ impl NodeService {
                 network: self.config.network,
                 name_flags,
             };
+            let input_verifier = active_mempool_input_verifier()?;
             self.state
                 .mempool
                 .reconcile_chain_transition_with_context(
@@ -499,7 +511,7 @@ impl NodeService {
                     disconnected_transactions,
                     &context,
                     &view,
-                    self.state.state_engine.input_verifier(),
+                    &input_verifier,
                     &contextual_verifier,
                 )
                 .map_err(|error| anyhow::anyhow!("post-connect revalidation failed: {error}"))
@@ -595,6 +607,7 @@ impl NodeService {
             network: self.config.network,
             name_flags,
         };
+        let input_verifier = active_mempool_input_verifier()?;
         let admission = self
             .state
             .mempool
@@ -602,7 +615,7 @@ impl NodeService {
                 transaction,
                 &context,
                 &view,
-                self.state.state_engine.input_verifier(),
+                &input_verifier,
                 &contextual_verifier,
             )
             .map_err(|error| anyhow::anyhow!("peer transaction admission failed: {error}"))?;

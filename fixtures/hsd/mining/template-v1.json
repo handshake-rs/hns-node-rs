@@ -1,5 +1,5 @@
 {
-  "schema": 2,
+  "schema": 3,
   "oracle": {
     "repository": "handshake-org/hsd",
     "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
@@ -172,6 +172,55 @@
         "policySize": 80005,
         "rate": 3,
         "minimumFee": 240
+      }
+    ]
+  },
+  "mempoolStandardPolicy": {
+    "maximumVersion": 0,
+    "maximumWeight": 400000,
+    "maximumWitnessStack": 100,
+    "maximumWitnessPush": 80,
+    "maximumWitnessScript": 3600,
+    "absurdFeeFactor": 10000,
+    "dustThreshold": 297,
+    "requireStandard": [
+      {
+        "network": "main",
+        "required": true
+      },
+      {
+        "network": "testnet",
+        "required": false
+      },
+      {
+        "network": "regtest",
+        "required": false
+      },
+      {
+        "network": "simnet",
+        "required": false
+      }
+    ],
+    "cases": [
+      {
+        "name": "baseline",
+        "accepted": true
+      },
+      {
+        "name": "version-one",
+        "accepted": false
+      },
+      {
+        "name": "unknown-address",
+        "accepted": false
+      },
+      {
+        "name": "dust",
+        "accepted": false
+      },
+      {
+        "name": "multiple-nulldata",
+        "accepted": false
       }
     ]
   }

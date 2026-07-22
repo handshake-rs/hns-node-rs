@@ -179,6 +179,8 @@
   fail closed, while ordinary peer admission composes an immutable active-chain
   view, native scripts, deployment-derived name flags, accepted-name overlay,
   HSD exclusive-name conflicts, minimum relay fees, and orphan promotion.
+- HSD mainnet transaction/output and contextual witness standardness, standard
+  script flags on all networks, exact dust thresholds, and absurd-fee rejection.
 - Atomic post-connect rebuilding revalidates every retained transaction and
   orphan against the new active context, promotes newly resolvable dependencies,
   and advances the mempool generation once only when membership changes.
@@ -242,13 +244,14 @@ These are substantial foundations, not a production full node.
   beyond implemented HSD network-prefix grouping, and adversarial network
   qualification.
 - Pruning-aware synchronization and sustained compact-relay WAN qualification.
-- Complete HSD mempool standardness/replacement policy and claim/airdrop relay.
+- HSD free-relay priority/rate limiting, expiry/fee-based eviction, and special
+  claim/airdrop relay including replacement claims.
 - Sustained multipath publication and reconnect/retry supervision under WAN
   partitions and queue saturation.
 
 ### Mining authority
 
-- HSD replacement/policy parity.
+- Remaining HSD dynamic relay/eviction policy and special-packet replacement.
 - Continuous future-template lifecycle tied to live committed tips and the ASIC
   gateway.
 - End-to-end candidate validation against a historically qualified active state.

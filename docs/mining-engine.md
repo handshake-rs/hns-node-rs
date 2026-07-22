@@ -78,7 +78,9 @@ mining-engine peer boundary now does so for ordinary transactions using one
 immutable active-chain snapshot, deployment-derived name flags, HSD's 1,000
 minimum relay rate, the native script backend, and the live accepted-name
 overlay. The compatibility entrypoint remains fail closed, and complete HSD
-standardness/replacement policy and claim/airdrop packets remain unfinished.
+free-relay priority/rate limiting, expiry/fee-based eviction, and special
+claim/airdrop packets remain unfinished. Mainnet transaction/output and witness
+standardness, standard script flags, dust, and absurd-fee checks are active.
 Every direct active extension atomically rebuilds retained transactions and
 orphans through the same complete context, promoting newly resolvable inputs
 and advancing the generation once only when membership changes. Disconnects
@@ -191,6 +193,7 @@ remain release-blocking:
 - deployment-scale Urkel compaction performance/priority qualification and
   RocksDB mid-commit process-crash/fault injection;
 - qualified full-mainnet active-state IBD and live HSD state comparison;
-- complete HSD mempool standardness/replacement policy and claim/airdrop relay;
+- HSD free-relay priority/rate limiting, expiry/fee-based eviction, and special
+  claim/airdrop relay including replacement claims;
 - measured production template and solved-block latency;
 - native mainnet authority qualification.

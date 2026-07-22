@@ -339,6 +339,9 @@ Implemented:
 - Ordinary peer transactions admitted against one immutable active-chain UTXO,
   median-time, deployment, and name-state snapshot, including deterministic
   mempool name-overlay replay, exclusive-name conflicts, and orphan promotion.
+- HSD mainnet transaction/output standardness, contextual witness-shape limits,
+  standard script flags on every network, dust thresholds, and absurd-fee
+  protection, pinned to the HSD policy oracle.
 - Atomic post-connect revalidation of every retained transaction and orphan
   against the new active context, with one monotonic generation update and
   fail-closed clearing on internal view failure.
@@ -359,7 +362,8 @@ Implemented:
 
 Still release-blocking:
 
-- complete HSD mempool standardness/replacement policy and claim/airdrop relay;
+- HSD free-relay priority/rate limiting, expiry/fee-based eviction, and special
+  claim/airdrop relay including replacement claims;
 - qualified full-mainnet active-state IBD and the incremental production Urkel
   lifecycle;
 - sustained live HSD comparison evidence across restarts, partitions, and real

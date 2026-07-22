@@ -603,8 +603,11 @@ mod tests {
         transaction_weight, ConsensusError, Network, SequenceLockView, TransactionInputVerifier,
     };
     use hns_mempool::{
-        sigop_adjusted_virtual_size, Admission, ContextualTransactionVerifier, MemoryMempool,
-        Mempool, MempoolContext, MempoolView, BYTES_PER_SIGOP, MAX_TX_SIGOPS,
+        sigop_adjusted_virtual_size, standard_output_dust_threshold, Admission,
+        ContextualTransactionVerifier, MemoryMempool, Mempool, MempoolContext, MempoolView,
+        BYTES_PER_SIGOP, HSD_ABSURD_FEE_FACTOR, HSD_MAX_P2WSH_PUSH, HSD_MAX_P2WSH_SIZE,
+        HSD_MAX_P2WSH_STACK, HSD_MAX_STANDARD_TX_VERSION, HSD_MAX_STANDARD_TX_WEIGHT,
+        HSD_MINIMUM_RELAY_FEE_RATE, MAX_TX_SIGOPS,
     };
     use hns_primitives::{Coin, Height, Txid};
     use std::collections::HashMap;
@@ -730,7 +733,7 @@ mod tests {
             "../../../fixtures/hsd/mining/template-v1.json"
         ))
         .expect("hsrd mining fixture");
-        assert_eq!(fixture["schema"], 2);
+        assert_eq!(fixture["schema"], 3);
         let deterministic = &fixture["deterministicCoinbase"];
         let coinbase = create_coinbase(
             u32::try_from(deterministic["height"].as_u64().expect("height"))
@@ -804,6 +807,55 @@ mod tests {
                 minimum_policy_fee(policy_size, rate),
                 case["minimumFee"].as_u64().expect("minimum fee")
             );
+        }
+        let standard = &fixture["mempoolStandardPolicy"];
+        assert_eq!(standard["maximumVersion"], HSD_MAX_STANDARD_TX_VERSION);
+        assert_eq!(standard["maximumWeight"], HSD_MAX_STANDARD_TX_WEIGHT);
+        assert_eq!(standard["maximumWitnessStack"], HSD_MAX_P2WSH_STACK);
+        assert_eq!(standard["maximumWitnessPush"], HSD_MAX_P2WSH_PUSH);
+        assert_eq!(standard["maximumWitnessScript"], HSD_MAX_P2WSH_SIZE);
+        assert_eq!(standard["absurdFeeFactor"], HSD_ABSURD_FEE_FACTOR);
+        let dust_output = Output {
+            value: 1,
+            address: address(2),
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        };
+        assert_eq!(
+            standard_output_dust_threshold(&dust_output, HSD_MINIMUM_RELAY_FEE_RATE),
+            standard["dustThreshold"].as_u64().expect("dust threshold")
+        );
+        for network in standard["requireStandard"]
+            .as_array()
+            .expect("network standardness")
+        {
+            let expected = match network["network"].as_str().expect("network") {
+                "main" => true,
+                "testnet" | "regtest" | "simnet" => false,
+                other => panic!("unexpected HSD network {other}"),
+            };
+            assert_eq!(
+                network["required"].as_bool().expect("standardness flag"),
+                expected
+            );
+        }
+        let expected_cases = [
+            ("baseline", true),
+            ("version-one", false),
+            ("unknown-address", false),
+            ("dust", false),
+            ("multiple-nulldata", false),
+        ];
+        for (case, (name, accepted)) in standard["cases"]
+            .as_array()
+            .expect("standardness cases")
+            .iter()
+            .zip(expected_cases)
+        {
+            assert_eq!(case["name"], name);
+            assert_eq!(case["accepted"], accepted);
         }
     }
 

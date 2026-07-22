@@ -4921,13 +4921,22 @@ mod tests {
     }
 
     fn install_script_coin(node: &NodeService, outpoint: Outpoint, value: Amount, height: Height) {
-        let script = [0x51];
+        install_script_coin_with_script(node, outpoint, value, height, &[0x51]);
+    }
+
+    fn install_script_coin_with_script(
+        node: &NodeService,
+        outpoint: Outpoint,
+        value: Amount,
+        height: Height,
+        script: &[u8],
+    ) {
         let coin = Coin {
             outpoint,
             value,
             height,
             coinbase: false,
-            address: Address::new(0, sha3_256(&script).to_vec()).expect("script address"),
+            address: Address::new(0, sha3_256(script).to_vec()).expect("script address"),
             covenant: Covenant {
                 kind: CovenantKind::None,
                 items: Vec::new(),
@@ -5190,6 +5199,26 @@ mod tests {
                 if reason.contains("witness program")
         ));
         assert_eq!(node.state.mempool.info().transaction_count, 1);
+    }
+
+    #[test]
+    fn peer_transaction_admission_uses_hsd_standard_script_flags() {
+        let mut node = peer_transaction_node(0);
+        let outpoint = Outpoint {
+            txid: Txid::new([0xa3; 32]),
+            index: 0,
+        };
+        let script = [0xb3, 0x51];
+        install_script_coin_with_script(&node, outpoint.clone(), 10_000, 0, &script);
+        let mut transaction = script_spend(outpoint, 9_000);
+        transaction.inputs[0].witness.items = vec![script.to_vec()];
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(transaction)
+                .expect("standard script admission"),
+            hns_mempool::Admission::Rejected { reason }
+                if reason.contains("upgradable NOP is discouraged")
+        ));
+        assert_eq!(node.state.mempool.info().transaction_count, 0);
     }
 
     #[test]

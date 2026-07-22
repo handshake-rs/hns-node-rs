@@ -107,8 +107,8 @@ The following remain untrusted and release-blocking:
   mid-commit process-crash/fault injection;
 - full-mainnet active-state IBD, pruning, and sustained
   alternate-chain/reorganization qualification;
-- Brontide, long-lived subthreshold peer reputation, complete HSD mempool
-  standardness/replacement, and claim/airdrop relay;
+- Brontide, long-lived subthreshold peer reputation, remaining HSD dynamic
+  relay/eviction policy, and special claim/airdrop relay;
 - production template qualification, continuously supervised publication
   retry, and measured publication latency;
 - complete mainnet replay, invalid corpus, and sustained live HSD shadow

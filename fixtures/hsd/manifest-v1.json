@@ -414,9 +414,12 @@
         "mempool",
         "sigops",
         "policy-size",
+        "standardness",
+        "dust",
+        "absurd-fee",
         "oracle"
       ],
-      "blake2b256": "b725764874f8f944272e221f63cd87d425dc11789fbe74fe5415d609053a61ba"
+      "blake2b256": "0393b737a0a5e571f579fb015c4585008328e307925664b9eb315f5dff5e2e10"
     }
   ]
 }
