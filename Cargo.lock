@@ -481,6 +481,7 @@ dependencies = [
  "hns-state",
  "hns-store",
  "hns-sync",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

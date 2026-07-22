@@ -19,6 +19,13 @@ The default mode is `native`.
 acknowledgement, and regtest or simnet. No incomplete validation or
 synchronization stage is presented as complete Handshake consensus.
 
+The Core/operator integration has no runtime HSD dependency. It consumes the
+hsrd-specific atomic `getparentauthority` snapshot, and it will accept that
+snapshot only when the RPC listener is protected with
+`--rpc-authorization-header-file` and every native authority/readiness and
+durable-tip gate passes. Because readiness is currently incomplete, this is a
+fail-closed integration boundary rather than a claim of mainnet mining authority.
+
 The current tree contains hardened authority, storage, transaction, covenant,
 and name-state foundations, a live native P2P/synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication

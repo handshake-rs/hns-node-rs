@@ -25,6 +25,9 @@ use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::State,
+    http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -76,6 +79,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 9;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
+pub const MAX_RPC_AUTHORIZATION_BYTES: usize = 4_096;
 
 const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
 const DEPLOYMENT_STATE_CACHE_VERSION: u8 = 1;
@@ -104,6 +108,49 @@ pub enum AuthorityMode {
     #[default]
     Native,
     NativeExperimental,
+}
+
+/// Exact HTTP Authorization value required by the hsrd RPC listener.
+///
+/// The value is deliberately redacted from diagnostics and comparisons use a
+/// length-independent byte loop so a rejected local client does not receive a
+/// useful early-mismatch timing signal.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RpcAuthorizationHeader(Arc<str>);
+
+impl RpcAuthorizationHeader {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > MAX_RPC_AUTHORIZATION_BYTES
+            || value
+                .chars()
+                .any(|character| matches!(character, '\r' | '\n'))
+        {
+            anyhow::bail!("RPC Authorization value must be one bounded nonempty line");
+        }
+        Ok(Self(Arc::from(value)))
+    }
+
+    fn matches(&self, candidate: Option<&[u8]>) -> bool {
+        let expected = self.0.as_bytes();
+        let candidate = candidate.unwrap_or_default();
+        let maximum = expected.len().max(candidate.len());
+        let mut difference = expected.len() ^ candidate.len();
+        for index in 0..maximum {
+            difference |= usize::from(
+                expected.get(index).copied().unwrap_or(0)
+                    ^ candidate.get(index).copied().unwrap_or(0),
+            );
+        }
+        difference == 0
+    }
+}
+
+impl std::fmt::Debug for RpcAuthorizationHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RpcAuthorizationHeader([REDACTED])")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -298,6 +345,7 @@ pub struct NodeConfig {
     pub network: Network,
     pub data_dir: Option<PathBuf>,
     pub rpc_bind: SocketAddr,
+    pub rpc_authorization: Option<RpcAuthorizationHeader>,
     pub log_filter: String,
     pub authority_mode: AuthorityMode,
     pub acknowledge_incomplete_consensus: bool,
@@ -314,6 +362,7 @@ impl Default for NodeConfig {
             network: Network::Mainnet,
             data_dir: None,
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], 12037)),
+            rpc_authorization: None,
             log_filter: "info".to_owned(),
             authority_mode: AuthorityMode::Native,
             acknowledge_incomplete_consensus: false,
@@ -1092,7 +1141,13 @@ impl NodeService {
             mempool_size = rpc_service.snapshot().mempool_info.transaction_count,
             "hsrd rpc server started"
         );
-        let result = serve_rpc_listener(listener, rpc_service, shutdown.wait()).await;
+        let result = serve_rpc_listener_with_authorization(
+            listener,
+            rpc_service,
+            self.config.rpc_authorization.clone(),
+            shutdown.wait(),
+        )
+        .await;
         if result.is_ok() {
             mark_clean_shutdown(&self.state.store).map_err(|error| {
                 anyhow::anyhow!("failed to mark node store clean at shutdown: {error}")
@@ -1193,6 +1248,7 @@ impl NodeService {
             network: self.config.network.to_string(),
             storage_profile: String::from_utf8_lossy(STORAGE_PROFILE).into_owned(),
             storage_durability: self.state.store.durability_policy().to_string(),
+            rpc_authentication_required: self.config.rpc_authorization.is_some(),
             best_header_hash: best_header.as_ref().map(|tip| tip.hash),
             best_header_height: best_header.as_ref().map(|tip| tip.height),
             best_block_hash: chain_tip.as_ref().map(|tip| tip.hash),
@@ -1261,6 +1317,18 @@ pub async fn serve_rpc_listener<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    serve_rpc_listener_with_authorization(listener, service, None, shutdown).await
+}
+
+pub async fn serve_rpc_listener_with_authorization<F>(
+    listener: TcpListener,
+    service: BasicRpcService,
+    authorization: Option<RpcAuthorizationHeader>,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let state = RpcHttpState {
         service: Arc::new(service),
     };
@@ -1272,11 +1340,31 @@ where
         .route("/api/v1/parity", get(handle_parity_http))
         .route("/api/v1/mining-engine", get(handle_mining_engine_http))
         .with_state(state);
+    let app = match authorization {
+        Some(expected) => app.layer(middleware::from_fn_with_state(
+            expected,
+            require_rpc_authorization,
+        )),
+        None => app,
+    };
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
         .context("RPC server failed")
+}
+
+pub(crate) async fn require_rpc_authorization(
+    State(expected): State<RpcAuthorizationHeader>,
+    headers: HeaderMap,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let candidate = headers.get(AUTHORIZATION).map(|value| value.as_bytes());
+    if !expected.matches(candidate) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    next.run(request).await
 }
 
 async fn handle_status_http(State(state): State<RpcHttpState>) -> Json<serde_json::Value> {
@@ -7045,6 +7133,52 @@ mod tests {
         let json: Value = serde_json::from_str(response_body).expect("json response");
         assert_eq!(json["id"], 7);
         assert_eq!(json["result"]["networkactive"], false);
+
+        shutdown_tx.send(()).expect("shutdown");
+        server.await.expect("server join").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn rpc_authorization_rejects_missing_and_wrong_values() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let service = node.rpc_service().expect("rpc service");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let expected = RpcAuthorizationHeader::new("Bearer exact-secret").expect("authorization");
+        let server = tokio::spawn(async move {
+            serve_rpc_listener_with_authorization(listener, service, Some(expected), async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        for (authorization, expected_status) in [
+            (None, "HTTP/1.1 401 Unauthorized"),
+            (Some("Bearer wrong"), "HTTP/1.1 401 Unauthorized"),
+            (Some("Bearer exact-secret"), "HTTP/1.1 200 OK"),
+        ] {
+            let authorization = authorization
+                .map(|value| format!("Authorization: {value}\r\n"))
+                .unwrap_or_default();
+            let request = format!(
+                "GET /api/v1/authority HTTP/1.1\r\nHost: {addr}\r\n{authorization}Connection: close\r\n\r\n"
+            );
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .await
+                .expect("read response");
+            assert!(response.starts_with(expected_status), "{response}");
+        }
 
         shutdown_tx.send(()).expect("shutdown");
         server.await.expect("server join").expect("server result");

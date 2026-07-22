@@ -1,7 +1,10 @@
 # Bounded control and differential API
 
-Mining does not use this interface. MeshMine and `hsrd` communicate through
-native Rust types and bounded channels.
+Native template construction and candidate admission do not use this
+interface. The separately built MeshMine Core/operator process uses the
+hsrd-specific read-only `getparentauthority` method as its authenticated
+runtime parent boundary; in-process mining continues to use native Rust types
+and bounded channels.
 
 The HTTP/JSON surface is retained only for operator diagnostics, health checks,
 and fixture comparison. It binds to loopback by default and reads immutable
@@ -11,6 +14,12 @@ snapshots only.
 
 - Read-only chain, header, block, transaction, UTXO, name-state, mempool,
   authority, parity, and mining-engine snapshots.
+- `getparentauthority`, which returns the requested canonical header, active
+  tip, native authority/readiness, durable validation status, and pending-tip
+  state from one immutable snapshot so Core cannot combine claims across a tip
+  transition. The native-sync handler uses keyed store reads under the chain
+  coordinator lock; periodic Core requalification does not scan the UTXO,
+  name-state, header, or block collections.
 - Truthful network-active and connection-count reporting.
 - Live peer and synchronization details on the native runtime's bounded REST
   endpoints. `getpeerinfo` fails explicitly until the JSON-RPC compatibility
@@ -36,8 +45,24 @@ snapshots only.
   committed blocks, reorganizations, contextual-invalid bodies, durable
   address-book load/prune/generation/flush state, and an opaque process-local
   runtime instance used to correlate restart evidence.
-- Unsupported mutations fail explicitly. No current control endpoint claims to
-  authenticate or perform a mutation.
+- Optional whole-listener Authorization enforcement from
+  `--rpc-authorization-header-file`. The absolute nonsymlink file must be
+  private and contain one bounded nonempty header value such as `Bearer ...`.
+  When configured, every JSON-RPC and diagnostic route rejects missing or
+  unequal values with HTTP 401. Secrets are redacted from Debug output.
+- Unsupported mutations fail explicitly. No current control endpoint performs
+  a mutation.
+
+Core requires authentication to be configured and rejects an otherwise valid
+authority snapshot whose `rpc_authentication_required` field is false. A
+matching command shape is:
+
+```bash
+hsrd --network mainnet --data-dir /path/to/hsrd \
+  --rpc-bind 127.0.0.1:14037 \
+  --rpc-authorization-header-file /absolute/private/hsrd-authorization-header \
+  --authority-mode native --native-sync --p2p-discovery
+```
 
 ## Target reads
 

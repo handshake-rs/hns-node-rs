@@ -12,11 +12,13 @@ use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::State,
+    middleware,
     routing::{get, post},
     Json, Router,
 };
 use hns_chain::{
-    prepare_header_record, BlockIndexRecord, ChainTip, HeaderImport, HeaderIndex, HeaderRecord,
+    prepare_header_record, read_canonical_hash, BlockIndexRecord, ChainTip, HeaderImport,
+    HeaderIndex, HeaderRecord,
 };
 use hns_consensus::{
     advance_threshold_state, block_merkle_root, block_witness_root,
@@ -50,10 +52,13 @@ use tokio::{
 };
 
 use super::{
+    authority_info, best_block_tip_from_snapshot, best_header_tip_from_snapshot,
     completed_deployment_period_with_lookup, current_unix_time, expected_bits_with_lookup,
-    json_rpc_error, median_time_past_with_lookup, AuthorityMode, ChainActivationFailure,
-    FailedBlockMutation, FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
-    ShutdownSignal,
+    json_rpc_error, load_block_index_record, load_header_record, median_time_past_with_lookup,
+    mining_generation_from_snapshot, mining_snapshot_for_hash, require_rpc_authorization,
+    AuthorityMode, ChainActivationFailure, DurableMiningState, FailedBlockMutation,
+    FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
+    RpcAuthorizationHeader, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
 };
 use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
@@ -1409,6 +1414,7 @@ impl NodeService {
 
         let shadow_sync_config = self.config.shadow_sync.clone();
         let rpc_bind = self.config.rpc_bind;
+        let rpc_authorization = self.config.rpc_authorization.clone();
         let network = self.config.network;
         let data_dir = self.config.data_dir.clone();
         let ban_list_persistent = self.config.data_dir.is_some();
@@ -1655,6 +1661,7 @@ impl NodeService {
             rpc_listener,
             Arc::clone(&node),
             Arc::clone(&diagnostics),
+            rpc_authorization,
             shutdown_rx.clone(),
         ));
 
@@ -2781,6 +2788,93 @@ impl NodeService {
         }
         Ok(headers)
     }
+
+    /// Build Core's parent-authority response with O(1) keyed reads while the
+    /// native-sync coordinator lock excludes a concurrent chain transition.
+    /// The general diagnostic snapshot intentionally remains richer and may
+    /// scan state; parent requalification must not put that work in the mining
+    /// critical path.
+    fn parent_authority_value(&self, hash: BlockHash) -> Result<serde_json::Value> {
+        let snapshot = self.state.store.snapshot()?;
+        let active_tip = best_block_tip_from_snapshot(&snapshot)?;
+        let best_header = best_header_tip_from_snapshot(&snapshot)?;
+        let header = load_header_record(&snapshot, &hash)?
+            .ok_or_else(|| anyhow::anyhow!("block header not found"))?;
+        if read_canonical_hash(&snapshot, header.height)? != Some(hash) {
+            anyhow::bail!("block header is not canonical");
+        }
+
+        let generation = mining_generation_from_snapshot(&snapshot)?;
+        let (mining_snapshot, authoritative) = match active_tip.as_ref() {
+            Some(tip) => {
+                let (mining_snapshot, authoritative) = mining_snapshot_for_hash(
+                    &snapshot,
+                    self.config.network.canonical_id(),
+                    tip.hash,
+                    generation,
+                )?;
+                (Some(mining_snapshot), authoritative)
+            }
+            None => (None, false),
+        };
+        let durable = DurableMiningState {
+            generation,
+            snapshot: mining_snapshot,
+            authoritative,
+        };
+        let authority = authority_info(&self.config, &durable);
+        let tip_validation = match active_tip.as_ref() {
+            Some(tip) => load_block_index_record(&snapshot, &tip.hash)?.map(|record| record.status),
+            None => None,
+        };
+        let confirmations = active_tip
+            .as_ref()
+            .and_then(|tip| tip.height.checked_sub(header.height))
+            .map_or(0, |depth| depth.saturating_add(1));
+        let pending_best_chain_activation = match (&best_header, &active_tip) {
+            (Some(best), Some(active)) => {
+                best.hash != active.hash && best.chainwork > active.chainwork
+            }
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        Ok(serde_json::json!({
+            "api_version": HSRD_DIAGNOSTIC_API_VERSION,
+            "network": self.config.network.to_string(),
+            "rpc_authentication_required": self.config.rpc_authorization.is_some(),
+            "chain": {
+                "blocks": active_tip.as_ref().map_or(0, |tip| tip.height),
+                "headers": best_header.as_ref().map_or(0, |tip| tip.height),
+                "bestblockhash": active_tip.as_ref().map(|tip| tip.hash.to_hex()),
+                "chainwork": active_tip.as_ref().map(|tip| format!("{:x}", tip.chainwork)).unwrap_or_else(|| "0".to_owned()),
+            },
+            "header": {
+                "hash": header.hash.to_hex(),
+                "confirmations": confirmations,
+                "height": header.height,
+                "time": header.header.time,
+                "chainwork": format!("{:x}", header.chainwork),
+            },
+            "authority": authority,
+            "authoritative_mining_tip": self.mining_events.snapshot().is_some(),
+            "pending_best_chain_activation": pending_best_chain_activation,
+            "tip_validation": tip_validation,
+        }))
+    }
+}
+
+fn decode_rpc_block_hash(value: &str) -> Result<BlockHash> {
+    if value.len() != 64 {
+        anyhow::bail!("block hash must contain exactly 64 hexadecimal characters");
+    }
+    let mut raw = [0u8; 32];
+    for (index, output) in raw.iter_mut().enumerate() {
+        let offset = index * 2;
+        *output = u8::from_str_radix(&value[offset..offset + 2], 16)
+            .map_err(|_| anyhow::anyhow!("block hash is not hexadecimal"))?;
+    }
+    Ok(BlockHash::new(raw))
 }
 
 #[derive(Clone)]
@@ -2793,6 +2887,7 @@ async fn serve_shadow_sync_rpc(
     listener: TcpListener,
     node: Arc<Mutex<NodeService>>,
     diagnostics: Arc<RwLock<ShadowSyncDiagnostics>>,
+    authorization: Option<RpcAuthorizationHeader>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let state = ShadowSyncHttpState { node, diagnostics };
@@ -2812,6 +2907,13 @@ async fn serve_shadow_sync_rpc(
             get(handle_mining_engine_diagnostics),
         )
         .with_state(state);
+    let app = match authorization {
+        Some(expected) => app.layer(middleware::from_fn_with_state(
+            expected,
+            require_rpc_authorization,
+        )),
+        None => app,
+    };
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown.changed().await;
@@ -2852,6 +2954,30 @@ async fn handle_shadow_sync_rpc(
         }
     };
     let id = request.id.clone();
+    if request.method == "getparentauthority" {
+        let Some(encoded_hash) = request
+            .params
+            .as_array()
+            .and_then(|params| params.first())
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Json(json_rpc_error(id, -32602, "missing parent hash".to_owned()));
+        };
+        let hash = match decode_rpc_block_hash(encoded_hash) {
+            Ok(hash) => hash,
+            Err(error) => return Json(json_rpc_error(id, -32602, error.to_string())),
+        };
+        let result = state.node.lock().await.parent_authority_value(hash);
+        return match result {
+            Ok(result) => Json(JsonRpcResponse {
+                jsonrpc: "2.0".to_owned(),
+                result: Some(result),
+                error: None,
+                id,
+            }),
+            Err(error) => Json(json_rpc_error(id, -32603, error.to_string())),
+        };
+    }
     match shadow_sync_rpc_service(&state).await {
         Ok(service) => Json(
             service
@@ -4961,6 +5087,55 @@ mod tests {
         }
     }
 
+    fn decode_fixture_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let encoded = std::str::from_utf8(pair).expect("fixture hex");
+                u8::from_str_radix(encoded, 16).expect("fixture hex byte")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parent_authority_fast_path_is_coherent_and_fail_closed() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/blocks/genesis-v1.json"))
+                .expect("genesis fixture");
+        let case = fixture["networks"]
+            .as_array()
+            .expect("networks")
+            .iter()
+            .find(|case| case["network"] == "regtest")
+            .expect("regtest fixture");
+        let block = Block::decode(&decode_fixture_hex(
+            case["raw"].as_str().expect("raw genesis"),
+        ))
+        .expect("decode genesis");
+        let hash = block.hash();
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            rpc_authorization: Some(
+                RpcAuthorizationHeader::new("Bearer test").expect("authorization"),
+            ),
+            ..NodeConfig::default()
+        });
+        node.accept_block(NodeBlockImport::from_peer(block, 0))
+            .expect("connect genesis");
+
+        let value = node.parent_authority_value(hash).expect("parent authority");
+        assert_eq!(value["network"], "regtest");
+        assert_eq!(value["rpc_authentication_required"], true);
+        assert_eq!(value["chain"]["bestblockhash"], hash.to_hex());
+        assert_eq!(value["header"]["hash"], hash.to_hex());
+        assert_eq!(value["header"]["confirmations"], 1);
+        assert_eq!(value["authority"]["mode"], "native");
+        assert_eq!(value["authority"]["consensus_complete"], false);
+        assert_eq!(value["authoritative_mining_tip"], false);
+    }
+
     #[test]
     fn event_driven_connector_waits_for_a_full_storage_slice() {
         let now = StdInstant::now();
@@ -6379,10 +6554,13 @@ mod tests {
             ..ShadowSyncDiagnostics::default()
         }));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let authorization =
+            RpcAuthorizationHeader::new("Bearer native-sync-test").expect("authorization");
         let server = tokio::spawn(serve_shadow_sync_rpc(
             listener,
             node,
             diagnostics,
+            Some(authorization),
             shutdown_rx,
         ));
 
@@ -6391,8 +6569,9 @@ mod tests {
             "/api/v1/header-deployments",
             "/api/v1/mining-engine",
         ] {
-            let request =
-                format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+            let request = format!(
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer native-sync-test\r\nConnection: close\r\n\r\n"
+            );
             let mut stream = tokio::net::TcpStream::connect(address)
                 .await
                 .expect("connect");

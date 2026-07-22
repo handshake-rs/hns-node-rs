@@ -54,6 +54,7 @@ pub enum RpcMethod {
     GetNameByHash,
     GetHsrdStatus,
     GetAuthorityInfo,
+    GetParentAuthority,
     GetParityInfo,
     GetMiningEngineInfo,
 }
@@ -80,6 +81,7 @@ impl RpcMethod {
             "getnamebyhash" => Some(Self::GetNameByHash),
             "gethsrdstatus" => Some(Self::GetHsrdStatus),
             "getauthorityinfo" => Some(Self::GetAuthorityInfo),
+            "getparentauthority" => Some(Self::GetParentAuthority),
             "getparityinfo" => Some(Self::GetParityInfo),
             "getminingengineinfo" => Some(Self::GetMiningEngineInfo),
             _ => None,
@@ -243,6 +245,7 @@ pub struct RpcNodeStatus {
     pub network: String,
     pub storage_profile: String,
     pub storage_durability: String,
+    pub rpc_authentication_required: bool,
     pub best_header_hash: Option<BlockHash>,
     pub best_header_height: Option<Height>,
     pub best_block_hash: Option<BlockHash>,
@@ -507,6 +510,7 @@ impl BasicRpcService {
                 serde_json::to_value(&self.snapshot.node_status.authority)
                     .map_err(|error| RpcCallError::new(-32603, error.to_string()))
             }
+            RpcMethod::GetParentAuthority => self.get_parent_authority(params),
             RpcMethod::GetParityInfo => serde_json::to_value(&self.snapshot.node_status.parity)
                 .map_err(|error| RpcCallError::new(-32603, error.to_string())),
             RpcMethod::GetMiningEngineInfo => serde_json::to_value(&self.snapshot.mining_engine)
@@ -521,6 +525,31 @@ impl BasicRpcService {
             .header_by_height(height)
             .ok_or_else(|| RpcCallError::new(-8, "block height out of range"))?;
         Ok(json!(entry.record.hash.to_hex()))
+    }
+
+    /// Return the authority, active tip, and requested canonical header from
+    /// one immutable RPC snapshot. Core must not compose those claims from
+    /// separate calls that can straddle a tip transition.
+    fn get_parent_authority(&self, params: &[Value]) -> Result<Value, RpcCallError> {
+        let hash = required_string(params, 0, "hash")?;
+        let header = self.get_block_header(&[Value::String(hash), Value::Bool(true)])?;
+        let tip = self.snapshot.chain_tip.as_ref();
+        Ok(json!({
+            "api_version": self.snapshot.node_status.api_version,
+            "network": self.snapshot.network,
+            "rpc_authentication_required": self.snapshot.node_status.rpc_authentication_required,
+            "chain": {
+                "blocks": tip.map(|tip| tip.height).unwrap_or(0),
+                "headers": self.snapshot.node_status.best_header_height.unwrap_or(0),
+                "bestblockhash": tip.map(|tip| tip.hash.to_hex()),
+                "chainwork": tip.map(|tip| format!("{:x}", tip.chainwork)).unwrap_or_else(|| "0".to_owned()),
+            },
+            "header": header,
+            "authority": self.snapshot.node_status.authority,
+            "authoritative_mining_tip": self.snapshot.node_status.authoritative_mining_tip,
+            "pending_best_chain_activation": self.snapshot.node_status.pending_best_chain_activation,
+            "tip_validation": self.snapshot.node_status.tip_validation,
+        }))
     }
 
     fn get_block_header(&self, params: &[Value]) -> Result<Value, RpcCallError> {
@@ -1016,6 +1045,42 @@ mod tests {
         assert_eq!(info["name"], "handshake");
         assert_eq!(info["registered"], true);
     }
+
+    #[test]
+    fn parent_authority_is_one_coherent_snapshot() {
+        let mut snapshot = rpc_snapshot_with_block();
+        snapshot.node_status.api_version = 9;
+        snapshot.node_status.best_header_height = Some(0);
+        snapshot.node_status.authoritative_mining_tip = true;
+        snapshot.node_status.rpc_authentication_required = true;
+        snapshot.node_status.authority = RpcAuthorityInfo {
+            mode: "native".to_owned(),
+            consensus_complete: true,
+            can_authorize_mining_templates: true,
+            can_accept_mining_candidates: true,
+            ..RpcAuthorityInfo::default()
+        };
+        let hash = snapshot.chain_tip.as_ref().expect("tip").hash;
+        let service = BasicRpcService::new(snapshot);
+        let response = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getparentauthority".to_owned(),
+                params: json!([hash.to_hex()]),
+                id: Some(json!(9)),
+            })
+            .expect("RPC response")
+            .result
+            .expect("result");
+        assert_eq!(response["api_version"], 9);
+        assert_eq!(response["network"], "regtest");
+        assert_eq!(response["rpc_authentication_required"], true);
+        assert_eq!(response["chain"]["bestblockhash"], hash.to_hex());
+        assert_eq!(response["header"]["hash"], hash.to_hex());
+        assert_eq!(response["authority"]["mode"], "native");
+        assert_eq!(response["authoritative_mining_tip"], true);
+    }
+
     #[test]
     fn basic_rpc_exposes_hsrd_authority_and_parity_diagnostics() {
         let snapshot = RpcSnapshot {

@@ -325,6 +325,7 @@ stage runs on the full path.
 ```bash
 cargo run --locked -p hns-node -- \
   --network mainnet --authority-mode native \
+  --rpc-authorization-header-file /absolute/private/hsrd-authorization-header \
   --native-sync --p2p-discovery \
   --active-state-connect-batch 288
 ```

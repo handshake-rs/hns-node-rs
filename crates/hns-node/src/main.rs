@@ -1,14 +1,26 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use clap::{Parser, ValueEnum};
 use hns_consensus::Network;
 use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
     init_logging, validate_node_config, AuthorityMode, MiningEngineConfig,
-    NameTreeCompactionConfig, NativeSyncConfig, NodeConfig, NodeService, ShutdownSignal,
-    UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
+    NameTreeCompactionConfig, NativeSyncConfig, NodeConfig, NodeService, RpcAuthorizationHeader,
+    ShutdownSignal, UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
+    MAX_RPC_AUTHORIZATION_BYTES,
 };
 use hns_store::DurabilityPolicy;
 
@@ -23,6 +35,10 @@ struct Cli {
 
     #[arg(long, default_value = "127.0.0.1:12037")]
     rpc_bind: SocketAddr,
+
+    /// Read the exact required HTTP Authorization value from a mode-0600 file.
+    #[arg(long)]
+    rpc_authorization_header_file: Option<PathBuf>,
 
     #[arg(long, env = "HSRD_LOG", default_value = "info")]
     log_filter: String,
@@ -153,7 +169,7 @@ struct Cli {
 }
 
 impl Cli {
-    fn into_config(self) -> NodeConfig {
+    fn into_config(self) -> anyhow::Result<NodeConfig> {
         let connect = self
             .p2p_connect
             .iter()
@@ -164,10 +180,16 @@ impl Cli {
             .iter()
             .filter_map(|peer| peer.key.map(|key| (peer.address, key)))
             .collect::<BTreeMap<_, _>>();
-        NodeConfig {
+        let rpc_authorization = self
+            .rpc_authorization_header_file
+            .as_deref()
+            .map(read_rpc_authorization)
+            .transpose()?;
+        Ok(NodeConfig {
             network: self.network.into(),
             data_dir: self.data_dir,
             rpc_bind: self.rpc_bind,
+            rpc_authorization,
             log_filter: self.log_filter,
             authority_mode: self.authority_mode,
             acknowledge_incomplete_consensus: self.acknowledge_incomplete_consensus,
@@ -215,8 +237,43 @@ impl Cli {
                 maximum_pending_publications: self.pending_publications,
                 publication_retry_interval: Duration::from_millis(self.publication_retry_ms),
             },
-        }
+        })
     }
+}
+
+fn read_rpc_authorization(path: &Path) -> anyhow::Result<RpcAuthorizationHeader> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("RPC authorization header path must be absolute without parent traversal");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_RPC_AUTHORIZATION_BYTES as u64 {
+        anyhow::bail!("RPC authorization header must be a bounded mode-0600 regular file");
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o077 != 0 {
+        anyhow::bail!("RPC authorization header must not be accessible by group or other users");
+    }
+    let current = fs::symlink_metadata(path)?;
+    if current.file_type().is_symlink() {
+        anyhow::bail!("RPC authorization header must not be a symbolic link");
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_RPC_AUTHORIZATION_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_RPC_AUTHORIZATION_BYTES {
+        anyhow::bail!("RPC authorization header exceeds the hard byte limit");
+    }
+    let value = String::from_utf8(bytes)?.trim().to_owned();
+    RpcAuthorizationHeader::new(value)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,7 +337,7 @@ impl From<NetworkArg> for Network {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let check_config = cli.check_config;
-    let config = cli.into_config();
+    let config = cli.into_config()?;
 
     init_logging(&config.log_filter)?;
     validate_node_config(&config)?;

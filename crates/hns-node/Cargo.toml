@@ -23,6 +23,7 @@ hns-rpc = { path = "../hns-rpc" }
 hns-state = { path = "../hns-state" }
 hns-store = { path = "../hns-store", default-features = false }
 hns-sync = { path = "../hns-sync" }
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
