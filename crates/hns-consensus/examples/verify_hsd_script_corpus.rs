@@ -1,14 +1,33 @@
 use std::{env, error::Error, fs, path::Path};
 
-use hns_consensus::{verify_witness_program, NativeSignatureVerifier, ScriptFlags};
-use hns_primitives::{Address, Coin, Covenant, CovenantKind, Transaction};
+use hns_consensus::{
+    count_script_sigops, verify_witness_program, NativeSignatureVerifier, ScriptFlags,
+};
+use hns_primitives::{sha3_256, Address, Coin, Covenant, CovenantKind, Transaction};
 use serde::Deserialize;
+
+const HSD_REPOSITORY: &str = "handshake-org/hsd";
+const HSD_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
+const HSD_VERSION: &str = "8.99.0";
+const HSD_SCRIPT_SOURCE: &str =
+    "test/data/script-tests.json via lib/script/script.js#verify/execute";
+const HSD_SCRIPT_CASES: usize = 876;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ScriptExecutionFixture {
     schema: u32,
+    oracle: ScriptExecutionOracle,
     vectors: Vec<ScriptExecutionVector>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScriptExecutionOracle {
+    repository: String,
+    revision: String,
+    hsd_version: String,
+    source: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +42,7 @@ struct ScriptExecutionVector {
     previous_value: u64,
     address_version: u8,
     address_hash: String,
+    sigops: u32,
     flags: Vec<String>,
     result: String,
 }
@@ -35,17 +55,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     let signatures = NativeSignatureVerifier::new()?;
     let mut mismatches = Vec::new();
 
-    for vector in &fixture.vectors {
+    for (index, vector) in fixture.vectors.iter().enumerate() {
+        let expected_id = format!("hsd-script-{index:04}");
+        if vector.id != expected_id {
+            return Err(format!(
+                "script corpus case {index} has id {}; expected {expected_id}",
+                vector.id
+            )
+            .into());
+        }
+        let script = decode_hex(&vector.script_raw)?;
         let transaction = Transaction::decode(&decode_hex(&vector.transaction_raw)?)?;
-        let input = transaction
-            .inputs
-            .first()
-            .ok_or("script corpus transaction has no input")?;
+        let [input] = transaction.inputs.as_slice() else {
+            return Err(format!(
+                "{} transaction has {} inputs; expected exactly one",
+                vector.id,
+                transaction.inputs.len()
+            )
+            .into());
+        };
         let expected_witness = vector
             .witness
             .iter()
             .map(|item| decode_hex(item))
-            .chain(std::iter::once(decode_hex(&vector.script_raw)))
+            .chain(std::iter::once(Ok(script.clone())))
             .collect::<Result<Vec<_>, _>>()?;
         if input.witness.items != expected_witness {
             return Err(format!(
@@ -54,12 +87,28 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
+        let address_hash = decode_hex(&vector.address_hash)?;
+        if vector.address_version != 0 || address_hash.as_slice() != sha3_256(&script) {
+            return Err(format!(
+                "{} address does not commit to its HSD witness script",
+                vector.id
+            )
+            .into());
+        }
+        let sigops = count_script_sigops(&script);
+        if sigops != vector.sigops {
+            return Err(format!(
+                "{}: expected {} sigops, observed {sigops}",
+                vector.id, vector.sigops
+            )
+            .into());
+        }
         let coin = Coin {
             outpoint: input.previous_output.clone(),
             value: vector.previous_value,
             height: 1,
             coinbase: false,
-            address: Address::new(vector.address_version, decode_hex(&vector.address_hash)?)?,
+            address: Address::new(vector.address_version, address_hash)?,
             covenant: Covenant {
                 kind: CovenantKind::None,
                 items: Vec::new(),
@@ -100,7 +149,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     println!(
-        "verified {} HSD script execution cases",
+        "verified {} HSD script execution and sigop cases",
         fixture.vectors.len()
     );
     Ok(())
@@ -109,10 +158,29 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn load_fixture(path: &Path) -> Result<ScriptExecutionFixture, Box<dyn Error>> {
     let bytes = fs::read(path)?;
     let fixture: ScriptExecutionFixture = serde_json::from_slice(&bytes)?;
-    if fixture.schema != 1 || fixture.vectors.is_empty() {
-        return Err("unsupported or empty HSD script corpus".into());
-    }
+    validate_fixture(&fixture)?;
     Ok(fixture)
+}
+
+fn validate_fixture(fixture: &ScriptExecutionFixture) -> Result<(), Box<dyn Error>> {
+    if fixture.schema != 1 {
+        return Err(format!("unsupported HSD script corpus schema {}", fixture.schema).into());
+    }
+    if fixture.oracle.repository != HSD_REPOSITORY
+        || fixture.oracle.revision != HSD_REVISION
+        || fixture.oracle.hsd_version != HSD_VERSION
+        || fixture.oracle.source != HSD_SCRIPT_SOURCE
+    {
+        return Err("HSD script corpus oracle metadata does not match the pinned source".into());
+    }
+    if fixture.vectors.len() != HSD_SCRIPT_CASES {
+        return Err(format!(
+            "HSD script corpus has {} cases; expected {HSD_SCRIPT_CASES}",
+            fixture.vectors.len()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn fixture_flags(names: &[String]) -> Result<ScriptFlags, Box<dyn Error>> {
@@ -144,4 +212,36 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, Box<dyn Error>> {
                 .map_err(|error| -> Box<dyn Error> { Box::new(error) })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_fixture(revision: &str) -> ScriptExecutionFixture {
+        ScriptExecutionFixture {
+            schema: 1,
+            oracle: ScriptExecutionOracle {
+                repository: HSD_REPOSITORY.to_owned(),
+                revision: revision.to_owned(),
+                hsd_version: HSD_VERSION.to_owned(),
+                source: HSD_SCRIPT_SOURCE.to_owned(),
+            },
+            vectors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn full_corpus_rejects_unpinned_oracle_metadata() {
+        let error = validate_fixture(&empty_fixture("wrong-revision"))
+            .expect_err("wrong revision must fail closed");
+        assert!(error.to_string().contains("oracle metadata"));
+    }
+
+    #[test]
+    fn full_corpus_requires_the_exact_pinned_case_count() {
+        let error = validate_fixture(&empty_fixture(HSD_REVISION))
+            .expect_err("truncated corpus must fail closed");
+        assert!(error.to_string().contains("expected 876"));
+    }
 }

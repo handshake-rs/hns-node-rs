@@ -235,7 +235,8 @@ Remaining:
 Implemented:
 
 - HSD generators for sighash, locks, a 56-case focused script execution/error
-  corpus, all 876 upstream script cases, deployments/checkpoints/historical
+  corpus, and pinned-source native replay of all 876 upstream execution/error
+  outcomes and sigop counts; deployments/checkpoints/historical
   boundaries and validation routes, all 168 canonical mainnet deployment
   periods through height 338,688 with next-block versions, airdrop proofs,
   Claim/TXT/DNSSEC ownership-proof codecs and all four

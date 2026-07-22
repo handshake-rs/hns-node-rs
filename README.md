@@ -82,8 +82,10 @@ Implemented:
 - Input authorization and relative-lock checks before any spend is staged.
 - Fail-closed verification when a complete authorization backend is not
   explicitly installed.
-- Reproducible HSD signature-hash, sequence-lock, and 56-case script
-  execution/error fixtures, including flag-sensitive numeric-depth behavior.
+- Reproducible HSD signature-hash, sequence-lock, and 56-case focused script
+  execution/error fixtures, plus a pinned-source full-corpus verifier covering
+  all 876 upstream execution outcomes and sigop counts, including
+  flag-sensitive numeric-depth behavior.
 - Reproducible complete canonical genesis blocks for all four HSD networks,
   with strict peer-style import, UTXO/undo connection, durable restart, and a
   canonical mainnet block-1 continuation through the ordinary validation path.

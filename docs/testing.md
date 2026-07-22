@@ -292,8 +292,10 @@ cargo run --locked --manifest-path hsrd/Cargo.toml -p hns-consensus \
 
 The exporter requires the exact pinned Git revision, reruns every declared HSD
 case through that checkout's script engine, and refuses source/result drift.
-The Rust verifier compares all normalized success and rejection codes and exits
-nonzero on any mismatch.
+The Rust verifier independently pins the oracle repository, revision, version,
+source description, exact 876-case count, and sequential case IDs; it also
+rechecks each transaction witness, SHA3 witness-script commitment, normalized
+success/rejection code, and HSD sigop count. Any mismatch exits nonzero.
 
 The committed deployment/checkpoint fixture is generated through HSD's own
 `Chain.getState`, `getDeployments`, `computeBlockVersion`, and historical
