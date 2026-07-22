@@ -17,19 +17,27 @@ use tokio::{
 };
 
 use crate::{
+    brontide::{inbound_handshake, outbound_handshake, BrontideIdentity, BrontideSession},
     constants::{DEFAULT_USER_AGENT, PROTOCOL_VERSION, SERVICE_NETWORK},
     handshake::{PeerDirection, PeerState},
     runtime::{
-        spawn_peer_runtime, OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig,
-        PeerRuntimeParameters, PeerSnapshot,
+        spawn_brontide_peer_runtime, spawn_peer_runtime, OutboundPriority, PeerEvent, PeerHandle,
+        PeerId, PeerRuntimeConfig, PeerRuntimeParameters, PeerSnapshot,
     },
     wire::{NetAddress, NetworkMagic, Packet, VersionPacket},
     P2pError,
 };
 
 #[derive(Clone, Debug)]
+pub enum PeerTransport {
+    Plaintext,
+    Brontide(BrontideIdentity),
+}
+
+#[derive(Clone, Debug)]
 pub struct LivePeerConfig {
     pub network: Network,
+    pub transport: PeerTransport,
     pub maximum_inbound: usize,
     pub maximum_outbound: usize,
     pub event_capacity: usize,
@@ -46,8 +54,17 @@ pub struct LivePeerConfig {
 
 impl LivePeerConfig {
     pub fn for_network(network: Network) -> Self {
+        let transport = match network {
+            // Public HSD networks expose authenticated Brontide peers. Never
+            // silently fall back to the legacy plaintext port on mainnet.
+            Network::Mainnet | Network::Testnet => {
+                PeerTransport::Brontide(BrontideIdentity::generate())
+            }
+            Network::Regtest | Network::Simnet => PeerTransport::Plaintext,
+        };
         Self {
             network,
+            transport,
             maximum_inbound: 32,
             maximum_outbound: 8,
             event_capacity: 1_024,
@@ -195,25 +212,84 @@ impl LivePeerManager {
     }
 
     pub async fn connect(&self, address: SocketAddr) -> Result<PeerId, P2pError> {
+        if matches!(self.config.transport, PeerTransport::Brontide(_)) {
+            return Err(P2pError::Configuration(
+                "Brontide outbound connections require a NetAddress with an authenticated remote static key"
+                    .to_owned(),
+            ));
+        }
         self.ensure_capacity(PeerDirection::Outbound, address)
             .await?;
         let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(address))
             .await
             .map_err(|_| P2pError::Timeout(format!("connection to {address} timed out")))??;
         stream.set_nodelay(true)?;
-        self.register_stream(stream, address, PeerDirection::Outbound)
+        self.register_stream(stream, address, PeerDirection::Outbound, None)
             .await
+    }
+
+    /// Connect to a key-bearing HSD network address. On Brontide networks the
+    /// advertised static key authenticates the remote endpoint; plaintext mode
+    /// accepts the socket portion for local development compatibility.
+    pub async fn connect_net_address(&self, peer: &NetAddress) -> Result<PeerId, P2pError> {
+        let address = peer.socket_addr().ok_or_else(|| {
+            P2pError::Configuration("peer network address is not an IP endpoint".to_owned())
+        })?;
+        match &self.config.transport {
+            PeerTransport::Plaintext => self.connect(address).await,
+            PeerTransport::Brontide(identity) => {
+                self.ensure_capacity(PeerDirection::Outbound, address)
+                    .await?;
+                if !matches!(peer.key[0], 0x02 | 0x03) {
+                    return Err(P2pError::Configuration(format!(
+                        "Brontide peer {address} has no valid compressed static key"
+                    )));
+                }
+                let mut stream =
+                    tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(address))
+                        .await
+                        .map_err(|_| {
+                            P2pError::Timeout(format!("connection to {address} timed out"))
+                        })??;
+                stream.set_nodelay(true)?;
+                let session = tokio::time::timeout(
+                    self.config.runtime.handshake_timeout,
+                    outbound_handshake(&mut stream, identity, peer.key),
+                )
+                .await
+                .map_err(|_| {
+                    P2pError::Timeout(format!("Brontide handshake with {address} timed out"))
+                })??;
+                self.register_stream(stream, address, PeerDirection::Outbound, Some(session))
+                    .await
+            }
+        }
     }
 
     pub async fn accept_stream(
         &self,
-        stream: TcpStream,
+        mut stream: TcpStream,
         address: SocketAddr,
     ) -> Result<PeerId, P2pError> {
         self.ensure_capacity(PeerDirection::Inbound, address)
             .await?;
         stream.set_nodelay(true)?;
-        self.register_stream(stream, address, PeerDirection::Inbound)
+        let session = match &self.config.transport {
+            PeerTransport::Plaintext => None,
+            PeerTransport::Brontide(identity) => Some(
+                tokio::time::timeout(
+                    self.config.runtime.handshake_timeout,
+                    inbound_handshake(&mut stream, identity),
+                )
+                .await
+                .map_err(|_| {
+                    P2pError::Timeout(format!(
+                        "inbound Brontide handshake with {address} timed out"
+                    ))
+                })??,
+            ),
+        };
+        self.register_stream(stream, address, PeerDirection::Inbound, session)
             .await
     }
 
@@ -505,6 +581,7 @@ impl LivePeerManager {
         stream: TcpStream,
         address: SocketAddr,
         direction: PeerDirection,
+        brontide: Option<BrontideSession>,
     ) -> Result<PeerId, P2pError> {
         let _registration = self.registration_lock.lock().await;
         self.ensure_capacity(direction, address).await?;
@@ -522,19 +599,19 @@ impl LivePeerManager {
         };
         let magic = NetworkMagic::from(self.config.network);
         let (reader, writer) = stream.into_split();
-        let spawned = spawn_peer_runtime(
-            PeerRuntimeParameters {
-                id,
-                address,
-                direction,
-                magic,
-                local_version,
-                config: self.config.runtime.clone(),
-                events: self.events.clone(),
-            },
-            reader,
-            writer,
-        )?;
+        let parameters = PeerRuntimeParameters {
+            id,
+            address,
+            direction,
+            magic,
+            local_version,
+            config: self.config.runtime.clone(),
+            events: self.events.clone(),
+        };
+        let spawned = match brontide {
+            Some(session) => spawn_brontide_peer_runtime(parameters, reader, writer, session)?,
+            None => spawn_peer_runtime(parameters, reader, writer)?,
+        };
         self.peers.write().await.insert(id, spawned.handle.clone());
 
         let peers = Arc::clone(&self.peers);
@@ -681,6 +758,63 @@ mod tests {
         assert!(matches!(error, P2pError::BannedAddress { .. }));
         client_manager.disconnect_all().await;
         server_manager.disconnect_all().await;
+    }
+
+    #[tokio::test]
+    async fn live_manager_completes_authenticated_brontide_and_version_handshakes() {
+        let mut server_config = LivePeerConfig::for_network(Network::Testnet);
+        server_config.runtime.ping_interval = Duration::from_secs(60);
+        let server_key = match &server_config.transport {
+            PeerTransport::Brontide(identity) => *identity.public_key(),
+            PeerTransport::Plaintext => panic!("public network must use Brontide"),
+        };
+        let mut client_config = LivePeerConfig::for_network(Network::Testnet);
+        client_config.runtime.ping_interval = Duration::from_secs(60);
+        let (server_manager, mut server_events) =
+            LivePeerManager::new(server_config).expect("server");
+        let (client_manager, mut client_events) =
+            LivePeerManager::new(client_config).expect("client");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = {
+            let manager = server_manager.clone();
+            tokio::spawn(async move {
+                let (stream, peer_address) = listener.accept().await.expect("accept");
+                manager
+                    .accept_stream(stream, peer_address)
+                    .await
+                    .expect("register")
+            })
+        };
+        let mut peer_address = NetAddress::from_socket_addr(address, unix_time(), SERVICE_NETWORK);
+        peer_address.key = server_key;
+        let client_peer = client_manager
+            .connect_net_address(&peer_address)
+            .await
+            .expect("Brontide connect");
+        let server_peer = server.await.expect("join");
+
+        let client_ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(PeerEvent::Ready { peer, .. }) = client_events.recv().await {
+                    break peer;
+                }
+            }
+        })
+        .await
+        .expect("client ready");
+        let server_ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(PeerEvent::Ready { peer, .. }) = server_events.recv().await {
+                    break peer;
+                }
+            }
+        })
+        .await
+        .expect("server ready");
+        assert_eq!(client_ready, client_peer);
+        assert_eq!(server_ready, server_peer);
     }
 
     #[tokio::test]

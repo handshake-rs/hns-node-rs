@@ -341,6 +341,12 @@ fn map_secp_error(error: SecpError) -> ScriptError {
         SecpError::ContextCreation => ScriptError::SignatureBackendUnavailable,
         SecpError::InvalidCompactSignature | SecpError::HighS => ScriptError::SignatureEncoding,
         SecpError::InvalidPublicKey => ScriptError::PublicKeyEncoding,
+        // Transport-only operations are never called by this verifier. Treat
+        // any future accidental crossing of that boundary as backend failure,
+        // preserving fail-closed consensus behavior.
+        SecpError::InvalidPrivateKey | SecpError::InvalidElligatorEncoding => {
+            ScriptError::SignatureBackendUnavailable
+        }
     }
 }
 

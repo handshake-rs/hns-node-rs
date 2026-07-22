@@ -65,7 +65,7 @@ struct Cli {
     #[arg(long, default_value_t = 288)]
     active_state_connect_batch: usize,
 
-    /// Bind an inbound plaintext Handshake P2P listener.
+    /// Bind an inbound Handshake P2P listener (Brontide on public networks).
     #[arg(long)]
     p2p_listen: Option<SocketAddr>,
 
@@ -73,11 +73,11 @@ struct Cli {
     #[arg(long = "connect")]
     p2p_connect: Vec<SocketAddr>,
 
-    /// Resolve HSD's network DNS seeds and learn bounded peers through GETADDR/ADDR.
+    /// Bootstrap from HSD's key-bearing fixed seeds and learn peers through GETADDR/ADDR.
     #[arg(long)]
     p2p_discovery: bool,
 
-    /// Maximum explicit and discovered plaintext peers retained by the address book.
+    /// Maximum explicit and discovered peers retained by the address book.
     #[arg(long, default_value_t = 4_096)]
     maximum_known_addresses: usize,
 

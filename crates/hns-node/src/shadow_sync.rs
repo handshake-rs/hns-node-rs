@@ -69,9 +69,9 @@ const MAX_KNOWN_PEER_ADDRESSES: usize = 16_384;
 const DEFAULT_KNOWN_PEER_ADDRESSES: usize = 4_096;
 const ADDRESS_BOOK_KEY: &[u8] = b"address-book/v1";
 const ADDRESS_BOOK_MAGIC: &[u8; 4] = b"HAB1";
-const ADDRESS_BOOK_VERSION: u8 = 1;
+const ADDRESS_BOOK_VERSION: u8 = 2;
 const ADDRESS_BOOK_CHECKSUM_SIZE: usize = 32;
-const ADDRESS_BOOK_ENTRY_SIZE: usize = 63;
+const ADDRESS_BOOK_ENTRY_SIZE: usize = 96;
 const ADDRESS_BOOK_HEADER_SIZE: usize = 26;
 const MAX_ADDRESS_BOOK_RECORD_SIZE: usize = ADDRESS_BOOK_HEADER_SIZE
     + MAX_KNOWN_PEER_ADDRESSES * ADDRESS_BOOK_ENTRY_SIZE
@@ -82,7 +82,6 @@ const HSD_ADDRESS_MIN_FAIL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const HSD_ADDRESS_MAX_FAILURES: u32 = 10;
 const HSD_ADDRESS_RECENT_ATTEMPT_SECONDS: u64 = 60;
 const HSD_ADDRESS_TIMESTAMP_REFRESH_SECONDS: u64 = 20 * 60;
-const DNS_SEED_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ADDR_FUTURE_SECONDS: u64 = 10 * 60;
 const FALLBACK_ADDR_AGE_SECONDS: u64 = 5 * 24 * 60 * 60;
 const MIN_ADDR_TIMESTAMP: u64 = 100_000_000;
@@ -96,10 +95,76 @@ pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 8;
 const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
 const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-const fn hsd_dns_seeds(network: Network) -> &'static [&'static str] {
+// Key-bearing fixed seeds from the pinned HSD `lib/net/seeds` tables. HSD's
+// DNS seed answers expose legacy plaintext endpoints without static keys, so a
+// native Brontide bootstrap must begin from these authenticated records and
+// then learn more key-bearing peers through ADDR.
+const HSD_MAINNET_BRONTIDE_SEEDS: &[(&str, &str)] = &[
+    (
+        "129.153.177.220",
+        "02a58318ea330487308b1a4bd90bd196a466e99be64a3cf2f1fe7b5352154a25c2",
+    ),
+    (
+        "159.69.46.23",
+        "03e7c897432e08b0a2a6f6e9cfdb0aa8d3392f8abe4a3c2d40013b2ee06b1adb6a",
+    ),
+    (
+        "173.255.209.126",
+        "024798bdd795240b711787273406f7950fd2a943a0bb096701720682eb3aea37ed",
+    ),
+    (
+        "74.207.247.120",
+        "0290c11c1d0895f96f9c1b0c4f2b6034ee3d4ee8f5f90c9b6c76bd27d4bd0a5cbd",
+    ),
+    (
+        "172.104.214.189",
+        "039078400609f39f5ae6e6d132161561860e52d35637ed3f5a5050c160dd28dfde",
+    ),
+    (
+        "45.79.134.225",
+        "03fb5a5801cdb19f01472480d00c1c928e498f49955eab5217cd00e755bd267973",
+    ),
+    (
+        "35.154.209.88",
+        "022d850f3bfb951c6de1d2f239183721bfaa2b1ac89576200fcca6f84181d1da62",
+    ),
+    (
+        "194.50.5.26",
+        "023e3322d4221160923ea1dc481523a26ef3fa8483da062f7e92040534cc6b3606",
+    ),
+    (
+        "194.50.5.27",
+        "03949fede42b27117d0a75e08cf1b139a37241ad4bebcb5c8a9928fdec7469107d",
+    ),
+    (
+        "194.50.5.28",
+        "0247eb646fdf05bd470c5ad380d42e936ffe8278e46cc9bd5791ea58c28587ab45",
+    ),
+];
+
+const HSD_TESTNET_BRONTIDE_SEEDS: &[(&str, &str)] = &[
+    (
+        "172.104.214.189",
+        "039078400609f39f5ae6e6d132161561860e52d35637ed3f5a5050c160dd28dfde",
+    ),
+    (
+        "173.255.209.126",
+        "024798bdd795240b711787273406f7950fd2a943a0bb096701720682eb3aea37ed",
+    ),
+    (
+        "172.104.177.177",
+        "0255dfda9369ca3cd616844c00eed63f2d7740cd56780a856def1e64f536214539",
+    ),
+    (
+        "139.162.183.168",
+        "0334b93039cdda203e704bb5a4831b66665b2f7b0dcea7fd022dfea623b1aa4081",
+    ),
+];
+
+const fn hsd_brontide_seeds(network: Network) -> &'static [(&'static str, &'static str)] {
     match network {
-        Network::Mainnet => &["hs-mainnet.bcoin.ninja", "seed.htools.work"],
-        Network::Testnet => &["hs-testnet.bcoin.ninja"],
+        Network::Mainnet => HSD_MAINNET_BRONTIDE_SEEDS,
+        Network::Testnet => HSD_TESTNET_BRONTIDE_SEEDS,
         Network::Regtest | Network::Simnet => &[],
     }
 }
@@ -113,8 +178,8 @@ pub struct ShadowSyncConfig {
     pub active_state_connect_batch: usize,
     pub listen: Option<SocketAddr>,
     pub connect: Vec<SocketAddr>,
-    /// Resolve HSD's network DNS seeds and learn bounded plaintext peers from
-    /// GETADDR/ADDR. Explicit `connect` peers remain pinned reconnect targets.
+    /// Bootstrap from HSD's key-bearing fixed seeds and learn bounded peers
+    /// from GETADDR/ADDR. Explicit `connect` peers remain pinned reconnect targets.
     pub discovery: bool,
     pub maximum_known_addresses: usize,
     pub maximum_inbound: usize,
@@ -178,7 +243,7 @@ impl ShadowSyncConfig {
                 self.active_state_connect_batch
             );
         }
-        let has_discovery_endpoint = self.discovery && !hsd_dns_seeds(network).is_empty();
+        let has_discovery_endpoint = self.discovery && !hsd_brontide_seeds(network).is_empty();
         if self.listen.is_none() && self.connect.is_empty() && !has_discovery_endpoint {
             anyhow::bail!(
                 "Shadow sync requires an inbound listener, an explicit outbound peer, or DNS discovery on a seeded network"
@@ -460,6 +525,7 @@ impl AddressAdmission {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PersistedPeerAddress {
     address: SocketAddr,
+    key: [u8; 33],
     services: u64,
     time: u64,
     failures: u32,
@@ -571,11 +637,16 @@ impl BoundedAddressBook {
             }
             let old_services = existing.wire.services;
             let old_time = existing.wire.time;
+            let old_key = existing.wire.key;
             existing.wire.services |= wire.services;
             if wire.time > existing.wire.time {
                 existing.wire.time = wire.time;
+                existing.wire.key = wire.key;
             }
-            if existing.wire.services != old_services || existing.wire.time != old_time {
+            if existing.wire.services != old_services
+                || existing.wire.time != old_time
+                || existing.wire.key != old_key
+            {
                 self.dirty = true;
             }
             return AddressAdmission::Updated;
@@ -665,6 +736,10 @@ impl BoundedAddressBook {
         selected
     }
 
+    fn wire_address(&self, address: SocketAddr) -> Option<hns_p2p::NetAddress> {
+        self.entries.get(&address).map(|entry| entry.wire.clone())
+    }
+
     fn remove_discovered_ip(&mut self, address: IpAddr) -> usize {
         let address = normalize_peer_ip(address);
         let before = self.entries.len();
@@ -752,6 +827,7 @@ impl BoundedAddressBook {
             .filter(|(_, entry)| !entry.configured)
             .map(|(address, entry)| PersistedPeerAddress {
                 address: *address,
+                key: entry.wire.key,
                 services: entry.wire.services,
                 time: entry.wire.time,
                 failures: entry.failures,
@@ -810,11 +886,15 @@ impl BoundedAddressBook {
             self.entries.insert(
                 entry.address,
                 KnownPeerAddress {
-                    wire: hns_p2p::NetAddress::from_socket_addr(
-                        entry.address,
-                        entry.time,
-                        entry.services,
-                    ),
+                    wire: {
+                        let mut wire = hns_p2p::NetAddress::from_socket_addr(
+                            entry.address,
+                            entry.time,
+                            entry.services,
+                        );
+                        wire.key = entry.key;
+                        wire
+                    },
                     configured: false,
                     failures: entry.failures,
                     last_success: entry.last_success,
@@ -866,6 +946,7 @@ impl AddressBookRecord {
                 }
             }
             writer.write_u16(entry.address.port());
+            writer.write_bytes(&entry.key);
             writer.write_u64(entry.services);
             writer.write_u64(entry.time);
             writer.write_u32(entry.failures);
@@ -954,6 +1035,10 @@ impl AddressBookRecord {
             }
             entries.push(PersistedPeerAddress {
                 address,
+                key: reader
+                    .read_vec(33)?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("address-book public key length mismatch"))?,
                 services: reader.read_u64()?,
                 time: reader.read_u64()?,
                 failures: reader.read_u32()?,
@@ -1140,32 +1225,55 @@ struct ConnectAttemptResult {
 
 #[derive(Debug, Default)]
 struct DnsSeedResolution {
-    addresses: Vec<SocketAddr>,
+    addresses: Vec<hns_p2p::NetAddress>,
     errors: Vec<String>,
 }
 
 async fn resolve_hsd_dns_seeds(network: Network) -> DnsSeedResolution {
-    let mut resolved = BTreeSet::new();
+    let seeds = hsd_brontide_seeds(network);
+    let mut resolved = Vec::with_capacity(seeds.len());
     let mut errors = Vec::new();
-    for seed in hsd_dns_seeds(network) {
-        let lookup = tokio::time::timeout(
-            DNS_SEED_TIMEOUT,
-            tokio::net::lookup_host((*seed, network.params().port)),
-        )
-        .await;
-        match lookup {
-            Ok(Ok(addresses)) => resolved.extend(addresses),
-            Ok(Err(error)) => errors.push(format!("DNS seed {seed} failed: {error}")),
-            Err(_) => errors.push(format!(
-                "DNS seed {seed} exceeded the {} second timeout",
-                DNS_SEED_TIMEOUT.as_secs()
-            )),
+    for (host, encoded_key) in seeds {
+        let parsed = host
+            .parse::<IpAddr>()
+            .map_err(|error| format!("invalid pinned HSD seed IP {host}: {error}"))
+            .and_then(|ip| decode_compressed_public_key(encoded_key).map(|key| (ip, key)));
+        match parsed {
+            Ok((ip, key)) => {
+                let mut wire = hns_p2p::NetAddress::from_socket_addr(
+                    SocketAddr::new(ip, network.params().brontide_port),
+                    0,
+                    SERVICE_NETWORK,
+                );
+                wire.key = key;
+                resolved.push(wire);
+            }
+            Err(error) => errors.push(error),
         }
     }
     DnsSeedResolution {
-        addresses: resolved.into_iter().collect(),
+        addresses: resolved,
         errors,
     }
+}
+
+fn decode_compressed_public_key(encoded: &str) -> std::result::Result<[u8; 33], String> {
+    if encoded.len() != 66 {
+        return Err(format!(
+            "compressed public key has {} hex characters; expected 66",
+            encoded.len()
+        ));
+    }
+    let mut key = [0u8; 33];
+    for (index, output) in key.iter_mut().enumerate() {
+        let offset = index * 2;
+        *output = u8::from_str_radix(&encoded[offset..offset + 2], 16)
+            .map_err(|error| format!("invalid compressed public key hex: {error}"))?;
+    }
+    if !matches!(key[0], 0x02 | 0x03) {
+        return Err("compressed public key has an invalid prefix".to_owned());
+    }
+    Ok(key)
 }
 
 impl NodeService {
@@ -1322,12 +1430,8 @@ impl NodeService {
             for error in resolution.errors {
                 tracing::warn!(%error, "HNS DNS seed resolution failed");
             }
-            for address in resolution.addresses {
-                let wire = hns_p2p::NetAddress::from_socket_addr(
-                    address,
-                    address_timestamp,
-                    SERVICE_NETWORK,
-                );
+            for mut wire in resolution.addresses {
+                wire.time = address_timestamp;
                 if address_book
                     .insert_discovered(wire, address_now, address_timestamp)
                     .accepted()
@@ -4289,11 +4393,14 @@ fn spawn_due_connections(
     }
     for address in &due {
         let address = *address;
+        let Some(wire) = addresses.wire_address(address) else {
+            continue;
+        };
         let peers = peers.clone();
         let results = results.clone();
         tokio::spawn(async move {
             let result = peers
-                .connect(address)
+                .connect_net_address(&wire)
                 .await
                 .map_err(|error| error.to_string());
             let _ = results.send(ConnectAttemptResult { address, result }).await;
@@ -4811,13 +4918,15 @@ mod tests {
     }
 
     #[test]
-    fn dns_discovery_uses_pinned_hsd_network_seeds() {
+    fn discovery_uses_pinned_hsd_key_bearing_seeds() {
+        assert_eq!(hsd_brontide_seeds(Network::Mainnet).len(), 10);
+        assert_eq!(hsd_brontide_seeds(Network::Testnet).len(), 4);
+        assert!(hsd_brontide_seeds(Network::Regtest).is_empty());
         assert_eq!(
-            hsd_dns_seeds(Network::Mainnet),
-            &["hs-mainnet.bcoin.ninja", "seed.htools.work"]
+            decode_compressed_public_key(hsd_brontide_seeds(Network::Mainnet)[0].1)
+                .expect("pinned key")[0],
+            0x02
         );
-        assert_eq!(hsd_dns_seeds(Network::Testnet), &["hs-testnet.bcoin.ninja"]);
-        assert!(hsd_dns_seeds(Network::Regtest).is_empty());
 
         let discovery = ShadowSyncConfig {
             enabled: true,
@@ -4826,7 +4935,7 @@ mod tests {
         };
         discovery
             .validate(AuthorityMode::Shadow, Network::Mainnet)
-            .expect("mainnet has HSD DNS seeds");
+            .expect("mainnet has HSD Brontide seeds");
         assert!(discovery
             .validate(AuthorityMode::Shadow, Network::Regtest)
             .is_err());
@@ -4856,6 +4965,7 @@ mod tests {
             entries: vec![
                 PersistedPeerAddress {
                     address: "8.8.8.8:12038".parse().expect("IPv4 peer"),
+                    key: [2; 33],
                     services: SERVICE_NETWORK,
                     time: 1_799_999_900,
                     failures: 2,
@@ -4865,6 +4975,7 @@ mod tests {
                 },
                 PersistedPeerAddress {
                     address: "[2606:4700:4700::1111]:12038".parse().expect("IPv6 peer"),
+                    key: [3; 33],
                     services: SERVICE_NETWORK,
                     time: 1_799_999_700,
                     failures: 0,

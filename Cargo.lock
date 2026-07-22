@@ -494,6 +494,8 @@ version = "0.1.0"
 dependencies = [
  "hns-consensus",
  "hns-primitives",
+ "hns-secp256k1",
+ "openssl",
  "rand",
  "serde",
  "serde_json",

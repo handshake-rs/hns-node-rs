@@ -10,15 +10,22 @@ use std::{
 
 use hns_primitives::BlockHash;
 
+pub mod brontide;
 pub mod constants;
 pub mod handshake;
 pub mod manager;
 pub mod runtime;
 pub mod wire;
 
+pub use brontide::{
+    generate_private_key, BrontideHandshake, BrontideIdentity, BrontideSession,
+    BRONTIDE_ACT_ONE_SIZE, BRONTIDE_ACT_THREE_SIZE, BRONTIDE_ACT_TWO_SIZE, BRONTIDE_HEADER_SIZE,
+};
 pub use constants::*;
 pub use handshake::{HandshakeUpdate, PeerDirection, PeerHandshake, PeerState};
-pub use manager::{normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, PeerBan};
+pub use manager::{
+    normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, PeerBan, PeerTransport,
+};
 pub use runtime::{
     OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot,
 };

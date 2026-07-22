@@ -395,13 +395,15 @@
       "tags": [
         "p2p",
         "wire",
+        "brontide",
+        "noise-xk",
         "claim",
         "ownership",
         "dnssec",
         "airdrop",
         "oracle"
       ],
-      "blake2b256": "62ee994ba4567d9205c225f937a70a94fb3eacef7a51a333a2e71ce88867fea5"
+      "blake2b256": "002de68cb471d2893cff83c5787e3219a4798d1601bcaacbdcac3882fed2c55a"
     },
     {
       "id": "mining-template-v1",

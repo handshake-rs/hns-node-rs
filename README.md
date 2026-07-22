@@ -239,9 +239,14 @@ Implemented:
 
 - Exact bounded HNS frame and sync-relevant packet codecs with pinned HSD wire
   fixtures.
-- Live inbound, explicit outbound, and opt-in discovered plaintext TCP sessions with VERSION,
-  VERACK, SENDHEADERS, PING/PONG, self-connection rejection, handshake/idle
-  timeouts, and byte counters. Partial frame reads remain pinned across timer
+- Live inbound, explicit outbound, and opt-in discovered TCP sessions with
+  VERSION, VERACK, SENDHEADERS, PING/PONG, self-connection rejection,
+  handshake/idle timeouts, and byte counters. Mainnet and testnet use HSD's
+  authenticated Brontide transport (Noise XK, Elligator-Squared,
+  ChaCha20-Poly1305, exact transcript rules, and 1,000-record key rotation);
+  plaintext remains limited to regtest/simnet development. Pinned HSD cipher,
+  split-key, packet, and rotation vectors plus a full encrypted manager test
+  cover the transport boundary. Partial frame reads remain pinned across timer
   maintenance so a ping tick cannot desynchronize a large block payload.
 - Bounded critical, control, and normal outbound queues.
 - A bounded peer manager with connection limits, duplicate-address rejection,
@@ -249,9 +254,11 @@ Implemented:
   pre-handshake inbound/outbound enforcement, snapshots, and exponential
   outbound reconnect backoff. Ban records are restart-durable when a data
   directory is configured.
-- Opt-in HSD DNS-seed bootstrap and GETADDR/ADDR learning through a bounded,
-  restart-durable address book. Discovery accepts only keyless, network-service,
-  routable addresses with HSD-normalized timestamps; repeatedly failing
+- Opt-in bootstrap from HSD's pinned key-bearing Brontide seed table and
+  GETADDR/ADDR learning through a bounded, restart-durable address book.
+  Discovery accepts only key-bearing, network-service, routable addresses with
+  HSD-normalized timestamps; public keys survive restart and newer address
+  records can rotate them. Repeatedly failing
   discovered targets rotate without displacing explicit reconnect peers.
   Discovered outbound targets and simultaneous attempts enforce HSD's exact
   IPv4 `/16`, IPv6 `/32`, HE `/36`, and transition-address group keys.
@@ -314,8 +321,8 @@ Implemented:
 
 Still release-blocking:
 
-- Brontide transport, long-lived subthreshold peer reputation, and broader
-  adversarial network qualification;
+- Long-lived subthreshold peer reputation and broader adversarial network
+  qualification;
 - sustained adversarial qualification of the implemented ordinary,
   claim/airdrop, and solved-block relay paths;
 - production qualification of contextual active-state IBD across full mainnet

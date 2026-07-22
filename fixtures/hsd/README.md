@@ -22,5 +22,7 @@ golden cases can be added without changing testkit paths.
   vectors, compact canonical-mainnet deployment-period/next-version history,
   canonical block-1 coinbase-finality evidence, and generated regtest/simnet
   chain scenarios.
-- `network`: P2P peer and packet fixtures.
+- `p2p`: P2P peer/packet fixtures plus HSD Brontide cipher, handshake,
+  key-rotation, traffic, and key-bearing fixed-seed vectors.
+- `network`: reserved live-network evidence fixtures.
 - `snapshots`: snapshot manifest and chunk fixtures.

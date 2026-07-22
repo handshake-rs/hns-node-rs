@@ -1,15 +1,16 @@
-//! Verification-only, safe Rust ownership wrapper around the exact
+//! Safe Rust ownership wrapper around the exact
 //! libsecp256k1 source revision vendored by HSD's pinned bcrypto dependency.
 //!
-//! The crate deliberately exposes no signing or key-generation API. Consensus
-//! code needs only compact ECDSA signature parsing, HSD's low-S rule, compressed
-//! public-key parsing, and verification. The FFI context is thread-local: this
-//! keeps all unsafe ownership details inside this crate without asserting
-//! `Send` or `Sync` for a foreign pointer.
+//! Consensus code uses compact ECDSA verification. P2P transport additionally
+//! uses public-key derivation, raw compressed ECDH, and Elligator-Squared. The
+//! crate deliberately exposes no signing API. The FFI context is thread-local,
+//! keeping all unsafe ownership details here without asserting `Send` or `Sync`
+//! for a foreign pointer.
 
 use std::{cell::RefCell, ffi::c_void, ptr::NonNull};
 
-const CONTEXT_VERIFY: u32 = (1 << 0) | (1 << 8);
+const CONTEXT_VERIFY_AND_SIGN: u32 = (1 << 0) | (1 << 8) | (1 << 9);
+const EC_COMPRESSED: u32 = (1 << 1) | (1 << 8);
 
 #[repr(C)]
 struct SecpPublicKey {
@@ -30,6 +31,37 @@ extern "C" {
         input: *const u8,
         input_len: usize,
     ) -> i32;
+    fn secp256k1_ec_pubkey_create(
+        context: *const c_void,
+        output: *mut SecpPublicKey,
+        secret_key: *const u8,
+    ) -> i32;
+    fn secp256k1_ec_pubkey_serialize(
+        context: *const c_void,
+        output: *mut u8,
+        output_len: *mut usize,
+        public_key: *const SecpPublicKey,
+        flags: u32,
+    ) -> i32;
+    fn secp256k1_ecdh(
+        context: *const c_void,
+        output: *mut u8,
+        public_key: *const SecpPublicKey,
+        secret_key: *const u8,
+        hash_function: Option<EcdhHashFunction>,
+        data: *mut c_void,
+    ) -> i32;
+    fn secp256k1_ec_pubkey_from_hash(
+        context: *const c_void,
+        output: *mut SecpPublicKey,
+        bytes64: *const u8,
+    ) -> i32;
+    fn secp256k1_ec_pubkey_to_hash(
+        context: *const c_void,
+        output: *mut u8,
+        public_key: *const SecpPublicKey,
+        entropy: *const u8,
+    ) -> i32;
     fn secp256k1_ecdsa_signature_parse_compact(
         context: *const c_void,
         output: *mut SecpSignature,
@@ -48,14 +80,36 @@ extern "C" {
     ) -> i32;
 }
 
+type EcdhHashFunction = unsafe extern "C" fn(
+    output: *mut u8,
+    x_coordinate: *const u8,
+    y_coordinate: *const u8,
+    data: *mut c_void,
+) -> i32;
+
+unsafe extern "C" fn compressed_ecdh_point(
+    output: *mut u8,
+    x_coordinate: *const u8,
+    y_coordinate: *const u8,
+    _data: *mut c_void,
+) -> i32 {
+    // Match bcrypto's `ecdh_hash_function_raw(..., compress=true)`: the caller
+    // hashes this 33-byte compressed point with SHA256 at the Noise layer.
+    unsafe {
+        *output = 0x02 | (*y_coordinate.add(31) & 1);
+        std::ptr::copy_nonoverlapping(x_coordinate, output.add(1), 32);
+    }
+    1
+}
+
 #[derive(Debug)]
-struct VerificationContext {
+struct SecpContext {
     pointer: NonNull<c_void>,
 }
 
-impl VerificationContext {
+impl SecpContext {
     fn new() -> Result<Self, SecpError> {
-        let pointer = unsafe { secp256k1_context_create(CONTEXT_VERIFY) };
+        let pointer = unsafe { secp256k1_context_create(CONTEXT_VERIFY_AND_SIGN) };
         let pointer = NonNull::new(pointer).ok_or(SecpError::ContextCreation)?;
         Ok(Self { pointer })
     }
@@ -65,26 +119,120 @@ impl VerificationContext {
     }
 }
 
-impl Drop for VerificationContext {
+impl Drop for SecpContext {
     fn drop(&mut self) {
         unsafe { secp256k1_context_destroy(self.pointer.as_ptr()) };
     }
 }
 
 thread_local! {
-    static VERIFY_CONTEXT: RefCell<Option<VerificationContext>> = const { RefCell::new(None) };
+    static SECP_CONTEXT: RefCell<Option<SecpContext>> = const { RefCell::new(None) };
 }
 
 fn with_context<T>(
-    operation: impl FnOnce(&VerificationContext) -> Result<T, SecpError>,
+    operation: impl FnOnce(&SecpContext) -> Result<T, SecpError>,
 ) -> Result<T, SecpError> {
-    VERIFY_CONTEXT.with(|slot| {
+    SECP_CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = Some(VerificationContext::new()?);
+            *slot = Some(SecpContext::new()?);
         }
         operation(slot.as_ref().expect("verification context initialized"))
     })
+}
+
+/// Stateless transport primitive provider backed by the same pinned context
+/// as [`Secp256k1Verifier`]. Private keys are always supplied by the caller and
+/// never retained by this type.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Secp256k1Transport;
+
+impl Secp256k1Transport {
+    /// Eagerly exercise context construction for startup/readiness checks.
+    pub fn new() -> Result<Self, SecpError> {
+        with_context(|_| Ok(()))?;
+        Ok(Self)
+    }
+
+    /// Derive the compressed public key for a valid 32-byte private scalar.
+    pub fn public_key(&self, private_key: &[u8; 32]) -> Result<[u8; 33], SecpError> {
+        with_context(|context| {
+            let mut public_key = SecpPublicKey { data: [0; 64] };
+            let created = unsafe {
+                secp256k1_ec_pubkey_create(context.as_ptr(), &mut public_key, private_key.as_ptr())
+            };
+            if created != 1 {
+                return Err(SecpError::InvalidPrivateKey);
+            }
+            serialize_public_key(context, &public_key)
+        })
+    }
+
+    /// Derive the raw compressed shared point used by HSD before its SHA256.
+    pub fn derive_compressed(
+        &self,
+        remote_public_key: &[u8; 33],
+        private_key: &[u8; 32],
+    ) -> Result<[u8; 33], SecpError> {
+        with_context(|context| {
+            let public_key = parse_public_key(context, remote_public_key)?;
+            let mut shared = [0u8; 33];
+            let derived = unsafe {
+                secp256k1_ecdh(
+                    context.as_ptr(),
+                    shared.as_mut_ptr(),
+                    &public_key,
+                    private_key.as_ptr(),
+                    Some(compressed_ecdh_point),
+                    std::ptr::null_mut(),
+                )
+            };
+            if derived != 1 {
+                return Err(SecpError::InvalidPrivateKey);
+            }
+            Ok(shared)
+        })
+    }
+
+    /// Decode HSD's 64-byte Elligator-Squared representation.
+    pub fn public_key_from_hash(&self, encoded: &[u8; 64]) -> Result<[u8; 33], SecpError> {
+        with_context(|context| {
+            let mut public_key = SecpPublicKey { data: [0; 64] };
+            let decoded = unsafe {
+                secp256k1_ec_pubkey_from_hash(context.as_ptr(), &mut public_key, encoded.as_ptr())
+            };
+            if decoded != 1 {
+                return Err(SecpError::InvalidElligatorEncoding);
+            }
+            serialize_public_key(context, &public_key)
+        })
+    }
+
+    /// Encode a compressed key with HSD's Elligator-Squared transform.
+    /// `entropy` is explicit so callers can use an OS RNG in production and
+    /// fixed oracle entropy in compatibility tests.
+    pub fn public_key_to_hash(
+        &self,
+        public_key: &[u8; 33],
+        entropy: &[u8; 32],
+    ) -> Result<[u8; 64], SecpError> {
+        with_context(|context| {
+            let public_key = parse_public_key(context, public_key)?;
+            let mut encoded = [0u8; 64];
+            let encoded_ok = unsafe {
+                secp256k1_ec_pubkey_to_hash(
+                    context.as_ptr(),
+                    encoded.as_mut_ptr(),
+                    &public_key,
+                    entropy.as_ptr(),
+                )
+            };
+            if encoded_ok != 1 {
+                return Err(SecpError::InvalidElligatorEncoding);
+            }
+            Ok(encoded)
+        })
+    }
 }
 
 /// Stateless, cloneable verifier. The actual libsecp256k1 context is created
@@ -158,10 +306,7 @@ impl Secp256k1Verifier {
     }
 }
 
-fn parse_signature(
-    context: &VerificationContext,
-    compact: &[u8; 64],
-) -> Result<SecpSignature, SecpError> {
+fn parse_signature(context: &SecpContext, compact: &[u8; 64]) -> Result<SecpSignature, SecpError> {
     let mut signature = SecpSignature { data: [0; 64] };
     let parsed = unsafe {
         secp256k1_ecdsa_signature_parse_compact(context.as_ptr(), &mut signature, compact.as_ptr())
@@ -170,6 +315,46 @@ fn parse_signature(
         return Err(SecpError::InvalidCompactSignature);
     }
     Ok(signature)
+}
+
+fn parse_public_key(
+    context: &SecpContext,
+    compressed_public_key: &[u8; 33],
+) -> Result<SecpPublicKey, SecpError> {
+    let mut public_key = SecpPublicKey { data: [0; 64] };
+    let parsed = unsafe {
+        secp256k1_ec_pubkey_parse(
+            context.as_ptr(),
+            &mut public_key,
+            compressed_public_key.as_ptr(),
+            compressed_public_key.len(),
+        )
+    };
+    if parsed != 1 {
+        return Err(SecpError::InvalidPublicKey);
+    }
+    Ok(public_key)
+}
+
+fn serialize_public_key(
+    context: &SecpContext,
+    public_key: &SecpPublicKey,
+) -> Result<[u8; 33], SecpError> {
+    let mut compressed = [0u8; 33];
+    let mut length = compressed.len();
+    let serialized = unsafe {
+        secp256k1_ec_pubkey_serialize(
+            context.as_ptr(),
+            compressed.as_mut_ptr(),
+            &mut length,
+            public_key,
+            EC_COMPRESSED,
+        )
+    };
+    if serialized != 1 || length != compressed.len() {
+        return Err(SecpError::InvalidPublicKey);
+    }
+    Ok(compressed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -182,6 +367,10 @@ pub enum SecpError {
     HighS,
     #[error("compressed secp256k1 public key is invalid")]
     InvalidPublicKey,
+    #[error("secp256k1 private key is invalid")]
+    InvalidPrivateKey,
+    #[error("Elligator-Squared public-key encoding is invalid")]
+    InvalidElligatorEncoding,
 }
 
 #[cfg(test)]
@@ -235,6 +424,35 @@ mod tests {
         assert_eq!(
             verifier.validate_compact_signature(&high_s),
             Err(SecpError::HighS)
+        );
+    }
+
+    #[test]
+    fn transport_public_key_ecdh_and_elligator_round_trip() {
+        let transport = Secp256k1Transport::new().expect("context");
+        let private_one = [1u8; 32];
+        let private_two = [2u8; 32];
+        let public_one = transport.public_key(&private_one).expect("public one");
+        let public_two = transport.public_key(&private_two).expect("public two");
+
+        let shared_one = transport
+            .derive_compressed(&public_two, &private_one)
+            .expect("shared one");
+        let shared_two = transport
+            .derive_compressed(&public_one, &private_two)
+            .expect("shared two");
+        assert_eq!(shared_one, shared_two);
+
+        let encoded = transport
+            .public_key_to_hash(&public_one, &[0x42; 32])
+            .expect("encode");
+        assert_eq!(
+            transport.public_key_from_hash(&encoded).expect("decode"),
+            public_one
+        );
+        assert_eq!(
+            transport.public_key(&[0; 32]),
+            Err(SecpError::InvalidPrivateKey)
         );
     }
 }

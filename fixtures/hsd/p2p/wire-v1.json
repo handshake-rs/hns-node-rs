@@ -1,5 +1,5 @@
 {
-  "schema": 3,
+  "schema": 4,
   "oracle": {
     "repository": "handshake-org/hsd",
     "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
@@ -395,5 +395,107 @@
       "key": "222222222222222222222222222222222222222222222222222222222222222222"
     },
     "canonicalReencode": "7b00000000000000070000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d636222222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "brontide": {
+    "protocolName": "Noise_XK_secp256k1_ChaChaPoly_SHA256+SVDW_Squared",
+    "prologue": "hns",
+    "rotationInterval": 1000,
+    "streamHeaderSize": 20,
+    "actSizes": [
+      80,
+      80,
+      65
+    ],
+    "cipher": {
+      "firstCiphertext": "0935b4c530",
+      "firstTag": "f11ae60b9df4c6ea25aea58ce1b6df83",
+      "secondCiphertext": "74898781da",
+      "secondTag": "d840242a1e817cd8374d45fb5621a5fc",
+      "rotatedKey": "0b579ba44366e4d49ac7a44a8203925cb6d610e950aee7a23c47a5448173af11",
+      "rotatedSalt": "be23775b41e7c67d1ec6dcfc21299f32461e145d4164f65943b4b99fcaff6dee"
+    },
+    "handshake": {
+      "initiatorSendKey": "1f33627bc124e43ab1024fded2f5c0d6730430f3f4cb85172b10e77c055b3b65",
+      "initiatorReceiveKey": "5b943fc7215b1d55f7b440d43ad0057d6ef1cfde0e12ab69b1db6b4578e84469",
+      "responderSendKey": "5b943fc7215b1d55f7b440d43ad0057d6ef1cfde0e12ab69b1db6b4578e84469",
+      "responderReceiveKey": "1f33627bc124e43ab1024fded2f5c0d6730430f3f4cb85172b10e77c055b3b65",
+      "firstPacket": "186a811dd5ebcd7c79b728cc8b72178ef5f8a447efac0f9b5477046ce72596296844e1702fe463"
+    },
+    "fixedSeeds": {
+      "main": [
+        {
+          "host": "129.153.177.220",
+          "port": 44806,
+          "key": "02a58318ea330487308b1a4bd90bd196a466e99be64a3cf2f1fe7b5352154a25c2"
+        },
+        {
+          "host": "159.69.46.23",
+          "port": 44806,
+          "key": "03e7c897432e08b0a2a6f6e9cfdb0aa8d3392f8abe4a3c2d40013b2ee06b1adb6a"
+        },
+        {
+          "host": "173.255.209.126",
+          "port": 44806,
+          "key": "024798bdd795240b711787273406f7950fd2a943a0bb096701720682eb3aea37ed"
+        },
+        {
+          "host": "74.207.247.120",
+          "port": 44806,
+          "key": "0290c11c1d0895f96f9c1b0c4f2b6034ee3d4ee8f5f90c9b6c76bd27d4bd0a5cbd"
+        },
+        {
+          "host": "172.104.214.189",
+          "port": 44806,
+          "key": "039078400609f39f5ae6e6d132161561860e52d35637ed3f5a5050c160dd28dfde"
+        },
+        {
+          "host": "45.79.134.225",
+          "port": 44806,
+          "key": "03fb5a5801cdb19f01472480d00c1c928e498f49955eab5217cd00e755bd267973"
+        },
+        {
+          "host": "35.154.209.88",
+          "port": 44806,
+          "key": "022d850f3bfb951c6de1d2f239183721bfaa2b1ac89576200fcca6f84181d1da62"
+        },
+        {
+          "host": "194.50.5.26",
+          "port": 44806,
+          "key": "023e3322d4221160923ea1dc481523a26ef3fa8483da062f7e92040534cc6b3606"
+        },
+        {
+          "host": "194.50.5.27",
+          "port": 44806,
+          "key": "03949fede42b27117d0a75e08cf1b139a37241ad4bebcb5c8a9928fdec7469107d"
+        },
+        {
+          "host": "194.50.5.28",
+          "port": 44806,
+          "key": "0247eb646fdf05bd470c5ad380d42e936ffe8278e46cc9bd5791ea58c28587ab45"
+        }
+      ],
+      "testnet": [
+        {
+          "host": "172.104.214.189",
+          "port": 45806,
+          "key": "039078400609f39f5ae6e6d132161561860e52d35637ed3f5a5050c160dd28dfde"
+        },
+        {
+          "host": "173.255.209.126",
+          "port": 45806,
+          "key": "024798bdd795240b711787273406f7950fd2a943a0bb096701720682eb3aea37ed"
+        },
+        {
+          "host": "172.104.177.177",
+          "port": 45806,
+          "key": "0255dfda9369ca3cd616844c00eed63f2d7740cd56780a856def1e64f536214539"
+        },
+        {
+          "host": "139.162.183.168",
+          "port": 45806,
+          "key": "0334b93039cdda203e704bb5a4831b66665b2f7b0dcea7fd022dfea623b1aa4081"
+        }
+      ]
+    }
   }
 }

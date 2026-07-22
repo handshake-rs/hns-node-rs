@@ -13,8 +13,9 @@ use tokio::{
 };
 
 use crate::{
+    brontide::{AsyncBrontideFrameReader, AsyncBrontideFrameWriter, BrontideSession},
     handshake::{PeerDirection, PeerHandshake, PeerState},
-    wire::{AsyncFrameReader, AsyncFrameWriter, NetworkMagic, Packet, VersionPacket},
+    wire::{AsyncFrameReader, AsyncFrameWriter, Frame, NetworkMagic, Packet, VersionPacket},
     P2pError,
 };
 
@@ -266,6 +267,42 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let magic = parameters.magic;
+    spawn_peer_runtime_with_frames(
+        parameters,
+        PeerFrameReader::Plaintext(AsyncFrameReader::new(reader, magic)),
+        PeerFrameWriter::Plaintext(AsyncFrameWriter::new(writer, magic)),
+    )
+}
+
+pub(crate) fn spawn_brontide_peer_runtime<R, W>(
+    parameters: PeerRuntimeParameters,
+    reader: R,
+    writer: W,
+    session: BrontideSession,
+) -> Result<SpawnedPeer, P2pError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let magic = parameters.magic;
+    let (send_cipher, receive_cipher) = session.into_ciphers();
+    spawn_peer_runtime_with_frames(
+        parameters,
+        PeerFrameReader::Brontide(AsyncBrontideFrameReader::new(reader, receive_cipher, magic)),
+        PeerFrameWriter::Brontide(AsyncBrontideFrameWriter::new(writer, send_cipher, magic)),
+    )
+}
+
+fn spawn_peer_runtime_with_frames<R, W>(
+    parameters: PeerRuntimeParameters,
+    reader: PeerFrameReader<R>,
+    writer: PeerFrameWriter<W>,
+) -> Result<SpawnedPeer, P2pError>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let PeerRuntimeParameters {
         id,
         address,
@@ -311,15 +348,49 @@ where
     Ok(SpawnedPeer { handle, task })
 }
 
+enum PeerFrameReader<R> {
+    Plaintext(AsyncFrameReader<R>),
+    Brontide(AsyncBrontideFrameReader<R>),
+}
+
+impl<R> PeerFrameReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    async fn read_frame(&mut self) -> Result<Frame, P2pError> {
+        match self {
+            Self::Plaintext(reader) => reader.read_frame().await,
+            Self::Brontide(reader) => reader.read_frame().await,
+        }
+    }
+}
+
+enum PeerFrameWriter<W> {
+    Plaintext(AsyncFrameWriter<W>),
+    Brontide(AsyncBrontideFrameWriter<W>),
+}
+
+impl<W> PeerFrameWriter<W>
+where
+    W: AsyncWrite + Unpin,
+{
+    async fn write_packet(&mut self, packet: &Packet) -> Result<usize, P2pError> {
+        match self {
+            Self::Plaintext(writer) => writer.write_packet(packet).await,
+            Self::Brontide(writer) => writer.write_frame(&Frame::from_packet(packet)?).await,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_peer<R, W>(
     id: PeerId,
     address: SocketAddr,
     direction: PeerDirection,
-    magic: NetworkMagic,
+    _magic: NetworkMagic,
     local_version: VersionPacket,
-    reader: R,
-    writer: W,
+    reader: PeerFrameReader<R>,
+    writer: PeerFrameWriter<W>,
     config: PeerRuntimeConfig,
     events: mpsc::Sender<PeerEvent>,
     snapshot: Arc<RwLock<PeerSnapshot>>,
@@ -347,7 +418,7 @@ where
         .map_err(|_| P2pError::EventChannelClosed)?;
 
     let mut writer_task = tokio::spawn(peer_writer(
-        AsyncFrameWriter::new(writer, magic),
+        writer,
         Arc::clone(&snapshot),
         critical_rx,
         control_rx,
@@ -364,7 +435,7 @@ where
         id,
         direction,
         local_version,
-        AsyncFrameReader::new(reader, magic),
+        reader,
         config,
         events,
         Arc::clone(&snapshot),
@@ -397,7 +468,7 @@ async fn peer_reader<R>(
     id: PeerId,
     direction: PeerDirection,
     local_version: VersionPacket,
-    mut reader: AsyncFrameReader<R>,
+    mut reader: PeerFrameReader<R>,
     config: PeerRuntimeConfig,
     events: mpsc::Sender<PeerEvent>,
     snapshot: Arc<RwLock<PeerSnapshot>>,
@@ -545,7 +616,7 @@ where
 }
 
 async fn peer_writer<W>(
-    mut writer: AsyncFrameWriter<W>,
+    mut writer: PeerFrameWriter<W>,
     snapshot: Arc<RwLock<PeerSnapshot>>,
     mut critical_rx: mpsc::Receiver<CriticalOutbound>,
     mut control_rx: mpsc::Receiver<Arc<Packet>>,
@@ -654,7 +725,7 @@ mod tests {
             PeerDirection::Outbound,
         )));
         let writer = tokio::spawn(peer_writer(
-            AsyncFrameWriter::new(writer_io, NetworkMagic::Regtest),
+            PeerFrameWriter::Plaintext(AsyncFrameWriter::new(writer_io, NetworkMagic::Regtest)),
             Arc::clone(&snapshot),
             critical_rx,
             control_rx,
@@ -711,7 +782,7 @@ mod tests {
             peer,
             PeerDirection::Inbound,
             test_version([1; 8]),
-            AsyncFrameReader::new(peer_io, NetworkMagic::Regtest),
+            PeerFrameReader::Plaintext(AsyncFrameReader::new(peer_io, NetworkMagic::Regtest)),
             config,
             events_tx,
             Arc::clone(&snapshot),

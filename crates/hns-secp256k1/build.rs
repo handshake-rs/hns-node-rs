@@ -27,6 +27,12 @@ fn main() {
         .define("ECMULT_WINDOW_SIZE", "15")
         .define("ECMULT_GEN_PREC_BITS", "4")
         .define("USE_ENDOMORPHISM", "1")
+        // HSD's Brontide transport uses the pinned implementation's raw ECDH
+        // point and Elligator-Squared public-key encoding. Keep those modules
+        // in the same static library as consensus verification so there is a
+        // single audited secp256k1 revision in the workspace.
+        .define("ENABLE_MODULE_ECDH", "1")
+        .define("ENABLE_MODULE_ELLIGATOR", "1")
         .warnings(false);
 
     // This pinned libsecp256k1 revision selects its field/scalar layout through
