@@ -16,9 +16,10 @@ use hns_chain::{
     prepare_header_record, BlockIndexRecord, ChainTip, HeaderImport, HeaderIndex, HeaderRecord,
 };
 use hns_consensus::{
-    block_merkle_root, block_witness_root, is_hsd_historical_block, validate_coinbase_height,
-    validate_transaction_start, ConsensusParams, HeaderConsensus, HeaderParent,
-    HeaderValidationContext, Network, MAX_FUTURE_BLOCK_TIME,
+    advance_threshold_state, block_merkle_root, block_witness_root,
+    compute_block_version_from_state, is_hsd_historical_block, validate_coinbase_height,
+    validate_transaction_start, ConsensusParams, DeploymentState, HeaderConsensus, HeaderParent,
+    HeaderValidationContext, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
 };
 use hns_mempool::Admission;
 use hns_p2p::{
@@ -43,9 +44,10 @@ use tokio::{
 };
 
 use super::{
-    current_unix_time, expected_bits_with_lookup, json_rpc_error, median_time_past_with_lookup,
-    AuthorityMode, ChainActivationFailure, FailedBlockMutation, FailedBlockStage, HeaderSummary,
-    NodeBlockImport, NodeReorg, NodeService, ShutdownSignal,
+    completed_deployment_period_with_lookup, current_unix_time, expected_bits_with_lookup,
+    json_rpc_error, median_time_past_with_lookup, AuthorityMode, ChainActivationFailure,
+    FailedBlockMutation, FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
+    ShutdownSignal,
 };
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
@@ -246,6 +248,39 @@ pub struct ShadowSyncDiagnostics {
     pub served_mempool_inventories: u64,
     pub rejected_messages: u64,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HeaderDeploymentEntry {
+    pub name: String,
+    pub state: ThresholdState,
+    pub bit: u8,
+    pub start_time: u64,
+    pub timeout: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HeaderCheckpointEvidence {
+    pub height: Height,
+    pub hash: BlockHash,
+    pub anchored: bool,
+}
+
+/// Deployment and historical-script policy derived independently from the
+/// complete canonical header ancestry. This does not claim that block bodies
+/// or active state have been replayed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HeaderDeploymentDiagnostics {
+    pub best_header: ChainTip,
+    pub next_height: Height,
+    pub deployments: Vec<HeaderDeploymentEntry>,
+    pub script_flags: u32,
+    pub lock_flags: u32,
+    pub name_flags: u32,
+    pub has_airstop: bool,
+    pub next_block_version: u32,
+    pub final_checkpoint: Option<HeaderCheckpointEvidence>,
+    pub historical_script_assumption_through: Option<Height>,
 }
 
 #[derive(Clone, Debug)]
@@ -853,6 +888,165 @@ impl NodeService {
             .map_err(|error| anyhow::anyhow!("failed to read best header: {error}"))
     }
 
+    fn shadow_sync_header_deployments(&self) -> Result<HeaderDeploymentDiagnostics> {
+        let best_header = self
+            .shadow_sync_best_header_tip()?
+            .ok_or_else(|| anyhow::anyhow!("best header is unavailable"))?;
+        let next_height = best_header
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("best-header height exhausted"))?;
+        let params = self.config.network.params();
+        let mut state = DeploymentState::from_states([ThresholdState::Defined; 4]);
+
+        for deployment in self.config.network.deployments() {
+            let window = deployment.effective_window(params.miner_window);
+            if window == 0 {
+                anyhow::bail!("deployment {} has a zero window", deployment.name());
+            }
+            let mut threshold = ThresholdState::Defined;
+            let mut boundary = window;
+            while boundary <= next_height {
+                let parent_height = boundary
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("deployment boundary underflow"))?;
+                let parent_hash = self
+                    .state
+                    .chain
+                    .canonical_hash(parent_height)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to read canonical deployment parent at {parent_height}: {error}"
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "canonical deployment parent at height {parent_height} is missing"
+                        )
+                    })?;
+                let parent = self
+                    .state
+                    .chain
+                    .header(&parent_hash)
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to read deployment parent header: {error}")
+                    })?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "canonical deployment parent {} is missing",
+                            parent_hash.to_hex()
+                        )
+                    })?;
+                if parent.height != parent_height || parent.status.failed {
+                    anyhow::bail!(
+                        "canonical deployment parent {} is invalid at height {parent_height}",
+                        parent_hash.to_hex()
+                    );
+                }
+                let mut lookup = |hash: &BlockHash| {
+                    self.state.chain.header(hash).map_err(|error| {
+                        anyhow::anyhow!("failed to read deployment ancestry: {error}")
+                    })
+                };
+                let period = completed_deployment_period_with_lookup(
+                    &parent,
+                    *deployment,
+                    window,
+                    &mut lookup,
+                )?;
+                threshold = advance_threshold_state(
+                    params.activation_threshold,
+                    params.miner_window,
+                    *deployment,
+                    boundary,
+                    threshold,
+                    Some(period),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to derive deployment {} at height {boundary}",
+                        deployment.name()
+                    )
+                })?;
+                boundary = match boundary.checked_add(window) {
+                    Some(boundary) => boundary,
+                    None => break,
+                };
+            }
+            state = state.with_state(deployment.id, threshold);
+        }
+
+        let deployments = self
+            .config
+            .network
+            .deployments()
+            .iter()
+            .map(|deployment| HeaderDeploymentEntry {
+                name: deployment.name().to_owned(),
+                state: state.state(deployment.id),
+                bit: deployment.bit,
+                start_time: deployment.start_time,
+                timeout: deployment.timeout,
+            })
+            .collect::<Vec<_>>();
+        let final_checkpoint = self
+            .config
+            .network
+            .checkpoints()
+            .last()
+            .map(|checkpoint| {
+                let anchored = if best_header.height < checkpoint.height {
+                    false
+                } else {
+                    let canonical =
+                        self.state
+                            .chain
+                            .canonical_hash(checkpoint.height)
+                            .map_err(|error| {
+                                anyhow::anyhow!("failed to read final checkpoint ancestry: {error}")
+                            })?;
+                    let record = self.state.chain.header(&checkpoint.hash).map_err(|error| {
+                        anyhow::anyhow!("failed to read final checkpoint header: {error}")
+                    })?;
+                    canonical == Some(checkpoint.hash)
+                        && record.is_some_and(|record| {
+                            record.height == checkpoint.height
+                                && record.hash == checkpoint.hash
+                                && record.status.header_context_valid
+                                && record.status.checkpoint_valid
+                                && !record.status.failed
+                        })
+                };
+                Ok::<_, anyhow::Error>(HeaderCheckpointEvidence {
+                    height: checkpoint.height,
+                    hash: checkpoint.hash,
+                    anchored,
+                })
+            })
+            .transpose()?;
+        let historical_script_assumption_through = final_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.anchored)
+            .map(|checkpoint| checkpoint.height);
+
+        Ok(HeaderDeploymentDiagnostics {
+            best_header,
+            next_height,
+            deployments,
+            script_flags: state.script_flags.bits(),
+            lock_flags: state.lock_flags,
+            name_flags: state.name_flags.bits(),
+            has_airstop: state.has_airstop,
+            next_block_version: compute_block_version_from_state(
+                self.config.network.deployments(),
+                state,
+            )
+            .context("failed to derive next-block deployment version")?,
+            final_checkpoint,
+            historical_script_assumption_through,
+        })
+    }
+
     fn shadow_sync_active_tip(&self) -> Result<Option<ChainTip>> {
         self.state.best_block_tip()
     }
@@ -1255,6 +1449,7 @@ async fn serve_shadow_sync_rpc(
         .route("/api/v1/peers", get(handle_shadow_sync_peers))
         .route("/api/v1/sync", get(handle_shadow_sync_sync))
         .route("/api/v1/shadow-sync", get(handle_shadow_sync_diagnostics))
+        .route("/api/v1/header-deployments", get(handle_header_deployments))
         .route(
             "/api/v1/mining-engine",
             get(handle_mining_engine_diagnostics),
@@ -1367,6 +1562,17 @@ async fn handle_shadow_sync_diagnostics(
     State(state): State<ShadowSyncHttpState>,
 ) -> Json<ShadowSyncDiagnostics> {
     Json(state.diagnostics.read().await.clone())
+}
+
+async fn handle_header_deployments(
+    State(state): State<ShadowSyncHttpState>,
+) -> Json<serde_json::Value> {
+    let node = state.node.lock().await;
+    Json(match node.shadow_sync_header_deployments() {
+        Ok(diagnostics) => serde_json::to_value(diagnostics)
+            .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() })),
+        Err(error) => serde_json::json!({ "error": error.to_string() }),
+    })
 }
 
 async fn handle_mining_engine_diagnostics(
@@ -2637,6 +2843,61 @@ mod tests {
     }
 
     #[test]
+    fn canonical_headers_derive_hsd_deployment_and_script_policy() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis");
+        let params = Network::Regtest.params();
+        let mut previous = genesis.header;
+        let mut headers = Vec::new();
+        // HSD's regtest testdummy deployment is STARTED at 144, LOCKED_IN at
+        // 288, and ACTIVE for the candidate at height 432 when every header
+        // signals bit 28.
+        for _ in 1..432 {
+            let mut header = Header {
+                version: 1 << 28,
+                prev_block: previous.hash(),
+                time: previous.time + 1,
+                bits: params.pow.bits,
+                ..Header::default()
+            };
+            while !header.verify_pow() {
+                header.nonce = header.nonce.checked_add(1).expect("regtest nonce space");
+            }
+            previous = header.clone();
+            headers.push(header);
+        }
+        service
+            .shadow_sync_import_headers(headers)
+            .expect("deployment header ancestry");
+
+        let diagnostics = service
+            .shadow_sync_header_deployments()
+            .expect("header deployment diagnostics");
+        assert_eq!(diagnostics.best_header.height, 431);
+        assert_eq!(diagnostics.next_height, 432);
+        assert_eq!(diagnostics.script_flags, 50);
+        assert_eq!(diagnostics.lock_flags, 0);
+        assert_eq!(diagnostics.name_flags, 0);
+        assert!(!diagnostics.has_airstop);
+        assert_eq!(diagnostics.next_block_version, 0);
+        assert_eq!(diagnostics.final_checkpoint, None);
+        assert_eq!(diagnostics.historical_script_assumption_through, None);
+        assert_eq!(
+            diagnostics
+                .deployments
+                .iter()
+                .find(|deployment| deployment.name == "testdummy")
+                .map(|deployment| deployment.state),
+            Some(ThresholdState::Active)
+        );
+    }
+
+    #[test]
     fn shadow_sync_resource_limits_fail_closed() {
         let peer: SocketAddr = "127.0.0.1:14038".parse().expect("peer");
         let too_many_peers = ShadowSyncConfig {
@@ -2675,10 +2936,14 @@ mod tests {
     async fn shadow_sync_serves_capability_named_diagnostic_routes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
-        let node = Arc::new(Mutex::new(NodeService::new(NodeConfig {
+        let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
-        })));
+        });
+        service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis header");
+        let node = Arc::new(Mutex::new(service));
         let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
             enabled: true,
             observation_only: true,
@@ -2693,7 +2958,11 @@ mod tests {
             shutdown_rx,
         ));
 
-        for path in ["/api/v1/shadow-sync", "/api/v1/mining-engine"] {
+        for path in [
+            "/api/v1/shadow-sync",
+            "/api/v1/header-deployments",
+            "/api/v1/mining-engine",
+        ] {
             let request =
                 format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
             let mut stream = tokio::net::TcpStream::connect(address)
@@ -2718,6 +2987,10 @@ mod tests {
                 assert_eq!(json["runtime_instance"], "test-runtime");
                 assert_eq!(json["connected_blocks"], 0);
                 assert_eq!(json["contextual_failed_bodies"], 0);
+            } else if path == "/api/v1/header-deployments" {
+                assert_eq!(json["best_header"]["height"], 0);
+                assert_eq!(json["next_height"], 1);
+                assert_eq!(json["script_flags"], 50);
             }
         }
 

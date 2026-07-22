@@ -66,10 +66,17 @@ scripts/compare-hsrd-hsd-shadow.py \
   --hsd-source /absolute/path/to/hsd
 ```
 
-The emitted scope covers header linkage, difficulty, timestamps, checkpoints,
-chainwork, and canonical ancestry. It does not cover body, script, covenant,
-UTXO, name-state, or root parity. Header-only mode refuses the active-state
-evidence `--state-file` format rather than mixing those scopes.
+At a coherent current tip, the runner also compares every header-derived BIP9
+threshold state and parameter with HSD's `getblockchaininfo` softfork view. It
+checks HSD's mandatory script flags, lock/name effects, next-block version, and
+the exact final-checkpoint ancestry that permits the historical script policy.
+The emitted scope therefore covers header linkage, difficulty, timestamps,
+checkpoints, chainwork, canonical ancestry, deployments, and script *policy*.
+It does not execute historical scripts or cover body, covenant, UTXO,
+name-state, or root parity. Header-only mode refuses the active-state evidence
+`--state-file` format rather than mixing those scopes. While hsrd is still
+behind HSD, probes compare canonical headers but defer the tip-specific
+deployment comparison; `--require-current-tip` requires both scopes.
 
 ## Evidence checkpoint
 

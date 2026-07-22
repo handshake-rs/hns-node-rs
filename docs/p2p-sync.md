@@ -160,6 +160,14 @@ path, not block-body or state parity. Its scheduler reports `Synced` when the
 best header reaches the peer target without pretending that stored-body or
 active-state tips advanced.
 
+`GET /api/v1/header-deployments` independently walks the canonical header
+ancestry and replays every HSD BIP9 window. It reports threshold states,
+deployment parameters, mandatory script and lock flags, deployment-derived
+name/airdrop effects, the next-block version, and whether the exact final
+checkpoint anchors HSD's historical script assumption. The derivation does not
+consult the active-state deployment cache, so it remains useful as independent
+qualification evidence in headers-only mode.
+
 ## Block-body synchronization
 
 Canonical headers without stored bodies enter a bounded pending queue. Requests
@@ -301,6 +309,7 @@ GET /api/v1/parity
 GET /api/v1/peers
 GET /api/v1/sync
 GET /api/v1/shadow-sync
+GET /api/v1/header-deployments
 ```
 
 Diagnostics include configured endpoints, reconnect attempts, live peer
@@ -328,9 +337,11 @@ checksummed bounded restart/reorganization evidence checkpoint. See
 
 With `--headers-only`, the same runner instead compares the durable hsrd
 best-header height/hash with `getblockhash` from a coherent pinned HSD RPC
-snapshot. `--require-current-tip` additionally fails unless both heights match.
-This mode deliberately rejects `--state-file`, whose schema records active
-block/root evidence rather than header-only evidence.
+snapshot. At the current tip it also compares the header-derived deployment
+states and script-policy effects with HSD's softfork view.
+`--require-current-tip` fails unless both heights and both deployment views
+match. This mode deliberately rejects `--state-file`, whose schema records
+active block/root evidence rather than header-only evidence.
 
 ## Known limitations
 

@@ -2557,39 +2557,8 @@ impl NodeState {
         deployment: Deployment,
         window: u32,
     ) -> Result<DeploymentPeriod> {
-        let signal = 1u32
-            .checked_shl(u32::from(deployment.bit))
-            .ok_or_else(|| anyhow::anyhow!("deployment bit {} is invalid", deployment.bit))?;
-        let mut entry = parent.clone();
-        let mut signalling_blocks = 0u32;
-        for offset in 0..window {
-            if entry.header.version & signal != 0 {
-                signalling_blocks = signalling_blocks
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("deployment signalling count overflow"))?;
-            }
-            if offset + 1 != window {
-                entry = self.header_parent(snapshot, &entry).with_context(|| {
-                    format!(
-                        "deployment {} period is not parent-contiguous",
-                        deployment.name()
-                    )
-                })?;
-            }
-        }
-        Ok(DeploymentPeriod {
-            median_time_past: self.median_time_past(snapshot, parent)?,
-            signalling_blocks,
-        })
-    }
-
-    fn header_parent<T: ReadSnapshot>(
-        &self,
-        snapshot: &T,
-        record: &HeaderRecord,
-    ) -> Result<HeaderRecord> {
         let mut lookup = |hash: &BlockHash| load_header_record(snapshot, hash);
-        header_parent_with_lookup(record, &mut lookup)
+        completed_deployment_period_with_lookup(parent, deployment, window, &mut lookup)
     }
 
     fn commit_staged_block(
@@ -3725,6 +3694,41 @@ where
         Some(difficulty_point(&last)),
     )
     .map_err(|error| anyhow::anyhow!("difficulty validation failed: {error}"))
+}
+
+fn completed_deployment_period_with_lookup<F>(
+    parent: &HeaderRecord,
+    deployment: Deployment,
+    window: u32,
+    lookup: &mut F,
+) -> Result<DeploymentPeriod>
+where
+    F: FnMut(&BlockHash) -> Result<Option<HeaderRecord>>,
+{
+    let signal = 1u32
+        .checked_shl(u32::from(deployment.bit))
+        .ok_or_else(|| anyhow::anyhow!("deployment bit {} is invalid", deployment.bit))?;
+    let mut entry = parent.clone();
+    let mut signalling_blocks = 0u32;
+    for offset in 0..window {
+        if entry.header.version & signal != 0 {
+            signalling_blocks = signalling_blocks
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("deployment signalling count overflow"))?;
+        }
+        if offset + 1 != window {
+            entry = header_parent_with_lookup(&entry, lookup).with_context(|| {
+                format!(
+                    "deployment {} period is not parent-contiguous",
+                    deployment.name()
+                )
+            })?;
+        }
+    }
+    Ok(DeploymentPeriod {
+        median_time_past: median_time_past_with_lookup(parent, lookup)?,
+        signalling_blocks,
+    })
 }
 
 fn current_unix_time() -> Result<u64> {

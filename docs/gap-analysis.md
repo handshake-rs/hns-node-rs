@@ -118,8 +118,8 @@
   timeout, ping/pong, and priority-queue controls.
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
 - Headers-first synchronization with 2,000-header atomic protocol batches plus
-  bounded pending/inflight/per-peer body requests, retry, timeout, and
-  reassignment.
+  canonical-header BIP9/script-policy derivation and bounded
+  pending/inflight/per-peer body requests, retry, timeout, and reassignment.
 - Bounded orphan retention only for statelessly valid bodies with known header
   context; unknown-context bodies are dropped after requesting headers.
 - Blocking validation workers with ordered result delivery.

@@ -152,6 +152,9 @@ an authoritative durable tip.
   currently process-local and are not trusted after restart.
 - The synchronization checkpoint is checksummed and reconciled with durable
   chain/body state rather than trusted as consensus.
+- Header-derived deployment diagnostics walk only the validated canonical
+  ancestry and bind any historical-script assumption to the exact final
+  configured checkpoint; they do not confer body, state, or mining authority.
 
 ## Mining-engine and publication policy
 

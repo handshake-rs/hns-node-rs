@@ -127,8 +127,9 @@ Implemented:
 - process-local self-connection detection, service checks, timeouts, ping/pong,
   and priority outbound lanes;
 - bounded peer registration, scoring, disconnect, diagnostics, and reconnect;
-- headers-first acquisition, 2,000-header atomic durable protocol batches, and
-  best-work header retention;
+- headers-first acquisition, 2,000-header atomic durable protocol batches,
+  best-work retention, and independent canonical-header derivation of BIP9
+  states plus mandatory script/lock/name policy;
 - bounded pending/inflight/per-peer block scheduling with retry and timeout;
 - bounded known-header orphan handling;
 - parallel stateless body validation with ordered results;

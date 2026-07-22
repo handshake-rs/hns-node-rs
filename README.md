@@ -239,9 +239,12 @@ Implemented:
   process-local scoring, disconnect thresholds, snapshots, and exponential
   outbound reconnect backoff.
 - Headers-first synchronization with 2,000-header atomic protocol batches and an
-  explicit headers-only checkpoint/deployment-ancestry qualification mode,
-  plus bounded pending, global inflight, and per-peer block requests; timeout,
-  retry, penalty, and reassignment behavior.
+  explicit headers-only checkpoint/deployment-ancestry qualification mode. A
+  read-only diagnostic independently replays every canonical BIP9 window and
+  reports current threshold states, next-block version, mandatory script/lock/
+  name effects, and the final-checkpoint historical-script binding. Bounded
+  pending, global inflight, and per-peer block requests retain timeout, retry,
+  penalty, and reassignment behavior.
 - Bounded oldest-first orphan retention only after the block's header context is
   known and the body passes stateless validation. Bodies with no known header
   context are dropped after requesting headers.

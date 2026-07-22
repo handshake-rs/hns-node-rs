@@ -137,6 +137,8 @@ Current evidence includes:
   `noRelay`, ASCII handling, inventory, locators, headers, blocks, and rejects;
 - maximum-size 2,000-header atomic protocol-batch import, including
   late-invalid and failed-commit rollback;
+- canonical-header derivation of BIP9 threshold states, next-block signaling,
+  mandatory script/lock/name effects, and final-checkpoint historical policy;
 - durable invalid/invalid-child propagation, best-header fallback across
   restart, body/header mismatch retry, and non-attribution of validator-worker
   failures;
@@ -146,8 +148,9 @@ Current evidence includes:
   or grant shadow mining authority;
 - API-v8 post-tip root material, opaque runtime-instance exposure, and the
   external HSD comparison self-test covering confirmed/provisional roots,
-  divergence, restart/reorganization counters, hash normalization, and
-  checksummed evidence chaining;
+  header-derived deployment/script-policy comparison, divergence,
+  restart/reorganization counters, hash normalization, and checksummed evidence
+  chaining;
 - HSD subsidy boundaries and deterministic mining-template coinbase bytes.
 
 ## Native secp256k1 smoke gate
