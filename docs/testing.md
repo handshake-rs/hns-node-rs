@@ -230,10 +230,13 @@ Tests and fault harnesses should cover:
 - duplicate/conflict rejection, dependency indexes, deterministic package
   order, orphan promotion, and oldest-first bounded orphan eviction;
 - explicit rejection when input or contextual verification is incomplete;
+- exact HSD native sigop derivation from resolved coins, 16,001-sigop policy
+  rejection, and sigop-adjusted minimum-fee accounting;
 - one-generation advancement for a block reconciliation and conservative
   clearing on disconnect/reorganization;
-- deterministic package ranking and selection under HNS weight, sigops, OPEN,
-  UPDATE, RENEW, transaction-count, and exclusive-name limits;
+- deterministic package ranking by HSD sigop-adjusted policy size while actual
+  HNS weight independently controls block fit, plus sigops, OPEN, UPDATE,
+  RENEW, transaction-count, and exclusive-name limits;
 - atomic template-set replacement: any failed variant preserves the previous
   complete cache;
 - activation rejection for stale chain generation, mempool generation, parent,

@@ -4,7 +4,7 @@ use hns_consensus::{
     block_merkle_root, block_subsidy, block_witness_root, validate_block_body, Network,
     MAX_BLOCK_OPENS, MAX_BLOCK_RENEWALS, MAX_BLOCK_SIGOPS, MAX_BLOCK_UPDATES,
 };
-use hns_mempool::{MempoolPackage, MempoolSnapshot};
+use hns_mempool::{minimum_policy_fee, MempoolPackage, MempoolSnapshot};
 use hns_primitives::{
     blake2b_256_many, Address, Block, Covenant, CovenantKind, Header, Input, Outpoint, Output,
     Transaction, Witness, MAX_BLOCK_WEIGHT,
@@ -29,7 +29,7 @@ pub struct TemplatePolicy {
     pub maximum_transactions: usize,
     pub reserved_weight: usize,
     pub reserved_sigops: u32,
-    /// Minimum package fee in atomic units per 1,000 weight units.
+    /// Minimum package fee in atomic units per 1,000 HSD policy virtual bytes.
     pub minimum_package_fee_rate: u64,
 }
 
@@ -333,11 +333,7 @@ fn create_coinbase(
 }
 
 fn package_meets_fee_rate(package: &MempoolPackage, minimum_rate: u64) -> bool {
-    if minimum_rate == 0 {
-        return true;
-    }
-    u128::from(package.fee).saturating_mul(1_000)
-        >= u128::from(minimum_rate).saturating_mul(package.weight.max(1) as u128)
+    package.fee >= minimum_policy_fee(package.policy_size, minimum_rate)
 }
 
 fn package_fits(
@@ -365,8 +361,8 @@ fn package_fits(
 }
 
 fn compare_packages(left: &MempoolPackage, right: &MempoolPackage) -> Ordering {
-    let left_rate = u128::from(left.fee).saturating_mul(right.weight.max(1) as u128);
-    let right_rate = u128::from(right.fee).saturating_mul(left.weight.max(1) as u128);
+    let left_rate = u128::from(left.fee).saturating_mul(right.policy_size.max(1) as u128);
+    let right_rate = u128::from(right.fee).saturating_mul(left.policy_size.max(1) as u128);
     left_rate
         .cmp(&right_rate)
         .then_with(|| right.oldest_sequence.cmp(&left.oldest_sequence))
@@ -603,10 +599,12 @@ impl Default for TemplateCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_consensus::{ConsensusError, Network, SequenceLockView, TransactionInputVerifier};
+    use hns_consensus::{
+        transaction_weight, ConsensusError, Network, SequenceLockView, TransactionInputVerifier,
+    };
     use hns_mempool::{
-        Admission, AdmissionMetadata, ContextualTransactionVerifier, MemoryMempool, Mempool,
-        MempoolContext, MempoolView,
+        sigop_adjusted_virtual_size, Admission, ContextualTransactionVerifier, MemoryMempool,
+        Mempool, MempoolContext, MempoolView, BYTES_PER_SIGOP, MAX_TX_SIGOPS,
     };
     use hns_primitives::{Coin, Height, Txid};
     use std::collections::HashMap;
@@ -651,13 +649,29 @@ mod tests {
             _transaction: &Transaction,
             _input_coins: &[Coin],
             _context: &MempoolContext,
-        ) -> Result<AdmissionMetadata, ConsensusError> {
-            Ok(AdmissionMetadata::default())
+        ) -> Result<(), ConsensusError> {
+            Ok(())
         }
     }
 
     fn address(byte: u8) -> Address {
         Address::new(0, vec![byte; 20]).expect("address")
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        fn nibble(value: u8) -> u8 {
+            match value {
+                b'0'..=b'9' => value - b'0',
+                b'a'..=b'f' => value - b'a' + 10,
+                _ => panic!("invalid fixture hex"),
+            }
+        }
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
+            .collect()
     }
 
     fn transaction(previous: Outpoint, input_value: u64, output_value: u64) -> (Transaction, Coin) {
@@ -715,6 +729,7 @@ mod tests {
             "../../../fixtures/hsd/mining/template-v1.json"
         ))
         .expect("hsrd mining fixture");
+        assert_eq!(fixture["schema"], 2);
         let deterministic = &fixture["deterministicCoinbase"];
         let coinbase = create_coinbase(
             u32::try_from(deterministic["height"].as_u64().expect("height"))
@@ -740,6 +755,53 @@ mod tests {
             assert_eq!(
                 block_subsidy(height, interval),
                 case["reward"].as_u64().expect("reward")
+            );
+        }
+
+        let policy = &fixture["mempoolSigopPolicy"];
+        assert_eq!(
+            policy["maxTxSigops"].as_u64().expect("maximum sigops"),
+            u64::from(MAX_TX_SIGOPS)
+        );
+        assert_eq!(
+            policy["bytesPerSigop"].as_u64().expect("bytes per sigop"),
+            BYTES_PER_SIGOP as u64
+        );
+        let policy_transaction = Transaction::decode(&decode_hex(
+            policy["transactionRaw"]
+                .as_str()
+                .expect("policy transaction"),
+        ))
+        .expect("policy transaction decode");
+        assert_eq!(
+            transaction_weight(&policy_transaction) as u64,
+            policy["transactionWeight"]
+                .as_u64()
+                .expect("policy transaction weight")
+        );
+        for case in policy["cases"].as_array().expect("sigop policy cases") {
+            let sigops = u32::try_from(case["sigops"].as_u64().expect("case sigops"))
+                .expect("case sigops fit u32");
+            assert_eq!(
+                sigop_adjusted_virtual_size(&policy_transaction, sigops) as u64,
+                case["policySize"].as_u64().expect("policy size")
+            );
+            assert_eq!(
+                sigops <= MAX_TX_SIGOPS,
+                case["accepted"].as_bool().expect("policy acceptance")
+            );
+        }
+        for case in policy["minimumFeeCases"]
+            .as_array()
+            .expect("minimum fee cases")
+        {
+            let policy_size =
+                usize::try_from(case["policySize"].as_u64().expect("fee policy size"))
+                    .expect("fee policy size fits usize");
+            let rate = case["rate"].as_u64().expect("fee rate");
+            assert_eq!(
+                minimum_policy_fee(policy_size, rate),
+                case["minimumFee"].as_u64().expect("minimum fee")
             );
         }
     }
@@ -794,6 +856,81 @@ mod tests {
         assert_eq!(template.metrics().fees, 60);
         assert_eq!(template.transactions()[0].outputs[0].value, 2_000_000_060);
         assert!(template.prepare_job(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn package_ranking_uses_hsd_sigop_size_but_block_fit_uses_weight() {
+        let heavy_prev = Outpoint {
+            txid: Txid::new([6; 32]),
+            index: 0,
+        };
+        let normal_prev = Outpoint {
+            txid: Txid::new([7; 32]),
+            index: 0,
+        };
+        let (mut heavy, mut heavy_coin) = transaction(heavy_prev.clone(), 1_000, 900);
+        heavy_coin.address = Address::new(0, vec![0x44; 32]).expect("script-hash address");
+        heavy.inputs[0].witness = Witness {
+            items: vec![vec![0xae; 200]],
+        };
+        let heavy_txid = heavy.txid();
+        let (normal, normal_coin) = transaction(normal_prev.clone(), 100, 90);
+        let normal_txid = normal.txid();
+        let mut view = View::default();
+        view.coins.insert(heavy_prev, heavy_coin);
+        view.coins.insert(normal_prev, normal_coin);
+        let mut pool = MemoryMempool::new();
+        for transaction in [heavy.clone(), normal.clone()] {
+            assert!(matches!(
+                pool.submit_with_context(
+                    transaction,
+                    &MempoolContext::testing(11, 100),
+                    &view,
+                    &Allow,
+                    &Allow,
+                )
+                .expect("admit"),
+                Admission::Accepted(_)
+            ));
+        }
+        let pool_snapshot = pool.snapshot();
+        let heavy_entry = pool_snapshot.entry(&heavy_txid).expect("heavy entry");
+        let normal_entry = pool_snapshot.entry(&normal_txid).expect("normal entry");
+        assert!(
+            100u128 * (transaction_weight(&normal) as u128)
+                > 10u128 * (transaction_weight(&heavy) as u128),
+            "raw weight would rank the sigop-heavy transaction first"
+        );
+        assert!(
+            100u128 * (normal_entry.policy_size as u128)
+                < 10u128 * (heavy_entry.policy_size as u128),
+            "HSD policy size must reverse the raw-weight ranking"
+        );
+
+        let snapshot = snapshot();
+        let template = TemplateAssembler
+            .assemble(TemplateBuildRequest {
+                snapshot: &snapshot,
+                mempool: &pool_snapshot,
+                payout_address: address(9),
+                coinbase_flags: b"hsrd".to_vec(),
+                version: 1,
+                bits: 0x207f_ffff,
+                minimum_time: 101,
+                reserved_root: [0; 32],
+                mask_hash: [8; 32],
+                policy: TemplatePolicy::default(),
+            })
+            .expect("template");
+        assert_eq!(template.transactions()[1].txid(), normal_txid);
+        assert_eq!(template.transactions()[2].txid(), heavy_txid);
+        assert_eq!(
+            template.metrics().weight,
+            hns_consensus::block_weight(&Block {
+                header: Header::default(),
+                transactions: template.transactions().to_vec(),
+            })
+        );
     }
 
     #[test]

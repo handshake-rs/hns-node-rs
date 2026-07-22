@@ -135,13 +135,16 @@
 - Immutable mempool generations, parent/child/spent-outpoint indexes,
   deterministic dependency-ordered packages, and bounded orphan promotion.
 - Admission stages for syntax, finality, conflicts, coin resolution, maturity,
-  relative locks, input authorization, covenant linkage, contextual checks,
-  value, fees, and resource limits.
+  relative locks, native resolved-coin sigop accounting and the HSD 16,000
+  transaction-policy ceiling, input authorization, covenant linkage,
+  contextual checks, value, fees, and resource limits.
 - Explicit verifier-completeness gates; compatibility and peer transaction
   entrypoints fail closed until complete contextual consensus is composed.
-- Deterministic ancestor-inclusive future templates with HNS weight, sigops,
-  OPEN, UPDATE, RENEW, transaction-count, and exclusive-name limits.
-- HSD-derived subsidy boundaries and deterministic coinbase bytes.
+- Deterministic ancestor-inclusive future templates with actual HNS block
+  weight kept separate from HSD sigop-adjusted policy size, plus sigops, OPEN,
+  UPDATE, RENEW, transaction-count, and exclusive-name limits.
+- HSD-derived subsidy boundaries, deterministic coinbase bytes, transaction
+  sigop policy constants, and exact policy-size vectors.
 - Atomic bounded template-variant replacement tied to exact chain and mempool
   generations, parent, and next authenticated tree root.
 - Versioned checksummed publication intents and bounded durable recovery.

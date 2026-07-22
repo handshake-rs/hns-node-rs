@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "oracle": {
     "repository": "handshake-org/hsd",
     "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
@@ -109,5 +109,70 @@
     "baseSize": 82,
     "witnessSize": 24,
     "weight": 352
+  },
+  "mempoolSigopPolicy": {
+    "transactionRaw": "00000000010000000000000000000000000000000000000000000000000000000000000000ffffffff07000000013c943577000000000014090909090909090909090909090909090909090900000b000000030468737264080000000000000000080000000000000000",
+    "transactionWeight": 352,
+    "maxTxSigops": 16000,
+    "bytesPerSigop": 20,
+    "cases": [
+      {
+        "sigops": 0,
+        "policySize": 88,
+        "accepted": true
+      },
+      {
+        "sigops": 1,
+        "policySize": 88,
+        "accepted": true
+      },
+      {
+        "sigops": 40,
+        "policySize": 200,
+        "accepted": true
+      },
+      {
+        "sigops": 4000,
+        "policySize": 20000,
+        "accepted": true
+      },
+      {
+        "sigops": 16000,
+        "policySize": 80000,
+        "accepted": true
+      },
+      {
+        "sigops": 16001,
+        "policySize": 80005,
+        "accepted": false
+      }
+    ],
+    "minimumFeeCases": [
+      {
+        "policySize": 0,
+        "rate": 3,
+        "minimumFee": 0
+      },
+      {
+        "policySize": 88,
+        "rate": 0,
+        "minimumFee": 0
+      },
+      {
+        "policySize": 88,
+        "rate": 3,
+        "minimumFee": 3
+      },
+      {
+        "policySize": 20000,
+        "rate": 3,
+        "minimumFee": 60
+      },
+      {
+        "policySize": 80005,
+        "rate": 3,
+        "minimumFee": 240
+      }
+    ]
   }
 }

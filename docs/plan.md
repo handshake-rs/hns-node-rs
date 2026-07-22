@@ -126,10 +126,13 @@ reserved low-latency paths.
 - Immutable mempool generations and deterministic package construction.
 - Explicit verifier-completeness gates; compatibility and peer relay fail
   closed until contextual consensus admission is complete.
+- Native HSD transaction sigop accounting, the 16,000-sigop admission ceiling,
+  and sigop-adjusted fee/package size without conflating it with block weight.
 - Deterministic ancestor-inclusive templates with HNS operation limits.
 - Atomic bounded future-template variants tied to exact chain and mempool
   generations.
-- HSD-derived subsidy and deterministic coinbase fixtures.
+- HSD-derived subsidy, deterministic coinbase, and mempool sigop-policy
+  fixtures.
 - Versioned and checksummed durable publication intents.
 - Local candidate admission before network publication.
 - Parallel critical fan-out with writer-completion acknowledgment and retry only for locally accepted active blocks.

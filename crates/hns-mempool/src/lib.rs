@@ -10,9 +10,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use hns_consensus::{
-    is_coinbase, is_final_transaction, transaction_weight, validate_transaction_sanity,
-    verify_sequence_locks, verify_transaction_covenant_links, ConsensusError, SequenceLockView,
-    TransactionInputVerifier,
+    is_coinbase, is_final_transaction, transaction_sigops, transaction_weight,
+    validate_transaction_sanity, verify_sequence_locks, verify_transaction_covenant_links,
+    ConsensusError, SequenceLockView, TransactionInputVerifier, MAX_BLOCK_SIGOPS,
+    WITNESS_SCALE_FACTOR,
 };
 use hns_primitives::{Amount, Coin, CovenantKind, Height, Outpoint, Transaction, Txid};
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,32 @@ pub const MAX_MEMPOOL_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_ORPHANS: usize = 8_192;
 pub const MAX_ORPHAN_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PACKAGE_MEMBERS: usize = 1_000;
+pub const MAX_TX_SIGOPS: u32 = MAX_BLOCK_SIGOPS / 5;
+pub const BYTES_PER_SIGOP: usize = 20;
+
+/// HSD's mempool fee/ranking size is the larger of serialized transaction
+/// weight and its sigop cost, rounded up to virtual bytes. Consensus block-fit
+/// accounting continues to use the unadjusted transaction weight.
+pub fn sigop_adjusted_virtual_size(transaction: &Transaction, sigops: u32) -> usize {
+    let sigop_weight = u128::from(sigops) * (BYTES_PER_SIGOP as u128);
+    let weight = (transaction_weight(transaction) as u128).max(sigop_weight);
+    let size = (weight + (WITNESS_SCALE_FACTOR - 1) as u128) / WITNESS_SCALE_FACTOR as u128;
+    usize::try_from(size).unwrap_or(usize::MAX)
+}
+
+/// Match HSD `policy.getMinFee`: use the floor of rate-times-policy-size and,
+/// for any non-empty sub-kilobyte result, charge one full rate unit.
+pub fn minimum_policy_fee(policy_size: usize, rate: Amount) -> Amount {
+    if policy_size == 0 || rate == 0 {
+        return 0;
+    }
+    let fee = u128::from(rate) * (policy_size as u128) / 1_000;
+    if fee == 0 {
+        rate
+    } else {
+        u64::try_from(fee).unwrap_or(u64::MAX)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolLimits {
@@ -109,7 +136,7 @@ pub struct MempoolContext {
     pub next_height: Height,
     pub parent_median_time: u64,
     pub coinbase_maturity: u32,
-    /// Minimum fee in native atomic units per 1,000 weight units.
+    /// Minimum fee in native atomic units per 1,000 HSD policy virtual bytes.
     pub minimum_relay_fee_rate: Amount,
     /// Production admission sets this to true. Tests and oracle harnesses may
     /// explicitly disable it while retaining every other admission check.
@@ -128,11 +155,6 @@ impl MempoolContext {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AdmissionMetadata {
-    pub sigops: u32,
-}
-
 /// Storage-independent contextual validation boundary. Complete production
 /// implementations must verify deployment flags, name state, claims, airdrops,
 /// and every policy which is intentionally outside transaction syntax.
@@ -142,7 +164,7 @@ pub trait ContextualTransactionVerifier: Send + Sync {
         transaction: &Transaction,
         input_coins: &[Coin],
         context: &MempoolContext,
-    ) -> Result<AdmissionMetadata, ConsensusError>;
+    ) -> Result<(), ConsensusError>;
 
     fn is_consensus_complete(&self) -> bool {
         false
@@ -158,7 +180,7 @@ impl ContextualTransactionVerifier for RejectUnverifiedContext {
         _transaction: &Transaction,
         _input_coins: &[Coin],
         _context: &MempoolContext,
-    ) -> Result<AdmissionMetadata, ConsensusError> {
+    ) -> Result<(), ConsensusError> {
         Err(ConsensusError::Authorization(
             "contextual mempool verifier is not configured".to_owned(),
         ))
@@ -178,6 +200,7 @@ pub struct MempoolEntry {
     pub base_size: usize,
     pub witness_size: usize,
     pub weight: usize,
+    pub policy_size: usize,
     pub sigops: u32,
     pub opens: u32,
     pub updates: u32,
@@ -186,6 +209,7 @@ pub struct MempoolEntry {
     pub ancestor_count: usize,
     pub ancestor_fee: Amount,
     pub ancestor_weight: usize,
+    pub ancestor_policy_size: usize,
     pub sequence: u64,
 }
 
@@ -195,7 +219,7 @@ impl MempoolEntry {
     }
 
     pub fn fee_rate_denominator(&self) -> usize {
-        self.weight.max(1)
+        self.policy_size.max(1)
     }
 }
 
@@ -231,6 +255,7 @@ pub struct MempoolPackage {
     pub txids: Vec<Txid>,
     pub fee: Amount,
     pub weight: usize,
+    pub policy_size: usize,
     pub sigops: u32,
     pub opens: u32,
     pub updates: u32,
@@ -300,6 +325,7 @@ impl MempoolSnapshot {
 
         let mut fee = 0u64;
         let mut weight = 0usize;
+        let mut policy_size = 0usize;
         let mut sigops = 0u32;
         let mut opens = 0u32;
         let mut updates = 0u32;
@@ -316,6 +342,9 @@ impl MempoolSnapshot {
                 .ok_or(MempoolError::FeeOverflow)?;
             weight = weight
                 .checked_add(entry.weight)
+                .ok_or(MempoolError::WeightOverflow)?;
+            policy_size = policy_size
+                .checked_add(entry.policy_size)
                 .ok_or(MempoolError::WeightOverflow)?;
             sigops = sigops.saturating_add(entry.sigops);
             opens = opens.saturating_add(entry.opens);
@@ -337,6 +366,7 @@ impl MempoolSnapshot {
             txids: ordered,
             fee,
             weight,
+            policy_size,
             sigops,
             opens,
             updates,
@@ -581,6 +611,12 @@ impl MemoryMempool {
             return Ok(rejected("non-BIP68-final"));
         }
 
+        let sigops = transaction_sigops(&transaction, &input_coins)
+            .map_err(|error| MempoolError::Consensus(error.to_string()))?;
+        if sigops > MAX_TX_SIGOPS {
+            return Ok(rejected("bad-txns-too-many-sigops"));
+        }
+
         for (index, coin) in input_coins.iter().enumerate() {
             if let Err(error) = input_verifier.verify_input(&transaction, index, coin) {
                 return Ok(rejected(error.to_string()));
@@ -589,10 +625,9 @@ impl MemoryMempool {
         if let Err(error) = verify_transaction_covenant_links(&transaction, &input_coins) {
             return Ok(rejected(error.to_string()));
         }
-        let metadata = match contextual_verifier.verify(&transaction, &input_coins, context) {
-            Ok(metadata) => metadata,
-            Err(error) => return Ok(rejected(error.to_string())),
-        };
+        if let Err(error) = contextual_verifier.verify(&transaction, &input_coins, context) {
+            return Ok(rejected(error.to_string()));
+        }
 
         let input_value = input_coins.iter().try_fold(0u64, |total, coin| {
             total
@@ -608,7 +643,8 @@ impl MemoryMempool {
             return Ok(rejected("input-value-below-output-value"));
         };
         let weight = transaction_weight(&transaction);
-        let minimum_fee = minimum_fee(context.minimum_relay_fee_rate, weight)?;
+        let policy_size = sigop_adjusted_virtual_size(&transaction, sigops);
+        let minimum_fee = minimum_policy_fee(policy_size, context.minimum_relay_fee_rate);
         if fee < minimum_fee {
             return Ok(rejected("insufficient-fee"));
         }
@@ -661,6 +697,16 @@ impl MemoryMempool {
                 )
                 .ok_or(MempoolError::WeightOverflow)
         })?;
+        let ancestor_policy_size = ancestors.iter().try_fold(policy_size, |total, ancestor| {
+            total
+                .checked_add(
+                    self.entries
+                        .get(ancestor)
+                        .ok_or(MempoolError::UnknownTransaction(*ancestor))?
+                        .policy_size,
+                )
+                .ok_or(MempoolError::WeightOverflow)
+        })?;
         let sequence = self.take_sequence();
         let entry = MempoolEntry {
             txid,
@@ -668,7 +714,8 @@ impl MemoryMempool {
             base_size: transaction.base_size(),
             witness_size: transaction.witness_size(),
             weight,
-            sigops: metadata.sigops,
+            policy_size,
+            sigops,
             opens,
             updates,
             renewals,
@@ -676,6 +723,7 @@ impl MemoryMempool {
             ancestor_count: ancestors.len(),
             ancestor_fee,
             ancestor_weight,
+            ancestor_policy_size,
             sequence,
         };
 
@@ -1029,6 +1077,19 @@ impl MemoryMempool {
                     )
                     .expect("admitted ancestry weight remains representable")
             });
+            let ancestor_policy_size =
+                ancestors
+                    .iter()
+                    .fold(current.policy_size, |total, ancestor| {
+                        total
+                            .checked_add(
+                                self.entries
+                                    .get(ancestor)
+                                    .expect("retained ancestor has a mempool entry")
+                                    .policy_size,
+                            )
+                            .expect("admitted ancestry policy size remains representable")
+                    });
             let entry = self
                 .entries
                 .get_mut(txid)
@@ -1037,6 +1098,7 @@ impl MemoryMempool {
             entry.ancestor_count = ancestors.len();
             entry.ancestor_fee = ancestor_fee;
             entry.ancestor_weight = ancestor_weight;
+            entry.ancestor_policy_size = ancestor_policy_size;
         }
     }
 
@@ -1099,17 +1161,6 @@ fn rejected(reason: impl Into<String>) -> Admission {
     Admission::Rejected {
         reason: reason.into(),
     }
-}
-
-fn minimum_fee(rate: Amount, weight: usize) -> Result<Amount, MempoolError> {
-    if rate == 0 || weight == 0 {
-        return Ok(0);
-    }
-    let product = u128::from(rate)
-        .checked_mul(weight as u128)
-        .ok_or(MempoolError::FeeOverflow)?;
-    let fee = product.checked_add(999).ok_or(MempoolError::FeeOverflow)? / 1_000;
-    u64::try_from(fee).map_err(|_| MempoolError::FeeOverflow)
 }
 
 fn covenant_metrics(transaction: &Transaction) -> Result<CovenantMetrics, MempoolError> {
@@ -1291,8 +1342,8 @@ mod tests {
             _transaction: &Transaction,
             _input_coins: &[Coin],
             _context: &MempoolContext,
-        ) -> Result<AdmissionMetadata, ConsensusError> {
-            Ok(AdmissionMetadata::default())
+        ) -> Result<(), ConsensusError> {
+            Ok(())
         }
     }
 
@@ -1349,9 +1400,94 @@ mod tests {
         assert_eq!(package.txids, vec![parent_txid, child_txid]);
         assert_eq!(package.fee, 10);
         assert_eq!(
+            package.policy_size,
+            snapshot.entry(&parent_txid).expect("parent").policy_size
+                + snapshot.entry(&child_txid).expect("child").policy_size
+        );
+        assert_eq!(
             snapshot.entry(&child_txid).expect("entry").ancestor_count,
             1
         );
+    }
+
+    #[test]
+    fn native_sigop_accounting_enforces_hsd_transaction_policy() {
+        let input = outpoint(12, 0);
+        let mut view = FixedView::with_coin(input.clone(), 1_000);
+        view.coins.get_mut(&input).expect("funding coin").address =
+            Address::new(0, vec![0x55; 32]).expect("script-hash address");
+        let mut oversized = transaction(input.clone(), 900);
+        let checkmultisig_count = usize::try_from(MAX_TX_SIGOPS / 20).expect("sigop test length");
+        let mut oversized_script = vec![0xae; checkmultisig_count];
+        oversized_script.push(0xac);
+        oversized.inputs[0].witness = Witness {
+            items: vec![oversized_script],
+        };
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, oversized, &view),
+            Admission::Rejected { reason } if reason == "bad-txns-too-many-sigops"
+        ));
+        assert!(pool.snapshot().is_empty());
+
+        let mut accepted = transaction(input, 900);
+        accepted.inputs[0].witness = Witness {
+            items: vec![vec![0xae; 2]],
+        };
+        let txid = accepted.txid();
+        assert!(matches!(
+            submit(&mut pool, accepted.clone(), &view),
+            Admission::Accepted(id) if id == txid
+        ));
+        let entry = pool
+            .snapshot()
+            .entry(&txid)
+            .expect("accepted entry")
+            .clone();
+        assert_eq!(entry.sigops, 40);
+        assert_eq!(
+            entry.policy_size,
+            sigop_adjusted_virtual_size(&accepted, entry.sigops)
+        );
+        assert_eq!(entry.fee_rate_denominator(), entry.policy_size);
+    }
+
+    #[test]
+    fn sigop_adjusted_policy_size_sets_minimum_relay_fee() {
+        assert_eq!(minimum_policy_fee(0, 3), 0);
+        assert_eq!(minimum_policy_fee(88, 0), 0);
+        assert_eq!(minimum_policy_fee(88, 3), 3);
+        assert_eq!(minimum_policy_fee(20_000, 3), 60);
+        let input = outpoint(13, 0);
+        let mut view = FixedView::with_coin(input.clone(), 1_000);
+        view.coins.get_mut(&input).expect("funding coin").address =
+            Address::new(0, vec![0x66; 32]).expect("script-hash address");
+        let context = MempoolContext {
+            minimum_relay_fee_rate: 3,
+            ..MempoolContext::testing(2, 2)
+        };
+        let mut underpaying = transaction(input.clone(), 950);
+        underpaying.inputs[0].witness = Witness {
+            items: vec![vec![0xae; 200]],
+        };
+        let sigops = 4_000;
+        assert_eq!(sigop_adjusted_virtual_size(&underpaying, sigops), 20_000);
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            pool.submit_with_context(underpaying, &context, &view, &AllowInputs, &AllowContext)
+                .expect("underpaying admission"),
+            Admission::Rejected { reason } if reason == "insufficient-fee"
+        ));
+
+        let mut exact_fee = transaction(input, 940);
+        exact_fee.inputs[0].witness = Witness {
+            items: vec![vec![0xae; 200]],
+        };
+        assert!(matches!(
+            pool.submit_with_context(exact_fee, &context, &view, &AllowInputs, &AllowContext)
+                .expect("exact-fee admission"),
+            Admission::Accepted(_)
+        ));
     }
 
     #[test]
@@ -1434,12 +1570,17 @@ mod tests {
         assert_eq!(child.ancestor_count, 0);
         assert_eq!(child.ancestor_fee, child.fee);
         assert_eq!(child.ancestor_weight, child.weight);
+        assert_eq!(child.ancestor_policy_size, child.policy_size);
 
         let grandchild = snapshot.entry(&grandchild_txid).expect("grandchild");
         assert_eq!(grandchild.parents, vec![child_txid]);
         assert_eq!(grandchild.ancestor_count, 1);
         assert_eq!(grandchild.ancestor_fee, child.fee + grandchild.fee);
         assert_eq!(grandchild.ancestor_weight, child.weight + grandchild.weight);
+        assert_eq!(
+            grandchild.ancestor_policy_size,
+            child.policy_size + grandchild.policy_size
+        );
     }
 
     #[test]

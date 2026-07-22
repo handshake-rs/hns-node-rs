@@ -161,9 +161,12 @@ Implemented:
 - dependency, ancestor, descendant, spent-outpoint, and exclusive-name indexes;
 - deterministic dependency-ordered package construction;
 - explicit contextual-verifier completeness gates and fail-closed peer relay;
-- HNS-aware future-template construction with deterministic package selection;
+- native resolved-coin HSD sigop accounting, the 16,000-sigop transaction
+  policy maximum, and exact sigop-adjusted fee/package sizing;
+- HNS-aware future-template construction with deterministic package selection
+  that retains actual weight for consensus block-fit accounting;
 - bounded atomic template-variant replacement and exact generation activation;
-- HSD-derived subsidy and deterministic coinbase fixtures;
+- HSD-derived subsidy, deterministic coinbase, and sigop-policy fixtures;
 - versioned, checksummed, bounded solved-block publication intents;
 - authority-gated local candidate admission before parallel critical fan-out with writer-completion acknowledgment;
 - crash-safe retry restricted to locally accepted active blocks;

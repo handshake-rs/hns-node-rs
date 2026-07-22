@@ -392,9 +392,12 @@
         "mining",
         "template",
         "coinbase",
+        "mempool",
+        "sigops",
+        "policy-size",
         "oracle"
       ],
-      "blake2b256": "4bf4ad4ae64939029eb68b469fc9f2880c34dbd3cf77c24900ffec1b17312ae2"
+      "blake2b256": "b725764874f8f944272e221f63cd87d425dc11789fbe74fe5415d609053a61ba"
     }
   ]
 }
