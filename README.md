@@ -252,6 +252,10 @@ Implemented:
   restart-durable address book. Discovery accepts only keyless, network-service,
   routable addresses with HSD-normalized timestamps; repeatedly failing
   discovered targets rotate without displacing explicit reconnect peers.
+  Discovered outbound targets and simultaneous attempts enforce HSD's exact
+  IPv4 `/16`, IPv6 `/32`, HE `/36`, and transition-address group keys.
+  Explicit peers retain operator-selected priority while their live attempts
+  still reserve groups against discovery.
 - Headers-first synchronization with 2,000-header atomic protocol batches and an
   explicit headers-only checkpoint/deployment-ancestry qualification mode. A
   read-only diagnostic independently replays every canonical BIP9 window and
@@ -304,8 +308,8 @@ Implemented:
 
 Still release-blocking:
 
-- Brontide transport, long-lived subthreshold peer reputation, address-group
-  diversity, and broader adversarial network qualification;
+- Brontide transport, long-lived subthreshold peer reputation, and broader
+  adversarial network qualification;
 - contextually complete transaction admission and compact-block reconstruction;
 - production qualification of contextual active-state IBD across full mainnet
   replay and sustained reorganizations;

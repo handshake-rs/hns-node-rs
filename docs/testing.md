@@ -144,6 +144,9 @@ Current evidence includes:
 - pinned HSD DNS seed/port selection, bounded address admission and eviction,
   unroutable/service/key/timestamp filtering, and failed discovered-target
   rotation without displacement of explicit reconnect peers;
+- exact HSD address-group vectors for IPv4, IPv6, Hurricane Electric, 6to4,
+  Teredo, RFC6052, RFC6145, local, and unroutable addresses, plus unique
+  discovered selection/attempts and explicit-peer collision bypass;
 - versioned, checksummed, network-bound address-book codecs, HSD stale-entry
   pruning, restored attempt/cooldown rotation, no-op clean flushes, compacted
   generations, and exact RocksDB close/reopen retention;
@@ -245,6 +248,8 @@ Tests and fault harnesses should cover:
 - handshake, idle, ping, pong, request, and reconnect timeouts;
 - corrupt/network-mismatched address-book rejection, HSD stale pruning, and
   attempt/success metadata retention across RocksDB reopen;
+- exact HSD address-group keys, unique discovered target/attempt selection,
+  and explicit-peer collision bypass;
 - corrupt/network-mismatched ban-list rejection, bounded eviction, exact HSD
   expiry boundaries, IP-wide admission races, and restart enforcement before
   socket or VERSION work;

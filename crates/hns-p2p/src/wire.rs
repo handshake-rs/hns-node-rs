@@ -239,6 +239,132 @@ pub struct NetAddress {
     pub key: [u8; 33],
 }
 
+/// Canonical HSD outbound-peer network group.
+///
+/// HSD groups IPv4 peers by /16 and ordinary IPv6 peers by /32, with
+/// special handling for transition and tunnel address ranges. The encoded
+/// bytes intentionally match `NetAddress#getGroup()` so callers can use this
+/// value as a stable set key without retaining a full peer address.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PeerAddressGroup {
+    bytes: [u8; 6],
+    length: u8,
+}
+
+impl PeerAddressGroup {
+    fn from_prefix(prefix: &[u8]) -> Self {
+        debug_assert!(prefix.len() <= 6);
+        let mut bytes = [0; 6];
+        bytes[..prefix.len()].copy_from_slice(prefix);
+        Self {
+            bytes,
+            length: prefix.len() as u8,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.length)]
+    }
+}
+
+/// Return the exact HSD address-group key for an IP address.
+pub fn peer_address_group(address: IpAddr) -> PeerAddressGroup {
+    const NETWORK_NONE: u8 = 0;
+    const NETWORK_IPV4: u8 = 1;
+    const NETWORK_IPV6: u8 = 2;
+    const NETWORK_ONION: u8 = 3;
+    const NETWORK_LOCAL: u8 = 255;
+
+    let raw = match address {
+        IpAddr::V4(ip) => ip.to_ipv6_mapped().octets(),
+        IpAddr::V6(ip) => ip.octets(),
+    };
+
+    if is_hsd_local_ip(&raw) {
+        return PeerAddressGroup::from_prefix(&[NETWORK_LOCAL]);
+    }
+    if !is_hsd_routable_ip(&raw) {
+        return PeerAddressGroup::from_prefix(&[NETWORK_NONE]);
+    }
+    if is_ipv4_mapped(&raw) || is_rfc6145(&raw) || is_rfc6052(&raw) {
+        return PeerAddressGroup::from_prefix(&[NETWORK_IPV4, raw[12], raw[13]]);
+    }
+    if raw[0..2] == [0x20, 0x02] {
+        return PeerAddressGroup::from_prefix(&[NETWORK_IPV4, raw[2], raw[3]]);
+    }
+    if raw[0..4] == [0x20, 0x01, 0x00, 0x00] {
+        return PeerAddressGroup::from_prefix(&[NETWORK_IPV4, raw[12] ^ 0xff, raw[13] ^ 0xff]);
+    }
+    if is_onion_ip(&raw) {
+        return PeerAddressGroup::from_prefix(&[NETWORK_ONION, raw[6] | 0x0f]);
+    }
+    if raw[0..4] == [0x20, 0x01, 0x04, 0x70] {
+        return PeerAddressGroup::from_prefix(&[
+            NETWORK_IPV6,
+            raw[0],
+            raw[1],
+            raw[2],
+            raw[3],
+            raw[4] | 0x0f,
+        ]);
+    }
+    PeerAddressGroup::from_prefix(&[NETWORK_IPV6, raw[0], raw[1], raw[2], raw[3]])
+}
+
+fn is_ipv4_mapped(raw: &[u8; 16]) -> bool {
+    raw[..10] == [0; 10] && raw[10..12] == [0xff, 0xff]
+}
+
+fn is_rfc6052(raw: &[u8; 16]) -> bool {
+    raw[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+fn is_rfc6145(raw: &[u8; 16]) -> bool {
+    raw[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0]
+}
+
+fn is_onion_ip(raw: &[u8; 16]) -> bool {
+    raw[..6] == [0xfd, 0x87, 0xd8, 0x7e, 0xeb, 0x43]
+}
+
+fn is_hsd_local_ip(raw: &[u8; 16]) -> bool {
+    if is_ipv4_mapped(raw) {
+        return raw[12] == 0 || raw[12] == 127;
+    }
+    *raw == Ipv6Addr::LOCALHOST.octets()
+}
+
+fn is_hsd_routable_ip(raw: &[u8; 16]) -> bool {
+    if is_ipv4_mapped(raw) {
+        let [a, b, c, d] = [raw[12], raw[13], raw[14], raw[15]];
+        return !(a == 0
+            || a == 10
+            || a == 127
+            || (a == 100 && (64..=127).contains(&b))
+            || (a == 169 && b == 254)
+            || (a == 172 && (16..=31).contains(&b))
+            || (a == 192 && b == 0 && c == 2)
+            || (a == 192 && b == 168)
+            || (a == 198 && (b == 18 || b == 19))
+            || (a == 198 && b == 51 && c == 100)
+            || (a == 203 && b == 0 && c == 113)
+            || (a == 255 && b == 255 && c == 255 && d == 255));
+    }
+
+    if raw.iter().all(|byte| *byte == 0)
+        || is_hsd_local_ip(raw)
+        || raw[..9] == [0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]
+        || raw[..8] == [0xfe, 0x80, 0, 0, 0, 0, 0, 0]
+        || raw[..4] == [0x20, 0x01, 0x0d, 0xb8]
+        || (raw[0] & 0xfe == 0xfc && !is_onion_ip(raw))
+        || (raw[0..3] == [0x20, 0x01, 0x00] && raw[3] & 0xf0 == 0x10)
+        || (raw[0..3] == [0x20, 0x01, 0x00] && raw[3] & 0xf0 == 0x20)
+    {
+        return false;
+    }
+    true
+}
+
 impl NetAddress {
     pub fn from_socket_addr(address: SocketAddr, time: u64, services: u64) -> Self {
         let ip = match address.ip() {
@@ -996,6 +1122,43 @@ mod tests {
         assert_eq!(&canonical[12..16], &[0; 4]);
         assert_eq!(canonical[16], 0);
         assert_eq!(&canonical[17..53], &[0; 36]);
+    }
+
+    #[test]
+    fn peer_address_groups_match_hsd_network_prefix_rules() {
+        let vectors = [
+            ("8.8.4.4", &[0x01, 0x08, 0x08][..]),
+            ("8.8.200.1", &[0x01, 0x08, 0x08][..]),
+            ("9.9.9.9", &[0x01, 0x09, 0x09][..]),
+            ("2001:4860:4860::8888", &[0x02, 0x20, 0x01, 0x48, 0x60][..]),
+            ("2001:4860:abcd::1", &[0x02, 0x20, 0x01, 0x48, 0x60][..]),
+            (
+                "2001:470:1234::1",
+                &[0x02, 0x20, 0x01, 0x04, 0x70, 0x1f][..],
+            ),
+            (
+                "2001:470:1fff::1",
+                &[0x02, 0x20, 0x01, 0x04, 0x70, 0x1f][..],
+            ),
+            ("2002:0808:0404::1", &[0x01, 0x08, 0x08][..]),
+            (
+                "2001:0000:4136:e378:8000:63bf:f7f7:fbfb",
+                &[0x01, 0x08, 0x08][..],
+            ),
+            ("64:ff9b::808:404", &[0x01, 0x08, 0x08][..]),
+            ("::ffff:0:808:404", &[0x01, 0x08, 0x08][..]),
+            ("127.0.0.1", &[0xff][..]),
+            ("10.0.0.1", &[0x00][..]),
+        ];
+
+        for (address, expected) in vectors {
+            let address = address.parse::<IpAddr>().expect("IP address");
+            assert_eq!(
+                peer_address_group(address).as_bytes(),
+                expected,
+                "unexpected HSD group for {address}"
+            );
+        }
     }
 
     #[test]

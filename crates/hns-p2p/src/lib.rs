@@ -23,9 +23,9 @@ pub use runtime::{
     OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot,
 };
 pub use wire::{
-    decode_frame, encode_frame, AddressHost, AsyncFrameReader, AsyncFrameWriter,
-    AsyncPeerTransport, Frame, Inventory, InventoryKind, LocatorPacket, NetAddress, NetworkMagic,
-    Packet, PacketType, RejectPacket, VersionPacket,
+    decode_frame, encode_frame, peer_address_group, AddressHost, AsyncFrameReader,
+    AsyncFrameWriter, AsyncPeerTransport, Frame, Inventory, InventoryKind, LocatorPacket,
+    NetAddress, NetworkMagic, Packet, PacketType, PeerAddressGroup, RejectPacket, VersionPacket,
 };
 
 pub trait PeerManager {

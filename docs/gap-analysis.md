@@ -227,8 +227,9 @@ These are substantial foundations, not a production full node.
   and pruning qualification of the bounded restartable active-state connector.
 - Failed-branch pruning/retention policy, historical reorganizations, and
   RocksDB fault evidence.
-- Brontide, long-lived subthreshold reputation, broader peer/address-group
-  diversity controls, and adversarial network qualification.
+- Brontide, long-lived subthreshold reputation, broader peer-diversity controls
+  beyond implemented HSD network-prefix grouping, and adversarial network
+  qualification.
 - Compact-block reconstruction and pruning-aware synchronization.
 - Production-complete contextual peer transaction admission and relay.
 - Sustained multipath publication and reconnect/retry supervision under WAN

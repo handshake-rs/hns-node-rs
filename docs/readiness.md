@@ -137,6 +137,9 @@ Implemented:
 - HSD-aligned connection-local scoring with a score-100 normalized-IP ban for
   24 hours, IP-wide disconnect and pre-handshake admission enforcement, bounded
   checksummed/network-bound persistence, expiry compaction, and restart restore;
+- exact HSD IPv4 `/16`, IPv6 `/32`, HE `/36`, and transition-address outbound
+  groups, with unique discovered targets/attempts, explicit-peer priority, and
+  active-group diagnostics;
 - headers-first acquisition, 2,000-header atomic durable protocol batches,
   best-work retention, and independent canonical-header derivation of BIP9
   states plus mandatory script/lock/name policy;
@@ -170,7 +173,7 @@ Implemented:
 Remaining:
 
 - Brontide transport;
-- long-lived subthreshold reputation, peer/address-group diversity, and broader
+- long-lived subthreshold reputation, broader peer-diversity controls, and
   adversarial network qualification;
 - full-mainnet replay and pruning-aware qualification of active-state IBD;
 - compact blocks and production-complete contextual transaction relay;

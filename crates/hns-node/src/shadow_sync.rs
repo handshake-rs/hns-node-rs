@@ -23,9 +23,9 @@ use hns_consensus::{
 };
 use hns_mempool::Admission;
 use hns_p2p::{
-    normalize_peer_ip, Inventory, InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket,
-    OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot,
-    SERVICE_NETWORK,
+    normalize_peer_ip, peer_address_group, Inventory, InventoryKind, LivePeerConfig,
+    LivePeerManager, LocatorPacket, OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent,
+    PeerId, PeerSnapshot, SERVICE_NETWORK,
 };
 use hns_primitives::{blake2b_256, Block, BlockHash, Header, Height, Reader, Txid, Writer};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
@@ -316,6 +316,7 @@ pub struct ShadowSyncDiagnostics {
     pub served_addresses: u64,
     pub outbound_connected: usize,
     pub outbound_connecting: usize,
+    pub outbound_address_groups: usize,
     pub outbound_reconnect_attempts: u64,
     pub started_at: u64,
     pub peers: Vec<PeerSnapshot>,
@@ -602,6 +603,20 @@ impl BoundedAddressBook {
         timestamp: u64,
         maximum: usize,
     ) -> Vec<SocketAddr> {
+        if maximum == 0 {
+            return Vec::new();
+        }
+        let mut occupied_groups = tracked
+            .iter()
+            .filter(|(address, state)| {
+                state.connected
+                    || state.connecting
+                    || (state.persistent
+                        && state.next_attempt <= now
+                        && !bans.is_banned(address.ip(), timestamp))
+            })
+            .map(|(address, _)| peer_address_group(address.ip()))
+            .collect::<HashSet<_>>();
         let mut candidates = self
             .entries
             .iter()
@@ -621,11 +636,16 @@ impl BoundedAddressBook {
             })
             .collect::<Vec<_>>();
         candidates.sort();
-        candidates
-            .into_iter()
-            .take(maximum)
-            .map(|(_, _, _, address)| address)
-            .collect()
+        let mut selected = Vec::with_capacity(maximum.min(candidates.len()));
+        for (_, _, _, address) in candidates {
+            if occupied_groups.insert(peer_address_group(address.ip())) {
+                selected.push(address);
+                if selected.len() == maximum {
+                    break;
+                }
+            }
+        }
+        selected
     }
 
     fn remove_discovered_ip(&mut self, address: IpAddr) -> usize {
@@ -3722,6 +3742,9 @@ fn take_due_connection_targets(
         .filter(|state| state.connected || state.connecting)
         .count();
     let available = maximum_outbound.saturating_sub(occupied);
+    if available == 0 {
+        return Vec::new();
+    }
     let mut eligible = reconnects
         .iter()
         .filter_map(|(address, state)| {
@@ -3736,11 +3759,23 @@ fn take_due_connection_targets(
         })
         .collect::<Vec<_>>();
     eligible.sort();
-    let due = eligible
-        .into_iter()
-        .take(available)
-        .map(|(_, _, address)| address)
-        .collect::<Vec<_>>();
+    let mut occupied_groups = reconnects
+        .iter()
+        .filter(|(_, state)| state.connected || state.connecting)
+        .map(|(address, _)| peer_address_group(address.ip()))
+        .collect::<HashSet<_>>();
+    let mut due = Vec::with_capacity(available.min(eligible.len()));
+    for (discovered, _, address) in eligible {
+        let group = peer_address_group(address.ip());
+        if discovered && !occupied_groups.insert(group) {
+            continue;
+        }
+        occupied_groups.insert(group);
+        due.push(address);
+        if due.len() == available {
+            break;
+        }
+    }
 
     for address in &due {
         reconnects
@@ -3848,6 +3883,12 @@ async fn refresh_diagnostics(
     state.ban_list_dirty = bans.is_dirty();
     state.outbound_connected = reconnects.values().filter(|item| item.connected).count();
     state.outbound_connecting = reconnects.values().filter(|item| item.connecting).count();
+    state.outbound_address_groups = reconnects
+        .iter()
+        .filter(|(_, item)| item.connected || item.connecting)
+        .map(|(address, _)| peer_address_group(address.ip()))
+        .collect::<HashSet<_>>()
+        .len();
 }
 
 async fn flush_address_book(
@@ -4551,6 +4592,64 @@ mod tests {
         );
         assert_eq!(reconnects.len(), 2);
         assert!(!reconnects.contains_key(&discovered));
+    }
+
+    #[test]
+    fn outbound_selection_enforces_hsd_groups_without_overriding_explicit_peers() {
+        let now = Instant::now();
+        let timestamp = 1_800_000_000;
+        let explicit: SocketAddr = "8.8.4.4:12038".parse().expect("explicit peer");
+        let same_group: SocketAddr = "8.8.200.1:12038".parse().expect("same group");
+        let second_group: SocketAddr = "9.9.9.9:12038".parse().expect("second group");
+        let third_group: SocketAddr = "1.1.1.1:12038".parse().expect("third group");
+        let mut addresses = BoundedAddressBook::new(Network::Mainnet, None, 8).expect("book");
+        addresses
+            .insert_configured(explicit, now, timestamp)
+            .expect("configured address");
+        for address in [same_group, second_group, third_group] {
+            assert!(addresses
+                .insert_discovered(
+                    hns_p2p::NetAddress::from_socket_addr(address, timestamp, SERVICE_NETWORK),
+                    now,
+                    timestamp,
+                )
+                .accepted());
+        }
+
+        let bans = PeerBanBook::new(Network::Mainnet, 8).expect("bans");
+        let mut reconnects = HashMap::from([(explicit, ReconnectState::new(now, true))]);
+        assert_eq!(
+            fill_discovery_slots(&addresses, &mut reconnects, &bans, 3, now, timestamp),
+            2
+        );
+        assert!(!reconnects.contains_key(&same_group));
+        assert!(reconnects.contains_key(&second_group));
+        assert!(reconnects.contains_key(&third_group));
+        assert_eq!(
+            take_due_connection_targets(&mut reconnects, &bans, now, timestamp, 3),
+            vec![explicit, third_group, second_group]
+        );
+
+        let mut explicit_reconnects = HashMap::from([
+            (explicit, ReconnectState::new(now, true)),
+            (same_group, ReconnectState::new(now, true)),
+        ]);
+        assert_eq!(
+            take_due_connection_targets(&mut explicit_reconnects, &bans, now, timestamp, 2),
+            vec![explicit, same_group],
+            "configured peers must retain operator-selected priority"
+        );
+
+        let mut discovered_reconnects = HashMap::from([
+            (explicit, ReconnectState::new(now, false)),
+            (same_group, ReconnectState::new(now, false)),
+            (second_group, ReconnectState::new(now, false)),
+        ]);
+        assert_eq!(
+            take_due_connection_targets(&mut discovered_reconnects, &bans, now, timestamp, 3),
+            vec![explicit, second_group],
+            "simultaneous discovered attempts must reserve unique groups"
+        );
     }
 
     #[test]

@@ -410,6 +410,14 @@ listener, and normalizes missing or future timestamps with HSD's five-day
 fallback. Explicit `--connect` addresses are protected reconnect targets.
 Discovered targets fill only unused outbound slots and rotate after three
 consecutive connection failures; they cannot displace explicit targets.
+Selection matches HSD's canonical network groups: IPv4 and embedded IPv4
+transition addresses use `/16`, ordinary IPv6 uses `/32`, Hurricane Electric
+tunnels use `/36`, and Teredo uses its decoded client prefix. Discovery slots
+and simultaneous socket attempts are unique by group. Explicit `--connect`
+targets bypass the collision check to preserve operator intent, but an active
+or immediately due explicit attempt reserves its group against discovered
+targets. The API reports the number of groups represented by connected and
+connecting outbound peers.
 Active bans exclude every port on the IP from ADDR admission, selection, socket
 attempts, and GETADDR replies. Learned endpoints for a newly banned IP are
 removed; explicit endpoints remain configured but dormant until expiry and do
@@ -450,7 +458,7 @@ subthreshold scores are not persisted.
 The shadow-sync runtime does not yet provide:
 
 - Brontide transport;
-- long-lived subthreshold peer reputation and address-group diversity;
+- long-lived subthreshold peer reputation;
 - transaction and mempool relay;
 - compact-block reconstruction;
 - historical mainnet block-body and active-state replay qualification;

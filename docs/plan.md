@@ -172,8 +172,9 @@ reserved low-latency paths.
    mainnet replay, pruning, sustained reorganizations, and live state/root
    comparison without changing the authority boundary.
 5. **Network hardening** — extend the implemented durable HSD threshold bans
-   with Brontide, long-lived subthreshold reputation, peer/address-group
-   diversity, compact blocks, and adversarial WAN tests.
+   and exact network-prefix address-group selection with Brontide, long-lived
+   subthreshold reputation, broader peer-diversity controls, compact blocks,
+   and adversarial WAN tests.
 6. **Mempool admission closure** — compose complete active-chain views,
    scripts/deployments/claims/name context, disconnected-transaction
    re-admission, policy replacement, and differential corpora.
