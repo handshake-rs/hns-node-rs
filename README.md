@@ -340,6 +340,9 @@ Implemented:
 - Ordinary peer transactions admitted against one immutable active-chain UTXO,
   median-time, deployment, and name-state snapshot, including deterministic
   mempool name-overlay replay, exclusive-name conflicts, and orphan promotion.
+- Atomic post-connect revalidation of every retained transaction and orphan
+  against the new active context, with one monotonic generation update and
+  fail-closed clearing on internal view failure.
 - Deterministic ancestor-inclusive template selection with HNS weight, sigops,
   OPEN, UPDATE, RENEW, transaction-count, and exclusive-name limits.
 - HSD-derived subsidy and deterministic coinbase fixtures.
@@ -354,8 +357,7 @@ Implemented:
 
 Still release-blocking:
 
-- complete HSD mempool standardness/replacement policy, claim and airdrop relay,
-  and contextual revalidation after every active-tip change;
+- complete HSD mempool standardness/replacement policy and claim/airdrop relay;
 - disconnected-transaction re-admission after reorganizations;
 - qualified full-mainnet active-state IBD and the incremental production Urkel
   lifecycle;

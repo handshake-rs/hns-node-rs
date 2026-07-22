@@ -179,6 +179,9 @@
   fail closed, while ordinary peer admission composes an immutable active-chain
   view, native scripts, deployment-derived name flags, accepted-name overlay,
   HSD exclusive-name conflicts, minimum relay fees, and orphan promotion.
+- Atomic post-connect rebuilding revalidates every retained transaction and
+  orphan against the new active context, promotes newly resolvable dependencies,
+  and advances the mempool generation once only when membership changes.
 - Deterministic ancestor-inclusive future templates with actual HNS block
   weight kept separate from HSD sigop-adjusted policy size, plus sigops, OPEN,
   UPDATE, RENEW, transaction-count, and exclusive-name limits.
@@ -236,15 +239,13 @@ These are substantial foundations, not a production full node.
   beyond implemented HSD network-prefix grouping, and adversarial network
   qualification.
 - Pruning-aware synchronization and sustained compact-relay WAN qualification.
-- Complete HSD mempool standardness/replacement policy, claim/airdrop relay,
-  and contextual revalidation after active-tip changes.
+- Complete HSD mempool standardness/replacement policy and claim/airdrop relay.
 - Sustained multipath publication and reconnect/retry supervision under WAN
   partitions and queue saturation.
 
 ### Mining authority
 
-- HSD replacement/policy parity, post-tip contextual revalidation, and
-  disconnected-transaction re-admission.
+- HSD replacement/policy parity and disconnected-transaction re-admission.
 - Continuous future-template lifecycle tied to live committed tips and the ASIC
   gateway.
 - End-to-end candidate validation against a historically qualified active state.

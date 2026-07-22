@@ -67,7 +67,8 @@ local connection from becoming a network publication source.
 - ancestor fee and weight accounting;
 - bounded orphan retention and deterministic oldest-first eviction;
 - HSD exclusive-name admission and deterministic accepted-name overlay replay;
-- block-confirmation reconciliation;
+- atomic block-confirmation reconciliation and complete retained-pool
+  revalidation against each new direct active tip;
 - fail-closed clearing on reorganizations until disconnected transactions can
   be contextually re-admitted;
 - explicit verifier-completeness gates.
@@ -79,8 +80,10 @@ mining-engine peer boundary now does so for ordinary transactions using one
 immutable active-chain snapshot, deployment-derived name flags, HSD's 1,000
 minimum relay rate, the native script backend, and the live accepted-name
 overlay. The compatibility entrypoint remains fail closed, and complete HSD
-standardness/replacement policy, claim/airdrop packets, and contextual
-revalidation after active-tip changes remain unfinished. The pinned
+standardness/replacement policy and claim/airdrop packets remain unfinished.
+Every direct active extension atomically rebuilds retained transactions and
+orphans through the same complete context, promoting newly resolvable inputs
+and advancing the generation once only when membership changes. The pinned
 height-62,517 case and the 39,086-39,101 -> 76,722 replacement history establish
 exact proof/accounting, parent-header-time, retained-value, and commit-advance
 behavior for bounded real mainnet claims, but they are not full-chain
@@ -186,7 +189,6 @@ remain release-blocking:
 - deployment-scale Urkel compaction performance/priority qualification and
   RocksDB mid-commit process-crash/fault injection;
 - qualified full-mainnet active-state IBD and live HSD state comparison;
-- complete HSD mempool standardness/replacement policy, claim/airdrop relay,
-  and post-tip contextual revalidation;
+- complete HSD mempool standardness/replacement policy and claim/airdrop relay;
 - measured production template and solved-block latency;
 - native mainnet authority qualification.

@@ -247,6 +247,16 @@ pub enum Admission {
     Orphan(Txid),
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MempoolRevalidation {
+    pub changed: bool,
+    pub removed: usize,
+    pub promoted_orphans: usize,
+    pub retained_transactions: usize,
+    pub retained_orphans: usize,
+    pub generation: u64,
+}
+
 pub trait Mempool {
     fn info(&self) -> MempoolInfo;
 
@@ -544,6 +554,165 @@ impl MemoryMempool {
             self.promote_orphans(context, view, input_verifier, contextual_verifier)?;
         }
         Ok(admission)
+    }
+
+    /// Reconcile one newly connected active block and atomically revalidate
+    /// every retained transaction against the resulting chain context. This
+    /// mirrors HSD's post-block contract invalidation while also refreshing
+    /// locks, maturity, scripts, fees, ancestry, and newly resolvable orphans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile_connected_with_context<V: MempoolView>(
+        &mut self,
+        connected_transactions: &[Transaction],
+        context: &MempoolContext,
+        view: &V,
+        input_verifier: &dyn TransactionInputVerifier,
+        contextual_verifier: &dyn ContextualTransactionVerifier,
+    ) -> Result<MempoolRevalidation, MempoolError> {
+        let previous_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
+        let previous_orphans = self.orphans.keys().copied().collect::<BTreeSet<_>>();
+        let previous_total = previous_transactions
+            .len()
+            .saturating_add(previous_orphans.len());
+        let previous_generation = self.generation;
+
+        let connected_txids = connected_transactions
+            .iter()
+            .map(Transaction::txid)
+            .collect::<BTreeSet<_>>();
+        let connected_spends = connected_transactions
+            .iter()
+            .flat_map(|transaction| {
+                transaction
+                    .inputs
+                    .iter()
+                    .map(|input| input.previous_output.clone())
+            })
+            .collect::<HashSet<_>>();
+
+        let mut source = self.clone();
+        source.remove_confirmed(connected_transactions);
+        for txid in &connected_txids {
+            source.remove_orphan(txid);
+        }
+
+        let accepted = source
+            .entries
+            .values()
+            .map(|entry| (entry.sequence, entry.txid))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|(_, txid)| source.transactions.get(&txid).cloned())
+            .collect::<Vec<_>>();
+        let mut ordered_orphans = source
+            .orphans
+            .iter()
+            .map(|(txid, orphan)| (orphan.sequence, *txid, orphan.transaction.clone()))
+            .collect::<Vec<_>>();
+        ordered_orphans.sort_by_key(|(sequence, txid, _)| (*sequence, *txid));
+        let mut discarded_orphans = ordered_orphans
+            .iter()
+            .filter(|(_, _, transaction)| {
+                transaction
+                    .inputs
+                    .iter()
+                    .any(|input| connected_spends.contains(&input.previous_output))
+            })
+            .map(|(_, txid, _)| *txid)
+            .collect::<HashSet<_>>();
+
+        let mut rebuilt = Self::with_limits(self.limits.clone())?;
+        for transaction in accepted {
+            let txid = transaction.txid();
+            match rebuilt.submit_checked(
+                transaction,
+                context,
+                view,
+                input_verifier,
+                contextual_verifier,
+            )? {
+                Admission::Accepted(_) => {}
+                Admission::Orphan(_) => {
+                    rebuilt.remove_orphan(&txid);
+                }
+                Admission::Rejected { .. } => {}
+            }
+        }
+        let invalidated_transactions = previous_transactions
+            .difference(&connected_txids)
+            .filter(|txid| !rebuilt.entries.contains_key(txid))
+            .copied()
+            .collect::<HashSet<_>>();
+        discarded_orphans.extend(
+            ordered_orphans
+                .iter()
+                .filter(|(_, _, transaction)| {
+                    transaction
+                        .inputs
+                        .iter()
+                        .any(|input| invalidated_transactions.contains(&input.previous_output.txid))
+                })
+                .map(|(_, txid, _)| *txid),
+        );
+        loop {
+            let descendants = ordered_orphans
+                .iter()
+                .filter(|(_, txid, _)| !discarded_orphans.contains(txid))
+                .filter(|(_, _, transaction)| {
+                    transaction
+                        .inputs
+                        .iter()
+                        .any(|input| discarded_orphans.contains(&input.previous_output.txid))
+                })
+                .map(|(_, txid, _)| *txid)
+                .collect::<Vec<_>>();
+            if descendants.is_empty() {
+                break;
+            }
+            discarded_orphans.extend(descendants);
+        }
+        for (_, txid, transaction) in ordered_orphans {
+            if discarded_orphans.contains(&txid) {
+                continue;
+            }
+            let _ = rebuilt.submit_checked(
+                transaction,
+                context,
+                view,
+                input_verifier,
+                contextual_verifier,
+            )?;
+        }
+        rebuilt.promote_orphans(context, view, input_verifier, contextual_verifier)?;
+
+        let retained_transactions = rebuilt.entries.keys().copied().collect::<BTreeSet<_>>();
+        let retained_orphans = rebuilt.orphans.keys().copied().collect::<BTreeSet<_>>();
+        let changed =
+            retained_transactions != previous_transactions || retained_orphans != previous_orphans;
+        let retained_total = retained_transactions
+            .len()
+            .saturating_add(retained_orphans.len());
+        let removed = previous_total.saturating_sub(retained_total);
+        let promoted_orphans = previous_orphans
+            .intersection(&retained_transactions)
+            .count();
+        let generation = if changed {
+            previous_generation.saturating_add(1).max(1)
+        } else {
+            previous_generation
+        };
+        if changed {
+            rebuilt.generation = generation;
+            *self = rebuilt;
+        }
+        Ok(MempoolRevalidation {
+            changed,
+            removed,
+            promoted_orphans,
+            retained_transactions: retained_transactions.len(),
+            retained_orphans: retained_orphans.len(),
+            generation,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1375,6 +1544,24 @@ mod tests {
         }
     }
 
+    struct FailingView;
+
+    impl SequenceLockView for FailingView {
+        fn coin_height(&self, _outpoint: &Outpoint) -> Result<Option<Height>, ConsensusError> {
+            Err(ConsensusError::View("injected view failure".to_owned()))
+        }
+
+        fn median_time_past(&self, _height: Height) -> Result<u64, ConsensusError> {
+            Err(ConsensusError::View("injected view failure".to_owned()))
+        }
+    }
+
+    impl MempoolView for FailingView {
+        fn coin(&self, _outpoint: &Outpoint) -> Result<Option<Coin>, ConsensusError> {
+            Err(ConsensusError::View("injected view failure".to_owned()))
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct AllowInputs;
 
@@ -1425,6 +1612,29 @@ mod tests {
                     "expected {expected} accepted name transactions, got {}",
                     accepted_name_transactions.len()
                 )));
+            }
+            Ok(())
+        }
+    }
+
+    struct RejectName(&'static [u8]);
+
+    impl ContextualTransactionVerifier for RejectName {
+        fn verify(
+            &self,
+            transaction: &Transaction,
+            _input_coins: &[Coin],
+            _context: &MempoolContext,
+            _accepted_name_transactions: &[&Transaction],
+        ) -> Result<(), ConsensusError> {
+            let rejected = transaction
+                .outputs
+                .iter()
+                .any(|output| output.covenant.item(2) == Some(self.0));
+            if rejected {
+                return Err(ConsensusError::ContextualCovenant(
+                    "name invalidated by new active context".to_owned(),
+                ));
             }
             Ok(())
         }
@@ -1536,6 +1746,196 @@ mod tests {
             submit(&mut pool, replacement, &view),
             Admission::Accepted(_)
         ));
+    }
+
+    #[test]
+    fn connected_block_revalidation_atomically_removes_stale_context() {
+        let stale_input = outpoint(0xf1, 0);
+        let retained_input = outpoint(0xf2, 0);
+        let mut view = FixedView::with_coin(stale_input.clone(), 20);
+        view.coins.insert(
+            retained_input.clone(),
+            Coin {
+                outpoint: retained_input.clone(),
+                value: 20,
+                height: 1,
+                coinbase: false,
+                address: Address::new(0, vec![3; 20]).expect("address"),
+                covenant: covenant(),
+            },
+        );
+        let stale = open_transaction(stale_input, 15, b"stale-context");
+        let stale_txid = stale.txid();
+        let retained = open_transaction(retained_input, 15, b"retained-context");
+        let retained_txid = retained.txid();
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, stale, &view),
+            Admission::Accepted(_)
+        ));
+        assert!(matches!(
+            submit(&mut pool, retained, &view),
+            Admission::Accepted(_)
+        ));
+        let previous_generation = pool.info().generation;
+        let summary = pool
+            .reconcile_connected_with_context(
+                &[],
+                &MempoolContext::testing(3, 3),
+                &view,
+                &AllowInputs,
+                &RejectName(b"stale-context"),
+            )
+            .expect("revalidation");
+        assert!(summary.changed);
+        assert_eq!(summary.removed, 1);
+        assert_eq!(summary.retained_transactions, 1);
+        assert_eq!(summary.retained_orphans, 0);
+        assert_eq!(summary.generation, previous_generation + 1);
+        assert!(pool.transaction(&stale_txid).is_none());
+        assert!(pool.transaction(&retained_txid).is_some());
+
+        let stable = pool
+            .reconcile_connected_with_context(
+                &[],
+                &MempoolContext::testing(3, 3),
+                &view,
+                &AllowInputs,
+                &RejectName(b"stale-context"),
+            )
+            .expect("stable revalidation");
+        assert!(!stable.changed);
+        assert_eq!(stable.generation, summary.generation);
+    }
+
+    #[test]
+    fn connected_block_revalidation_promotes_newly_resolvable_orphan() {
+        let input = outpoint(0xf3, 0);
+        let transaction = transaction(input.clone(), 9);
+        let txid = transaction.txid();
+        let mut view = FixedView::default();
+        let mut pool = MemoryMempool::new();
+        assert_eq!(
+            submit(&mut pool, transaction, &view),
+            Admission::Orphan(txid)
+        );
+        view.coins.insert(
+            input.clone(),
+            Coin {
+                outpoint: input,
+                value: 20,
+                height: 1,
+                coinbase: false,
+                address: Address::new(0, vec![3; 20]).expect("address"),
+                covenant: covenant(),
+            },
+        );
+        let previous_generation = pool.info().generation;
+        let summary = pool
+            .reconcile_connected_with_context(
+                &[],
+                &MempoolContext::testing(3, 3),
+                &view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect("revalidation");
+        assert!(summary.changed);
+        assert_eq!(summary.promoted_orphans, 1);
+        assert_eq!(summary.retained_transactions, 1);
+        assert_eq!(summary.retained_orphans, 0);
+        assert_eq!(summary.generation, previous_generation + 1);
+        assert!(pool.orphan(&txid).is_none());
+        assert!(pool.transaction(&txid).is_some());
+    }
+
+    #[test]
+    fn connected_block_revalidation_removes_orphaned_conflict_descendants() {
+        let parent_input = outpoint(0xf4, 0);
+        let missing_input = outpoint(0xf5, 0);
+        let view = FixedView::with_coin(parent_input.clone(), 20);
+        let parent = transaction(parent_input.clone(), 15);
+        let parent_txid = parent.txid();
+        let mut orphan = transaction(
+            Outpoint {
+                txid: parent_txid,
+                index: 0,
+            },
+            10,
+        );
+        orphan.inputs.push(Input {
+            previous_output: missing_input,
+            sequence: u32::MAX,
+            witness: Witness::default(),
+        });
+        let orphan_txid = orphan.txid();
+        let orphan_descendant = transaction(
+            Outpoint {
+                txid: orphan_txid,
+                index: 0,
+            },
+            5,
+        );
+        let orphan_descendant_txid = orphan_descendant.txid();
+        let conflicting_block_transaction = transaction(parent_input, 14);
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, parent, &view),
+            Admission::Accepted(_)
+        ));
+        assert_eq!(
+            submit(&mut pool, orphan, &view),
+            Admission::Orphan(orphan_txid)
+        );
+        assert_eq!(
+            submit(&mut pool, orphan_descendant, &view),
+            Admission::Orphan(orphan_descendant_txid)
+        );
+
+        let previous_generation = pool.info().generation;
+        let summary = pool
+            .reconcile_connected_with_context(
+                &[conflicting_block_transaction],
+                &MempoolContext::testing(3, 3),
+                &view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect("revalidation");
+        assert!(summary.changed);
+        assert_eq!(summary.removed, 3);
+        assert_eq!(summary.retained_transactions, 0);
+        assert_eq!(summary.retained_orphans, 0);
+        assert_eq!(summary.generation, previous_generation + 1);
+        assert!(pool.transaction(&parent_txid).is_none());
+        assert!(pool.orphan(&orphan_txid).is_none());
+        assert!(pool.orphan(&orphan_descendant_txid).is_none());
+    }
+
+    #[test]
+    fn connected_block_revalidation_failure_preserves_original_pool() {
+        let input = outpoint(0xf6, 0);
+        let view = FixedView::with_coin(input.clone(), 20);
+        let transaction = transaction(input, 9);
+        let txid = transaction.txid();
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, transaction, &view),
+            Admission::Accepted(_)
+        ));
+        let previous_generation = pool.info().generation;
+        let error = pool
+            .reconcile_connected_with_context(
+                &[],
+                &MempoolContext::testing(3, 3),
+                &FailingView,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect_err("injected revalidation failure");
+        assert!(error.to_string().contains("injected view failure"));
+        assert_eq!(pool.info().generation, previous_generation);
+        assert!(pool.transaction(&txid).is_some());
     }
 
     #[test]

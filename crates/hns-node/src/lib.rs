@@ -799,9 +799,10 @@ impl NodeService {
             }
         } else if self.state.is_direct_active_extension(&request)? {
             let committed = self.state.commit_staged_block(request, validated)?;
+            let mining_publication = self.publish_durable_mining_state(&committed.mining);
             let mempool_generation =
                 self.mining_engine_reconcile_connected_transactions(&active_transactions);
-            self.publish_durable_mining_state(&committed.mining)?;
+            mining_publication?;
             self.mining_engine_publish_mempool_reconciled(
                 committed.mining.generation,
                 mempool_generation,
@@ -5193,6 +5194,54 @@ mod tests {
             hns_mempool::Admission::Rejected { reason }
                 if reason == "name-already-in-mempool"
         ));
+    }
+
+    #[test]
+    fn active_tip_revalidation_evicts_stale_name_transaction() {
+        let mut node = peer_transaction_node(200);
+        let mempool_outpoint = Outpoint {
+            txid: Txid::new([0xd1; 32]),
+            index: 0,
+        };
+        let block_outpoint = Outpoint {
+            txid: Txid::new([0xd2; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, mempool_outpoint.clone(), 10_000, 1);
+        install_script_coin(&node, block_outpoint.clone(), 10_000, 1);
+        let name = b"posttiprevalidation";
+        let mut mempool_open = open_transaction(name, mempool_outpoint);
+        mempool_open.inputs[0].witness.items = vec![vec![0x51]];
+        let mempool_txid = mempool_open.txid();
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(mempool_open)
+                .expect("mempool OPEN admission"),
+            hns_mempool::Admission::Accepted(_)
+        ));
+        let previous_generation = node.state.mempool.info().generation;
+
+        let mut confirmed_open = open_transaction(name, block_outpoint);
+        confirmed_open.inputs[0].witness.items = vec![vec![0x51]];
+        let snapshot = node.state.store.snapshot().expect("active snapshot");
+        let tip = best_block_tip_from_snapshot(&snapshot)
+            .expect("active tip read")
+            .expect("active tip");
+        let tree_root = load_stored_name_tree_commit_root(&snapshot).expect("committed root");
+        drop(snapshot);
+        let mut block =
+            block_with_commitments(vec![coinbase_transaction_with_tag(201, 50), confirmed_open]);
+        block.header.prev_block = tip.hash;
+        block.header.tree_root = *tree_root.as_bytes();
+        block.header.nonce = 211;
+        node.connect_block(NodeBlockImport::fixture(block, 201, 202))
+            .expect("connect conflicting name block");
+
+        assert!(node.state.mempool.transaction(&mempool_txid).is_none());
+        assert_eq!(node.state.mempool.info().transaction_count, 0);
+        assert_eq!(
+            node.state.mempool.info().generation,
+            previous_generation + 1
+        );
     }
 
     #[test]

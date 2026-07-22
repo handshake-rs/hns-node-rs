@@ -131,6 +131,41 @@ impl<T: ReadSnapshot + Sync> ContextualTransactionVerifier
     }
 }
 
+fn active_mempool_parameters<T: ReadSnapshot>(
+    state: &super::NodeState,
+    network: Network,
+    snapshot: &T,
+) -> Result<Option<(MempoolContext, NameFlags)>> {
+    let Some(tip) = super::best_block_tip_from_snapshot(snapshot)? else {
+        return Ok(None);
+    };
+    let next_height = tip
+        .height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("active-chain height exhausted"))?;
+    let tip_record = super::load_header_record(snapshot, &tip.hash)?
+        .ok_or_else(|| anyhow::anyhow!("active tip {} has no header record", tip.hash.to_hex()))?;
+    if tip_record.hash != tip.hash || tip_record.height != tip.height {
+        anyhow::bail!(
+            "active tip header payload disagrees with {} at height {}",
+            tip.hash.to_hex(),
+            tip.height
+        );
+    }
+    let parent_median_time = state.median_time_past(snapshot, &tip_record)?;
+    let deployments = state.deployment_state_for_block(snapshot, next_height, tip.hash)?;
+    Ok(Some((
+        MempoolContext {
+            next_height,
+            parent_median_time,
+            coinbase_maturity: network.params().coinbase_maturity,
+            minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
+            require_complete_verifiers: true,
+        },
+        deployments.name_flags,
+    )))
+}
+
 /// The mining engine may build diagnostic templates in shadow mode, but
 /// transaction relay and solved-block publication remain
 /// separately gated. No setting in this structure can manufacture an authority
@@ -432,8 +467,50 @@ impl NodeService {
         if !self.config.mining_engine.enabled {
             return None;
         }
-        let removed = self.state.mempool.remove_confirmed(transactions);
-        (removed > 0).then(|| self.state.mempool.info().generation)
+        let revalidation = (|| -> Result<hns_mempool::MempoolRevalidation> {
+            let snapshot = self
+                .state
+                .store
+                .snapshot()
+                .context("failed to open post-connect mempool context")?;
+            let (context, name_flags) =
+                active_mempool_parameters(&self.state, self.config.network, &snapshot)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("connected chain has no active mempool context")
+                    })?;
+            let view = ActiveMempoolView::new(&snapshot);
+            let contextual_verifier = ActiveContextualTransactionVerifier {
+                snapshot: &snapshot,
+                network: self.config.network,
+                name_flags,
+            };
+            self.state
+                .mempool
+                .reconcile_connected_with_context(
+                    transactions,
+                    &context,
+                    &view,
+                    self.state.state_engine.input_verifier(),
+                    &contextual_verifier,
+                )
+                .map_err(|error| anyhow::anyhow!("post-connect revalidation failed: {error}"))
+        })();
+        let revalidation = match revalidation {
+            Ok(revalidation) => revalidation,
+            Err(error) => {
+                let removed = self.state.mempool.clear();
+                self.mining_engine_template_cache().clear();
+                tracing::warn!(
+                    %error,
+                    "post-connect mempool revalidation failed; cleared the retained pool"
+                );
+                return (removed > 0).then(|| self.state.mempool.info().generation);
+            }
+        };
+        if revalidation.changed {
+            self.mining_engine_template_cache().clear();
+        }
+        revalidation.changed.then_some(revalidation.generation)
     }
 
     pub(crate) fn mining_engine_clear_mempool_for_chain_transition(&mut self) -> Option<u64> {
@@ -504,41 +581,18 @@ impl NodeService {
             .store
             .snapshot()
             .context("failed to open active mempool context")?;
-        let Some(tip) = super::best_block_tip_from_snapshot(&snapshot)? else {
+        let Some((context, name_flags)) =
+            active_mempool_parameters(&self.state, self.config.network, &snapshot)?
+        else {
             return Ok(hns_mempool::Admission::Rejected {
                 reason: "active-chain-context-unavailable".to_owned(),
             });
-        };
-        let next_height = tip
-            .height
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("active-chain height exhausted"))?;
-        let tip_record = super::load_header_record(&snapshot, &tip.hash)?.ok_or_else(|| {
-            anyhow::anyhow!("active tip {} has no header record", tip.hash.to_hex())
-        })?;
-        if tip_record.hash != tip.hash || tip_record.height != tip.height {
-            anyhow::bail!(
-                "active tip header payload disagrees with {} at height {}",
-                tip.hash.to_hex(),
-                tip.height
-            );
-        }
-        let parent_median_time = self.state.median_time_past(&snapshot, &tip_record)?;
-        let deployments =
-            self.state
-                .deployment_state_for_block(&snapshot, next_height, tip.hash)?;
-        let context = MempoolContext {
-            next_height,
-            parent_median_time,
-            coinbase_maturity: self.config.network.params().coinbase_maturity,
-            minimum_relay_fee_rate: HSD_MINIMUM_RELAY_FEE_RATE,
-            require_complete_verifiers: true,
         };
         let view = ActiveMempoolView::new(&snapshot);
         let contextual_verifier = ActiveContextualTransactionVerifier {
             snapshot: &snapshot,
             network: self.config.network,
-            name_flags: deployments.name_flags,
+            name_flags,
         };
         let admission = self
             .state
