@@ -538,6 +538,10 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   nodes retain their separate bounded cache.
 - Block-state tests require all existing-input and output-collision UTXO probes
   to use one multi-get with no individual UTXO point reads.
+- Segment-store tests require canonical payload and locator-hint round trips,
+  checksum rejection for complete corruption, preservation of the last complete
+  frame across a torn tail, zero-copy payload decoding, and duplicate-free page
+  plans for overlapping and page-spanning records.
 - Native-sync diagnostics distinguish activation planning, state commit, and
   post-commit time, normalize commit cost by transactions, inputs, outputs, and
   name actions, and expose peer-event and validation-result backlog during the

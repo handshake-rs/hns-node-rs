@@ -9,6 +9,7 @@ default = ["rocksdb-backend"]
 rocksdb-backend = ["dep:rocksdb"]
 
 [dependencies]
+hns-primitives = { path = "../hns-primitives" }
 rocksdb = { version = "0.24", optional = true }
 serde.workspace = true
 thiserror.workspace = true

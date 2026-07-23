@@ -1,5 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod segment;
+
+pub use segment::{
+    decode_segment_record, decode_segment_record_ref, encode_segment_record,
+    plan_segment_page_reads, scan_segment_prefix, SegmentError, SegmentKind, SegmentLocator,
+    SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan, SEGMENT_MAX_HINTS,
+    SEGMENT_PAGE_BYTES,
+};
+
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap},

@@ -554,6 +554,7 @@ dependencies = [
 name = "hns-store"
 version = "0.1.0"
 dependencies = [
+ "hns-primitives",
  "rocksdb",
  "serde",
  "thiserror",
