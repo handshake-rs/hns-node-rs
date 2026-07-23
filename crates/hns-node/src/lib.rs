@@ -13,7 +13,7 @@ pub use shadow_sync::{
 };
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     net::SocketAddr,
     path::PathBuf,
@@ -64,17 +64,20 @@ use hns_rpc::{
 use hns_state::{
     compact_name_tree_nodes_streaming, connect_block_to_batch_with_services, decode_coin,
     decode_name_state, disconnect_block_to_batch, load_name_tree_snapshot_pins,
-    load_stored_name_tree_commit_root, load_stored_name_tree_root,
-    migrate_name_tree_interval_accumulator, stage_remove_name_tree_snapshot_pin,
-    validate_persisted_name_tree_root, validate_persisted_name_trees,
-    verify_name_tree_interval_state, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
-    BlockUndo, ConnectBlock, DisconnectBlock, NameTreeCompactionSummary, NameTreeSnapshotPin,
-    StateError, StateServices, StoredStateEngine,
+    load_persisted_name_tree_records, load_stored_name_tree_commit_root,
+    load_stored_name_tree_root, migrate_name_tree_interval_accumulator, name_page_root_key,
+    pack_name_page_records, stage_remove_name_tree_snapshot_pin, validate_persisted_name_tree_root,
+    validate_persisted_name_trees, verify_name_tree_interval_state, verify_stored_name_tree_root,
+    AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock, NamePageRootLocator,
+    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader,
+    NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine,
+    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_STATE_KEY,
 };
 use hns_store::{
-    decode_u64, encode_u64, mark_unclean_start, open_store, was_clean_shutdown, ColumnFamily,
-    DurabilityPolicy, MetaKey, ReadSnapshot, StagingOverlay, Store, StoreBackend, StoreConfig,
-    StoreHandle, WriteBatch, SCHEMA_VERSION, STORAGE_PROFILE,
+    decode_u64, encode_u64, mark_unclean_start, open_store, truncate_name_pages_to_committed_tail,
+    was_clean_shutdown, ColumnFamily, DurabilityPolicy, MetaKey, NamePageAppender, ReadSnapshot,
+    StagingOverlay, Store, StoreBackend, StoreConfig, StoreHandle, WriteBatch, SCHEMA_VERSION,
+    STORAGE_PROFILE,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -1909,7 +1912,385 @@ struct NodeReorgMutation {
     mining: DurableMiningState,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+struct NamePageStorage {
+    file_path: PathBuf,
+    state: NamePageState,
+    appender: Option<NamePageAppender>,
+}
+
+enum NodeReadSnapshot<'a, S: ReadSnapshot> {
+    Base(&'a S),
+    Pages(NamePageSnapshot<'a, S>),
+}
+
+impl<S: ReadSnapshot> ReadSnapshot for NodeReadSnapshot<'_, S> {
+    fn get(
+        &self,
+        family: ColumnFamily,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, hns_store::StoreError> {
+        match self {
+            Self::Base(snapshot) => snapshot.get(family, key),
+            Self::Pages(snapshot) => snapshot.get(family, key),
+        }
+    }
+
+    fn get_many(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, hns_store::StoreError> {
+        match self {
+            Self::Base(snapshot) => snapshot.get_many(family, keys),
+            Self::Pages(snapshot) => snapshot.get_many(family, keys),
+        }
+    }
+
+    fn scan_prefix(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<Vec<hns_store::ScanEntry>, hns_store::StoreError> {
+        match self {
+            Self::Base(snapshot) => snapshot.scan_prefix(family, prefix),
+            Self::Pages(snapshot) => snapshot.scan_prefix(family, prefix),
+        }
+    }
+}
+
+impl NamePageStorage {
+    fn open_or_bootstrap(directory: PathBuf, store: &StoreHandle) -> Result<Self> {
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+        let snapshot = store.snapshot()?;
+        let durable_root = load_stored_name_tree_commit_root(&snapshot)
+            .map_err(|error| anyhow::anyhow!("failed to load page bootstrap root: {error}"))?;
+        if let Some(raw) = snapshot
+            .get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)
+            .context("failed to read name-page state")?
+        {
+            let state = NamePageState::decode(&raw)
+                .map_err(|error| anyhow::anyhow!("failed to decode name-page state: {error}"))?;
+            if state.root != durable_root {
+                anyhow::bail!("name-page root does not match the durable committed name-tree root");
+            }
+            validate_name_page_root_record(&snapshot, &state)?;
+            let file_path = name_page_file_path(
+                &directory,
+                state.manifest.generation,
+                state.manifest.active_segment,
+            );
+            drop(snapshot);
+            truncate_name_pages_to_committed_tail(&file_path, state.manifest.durable_bytes)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to recover name-page file {}: {error}",
+                        file_path.display()
+                    )
+                })?;
+            let appender =
+                NamePageAppender::open_at_committed_tail(&file_path, state.manifest.clone())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to open name-page appender {}: {error}",
+                            file_path.display()
+                        )
+                    })?;
+            return Ok(Self {
+                file_path,
+                state,
+                appender: Some(appender),
+            });
+        }
+
+        let generation = 1;
+        let segment = 0;
+        let file_path = name_page_file_path(&directory, generation, segment);
+        if file_path.exists() {
+            std::fs::remove_file(&file_path).with_context(|| {
+                format!(
+                    "failed to discard uncommitted bootstrap page file {}",
+                    file_path.display()
+                )
+            })?;
+        }
+        let mut appender =
+            NamePageAppender::create_new(&file_path, generation, segment).map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to create name-page file {}: {error}",
+                    file_path.display()
+                )
+            })?;
+        let height = best_block_tip_from_snapshot(&snapshot)?.map(|tip| tip.height);
+        let (manifest, root_address) = if durable_root == TreeRoot::ZERO {
+            (appender.sync_data()?, None)
+        } else {
+            let records =
+                load_persisted_name_tree_records(&snapshot, durable_root).map_err(|error| {
+                    anyhow::anyhow!("failed to load name tree for page bootstrap: {error}")
+                })?;
+            let packed = pack_name_page_records(
+                generation,
+                segment,
+                appender.next_page(),
+                &records,
+                &HashMap::new(),
+            )
+            .map_err(|error| anyhow::anyhow!("failed to pack bootstrap name pages: {error}"))?;
+            let root_address = packed.address(durable_root).ok_or_else(|| {
+                anyhow::anyhow!("page bootstrap did not assign the committed root")
+            })?;
+            let manifest = packed
+                .append(&mut appender)
+                .map_err(|error| anyhow::anyhow!("failed to append bootstrap pages: {error}"))?;
+            (manifest, Some(root_address))
+        };
+        let state = NamePageState {
+            manifest,
+            root: durable_root,
+            root_address,
+            committed_height: height,
+        };
+        let mut batch = store.batch();
+        batch.put(
+            ColumnFamily::Snapshots,
+            NAME_PAGE_STATE_KEY,
+            &state.encode()?,
+        )?;
+        if let (Some(address), Some(height)) = (state.root_address, height) {
+            let record = NamePageRootRecord {
+                root: durable_root,
+                locator: NamePageRootLocator::new(generation, address),
+                height,
+            };
+            batch.put(
+                ColumnFamily::Snapshots,
+                &name_page_root_key(durable_root),
+                &record.encode(),
+            )?;
+        }
+        drop(snapshot);
+        store.commit(batch)?;
+        Ok(Self {
+            file_path,
+            state,
+            appender: Some(appender),
+        })
+    }
+
+    fn reader(&self, snapshot: &impl ReadSnapshot) -> Result<NamePageTreeReader> {
+        let locator = self.state.root_locator().unwrap_or_else(|| {
+            NamePageRootLocator::new(
+                self.state.manifest.generation,
+                hns_store::NamePageAddress::new(self.state.manifest.active_segment, 0, 0)
+                    .expect("zero page address fits"),
+            )
+        });
+        let reader = NamePageTreeReader::open(&self.file_path, self.state.root, locator)
+            .map_err(|error| anyhow::anyhow!("failed to open name-page reader: {error}"))?;
+        for (key, raw) in snapshot
+            .scan_prefix(ColumnFamily::Snapshots, NAME_PAGE_ROOT_PREFIX)
+            .context("failed to scan name-page root locators")?
+        {
+            let record = NamePageRootRecord::decode(&raw).map_err(|error| {
+                anyhow::anyhow!("failed to decode name-page root locator: {error}")
+            })?;
+            if key != name_page_root_key(record.root) {
+                anyhow::bail!("name-page root locator key does not match its record");
+            }
+            reader
+                .insert_root(record.root, record.locator)
+                .map_err(|error| anyhow::anyhow!("failed to seed page root locator: {error}"))?;
+        }
+        Ok(reader)
+    }
+
+    fn prepare_root<B: WriteBatch, S: ReadSnapshot>(
+        &mut self,
+        snapshot: &S,
+        batch: &mut B,
+        reader: &NamePageTreeReader,
+        staged_nodes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        root: TreeRoot,
+        height: Option<Height>,
+    ) -> Result<NamePageState> {
+        let mut records = BTreeMap::new();
+        for (key, value) in staged_nodes {
+            let raw_root: [u8; 32] = key.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!(
+                    "deferred name-page node key has {} bytes; expected 32",
+                    key.len()
+                )
+            })?;
+            let value = value.ok_or_else(|| {
+                anyhow::anyhow!("deferred name-page transaction deletes an immutable node")
+            })?;
+            records.insert(TreeRoot::new(raw_root), value);
+        }
+
+        let mut next = self.state.clone();
+        if records.is_empty() {
+            if root == self.state.root {
+                return Ok(next);
+            }
+            if root == TreeRoot::ZERO {
+                next.root = root;
+                next.root_address = None;
+                next.committed_height = height;
+            } else {
+                let height = height.ok_or_else(|| {
+                    anyhow::anyhow!("restored non-empty name-page root has no active height")
+                })?;
+                if let Some(record) = load_name_page_root_record(snapshot, root)? {
+                    next.root = root;
+                    next.root_address = Some(record.locator.page_address());
+                    next.committed_height = Some(height);
+                } else {
+                    let legacy_records =
+                        load_persisted_name_tree_records(snapshot, root).map_err(|error| {
+                            anyhow::anyhow!(
+                                "restored root has neither a page locator nor complete legacy records: {error}"
+                            )
+                        })?;
+                    let appender = self
+                        .appender
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
+                    let packed = pack_name_page_records(
+                        self.state.manifest.generation,
+                        self.state.manifest.active_segment,
+                        appender.next_page(),
+                        &legacy_records,
+                        &HashMap::new(),
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to pack restored legacy root: {error}")
+                    })?;
+                    let address = packed.address(root).ok_or_else(|| {
+                        anyhow::anyhow!("restored legacy pack did not assign its root")
+                    })?;
+                    let manifest = packed.append(appender).map_err(|error| {
+                        anyhow::anyhow!("failed to append restored legacy root: {error}")
+                    })?;
+                    next = NamePageState {
+                        manifest,
+                        root,
+                        root_address: Some(address),
+                        committed_height: Some(height),
+                    };
+                    let record = NamePageRootRecord {
+                        root,
+                        locator: NamePageRootLocator::new(next.manifest.generation, address),
+                        height,
+                    };
+                    batch.put(
+                        ColumnFamily::Snapshots,
+                        &name_page_root_key(root),
+                        &record.encode(),
+                    )?;
+                }
+            }
+        } else {
+            let height = height.ok_or_else(|| {
+                anyhow::anyhow!("non-empty name-page root has no committed height")
+            })?;
+            let known = reader.known_addresses().map_err(|error| {
+                anyhow::anyhow!("failed to collect traversal page addresses: {error}")
+            })?;
+            let appender = self
+                .appender
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
+            let packed = pack_name_page_records(
+                self.state.manifest.generation,
+                self.state.manifest.active_segment,
+                appender.next_page(),
+                &records,
+                &known,
+            )
+            .map_err(|error| anyhow::anyhow!("failed to pack name-page update: {error}"))?;
+            let address = packed.address(root).ok_or_else(|| {
+                anyhow::anyhow!("name-page update did not assign its resulting root")
+            })?;
+            let manifest = packed
+                .append(appender)
+                .map_err(|error| anyhow::anyhow!("failed to append name-page update: {error}"))?;
+            next = NamePageState {
+                manifest,
+                root,
+                root_address: Some(address),
+                committed_height: Some(height),
+            };
+            let record = NamePageRootRecord {
+                root,
+                locator: NamePageRootLocator::new(next.manifest.generation, address),
+                height,
+            };
+            batch.put(
+                ColumnFamily::Snapshots,
+                &name_page_root_key(root),
+                &record.encode(),
+            )?;
+        }
+        batch.put(
+            ColumnFamily::Snapshots,
+            NAME_PAGE_STATE_KEY,
+            &next.encode()?,
+        )?;
+        Ok(next)
+    }
+
+    fn commit_prepared(&mut self, prepared: NamePageState) {
+        self.state = prepared;
+    }
+
+    fn rollback_uncommitted_tail(&mut self) -> Result<()> {
+        self.appender.take();
+        truncate_name_pages_to_committed_tail(&self.file_path, self.state.manifest.durable_bytes)
+            .map_err(|error| anyhow::anyhow!("failed to roll back name-page tail: {error}"))?;
+        self.appender = Some(
+            NamePageAppender::open_at_committed_tail(&self.file_path, self.state.manifest.clone())
+                .map_err(|error| anyhow::anyhow!("failed to reopen name-page appender: {error}"))?,
+        );
+        Ok(())
+    }
+}
+
+fn name_page_file_path(directory: &std::path::Path, generation: u64, segment: u32) -> PathBuf {
+    directory.join(format!("name-g{generation:016x}-s{segment:08x}.pages"))
+}
+
+fn load_name_page_root_record(
+    snapshot: &impl ReadSnapshot,
+    root: TreeRoot,
+) -> Result<Option<NamePageRootRecord>> {
+    snapshot
+        .get(ColumnFamily::Snapshots, &name_page_root_key(root))?
+        .map(|raw| NamePageRootRecord::decode(&raw).map_err(anyhow::Error::from))
+        .transpose()
+}
+
+fn validate_name_page_root_record(
+    snapshot: &impl ReadSnapshot,
+    state: &NamePageState,
+) -> Result<()> {
+    match (state.root, state.root_locator(), state.committed_height) {
+        (TreeRoot::ZERO, None, _) => Ok(()),
+        (root, Some(locator), Some(height)) => {
+            let record = load_name_page_root_record(snapshot, root)?.ok_or_else(|| {
+                anyhow::anyhow!("current name-page root has no durable locator record")
+            })?;
+            if record.root != root || record.locator != locator || record.height > height {
+                anyhow::bail!("current name-page root locator record is inconsistent");
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("current name-page state is incomplete"),
+    }
+}
+
+#[derive(Debug)]
 pub struct NodeState {
     network: Network,
     undo_retention_policy: Option<UndoRetentionPolicy>,
@@ -1919,6 +2300,7 @@ pub struct NodeState {
     pub blocks: StoredBlockIndex<StoreHandle>,
     pub state_engine: StoredStateEngine<StoreHandle>,
     pub mempool: MemoryMempool,
+    name_pages: Option<NamePageStorage>,
 }
 
 impl NodeState {
@@ -1976,11 +2358,19 @@ impl NodeState {
         } else {
             (None, None)
         };
+        let name_pages = match &config.data_dir {
+            Some(data_dir) => Some(NamePageStorage::open_or_bootstrap(
+                data_dir.join("name-pages"),
+                &store,
+            )?),
+            None => None,
+        };
         let (mut state, audit) = Self::from_store_for_network_with_startup_audit(
             store,
             config.network,
             None,
             checkpoint.as_ref(),
+            name_pages,
         )?;
         state.startup_lifecycle = Some(StartupLifecycle {
             previous_shutdown_clean,
@@ -1999,8 +2389,14 @@ impl NodeState {
         network: Network,
         undo_retention_policy: Option<UndoRetentionPolicy>,
     ) -> Result<Self> {
-        Self::from_store_for_network_with_startup_audit(store, network, undo_retention_policy, None)
-            .map(|(state, _)| state)
+        Self::from_store_for_network_with_startup_audit(
+            store,
+            network,
+            undo_retention_policy,
+            None,
+            None,
+        )
+        .map(|(state, _)| state)
     }
 
     fn from_store_for_network_with_startup_audit(
@@ -2008,6 +2404,7 @@ impl NodeState {
         network: Network,
         undo_retention_policy: Option<UndoRetentionPolicy>,
         checkpoint: Option<&StartupAuditCheckpoint>,
+        name_pages: Option<NamePageStorage>,
     ) -> Result<(Self, StartupAuditKind)> {
         bind_store_identity(&store, network)?;
         let chain = StoredHeaderIndex::new(store.clone())
@@ -2027,6 +2424,7 @@ impl NodeState {
             blocks,
             state_engine,
             mempool: MemoryMempool::new(),
+            name_pages,
         };
         let audit = state.validate_durable_chain_invariants(checkpoint)?;
         Ok((state, audit))
@@ -2036,7 +2434,19 @@ impl NodeState {
         &self,
         checkpoint: Option<&StartupAuditCheckpoint>,
     ) -> Result<StartupAuditKind> {
-        let snapshot = self.store.snapshot()?;
+        let raw_snapshot = self.store.snapshot()?;
+        let page_reader = self
+            .name_pages
+            .as_ref()
+            .map(|pages| pages.reader(&raw_snapshot))
+            .transpose()?;
+        let snapshot = match page_reader.as_ref() {
+            Some(reader) => NodeReadSnapshot::Pages(NamePageSnapshot::with_legacy_fallback(
+                &raw_snapshot,
+                reader,
+            )),
+            None => NodeReadSnapshot::Base(&raw_snapshot),
+        };
         let checkpoint_matches = checkpoint
             .map(|checkpoint| {
                 StartupAuditCheckpoint::capture(&snapshot, self.network)
@@ -3457,6 +3867,9 @@ impl NodeState {
         request: NodeBlockImport,
         validated: ValidatedImport,
     ) -> Result<NodeBlockMutation> {
+        if self.name_pages.is_some() {
+            return self.commit_staged_block_with_name_pages(request, validated);
+        }
         let snapshot = self.store.snapshot()?;
         let generation = next_mining_generation(&snapshot)?;
         let chain_epoch = next_chain_epoch(&snapshot)?;
@@ -3474,6 +3887,84 @@ impl NodeState {
         )?;
         drop(snapshot);
         self.store.commit(batch)?;
+        self.cache_committed_block_records(std::slice::from_ref(&record))?;
+
+        Ok(NodeBlockMutation {
+            record,
+            mining: self.durable_mining_state()?,
+        })
+    }
+
+    fn commit_staged_block_with_name_pages(
+        &mut self,
+        request: NodeBlockImport,
+        validated: ValidatedImport,
+    ) -> Result<NodeBlockMutation> {
+        let store = self.store.clone();
+        let raw = store.snapshot()?;
+        let reader = self
+            .name_pages
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("name-page storage is unavailable"))?
+            .reader(&raw)?;
+        let page_base = NamePageSnapshot::new(&raw, &reader);
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&page_base);
+        let generation = next_mining_generation(&staged)?;
+        let chain_epoch = next_chain_epoch(&staged)?;
+        let mut batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
+        let record = self.stage_connect(&staged, &mut batch, &request, validated, true)?;
+        batch.put(
+            ColumnFamily::Meta,
+            MetaKey::MiningGeneration.as_bytes(),
+            &encode_u64(generation),
+        )?;
+        batch.put(
+            ColumnFamily::Meta,
+            MetaKey::ChainEpoch.as_bytes(),
+            &encode_u64(chain_epoch),
+        )?;
+        let root = load_stored_name_tree_commit_root(&staged)
+            .map_err(|error| anyhow::anyhow!("failed to read staged page root: {error}"))?;
+        let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
+        drop(staged);
+        drop(page_base);
+        let mut inner = batch.into_inner();
+        let prepared = match self
+            .name_pages
+            .as_mut()
+            .expect("page storage checked above")
+            .prepare_root(
+                &raw,
+                &mut inner,
+                &reader,
+                staged_nodes,
+                root,
+                Some(request.height),
+            ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.name_pages
+                    .as_mut()
+                    .expect("page storage checked above")
+                    .rollback_uncommitted_tail()?;
+                return Err(error);
+            }
+        };
+        drop(raw);
+        if let Err(error) = store.commit(inner) {
+            self.name_pages
+                .as_mut()
+                .expect("page storage checked above")
+                .rollback_uncommitted_tail()?;
+            return Err(anyhow::anyhow!(
+                "failed to commit page-backed block: {error}"
+            ));
+        }
+        self.name_pages
+            .as_mut()
+            .expect("page storage checked above")
+            .commit_prepared(prepared);
         self.cache_committed_block_records(std::slice::from_ref(&record))?;
 
         Ok(NodeBlockMutation {
@@ -3645,6 +4136,9 @@ impl NodeState {
     }
 
     fn disconnect_block(&mut self, request: NodeBlockDisconnect) -> Result<NodeBlockMutation> {
+        if self.name_pages.is_some() {
+            return self.disconnect_block_with_name_pages(request);
+        }
         let snapshot = self.store.snapshot()?;
         let generation = next_mining_generation(&snapshot)?;
         let chain_epoch = next_chain_epoch(&snapshot)?;
@@ -3664,6 +4158,84 @@ impl NodeState {
         self.store.commit(batch)?;
         self.cache_committed_block_records(std::slice::from_ref(&record))?;
 
+        Ok(NodeBlockMutation {
+            record,
+            mining: self.durable_mining_state()?,
+        })
+    }
+
+    fn disconnect_block_with_name_pages(
+        &mut self,
+        request: NodeBlockDisconnect,
+    ) -> Result<NodeBlockMutation> {
+        let store = self.store.clone();
+        let raw = store.snapshot()?;
+        let reader = self
+            .name_pages
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("name-page storage is unavailable"))?
+            .reader(&raw)?;
+        let page_base = NamePageSnapshot::new(&raw, &reader);
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&page_base);
+        let generation = next_mining_generation(&staged)?;
+        let chain_epoch = next_chain_epoch(&staged)?;
+        let request_height = request.height;
+        let mut batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
+        let record = self.stage_disconnect(&staged, &mut batch, request)?;
+        batch.put(
+            ColumnFamily::Meta,
+            MetaKey::MiningGeneration.as_bytes(),
+            &encode_u64(generation),
+        )?;
+        batch.put(
+            ColumnFamily::Meta,
+            MetaKey::ChainEpoch.as_bytes(),
+            &encode_u64(chain_epoch),
+        )?;
+        let root = load_stored_name_tree_commit_root(&staged)
+            .map_err(|error| anyhow::anyhow!("failed to read restored page root: {error}"))?;
+        let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
+        drop(staged);
+        drop(page_base);
+        let mut inner = batch.into_inner();
+        let resulting_height = request_height.checked_sub(1);
+        let prepared = match self
+            .name_pages
+            .as_mut()
+            .expect("page storage checked above")
+            .prepare_root(
+                &raw,
+                &mut inner,
+                &reader,
+                staged_nodes,
+                root,
+                resulting_height,
+            ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.name_pages
+                    .as_mut()
+                    .expect("page storage checked above")
+                    .rollback_uncommitted_tail()?;
+                return Err(error);
+            }
+        };
+        drop(raw);
+        if let Err(error) = store.commit(inner) {
+            self.name_pages
+                .as_mut()
+                .expect("page storage checked above")
+                .rollback_uncommitted_tail()?;
+            return Err(anyhow::anyhow!(
+                "failed to commit page-backed disconnect: {error}"
+            ));
+        }
+        self.name_pages
+            .as_mut()
+            .expect("page storage checked above")
+            .commit_prepared(prepared);
+        self.cache_committed_block_records(std::slice::from_ref(&record))?;
         Ok(NodeBlockMutation {
             record,
             mining: self.durable_mining_state()?,
@@ -3780,11 +4352,21 @@ impl NodeState {
             )));
         }
 
-        let base = self
-            .store
+        let store = self.store.clone();
+        let raw_base = store
             .snapshot()
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
+        let page_reader = self
+            .name_pages
+            .as_ref()
+            .map(|pages| pages.reader(&raw_base))
+            .transpose()
+            .map_err(ChainActivationFailure::Internal)?;
+        let base = match page_reader.as_ref() {
+            Some(reader) => NodeReadSnapshot::Pages(NamePageSnapshot::new(&raw_base, reader)),
+            None => NodeReadSnapshot::Base(&raw_base),
+        };
         let original_tip =
             best_block_tip_from_snapshot(&base).map_err(ChainActivationFailure::Internal)?;
         validate_reorg_request_shape(&base, &request, original_tip.as_ref())
@@ -3794,7 +4376,11 @@ impl NodeState {
         let chain_epoch = next_chain_epoch(&base).map_err(ChainActivationFailure::Internal)?;
         let overlay = StagingOverlay::new();
         let staged = overlay.snapshot(&base);
-        let mut batch = overlay.batch(self.store.batch());
+        let mut batch = if self.name_pages.is_some() {
+            overlay.batch_with_deferred_name_tree_nodes(store.batch())
+        } else {
+            overlay.batch(store.batch())
+        };
         let mut summary = NodeReorgSummary::default();
 
         for disconnect in request.disconnect {
@@ -3915,13 +4501,46 @@ impl NodeState {
             )
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
-        let batch = batch.into_inner();
-        drop(staged);
-        drop(base);
-        self.store
-            .commit(batch)
+        let root = load_stored_name_tree_commit_root(&staged)
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
+        let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
+        let mut batch = batch.into_inner();
+        drop(staged);
+        drop(base);
+        let prepared_page_state =
+            if let (Some(pages), Some(reader)) = (self.name_pages.as_mut(), page_reader.as_ref()) {
+                match pages.prepare_root(
+                    &raw_base,
+                    &mut batch,
+                    reader,
+                    staged_nodes,
+                    root,
+                    Some(final_tip.height),
+                ) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        pages
+                            .rollback_uncommitted_tail()
+                            .map_err(ChainActivationFailure::Internal)?;
+                        return Err(ChainActivationFailure::Internal(error));
+                    }
+                }
+            } else {
+                None
+            };
+        drop(raw_base);
+        if let Err(error) = store.commit(batch) {
+            if let Some(pages) = self.name_pages.as_mut() {
+                pages
+                    .rollback_uncommitted_tail()
+                    .map_err(ChainActivationFailure::Internal)?;
+            }
+            return Err(ChainActivationFailure::Internal(anyhow::Error::from(error)));
+        }
+        if let (Some(pages), Some(prepared)) = (self.name_pages.as_mut(), prepared_page_state) {
+            pages.commit_prepared(prepared);
+        }
         let committed_records = summary
             .disconnected
             .iter()
@@ -4022,6 +4641,11 @@ impl NodeState {
     }
 
     pub fn compact_name_tree_nodes(&mut self) -> Result<NameTreeCompactionCheckpoint> {
+        if self.name_pages.is_some() {
+            anyhow::bail!(
+                "legacy RocksDB name-node compaction is disabled after append-only page storage is active"
+            );
+        }
         self.compact_name_tree_nodes_with_interval(None)?
             .ok_or_else(|| anyhow::anyhow!("name-tree compaction requires an active block tip"))
     }
@@ -4032,6 +4656,12 @@ impl NodeState {
     ) -> Result<Option<NameTreeCompactionCheckpoint>> {
         if interval == 0 {
             anyhow::bail!("name-tree compaction startup interval must be non-zero");
+        }
+        // Page-backed nodes never add records to the legacy LSM column. Its
+        // existing contents remain a migration/reorg fallback until the
+        // explicit legacy-retirement pass has copied every retained root.
+        if self.name_pages.is_some() {
+            return Ok(None);
         }
         self.compact_name_tree_nodes_with_interval(Some(interval))
     }
@@ -4324,21 +4954,32 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
         .as_ref()
         .map(|state| state.pruned_through.saturating_add(1))
         .unwrap_or_else(|| policy.prune_after_height.saturating_add(1));
-    if target != expected {
+    let due = target
+        .checked_sub(expected)
+        .and_then(|distance| distance.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("undo-pruning range is invalid"))?;
+    if due > tree_interval {
         anyhow::bail!(
             "undo history requires startup catch-up through height {} before pruning height {target}",
             target.saturating_sub(1)
         );
     }
-    let (block_hash, pruned) = stage_prune_undo_height(snapshot, batch, target)?;
-    let pruned_undos = previous
-        .as_ref()
-        .map_or(0, |state| state.pruned_undos)
-        .checked_add(u64::from(pruned))
-        .ok_or_else(|| anyhow::anyhow!("pruned undo count exhausted"))?;
+    // The accumulator makes the safe frontier advance at authenticated-tree
+    // boundaries rather than one block at a time. Retire that bounded interval
+    // atomically with the boundary block.
+    let mut block_hash = None;
+    let mut pruned_undos = previous.as_ref().map_or(0, |state| state.pruned_undos);
+    for height in expected..=target {
+        let (hash, pruned) = stage_prune_undo_height(snapshot, batch, height)?;
+        pruned_undos = pruned_undos
+            .checked_add(u64::from(pruned))
+            .ok_or_else(|| anyhow::anyhow!("pruned undo count exhausted"))?;
+        block_hash = Some(hash);
+    }
     let checkpoint = UndoPruningCheckpoint {
         pruned_through: target,
-        block_hash,
+        block_hash: block_hash
+            .ok_or_else(|| anyhow::anyhow!("undo-pruning range contained no active heights"))?,
         pruned_undos,
     };
     batch.put(
@@ -6808,6 +7449,187 @@ mod tests {
                 .next_tree_root,
             *pending_root.as_bytes()
         );
+    }
+
+    #[test]
+    fn page_backed_node_commits_interval_root_without_lsm_name_nodes_and_restarts() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-node-name-pages-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let mut state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        state.name_pages =
+            Some(NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages"));
+        state.state_engine = StoredStateEngine::with_services(
+            store.clone(),
+            Network::Regtest,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+        .expect("fixture verifier");
+        let mut node =
+            NodeService::try_with_state(active_state_shadow_config(), state).expect("node");
+        let records = connect_fixture_chain(&mut node, 200, None);
+        let spend_txid = node
+            .state
+            .blocks
+            .load_block(&records[198].hash)
+            .expect("load spend source")
+            .expect("spend source")
+            .transactions[0]
+            .txid();
+
+        let mut opening = block_with_commitments(vec![
+            coinbase_transaction_with_tag(201, 50),
+            open_transaction(
+                b"page-backed-name",
+                Outpoint {
+                    txid: spend_txid,
+                    index: 0,
+                },
+            ),
+        ]);
+        opening.header.prev_block = records[200].hash;
+        opening.header.nonce = 221;
+        let opening = node
+            .connect_block(NodeBlockImport::fixture(opening, 201, 202))
+            .expect("connect pending OPEN");
+
+        let mut previous = opening.hash;
+        let mut boundary_block = None;
+        for height in 202..=205 {
+            let snapshot = store.snapshot().expect("pre-boundary snapshot");
+            let root = load_stored_name_tree_commit_root(&snapshot).expect("header root");
+            drop(snapshot);
+            let mut block = block_with_commitments(vec![coinbase_transaction_with_tag(height, 50)]);
+            block.header.prev_block = previous;
+            block.header.tree_root = *root.as_bytes();
+            block.header.nonce = height.saturating_add(20);
+            if height == 205 {
+                boundary_block = Some(block.clone());
+            }
+            previous = node
+                .connect_block(NodeBlockImport::fixture(
+                    block,
+                    height,
+                    u64::from(height) + 1,
+                ))
+                .unwrap_or_else(|error| panic!("connect page boundary {height}: {error}"))
+                .hash;
+        }
+
+        let snapshot = store.snapshot().expect("page-backed snapshot");
+        assert!(snapshot
+            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+            .expect("LSM name nodes")
+            .is_empty());
+        let page_state = NamePageState::decode(
+            &snapshot
+                .get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)
+                .expect("page state read")
+                .expect("page state"),
+        )
+        .expect("decode page state");
+        assert_ne!(page_state.root, TreeRoot::ZERO);
+        assert!(page_state.manifest.durable_bytes > 0);
+        assert_eq!(page_state.committed_height, Some(205));
+        let reader = node
+            .state
+            .name_pages
+            .as_ref()
+            .expect("page storage")
+            .reader(&snapshot)
+            .expect("page reader");
+        let duplicate = reader
+            .load(page_state.root)
+            .expect("load current root")
+            .expect("current root record");
+        drop(snapshot);
+        drop(reader);
+
+        let pages = node.state.name_pages.as_mut().expect("page storage");
+        pages
+            .appender
+            .as_mut()
+            .expect("page appender")
+            .append(&[hns_store::NamePageRecord {
+                key: *page_state.root.as_bytes(),
+                children: Vec::new(),
+                canonical: duplicate,
+            }])
+            .expect("append simulated uncommitted page");
+        pages
+            .appender
+            .as_mut()
+            .expect("page appender")
+            .sync_data()
+            .expect("sync simulated tail");
+        assert!(
+            std::fs::metadata(&pages.file_path)
+                .expect("page metadata")
+                .len()
+                > page_state.manifest.durable_bytes
+        );
+        pages
+            .rollback_uncommitted_tail()
+            .expect("truncate uncommitted page");
+        assert_eq!(
+            std::fs::metadata(&pages.file_path)
+                .expect("recovered page metadata")
+                .len(),
+            page_state.manifest.durable_bytes
+        );
+
+        node.disconnect_block(NodeBlockDisconnect {
+            block_hash: previous,
+            height: 205,
+        })
+        .expect("disconnect page boundary");
+        let snapshot = store.snapshot().expect("disconnected page snapshot");
+        let disconnected_page_state = NamePageState::decode(
+            &snapshot
+                .get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)
+                .expect("disconnected page state read")
+                .expect("disconnected page state"),
+        )
+        .expect("decode disconnected page state");
+        assert_eq!(disconnected_page_state.root, TreeRoot::ZERO);
+        assert!(snapshot
+            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+            .expect("disconnected LSM name nodes")
+            .is_empty());
+        drop(snapshot);
+
+        node.connect_block(NodeBlockImport::fixture(
+            boundary_block.expect("boundary block"),
+            205,
+            206,
+        ))
+        .expect("reconnect page boundary");
+        drop(node);
+
+        let pages =
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("reopen pages");
+        let (_reopened, audit) = NodeState::from_store_for_network_with_startup_audit(
+            store,
+            Network::Regtest,
+            None,
+            None,
+            Some(pages),
+        )
+        .expect("restart page-backed node");
+        assert_eq!(audit, StartupAuditKind::Exhaustive);
+        std::fs::remove_dir_all(directory).expect("remove page fixture");
     }
 
     #[test]

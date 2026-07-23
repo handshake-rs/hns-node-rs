@@ -20,6 +20,10 @@ const NAME_PAGE_STATE_VERSION: u32 = 1;
 const NAME_PAGE_STATE_BODY_BYTES: usize = 4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4;
 const NAME_PAGE_STATE_BYTES: usize = NAME_PAGE_STATE_BODY_BYTES + 32;
 pub const NAME_PAGE_STATE_KEY: &[u8] = b"name-page-state/v1";
+const NAME_PAGE_ROOT_RECORD_VERSION: u32 = 1;
+const NAME_PAGE_ROOT_RECORD_BODY_BYTES: usize = 4 + 32 + 8 + 8 + 4;
+const NAME_PAGE_ROOT_RECORD_BYTES: usize = NAME_PAGE_ROOT_RECORD_BODY_BYTES + 32;
+pub const NAME_PAGE_ROOT_PREFIX: &[u8] = b"name-page-root/v1/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NamePageRootLocator {
@@ -33,6 +37,85 @@ pub struct NamePageState {
     pub root: TreeRoot,
     pub root_address: Option<NamePageAddress>,
     pub committed_height: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamePageRootRecord {
+    pub root: TreeRoot,
+    pub locator: NamePageRootLocator,
+    pub height: u32,
+}
+
+impl NamePageRootRecord {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::with_capacity(NAME_PAGE_ROOT_RECORD_BYTES);
+        writer.write_u32(NAME_PAGE_ROOT_RECORD_VERSION);
+        writer.write_bytes(self.root.as_bytes());
+        writer.write_u64(self.locator.generation);
+        writer.write_u64(self.locator.address);
+        writer.write_u32(self.height);
+        let mut raw = writer.finish();
+        debug_assert_eq!(raw.len(), NAME_PAGE_ROOT_RECORD_BODY_BYTES);
+        raw.extend_from_slice(&blake2b_256(&raw));
+        raw
+    }
+
+    pub fn decode(raw: &[u8]) -> Result<Self, PageTreeError> {
+        if raw.len() != NAME_PAGE_ROOT_RECORD_BYTES {
+            return Err(PageTreeError::StateCodec(format!(
+                "name-page root record contains {} bytes; expected {NAME_PAGE_ROOT_RECORD_BYTES}",
+                raw.len()
+            )));
+        }
+        let (body, checksum) = raw.split_at(NAME_PAGE_ROOT_RECORD_BODY_BYTES);
+        if checksum != blake2b_256(body) {
+            return Err(PageTreeError::StateCodec(
+                "name-page root record checksum mismatch".to_owned(),
+            ));
+        }
+        let mut reader = Reader::new(body, NAME_PAGE_ROOT_RECORD_BODY_BYTES)
+            .map_err(|error| PageTreeError::StateCodec(error.to_string()))?;
+        let version = reader
+            .read_u32()
+            .map_err(|error| PageTreeError::StateCodec(error.to_string()))?;
+        if version != NAME_PAGE_ROOT_RECORD_VERSION {
+            return Err(PageTreeError::StateCodec(format!(
+                "unsupported name-page root record version {version}"
+            )));
+        }
+        let record = Self {
+            root: TreeRoot::new(
+                reader
+                    .read_hash()
+                    .map_err(|error| PageTreeError::StateCodec(error.to_string()))?,
+            ),
+            locator: NamePageRootLocator {
+                generation: reader
+                    .read_u64()
+                    .map_err(|error| PageTreeError::StateCodec(error.to_string()))?,
+                address: reader
+                    .read_u64()
+                    .map_err(|error| PageTreeError::StateCodec(error.to_string()))?,
+            },
+            height: reader
+                .read_u32()
+                .map_err(|error| PageTreeError::StateCodec(error.to_string()))?,
+        };
+        reader
+            .ensure_finished()
+            .map_err(|error| PageTreeError::StateCodec(error.to_string()))?;
+        if record.root == TreeRoot::ZERO {
+            return Err(PageTreeError::RootLocatorInvariant);
+        }
+        Ok(record)
+    }
+}
+
+pub fn name_page_root_key(root: TreeRoot) -> Vec<u8> {
+    let mut key = Vec::with_capacity(NAME_PAGE_ROOT_PREFIX.len() + 32);
+    key.extend_from_slice(NAME_PAGE_ROOT_PREFIX);
+    key.extend_from_slice(root.as_bytes());
+    key
 }
 
 impl NamePageState {
@@ -328,11 +411,24 @@ pub struct NamePageTreeReader {
 pub struct NamePageSnapshot<'a, S: ReadSnapshot> {
     base: &'a S,
     pages: &'a NamePageTreeReader,
+    fallback_legacy_nodes: bool,
 }
 
 impl<'a, S: ReadSnapshot> NamePageSnapshot<'a, S> {
     pub const fn new(base: &'a S, pages: &'a NamePageTreeReader) -> Self {
-        Self { base, pages }
+        Self {
+            base,
+            pages,
+            fallback_legacy_nodes: false,
+        }
+    }
+
+    pub const fn with_legacy_fallback(base: &'a S, pages: &'a NamePageTreeReader) -> Self {
+        Self {
+            base,
+            pages,
+            fallback_legacy_nodes: true,
+        }
     }
 }
 
@@ -347,9 +443,15 @@ impl<S: ReadSnapshot> ReadSnapshot for NamePageSnapshot<'_, S> {
                 key.len()
             ))
         })?;
-        self.pages
+        match self
+            .pages
             .load(TreeRoot::new(root))
-            .map_err(|error| StoreError::Backend(error.to_string()))
+            .map_err(|error| StoreError::Backend(error.to_string()))?
+        {
+            Some(raw) => Ok(Some(raw)),
+            None if self.fallback_legacy_nodes => self.base.get(family, key),
+            None => Ok(None),
+        }
     }
 
     fn get_many(
@@ -413,6 +515,22 @@ impl NamePageTreeReader {
 
     pub const fn segment(&self) -> u32 {
         self.segment
+    }
+
+    pub fn insert_root(
+        &self,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+    ) -> Result<(), PageTreeError> {
+        let address = locator.page_address();
+        if locator.generation != self.generation || address.segment() != self.segment {
+            return Err(PageTreeError::WrongSegment {
+                expected: self.segment,
+                actual: address.segment(),
+            });
+        }
+        let mut addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
+        insert_discovered_address(&mut addresses, root, address)
     }
 
     pub fn load(&self, root: TreeRoot) -> Result<Option<Vec<u8>>, PageTreeError> {

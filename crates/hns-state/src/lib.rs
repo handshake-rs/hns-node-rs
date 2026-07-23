@@ -2,9 +2,11 @@
 
 mod page_tree;
 
+pub use hns_urkel::TreeRoot;
 pub use page_tree::{
-    pack_name_page_records, NamePageRootLocator, NamePageSnapshot, NamePageState,
-    NamePageTreeReader, PackedNamePages, PageTreeError, NAME_PAGE_STATE_KEY,
+    name_page_root_key, pack_name_page_records, NamePageRootLocator, NamePageRootRecord,
+    NamePageSnapshot, NamePageState, NamePageTreeReader, PackedNamePages, PageTreeError,
+    NAME_PAGE_ROOT_PREFIX, NAME_PAGE_STATE_KEY,
 };
 
 use std::{
@@ -40,7 +42,7 @@ use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
     reachable_record_roots_batched, update_record_tree, update_record_tree_batched,
     validate_record_root, validate_record_tree, validate_record_trees_batched, MemoryUrkel,
-    NameTreeSnapshot, TreeRoot, UrkelError, UrkelProof,
+    NameTreeSnapshot, UrkelError, UrkelProof,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2641,6 +2643,22 @@ pub fn validate_persisted_name_tree<T: ReadSnapshot>(
 ) -> Result<usize, StateError> {
     validate_record_tree(root, |node_root| load_persisted_node(snapshot, node_root))
         .map_err(StateError::NameTree)
+}
+
+pub fn load_persisted_name_tree_records<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+) -> Result<BTreeMap<TreeRoot, Vec<u8>>, StateError> {
+    let roots =
+        reachable_record_roots([root], |node_root| load_persisted_node(snapshot, node_root))?;
+    let mut records = BTreeMap::new();
+    for node_root in roots {
+        let raw = snapshot
+            .get(ColumnFamily::NameTreeNodes, node_root.as_bytes())?
+            .ok_or(UrkelError::MissingNode(node_root))?;
+        records.insert(node_root, raw);
+    }
+    Ok(records)
 }
 
 /// Verify the reachable union of multiple durable content-addressed roots.
