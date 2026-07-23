@@ -62,9 +62,9 @@ use hns_rpc::{
     RpcTransactionEntry, RpcUndoRetentionInfo,
 };
 use hns_state::{
-    connect_block_to_batch_with_services, decode_coin, decode_name_state,
-    disconnect_block_to_batch, load_name_tree_snapshot_pins, load_stored_name_tree_commit_root,
-    load_stored_name_tree_root, stage_name_tree_node_compaction,
+    compact_name_tree_nodes_streaming, connect_block_to_batch_with_services, decode_coin,
+    decode_name_state, disconnect_block_to_batch, load_name_tree_snapshot_pins,
+    load_stored_name_tree_commit_root, load_stored_name_tree_root,
     stage_remove_name_tree_snapshot_pin, validate_persisted_name_tree_root,
     validate_persisted_name_trees, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
     BlockUndo, ConnectBlock, DisconnectBlock, NameTreeCompactionSummary, NameTreeSnapshotPin,
@@ -88,6 +88,7 @@ const DEPLOYMENT_STATE_CACHE_VERSION: u8 = 1;
 const DEPLOYMENT_STATE_CACHE_SIZE: usize = 1 + 4 + 4;
 const NAME_TREE_COMPACTION_CHECKPOINT_KEY: &[u8] = b"name-tree-compaction/v1";
 const NAME_TREE_COMPACTION_CHECKPOINT_VERSION: u32 = 1;
+const NAME_TREE_COMPACTION_DELETE_BATCH: usize = 65_536;
 const NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE: usize = 4 + 4 + 32 + (4 * 8);
 const NAME_TREE_COMPACTION_CHECKPOINT_SIZE: usize = NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE + 32;
 pub const DEFAULT_NAME_TREE_COMPACTION_INTERVAL: Height = 10_000;
@@ -3937,20 +3938,26 @@ impl NodeState {
             }
         }
 
-        let mut batch = self.store.batch();
-        let summary = stage_name_tree_node_compaction(&snapshot, &mut batch)
-            .map_err(|error| anyhow::anyhow!("failed to compact durable name tree: {error}"))?;
+        drop(snapshot);
+        let summary =
+            compact_name_tree_nodes_streaming(&self.store, NAME_TREE_COMPACTION_DELETE_BATCH)
+                .map_err(|error| anyhow::anyhow!("failed to compact durable name tree: {error}"))?;
+        let snapshot = self.store.snapshot()?;
+        if best_block_tip_from_snapshot(&snapshot)?.as_ref() != Some(&tip) {
+            anyhow::bail!("active tip changed during name-tree compaction");
+        }
+        drop(snapshot);
         let checkpoint = NameTreeCompactionCheckpoint {
             height: tip.height,
             tip: tip.hash,
             summary,
         };
+        let mut batch = self.store.batch();
         batch.put(
             ColumnFamily::Snapshots,
             NAME_TREE_COMPACTION_CHECKPOINT_KEY,
             &checkpoint.encode()?,
         )?;
-        drop(snapshot);
         self.store.commit(batch)?;
         Ok(Some(checkpoint))
     }

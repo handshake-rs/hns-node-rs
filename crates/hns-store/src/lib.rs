@@ -208,6 +208,16 @@ pub trait Store {
 /// every staged operation has validated successfully.
 type StagedChanges = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
 type SharedStagedChanges = Rc<RefCell<StagedChanges>>;
+type NameNodeReadCache = HashMap<Vec<u8>, Vec<u8>>;
+type NameStateReadCache = HashMap<Vec<u8>, Option<Vec<u8>>>;
+/// Bound one active-state transaction's positive cache for content-addressed
+/// name-tree nodes. The cache belongs to a single immutable base snapshot;
+/// staged replacements and deletions are always resolved before it.
+const STAGED_NAME_NODE_READ_CACHE_LIMIT: usize = 131_072;
+/// Bound mutable name-state values read from one immutable base snapshot.
+/// Missing values are cached too; writes in the staging overlay take
+/// precedence, so a later OPEN or other transition cannot be masked.
+const STAGED_NAME_STATE_READ_CACHE_LIMIT: usize = 32_768;
 
 #[derive(Clone, Debug, Default)]
 pub struct StagingOverlay {
@@ -223,6 +233,8 @@ impl StagingOverlay {
         StagedSnapshot {
             base,
             changes: Rc::clone(&self.changes),
+            name_node_reads: RefCell::default(),
+            name_state_reads: RefCell::default(),
         }
     }
 
@@ -237,6 +249,8 @@ impl StagingOverlay {
 pub struct StagedSnapshot<'a, S: ReadSnapshot> {
     base: &'a S,
     changes: SharedStagedChanges,
+    name_node_reads: RefCell<NameNodeReadCache>,
+    name_state_reads: RefCell<NameStateReadCache>,
 }
 
 impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
@@ -250,7 +264,30 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
         if let Some(value) = staged {
             return Ok(value);
         }
-        self.base.get(family, key)
+        if family == ColumnFamily::NameTreeNodes {
+            if let Some(value) = self.name_node_reads.borrow().get(key) {
+                return Ok(Some(value.clone()));
+            }
+        } else if family == ColumnFamily::NameState {
+            if let Some(value) = self.name_state_reads.borrow().get(key) {
+                return Ok(value.clone());
+            }
+        }
+        let value = self.base.get(family, key)?;
+        if family == ColumnFamily::NameTreeNodes {
+            if let Some(value) = &value {
+                let mut cache = self.name_node_reads.borrow_mut();
+                if cache.len() < STAGED_NAME_NODE_READ_CACHE_LIMIT {
+                    cache.insert(key.to_vec(), value.clone());
+                }
+            }
+        } else if family == ColumnFamily::NameState {
+            let mut cache = self.name_state_reads.borrow_mut();
+            if cache.len() < STAGED_NAME_STATE_READ_CACHE_LIMIT {
+                cache.insert(key.to_vec(), value.clone());
+            }
+        }
+        Ok(value)
     }
 
     fn get_many(
@@ -258,32 +295,72 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
         family: ColumnFamily,
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
-        let staged = {
+        let resolved = {
             let changes = self.changes.borrow();
+            let name_node_reads = self.name_node_reads.borrow();
+            let name_state_reads = self.name_state_reads.borrow();
             keys.iter()
                 .map(|key| {
-                    changes
+                    let staged = changes
                         .get(&family)
                         .and_then(|changes| changes.get(*key))
-                        .cloned()
+                        .cloned();
+                    if staged.is_some() {
+                        return staged;
+                    }
+                    if family == ColumnFamily::NameTreeNodes {
+                        return name_node_reads.get(*key).cloned().map(Some);
+                    }
+                    if family == ColumnFamily::NameState {
+                        return name_state_reads.get(*key).cloned();
+                    }
+                    None
                 })
                 .collect::<Vec<_>>()
         };
         let missing_keys = keys
             .iter()
-            .zip(&staged)
+            .zip(&resolved)
             .filter_map(|(key, value)| value.is_none().then_some(*key))
             .collect::<Vec<_>>();
-        let mut missing_values = self.base.get_many(family, &missing_keys)?.into_iter();
+        let missing_values = if missing_keys.is_empty() {
+            Vec::new()
+        } else {
+            self.base.get_many(family, &missing_keys)?
+        };
+        if missing_values.len() != missing_keys.len() {
+            return Err(StoreError::Backend(format!(
+                "snapshot multi-get returned {} values for {} requested keys",
+                missing_values.len(),
+                missing_keys.len()
+            )));
+        }
+        let mut missing_values = missing_keys.into_iter().zip(missing_values);
         let mut values = Vec::with_capacity(keys.len());
-        for value in staged {
+        for value in resolved {
             match value {
                 Some(value) => values.push(value),
-                None => values.push(missing_values.next().ok_or_else(|| {
-                    StoreError::Backend(
-                        "snapshot multi-get returned fewer values than requested".to_owned(),
-                    )
-                })?),
+                None => {
+                    let (key, value) = missing_values.next().ok_or_else(|| {
+                        StoreError::Backend(
+                            "snapshot multi-get returned fewer values than requested".to_owned(),
+                        )
+                    })?;
+                    if family == ColumnFamily::NameTreeNodes {
+                        if let Some(value) = &value {
+                            let mut cache = self.name_node_reads.borrow_mut();
+                            if cache.len() < STAGED_NAME_NODE_READ_CACHE_LIMIT {
+                                cache.insert(key.to_vec(), value.clone());
+                            }
+                        }
+                    } else if family == ColumnFamily::NameState {
+                        let mut cache = self.name_state_reads.borrow_mut();
+                        if cache.len() < STAGED_NAME_STATE_READ_CACHE_LIMIT {
+                            cache.insert(key.to_vec(), value.clone());
+                        }
+                    }
+                    values.push(value);
+                }
             }
         }
         if missing_values.next().is_some() {
@@ -1159,6 +1236,47 @@ pub enum StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    struct CountingSnapshot {
+        inner: MemorySnapshot,
+        gets: Cell<usize>,
+        multi_gets: Cell<usize>,
+    }
+
+    impl CountingSnapshot {
+        fn new(inner: MemorySnapshot) -> Self {
+            Self {
+                inner,
+                gets: Cell::new(0),
+                multi_gets: Cell::new(0),
+            }
+        }
+    }
+
+    impl ReadSnapshot for CountingSnapshot {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            self.gets.set(self.gets.get() + 1);
+            self.inner.get(family, key)
+        }
+
+        fn get_many(
+            &self,
+            family: ColumnFamily,
+            keys: &[&[u8]],
+        ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+            self.multi_gets.set(self.multi_gets.get() + 1);
+            self.inner.get_many(family, keys)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<Vec<ScanEntry>, StoreError> {
+            self.inner.scan_prefix(family, prefix)
+        }
+    }
 
     #[test]
     fn memory_store_commits_batches_atomically() {
@@ -1340,6 +1458,127 @@ mod tests {
                 .expect("committed get"),
             Some(b"two".to_vec())
         );
+    }
+
+    #[test]
+    fn staging_overlay_caches_name_nodes_and_snapshot_name_state() {
+        let store = MemoryStore::new();
+        let mut initial = store.batch();
+        initial
+            .put(ColumnFamily::NameTreeNodes, b"node-a", b"value-a")
+            .expect("put node a");
+        initial
+            .put(ColumnFamily::NameTreeNodes, b"node-b", b"value-b")
+            .expect("put node b");
+        initial
+            .put(ColumnFamily::Headers, b"header", b"value")
+            .expect("put header");
+        initial
+            .put(ColumnFamily::NameState, b"name-present", b"old-state")
+            .expect("put name state");
+        store.commit(initial).expect("commit initial");
+
+        let base = CountingSnapshot::new(store.snapshot().expect("base snapshot"));
+        let overlay = StagingOverlay::new();
+        let staged_snapshot = overlay.snapshot(&base);
+        let mut staged_batch = overlay.batch(store.batch());
+
+        assert_eq!(
+            staged_snapshot
+                .get_many(
+                    ColumnFamily::NameTreeNodes,
+                    &[b"node-a".as_slice(), b"node-b".as_slice()],
+                )
+                .expect("initial node multi-get"),
+            vec![Some(b"value-a".to_vec()), Some(b"value-b".to_vec())]
+        );
+        assert_eq!(base.multi_gets.get(), 1);
+        assert_eq!(
+            staged_snapshot
+                .get(ColumnFamily::NameTreeNodes, b"node-a")
+                .expect("cached node get"),
+            Some(b"value-a".to_vec())
+        );
+        assert_eq!(
+            staged_snapshot
+                .get_many(
+                    ColumnFamily::NameTreeNodes,
+                    &[b"node-b".as_slice(), b"node-a".as_slice()],
+                )
+                .expect("cached node multi-get"),
+            vec![Some(b"value-b".to_vec()), Some(b"value-a".to_vec())]
+        );
+        assert_eq!(base.gets.get(), 0);
+        assert_eq!(base.multi_gets.get(), 1);
+
+        for _ in 0..2 {
+            assert_eq!(
+                staged_snapshot
+                    .get(ColumnFamily::NameState, b"name-present")
+                    .expect("cached present name state"),
+                Some(b"old-state".to_vec())
+            );
+            assert_eq!(
+                staged_snapshot
+                    .get(ColumnFamily::NameState, b"name-absent")
+                    .expect("cached absent name state"),
+                None
+            );
+        }
+        assert_eq!(
+            base.gets.get(),
+            2,
+            "present and absent name state must each reach the base once"
+        );
+
+        staged_batch
+            .put(ColumnFamily::NameTreeNodes, b"node-a", b"staged")
+            .expect("replace cached node");
+        staged_batch
+            .delete(ColumnFamily::NameTreeNodes, b"node-b")
+            .expect("delete cached node");
+        assert_eq!(
+            staged_snapshot
+                .get(ColumnFamily::NameTreeNodes, b"node-a")
+                .expect("staged node get"),
+            Some(b"staged".to_vec())
+        );
+        assert_eq!(
+            staged_snapshot
+                .get(ColumnFamily::NameTreeNodes, b"node-b")
+                .expect("staged node delete"),
+            None
+        );
+        staged_batch
+            .put(ColumnFamily::NameState, b"name-present", b"new-state")
+            .expect("replace cached name state");
+        staged_batch
+            .put(ColumnFamily::NameState, b"name-absent", b"opened-state")
+            .expect("insert cached absent name state");
+        assert_eq!(
+            staged_snapshot
+                .get(ColumnFamily::NameState, b"name-present")
+                .expect("staged present name state"),
+            Some(b"new-state".to_vec())
+        );
+        assert_eq!(
+            staged_snapshot
+                .get(ColumnFamily::NameState, b"name-absent")
+                .expect("staged absent name state"),
+            Some(b"opened-state".to_vec())
+        );
+        assert_eq!(base.gets.get(), 2);
+        assert_eq!(base.multi_gets.get(), 1);
+
+        for _ in 0..2 {
+            assert_eq!(
+                staged_snapshot
+                    .get(ColumnFamily::Headers, b"header")
+                    .expect("uncached header get"),
+                Some(b"value".to_vec())
+            );
+        }
+        assert_eq!(base.gets.get(), 4);
     }
 
     #[test]

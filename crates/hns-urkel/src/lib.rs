@@ -713,9 +713,62 @@ where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
     I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
 {
+    apply_record_updates(root, updates, load, BTreeMap::new())
+}
+
+/// Apply path-local mutations after loading all affected paths breadth-first.
+/// One loader call can resolve many content-addressed nodes at the same tree
+/// depth, allowing persistent stores to use a true database MultiGet instead
+/// of crossing the storage boundary once per node and mutation.
+///
+/// Constructed nodes remain in the mutation context, and an uncommon node not
+/// present on an original affected path (for example a deletion sibling needed
+/// for prefix compression) falls back to a one-record batch. The result is
+/// byte-identical to [`update_record_tree`].
+pub fn update_record_tree_batched<F, I>(
+    root: TreeRoot,
+    updates: I,
+    batch_size: usize,
+    mut load_many: F,
+) -> Result<UrkelRecordUpdate, UrkelError>
+where
+    F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
+    I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
+{
+    if batch_size == 0 {
+        return Err(UrkelError::InvalidNode(
+            "record mutation batch size must be non-zero".to_owned(),
+        ));
+    }
+    let updates = updates.into_iter().collect::<Vec<_>>();
+    let keys = updates.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    let loaded = prefetch_record_paths(root, &keys, batch_size, &mut load_many)?;
+    let load_one = move |record_root: TreeRoot| {
+        let mut values = load_many(&[record_root])?;
+        if values.len() != 1 {
+            return Err(UrkelError::Storage(format!(
+                "record mutation loader returned {} records for one key",
+                values.len()
+            )));
+        }
+        Ok(values.pop().expect("one mutation record"))
+    };
+    apply_record_updates(root, updates, load_one, loaded)
+}
+
+fn apply_record_updates<F, I>(
+    root: TreeRoot,
+    updates: I,
+    load: F,
+    loaded: BTreeMap<TreeRoot, UrkelNodeRecord>,
+) -> Result<UrkelRecordUpdate, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
+{
     let mut context = RecordMutationContext {
         load,
-        loaded: BTreeMap::new(),
+        loaded,
         records: BTreeMap::new(),
     };
     if root != TreeRoot::ZERO {
@@ -738,6 +791,78 @@ where
         root: current,
         records: context.records,
     })
+}
+
+fn prefetch_record_paths<F>(
+    root: TreeRoot,
+    keys: &[NameHash],
+    batch_size: usize,
+    load_many: &mut F,
+) -> Result<BTreeMap<TreeRoot, UrkelNodeRecord>, UrkelError>
+where
+    F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
+{
+    let mut loaded = BTreeMap::new();
+    if root == TreeRoot::ZERO || keys.is_empty() {
+        return Ok(loaded);
+    }
+
+    let mut frontier: BTreeMap<TreeRoot, Vec<(NameHash, usize)>> = BTreeMap::from([(
+        root,
+        keys.iter().copied().map(|key| (key, 0usize)).collect(),
+    )]);
+    while !frontier.is_empty() {
+        let requested = frontier
+            .keys()
+            .filter(|record_root| !loaded.contains_key(*record_root))
+            .copied()
+            .collect::<Vec<_>>();
+        for chunk in requested.chunks(batch_size) {
+            let values = load_many(chunk)?;
+            if values.len() != chunk.len() {
+                return Err(UrkelError::Storage(format!(
+                    "record mutation loader returned {} records for {} keys",
+                    values.len(),
+                    chunk.len()
+                )));
+            }
+            for (record_root, value) in chunk.iter().copied().zip(values) {
+                let raw = value.ok_or(UrkelError::MissingNode(record_root))?;
+                loaded.insert(record_root, decode_verified_record(record_root, &raw)?);
+            }
+        }
+
+        let mut next = BTreeMap::<TreeRoot, Vec<(NameHash, usize)>>::new();
+        for (record_root, traversals) in frontier {
+            let record = loaded.get(&record_root).ok_or_else(|| {
+                UrkelError::InvalidNode(format!(
+                    "prefetched Urkel record {record_root:?} is unavailable"
+                ))
+            })?;
+            let UrkelNodeRecord::Internal {
+                prefix,
+                left,
+                right,
+            } = record
+            else {
+                continue;
+            };
+            for (key, depth) in traversals {
+                if !prefix.matches_key(key.as_bytes(), depth) {
+                    continue;
+                }
+                let branch_depth = checked_branch_depth(prefix, depth)?;
+                let child = if key_bit(key.as_bytes(), branch_depth) == 0 {
+                    *left
+                } else {
+                    *right
+                };
+                next.entry(child).or_default().push((key, branch_depth + 1));
+            }
+        }
+        frontier = next;
+    }
+    Ok(loaded)
 }
 
 struct RecordMutationContext<F> {
@@ -1139,8 +1264,44 @@ where
 pub fn validate_record_trees_batched<F, I>(
     roots: I,
     maximum_batch: usize,
-    mut load_many: F,
+    load_many: F,
 ) -> Result<usize, UrkelError>
+where
+    F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
+    I: IntoIterator<Item = TreeRoot>,
+{
+    reachable_record_roots_batched(roots, maximum_batch, load_many).map(|reachable| reachable.len())
+}
+
+/// Validated, deduplicated content-addressed roots reachable from a retained
+/// root set. The retained depth value is also the primary path-depth evidence
+/// used during validation, so compaction does not need a second full hash set.
+#[derive(Debug)]
+pub struct ReachableRecordRoots {
+    primary_depths: HashMap<TreeRoot, u16>,
+}
+
+impl ReachableRecordRoots {
+    pub fn contains(&self, root: &TreeRoot) -> bool {
+        self.primary_depths.contains_key(root)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.primary_depths.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.primary_depths.len()
+    }
+}
+
+/// Validate and retain the reachable union using bounded storage MultiGet
+/// batches. This is the collection form used by streaming compaction.
+pub fn reachable_record_roots_batched<F, I>(
+    roots: I,
+    maximum_batch: usize,
+    mut load_many: F,
+) -> Result<ReachableRecordRoots, UrkelError>
 where
     F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
     I: IntoIterator<Item = TreeRoot>,
@@ -1237,7 +1398,7 @@ where
             }
         }
     }
-    Ok(primary_depths.len())
+    Ok(ReachableRecordRoots { primary_depths })
 }
 
 /// Validate the record directly bound by `root` without traversing unrelated
@@ -2352,11 +2513,10 @@ mod tests {
         records.extend(second.node_records().expect("second records"));
         let roots = [first.root(), second.root()];
         let expected = reachable_record_roots(roots, |root| Ok(records.get(&root).cloned()))
-            .expect("reachable union")
-            .len();
+            .expect("reachable union");
 
         let mut calls = 0usize;
-        let actual = validate_record_trees_batched(roots, 3, |requested| {
+        let actual = reachable_record_roots_batched(roots, 3, |requested| {
             calls += 1;
             assert!(!requested.is_empty());
             assert!(requested.len() <= 3);
@@ -2367,7 +2527,19 @@ mod tests {
         })
         .expect("batched validation");
 
-        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), expected.len());
+        assert!(!actual.is_empty());
+        assert!(expected.iter().all(|root| actual.contains(root)));
+        assert_eq!(
+            validate_record_trees_batched(roots, 3, |requested| {
+                Ok(requested
+                    .iter()
+                    .map(|root| records.get(root).cloned())
+                    .collect())
+            })
+            .expect("batched count"),
+            expected.len()
+        );
         assert!(calls > 1);
     }
 
@@ -2419,6 +2591,87 @@ mod tests {
                 .all(|record_root| reachable.contains(record_root)),
             "the staged update must not retain superseded intra-block paths"
         );
+    }
+
+    #[test]
+    fn batched_record_mutation_matches_point_loading_with_fewer_boundaries() {
+        let tree = MemoryUrkel::from_entries(
+            (0..512).map(|index| (key(index), format!("value-{index}").into_bytes())),
+        )
+        .expect("tree");
+        let records = tree.node_records().expect("records");
+        let updates = (96..224)
+            .map(|index| {
+                (
+                    key(index),
+                    Some(format!("replacement-{index}").into_bytes()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut point_calls = 0usize;
+        let point = update_record_tree(tree.root(), updates.clone(), |record_root| {
+            point_calls += 1;
+            Ok(records.get(&record_root).cloned())
+        })
+        .expect("point-loaded mutation");
+
+        let mut batch_calls = 0usize;
+        let mut maximum_batch = 0usize;
+        let batched = update_record_tree_batched(tree.root(), updates, 1_024, |record_roots| {
+            batch_calls += 1;
+            maximum_batch = maximum_batch.max(record_roots.len());
+            Ok(record_roots
+                .iter()
+                .map(|record_root| records.get(record_root).cloned())
+                .collect())
+        })
+        .expect("batch-loaded mutation");
+
+        assert_eq!(batched.root(), point.root());
+        assert_eq!(batched.records(), point.records());
+        assert!(maximum_batch > 1, "fixture must exercise a real MultiGet");
+        assert!(
+            batch_calls * 4 < point_calls,
+            "batch calls {batch_calls} did not materially reduce {point_calls} point loads"
+        );
+    }
+
+    #[test]
+    fn batched_record_mutation_handles_removals_and_fails_closed() {
+        let tree = MemoryUrkel::from_entries(
+            (0..128).map(|index| (key(index), format!("value-{index}").into_bytes())),
+        )
+        .expect("tree");
+        let records = tree.node_records().expect("records");
+        let updates = (16..48)
+            .map(|index| (key(index), None))
+            .chain(
+                (128..160)
+                    .map(|index| (key(index), Some(format!("inserted-{index}").into_bytes()))),
+            )
+            .collect::<Vec<_>>();
+        let expected = update_record_tree(tree.root(), updates.clone(), |record_root| {
+            Ok(records.get(&record_root).cloned())
+        })
+        .expect("point-loaded mixed mutation");
+        let actual = update_record_tree_batched(tree.root(), updates.clone(), 7, |record_roots| {
+            Ok(record_roots
+                .iter()
+                .map(|record_root| records.get(record_root).cloned())
+                .collect())
+        })
+        .expect("batch-loaded mixed mutation");
+        assert_eq!(actual, expected);
+
+        assert!(matches!(
+            update_record_tree_batched(tree.root(), updates.clone(), 0, |_| Ok(Vec::new())),
+            Err(UrkelError::InvalidNode(message)) if message.contains("batch size")
+        ));
+        assert!(matches!(
+            update_record_tree_batched(tree.root(), updates, 7, |_| Ok(Vec::new())),
+            Err(UrkelError::Storage(message)) if message.contains("returned 0 records")
+        ));
     }
 
     #[test]

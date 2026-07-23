@@ -255,8 +255,8 @@ Tests must cover:
 - atomic connect/disconnect root transitions;
 - multi-block staged root transitions;
 - interval-pin lifecycle and startup validation;
-- compaction reachability, malformed metadata, idempotence, and atomic commit
-  failure;
+- compaction reachability, malformed metadata, idempotence, atomic commit
+  failure, and bounded streaming delete batches;
 - scheduled and forced compaction checkpoint agreement across unclean RocksDB
   reopen;
 - equal-work branch stability and greater-work activation;

@@ -194,6 +194,49 @@ multi-get per block instead of crossing the Rust/C++ boundary once per node;
 the atomic staging overlay composes its own puts and deletes over the same
 ordered base result.
 
+Multi-name mutation now also prefetches every affected original Urkel path
+breadth-first with bounded snapshot `MultiGet` calls. One activation snapshot
+caches at most 131,072 positive content-addressed node records and 32,768
+present-or-absent materialized `NameState` reads; staged writes and deletes are
+always consulted first, and neither cache survives the snapshot. Resolved
+transaction coins are stored contiguously from input resolution through script,
+covenant, fee, and spend processing instead of cloning the full vector.
+
+On the persistent mainnet canary at heights 70,766--71,154, a 30.004-second
+window committed 388 blocks (12.932 blocks/s) with zero failed or unavailable
+blocks. RSS moved from 864 to 875 MiB. The process issued about 408 read
+syscalls and 1.66 MiB of logical reads per committed block. The earlier
+height-60,331--60,703 window issued about 522 read syscalls and 2.05 MiB per
+block, so the normalized reductions were approximately 22% and 19% while the
+later chain region was denser. An adjacent traced window committed 132 blocks
+in eight seconds and issued about 494 `pread64` calls per block, versus 568 in
+the immediately preceding dense-region build. These cross-height results are
+directional rather than an A/B replay of identical blocks. Stack sampling
+confirmed that recursive point-loaded Urkel traversal, repeated `NameState`
+point reads, and the resolved-coin vector clone were gone; RocksDB `MultiGet`,
+memtable insertion/commit, block decoding, and Urkel allocation remained.
+At 71% of one core, replay was therefore still not cryptography-limited.
+
+The pre-streaming compactor's height-70,021 run exposed a separate
+deployment-scale defect: it scanned 21,780,645 records, retained 3,058,228,
+deleted 18,722,417, and sampled roughly 3.9 GiB resident plus 1.25 GiB swapped
+(with a transient RSS reading above 5 GiB). It materialized every key/value,
+duplicated every key, and retained every deletion in one batch. The production
+path now validates one batched reachable-root set, performs a key-only
+preflight scan, then streams the stable snapshot and commits unreachable
+deletions in 65,536-key chunks. Only the final completion checkpoint is delayed
+until every chunk succeeds. A crash can leave extra unreachable records but
+cannot delete a validated reachable record; retry is idempotent.
+
+The next live scheduled run completed at height 80,026 over 19,864,432 nodes:
+3,684,694 were retained and 16,179,738 were deleted. Two-second process
+sampling observed a 1,146,448 KiB peak RSS and 118,672 KiB peak swap, roughly a
+77% resident-memory reduction from the old transient reading above 5 GiB.
+The node reported zero failed blocks, wrote the completed checkpoint, and
+resumed replay through height 80,650 during the observation. This qualifies
+the bounded-memory shape on the deployment-scale datastore; forced
+mid-compaction process-crash and latency-distribution campaigns remain open.
+
 Native-sync `getblockhash` is a keyed canonical-height read under the
 coordinator lock. It does not construct the general compatibility RPC snapshot,
 whose complete header/block/transaction/UTXO/name materialization is reserved

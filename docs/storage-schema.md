@@ -89,6 +89,15 @@ Durable identity binds:
   uses one snapshot-bound multi-get, while atomic staging overlays resolve their
   own replacements/deletions first and batch only missing keys against the base
   snapshot.
+- One atomic activation snapshot has bounded read-through caches for immutable
+  name-tree nodes and materialized name state, including absent name-state
+  lookups. Overlay writes/deletes always take precedence and the caches are
+  discarded with that snapshot.
+- Name-tree garbage collection validates the complete retained-root union
+  before mutation, preflights durable key shape without materializing values,
+  and streams unreachable deletes in 65,536-key commits. Its completion
+  checkpoint is written last; an interrupted run is safe and idempotent because
+  only unreachable content-addressed records can have been deleted.
 - The in-memory backend exists for deterministic tests.
 - SQLite is not a consensus-state backend.
 

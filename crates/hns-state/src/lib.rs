@@ -27,9 +27,9 @@ use hns_store::{
     ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES,
 };
 use hns_urkel::{
-    prove_hsd_from_records, reachable_record_roots, update_record_tree, validate_record_root,
-    validate_record_tree, validate_record_trees_batched, MemoryUrkel, NameTreeSnapshot, TreeRoot,
-    UrkelError, UrkelProof,
+    prove_hsd_from_records, reachable_record_roots, reachable_record_roots_batched,
+    update_record_tree, update_record_tree_batched, validate_record_root, validate_record_tree,
+    validate_record_trees_batched, MemoryUrkel, NameTreeSnapshot, TreeRoot, UrkelError, UrkelProof,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1043,22 +1043,19 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
                 request.coinbase_maturity,
                 !assumes(route.input_values),
             )?;
-            let input_coins = resolved
-                .iter()
-                .map(|resolved| resolved.coin.clone())
-                .collect::<Vec<_>>();
+            let input_coins = resolved.coins();
 
             if !assumes(route.sequence_locks) {
                 verify_transaction_sequence_locks(
                     transaction,
                     request.height,
-                    &input_coins,
+                    input_coins,
                     &chain_context,
                 )?;
             }
             if !assumes(route.block_sigops) {
                 block_sigops = block_sigops
-                    .checked_add(transaction_sigops(transaction, &input_coins)?)
+                    .checked_add(transaction_sigops(transaction, input_coins)?)
                     .ok_or(StateError::BlockSigopsExceeded {
                         actual: u32::MAX,
                         maximum: MAX_BLOCK_SIGOPS,
@@ -1071,10 +1068,10 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
                 }
             }
             if !assumes(route.scripts) {
-                verify_transaction_inputs(services.input_verifier, transaction, &input_coins)?;
+                verify_transaction_inputs(services.input_verifier, transaction, input_coins)?;
             }
             if !assumes(route.covenant_links) {
-                verify_transaction_covenant_links(transaction, &input_coins)?;
+                verify_transaction_covenant_links(transaction, input_coins)?;
             }
 
             let fee = if assumes(route.input_values) {
@@ -1278,10 +1275,28 @@ enum ResolvedCoinSource {
     Existing,
 }
 
-#[derive(Clone, Debug)]
-struct ResolvedInput {
-    coin: Coin,
-    source: ResolvedCoinSource,
+#[derive(Clone, Debug, Default)]
+struct ResolvedInputs {
+    coins: Vec<Coin>,
+    sources: Vec<ResolvedCoinSource>,
+}
+
+impl ResolvedInputs {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            coins: Vec::with_capacity(capacity),
+            sources: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, coin: Coin, source: ResolvedCoinSource) {
+        self.coins.push(coin);
+        self.sources.push(source);
+    }
+
+    fn coins(&self) -> &[Coin] {
+        &self.coins
+    }
 }
 
 fn resolve_transaction_inputs<T: ReadSnapshot>(
@@ -1292,8 +1307,8 @@ fn resolve_transaction_inputs<T: ReadSnapshot>(
     spend_height: Height,
     coinbase_maturity: u32,
     check_maturity: bool,
-) -> Result<Vec<ResolvedInput>, StateError> {
-    let mut resolved = Vec::with_capacity(transaction.inputs.len());
+) -> Result<ResolvedInputs, StateError> {
+    let mut resolved = ResolvedInputs::with_capacity(transaction.inputs.len());
     for input in &transaction.inputs {
         if !spent_outpoints.insert(input.previous_output.clone()) {
             return Err(StateError::DuplicateSpend(input.previous_output.clone()));
@@ -1308,7 +1323,7 @@ fn resolve_transaction_inputs<T: ReadSnapshot>(
         if check_maturity {
             check_coinbase_maturity(&coin, spend_height, coinbase_maturity)?;
         }
-        resolved.push(ResolvedInput { coin, source });
+        resolved.push(coin, source);
     }
     Ok(resolved)
 }
@@ -1655,24 +1670,23 @@ fn stage_transaction_spends<B: WriteBatch>(
     pending_created: &mut HashMap<Outpoint, Coin>,
     created_coins: &mut Vec<Outpoint>,
     spent_coins: &mut Vec<Coin>,
-    resolved: Vec<ResolvedInput>,
+    resolved: ResolvedInputs,
 ) -> Result<(), StateError> {
-    for input in resolved {
-        match input.source {
+    if resolved.coins.len() != resolved.sources.len() {
+        return Err(StateError::Codec(
+            "resolved input coin/source count mismatch".to_owned(),
+        ));
+    }
+    for (coin, source) in resolved.coins.into_iter().zip(resolved.sources) {
+        match source {
             ResolvedCoinSource::Pending => {
-                pending_created.remove(&input.coin.outpoint);
-                batch.delete(
-                    ColumnFamily::Utxo,
-                    &encode_outpoint_key(&input.coin.outpoint),
-                )?;
-                created_coins.retain(|outpoint| outpoint != &input.coin.outpoint);
+                pending_created.remove(&coin.outpoint);
+                batch.delete(ColumnFamily::Utxo, &encode_outpoint_key(&coin.outpoint))?;
+                created_coins.retain(|outpoint| outpoint != &coin.outpoint);
             }
             ResolvedCoinSource::Existing => {
-                batch.delete(
-                    ColumnFamily::Utxo,
-                    &encode_outpoint_key(&input.coin.outpoint),
-                )?;
-                spent_coins.push(input.coin);
+                batch.delete(ColumnFamily::Utxo, &encode_outpoint_key(&coin.outpoint))?;
+                spent_coins.push(coin);
             }
         }
     }
@@ -2122,6 +2136,13 @@ fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
     root: TreeRoot,
     overrides: &BTreeMap<NameHash, Option<NameState>>,
 ) -> Result<TreeRoot, StateError> {
+    const MUTATION_MULTI_GET_THRESHOLD: usize = 4;
+    const MUTATION_READ_BATCH: usize = 1_024;
+
+    if overrides.is_empty() {
+        return Ok(root);
+    }
+
     let mut mutations = Vec::with_capacity(overrides.len());
     for (name_hash, state) in overrides {
         let value = match state {
@@ -2138,9 +2159,21 @@ fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
         mutations.push((*name_hash, value));
     }
 
-    let update = update_record_tree(root, mutations, |node_root| {
-        load_persisted_node(snapshot, node_root)
-    })?;
+    let update = if mutations.len() >= MUTATION_MULTI_GET_THRESHOLD {
+        update_record_tree_batched(root, mutations, MUTATION_READ_BATCH, |node_roots| {
+            let keys = node_roots
+                .iter()
+                .map(|node_root| node_root.as_bytes().as_slice())
+                .collect::<Vec<_>>();
+            snapshot
+                .get_many(ColumnFamily::NameTreeNodes, &keys)
+                .map_err(|error| UrkelError::Storage(error.to_string()))
+        })?
+    } else {
+        update_record_tree(root, mutations, |node_root| {
+            load_persisted_node(snapshot, node_root)
+        })?
+    };
     let record_keys = update
         .records()
         .keys()
@@ -2426,6 +2459,108 @@ pub fn stage_name_tree_node_compaction<T: ReadSnapshot, B: WriteBatch>(
         nodes_retained,
         nodes_deleted,
     })
+}
+
+/// Validate retained roots first, then stream unreachable-node deletions in
+/// bounded commits. Deleting unreachable content-addressed records is
+/// monotonic garbage collection: a crash can leave extra nodes but cannot
+/// remove a retained node. Callers write their completed-compaction checkpoint
+/// only after this function returns.
+pub fn compact_name_tree_nodes_streaming<S: Store>(
+    store: &S,
+    delete_batch_size: usize,
+) -> Result<NameTreeCompactionSummary, StateError> {
+    const REACHABILITY_READ_BATCH: usize = 1_024;
+
+    if delete_batch_size == 0 {
+        return Err(StateError::Codec(
+            "name-tree compaction delete batch size must be non-zero".to_owned(),
+        ));
+    }
+
+    let snapshot = store.snapshot()?;
+    let retained_roots = retained_name_tree_roots(&snapshot)?;
+    let reachable = reachable_record_roots_batched(
+        retained_roots.iter().copied(),
+        REACHABILITY_READ_BATCH,
+        |node_roots| {
+            let keys = node_roots
+                .iter()
+                .map(|root| root.as_bytes().as_slice())
+                .collect::<Vec<_>>();
+            snapshot
+                .get_many(ColumnFamily::NameTreeNodes, &keys)
+                .map_err(|error| UrkelError::Storage(error.to_string()))
+        },
+    )?;
+
+    // Validate every durable key before the first mutation. Values are not
+    // materialized, and the stable snapshot is reused for the deletion pass.
+    let mut nodes_before = 0usize;
+    let mut malformed_key_length = None;
+    snapshot.visit_prefix(ColumnFamily::NameTreeNodes, b"", &mut |key, _value| {
+        nodes_before = nodes_before.checked_add(1).ok_or_else(|| {
+            StoreError::Backend("name-tree compaction node count overflowed".to_owned())
+        })?;
+        if key.len() != 32 && malformed_key_length.is_none() {
+            malformed_key_length = Some(key.len());
+        }
+        Ok(())
+    })?;
+    if let Some(length) = malformed_key_length {
+        return Err(StateError::Codec(format!(
+            "name-tree node key contains {length} bytes; expected 32"
+        )));
+    }
+
+    let mut delete_keys = Vec::with_capacity(delete_batch_size);
+    let mut nodes_deleted = 0usize;
+    snapshot.visit_prefix(ColumnFamily::NameTreeNodes, b"", &mut |key, _value| {
+        let root = TreeRoot::new(
+            key.try_into()
+                .expect("name-tree keys were validated before deletion"),
+        );
+        if reachable.contains(&root) {
+            return Ok(());
+        }
+        delete_keys.push(key.to_vec());
+        nodes_deleted = nodes_deleted
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Backend("name-tree deletion count overflowed".to_owned()))?;
+        if delete_keys.len() == delete_batch_size {
+            commit_name_tree_node_deletes(store, &mut delete_keys)?;
+        }
+        Ok(())
+    })?;
+    commit_name_tree_node_deletes(store, &mut delete_keys)?;
+
+    let nodes_retained = nodes_before.saturating_sub(nodes_deleted);
+    if nodes_retained != reachable.len() {
+        return Err(StateError::Codec(format!(
+            "retained name-tree node count {nodes_retained} does not match reachable count {}",
+            reachable.len()
+        )));
+    }
+    Ok(NameTreeCompactionSummary {
+        retained_roots: retained_roots.len(),
+        nodes_before,
+        nodes_retained,
+        nodes_deleted,
+    })
+}
+
+fn commit_name_tree_node_deletes<S: Store>(
+    store: &S,
+    delete_keys: &mut Vec<Vec<u8>>,
+) -> Result<(), StoreError> {
+    if delete_keys.is_empty() {
+        return Ok(());
+    }
+    let mut batch = store.batch();
+    for key in delete_keys.drain(..) {
+        batch.delete(ColumnFamily::NameTreeNodes, &key)?;
+    }
+    store.commit(batch)
 }
 
 /// Immutable exact-proof view rebuilt from one durable store snapshot after
@@ -2946,7 +3081,7 @@ mod tests {
         cell::Cell,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc,
+            Arc, Mutex,
         },
     };
 
@@ -2984,6 +3119,8 @@ mod tests {
     struct NoNameStateScanSnapshot<S> {
         inner: S,
         name_node_reads: Cell<usize>,
+        name_node_batches: Cell<usize>,
+        maximum_name_node_batch: Cell<usize>,
     }
 
     #[derive(Clone)]
@@ -3025,6 +3162,51 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordingStore {
+        inner: MemoryStore,
+        committed_batch_sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl RecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                committed_batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn take_committed_batch_sizes(&self) -> Vec<usize> {
+            std::mem::take(
+                &mut *self
+                    .committed_batch_sizes
+                    .lock()
+                    .expect("recorded batches lock"),
+            )
+        }
+    }
+
+    impl Store for RecordingStore {
+        type Snapshot<'a> = MemorySnapshot;
+        type Batch = MemoryBatch;
+
+        fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+            self.inner.snapshot()
+        }
+
+        fn batch(&self) -> Self::Batch {
+            self.inner.batch()
+        }
+
+        fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
+            self.committed_batch_sizes
+                .lock()
+                .expect("recorded batches lock")
+                .push(batch.len());
+            self.inner.commit(batch)
+        }
+    }
+
     impl<S: ReadSnapshot> ReadSnapshot for NoNameStateScanSnapshot<S> {
         fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
             if family == ColumnFamily::NameTreeNodes {
@@ -3032,6 +3214,20 @@ mod tests {
                     .set(self.name_node_reads.get().saturating_add(1));
             }
             self.inner.get(family, key)
+        }
+
+        fn get_many(
+            &self,
+            family: ColumnFamily,
+            keys: &[&[u8]],
+        ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+            if family == ColumnFamily::NameTreeNodes {
+                self.name_node_batches
+                    .set(self.name_node_batches.get().saturating_add(1));
+                self.maximum_name_node_batch
+                    .set(self.maximum_name_node_batch.get().max(keys.len()));
+            }
+            self.inner.get_many(family, keys)
         }
 
         fn scan_prefix(
@@ -4051,22 +4247,56 @@ mod tests {
             .expect("bind root");
         store.commit(initial).expect("commit initial tree");
 
-        let mut replacement = states[31].clone();
-        replacement.height += 1;
-        let overrides = BTreeMap::from([(replacement.name_hash, Some(replacement))]);
+        let overrides = states[16..32]
+            .iter()
+            .cloned()
+            .map(|mut replacement| {
+                replacement.height += 1;
+                (replacement.name_hash, Some(replacement))
+            })
+            .collect::<BTreeMap<_, _>>();
         let base = store.snapshot().expect("base snapshot");
         let expected =
             rebuild_name_tree_root_with_overrides(&base, &overrides).expect("rebuild oracle");
         let guarded = NoNameStateScanSnapshot {
             inner: base,
             name_node_reads: Cell::new(0),
+            name_node_batches: Cell::new(0),
+            maximum_name_node_batch: Cell::new(0),
         };
         let mut batch = store.batch();
         let actual = stage_name_tree_with_overrides(&guarded, &mut batch, root, &overrides)
             .expect("path-local mutation");
 
         assert_eq!(actual, expected);
-        assert!(guarded.name_node_reads.get() < records.len());
+        assert_eq!(
+            guarded.name_node_reads.get(),
+            0,
+            "multi-mutation path must not issue individual storage reads"
+        );
+        assert!(guarded.name_node_batches.get() > 1);
+        assert!(guarded.maximum_name_node_batch.get() > 1);
+
+        let empty_base = store.snapshot().expect("empty override snapshot");
+        let empty_guarded = NoNameStateScanSnapshot {
+            inner: empty_base,
+            name_node_reads: Cell::new(0),
+            name_node_batches: Cell::new(0),
+            maximum_name_node_batch: Cell::new(0),
+        };
+        let mut empty_batch = store.batch();
+        assert_eq!(
+            stage_name_tree_with_overrides(
+                &empty_guarded,
+                &mut empty_batch,
+                root,
+                &BTreeMap::new()
+            )
+            .expect("empty mutation"),
+            root
+        );
+        assert_eq!(empty_guarded.name_node_reads.get(), 0);
+        assert_eq!(empty_guarded.name_node_batches.get(), 0);
     }
 
     #[test]
@@ -4472,6 +4702,48 @@ mod tests {
             .scan_prefix(ColumnFamily::NameTreeNodes, b"")
             .expect("compacted nodes")
             .is_empty());
+    }
+
+    #[test]
+    fn streaming_compaction_bounds_delete_batches_and_is_idempotent() {
+        let store = RecordingStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let tree = MemoryUrkel::from_entries(
+            (0..16).map(|index| (NameHash::new([index; 32]), vec![index; 32])),
+        )
+        .expect("orphan tree");
+        let records = tree.node_records().expect("orphan records");
+        let mut batch = store.batch();
+        for (root, raw) in &records {
+            batch
+                .put(ColumnFamily::NameTreeNodes, root.as_bytes(), raw)
+                .expect("stage orphan record");
+        }
+        store.commit(batch).expect("commit orphan records");
+        store.take_committed_batch_sizes();
+
+        let summary = compact_name_tree_nodes_streaming(&store, 3).expect("stream compaction");
+        assert_eq!(summary.nodes_before, records.len());
+        assert_eq!(summary.nodes_retained, 0);
+        assert_eq!(summary.nodes_deleted, records.len());
+        let batches = store.take_committed_batch_sizes();
+        assert!(batches.len() > 1);
+        assert!(batches.iter().all(|size| *size <= 3));
+        assert_eq!(batches.iter().sum::<usize>(), records.len());
+        assert!(store
+            .snapshot()
+            .expect("compacted snapshot")
+            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+            .expect("compacted nodes")
+            .is_empty());
+
+        assert_eq!(
+            compact_name_tree_nodes_streaming(&store, 3)
+                .expect("idempotent streaming compaction")
+                .nodes_deleted,
+            0
+        );
+        assert!(store.take_committed_batch_sizes().is_empty());
     }
 
     #[test]
