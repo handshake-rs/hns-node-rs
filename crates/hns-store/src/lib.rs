@@ -147,6 +147,14 @@ impl ColumnFamily {
 pub trait ReadSnapshot {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError>;
 
+    fn get_many(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        keys.iter().map(|key| self.get(family, key)).collect()
+    }
+
     fn scan_prefix(
         &self,
         family: ColumnFamily,
@@ -221,6 +229,47 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
             return Ok(value);
         }
         self.base.get(family, key)
+    }
+
+    fn get_many(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        let staged = {
+            let changes = self.changes.borrow();
+            keys.iter()
+                .map(|key| {
+                    changes
+                        .get(&family)
+                        .and_then(|changes| changes.get(*key))
+                        .cloned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let missing_keys = keys
+            .iter()
+            .zip(&staged)
+            .filter_map(|(key, value)| value.is_none().then_some(*key))
+            .collect::<Vec<_>>();
+        let mut missing_values = self.base.get_many(family, &missing_keys)?.into_iter();
+        let mut values = Vec::with_capacity(keys.len());
+        for value in staged {
+            match value {
+                Some(value) => values.push(value),
+                None => values.push(missing_values.next().ok_or_else(|| {
+                    StoreError::Backend(
+                        "snapshot multi-get returned fewer values than requested".to_owned(),
+                    )
+                })?),
+            }
+        }
+        if missing_values.next().is_some() {
+            return Err(StoreError::Backend(
+                "snapshot multi-get returned more values than requested".to_owned(),
+            ));
+        }
+        Ok(values)
     }
 
     fn scan_prefix(
@@ -627,6 +676,18 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
         }
     }
 
+    fn get_many(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        match self {
+            Self::Memory(snapshot, _) => snapshot.get_many(family, keys),
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(snapshot) => snapshot.get_many(family, keys),
+        }
+    }
+
     fn scan_prefix(
         &self,
         family: ColumnFamily,
@@ -941,6 +1002,19 @@ impl ReadSnapshot for RocksSnapshot<'_> {
             .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
+    fn get_many(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        let cf = RocksStore::cf(self.db, family)?;
+        self.snapshot
+            .multi_get_cf(keys.iter().map(|key| (cf, *key)))
+            .into_iter()
+            .map(|value| value.map_err(|error| StoreError::Backend(error.to_string())))
+            .collect()
+    }
+
     fn scan_prefix(
         &self,
         family: ColumnFamily,
@@ -1103,6 +1177,9 @@ mod tests {
         initial
             .put(ColumnFamily::Headers, b"b/1", b"old")
             .expect("put initial");
+        initial
+            .put(ColumnFamily::Headers, b"b/0", b"base")
+            .expect("put base value");
         store.commit(initial).expect("commit initial");
 
         let base = store.snapshot().expect("base snapshot");
@@ -1127,9 +1204,21 @@ mod tests {
         );
         assert_eq!(
             staged_snapshot
+                .get_many(ColumnFamily::Headers, &[b"b/0", b"b/1", b"b/2", b"b/3"],)
+                .expect("staged multi-get"),
+            vec![
+                Some(b"base".to_vec()),
+                Some(b"new".to_vec()),
+                Some(b"two".to_vec()),
+                None,
+            ]
+        );
+        assert_eq!(
+            staged_snapshot
                 .scan_prefix(ColumnFamily::Headers, b"b/")
                 .expect("staged scan"),
             vec![
+                (b"b/0".to_vec(), b"base".to_vec()),
                 (b"b/1".to_vec(), b"new".to_vec()),
                 (b"b/2".to_vec(), b"two".to_vec())
             ]
@@ -1716,6 +1805,12 @@ mod tests {
             assert_eq!(
                 snapshot.get(ColumnFamily::Headers, b"hash").expect("get"),
                 Some(b"header".to_vec())
+            );
+            assert_eq!(
+                snapshot
+                    .get_many(ColumnFamily::Headers, &[b"missing", b"hash"])
+                    .expect("multi-get"),
+                vec![None, Some(b"header".to_vec())]
             );
             assert_eq!(
                 snapshot

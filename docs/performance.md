@@ -165,6 +165,10 @@ update, the record engine now traverses the final root and discards constructed
 records that were superseded inside that block. Historical roots committed by
 earlier blocks remain untouched; only never-committed intermediate paths avoid
 the RocksDB existence checks, writes, and later compaction work.
+The remaining final-record collision checks use one snapshot-bound RocksDB
+multi-get per block instead of crossing the Rust/C++ boundary once per node;
+the atomic staging overlay composes its own puts and deletes over the same
+ordered base result.
 
 Unclean startup, first startup after upgrade, and any stale or corrupt audit
 checkpoint perform the exhaustive materialized-name rebuild and the

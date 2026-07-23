@@ -80,6 +80,10 @@ Durable identity binds:
   atomic update were never durable roots and are not written; records reachable
   from prior block roots and retained snapshot pins remain content-addressed and
   independently verifiable.
+- Snapshot reads expose ordered batched point lookup. The RocksDB implementation
+  uses one snapshot-bound multi-get, while atomic staging overlays resolve their
+  own replacements/deletions first and batch only missing keys against the base
+  snapshot.
 - The in-memory backend exists for deterministic tests.
 - SQLite is not a consensus-state backend.
 

@@ -2134,8 +2134,21 @@ fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
     let update = update_record_tree(root, mutations, |node_root| {
         load_persisted_node(snapshot, node_root)
     })?;
-    for (node_root, raw) in update.records() {
-        match snapshot.get(ColumnFamily::NameTreeNodes, node_root.as_bytes())? {
+    let record_keys = update
+        .records()
+        .keys()
+        .map(|node_root| node_root.as_bytes().as_slice())
+        .collect::<Vec<_>>();
+    let existing_records = snapshot.get_many(ColumnFamily::NameTreeNodes, &record_keys)?;
+    if existing_records.len() != update.records().len() {
+        return Err(StateError::Codec(format!(
+            "name-tree multi-get returned {} records for {} keys",
+            existing_records.len(),
+            update.records().len()
+        )));
+    }
+    for ((node_root, raw), existing) in update.records().iter().zip(existing_records) {
+        match existing {
             Some(existing) if existing != *raw => {
                 return Err(StateError::PersistedNodeConflict(*node_root));
             }
