@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap},
     fmt,
     marker::PhantomData,
     path::PathBuf,
@@ -219,89 +219,6 @@ const STAGED_NAME_NODE_READ_CACHE_LIMIT: usize = 131_072;
 /// caching cannot mask a later mutation in the same atomic transaction.
 const STAGED_STATE_POINT_READ_CACHE_LIMIT: usize = 65_536;
 
-#[derive(Debug, Default)]
-struct BoundedNameNodeReadCache {
-    values: NameNodeReadCache,
-    insertion_order: VecDeque<Vec<u8>>,
-}
-
-impl BoundedNameNodeReadCache {
-    fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        if self.values.contains_key(&key) {
-            return;
-        }
-        while self.values.len() >= STAGED_NAME_NODE_READ_CACHE_LIMIT {
-            let Some(expired) = self.insertion_order.pop_front() else {
-                self.values.clear();
-                break;
-            };
-            self.values.remove(&expired);
-        }
-        self.insertion_order.push_back(key.clone());
-        self.values.insert(key, value);
-    }
-
-    fn remove(&mut self, key: &[u8]) {
-        self.values.remove(key);
-    }
-
-    fn clear(&mut self) {
-        self.values.clear();
-        self.insertion_order.clear();
-    }
-}
-
-/// Bounded process-local cache for immutable content-addressed name-tree
-/// records. A caller may reuse it across consecutive current-tip snapshots
-/// only when committed puts are published after durability and the cache is
-/// cleared before any maintenance that can delete records.
-#[derive(Clone, Debug, Default)]
-pub struct SharedNameNodeReadCache {
-    inner: Arc<RwLock<BoundedNameNodeReadCache>>,
-}
-
-impl SharedNameNodeReadCache {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn clear(&self) {
-        self.inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
-
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values
-            .get(key)
-            .cloned()
-    }
-
-    fn insert(&self, key: Vec<u8>, value: Vec<u8>) {
-        self.inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key, value);
-    }
-
-    fn apply_committed_changes(&self, changes: &HashMap<Vec<u8>, Option<Vec<u8>>>) {
-        let mut cache = self
-            .inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (key, value) in changes {
-            match value {
-                Some(value) => cache.insert(key.clone(), value.clone()),
-                None => cache.remove(key),
-            }
-        }
-    }
-}
-
 const fn caches_staged_state_point_read(family: ColumnFamily) -> bool {
     matches!(
         family,
@@ -327,18 +244,10 @@ impl StagingOverlay {
     }
 
     pub fn snapshot<'a, S: ReadSnapshot>(&self, base: &'a S) -> StagedSnapshot<'a, S> {
-        self.snapshot_with_name_node_cache(base, SharedNameNodeReadCache::new())
-    }
-
-    pub fn snapshot_with_name_node_cache<'a, S: ReadSnapshot>(
-        &self,
-        base: &'a S,
-        name_node_reads: SharedNameNodeReadCache,
-    ) -> StagedSnapshot<'a, S> {
         StagedSnapshot {
             base,
             changes: Rc::clone(&self.changes),
-            name_node_reads,
+            name_node_reads: RefCell::default(),
             state_point_reads: RefCell::default(),
             state_point_read_count: Cell::new(0),
         }
@@ -350,20 +259,12 @@ impl StagingOverlay {
             changes: Rc::clone(&self.changes),
         }
     }
-
-    /// Publish only the content-addressed node changes from a batch whose
-    /// durable commit has already succeeded.
-    pub fn publish_committed_name_nodes(&self, cache: &SharedNameNodeReadCache) {
-        if let Some(changes) = self.changes.borrow().get(&ColumnFamily::NameTreeNodes) {
-            cache.apply_committed_changes(changes);
-        }
-    }
 }
 
 pub struct StagedSnapshot<'a, S: ReadSnapshot> {
     base: &'a S,
     changes: SharedStagedChanges,
-    name_node_reads: SharedNameNodeReadCache,
+    name_node_reads: RefCell<NameNodeReadCache>,
     state_point_reads: RefCell<StatePointReadCache>,
     state_point_read_count: Cell<usize>,
 }
@@ -380,8 +281,8 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
             return Ok(value);
         }
         if family == ColumnFamily::NameTreeNodes {
-            if let Some(value) = self.name_node_reads.get(key) {
-                return Ok(Some(value));
+            if let Some(value) = self.name_node_reads.borrow().get(key) {
+                return Ok(Some(value.clone()));
             }
         } else if caches_staged_state_point_read(family) {
             if let Some(value) = self
@@ -396,7 +297,10 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
         let value = self.base.get(family, key)?;
         if family == ColumnFamily::NameTreeNodes {
             if let Some(value) = &value {
-                self.name_node_reads.insert(key.to_vec(), value.clone());
+                let mut cache = self.name_node_reads.borrow_mut();
+                if cache.len() < STAGED_NAME_NODE_READ_CACHE_LIMIT {
+                    cache.insert(key.to_vec(), value.clone());
+                }
             }
         } else if caches_staged_state_point_read(family)
             && self.state_point_read_count.get() < STAGED_STATE_POINT_READ_CACHE_LIMIT
@@ -423,11 +327,7 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
         let resolved = {
             let changes = self.changes.borrow();
-            let name_node_reads = self
-                .name_node_reads
-                .inner
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let name_node_reads = self.name_node_reads.borrow();
             let state_point_reads = self.state_point_reads.borrow();
             keys.iter()
                 .map(|key| {
@@ -439,7 +339,7 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
                         return staged;
                     }
                     if family == ColumnFamily::NameTreeNodes {
-                        return name_node_reads.values.get(*key).cloned().map(Some);
+                        return name_node_reads.get(*key).cloned().map(Some);
                     }
                     if caches_staged_state_point_read(family) {
                         return state_point_reads
@@ -481,7 +381,10 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
                     })?;
                     if family == ColumnFamily::NameTreeNodes {
                         if let Some(value) = &value {
-                            self.name_node_reads.insert(key.to_vec(), value.clone());
+                            let mut cache = self.name_node_reads.borrow_mut();
+                            if cache.len() < STAGED_NAME_NODE_READ_CACHE_LIMIT {
+                                cache.insert(key.to_vec(), value.clone());
+                            }
                         }
                     } else if caches_staged_state_point_read(family)
                         && self.state_point_read_count.get() < STAGED_STATE_POINT_READ_CACHE_LIMIT
@@ -1736,82 +1639,6 @@ mod tests {
             base.gets.get(),
             5,
             "each immutable point value, including misses, must reach the base once"
-        );
-    }
-
-    #[test]
-    fn shared_name_node_cache_crosses_committed_slices_and_clears_for_maintenance() {
-        let store = MemoryStore::new();
-        let mut initial = store.batch();
-        initial
-            .put(ColumnFamily::NameTreeNodes, b"node-a", b"value-a")
-            .expect("put node");
-        store.commit(initial).expect("commit node");
-        let shared = SharedNameNodeReadCache::new();
-
-        let first_base = CountingSnapshot::new(store.snapshot().expect("first base"));
-        let first_overlay = StagingOverlay::new();
-        let first = first_overlay.snapshot_with_name_node_cache(&first_base, shared.clone());
-        assert_eq!(
-            first
-                .get(ColumnFamily::NameTreeNodes, b"node-a")
-                .expect("first read"),
-            Some(b"value-a".to_vec())
-        );
-        assert_eq!(first_base.gets.get(), 1);
-        drop(first);
-
-        let second_base = CountingSnapshot::new(store.snapshot().expect("second base"));
-        let second_overlay = StagingOverlay::new();
-        let second = second_overlay.snapshot_with_name_node_cache(&second_base, shared.clone());
-        assert_eq!(
-            second
-                .get(ColumnFamily::NameTreeNodes, b"node-a")
-                .expect("cross-slice cached read"),
-            Some(b"value-a".to_vec())
-        );
-        assert_eq!(
-            second_base.gets.get(),
-            0,
-            "the next committed slice must reuse an immutable node"
-        );
-        let mut second_batch = second_overlay.batch(store.batch());
-        second_batch
-            .put(ColumnFamily::NameTreeNodes, b"node-b", b"value-b")
-            .expect("stage new node");
-        drop(second);
-        store
-            .commit(second_batch.into_inner())
-            .expect("commit new node");
-        second_overlay.publish_committed_name_nodes(&shared);
-
-        let third_base = CountingSnapshot::new(store.snapshot().expect("third base"));
-        let third_overlay = StagingOverlay::new();
-        let third = third_overlay.snapshot_with_name_node_cache(&third_base, shared.clone());
-        assert_eq!(
-            third
-                .get(ColumnFamily::NameTreeNodes, b"node-b")
-                .expect("promoted committed node"),
-            Some(b"value-b".to_vec())
-        );
-        assert_eq!(third_base.gets.get(), 0);
-        drop(third);
-
-        shared.clear();
-        let maintenance_base = CountingSnapshot::new(store.snapshot().expect("maintenance base"));
-        let maintenance_overlay = StagingOverlay::new();
-        let maintenance =
-            maintenance_overlay.snapshot_with_name_node_cache(&maintenance_base, shared);
-        assert_eq!(
-            maintenance
-                .get(ColumnFamily::NameTreeNodes, b"node-a")
-                .expect("post-maintenance read"),
-            Some(b"value-a".to_vec())
-        );
-        assert_eq!(
-            maintenance_base.gets.get(),
-            1,
-            "maintenance clearing must force durable revalidation"
         );
     }
 

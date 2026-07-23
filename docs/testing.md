@@ -535,10 +535,7 @@ A mismatch fails closed and cannot become a silent compatibility exception.
 - Priority isolation under sync, compaction, diagnostics, and slow-peer load.
 - Activation-overlay tests require repeated present and absent metadata,
   header, UTXO, and name-state reads to reach the base snapshot once; name-tree
-  nodes retain their separate bounded cache. A committed-slice test requires
-  immutable nodes and newly committed nodes to cross into the next snapshot
-  without a base read, then requires maintenance clearing to force a durable
-  read again.
+  nodes retain their separate bounded cache.
 - Block-state tests require all existing-input and output-collision UTXO probes
   to use one multi-get with no individual UTXO point reads.
 - Native-sync diagnostics distinguish activation planning, state commit, and

@@ -112,14 +112,11 @@ The state path removes redundant reads at several levels:
   including misses, for metadata, headers, height/block/transaction indexes,
   UTXOs, name state, and snapshot records. Staged puts and deletes always take
   precedence.
-- Content-addressed Urkel nodes use a separate 131,072-entry positive FIFO
-  cache shared across consecutive committed activation slices. Base reads enter
-  it immediately; newly constructed records are promoted only after the atomic
-  commit succeeds. The cache is cleared before compaction, the only operation
-  that can delete these otherwise immutable records. Two or more name mutations
-  traverse their independent paths with bounded breadth-first multi-get. Newly
-  constructed records are collision-checked in one multi-get, and superseded
-  records that never formed a committed root are discarded.
+- Content-addressed Urkel nodes use a separate 131,072-entry positive cache.
+  Two or more name mutations traverse their independent paths with bounded
+  breadth-first multi-get. Newly constructed records are collision-checked in
+  one multi-get, and superseded records that never formed a committed root are
+  discarded.
 - Header-by-height and median-time values are memoized for the lifetime of each
   block transition.
 - A strict body already stored by the native validation pipeline reuses its
@@ -131,9 +128,8 @@ The state path removes redundant reads at several levels:
   active-chain validation in the atomic state transaction.
 - Empty-pool direct replay skips post-commit mempool snapshot construction.
 
-Mutable point caches are activation-snapshot local. Only immutable
-content-addressed name nodes cross a commit, with commit-gated promotion and
-compaction invalidation; no cache replaces durable validation.
+These caches are activation-snapshot local. They cannot expose stale data across
+commits or replace durable validation.
 
 ## Complexity and storage round trips
 
