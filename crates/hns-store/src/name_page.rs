@@ -104,6 +104,83 @@ pub struct NamePageAppender {
     poisoned: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamePagePush {
+    Added(NamePageAddress),
+    Full(NamePageRecord),
+}
+
+#[derive(Clone, Debug)]
+pub struct NamePageBuilder {
+    segment: u32,
+    page: u32,
+    records: Vec<NamePageRecord>,
+    keys: BTreeSet<[u8; 32]>,
+    record_bytes: usize,
+}
+
+impl NamePageBuilder {
+    pub fn new(segment: u32, page: u32) -> Result<Self, NamePageError> {
+        NamePageAddress::new(segment, page, 0)?;
+        Ok(Self {
+            segment,
+            page,
+            records: Vec::new(),
+            keys: BTreeSet::new(),
+            record_bytes: 0,
+        })
+    }
+
+    /// Add in topological order. A full result returns ownership of the record
+    /// unchanged so the caller can seal this page and retry on the next page.
+    pub fn push(&mut self, record: NamePageRecord) -> Result<NamePagePush, NamePageError> {
+        validate_name_page_record(self.records.len(), &record)?;
+        if self.keys.contains(&record.key) {
+            return Err(NamePageError::DuplicateKey);
+        }
+        let added_bytes = name_page_record_bytes(&record)?;
+        let next_record_bytes = self
+            .record_bytes
+            .checked_add(added_bytes)
+            .ok_or(NamePageError::OffsetOverflow)?;
+        let required = NAME_PAGE_HEADER_BYTES
+            .checked_add(NAME_PAGE_CHECKSUM_BYTES)
+            .and_then(|bytes| bytes.checked_add(next_record_bytes))
+            .ok_or(NamePageError::OffsetOverflow)?;
+        if required > NAME_PAGE_BYTES {
+            if self.records.is_empty() {
+                return Err(NamePageError::PageFull {
+                    required,
+                    capacity: NAME_PAGE_BYTES,
+                });
+            }
+            return Ok(NamePagePush::Full(record));
+        }
+        let slot = u16::try_from(self.records.len())
+            .map_err(|_| NamePageError::TooManyRecords(self.records.len()))?;
+        let address = NamePageAddress::new(self.segment, self.page, slot)?;
+        self.keys.insert(record.key);
+        self.records.push(record);
+        self.record_bytes = next_record_bytes;
+        Ok(NamePagePush::Added(address))
+    }
+
+    pub fn finish(self) -> Result<Vec<u8>, NamePageError> {
+        if self.records.is_empty() {
+            return Err(NamePageError::EmptyPage);
+        }
+        encode_name_page(&self.records)
+    }
+
+    pub fn records(&self) -> &[NamePageRecord] {
+        &self.records
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
 impl NamePageAppender {
     pub fn create_new(
         path: impl AsRef<Path>,
@@ -354,19 +431,7 @@ pub fn encode_name_page(records: &[NamePageRecord]) -> Result<Vec<u8>, NamePageE
         if !keys.insert(record.key) {
             return Err(NamePageError::DuplicateKey);
         }
-        if !record.children.is_empty() && record.children.len() != 2 {
-            return Err(NamePageError::ChildCount(record.children.len()));
-        }
-        if record.canonical.is_empty() {
-            return Err(NamePageError::EmptyRecord(index));
-        }
-        if record.canonical.len() > usize::from(u16::MAX) {
-            return Err(NamePageError::RecordTooLarge {
-                index,
-                actual: record.canonical.len(),
-                maximum: usize::from(u16::MAX),
-            });
-        }
+        validate_name_page_record(index, record)?;
         directory_bytes = directory_bytes
             .checked_add(NAME_PAGE_RECORD_FIXED_BYTES)
             .and_then(|bytes| bytes.checked_add(record.children.len() * NAME_PAGE_CHILD_BYTES))
@@ -445,6 +510,31 @@ pub fn encode_name_page(records: &[NamePageRecord]) -> Result<Vec<u8>, NamePageE
     let checksum = blake2b_256(&encoded[..checksum_offset]);
     encoded[checksum_offset..].copy_from_slice(&checksum);
     Ok(encoded)
+}
+
+fn validate_name_page_record(index: usize, record: &NamePageRecord) -> Result<(), NamePageError> {
+    if !record.children.is_empty() && record.children.len() != 2 {
+        return Err(NamePageError::ChildCount(record.children.len()));
+    }
+    if record.canonical.is_empty() {
+        return Err(NamePageError::EmptyRecord(index));
+    }
+    if record.canonical.len() > usize::from(u16::MAX) {
+        return Err(NamePageError::RecordTooLarge {
+            index,
+            actual: record.canonical.len(),
+            maximum: usize::from(u16::MAX),
+        });
+    }
+    Ok(())
+}
+
+fn name_page_record_bytes(record: &NamePageRecord) -> Result<usize, NamePageError> {
+    NAME_PAGE_INDEX_BYTES
+        .checked_add(NAME_PAGE_RECORD_FIXED_BYTES)
+        .and_then(|bytes| bytes.checked_add(record.children.len() * NAME_PAGE_CHILD_BYTES))
+        .and_then(|bytes| bytes.checked_add(record.canonical.len()))
+        .ok_or(NamePageError::OffsetOverflow)
 }
 
 pub fn decode_name_page(encoded: &[u8]) -> Result<NamePageRef<'_>, NamePageError> {
@@ -819,6 +909,45 @@ mod tests {
         assert_eq!(
             decode_name_page(&encoded).expect("decode").record_count(),
             500
+        );
+    }
+
+    #[test]
+    fn incremental_builder_assigns_stable_slots_and_returns_full_record() {
+        let mut builder = NamePageBuilder::new(12, 34).expect("builder");
+        let mut rejected = None;
+        for index in 0u16..600 {
+            let record = NamePageRecord {
+                key: {
+                    let mut key = [0u8; 32];
+                    key[..2].copy_from_slice(&index.to_le_bytes());
+                    key
+                },
+                children: vec![address(1, index), address(2, index)],
+                canonical: vec![0xa3; 70],
+            };
+            match builder.push(record).expect("push") {
+                NamePagePush::Added(actual) => {
+                    assert_eq!(
+                        actual,
+                        NamePageAddress::new(12, 34, index).expect("expected")
+                    );
+                }
+                NamePagePush::Full(record) => {
+                    rejected = Some(record);
+                    break;
+                }
+            }
+        }
+        assert_eq!(builder.records().len(), 519);
+        assert_eq!(
+            rejected.expect("full record").key[..2],
+            519u16.to_le_bytes()
+        );
+        let encoded = builder.finish().expect("finish");
+        assert_eq!(
+            decode_name_page(&encoded).expect("decode").record_count(),
+            519
         );
     }
 
