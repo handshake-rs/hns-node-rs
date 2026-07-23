@@ -4,8 +4,9 @@ mod name_page;
 mod segment;
 
 pub use name_page::{
-    decode_name_page, encode_name_page, plan_name_page_reads, NamePageAddress, NamePageError,
-    NamePageRecord, NamePageRecordRef, NamePageRef, NAME_PAGE_BYTES,
+    decode_name_page, encode_name_page, inspect_name_page_file, plan_name_page_reads,
+    truncate_name_pages_to_committed_tail, NamePageAddress, NamePageAppender, NamePageError,
+    NamePageFileInspection, NamePageRecord, NamePageRecordRef, NamePageRef, NAME_PAGE_BYTES,
 };
 pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,

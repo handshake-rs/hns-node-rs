@@ -1,9 +1,14 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
 use hns_primitives::blake2b_256;
 use thiserror::Error;
 
-use crate::SegmentPageRead;
+use crate::{SegmentManifest, SegmentPageRead};
 
 const NAME_PAGE_MAGIC: &[u8; 8] = b"HSGNPG01";
 const NAME_PAGE_VERSION: u16 = 1;
@@ -80,6 +85,141 @@ pub struct NamePageRef<'a> {
     record_count: u16,
     directory_end: usize,
     payload_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamePageFileInspection {
+    pub pages: u64,
+    pub valid_bytes: u64,
+    pub file_bytes: u64,
+    pub torn_tail: bool,
+}
+
+#[derive(Debug)]
+pub struct NamePageAppender {
+    file: File,
+    generation: u64,
+    segment: u32,
+    next_page: u32,
+    poisoned: bool,
+}
+
+impl NamePageAppender {
+    pub fn create_new(
+        path: impl AsRef<Path>,
+        generation: u64,
+        segment: u32,
+    ) -> Result<Self, NamePageError> {
+        NamePageAddress::new(segment, 0, 0)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(path)
+            .map_err(name_page_io)?;
+        Ok(Self {
+            file,
+            generation,
+            segment,
+            next_page: 0,
+            poisoned: false,
+        })
+    }
+
+    pub fn open_at_committed_tail(
+        path: impl AsRef<Path>,
+        manifest: SegmentManifest,
+    ) -> Result<Self, NamePageError> {
+        NamePageAddress::new(manifest.active_segment, 0, 0)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .map_err(name_page_io)?;
+        let actual = file.metadata().map_err(name_page_io)?.len();
+        if actual != manifest.durable_bytes || !actual.is_multiple_of(NAME_PAGE_BYTES as u64) {
+            return Err(NamePageError::UncommittedTail {
+                committed: manifest.durable_bytes,
+                actual,
+            });
+        }
+        validate_last_committed_page(&mut file, manifest.durable_bytes)?;
+        let next_page_u64 = manifest.durable_bytes / NAME_PAGE_BYTES as u64;
+        let next_page =
+            u32::try_from(next_page_u64).map_err(|_| NamePageError::PageIndexOverflow {
+                pages: next_page_u64,
+            })?;
+        if next_page > NAME_PAGE_ADDRESS_FIELD_MAX {
+            return Err(NamePageError::PageIndexOverflow {
+                pages: next_page_u64,
+            });
+        }
+        Ok(Self {
+            file,
+            generation: manifest.generation,
+            segment: manifest.active_segment,
+            next_page,
+            poisoned: false,
+        })
+    }
+
+    /// Write one complete immutable page. State mutation prepares records in
+    /// memory first, so consensus failure cannot leave a partially published
+    /// page or locator in the RocksDB batch.
+    pub fn append(
+        &mut self,
+        records: &[NamePageRecord],
+    ) -> Result<Vec<NamePageAddress>, NamePageError> {
+        if self.poisoned {
+            return Err(NamePageError::AppenderPoisoned);
+        }
+        if records.is_empty() {
+            return Err(NamePageError::EmptyPage);
+        }
+        if self.next_page > NAME_PAGE_ADDRESS_FIELD_MAX {
+            return Err(NamePageError::PageIndexOverflow {
+                pages: u64::from(self.next_page),
+            });
+        }
+        let encoded = encode_name_page(records)?;
+        let mut addresses = Vec::with_capacity(records.len());
+        for slot in 0..records.len() {
+            addresses.push(NamePageAddress::new(
+                self.segment,
+                self.next_page,
+                u16::try_from(slot).map_err(|_| NamePageError::TooManyRecords(records.len()))?,
+            )?);
+        }
+        self.poisoned = true;
+        self.file.write_all(&encoded).map_err(name_page_io)?;
+        self.next_page = self
+            .next_page
+            .checked_add(1)
+            .ok_or(NamePageError::PageIndexOverflow {
+                pages: u64::from(self.next_page) + 1,
+            })?;
+        self.poisoned = false;
+        Ok(addresses)
+    }
+
+    pub fn sync_data(&mut self) -> Result<SegmentManifest, NamePageError> {
+        if self.poisoned {
+            return Err(NamePageError::AppenderPoisoned);
+        }
+        self.file.sync_data().map_err(name_page_io)?;
+        let durable_bytes = u64::from(self.next_page)
+            .checked_mul(NAME_PAGE_BYTES as u64)
+            .ok_or(NamePageError::OffsetOverflow)?;
+        Ok(SegmentManifest {
+            generation: self.generation,
+            active_segment: self.segment,
+            durable_bytes,
+        })
+    }
+
+    pub const fn next_page(&self) -> u32 {
+        self.next_page
+    }
 }
 
 impl<'a> NamePageRef<'a> {
@@ -186,6 +326,18 @@ pub enum NamePageError {
     },
     #[error("name page offset arithmetic overflowed")]
     OffsetOverflow,
+    #[error("cannot append an empty name page")]
+    EmptyPage,
+    #[error("name page file has uncommitted tail: committed {committed}, actual {actual}")]
+    UncommittedTail { committed: u64, actual: u64 },
+    #[error("committed name-page tail {committed} is not a complete-page boundary")]
+    CommittedTailNotBoundary { committed: u64 },
+    #[error("name page count {pages} exceeds the compact address space")]
+    PageIndexOverflow { pages: u64 },
+    #[error("name page appender is poisoned by an incomplete write")]
+    AppenderPoisoned,
+    #[error("name page I/O failed: {0}")]
+    Io(String),
 }
 
 pub fn encode_name_page(records: &[NamePageRecord]) -> Result<Vec<u8>, NamePageError> {
@@ -398,6 +550,86 @@ where
     Ok(reads.into_iter().collect())
 }
 
+/// Full checksum audit for an immutable page file. Normal clean startup only
+/// validates the last committed page and then verifies nodes on demand or via
+/// retained-root traversal; qualification and compaction use this complete
+/// scan.
+pub fn inspect_name_page_file(
+    path: impl AsRef<Path>,
+) -> Result<NamePageFileInspection, NamePageError> {
+    let mut file = File::open(path).map_err(name_page_io)?;
+    let file_bytes = file.metadata().map_err(name_page_io)?.len();
+    let complete_pages = file_bytes / NAME_PAGE_BYTES as u64;
+    let valid_bytes = complete_pages
+        .checked_mul(NAME_PAGE_BYTES as u64)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let mut encoded = vec![0u8; NAME_PAGE_BYTES];
+    for _ in 0..complete_pages {
+        file.read_exact(&mut encoded).map_err(name_page_io)?;
+        decode_name_page(&encoded)?;
+    }
+    Ok(NamePageFileInspection {
+        pages: complete_pages,
+        valid_bytes,
+        file_bytes,
+        torn_tail: valid_bytes != file_bytes,
+    })
+}
+
+/// Recover from a crash by validating the final authoritative page and
+/// discarding any complete or partial pages beyond the manifest tail.
+pub fn truncate_name_pages_to_committed_tail(
+    path: impl AsRef<Path>,
+    committed_bytes: u64,
+) -> Result<(), NamePageError> {
+    if !committed_bytes.is_multiple_of(NAME_PAGE_BYTES as u64) {
+        return Err(NamePageError::CommittedTailNotBoundary {
+            committed: committed_bytes,
+        });
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(name_page_io)?;
+    let actual = file.metadata().map_err(name_page_io)?.len();
+    if committed_bytes > actual {
+        return Err(NamePageError::UncommittedTail {
+            committed: committed_bytes,
+            actual,
+        });
+    }
+    validate_last_committed_page(&mut file, committed_bytes)?;
+    file.set_len(committed_bytes).map_err(name_page_io)?;
+    file.sync_all().map_err(name_page_io)
+}
+
+fn validate_last_committed_page(
+    file: &mut File,
+    committed_bytes: u64,
+) -> Result<(), NamePageError> {
+    if committed_bytes == 0 {
+        return Ok(());
+    }
+    if !committed_bytes.is_multiple_of(NAME_PAGE_BYTES as u64) {
+        return Err(NamePageError::CommittedTailNotBoundary {
+            committed: committed_bytes,
+        });
+    }
+    let offset = committed_bytes
+        .checked_sub(NAME_PAGE_BYTES as u64)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    file.seek(SeekFrom::Start(offset)).map_err(name_page_io)?;
+    let mut encoded = vec![0u8; NAME_PAGE_BYTES];
+    file.read_exact(&mut encoded).map_err(name_page_io)?;
+    decode_name_page(&encoded)?;
+    Ok(())
+}
+
+fn name_page_io(error: std::io::Error) -> NamePageError {
+    NamePageError::Io(error.to_string())
+}
+
 fn write_bytes(encoded: &mut [u8], cursor: &mut usize, value: &[u8]) -> Result<(), NamePageError> {
     let end = cursor
         .checked_add(value.len())
@@ -442,7 +674,14 @@ fn read_array<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use super::*;
+
+    static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
 
     fn address(page: u32, slot: u16) -> NamePageAddress {
         NamePageAddress::new(3, page, slot).expect("address")
@@ -454,6 +693,14 @@ mod tests {
             children: Vec::new(),
             canonical: vec![key; size],
         }
+    }
+
+    fn test_file() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "hsrd-name-pages-{}-{}",
+            std::process::id(),
+            NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     #[test]
@@ -596,5 +843,75 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn page_appender_publishes_only_the_synced_manifest_tail() {
+        let path = test_file();
+        let mut appender = NamePageAppender::create_new(&path, 23, 6).expect("create");
+        let records = vec![leaf(0xa1, 70), leaf(0xa2, 70)];
+        let addresses = appender.append(&records).expect("append");
+        assert_eq!(
+            addresses,
+            vec![
+                NamePageAddress::new(6, 0, 0).expect("first"),
+                NamePageAddress::new(6, 0, 1).expect("second"),
+            ]
+        );
+        let manifest = appender.sync_data().expect("sync");
+        assert_eq!(manifest.durable_bytes, NAME_PAGE_BYTES as u64);
+        drop(appender);
+
+        let inspection = inspect_name_page_file(&path).expect("inspect");
+        assert_eq!(inspection.pages, 1);
+        assert!(!inspection.torn_tail);
+        let reopened = NamePageAppender::open_at_committed_tail(&path, manifest).expect("reopen");
+        assert_eq!(reopened.next_page(), 1);
+        drop(reopened);
+        fs::remove_file(path).expect("remove test pages");
+    }
+
+    #[test]
+    fn page_recovery_discards_complete_and_partial_uncommitted_pages() {
+        let path = test_file();
+        let mut appender = NamePageAppender::create_new(&path, 29, 8).expect("create");
+        appender.append(&[leaf(0xb1, 70)]).expect("committed");
+        let manifest = appender.sync_data().expect("sync");
+        appender.append(&[leaf(0xb2, 70)]).expect("orphan");
+        drop(appender);
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open partial tail");
+        file.write_all(&[0u8; 17]).expect("partial tail");
+        file.sync_all().expect("sync partial tail");
+        drop(file);
+        let before = inspect_name_page_file(&path).expect("inspect before");
+        assert_eq!(before.pages, 2);
+        assert!(before.torn_tail);
+        assert!(matches!(
+            NamePageAppender::open_at_committed_tail(&path, manifest),
+            Err(NamePageError::UncommittedTail { .. })
+        ));
+
+        truncate_name_pages_to_committed_tail(&path, manifest.durable_bytes).expect("recover");
+        let after = inspect_name_page_file(&path).expect("inspect after");
+        assert_eq!(after.pages, 1);
+        assert!(!after.torn_tail);
+        NamePageAppender::open_at_committed_tail(&path, manifest).expect("open recovered");
+        fs::remove_file(path).expect("remove test pages");
+    }
+
+    #[test]
+    fn page_recovery_rejects_non_page_manifest_boundary() {
+        let path = test_file();
+        let appender = NamePageAppender::create_new(&path, 31, 9).expect("create");
+        drop(appender);
+        assert_eq!(
+            truncate_name_pages_to_committed_tail(&path, 1),
+            Err(NamePageError::CommittedTailNotBoundary { committed: 1 })
+        );
+        fs::remove_file(path).expect("remove test pages");
     }
 }
