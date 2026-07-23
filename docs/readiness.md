@@ -73,12 +73,14 @@ Remaining:
 
 - full-mainnet qualification of the composed historical route and broader
   contextual invalid/fuzz corpora beyond the independently generated
-  non-contextual transaction/block corpus;
+  non-contextual and core UTXO/lock/script state-boundary block corpora;
 - independently sourced live DNSSEC-proof evidence for historical-policy
   qualification and complete historical claim replay beyond the pinned
   initial, multi-generation, and terminal histories; mainnet's claim period
   ended at height 210,240;
-- mainnet historical contextual replay and broader invalid corpus.
+- mainnet historical contextual replay and positive/negative invalid coverage
+  for every remaining claim, airdrop, name, deployment, and reorganization
+  rule family.
 
 ## State and reorganization engine — hardened foundation
 

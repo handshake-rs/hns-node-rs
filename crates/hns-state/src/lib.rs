@@ -3841,6 +3841,63 @@ mod tests {
         main: bool,
     }
 
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ContextualInvalidFixture {
+        schema: u32,
+        network: String,
+        oracle: ContextualInvalidOracleFixture,
+        generation: ContextualInvalidGenerationFixture,
+        context_headers: Vec<ContextualInvalidHeaderFixture>,
+        cases: Vec<ContextualInvalidCaseFixture>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ContextualInvalidOracleFixture {
+        repository: String,
+        revision: String,
+        hsd_version: String,
+        route: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ContextualInvalidGenerationFixture {
+        method: String,
+        seed_domain: String,
+        upstream_invalid_vectors_copied: bool,
+        candidate_height: u32,
+        parent_height: u32,
+        coinbase_maturity: u32,
+        invalid_cases: usize,
+        valid_controls: usize,
+    }
+
+    #[derive(Deserialize)]
+    struct ContextualInvalidHeaderFixture {
+        height: u32,
+        time: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ContextualInvalidCaseFixture {
+        id: String,
+        target: String,
+        mutation_class: String,
+        raw: String,
+        input_coins: Vec<NameTransitionCoinFixture>,
+        oracle: ContextualInvalidOutcomeFixture,
+    }
+
+    #[derive(Deserialize)]
+    struct ContextualInvalidOutcomeFixture {
+        accepted: bool,
+        reason: String,
+        score: u32,
+    }
+
     struct FixtureNameContext {
         historical: bool,
         heights: HashMap<BlockHash, Height>,
@@ -5522,6 +5579,273 @@ mod tests {
                     "rejected oracle case {}",
                     case.id
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn independently_generated_contextual_invalid_corpus_matches_pinned_hsd() {
+        let fixture: ContextualInvalidFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/chains/invalid-contextual-v1.json"
+        ))
+        .expect("contextual invalid corpus fixture");
+        assert_eq!(fixture.schema, 1);
+        assert_eq!(fixture.network, "regtest");
+        assert_eq!(fixture.oracle.repository, "handshake-org/hsd");
+        assert_eq!(
+            fixture.oracle.revision,
+            "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
+        );
+        assert!(!fixture.oracle.hsd_version.is_empty());
+        assert_eq!(fixture.oracle.route, "Chain.verifyInputs");
+        assert_eq!(
+            fixture.generation.method,
+            "independent-fixed-state-boundary-mutations"
+        );
+        assert_eq!(
+            fixture.generation.seed_domain,
+            "meshmine/hsrd-invalid-contextual/v1"
+        );
+        assert!(!fixture.generation.upstream_invalid_vectors_copied);
+        assert_eq!(
+            fixture.generation.candidate_height,
+            fixture.generation.parent_height + 1
+        );
+        assert_eq!(
+            fixture.generation.coinbase_maturity,
+            Network::Regtest.params().coinbase_maturity
+        );
+        assert_eq!(
+            fixture
+                .cases
+                .iter()
+                .filter(|case| !case.oracle.accepted)
+                .count(),
+            fixture.generation.invalid_cases
+        );
+        assert_eq!(
+            fixture
+                .cases
+                .iter()
+                .filter(|case| case.oracle.accepted)
+                .count(),
+            fixture.generation.valid_controls
+        );
+        assert_eq!(fixture.cases.len(), 12);
+        assert_eq!(fixture.context_headers.len(), 22);
+
+        for case in fixture.cases {
+            assert_eq!(case.target, "block-context", "oracle case {}", case.id);
+            let expected_reason = match case.mutation_class.as_str() {
+                "valid-future-program"
+                | "valid-height-sequence"
+                | "valid-time-sequence"
+                | "valid-mandatory-script" => "valid",
+                "missing-input" | "in-block-double-spend" => "bad-txns-inputs-missingorspent",
+                "premature-coinbase-spend" => "bad-txns-premature-spend-of-coinbase",
+                "input-value-below-output" => "bad-txns-in-belowout",
+                "height-sequence-lock" | "time-sequence-lock" => "bad-txns-nonfinal",
+                "mandatory-script-mismatch" => "mandatory-script-verify-flag-failed",
+                "coinbase-overclaim" => "bad-cb-amount",
+                other => panic!("{}: unknown mutation class {other}", case.id),
+            };
+            assert_eq!(
+                case.oracle.reason, expected_reason,
+                "{}: pinned HSD reason",
+                case.id
+            );
+            assert_eq!(
+                case.oracle.score == 0,
+                matches!(
+                    case.mutation_class.as_str(),
+                    "valid-future-program"
+                        | "valid-height-sequence"
+                        | "valid-time-sequence"
+                        | "valid-mandatory-script"
+                        | "premature-coinbase-spend"
+                        | "coinbase-overclaim"
+                ),
+                "{}: pinned HSD score",
+                case.id
+            );
+
+            let block = Block::decode(&decode_hex_vec(&case.raw))
+                .unwrap_or_else(|error| panic!("{} candidate block: {error}", case.id));
+            hns_consensus::validate_block_body(&block)
+                .unwrap_or_else(|error| panic!("{} contextual body control: {error}", case.id));
+
+            let store = MemoryStore::new();
+            let mut engine = StoredStateEngine::with_native_authorization_and_verified_name_flags(
+                store.clone(),
+                Network::Regtest,
+                NameFlags::NONE,
+            )
+            .expect("native contextual corpus engine");
+            let mut seed = store.batch();
+            let mut previous = BlockHash::ZERO;
+            for expected in &fixture.context_headers {
+                let header = Header {
+                    nonce: expected.height,
+                    time: expected.time,
+                    prev_block: previous,
+                    bits: Network::Regtest.params().pow.bits,
+                    ..Header::default()
+                };
+                let hash = header.hash();
+                seed.put(
+                    ColumnFamily::Headers,
+                    hash.as_bytes(),
+                    &HeaderRecord {
+                        hash,
+                        height: expected.height,
+                        chainwork: Uint256::ONE,
+                        header,
+                        status: BlockStatus::default(),
+                    }
+                    .encode(),
+                )
+                .expect("context header");
+                write_canonical_height_to_batch(&mut seed, expected.height, hash)
+                    .expect("canonical context header");
+                previous = hash;
+            }
+            let input_outpoints = case
+                .input_coins
+                .iter()
+                .map(|expected| {
+                    let coin = Coin {
+                        outpoint: Outpoint {
+                            txid: Txid::new(decode_hex::<32>(&expected.outpoint_txid)),
+                            index: expected.outpoint_index,
+                        },
+                        value: expected.value,
+                        height: expected.height,
+                        coinbase: expected.coinbase,
+                        address: Address::new(
+                            expected.address_version,
+                            decode_hex_vec(&expected.address_hash),
+                        )
+                        .expect("contextual corpus coin address"),
+                        covenant: Covenant {
+                            kind: CovenantKind::from_u8(expected.covenant_type),
+                            items: expected
+                                .covenant_items
+                                .iter()
+                                .map(|item| decode_hex_vec(item))
+                                .collect(),
+                        },
+                    };
+                    seed.put(
+                        ColumnFamily::Utxo,
+                        &encode_outpoint_key(&coin.outpoint),
+                        &encode_coin(&coin),
+                    )
+                    .expect("contextual corpus coin");
+                    coin.outpoint
+                })
+                .collect::<Vec<_>>();
+            store.commit(seed).expect("contextual corpus seed");
+
+            let fingerprint = |store: &MemoryStore| {
+                let snapshot = store.snapshot().expect("contextual corpus snapshot");
+                ColumnFamily::ALL
+                    .into_iter()
+                    .map(|family| {
+                        (
+                            family,
+                            snapshot
+                                .scan_prefix(family, b"")
+                                .expect("contextual corpus state scan"),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = fingerprint(&store);
+            let result = engine.connect_block(ConnectBlock {
+                block_hash: block.hash(),
+                height: fixture.generation.candidate_height,
+                coinbase_maturity: fixture.generation.coinbase_maturity,
+                block_reward: Network::Regtest
+                    .params()
+                    .block_reward(fixture.generation.candidate_height),
+                block: &block,
+            });
+            assert_eq!(
+                result.is_ok(),
+                case.oracle.accepted,
+                "{}: HSD/hsrd contextual admission",
+                case.id
+            );
+
+            if case.oracle.accepted {
+                result.unwrap_or_else(|error| panic!("{} native control: {error}", case.id));
+                assert!(
+                    engine
+                        .load_undo(&block.hash())
+                        .expect("accepted corpus undo")
+                        .is_some(),
+                    "{}: accepted candidate undo",
+                    case.id
+                );
+                engine
+                    .disconnect_block(DisconnectBlock {
+                        block_hash: block.hash(),
+                        height: fixture.generation.candidate_height,
+                    })
+                    .unwrap_or_else(|error| panic!("{} control disconnect: {error}", case.id));
+                assert_eq!(
+                    fingerprint(&store),
+                    before,
+                    "{}: accepted control exact disconnect",
+                    case.id
+                );
+            } else {
+                let error = result.expect_err("rejected contextual corpus case");
+                assert!(error.is_consensus_invalid(), "{}: {error}", case.id);
+                let class_matches = match case.mutation_class.as_str() {
+                    "missing-input" => matches!(error, StateError::MissingCoin(_)),
+                    "in-block-double-spend" => {
+                        matches!(error, StateError::DuplicateSpend(_))
+                    }
+                    "premature-coinbase-spend" => {
+                        matches!(error, StateError::PrematureCoinbaseSpend { .. })
+                    }
+                    "input-value-below-output" => {
+                        matches!(error, StateError::InputValueBelowOutput { .. })
+                    }
+                    "height-sequence-lock" | "time-sequence-lock" => {
+                        matches!(error, StateError::RelativeLocks)
+                    }
+                    "mandatory-script-mismatch" => {
+                        matches!(error, StateError::InputAuthorization { .. })
+                    }
+                    "coinbase-overclaim" => {
+                        matches!(error, StateError::CoinbaseValueExceedsReward { .. })
+                    }
+                    other => panic!("{}: rejected unknown mutation {other}", case.id),
+                };
+                assert!(class_matches, "{}: native rejection {error}", case.id);
+                assert_eq!(
+                    fingerprint(&store),
+                    before,
+                    "{}: rejected candidate changed durable state",
+                    case.id
+                );
+                assert!(
+                    engine
+                        .load_undo(&block.hash())
+                        .expect("rejected corpus undo lookup")
+                        .is_none(),
+                    "{}: rejected candidate wrote undo",
+                    case.id
+                );
+                for outpoint in &input_outpoints {
+                    assert!(
+                        engine.coin(outpoint).expect("seeded coin read").is_some(),
+                        "{}: rejected candidate spent input",
+                        case.id
+                    );
+                }
             }
         }
     }

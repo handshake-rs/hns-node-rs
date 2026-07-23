@@ -227,9 +227,11 @@ These are substantial foundations, not a production full node.
 ### Consensus and authenticated state
 
 - Full-mainnet replay and contextual invalid-corpus qualification of the now
-  composed checkpoint fast path. The independently generated 22-case
-  non-contextual rejection corpus is complete for its declared rule families,
-  but it does not stand in for state-boundary mutations.
+  composed checkpoint fast path. The independently generated corpus now
+  includes 22 non-contextual rejections and 8 state-boundary rejections with
+  exact atomicity checks, but positive/negative coverage is not yet complete
+  for every contextual claim, airdrop, name, deployment, and reorganization
+  rule family.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
 - Independently sourced live DNSSEC-proof evidence for historical-policy

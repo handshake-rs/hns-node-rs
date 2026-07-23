@@ -260,6 +260,27 @@
       "blake2b256": "c51761669eabf41a3c6603b9bce1ff05aedaf420d98cda36eaee7c9abfed9c4a"
     },
     {
+      "id": "invalid-contextual-v1",
+      "network": "regtest",
+      "kind": "block",
+      "path": "chains/invalid-contextual-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "oracle",
+        "invalid-corpus",
+        "independent-mutations",
+        "state-boundary",
+        "utxo",
+        "coinbase-maturity",
+        "sequence-locks",
+        "scripts",
+        "atomic-rejection"
+      ],
+      "blake2b256": "127153255640a1a27def47b6c09da495157904be7bc55406665c070f306a3293"
+    },
+    {
       "id": "sighash-v1",
       "network": "agnostic",
       "kind": "script",

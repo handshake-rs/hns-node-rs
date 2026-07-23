@@ -68,6 +68,7 @@ npm run hsrd-name-policy-fixtures --prefix hsd-oracle
 npm run hsrd-p2p-wire-fixtures --prefix hsd-oracle
 npm run hsrd-mining-template-fixtures --prefix hsd-oracle
 npm run hsrd-invalid-corpus --prefix hsd-oracle
+npm run hsrd-contextual-invalid-corpus --prefix hsd-oracle
 ```
 
 Current evidence includes:
@@ -80,6 +81,15 @@ Current evidence includes:
   accept/reject decision, ban score, and rejection code; Rust must match both
   admission and the normalized semantic reason. The generator records that no
   upstream invalid vector was copied;
+- 12 independently constructed state-boundary block cases (8 invalid plus 4
+  positive controls) executed through pinned HSD's exact `Chain.verifyInputs`
+  composition. They cover missing inputs, an in-block double spend, premature
+  coinbase spend, input/output conservation, height/time sequence locks,
+  mandatory witness-script failure, and coinbase overclaim. Rust replays each
+  immutable UTXO/header snapshot through the atomic state connector, requires
+  the corresponding rejection class, proves every rejected case leaves all
+  column families unchanged, and proves accepted controls connect, write undo,
+  disconnect, and restore the exact seed state;
 - HSD's complete canonical 452-byte genesis blocks for mainnet, testnet,
   regtest, and simnet, regenerated from `lib/protocol/genesis-data.json`,
   round-tripped and body-checked by HSD, then decoded, strictly imported,
