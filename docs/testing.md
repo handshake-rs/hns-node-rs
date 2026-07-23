@@ -67,10 +67,19 @@ npm run hsrd-name-state-urkel-fixtures --prefix hsd-oracle
 npm run hsrd-name-policy-fixtures --prefix hsd-oracle
 npm run hsrd-p2p-wire-fixtures --prefix hsd-oracle
 npm run hsrd-mining-template-fixtures --prefix hsd-oracle
+npm run hsrd-invalid-corpus --prefix hsd-oracle
 ```
 
 Current evidence includes:
 
+- 24 independently constructed non-contextual cases (22 invalid plus valid
+  transaction/block controls) covering empty bodies, output money/address
+  bounds, duplicate/null inputs, coinbase outpoint and witness rules,
+  malformed covenants, per-transaction OPEN/update/renewal limits, merkle/witness
+  commitments, and missing/multiple coinbases. Pinned HSD supplies the exact
+  accept/reject decision, ban score, and rejection code; Rust must match both
+  admission and the normalized semantic reason. The generator records that no
+  upstream invalid vector was copied;
 - HSD's complete canonical 452-byte genesis blocks for mainnet, testnet,
   regtest, and simnet, regenerated from `lib/protocol/genesis-data.json`,
   round-tripped and body-checked by HSD, then decoded, strictly imported,

@@ -20,8 +20,9 @@ golden cases can be added without changing testkit paths.
 - `name-states`: expected name-state records.
 - `chains`: HSD deployment/checkpoint/historical-boundary and validation-route
   vectors, compact canonical-mainnet deployment-period/next-version history,
-  canonical block-1 coinbase-finality evidence, and generated regtest/simnet
-  chain scenarios.
+  canonical block-1 coinbase-finality evidence, generated regtest/simnet chain
+  scenarios, and an independently generated invalid transaction/block corpus
+  with pinned HSD admission decisions and semantic rejection reasons.
 - `p2p`: P2P peer/packet fixtures plus HSD Brontide cipher, handshake,
   key-rotation, traffic, and key-bearing fixed-seed vectors.
 - `network`: reserved live-network evidence fixtures.

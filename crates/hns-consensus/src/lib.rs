@@ -888,6 +888,23 @@ pub fn validate_transaction_sanity(transaction: &Transaction) -> Result<(), Cons
         ));
     }
 
+    let name_operations = count_name_operations(transaction);
+    if name_operations.opens > MAX_BLOCK_OPENS {
+        return Err(ConsensusError::InvalidTransaction(
+            "transaction open limit exceeded",
+        ));
+    }
+    if name_operations.updates > MAX_BLOCK_UPDATES {
+        return Err(ConsensusError::InvalidTransaction(
+            "transaction update limit exceeded",
+        ));
+    }
+    if name_operations.renewals > MAX_BLOCK_RENEWALS {
+        return Err(ConsensusError::InvalidTransaction(
+            "transaction renewal limit exceeded",
+        ));
+    }
+
     let mut total_output = 0u64;
 
     for output in &transaction.outputs {
@@ -1012,26 +1029,17 @@ fn validate_block_covenant_limits(block: &Block) -> Result<(), ConsensusError> {
     let mut renewals = 0u32;
     let mut exclusive_names = HashSet::new();
     for transaction in &block.transactions {
+        let name_operations = count_name_operations(transaction);
+        opens = opens.saturating_add(name_operations.opens);
+        updates = updates.saturating_add(name_operations.updates);
+        renewals = renewals.saturating_add(name_operations.renewals);
+
         // HSD tests each transaction against names accumulated from earlier
         // transactions, then adds every name from the current transaction.
         // Repeated exclusive covenants within one transaction are therefore
         // permitted; only a later transaction using that name is rejected.
         let mut transaction_exclusive_names = HashSet::new();
         for output in &transaction.outputs {
-            match output.covenant.kind {
-                CovenantKind::Open => {
-                    opens = opens.saturating_add(1);
-                    updates = updates.saturating_add(1);
-                }
-                CovenantKind::Claim
-                | CovenantKind::Update
-                | CovenantKind::Transfer
-                | CovenantKind::Revoke => updates = updates.saturating_add(1),
-                CovenantKind::Register | CovenantKind::Renew | CovenantKind::Finalize => {
-                    renewals = renewals.saturating_add(1)
-                }
-                _ => {}
-            }
             if matches!(
                 output.covenant.kind,
                 CovenantKind::Claim
@@ -1070,6 +1078,36 @@ fn validate_block_covenant_limits(block: &Block) -> Result<(), ConsensusError> {
         return Err(ConsensusError::InvalidBlock("block renewal limit exceeded"));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NameOperationCounts {
+    opens: u32,
+    updates: u32,
+    renewals: u32,
+}
+
+fn count_name_operations(transaction: &Transaction) -> NameOperationCounts {
+    let mut counts = NameOperationCounts::default();
+    for output in &transaction.outputs {
+        match output.covenant.kind {
+            CovenantKind::Open => {
+                counts.opens = counts.opens.saturating_add(1);
+                counts.updates = counts.updates.saturating_add(1);
+            }
+            CovenantKind::Claim
+            | CovenantKind::Update
+            | CovenantKind::Transfer
+            | CovenantKind::Revoke => {
+                counts.updates = counts.updates.saturating_add(1);
+            }
+            CovenantKind::Register | CovenantKind::Renew | CovenantKind::Finalize => {
+                counts.renewals = counts.renewals.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    counts
 }
 
 fn has_sane_covenants(transaction: &Transaction) -> bool {
@@ -1331,7 +1369,9 @@ pub enum ConsensusError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_primitives::{Address, Covenant, CovenantKind, Input, Output, Transaction, Witness};
+    use hns_primitives::{
+        Address, Covenant, CovenantKind, Input, Output, PrimitiveError, Transaction, Witness,
+    };
 
     fn header(prev_block: BlockHash, nonce: u32, bits: u32) -> Header {
         Header {
@@ -1915,6 +1955,231 @@ mod tests {
         let mut claim = tx;
         claim.outputs[0].covenant.kind = CovenantKind::Claim;
         assert!(validate_transaction_sanity(&claim).is_err());
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct InvalidCorpus {
+        schema: u32,
+        oracle: InvalidCorpusOracle,
+        generation: InvalidCorpusGeneration,
+        cases: Vec<InvalidCorpusCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct InvalidCorpusOracle {
+        repository: String,
+        revision: String,
+        hsd_version: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct InvalidCorpusGeneration {
+        method: String,
+        seed_domain: String,
+        upstream_invalid_vectors_copied: bool,
+        transaction_cases: usize,
+        block_cases: usize,
+        invalid_cases: usize,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct InvalidCorpusCase {
+        id: String,
+        target: String,
+        raw: String,
+        oracle: InvalidCorpusOutcome,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct InvalidCorpusOutcome {
+        accepted: bool,
+        reason: String,
+        score: u32,
+        semantic_violation: String,
+    }
+
+    fn decode_corpus_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0, "odd corpus hex length");
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).expect("ASCII corpus hex");
+                u8::from_str_radix(text, 16).expect("valid corpus hex")
+            })
+            .collect()
+    }
+
+    fn hsd_semantic_violation(reason: &str) -> &'static str {
+        match reason {
+            "valid" => "valid",
+            "bad-txns-vin-empty" => "transaction-inputs-empty",
+            "bad-txns-vout-empty" => "transaction-outputs-empty",
+            "bad-txns-vout-toolarge" | "bad-txns-txouttotal-toolarge" => {
+                "transaction-output-value-range"
+            }
+            "bad-txns-address-size" => "transaction-output-address",
+            "bad-txns-inputs-duplicate" => "transaction-input-duplicate",
+            "bad-txns-prevout-null" => "transaction-null-prevout",
+            "bad-cb-outpoint" => "coinbase-outpoint",
+            "bad-cb-length" => "coinbase-witness-size",
+            "bad-cb-witness" => "coinbase-witness-shape",
+            "bad-txns-covenants" => "transaction-covenant-shape",
+            "bad-txns-opens" => "transaction-open-limit",
+            "bad-txns-updates" => "transaction-update-limit",
+            "bad-txns-renewals" => "transaction-renewal-limit",
+            "bad-blk-length" => "block-length",
+            "bad-txnmrklroot" => "block-merkle-commitment",
+            "bad-witnessroot" => "block-witness-commitment",
+            "bad-cb-missing" => "block-coinbase-missing",
+            "bad-cb-multiple" => "block-coinbase-multiple",
+            other => panic!("unclassified pinned-HSD reason {other}"),
+        }
+    }
+
+    fn hsrd_semantic_violation(error: &ConsensusError) -> &'static str {
+        match error {
+            ConsensusError::InvalidTransaction("transaction has no inputs") => {
+                "transaction-inputs-empty"
+            }
+            ConsensusError::InvalidTransaction("transaction has no outputs") => {
+                "transaction-outputs-empty"
+            }
+            ConsensusError::InvalidTransaction("transaction output value overflow")
+            | ConsensusError::InvalidTransaction("transaction output value exceeds max money") => {
+                "transaction-output-value-range"
+            }
+            ConsensusError::InvalidTransaction("transaction contains duplicate inputs") => {
+                "transaction-input-duplicate"
+            }
+            ConsensusError::InvalidTransaction("non-coinbase spends null outpoint") => {
+                "transaction-null-prevout"
+            }
+            ConsensusError::InvalidTransaction("coinbase claim input is not null") => {
+                "coinbase-outpoint"
+            }
+            ConsensusError::InvalidTransaction("coinbase witness exceeds limit")
+            | ConsensusError::InvalidTransaction("coinbase claim witness item exceeds limit") => {
+                "coinbase-witness-size"
+            }
+            ConsensusError::InvalidTransaction(
+                "coinbase claim input must have one witness item",
+            ) => "coinbase-witness-shape",
+            ConsensusError::InvalidTransaction(
+                "transaction covenants are structurally invalid",
+            ) => "transaction-covenant-shape",
+            ConsensusError::InvalidTransaction("transaction open limit exceeded") => {
+                "transaction-open-limit"
+            }
+            ConsensusError::InvalidTransaction("transaction update limit exceeded") => {
+                "transaction-update-limit"
+            }
+            ConsensusError::InvalidTransaction("transaction renewal limit exceeded") => {
+                "transaction-renewal-limit"
+            }
+            ConsensusError::InvalidBlock("block has no transactions") => "block-length",
+            ConsensusError::InvalidBlock("merkle root mismatch")
+            | ConsensusError::InvalidBlock("merkle root is zero") => "block-merkle-commitment",
+            ConsensusError::InvalidBlock("witness root mismatch") => "block-witness-commitment",
+            ConsensusError::InvalidBlock("first transaction is not coinbase") => {
+                "block-coinbase-missing"
+            }
+            ConsensusError::InvalidBlock("block contains multiple coinbase transactions") => {
+                "block-coinbase-multiple"
+            }
+            other => panic!("unclassified hsrd corpus rejection {other}"),
+        }
+    }
+
+    fn transaction_corpus_outcome(raw: &[u8]) -> (bool, &'static str) {
+        let transaction = match Transaction::decode(raw) {
+            Ok(transaction) => transaction,
+            Err(PrimitiveError::InvalidAddress(_)) => {
+                return (false, "transaction-output-address");
+            }
+            Err(error) => panic!("unexpected transaction corpus decode failure: {error}"),
+        };
+        match validate_transaction_sanity(&transaction) {
+            Ok(()) => (true, "valid"),
+            Err(error) => (false, hsrd_semantic_violation(&error)),
+        }
+    }
+
+    fn block_corpus_outcome(raw: &[u8]) -> (bool, &'static str) {
+        let block = Block::decode(raw).expect("invalid corpus block must remain decodable");
+        match validate_block_body(&block) {
+            Ok(_) => (true, "valid"),
+            Err(error) => (false, hsrd_semantic_violation(&error)),
+        }
+    }
+
+    #[test]
+    fn independently_generated_invalid_corpus_matches_pinned_hsd() {
+        let fixture: InvalidCorpus = serde_json::from_str(include_str!(
+            "../../../fixtures/hsd/chains/invalid-noncontextual-v1.json"
+        ))
+        .expect("invalid noncontextual corpus fixture");
+
+        assert_eq!(fixture.schema, 1);
+        assert_eq!(fixture.oracle.repository, "handshake-org/hsd");
+        assert_eq!(
+            fixture.oracle.revision,
+            "698e252ebc7b5c1dd0a9587e342fdd153d020ae4"
+        );
+        assert!(!fixture.oracle.hsd_version.is_empty());
+        assert_eq!(fixture.generation.method, "independent-fixed-mutations");
+        assert_eq!(
+            fixture.generation.seed_domain,
+            "meshmine/hsrd-invalid-noncontextual/v1"
+        );
+        assert!(!fixture.generation.upstream_invalid_vectors_copied);
+        assert_eq!(
+            fixture.cases.len(),
+            fixture.generation.transaction_cases + fixture.generation.block_cases
+        );
+        assert_eq!(
+            fixture
+                .cases
+                .iter()
+                .filter(|case| !case.oracle.accepted)
+                .count(),
+            fixture.generation.invalid_cases
+        );
+
+        for case in &fixture.cases {
+            let raw = decode_corpus_hex(&case.raw);
+            let expected_violation = hsd_semantic_violation(&case.oracle.reason);
+            assert_eq!(
+                case.oracle.semantic_violation, expected_violation,
+                "{}: fixture semantic classification",
+                case.id
+            );
+            assert_eq!(
+                case.oracle.score == 0,
+                case.oracle.accepted,
+                "{}: pinned HSD ban score",
+                case.id
+            );
+            let (accepted, violation) = match case.target.as_str() {
+                "transaction-sanity" => transaction_corpus_outcome(&raw),
+                "block-body" => block_corpus_outcome(&raw),
+                other => panic!("{}: unsupported corpus target {other}", case.id),
+            };
+            assert_eq!(
+                accepted, case.oracle.accepted,
+                "{}: HSD/hsrd admission decision",
+                case.id
+            );
+            assert_eq!(
+                violation, expected_violation,
+                "{}: HSD/hsrd semantic rejection reason",
+                case.id
+            );
+        }
     }
 
     #[test]

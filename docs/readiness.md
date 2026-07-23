@@ -72,7 +72,8 @@ Implemented:
 Remaining:
 
 - full-mainnet qualification of the composed historical route and broader
-  independent invalid/fuzz corpora;
+  contextual invalid/fuzz corpora beyond the independently generated
+  non-contextual transaction/block corpus;
 - independently sourced live DNSSEC-proof evidence for historical-policy
   qualification and complete historical claim replay beyond the pinned
   initial, multi-generation, and terminal histories; mainnet's claim period

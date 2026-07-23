@@ -242,6 +242,24 @@
       "blake2b256": "b8faafefca6ecd80b05a27b4438c4b1a9b6a358f8b5b2d1cb36648d0b2bba3e0"
     },
     {
+      "id": "invalid-noncontextual-v1",
+      "network": "all",
+      "kind": "block",
+      "path": "chains/invalid-noncontextual-v1.json",
+      "expectation": {
+        "outcome": "reference"
+      },
+      "tags": [
+        "oracle",
+        "invalid-corpus",
+        "independent-mutations",
+        "transaction-sanity",
+        "block-body",
+        "rejection-reason"
+      ],
+      "blake2b256": "c51761669eabf41a3c6603b9bce1ff05aedaf420d98cda36eaee7c9abfed9c4a"
+    },
+    {
       "id": "sighash-v1",
       "network": "agnostic",
       "kind": "script",
