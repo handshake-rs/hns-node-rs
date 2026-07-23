@@ -20,6 +20,9 @@ snapshots only.
   transition. The native-sync handler uses keyed store reads under the chain
   coordinator lock; periodic Core requalification does not scan the UTXO,
   name-state, header, or block collections.
+- Native-sync `getblockhash` also uses a direct canonical-height lookup rather
+  than materializing the compatibility snapshot, so replay/differential probes
+  remain constant-space as retained history grows.
 - Truthful network-active and connection-count reporting.
 - Live peer and synchronization details on the native runtime's bounded REST
   endpoints. `getpeerinfo` fails explicitly until the JSON-RPC compatibility

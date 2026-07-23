@@ -170,6 +170,12 @@ multi-get per block instead of crossing the Rust/C++ boundary once per node;
 the atomic staging overlay composes its own puts and deletes over the same
 ordered base result.
 
+Native-sync `getblockhash` is a keyed canonical-height read under the
+coordinator lock. It does not construct the general compatibility RPC snapshot,
+whose complete header/block/transaction/UTXO/name materialization is reserved
+for broad diagnostic methods. This keeps historical probes constant-space and
+prevents a single height lookup from pausing replay.
+
 Unclean startup, first startup after upgrade, and any stale or corrupt audit
 checkpoint perform the exhaustive materialized-name rebuild and the
 depth-sensitive reachable-union traversal of current, committed, and

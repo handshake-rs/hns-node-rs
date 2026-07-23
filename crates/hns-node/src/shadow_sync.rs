@@ -2993,6 +2993,36 @@ async fn handle_shadow_sync_rpc(
         }
     };
     let id = request.id.clone();
+    if request.method == "getblockhash" {
+        let Some(height) = request
+            .params
+            .as_array()
+            .and_then(|params| params.first())
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|height| Height::try_from(height).ok())
+        else {
+            return Json(json_rpc_error(
+                id,
+                -32602,
+                "missing or invalid block height".to_owned(),
+            ));
+        };
+        let result = state.node.lock().await.state.chain.canonical_hash(height);
+        return match result {
+            Ok(Some(hash)) => Json(JsonRpcResponse {
+                jsonrpc: "2.0".to_owned(),
+                result: Some(serde_json::json!(hash.to_hex())),
+                error: None,
+                id,
+            }),
+            Ok(None) => Json(json_rpc_error(
+                id,
+                -8,
+                "block height out of range".to_owned(),
+            )),
+            Err(error) => Json(json_rpc_error(id, -32603, error.to_string())),
+        };
+    }
     if request.method == "getparentauthority" {
         let Some(encoded_hash) = request
             .params
@@ -6834,6 +6864,35 @@ mod tests {
                 assert_eq!(json["script_flags"], 50);
             }
         }
+
+        let genesis_hash = Network::Regtest.params().genesis_hash.to_hex();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "point-read",
+            "method": "getblockhash",
+            "params": [0],
+        })
+        .to_string();
+        let request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer native-sync-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect point RPC");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write point RPC");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read point RPC");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").expect("body split");
+        let json: serde_json::Value = serde_json::from_str(body).expect("point RPC response");
+        assert_eq!(json["result"], genesis_hash);
 
         shutdown_tx.send(true).expect("shutdown");
         server.await.expect("server join").expect("server result");
