@@ -3,10 +3,11 @@
 mod segment;
 
 pub use segment::{
-    decode_segment_record, decode_segment_record_ref, encode_segment_record,
-    plan_segment_page_reads, scan_segment_prefix, SegmentError, SegmentKind, SegmentLocator,
-    SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan, SEGMENT_MAX_HINTS,
-    SEGMENT_PAGE_BYTES,
+    decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,
+    plan_segment_page_reads, scan_segment_prefix, truncate_segment_to_committed_tail,
+    SegmentAppender, SegmentError, SegmentFileInspection, SegmentKind, SegmentLocator,
+    SegmentManifest, SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan,
+    SEGMENT_MAX_HINTS, SEGMENT_PAGE_BYTES,
 };
 
 use std::{

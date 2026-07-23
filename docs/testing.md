@@ -540,8 +540,9 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   to use one multi-get with no individual UTXO point reads.
 - Segment-store tests require canonical payload and locator-hint round trips,
   checksum rejection for complete corruption, preservation of the last complete
-  frame across a torn tail, zero-copy payload decoding, and duplicate-free page
-  plans for overlapping and page-spanning records.
+  frame across a torn tail, zero-copy payload decoding, duplicate-free page
+  plans for overlapping and page-spanning records, an exact checksummed durable
+  manifest tail, and rejection of a recovery boundary inside a frame.
 - Native-sync diagnostics distinguish activation planning, state commit, and
   post-commit time, normalize commit cost by transactions, inputs, outputs, and
   name actions, and expose peer-event and validation-result backlog during the
