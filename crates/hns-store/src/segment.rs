@@ -23,9 +23,8 @@ pub const SEGMENT_PAGE_BYTES: u64 = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub enum SegmentKind {
-    NameTreeNode = 1,
-    Block = 2,
-    Undo = 3,
+    Block = 1,
+    Undo = 2,
 }
 
 impl TryFrom<u8> for SegmentKind {
@@ -33,9 +32,8 @@ impl TryFrom<u8> for SegmentKind {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::NameTreeNode),
-            2 => Ok(Self::Block),
-            3 => Ok(Self::Undo),
+            1 => Ok(Self::Block),
+            2 => Ok(Self::Undo),
             other => Err(SegmentError::UnknownKind(other)),
         }
     }
@@ -766,7 +764,7 @@ mod tests {
 
     fn record(payload: &[u8]) -> SegmentRecord {
         SegmentRecord {
-            kind: SegmentKind::NameTreeNode,
+            kind: SegmentKind::Block,
             key: [0x42; 32],
             hints: vec![locator(64, 96), locator(160, 80)],
             payload: payload.to_vec(),

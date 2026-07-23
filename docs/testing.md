@@ -543,6 +543,10 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   frame across a torn tail, zero-copy payload decoding, duplicate-free page
   plans for overlapping and page-spanning records, an exact checksummed durable
   manifest tail, and rejection of a recovery boundary inside a frame.
+- Packed name-page tests require compact address round trips, zero-copy `O(1)`
+  slot reads, full-page checksum coverage, unique content keys, canonical
+  directory/payload layout, and at least 500 average internal nodes per 64 KiB
+  page.
 - Native-sync diagnostics distinguish activation planning, state commit, and
   post-commit time, normalize commit cost by transactions, inputs, outputs, and
   name actions, and expose peer-event and validation-result backlog during the

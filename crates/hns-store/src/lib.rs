@@ -1,7 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod name_page;
 mod segment;
 
+pub use name_page::{
+    decode_name_page, encode_name_page, plan_name_page_reads, NamePageAddress, NamePageError,
+    NamePageRecord, NamePageRecordRef, NamePageRef, NAME_PAGE_BYTES,
+};
 pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,
     plan_segment_page_reads, scan_segment_prefix, truncate_segment_to_committed_tail,

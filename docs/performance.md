@@ -189,10 +189,12 @@ amplification and competes with RocksDB's existing block cache.
 
 The target layout is an append-only, generation-based Urkel record store:
 
-1. Pack canonical node records into checksummed immutable segment pages.
-2. Store unauthenticated child-locator hints beside the canonical bytes. A
-   locator is accepted only after the canonical record hashes to the expected
-   child root, so it cannot change consensus meaning.
+1. Pack canonical node records into fixed 64 KiB checksummed pages. A compact
+   slot index makes a node lookup within an already loaded page `O(1)` and
+   returns the canonical payload without copying it.
+2. Store two eight-byte, generation-local child addresses beside each internal
+   node. An address is accepted only after the canonical child record hashes to
+   the expected child root, so it cannot change consensus meaning.
 3. Persist the current and retained root locators with their root hashes. New
    paths reuse locators loaded from their unchanged parents and append only the
    changed records.
