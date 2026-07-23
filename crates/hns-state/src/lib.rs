@@ -1131,6 +1131,12 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
 
         let txid = transaction.txid();
         for (output_index, output) in transaction.outputs.iter().enumerate() {
+            // HSD's Coins.fromTX omits null-data and REVOKE outputs entirely.
+            // Their value and covenant effects were still validated above,
+            // but admitting them here would corrupt UTXO and undo parity.
+            if output.is_unspendable() {
+                continue;
+            }
             let index = u32::try_from(output_index).map_err(|_| {
                 StateError::Codec(format!("output index {output_index} exceeds u32"))
             })?;
@@ -3193,6 +3199,66 @@ mod tests {
             address: address(),
             covenant: covenant(),
         }
+    }
+
+    #[test]
+    fn connect_omits_hsd_unspendable_outputs_from_utxo_and_undo() {
+        let store = MemoryStore::new();
+        let mut state = engine(store.clone());
+        let transaction = coinbase(vec![
+            output(1),
+            Output {
+                value: 7,
+                address: Address::new(31, vec![0; 2]).expect("null-data address"),
+                covenant: covenant(),
+            },
+        ]);
+        let txid = transaction.txid();
+        let candidate = block(77, vec![transaction]);
+        let block_hash = candidate.hash();
+
+        let summary = state
+            .connect_block(ConnectBlock {
+                block_hash,
+                height: 77,
+                coinbase_maturity: 0,
+                block_reward: 8,
+                block: &candidate,
+            })
+            .expect("connect block with null-data output");
+        assert_eq!(summary.coins_created, 1);
+
+        let spendable = Outpoint { txid, index: 0 };
+        let nulldata = Outpoint { txid, index: 1 };
+        assert!(state
+            .coin(&spendable)
+            .expect("spendable coin read")
+            .is_some());
+        assert!(state
+            .coin(&nulldata)
+            .expect("null-data coin read")
+            .is_none());
+
+        let undo = state
+            .load_undo(&block_hash)
+            .expect("undo read")
+            .expect("block undo");
+        assert_eq!(undo.created_coins, vec![spendable.clone()]);
+
+        state
+            .disconnect_block(DisconnectBlock {
+                block_hash,
+                height: 77,
+            })
+            .expect("disconnect block with null-data output");
+        assert!(state
+            .coin(&spendable)
+            .expect("restored coin read")
+            .is_none());
+        assert!(state
+            .coin(&nulldata)
+            .expect("restored null-data read")
+            .is_none());
     }
 
     fn open_output(name: &[u8]) -> Output {

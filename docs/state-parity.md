@@ -23,6 +23,13 @@ canonical UTXO projection therefore declares
 `origin_transaction_version` as excluded archival metadata. hsrd must not grow
 a consensus-state field merely to mirror an HSD database object.
 
+Output admission is different: HSD's `Output.isUnspendable()` omits both
+version-31 null-data addresses and `REVOKE` covenants from `Coins.fromTX`.
+Their value and covenant effects still participate in validation and name
+state, but the outputs never become UTXOs or undo-created coins. hsrd applies
+that same rule because it changes the state a miner validates, not because it
+copies HSD's storage shape.
+
 This rule is general: a field belongs in hsrd when it can affect admission,
 state transition, authenticated roots, rollback, template construction,
 candidate validation, or publication. Wallet indexes, convenience RPC fields,

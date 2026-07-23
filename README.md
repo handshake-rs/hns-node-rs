@@ -60,7 +60,7 @@ Implemented:
 - Separate durable best-header and active-best-block bindings.
 - Strict greater-work activation; equal-work branches preserve the existing
   first-seen tip.
-- Schema version **14**, storage profile **`hsrd-mining-v10`**, explicit clean
+- Schema version **15**, storage profile **`hsrd-mining-v11`**, explicit clean
   reindex behavior, durable working and interval-committed name-tree-root
   bindings/content-addressed nodes and HSD
   airdrop-field bindings, versioned checksummed network-interval name-tree
@@ -491,12 +491,15 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 
 ## Storage migration
 
-Schema version 14 and storage profile `hsrd-mining-v10` add HSD's separate
-working and interval-committed name-tree roots to schema 13's checksummed
+Schema version 15 and storage profile `hsrd-mining-v11` retain HSD's separate
+working and interval-committed name-tree roots from schema 14 and align coin
+admission with HSD: null-data-address and `REVOKE` covenant outputs are
+validated but never enter the UTXO set or block undo. Schema 14 added the roots
+to schema 13's checksummed
 network-interval snapshot pins, retained-root node compaction,
 content-addressed authenticated nodes, and path-local proof reads. Block undo
 version 6 carries both root pairs across disconnect and restart recovery.
 The optional undo-retirement checkpoint uses the existing snapshots namespace;
 once present, `--prune-undo-history` is required on subsequent opens. Existing
-pre-authority databases must be reindexed. No implicit in-place migration is
-attempted.
+pre-authority databases must be reindexed because older profiles may retain
+impossible-to-spend outputs. No implicit in-place migration is attempted.

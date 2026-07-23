@@ -7,16 +7,18 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **14** and the storage profile is
-**`hsrd-mining-v10`**. This is an intentional clean-reindex boundary.
+The current persistent schema version is **15** and the storage profile is
+**`hsrd-mining-v11`**. This is an intentional clean-reindex boundary.
 
-Version 14 contains the authority, state, shadow-synchronization, and mining
+Version 15 contains the authority, state, shadow-synchronization, and mining
 publication schema, durable HSD airdrop duplicate prevention, active-chain
 deployment-state persistence, content-addressed authenticated name nodes, and
 durable interval-root retention metadata:
 
 - granular block-status bit assignments;
 - spent output address in the UTXO `Coin` codec;
+- HSD-compatible omission of null-data-address and `REVOKE` covenant outputs
+  from UTXO and undo admission after all value and covenant validation;
 - expanded HSD-compatible `NameState` encoding;
 - block undo version 6 with previous/resulting working and interval-committed
   name-tree roots plus airdrop positions to clear on disconnect;
@@ -314,10 +316,11 @@ exact bytes before fixture use.
 
 ## Migration policy
 
-Schema 14/profile `hsrd-mining-v10` requires an explicit clean reindex from every
-prior handoff. No automatic in-place migration is attempted while `hsrd`
-remains pre-authority. A failed or interrupted reindex must not modify the
-previous database.
+Schema 15/profile `hsrd-mining-v11` requires an explicit clean reindex from every
+prior handoff. Earlier hsrd profiles may contain impossible-to-spend outputs
+that HSD never admitted to its coin database. No automatic in-place migration
+is attempted while `hsrd` remains pre-authority. A failed or interrupted
+reindex must not modify the previous database.
 
 ## Persistent Urkel status
 

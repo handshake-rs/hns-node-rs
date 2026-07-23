@@ -622,6 +622,12 @@ pub struct Output {
 }
 
 impl Output {
+    /// Match HSD's coin-set admission rule: null-data address outputs and
+    /// REVOKE covenant outputs can never be spent and are not UTXOs.
+    pub const fn is_unspendable(&self) -> bool {
+        self.address.is_unspendable() || self.covenant.kind.is_unspendable()
+    }
+
     pub fn decode(raw: &[u8]) -> Result<Self, PrimitiveError> {
         let mut reader = Reader::new(raw, MAX_TX_SIZE)?;
         let output = Self::read_from(&mut reader)?;
@@ -674,6 +680,14 @@ impl Address {
         writer.write_u8(self.version);
         writer.write_u8(self.hash.len() as u8);
         writer.write_bytes(&self.hash);
+    }
+
+    pub const fn is_nulldata(&self) -> bool {
+        self.version == 31
+    }
+
+    pub const fn is_unspendable(&self) -> bool {
+        self.is_nulldata()
     }
 
     pub fn validate(&self) -> Result<(), PrimitiveError> {
@@ -1852,6 +1866,35 @@ mod tests {
 
         assert_eq!(decoded, transaction);
         assert_eq!(decoded.encode(), raw);
+    }
+
+    #[test]
+    fn output_unspendable_matches_hsd_coin_admission() {
+        let spendable = Output {
+            value: 1,
+            address: Address::new(0, vec![1; 20]).expect("spendable address"),
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        };
+        assert!(!spendable.is_unspendable());
+
+        let nulldata = Output {
+            address: Address::new(31, vec![2; 2]).expect("null-data address"),
+            ..spendable.clone()
+        };
+        assert!(nulldata.address.is_nulldata());
+        assert!(nulldata.is_unspendable());
+
+        let revoke = Output {
+            covenant: Covenant {
+                kind: CovenantKind::Revoke,
+                items: Vec::new(),
+            },
+            ..spendable
+        };
+        assert!(revoke.is_unspendable());
     }
 
     #[test]

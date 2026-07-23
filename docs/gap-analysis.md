@@ -12,7 +12,7 @@
 - Exact unsigned 256-bit chainwork and durable header/block/raw-body indexes.
 - Memory and RocksDB stores behind typed traits, atomic batches, true RocksDB
   snapshots, and a read-your-writes reorganization overlay.
-- Schema version 14, profile `hsrd-mining-v10`, network, genesis, epoch,
+- Schema version 15, profile `hsrd-mining-v11`, network, genesis, epoch,
   mandatory working/interval-committed name-tree-root bindings,
   content-addressed nodes, and HSD airdrop-field
   bindings, checksummed network-interval root pins, hash-keyed deployment-state
