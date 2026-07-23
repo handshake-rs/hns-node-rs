@@ -4535,10 +4535,25 @@ pub(super) async fn connect_stored_active_state(
     // restarting at genesis here makes replay quadratic because this helper is
     // called on every supervisor tick and after each full validation slice.
     let stored_tip_hint = scheduler.stored_tip().cloned();
-    let outcome = {
+    let (outcome, compaction) = {
         let mut node = node.lock().await;
-        node.shadow_sync_connect_stored_state_with_hint(maximum_connect, stored_tip_hint.as_ref())?
+        let outcome = node.shadow_sync_connect_stored_state_with_hint(
+            maximum_connect,
+            stored_tip_hint.as_ref(),
+        )?;
+        let compaction = node.compact_pruned_name_tree_nodes_if_due()?;
+        (outcome, compaction)
     };
+    if let Some(checkpoint) = compaction {
+        tracing::info!(
+            height = checkpoint.height,
+            tip = %checkpoint.tip.to_hex(),
+            nodes_before = checkpoint.summary.nodes_before,
+            nodes_retained = checkpoint.summary.nodes_retained,
+            nodes_deleted = checkpoint.summary.nodes_deleted,
+            "compacted pruned durable name tree during native sync"
+        );
+    }
 
     if let Some(failed) = &outcome.contextual_failure {
         for hash in &failed.affected {

@@ -2274,7 +2274,11 @@ fn stage_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
     Ok(())
 }
 
-fn stage_remove_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
+/// Remove an interval snapshot pin when the matching undo record is retired.
+///
+/// The undo record is the rollback authority for that historical root, so
+/// callers must delete both in the same durable batch.
+pub fn stage_remove_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
     snapshot: &T,
     batch: &mut B,
     undo: &BlockUndo,

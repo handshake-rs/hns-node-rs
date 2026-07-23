@@ -60,7 +60,7 @@ Implemented:
 - Separate durable best-header and active-best-block bindings.
 - Strict greater-work activation; equal-work branches preserve the existing
   first-seen tip.
-- Schema version **15**, storage profile **`hsrd-mining-v11`**, explicit clean
+- Schema version **16**, storage profile **`hsrd-mining-v12`**, explicit clean
   reindex behavior, durable working and interval-committed name-tree-root
   bindings/content-addressed nodes and HSD
   airdrop-field bindings, versioned checksummed network-interval name-tree
@@ -72,9 +72,11 @@ Implemented:
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
   block/header undo status and advances a checksummed checkpoint; startup
-  catches up missed heights, retained interval pins remain compactable, and a
-  reorganization that reaches retired undo fails before mutation. Once a store
-  has retired undo, the option cannot be disabled for that store.
+  catches up missed heights, retires the matching interval pin in the same
+  batch, and a reorganization that reaches retired undo fails before mutation.
+  Pruned mode compacts unreachable name-tree nodes every configured maintenance
+  interval. Once a store has retired undo, the option cannot be disabled for
+  that store.
 
 ## Transaction authorization foundation
 
@@ -491,8 +493,10 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 
 ## Storage migration
 
-Schema version 15 and storage profile `hsrd-mining-v11` retain HSD's separate
-working and interval-committed name-tree roots from schema 14 and align coin
+Schema version 16 and storage profile `hsrd-mining-v12` retain HSD's separate
+working and interval-committed name-tree roots from schema 15, bound aggregate
+RocksDB WAL retention, retire interval pins with expired rollback authority,
+and align coin
 admission with HSD: null-data-address and `REVOKE` covenant outputs are
 validated but never enter the UTXO set or block undo. Schema 14 added the roots
 to schema 13's checksummed

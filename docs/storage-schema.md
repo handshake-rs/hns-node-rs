@@ -7,10 +7,10 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **15** and the storage profile is
-**`hsrd-mining-v11`**. This is an intentional clean-reindex boundary.
+The current persistent schema version is **16** and the storage profile is
+**`hsrd-mining-v12`**. This is an intentional clean-reindex boundary.
 
-Version 15 contains the authority, state, shadow-synchronization, and mining
+Version 16 contains the authority, state, shadow-synchronization, and mining
 publication schema, durable HSD airdrop duplicate prevention, active-chain
 deployment-state persistence, content-addressed authenticated name nodes, and
 durable interval-root retention metadata:
@@ -77,6 +77,9 @@ Durable identity binds:
   the current four-core canary host and lets flush/compaction use otherwise idle
   cores; deployment-scale stall, CPU-contention, and memory qualification remain
   required on other hardware profiles.
+- Aggregate WAL retention across all column families is capped at 256 MiB.
+  RocksDB otherwise derives a multi-gigabyte allowance from the sum of every
+  column family's write buffers, which amplified mainnet replay disk use.
 - Incremental name-tree updates persist only newly constructed records reachable
   from that block's final root. Superseded paths constructed within the same
   atomic update were never durable roots and are not written; records reachable
@@ -316,7 +319,7 @@ exact bytes before fixture use.
 
 ## Migration policy
 
-Schema 15/profile `hsrd-mining-v11` requires an explicit clean reindex from every
+Schema 16/profile `hsrd-mining-v12` requires an explicit clean reindex from every
 prior handoff. Earlier hsrd profiles may contain impossible-to-spend outputs
 that HSD never admitted to its coin database. No automatic in-place migration
 is attempted while `hsrd` remains pre-authority. A failed or interrupted
@@ -338,11 +341,13 @@ also remains a differential-test oracle; it is no longer the steady-state root
 construction path. Pinned HSD incremental roots and canonical proof bytes match
 the path-local implementation, including multi-name history and reverse undo.
 
-Active connects now write a versioned, checksummed root pin whenever the height
-is divisible by the network's HSD `treeInterval`; disconnect removes the exact
-matching pin. Startup requires every active interval height to have a matching
-block/undo/root pin, rejects pins outside the active interval path, and fully
-validates each pinned reachable tree.
+Active connects write a versioned, checksummed root pin whenever the height is
+divisible by the network's HSD `treeInterval`; disconnect removes the exact
+matching pin. Undo retirement removes that pin in the same atomic batch once
+the interval can no longer be disconnected. Startup requires every retained
+active interval height to have a matching block/undo/root pin, requires pruned
+intervals to have no pin, rejects pins outside the retained active interval
+path, and fully validates each pinned reachable tree.
 
 The explicit compactor first validates and unions all nodes reachable from the
 current bound root, every previous/resulting root in retained undo, and every
@@ -353,7 +358,8 @@ unchanged. State transitions and compaction must be serialized by the node
 coordinator.
 
 The node coordinator exposes forced maintenance and HSD-shaped opt-in startup
-scheduling. A nonzero height interval (10,000 by default) prevents repeated
+scheduling. In undo-pruned mining mode the same scheduler also runs during
+native replay. A nonzero height interval (10,000 by default) prevents repeated
 work at the same tip. The deletion set and checksummed height/tip/count
 checkpoint commit in one batch; malformed checkpoints fail startup. API-v10
 status reports the configured policy and last result. Unclean RocksDB reopen
@@ -363,12 +369,13 @@ Undo retirement is separately opt-in. It uses HSD's exact network constants:
 no height through `pruneAfterHeight` is retired, and the newest `keepBlocks`
 remain disconnectable. The target comparison is strict, matching HSD. Each
 retirement deletes the undo bytes, clears the matching header/block status,
-and advances `undo-pruning/v1` in the same batch. Startup validates the
-protected prefix, retired band, retained suffix, canonical checkpoint binding,
-root continuity, and interval pins; missed retirements are caught up in bounded
-batches. Reorganizations crossing the retired band fail before any state
-mutation. A store with a pruning checkpoint cannot later open with retirement
-disabled.
+deletes any matching interval pin, and advances `undo-pruning/v1` in the same
+batch. Startup validates the protected prefix, retired band, retained suffix,
+canonical checkpoint binding, root continuity, and the absence/presence of
+interval pins on the retired/retained sides; missed retirements are caught up
+in bounded batches. Reorganizations crossing the retired band fail before any
+state mutation. A store with a pruning checkpoint cannot later open with
+retirement disabled.
 
 Production closure still requires deployment-scale performance and priority
 isolation plus RocksDB mid-commit process-kill/fault injection without weakening

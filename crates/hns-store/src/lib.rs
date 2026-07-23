@@ -13,11 +13,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v11";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
 
 /// HSD's MSB-first spent-allocation field contains 216,199 airdrop positions
 /// followed by 1,358 faucet positions.
@@ -32,6 +32,11 @@ const ROCKS_BULK_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const ROCKS_BLOOM_BITS_PER_KEY: f64 = 10.0;
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_BACKGROUND_JOBS: i32 = 4;
+/// Bound aggregate WAL retention across all column families. Without an
+/// explicit limit RocksDB derives the allowance from every column family's
+/// write buffers; a mainnet replay retained more than 4 GiB of WAL files.
+#[cfg(feature = "rocksdb-backend")]
+pub const ROCKS_MAX_TOTAL_WAL_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_BULK_BLOCK_BYTES: usize = 32 * 1024;
 
@@ -925,6 +930,7 @@ impl RocksStore {
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
         db_options.set_max_background_jobs(ROCKS_BACKGROUND_JOBS);
+        db_options.set_max_total_wal_size(ROCKS_MAX_TOTAL_WAL_BYTES);
 
         let point_cache = Cache::new_lru_cache(ROCKS_POINT_CACHE_BYTES);
         let bulk_cache = Cache::new_lru_cache(ROCKS_BULK_CACHE_BYTES);
@@ -1958,6 +1964,13 @@ mod tests {
         assert!(format!("{store:?}").contains("point_cache_usage"));
 
         drop(store);
+        let log = std::fs::read_to_string(path.join("LOG")).expect("rocksdb option log");
+        assert!(
+            log.contains(&format!(
+                "Options.max_total_wal_size: {ROCKS_MAX_TOTAL_WAL_BYTES}"
+            )),
+            "RocksDB did not apply the aggregate WAL cap"
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 

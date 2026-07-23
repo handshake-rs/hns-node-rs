@@ -138,17 +138,17 @@ Current evidence includes:
   oracle, plus retained historical proofs and read-your-writes multi-step
   connect/disconnect;
 - network-interval snapshot-pin codec/connect/disconnect/restart invariants and
-  retained-root compaction that preserves current, undo, and pinned proof bytes
-  while deleting only unreachable records;
+  retained-root compaction that preserves current, retained-undo, and pinned
+  proof bytes while deleting roots whose pins and rollback authority expired;
 - malformed-pin and failed-compaction-commit cases that leave the complete node
   set unchanged, followed by an idempotent successful retry;
 - startup compaction due/not-due scheduling, nonzero interval validation,
   forced coordinator maintenance, checksummed checkpoint rejection, API-v10
   status, and unclean RocksDB reopen with exact checkpoint/node-set agreement;
 - exact HSD undo-retention constants, steady/startup retirement, protected and
-  retained windows, non-empty pinned-root compaction after undo expiry,
-  checksummed checkpoint rejection, deep-reorg rejection, and unclean RocksDB
-  reopen;
+  retained windows, atomic interval-pin retirement, scheduled non-empty root
+  compaction after undo expiry, checksummed checkpoint rejection, deep-reorg
+  rejection, and unclean RocksDB reopen;
 - reserved-name and lockup dataset checks;
 - renewal-commitment maturity/period boundary checks;
 - exact HNS frames, version packets, addresses, service normalization,
@@ -254,6 +254,7 @@ Tests must cover:
 - header-index memory publication only after durable commit;
 - failure before commit leaving every durable key unchanged;
 - true snapshot consistency during concurrent writes;
+- bounded aggregate RocksDB WAL retention across all column families;
 - WAL/sync restart points and fault-injected batch failure.
 
 ## Network and synchronization tests

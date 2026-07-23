@@ -64,7 +64,8 @@ use hns_rpc::{
 use hns_state::{
     connect_block_to_batch_with_services, decode_coin, decode_name_state,
     disconnect_block_to_batch, load_name_tree_snapshot_pins, load_stored_name_tree_commit_root,
-    load_stored_name_tree_root, stage_name_tree_node_compaction, validate_persisted_name_tree_root,
+    load_stored_name_tree_root, stage_name_tree_node_compaction,
+    stage_remove_name_tree_snapshot_pin, validate_persisted_name_tree_root,
     validate_persisted_name_trees, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
     BlockUndo, ConnectBlock, DisconnectBlock, NameTreeCompactionSummary, NameTreeSnapshotPin,
     StateError, StateServices, StoredStateEngine,
@@ -1066,6 +1067,18 @@ impl NodeService {
     /// compaction checkpoint and all record deletions share one atomic batch.
     pub fn compact_name_tree_nodes(&mut self) -> Result<NameTreeCompactionCheckpoint> {
         self.state.compact_name_tree_nodes()
+    }
+
+    /// Mining-mode maintenance retires unreachable historical nodes on the
+    /// configured interval after their rollback authority has been pruned.
+    fn compact_pruned_name_tree_nodes_if_due(
+        &mut self,
+    ) -> Result<Option<NameTreeCompactionCheckpoint>> {
+        if !self.config.undo_retention.prune_history {
+            return Ok(None);
+        }
+        self.state
+            .compact_name_tree_nodes_if_due(self.config.name_tree_compaction.startup_interval)
     }
 
     pub fn name_tree_compaction_checkpoint(&self) -> Result<Option<NameTreeCompactionCheckpoint>> {
@@ -2413,35 +2426,45 @@ impl NodeState {
                         Some(undo)
                     };
                     if height.is_multiple_of(tree_interval) {
-                        let pin = name_tree_pins.remove(&height).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "active interval height {height} is missing its name-tree snapshot pin"
-                            )
-                        })?;
-                        let expected_pin_root = match undo.as_ref() {
-                            Some(undo) => *undo.resulting_committed_tree_root.as_bytes(),
-                            None if position + 1 < heights.len() => {
-                                let next_hash = block_hash_from_bytes(&heights[position + 1].1)?;
-                                let next = load_header_record(&snapshot, &next_hash)?.ok_or_else(
-                                    || {
-                                        anyhow::anyhow!(
-                                            "active header after snapshot height {height} is missing"
-                                        )
-                                    },
-                                )?;
-                                if next.height != height.saturating_add(1) {
-                                    anyhow::bail!(
-                                        "active header after snapshot height {height} is non-contiguous"
-                                    );
-                                }
-                                next.header.tree_root
+                        if undo_should_be_pruned {
+                            if name_tree_pins.remove(&height).is_some() {
+                                anyhow::bail!(
+                                    "pruned interval height {height} still has a name-tree snapshot pin"
+                                );
                             }
-                            None => *durable_name_tree_commit_root.as_bytes(),
-                        };
-                        if pin.block_hash != hash || pin.root.as_bytes() != &expected_pin_root {
-                            anyhow::bail!(
-                                "active interval height {height} has an inconsistent name-tree snapshot pin"
-                            );
+                        } else {
+                            let pin = name_tree_pins.remove(&height).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "active interval height {height} is missing its name-tree snapshot pin"
+                                )
+                            })?;
+                            let expected_pin_root = match undo.as_ref() {
+                                Some(undo) => *undo.resulting_committed_tree_root.as_bytes(),
+                                None if position + 1 < heights.len() => {
+                                    let next_hash =
+                                        block_hash_from_bytes(&heights[position + 1].1)?;
+                                    let next =
+                                        load_header_record(&snapshot, &next_hash)?.ok_or_else(
+                                            || {
+                                                anyhow::anyhow!(
+                                                    "active header after snapshot height {height} is missing"
+                                                )
+                                            },
+                                        )?;
+                                    if next.height != height.saturating_add(1) {
+                                        anyhow::bail!(
+                                            "active header after snapshot height {height} is non-contiguous"
+                                        );
+                                    }
+                                    next.header.tree_root
+                                }
+                                None => *durable_name_tree_commit_root.as_bytes(),
+                            };
+                            if pin.block_hash != hash || pin.root.as_bytes() != &expected_pin_root {
+                                anyhow::bail!(
+                                    "active interval height {height} has an inconsistent name-tree snapshot pin"
+                                );
+                            }
                         }
                     }
                     previous_hash = hash;
@@ -4232,6 +4255,12 @@ fn stage_prune_undo_height<T: ReadSnapshot, B: WriteBatch>(
             hash.to_hex()
         );
     }
+    stage_remove_name_tree_snapshot_pin(snapshot, batch, &undo).map_err(|error| {
+        anyhow::anyhow!(
+            "undo-pruning target {} could not retire its name-tree pin: {error}",
+            hash.to_hex()
+        )
+    })?;
     block.status.undo_present = false;
     header.status.undo_present = false;
     batch.delete(ColumnFamily::Undo, hash.as_bytes())?;
@@ -7025,7 +7054,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_retention_preserves_pinned_roots_and_rejects_deep_reorgs() {
+    fn undo_retention_retires_expired_pins_compacts_nodes_and_rejects_deep_reorgs() {
         let store = StoreHandle::memory();
         let policy = UndoRetentionPolicy {
             prune_after_height: 0,
@@ -7056,7 +7085,48 @@ mod tests {
         )
         .expect("fixture input verifier");
 
-        let records = connect_fixture_chain(&mut node, 202, Some(200));
+        let mut records = connect_fixture_chain(&mut node, 195, Some(195));
+        let snapshot = store.snapshot().expect("pre-prune snapshot");
+        let expired_pin = load_name_tree_snapshot_pins(&snapshot)
+            .expect("pins")
+            .into_iter()
+            .find(|pin| pin.height == 195)
+            .expect("height-195 pin before pruning");
+        assert_ne!(expired_pin.root.as_bytes(), &[0; 32]);
+        assert_eq!(expired_pin.block_hash, records[195].hash);
+        hns_state::validate_persisted_name_tree(&snapshot, expired_pin.root)
+            .expect("pinned tree before pruning");
+        drop(snapshot);
+
+        for height in 196..=202 {
+            let snapshot = store.snapshot().expect("name-tree snapshot");
+            let tree_root =
+                load_stored_name_tree_commit_root(&snapshot).expect("name-tree commit root");
+            drop(snapshot);
+            let coinbase = coinbase_transaction_with_tag(height, 50);
+            let mut transactions = vec![coinbase];
+            if height == 200 {
+                transactions.push(open_transaction(
+                    b"undo-retention-next",
+                    Outpoint {
+                        txid: coinbase_transaction_with_tag(197, 50).txid(),
+                        index: 0,
+                    },
+                ));
+            }
+            let mut block = block_with_commitments(transactions);
+            block.header.prev_block = records.last().expect("previous block").hash;
+            block.header.tree_root = *tree_root.as_bytes();
+            block.header.nonce = height.saturating_add(10);
+            let record = node
+                .connect_block(NodeBlockImport::fixture(
+                    block,
+                    height,
+                    u64::from(height) + 1,
+                ))
+                .unwrap_or_else(|error| panic!("connect fixture height {height}: {error}"));
+            records.push(record);
+        }
         let checkpoint = node
             .undo_pruning_checkpoint()
             .expect("checkpoint read")
@@ -7085,27 +7155,64 @@ mod tests {
                 "height {height}"
             );
         }
-        let pin = load_name_tree_snapshot_pins(&snapshot)
-            .expect("pins")
-            .into_iter()
-            .find(|pin| pin.height == 200)
-            .expect("height-200 pin");
-        assert_ne!(pin.root.as_bytes(), &[0; 32]);
-        assert_eq!(pin.block_hash, records[200].hash);
-        hns_state::validate_persisted_name_tree(&snapshot, pin.root)
-            .expect("pinned tree before compaction");
+        assert!(
+            load_name_tree_snapshot_pins(&snapshot)
+                .expect("pins")
+                .into_iter()
+                .all(|pin| pin.height != 195),
+            "pruned interval pin must retire with its undo"
+        );
+        hns_state::validate_persisted_name_tree(&snapshot, expired_pin.root)
+            .expect("expired tree nodes remain until compaction");
+        let mut expected_retained_roots = HashSet::from([
+            load_stored_name_tree_root(&snapshot).expect("current name-tree root"),
+            load_stored_name_tree_commit_root(&snapshot).expect("committed name-tree root"),
+        ]);
+        for (_, raw) in snapshot
+            .scan_prefix(ColumnFamily::Undo, b"")
+            .expect("retained undo scan")
+        {
+            let undo = BlockUndo::decode(&raw).expect("retained undo");
+            expected_retained_roots.insert(undo.previous_tree_root);
+            expected_retained_roots.insert(undo.resulting_tree_root);
+            expected_retained_roots.insert(undo.previous_committed_tree_root);
+            expected_retained_roots.insert(undo.resulting_committed_tree_root);
+        }
+        assert!(
+            !expected_retained_roots.contains(&expired_pin.root),
+            "expired pin root must not remain an external retention authority"
+        );
         let fork_root = load_header_record(&snapshot, &records[200].hash)
             .expect("fork child header read")
             .expect("fork child header")
             .header
             .tree_root;
         drop(snapshot);
+        let unreachable = put_unreachable_name_node(&store, 0x73);
 
-        let compacted = node.compact_name_tree_nodes().expect("compact pruned tree");
-        assert!(compacted.summary.retained_roots >= 2);
+        node.config.undo_retention.prune_history = true;
+        node.config.name_tree_compaction.startup_interval = 1;
+        let compacted = node
+            .compact_pruned_name_tree_nodes_if_due()
+            .expect("compact pruned tree")
+            .expect("due compaction");
+        assert_eq!(
+            compacted.summary.retained_roots,
+            expected_retained_roots.len()
+        );
+        assert!(compacted.summary.nodes_deleted >= 1);
         let snapshot = store.snapshot().expect("compacted snapshot");
-        hns_state::validate_persisted_name_tree(&snapshot, pin.root)
-            .expect("pinned tree after compaction");
+        assert!(
+            snapshot
+                .get(ColumnFamily::NameTreeNodes, &unreachable)
+                .expect("unreachable node read")
+                .is_none(),
+            "scheduled compaction must delete unreachable nodes"
+        );
+        let current_root =
+            load_stored_name_tree_root(&snapshot).expect("current name-tree root after compaction");
+        hns_state::validate_persisted_name_tree(&snapshot, current_root)
+            .expect("current tree survives compaction");
         drop(snapshot);
 
         let mut side_parent = records[199].hash;
