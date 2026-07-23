@@ -1012,6 +1012,11 @@ fn validate_block_covenant_limits(block: &Block) -> Result<(), ConsensusError> {
     let mut renewals = 0u32;
     let mut exclusive_names = HashSet::new();
     for transaction in &block.transactions {
+        // HSD tests each transaction against names accumulated from earlier
+        // transactions, then adds every name from the current transaction.
+        // Repeated exclusive covenants within one transaction are therefore
+        // permitted; only a later transaction using that name is rejected.
+        let mut transaction_exclusive_names = HashSet::new();
         for output in &transaction.outputs {
             match output.covenant.kind {
                 CovenantKind::Open => {
@@ -1045,13 +1050,15 @@ fn validate_block_covenant_limits(block: &Block) -> Result<(), ConsensusError> {
                     .ok_or(ConsensusError::InvalidBlock(
                         "name covenant hash has invalid length",
                     ))?;
-                if !exclusive_names.insert(name_hash) {
+                if exclusive_names.contains(&name_hash) {
                     return Err(ConsensusError::InvalidBlock(
                         "block contains duplicate exclusive name updates",
                     ));
                 }
+                transaction_exclusive_names.insert(name_hash);
             }
         }
+        exclusive_names.extend(transaction_exclusive_names);
     }
     if opens > MAX_BLOCK_OPENS {
         return Err(ConsensusError::InvalidBlock("block open limit exceeded"));
@@ -1936,6 +1943,18 @@ mod tests {
             },
             vec![open_output()],
         );
+        let same_transaction = transaction(
+            Outpoint {
+                txid: Txid::new([7; 32]),
+                index: 0,
+            },
+            vec![open_output(), open_output()],
+        );
+        let same_transaction_block =
+            block_with_roots(vec![coinbase(vec![output(50)]), same_transaction]);
+        validate_block_body(&same_transaction_block)
+            .expect("HSD permits repeated exclusive names within one transaction");
+
         let block = block_with_roots(vec![coinbase(vec![output(50)]), first, second]);
 
         assert!(matches!(
