@@ -234,8 +234,12 @@ sampling observed a 1,146,448 KiB peak RSS and 118,672 KiB peak swap, roughly a
 77% resident-memory reduction from the old transient reading above 5 GiB.
 The node reported zero failed blocks, wrote the completed checkpoint, and
 resumed replay through height 80,650 during the observation. This qualifies
-the bounded-memory shape on the deployment-scale datastore; forced
-mid-compaction process-crash and latency-distribution campaigns remain open.
+the bounded-memory shape on the deployment-scale datastore. A separate real
+RocksDB subprocess test exits immediately after its first synced 64-key delete
+chunk without running Rust destructors; reopen preserves the complete retained
+authenticated tree, observes only a partial garbage deletion, and an
+idempotent retry removes the remainder. Deployment-scale external `SIGKILL`
+and latency-distribution campaigns remain open.
 
 Native-sync `getblockhash` is a keyed canonical-height read under the
 coordinator lock. It does not construct the general compatibility RPC snapshot,

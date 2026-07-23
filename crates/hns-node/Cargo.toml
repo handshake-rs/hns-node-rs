@@ -6,7 +6,7 @@ publish.workspace = true
 
 [features]
 default = ["rocksdb-backend"]
-rocksdb-backend = ["hns-store/rocksdb-backend"]
+rocksdb-backend = ["hns-state/rocksdb-backend", "hns-store/rocksdb-backend"]
 experimental-authority = []
 
 [dependencies]

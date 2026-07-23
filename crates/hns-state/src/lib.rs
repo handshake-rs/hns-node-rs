@@ -3090,6 +3090,8 @@ mod tests {
     use hns_primitives::{
         hash_name, Address, CovenantKind, Header, Input, Output, Txid, Uint256, Witness,
     };
+    #[cfg(feature = "rocksdb-backend")]
+    use hns_store::{open_store, DurabilityPolicy, StoreBackend, StoreConfig};
     use hns_store::{MemoryBatch, MemorySnapshot, MemoryStore, StagingOverlay, Store};
 
     use super::*;
@@ -3204,6 +3206,51 @@ mod tests {
                 .expect("recorded batches lock")
                 .push(batch.len());
             self.inner.commit(batch)
+        }
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    struct ExitAfterCommitStore<S: Store> {
+        inner: S,
+        exit_after: usize,
+        commits: Cell<usize>,
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    impl<S: Store> ExitAfterCommitStore<S> {
+        fn new(inner: S, exit_after: usize) -> Self {
+            Self {
+                inner,
+                exit_after,
+                commits: Cell::new(0),
+            }
+        }
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    impl<S: Store> Store for ExitAfterCommitStore<S> {
+        type Snapshot<'a>
+            = S::Snapshot<'a>
+        where
+            Self: 'a;
+        type Batch = S::Batch;
+
+        fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+            self.inner.snapshot()
+        }
+
+        fn batch(&self) -> Self::Batch {
+            self.inner.batch()
+        }
+
+        fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
+            self.inner.commit(batch)?;
+            let commits = self.commits.get().saturating_add(1);
+            self.commits.set(commits);
+            if commits == self.exit_after {
+                std::process::exit(86);
+            }
+            Ok(())
         }
     }
 
@@ -4744,6 +4791,148 @@ mod tests {
             0
         );
         assert!(store.take_committed_batch_sizes().is_empty());
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn streaming_compaction_process_exit_is_restart_safe() {
+        const CHILD_ENV: &str = "HSRD_COMPACTION_EXIT_CHILD";
+        const PATH_ENV: &str = "HSRD_COMPACTION_EXIT_PATH";
+        const DELETE_BATCH: usize = 64;
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let path = std::path::PathBuf::from(
+                std::env::var_os(PATH_ENV).expect("child compaction path"),
+            );
+            let store = open_store(&StoreConfig {
+                path,
+                backend: StoreBackend::RocksDb,
+                durability: DurabilityPolicy::Sync,
+            })
+            .expect("open child store");
+            let store = ExitAfterCommitStore::new(store, 1);
+            compact_name_tree_nodes_streaming(&store, DELETE_BATCH)
+                .expect("child exits after first durable delete chunk");
+            panic!("fault-injected compaction child did not exit");
+        }
+
+        fn fixture_key(domain: u8, index: u32) -> NameHash {
+            let mut raw = Vec::with_capacity(5);
+            raw.push(domain);
+            raw.extend_from_slice(&index.to_le_bytes());
+            NameHash::new(blake2b_256(&raw))
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-stream-compaction-exit-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let config = StoreConfig {
+            path: path.clone(),
+            backend: StoreBackend::RocksDb,
+            durability: DurabilityPolicy::Sync,
+        };
+        let retained = MemoryUrkel::from_entries((0..64).map(|index| {
+            (
+                fixture_key(0x51, index),
+                format!("retained-{index}").into_bytes(),
+            )
+        }))
+        .expect("retained tree");
+        let retained_records = retained.node_records().expect("retained records");
+        let orphaned = MemoryUrkel::from_entries((0..512).map(|index| {
+            (
+                fixture_key(0xa7, index),
+                format!("orphaned-{index}").into_bytes(),
+            )
+        }))
+        .expect("orphaned tree");
+        let orphaned_records = orphaned.node_records().expect("orphaned records");
+        let nodes_before = retained_records.len() + orphaned_records.len();
+
+        {
+            let store = open_store(&config).expect("open fixture store");
+            hns_store::initialize_schema(&store).expect("schema");
+            let mut batch = store.batch();
+            for (root, raw) in retained_records.iter().chain(&orphaned_records) {
+                batch
+                    .put(ColumnFamily::NameTreeNodes, root.as_bytes(), raw)
+                    .expect("put fixture node");
+            }
+            batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::NameTreeRoot.as_bytes(),
+                    retained.root().as_bytes(),
+                )
+                .expect("bind retained root");
+            batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::NameTreeCommitRoot.as_bytes(),
+                    retained.root().as_bytes(),
+                )
+                .expect("bind retained commit root");
+            store.commit(batch).expect("commit compaction fixture");
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "tests::streaming_compaction_process_exit_is_restart_safe",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(PATH_ENV, path.as_os_str())
+            .status()
+            .expect("spawn compaction fault child");
+        assert_eq!(status.code(), Some(86));
+
+        {
+            let store = open_store(&config).expect("reopen interrupted store");
+            let snapshot = store.snapshot().expect("interrupted snapshot");
+            let nodes_after_exit = snapshot
+                .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+                .expect("nodes after exit")
+                .len();
+            assert!(nodes_after_exit < nodes_before);
+            assert!(nodes_after_exit > retained_records.len());
+            assert_eq!(
+                validate_persisted_name_tree(&snapshot, retained.root())
+                    .expect("retained tree after exit"),
+                retained_records.len()
+            );
+            drop(snapshot);
+
+            let summary = compact_name_tree_nodes_streaming(&store, DELETE_BATCH)
+                .expect("resume interrupted compaction");
+            assert_eq!(summary.nodes_before, nodes_after_exit);
+            assert_eq!(summary.nodes_retained, retained_records.len());
+            assert_eq!(
+                summary.nodes_deleted,
+                nodes_after_exit - retained_records.len()
+            );
+            let snapshot = store.snapshot().expect("resumed snapshot");
+            assert_eq!(
+                snapshot
+                    .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+                    .expect("nodes after resumed compaction")
+                    .len(),
+                retained_records.len()
+            );
+            assert_eq!(
+                validate_persisted_name_tree(&snapshot, retained.root())
+                    .expect("retained tree after resume"),
+                retained_records.len()
+            );
+        }
+
+        std::fs::remove_dir_all(path).expect("remove compaction fault store");
     }
 
     #[test]

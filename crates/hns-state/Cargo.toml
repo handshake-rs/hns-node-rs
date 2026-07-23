@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+rocksdb-backend = ["hns-store/rocksdb-backend"]
+
 [dependencies]
 hns-chain = { path = "../hns-chain" }
 hns-consensus = { path = "../hns-consensus" }
