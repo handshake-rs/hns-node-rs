@@ -361,18 +361,23 @@ path, and fully validates each pinned reachable tree.
 The explicit compactor first validates and unions all nodes reachable from the
 current bound root, every previous/resulting root in retained undo, and every
 interval pin. It validates all stored node keys before staging any deletion,
-then atomically removes only records outside that union. Malformed pins,
-missing/corrupt reachable nodes, and failed commits leave the durable node set
-unchanged. State transitions and compaction must be serialized by the node
-coordinator.
+then removes only records outside that union in bounded synced chunks over the
+same stable snapshot. Malformed pins and missing/corrupt reachable nodes fail
+before the first mutation. An interrupted chunked run may leave extra garbage,
+but cannot delete a root validated as retained; retry is idempotent. State
+transitions and compaction remain serialized by the node coordinator.
 
 The node coordinator exposes forced maintenance and HSD-shaped opt-in startup
 scheduling. In undo-pruned mining mode the same scheduler also runs during
 native replay. A nonzero height interval (10,000 by default) prevents repeated
-work at the same tip. The deletion set and checksummed height/tip/count
-checkpoint commit in one batch; malformed checkpoints fail startup. API-v10
-status reports the configured policy and last result. Unclean RocksDB reopen
-tests verify that the checkpoint and compacted node set remain synchronized.
+work at the same tip. The checksummed height/tip/count completion checkpoint is
+written only after every deletion chunk succeeds; malformed checkpoints fail
+startup. API-v10 status reports the configured policy and last completed
+result. During the serialized pass it serves an explicitly marked, timestamped
+cached diagnostic snapshot, while authority-bearing reads continue waiting for
+live state. Unclean RocksDB reopen tests verify that interrupted deletion
+resumes safely and that a completion checkpoint agrees with the compacted node
+set.
 
 Undo retirement is separately opt-in. It uses HSD's exact network constants:
 no height through `pruneAfterHeight` is retired, and the newest `keepBlocks`

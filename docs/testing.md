@@ -535,6 +535,9 @@ A mismatch fails closed and cannot become a silent compatibility exception.
 - Priority isolation under sync, compaction, diagnostics, and slow-peer load.
 - Live diagnostic snapshots that preserve exact block-status counts without
   materializing historical RPC payload collections.
+- Lock-held native status/authority/parity/mining diagnostics that return an
+  explicitly marked, timestamped cached snapshot within one second while
+  `getparentauthority` remains bound to coherent live state.
 
 ## Fuzzing
 

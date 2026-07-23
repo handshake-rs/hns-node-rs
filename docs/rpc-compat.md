@@ -43,6 +43,13 @@ snapshots only.
   active tip's post-state authenticated root and the height it results from are
   exposed explicitly for an external HSD comparison; this differs from the
   pre-state root committed inside the active tip's own header.
+- Native status, authority, parity, and mining-engine diagnostics bind before
+  startup replay and remain available while the state coordinator is occupied
+  by a connect slice or name-tree compaction. Each response reports
+  `diagnostic_snapshot_cached` and `diagnostic_snapshot_captured_at`; a cached
+  response is the last committed diagnostic snapshot, not mining authority.
+  `getparentauthority` is deliberately excluded and always reads one coherent
+  live state.
 - Native-sync diagnostics distinguish active-state, observe-only, and
   headers-only operation and report
   committed blocks, reorganizations, contextual-invalid bodies, durable

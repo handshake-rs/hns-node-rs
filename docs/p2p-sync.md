@@ -453,6 +453,15 @@ durably failed blocks and exposes the active tip's resulting authenticated
 root/height. The native endpoint includes an opaque runtime instance so external
 evidence can distinguish observations across restarts.
 
+Authenticated status, authority, parity, and mining-engine diagnostics remain
+available during serialized replay and name-tree compaction. They return a
+constant-payload snapshot captured after the last committed active-state slice;
+`diagnostic_snapshot_cached` identifies a lock-busy response and
+`diagnostic_snapshot_captured_at` gives its Unix capture time. RPC binds before
+startup replay so startup compaction is observable. This cache is diagnostic
+only: `getparentauthority` and every authority-bearing mining decision require
+the coherent live node lock and are never served from it.
+
 `observation_only` is false for the native default and true only under
 `--native-sync-observe-only` or `--native-sync-headers-only`. `active_state`
 reports that choice, while `headers_only` reports the narrower no-body mode.

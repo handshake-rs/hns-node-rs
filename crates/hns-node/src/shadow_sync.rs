@@ -1660,20 +1660,12 @@ impl NodeService {
             checkpoint_sequence: initial_sequence,
             ..ShadowSyncDiagnostics::default()
         }));
+        let diagnostic_rpc = initialize_cached_diagnostic_rpc(&node, &diagnostics).await?;
 
-        if shadow_sync_config.connect_active_state {
-            connect_stored_active_state(
-                &node,
-                &peers,
-                &mut scheduler,
-                &mut orphan_pool,
-                &diagnostics,
-                shadow_sync_config.active_state_connect_batch,
-            )
-            .await
-            .context("failed to resume active-state synchronization")?;
-        }
-
+        // Bind diagnostics before startup replay/compaction. The cached,
+        // explicitly timestamped snapshot remains readable while the
+        // state-coordination lock is held; authoritative parent reads still
+        // wait for the live node.
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let rpc_listener = TcpListener::bind(rpc_bind)
             .await
@@ -1682,9 +1674,28 @@ impl NodeService {
             rpc_listener,
             Arc::clone(&node),
             Arc::clone(&diagnostics),
+            Arc::clone(&diagnostic_rpc),
             rpc_authorization,
             shutdown_rx.clone(),
         ));
+
+        if shadow_sync_config.connect_active_state {
+            if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
+                &node,
+                &peers,
+                &mut scheduler,
+                &mut orphan_pool,
+                &diagnostics,
+                &diagnostic_rpc,
+                shadow_sync_config.active_state_connect_batch,
+            )
+            .await
+            {
+                let _ = shutdown_tx.send(true);
+                let _ = rpc_task.await;
+                return Err(error.context("failed to resume active-state synchronization"));
+            }
+        }
 
         let listener_task = if let Some(address) = shadow_sync_config.listen {
             let listener = TcpListener::bind(address)
@@ -1816,12 +1827,13 @@ impl NodeService {
                     }
 
                     if shadow_sync_config.connect_active_state {
-                        if let Err(error) = connect_stored_active_state(
+                        if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
                             &node,
                             &peers,
                             &mut scheduler,
                             &mut orphan_pool,
                             &diagnostics,
+                            &diagnostic_rpc,
                             shadow_sync_config.active_state_connect_batch,
                         )
                         .await
@@ -2016,12 +2028,13 @@ impl NodeService {
                         && shadow_sync_config.connect_active_state
                         && active_state_full_slice_ready(&scheduler)
                     {
-                        if let Err(error) = connect_stored_active_state(
+                        if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
                             &node,
                             &peers,
                             &mut scheduler,
                             &mut orphan_pool,
                             &diagnostics,
+                            &diagnostic_rpc,
                             shadow_sync_config.active_state_connect_batch,
                         )
                         .await
@@ -2937,16 +2950,28 @@ fn decode_rpc_block_hash(value: &str) -> Result<BlockHash> {
 struct ShadowSyncHttpState {
     node: Arc<Mutex<NodeService>>,
     diagnostics: Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostic_rpc: Arc<RwLock<CachedDiagnosticRpc>>,
+}
+
+#[derive(Clone)]
+struct CachedDiagnosticRpc {
+    service: BasicRpcService,
+    captured_at: u64,
 }
 
 async fn serve_shadow_sync_rpc(
     listener: TcpListener,
     node: Arc<Mutex<NodeService>>,
     diagnostics: Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostic_rpc: Arc<RwLock<CachedDiagnosticRpc>>,
     authorization: Option<RpcAuthorizationHeader>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let state = ShadowSyncHttpState { node, diagnostics };
+    let state = ShadowSyncHttpState {
+        node,
+        diagnostics,
+        diagnostic_rpc,
+    };
     let app = Router::new()
         .route("/", post(handle_shadow_sync_rpc))
         .route("/rpc", post(handle_shadow_sync_rpc))
@@ -2984,6 +3009,14 @@ async fn shadow_sync_rpc_service(
 ) -> Result<BasicRpcService> {
     let diagnostics = state.diagnostics.read().await.clone();
     let node = state.node.lock().await;
+    compose_shadow_sync_rpc_service(&node, &diagnostics, include_entries)
+}
+
+fn compose_shadow_sync_rpc_service(
+    node: &NodeService,
+    diagnostics: &ShadowSyncDiagnostics,
+    include_entries: bool,
+) -> Result<BasicRpcService> {
     let mut snapshot = if include_entries {
         node.rpc_snapshot()?
     } else {
@@ -3004,6 +3037,52 @@ async fn shadow_sync_rpc_service(
     Ok(BasicRpcService::new(snapshot))
 }
 
+async fn initialize_cached_diagnostic_rpc(
+    node: &Arc<Mutex<NodeService>>,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) -> Result<Arc<RwLock<CachedDiagnosticRpc>>> {
+    let diagnostics = diagnostics.read().await.clone();
+    let node = node.lock().await;
+    Ok(Arc::new(RwLock::new(CachedDiagnosticRpc {
+        service: compose_shadow_sync_rpc_service(&node, &diagnostics, false)?,
+        captured_at: unix_time(),
+    })))
+}
+
+async fn refresh_cached_diagnostic_rpc(
+    node: &Arc<Mutex<NodeService>>,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostic_rpc: &Arc<RwLock<CachedDiagnosticRpc>>,
+) -> Result<()> {
+    let diagnostics = diagnostics.read().await.clone();
+    let node = node.lock().await;
+    let service = compose_shadow_sync_rpc_service(&node, &diagnostics, false)?;
+    drop(node);
+    *diagnostic_rpc.write().await = CachedDiagnosticRpc {
+        service,
+        captured_at: unix_time(),
+    };
+    Ok(())
+}
+
+async fn available_diagnostic_rpc(
+    state: &ShadowSyncHttpState,
+) -> Result<(BasicRpcService, bool, u64)> {
+    let diagnostics = state.diagnostics.read().await.clone();
+    if let Ok(node) = state.node.try_lock() {
+        let service = compose_shadow_sync_rpc_service(&node, &diagnostics, false)?;
+        let captured_at = unix_time();
+        drop(node);
+        *state.diagnostic_rpc.write().await = CachedDiagnosticRpc {
+            service: service.clone(),
+            captured_at,
+        };
+        return Ok((service, false, captured_at));
+    }
+    let cached = state.diagnostic_rpc.read().await.clone();
+    Ok((cached.service, true, cached.captured_at))
+}
+
 async fn handle_shadow_sync_rpc(
     State(state): State<ShadowSyncHttpState>,
     body: Bytes,
@@ -3019,6 +3098,12 @@ async fn handle_shadow_sync_rpc(
         }
     };
     let id = request.id.clone();
+    if matches!(
+        request.method.as_str(),
+        "gethsrdstatus" | "getauthorityinfo" | "getparityinfo" | "getminingengineinfo"
+    ) {
+        return cached_json_rpc_diagnostic(&state, request).await;
+    }
     if request.method == "getblockhash" {
         let Some(height) = request
             .params
@@ -3084,8 +3169,8 @@ async fn handle_shadow_sync_rpc(
 }
 
 async fn diagnostic_method(state: &ShadowSyncHttpState, method: &str) -> serde_json::Value {
-    match shadow_sync_rpc_service(state, false).await {
-        Ok(service) => {
+    match available_diagnostic_rpc(state).await {
+        Ok((service, cached, captured_at)) => {
             let response = service.handle(JsonRpcRequest {
                 jsonrpc: Some("2.0".to_owned()),
                 method: method.to_owned(),
@@ -3093,18 +3178,57 @@ async fn diagnostic_method(state: &ShadowSyncHttpState, method: &str) -> serde_j
                 id: None,
             });
             match response {
-                Ok(response) => response.result.unwrap_or_else(|| {
-                    serde_json::json!({
-                        "error": response
-                            .error
-                            .map(|error| error.message)
-                            .unwrap_or_else(|| "missing result".to_owned())
-                    })
-                }),
+                Ok(response) => {
+                    let mut result = response.result.unwrap_or_else(|| {
+                        serde_json::json!({
+                            "error": response
+                                .error
+                                .map(|error| error.message)
+                                .unwrap_or_else(|| "missing result".to_owned())
+                        })
+                    });
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert(
+                            "diagnostic_snapshot_cached".to_owned(),
+                            serde_json::Value::Bool(cached),
+                        );
+                        object.insert(
+                            "diagnostic_snapshot_captured_at".to_owned(),
+                            serde_json::json!(captured_at),
+                        );
+                    }
+                    result
+                }
                 Err(error) => serde_json::json!({ "error": error.to_string() }),
             }
         }
         Err(error) => serde_json::json!({ "error": error.to_string() }),
+    }
+}
+
+async fn cached_json_rpc_diagnostic(
+    state: &ShadowSyncHttpState,
+    request: JsonRpcRequest,
+) -> Json<JsonRpcResponse> {
+    let id = request.id.clone();
+    match available_diagnostic_rpc(state).await {
+        Ok((service, cached, captured_at)) => {
+            let mut response = service
+                .handle(request)
+                .unwrap_or_else(|error| json_rpc_error(id, -32603, error.to_string()));
+            if let Some(serde_json::Value::Object(result)) = response.result.as_mut() {
+                result.insert(
+                    "diagnostic_snapshot_cached".to_owned(),
+                    serde_json::Value::Bool(cached),
+                );
+                result.insert(
+                    "diagnostic_snapshot_captured_at".to_owned(),
+                    serde_json::json!(captured_at),
+                );
+            }
+            Json(response)
+        }
+        Err(error) => Json(json_rpc_error(id, -32603, error.to_string())),
     }
 }
 
@@ -3156,12 +3280,7 @@ async fn handle_header_deployments(
 async fn handle_mining_engine_diagnostics(
     State(state): State<ShadowSyncHttpState>,
 ) -> Json<serde_json::Value> {
-    let node = state.node.lock().await;
-    Json(match node.mining_engine_diagnostics() {
-        Ok(diagnostics) => serde_json::to_value(diagnostics)
-            .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() })),
-        Err(error) => serde_json::json!({ "error": error.to_string() }),
-    })
+    Json(diagnostic_method(&state, "getminingengineinfo").await)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4564,6 +4683,7 @@ async fn handle_validation_failure(
     );
 }
 
+#[cfg(test)]
 pub(super) async fn connect_stored_active_state(
     node: &Arc<Mutex<NodeService>>,
     peers: &LivePeerManager,
@@ -4572,19 +4692,45 @@ pub(super) async fn connect_stored_active_state(
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
     maximum_connect: usize,
 ) -> Result<()> {
+    let diagnostic_rpc = initialize_cached_diagnostic_rpc(node, diagnostics).await?;
+    connect_stored_active_state_with_diagnostic_rpc(
+        node,
+        peers,
+        scheduler,
+        orphans,
+        diagnostics,
+        &diagnostic_rpc,
+        maximum_connect,
+    )
+    .await
+}
+
+async fn connect_stored_active_state_with_diagnostic_rpc(
+    node: &Arc<Mutex<NodeService>>,
+    peers: &LivePeerManager,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut BoundedOrphanPool,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostic_rpc: &Arc<RwLock<CachedDiagnosticRpc>>,
+    maximum_connect: usize,
+) -> Result<()> {
     // The scheduler's stored tip is already a validated contiguous frontier.
     // Revalidate that one anchor and scan only newly available descendants;
     // restarting at genesis here makes replay quadratic because this helper is
     // called on every supervisor tick and after each full validation slice.
     let stored_tip_hint = scheduler.stored_tip().cloned();
-    let (outcome, compaction) = {
+    let outcome = {
         let mut node = node.lock().await;
-        let outcome = node.shadow_sync_connect_stored_state_with_hint(
-            maximum_connect,
-            stored_tip_hint.as_ref(),
-        )?;
-        let compaction = node.compact_pruned_name_tree_nodes_if_due()?;
-        (outcome, compaction)
+        node.shadow_sync_connect_stored_state_with_hint(maximum_connect, stored_tip_hint.as_ref())?
+    };
+    // Capture the newly committed tip before a due compaction takes the
+    // state-coordination lock for its long, stable-snapshot deletion pass.
+    // Diagnostic RPC can serve this explicitly marked snapshot while all
+    // authoritative state access remains serialized behind the lock.
+    refresh_cached_diagnostic_rpc(node, diagnostics, diagnostic_rpc).await?;
+    let compaction = {
+        let mut node = node.lock().await;
+        node.compact_pruned_name_tree_nodes_if_due()?
     };
     if let Some(checkpoint) = compaction {
         tracing::info!(
@@ -4595,6 +4741,7 @@ pub(super) async fn connect_stored_active_state(
             nodes_deleted = checkpoint.summary.nodes_deleted,
             "compacted pruned durable name tree during native sync"
         );
+        refresh_cached_diagnostic_rpc(node, diagnostics, diagnostic_rpc).await?;
     }
 
     if let Some(failed) = &outcome.contextual_failure {
@@ -6903,13 +7050,27 @@ mod tests {
             runtime_instance: "test-runtime".to_owned(),
             ..ShadowSyncDiagnostics::default()
         }));
+        let diagnostic_rpc = {
+            let diagnostics_snapshot = diagnostics.read().await.clone();
+            let node_snapshot = node.lock().await;
+            Arc::new(RwLock::new(CachedDiagnosticRpc {
+                service: compose_shadow_sync_rpc_service(
+                    &node_snapshot,
+                    &diagnostics_snapshot,
+                    false,
+                )
+                .expect("initial diagnostic snapshot"),
+                captured_at: unix_time(),
+            }))
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let authorization =
             RpcAuthorizationHeader::new("Bearer native-sync-test").expect("authorization");
         let server = tokio::spawn(serve_shadow_sync_rpc(
             listener,
-            node,
+            Arc::clone(&node),
             diagnostics,
+            diagnostic_rpc,
             Some(authorization),
             shutdown_rx,
         ));
@@ -6918,6 +7079,7 @@ mod tests {
             "/api/v1/native-sync",
             "/api/v1/header-deployments",
             "/api/v1/mining-engine",
+            "/api/v1/status",
         ] {
             let request = format!(
                 "GET {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer native-sync-test\r\nConnection: close\r\n\r\n"
@@ -6948,8 +7110,84 @@ mod tests {
                 assert_eq!(json["best_header"]["height"], 0);
                 assert_eq!(json["next_height"], 1);
                 assert_eq!(json["script_flags"], 50);
+            } else if path == "/api/v1/status" {
+                assert_eq!(json["diagnostic_snapshot_cached"], false);
+                assert!(json["diagnostic_snapshot_captured_at"].is_u64());
             }
         }
+
+        let node_guard = node.lock().await;
+        let cached_request = format!(
+            "GET /api/v1/status HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer native-sync-test\r\nConnection: close\r\n\r\n"
+        );
+        let cached_response = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect cached status");
+            stream
+                .write_all(cached_request.as_bytes())
+                .await
+                .expect("write cached status");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .await
+                .expect("read cached status");
+            response
+        })
+        .await
+        .expect("cached diagnostic status must not wait for the node lock");
+        assert!(
+            cached_response.starts_with("HTTP/1.1 200 OK"),
+            "{cached_response}"
+        );
+        let (_, cached_body) = cached_response
+            .split_once("\r\n\r\n")
+            .expect("cached body split");
+        let cached_json: serde_json::Value =
+            serde_json::from_str(cached_body).expect("cached status response");
+        assert_eq!(cached_json["diagnostic_snapshot_cached"], true);
+        assert!(cached_json["diagnostic_snapshot_captured_at"].is_u64());
+
+        let cached_rpc_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "cached-authority",
+            "method": "getauthorityinfo",
+            "params": [],
+        })
+        .to_string();
+        let cached_rpc_request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer native-sync-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{cached_rpc_body}",
+            cached_rpc_body.len()
+        );
+        let cached_rpc_response = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect cached authority");
+            stream
+                .write_all(cached_rpc_request.as_bytes())
+                .await
+                .expect("write cached authority");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .await
+                .expect("read cached authority");
+            response
+        })
+        .await
+        .expect("cached JSON-RPC diagnostics must not wait for the node lock");
+        let (_, cached_rpc_body) = cached_rpc_response
+            .split_once("\r\n\r\n")
+            .expect("cached RPC body split");
+        let cached_rpc_json: serde_json::Value =
+            serde_json::from_str(cached_rpc_body).expect("cached RPC response");
+        assert_eq!(
+            cached_rpc_json["result"]["diagnostic_snapshot_cached"],
+            true
+        );
+        assert!(cached_rpc_json["result"]["diagnostic_snapshot_captured_at"].is_u64());
+        drop(node_guard);
 
         let genesis_hash = Network::Regtest.params().genesis_hash.to_hex();
         let body = serde_json::json!({

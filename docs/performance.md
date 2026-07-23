@@ -241,6 +241,20 @@ authenticated tree, observes only a partial garbage deletion, and an
 idempotent retry removes the remainder. Deployment-scale external `SIGKILL`
 and latency-distribution campaigns remain open.
 
+The height-90,000 scheduled run exposed an observability defect distinct from
+memory safety: the state coordinator correctly serialized compaction against
+connect/disconnect, but diagnostic RPC waited behind the same lock for minutes.
+Native sync now binds authenticated RPC before startup replay and captures a
+constant-payload diagnostic snapshot after each committed connect slice and
+immediately before a due compaction. Status, authority, parity, and
+mining-engine diagnostic reads use the live snapshot when the coordinator is
+available or return the cached snapshot immediately with
+`diagnostic_snapshot_cached` and `diagnostic_snapshot_captured_at`. The
+authoritative `getparentauthority` path is never cached and continues to wait
+for a coherent live state. A lock-held HTTP regression requires the cached
+status response to complete within one second. Deployment evidence from a
+production RocksDB compaction remains required.
+
 Native-sync `getblockhash` is a keyed canonical-height read under the
 coordinator lock. It does not construct the general compatibility RPC snapshot,
 whose complete header/block/transaction/UTXO/name materialization is reserved
