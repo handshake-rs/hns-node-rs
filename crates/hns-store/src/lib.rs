@@ -36,6 +36,7 @@ const ROCKS_BACKGROUND_JOBS: i32 = 4;
 const ROCKS_BULK_BLOCK_BYTES: usize = 32 * 1024;
 
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
+pub type PrefixVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum StoreBackend {
@@ -160,6 +161,22 @@ pub trait ReadSnapshot {
         family: ColumnFamily,
         prefix: &[u8],
     ) -> Result<Vec<ScanEntry>, StoreError>;
+
+    /// Visit a lexicographically ordered prefix range without requiring the
+    /// caller to materialize the entire range. Backends should override this
+    /// when they can stream from a stable snapshot; the default preserves the
+    /// behavior of lightweight test snapshots.
+    fn visit_prefix(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        visitor: &mut PrefixVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        for (key, value) in self.scan_prefix(family, prefix)? {
+            visitor(&key, &value)?;
+        }
+        Ok(())
+    }
 }
 
 pub trait WriteBatch {
@@ -699,6 +716,19 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
             Self::Rocks(snapshot) => snapshot.scan_prefix(family, prefix),
         }
     }
+
+    fn visit_prefix(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        visitor: &mut PrefixVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(snapshot, _) => snapshot.visit_prefix(family, prefix, visitor),
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(snapshot) => snapshot.visit_prefix(family, prefix, visitor),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1040,6 +1070,28 @@ impl ReadSnapshot for RocksSnapshot<'_> {
 
         Ok(entries)
     }
+
+    fn visit_prefix(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        visitor: &mut PrefixVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        use rocksdb::{Direction, IteratorMode};
+
+        let cf = RocksStore::cf(self.db, family)?;
+        for item in self
+            .snapshot
+            .iterator_cf(cf, IteratorMode::From(prefix, Direction::Forward))
+        {
+            let (key, value) = item.map_err(|error| StoreError::Backend(error.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            visitor(&key, &value)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "rocksdb-backend")]
@@ -1163,6 +1215,38 @@ mod tests {
             snapshot
                 .scan_prefix(ColumnFamily::Headers, b"b/")
                 .expect("scan"),
+            vec![
+                (b"b/1".to_vec(), b"one".to_vec()),
+                (b"b/2".to_vec(), b"two".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_visits_prefix_in_key_order() {
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        batch
+            .put(ColumnFamily::Headers, b"b/2", b"two")
+            .expect("put");
+        batch
+            .put(ColumnFamily::Headers, b"b/1", b"one")
+            .expect("put");
+        batch
+            .put(ColumnFamily::Headers, b"a/1", b"skip")
+            .expect("put");
+        store.commit(batch).expect("commit");
+
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut visited = Vec::new();
+        snapshot
+            .visit_prefix(ColumnFamily::Headers, b"b/", &mut |key, value| {
+                visited.push((key.to_vec(), value.to_vec()));
+                Ok(())
+            })
+            .expect("visit");
+        assert_eq!(
+            visited,
             vec![
                 (b"b/1".to_vec(), b"one".to_vec()),
                 (b"b/2".to_vec(), b"two".to_vec())
@@ -1818,6 +1902,14 @@ mod tests {
                     .expect("scan"),
                 vec![(b"hash".to_vec(), b"header".to_vec())]
             );
+            let mut visited = Vec::new();
+            snapshot
+                .visit_prefix(ColumnFamily::Headers, b"ha", &mut |key, value| {
+                    visited.push((key.to_vec(), value.to_vec()));
+                    Ok(())
+                })
+                .expect("visit");
+            assert_eq!(visited, vec![(b"hash".to_vec(), b"header".to_vec())]);
             initialize_schema(&store).expect("schema still valid");
         }
 

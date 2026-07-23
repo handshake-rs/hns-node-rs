@@ -1,5 +1,10 @@
 # Testing strategy
 
+Full mainnet semantic-state comparison is specified in
+[`state-parity.md`](state-parity.md). The paired exporters use a shared
+constant-space transcript for UTXOs and names; deployment parity and
+disconnect/reconnect undo parity remain separate evidence gates.
+
 ## Fast static gate
 
 `python3 scripts/validate-hsrd-static.py` runs without a Rust toolchain and

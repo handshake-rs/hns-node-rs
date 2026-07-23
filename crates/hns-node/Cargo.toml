@@ -12,6 +12,7 @@ experimental-authority = []
 [dependencies]
 anyhow.workspace = true
 axum = "0.8"
+blake2 = "0.10"
 clap.workspace = true
 hns-chain = { path = "../hns-chain" }
 hns-consensus = { path = "../hns-consensus" }
@@ -37,3 +38,7 @@ path = "src/main.rs"
 [[bin]]
 name = "hsrd-performance-gate"
 path = "src/bin/hsrd_performance_gate.rs"
+
+[[bin]]
+name = "hsrd-state-manifest"
+path = "src/bin/hsrd_state_manifest.rs"
