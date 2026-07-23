@@ -36,7 +36,9 @@ use hns_p2p::{
 };
 use hns_primitives::{blake2b_256, Block, BlockHash, Header, Height, Reader, Txid, Writer};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
-use hns_store::{mark_clean_shutdown, ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
+#[cfg(all(test, feature = "rocksdb-backend"))]
+use hns_store::mark_clean_shutdown;
+use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
 use hns_sync::{
     spawn_validation_pipeline, BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult,
     OrphanLimits, OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction,
@@ -54,10 +56,10 @@ use tokio::{
 use super::{
     authority_info, best_block_tip_from_snapshot, best_header_tip_from_snapshot,
     completed_deployment_period_with_lookup, current_unix_time, expected_bits_with_lookup,
-    json_rpc_error, load_block_index_record, load_header_record, median_time_past_with_lookup,
-    mining_generation_from_snapshot, mining_snapshot_for_hash, require_rpc_authorization,
-    AuthorityMode, ChainActivationFailure, DurableMiningState, FailedBlockMutation,
-    FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
+    json_rpc_error, load_block_index_record, load_header_record, mark_node_store_clean,
+    median_time_past_with_lookup, mining_generation_from_snapshot, mining_snapshot_for_hash,
+    require_rpc_authorization, AuthorityMode, ChainActivationFailure, DurableMiningState,
+    FailedBlockMutation, FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
     RpcAuthorizationHeader, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
 };
 use crate::peer_bans::{
@@ -2075,8 +2077,7 @@ impl NodeService {
         };
 
         if terminal_error.is_none() && rpc_result.is_ok() && listener_result.is_ok() {
-            mark_clean_shutdown(&store)
-                .map_err(|error| anyhow::anyhow!("failed to mark node store clean: {error}"))?;
+            mark_node_store_clean(&store, network)?;
         }
         if let Some(error) = terminal_error {
             return Err(error);

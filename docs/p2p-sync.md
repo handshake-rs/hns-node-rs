@@ -378,8 +378,11 @@ and advertised local height advance only after the complete state batch commits.
 
 The supervisor writes clean-shutdown metadata only if shutdown was requested
 normally and both the RPC server and optional P2P listener terminate
-successfully. Unexpected channel or task termination leaves the store marked
-unclean.
+successfully. The clean marker and exact startup-audit commitment are one atomic
+store batch. On entry the next process marks the store unclean before beginning
+recovery validation, so a crash during a long audit cannot preserve the prior
+clean state. Unexpected channel or task termination leaves the store marked
+unclean and forces the exhaustive recovery path.
 
 ## Serving behavior
 

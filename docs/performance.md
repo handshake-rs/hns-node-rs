@@ -151,13 +151,17 @@ difficulty, finality, branch, contextual state, scripts, covenants, claims,
 airdrops, name state, tree-root, and undo validation remain on their existing
 authoritative paths. A malformed member rejects the complete pre-commit group.
 
-Startup still performs the exhaustive durable-chain audit after both clean and
-unclean shutdowns. Current, committed, and interval-pinned Urkel roots are now
-verified through one depth-sensitive reachable-union traversal. This preserves
-canonical decoding, record-hash, missing-child, non-empty-child, and maximum
-path-depth checks for every retained root while avoiding repeated reads of
-shared historical subtrees. The active height, block/header/body, deployment,
-undo, root-continuity, and snapshot-pin audit remains exhaustive and unchanged.
+Unclean startup, first startup after upgrade, and any stale or corrupt audit
+checkpoint perform the exhaustive materialized-name rebuild and the
+depth-sensitive reachable-union traversal of current, committed, and
+interval-pinned Urkel roots. A clean shutdown now atomically binds a checksummed
+audit checkpoint to the exact durable identity. When it matches, startup checks
+the canonical encoding and content hash of every retained root record without
+walking shared descendants or rebuilding the materialized name tree. The active
+height, block/header/body, deployment, undo, root-continuity, and
+snapshot-pin-to-chain audit remains exhaustive in both routes. The process
+marks the database unclean before either audit starts, preventing a crash during
+startup from preserving an older clean marker.
 
 Production qualification still needs full mainnet IBD on persistent NVMe,
 P50/P95/P99/max storage and compaction latency, loaded-mempool templates,

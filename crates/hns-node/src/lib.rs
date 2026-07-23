@@ -64,14 +64,15 @@ use hns_rpc::{
 use hns_state::{
     connect_block_to_batch_with_services, decode_coin, decode_name_state,
     disconnect_block_to_batch, load_name_tree_snapshot_pins, load_stored_name_tree_commit_root,
-    stage_name_tree_node_compaction, validate_persisted_name_trees, verify_stored_name_tree_root,
-    AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock,
-    NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine,
+    load_stored_name_tree_root, stage_name_tree_node_compaction, validate_persisted_name_tree_root,
+    validate_persisted_name_trees, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
+    BlockUndo, ConnectBlock, DisconnectBlock, NameTreeCompactionSummary, NameTreeSnapshotPin,
+    StateError, StateServices, StoredStateEngine,
 };
 use hns_store::{
-    decode_u64, encode_u64, mark_clean_shutdown, mark_unclean_start, open_store,
-    was_clean_shutdown, ColumnFamily, DurabilityPolicy, MetaKey, ReadSnapshot, StagingOverlay,
-    Store, StoreBackend, StoreConfig, StoreHandle, WriteBatch, SCHEMA_VERSION, STORAGE_PROFILE,
+    decode_u64, encode_u64, mark_unclean_start, open_store, was_clean_shutdown, ColumnFamily,
+    DurabilityPolicy, MetaKey, ReadSnapshot, StagingOverlay, Store, StoreBackend, StoreConfig,
+    StoreHandle, WriteBatch, SCHEMA_VERSION, STORAGE_PROFILE,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -94,6 +95,10 @@ const UNDO_PRUNING_CHECKPOINT_VERSION: u32 = 1;
 const UNDO_PRUNING_CHECKPOINT_BODY_SIZE: usize = 4 + 4 + 32 + 8;
 const UNDO_PRUNING_CHECKPOINT_SIZE: usize = UNDO_PRUNING_CHECKPOINT_BODY_SIZE + 32;
 const MAX_UNDO_PRUNES_PER_BATCH: usize = 1_024;
+const STARTUP_AUDIT_CHECKPOINT_KEY: &[u8] = b"startup-audit/v1";
+const STARTUP_AUDIT_CHECKPOINT_VERSION: u32 = 1;
+const STARTUP_AUDIT_CHECKPOINT_BODY_SIZE: usize = 4 + 32;
+const STARTUP_AUDIT_CHECKPOINT_SIZE: usize = STARTUP_AUDIT_CHECKPOINT_BODY_SIZE + 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -326,6 +331,172 @@ impl NameTreeCompactionCheckpoint {
         }
         Ok(())
     }
+}
+
+/// Checksummed commitment to the exact durable identity whose expensive
+/// materialized-name and retained-Urkel traversals completed during an earlier
+/// process lifetime. The clean-shutdown marker and this checkpoint are written
+/// in the same atomic batch. Unclean starts and any identity mismatch retain
+/// the exhaustive audit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StartupAuditCheckpoint {
+    state_digest: [u8; 32],
+}
+
+impl StartupAuditCheckpoint {
+    fn capture(snapshot: &impl ReadSnapshot, network: Network) -> Result<Self> {
+        let mut writer = Writer::new();
+        writer.write_u32(SCHEMA_VERSION);
+        writer.write_u8(network.canonical_id());
+        writer.write_bytes(network.params().genesis_hash.as_bytes());
+        writer.write_varbytes(STORAGE_PROFILE);
+        writer.write_u64(chain_epoch_from_snapshot(snapshot)?);
+        writer.write_u64(mining_generation_from_snapshot(snapshot)?);
+        write_startup_audit_tip(&mut writer, best_header_tip_from_snapshot(snapshot)?);
+        write_startup_audit_tip(&mut writer, best_block_tip_from_snapshot(snapshot)?);
+
+        let name_tree_root = load_stored_name_tree_root(snapshot)
+            .map_err(|error| anyhow::anyhow!("failed to capture name-tree root: {error}"))?;
+        let committed_tree_root = load_stored_name_tree_commit_root(snapshot).map_err(|error| {
+            anyhow::anyhow!("failed to capture committed name-tree root: {error}")
+        })?;
+        writer.write_bytes(name_tree_root.as_bytes());
+        writer.write_bytes(committed_tree_root.as_bytes());
+
+        let airdrop_field = snapshot
+            .get(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes())
+            .context("failed to capture durable airdrop field")?
+            .ok_or_else(|| anyhow::anyhow!("durable airdrop field is missing"))?;
+        writer.write_varbytes(&airdrop_field);
+
+        let mut pins = load_name_tree_snapshot_pins(snapshot)
+            .map_err(|error| anyhow::anyhow!("failed to capture name-tree pins: {error}"))?;
+        pins.sort_by_key(|pin| pin.height);
+        writer.write_u64(u64::try_from(pins.len())?);
+        for pin in pins {
+            writer.write_u32(pin.height);
+            writer.write_bytes(pin.block_hash.as_bytes());
+            writer.write_bytes(pin.root.as_bytes());
+        }
+
+        write_startup_audit_optional_digest(
+            &mut writer,
+            snapshot
+                .get(ColumnFamily::Snapshots, UNDO_PRUNING_CHECKPOINT_KEY)
+                .context("failed to capture undo-pruning checkpoint")?,
+        );
+        write_startup_audit_optional_digest(
+            &mut writer,
+            snapshot
+                .get(ColumnFamily::Snapshots, NAME_TREE_COMPACTION_CHECKPOINT_KEY)
+                .context("failed to capture name-tree compaction checkpoint")?,
+        );
+
+        Ok(Self {
+            state_digest: blake2b_256(&writer.finish()),
+        })
+    }
+
+    fn encode(self) -> Vec<u8> {
+        let mut writer = Writer::with_capacity(STARTUP_AUDIT_CHECKPOINT_SIZE);
+        writer.write_u32(STARTUP_AUDIT_CHECKPOINT_VERSION);
+        writer.write_bytes(&self.state_digest);
+        let mut raw = writer.finish();
+        debug_assert_eq!(raw.len(), STARTUP_AUDIT_CHECKPOINT_BODY_SIZE);
+        raw.extend_from_slice(&blake2b_256(&raw));
+        raw
+    }
+
+    fn decode(raw: &[u8]) -> Result<Self> {
+        if raw.len() != STARTUP_AUDIT_CHECKPOINT_SIZE {
+            anyhow::bail!(
+                "startup-audit checkpoint contains {} bytes; expected {STARTUP_AUDIT_CHECKPOINT_SIZE}",
+                raw.len()
+            );
+        }
+        let (body, checksum) = raw.split_at(STARTUP_AUDIT_CHECKPOINT_BODY_SIZE);
+        if checksum != blake2b_256(body) {
+            anyhow::bail!("startup-audit checkpoint checksum mismatch");
+        }
+        let mut reader = Reader::new(body, STARTUP_AUDIT_CHECKPOINT_BODY_SIZE)?;
+        let version = reader.read_u32()?;
+        if version != STARTUP_AUDIT_CHECKPOINT_VERSION {
+            anyhow::bail!("unsupported startup-audit checkpoint version {version}");
+        }
+        let checkpoint = Self {
+            state_digest: reader.read_hash()?,
+        };
+        reader.ensure_finished()?;
+        Ok(checkpoint)
+    }
+}
+
+fn write_startup_audit_tip(writer: &mut Writer, tip: Option<ChainTip>) {
+    match tip {
+        Some(tip) => {
+            writer.write_u8(1);
+            writer.write_bytes(tip.hash.as_bytes());
+            writer.write_u32(tip.height);
+            writer.write_bytes(tip.chainwork.as_be_bytes());
+        }
+        None => writer.write_u8(0),
+    }
+}
+
+fn write_startup_audit_optional_digest(writer: &mut Writer, value: Option<Vec<u8>>) {
+    match value {
+        Some(value) => {
+            writer.write_u8(1);
+            writer.write_bytes(&blake2b_256(&value));
+        }
+        None => writer.write_u8(0),
+    }
+}
+
+fn load_startup_audit_checkpoint(
+    snapshot: &impl ReadSnapshot,
+) -> Result<Option<StartupAuditCheckpoint>> {
+    snapshot
+        .get(ColumnFamily::Snapshots, STARTUP_AUDIT_CHECKPOINT_KEY)
+        .context("failed to read startup-audit checkpoint")?
+        .map(|raw| StartupAuditCheckpoint::decode(&raw))
+        .transpose()
+}
+
+fn mark_node_store_clean(store: &StoreHandle, network: Network) -> Result<()> {
+    let snapshot = store.snapshot()?;
+    let checkpoint = StartupAuditCheckpoint::capture(&snapshot, network)?.encode();
+    drop(snapshot);
+
+    // Publish the checkpoint and clean marker atomically. A clean marker can
+    // therefore never refer to a missing or older audit identity.
+    let mut batch = store.batch();
+    batch
+        .put(
+            ColumnFamily::Snapshots,
+            STARTUP_AUDIT_CHECKPOINT_KEY,
+            &checkpoint,
+        )
+        .context("failed to stage startup-audit checkpoint")?;
+    batch
+        .put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[1])
+        .context("failed to stage clean-shutdown marker")?;
+    store
+        .commit(batch)
+        .context("failed to commit clean startup-audit checkpoint")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupAuditKind {
+    Exhaustive,
+    CleanCheckpoint,
+}
+
+#[derive(Clone, Debug)]
+struct StartupLifecycle {
+    previous_shutdown_clean: bool,
+    audit: StartupAuditKind,
+    checkpoint_warning: Option<String>,
 }
 
 impl AuthorityMode {
@@ -820,17 +991,38 @@ impl NodeService {
             }
         }
 
-        let previous_shutdown_clean = was_clean_shutdown(&state.store)
-            .map_err(|error| anyhow::anyhow!("failed to read shutdown marker: {error}"))?;
-        if !previous_shutdown_clean {
-            // Durable invariants were checked by NodeState construction. Keep the
-            // signal visible while still allowing deterministic recovery paths.
-            tracing::warn!(
-                "hsrd store was not marked clean at the previous shutdown; durable invariants were revalidated"
-            );
+        if let Some(lifecycle) = state.startup_lifecycle.take() {
+            if let Some(warning) = lifecycle.checkpoint_warning {
+                tracing::warn!(
+                    warning,
+                    "clean startup checkpoint was unreadable; exhaustive durable invariants were revalidated"
+                );
+            }
+            match (lifecycle.previous_shutdown_clean, lifecycle.audit) {
+                (true, StartupAuditKind::CleanCheckpoint) => tracing::info!(
+                    "clean startup checkpoint matched; durable roots received targeted validation"
+                ),
+                (true, StartupAuditKind::Exhaustive) => tracing::warn!(
+                    "clean startup checkpoint was missing or stale; durable invariants were exhaustively revalidated"
+                ),
+                (false, _) => tracing::warn!(
+                    "hsrd store was not marked clean at the previous shutdown; durable invariants were exhaustively revalidated"
+                ),
+            }
+        } else {
+            // Caller-supplied state already received exhaustive validation, but
+            // it did not claim the process lifecycle during construction.
+            let previous_shutdown_clean = was_clean_shutdown(&state.store)
+                .map_err(|error| anyhow::anyhow!("failed to read shutdown marker: {error}"))?;
+            if !previous_shutdown_clean {
+                tracing::warn!(
+                    "hsrd store was not marked clean at the previous shutdown; durable invariants were exhaustively revalidated"
+                );
+            }
+            mark_unclean_start(&state.store).map_err(|error| {
+                anyhow::anyhow!("failed to mark running store unclean: {error}")
+            })?;
         }
-        mark_unclean_start(&state.store)
-            .map_err(|error| anyhow::anyhow!("failed to mark running store unclean: {error}"))?;
 
         let durable = state.durable_mining_state()?;
         let initial = if durable_tip_can_authorize(&config, &durable) {
@@ -1204,9 +1396,7 @@ impl NodeService {
         )
         .await;
         if result.is_ok() {
-            mark_clean_shutdown(&self.state.store).map_err(|error| {
-                anyhow::anyhow!("failed to mark node store clean at shutdown: {error}")
-            })?;
+            mark_node_store_clean(&self.state.store, self.config.network)?;
         }
         result?;
         tracing::info!("hsrd rpc server stopped");
@@ -1713,6 +1903,7 @@ struct NodeReorgMutation {
 pub struct NodeState {
     network: Network,
     undo_retention_policy: Option<UndoRetentionPolicy>,
+    startup_lifecycle: Option<StartupLifecycle>,
     pub store: StoreHandle,
     pub chain: StoredHeaderIndex<StoreHandle>,
     pub blocks: StoredBlockIndex<StoreHandle>,
@@ -1740,8 +1931,37 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to open node store: {error}"))?,
             None => StoreHandle::memory(),
         };
+        bind_store_identity(&store, config.network)?;
+        let previous_shutdown_clean = was_clean_shutdown(&store)
+            .map_err(|error| anyhow::anyhow!("failed to read shutdown marker: {error}"))?;
 
-        Self::from_store_for_network(store, config.network)
+        // Claim the store before any potentially long recovery validation. A
+        // crash during the audit must never preserve the preceding process's
+        // clean marker and incorrectly authorize the next fast path.
+        mark_unclean_start(&store)
+            .map_err(|error| anyhow::anyhow!("failed to mark running store unclean: {error}"))?;
+
+        let (checkpoint, checkpoint_warning) = if previous_shutdown_clean {
+            let snapshot = store.snapshot()?;
+            match load_startup_audit_checkpoint(&snapshot) {
+                Ok(checkpoint) => (checkpoint, None),
+                Err(error) => (None, Some(format!("{error:#}"))),
+            }
+        } else {
+            (None, None)
+        };
+        let (mut state, audit) = Self::from_store_for_network_with_startup_audit(
+            store,
+            config.network,
+            None,
+            checkpoint.as_ref(),
+        )?;
+        state.startup_lifecycle = Some(StartupLifecycle {
+            previous_shutdown_clean,
+            audit,
+            checkpoint_warning,
+        });
+        Ok(state)
     }
 
     pub fn from_store_for_network(store: StoreHandle, network: Network) -> Result<Self> {
@@ -1753,6 +1973,16 @@ impl NodeState {
         network: Network,
         undo_retention_policy: Option<UndoRetentionPolicy>,
     ) -> Result<Self> {
+        Self::from_store_for_network_with_startup_audit(store, network, undo_retention_policy, None)
+            .map(|(state, _)| state)
+    }
+
+    fn from_store_for_network_with_startup_audit(
+        store: StoreHandle,
+        network: Network,
+        undo_retention_policy: Option<UndoRetentionPolicy>,
+        checkpoint: Option<&StartupAuditCheckpoint>,
+    ) -> Result<(Self, StartupAuditKind)> {
         bind_store_identity(&store, network)?;
         let chain = StoredHeaderIndex::new(store.clone())
             .map_err(|error| anyhow::anyhow!("failed to initialize header index: {error}"))?;
@@ -1765,18 +1995,29 @@ impl NodeState {
         let state = Self {
             network,
             undo_retention_policy,
+            startup_lifecycle: None,
             store,
             chain,
             blocks,
             state_engine,
             mempool: MemoryMempool::new(),
         };
-        state.validate_durable_chain_invariants()?;
-        Ok(state)
+        let audit = state.validate_durable_chain_invariants(checkpoint)?;
+        Ok((state, audit))
     }
 
-    fn validate_durable_chain_invariants(&self) -> Result<()> {
+    fn validate_durable_chain_invariants(
+        &self,
+        checkpoint: Option<&StartupAuditCheckpoint>,
+    ) -> Result<StartupAuditKind> {
         let snapshot = self.store.snapshot()?;
+        let checkpoint_matches = checkpoint
+            .map(|checkpoint| {
+                StartupAuditCheckpoint::capture(&snapshot, self.network)
+                    .map(|current| current == *checkpoint)
+            })
+            .transpose()?
+            .unwrap_or(false);
         if let Some(checkpoint) = load_name_tree_compaction_checkpoint(&snapshot)? {
             let record = load_block_index_record(&snapshot, &checkpoint.tip)?.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -1792,8 +2033,13 @@ impl NodeState {
                 );
             }
         }
-        let durable_name_tree_root = verify_stored_name_tree_root(&snapshot)
-            .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?;
+        let durable_name_tree_root = if checkpoint_matches {
+            load_stored_name_tree_root(&snapshot)
+                .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?
+        } else {
+            verify_stored_name_tree_root(&snapshot)
+                .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?
+        };
         let durable_name_tree_commit_root =
             load_stored_name_tree_commit_root(&snapshot).map_err(|error| {
                 anyhow::anyhow!("durable name-tree commit invariant failed: {error}")
@@ -1823,15 +2069,25 @@ impl NodeState {
         if name_tree_pins.len() != pin_count {
             anyhow::bail!("durable name-tree snapshot pins contain duplicate heights");
         }
-        validate_persisted_name_trees(
-            &snapshot,
-            [durable_name_tree_root, durable_name_tree_commit_root]
-                .into_iter()
-                .chain(name_tree_pins.values().map(|pin| pin.root)),
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
-        })?;
+        let retained_name_tree_roots = [durable_name_tree_root, durable_name_tree_commit_root]
+            .into_iter()
+            .chain(name_tree_pins.values().map(|pin| pin.root))
+            .collect::<HashSet<_>>();
+        if checkpoint_matches {
+            for root in retained_name_tree_roots {
+                validate_persisted_name_tree_root(&snapshot, root).map_err(|error| {
+                    anyhow::anyhow!(
+                        "durable content-addressed name-tree root invariant failed: {error}"
+                    )
+                })?;
+            }
+        } else {
+            validate_persisted_name_trees(&snapshot, retained_name_tree_roots).map_err(
+                |error| {
+                    anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
+                },
+            )?;
+        }
 
         match active_tip.as_ref() {
             None if !heights.is_empty() => {
@@ -2158,7 +2414,11 @@ impl NodeState {
         // exposed.
         let _ = chain_epoch_from_snapshot(&snapshot)?;
         let _ = mining_generation_from_snapshot(&snapshot)?;
-        Ok(())
+        Ok(if checkpoint_matches {
+            StartupAuditKind::CleanCheckpoint
+        } else {
+            StartupAuditKind::Exhaustive
+        })
     }
 
     pub const fn network(&self) -> Network {
@@ -7041,6 +7301,128 @@ mod tests {
                 .expect_err("content-addressed name-tree corruption");
             assert!(error.to_string().contains("content-addressed"), "{error}");
         }
+    }
+
+    #[test]
+    fn startup_audit_checkpoint_is_checksummed_and_bound_to_durable_identity() {
+        let store = StoreHandle::memory();
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let snapshot = store.snapshot().expect("snapshot");
+        let checkpoint =
+            StartupAuditCheckpoint::capture(&snapshot, Network::Regtest).expect("checkpoint");
+        drop(snapshot);
+
+        let raw = checkpoint.encode();
+        assert_eq!(
+            StartupAuditCheckpoint::decode(&raw).expect("decode checkpoint"),
+            checkpoint
+        );
+        assert_eq!(
+            state
+                .validate_durable_chain_invariants(Some(&checkpoint))
+                .expect("matching audit"),
+            StartupAuditKind::CleanCheckpoint
+        );
+
+        let mut corrupt = raw;
+        *corrupt.last_mut().expect("checksum byte") ^= 1;
+        let error = StartupAuditCheckpoint::decode(&corrupt).expect_err("checksum corruption");
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::ChainEpoch.as_bytes(),
+                &encode_u64(1),
+            )
+            .expect("chain epoch");
+        store.commit(batch).expect("commit identity drift");
+        assert_eq!(
+            state
+                .validate_durable_chain_invariants(Some(&checkpoint))
+                .expect("mismatch falls back to exhaustive audit"),
+            StartupAuditKind::Exhaustive
+        );
+    }
+
+    #[test]
+    fn clean_marker_and_startup_audit_checkpoint_commit_atomically() {
+        let store = StoreHandle::memory();
+        NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        mark_node_store_clean(&store, Network::Regtest).expect("clean checkpoint");
+
+        assert!(was_clean_shutdown(&store).expect("clean marker"));
+        let snapshot = store.snapshot().expect("snapshot");
+        let stored = load_startup_audit_checkpoint(&snapshot)
+            .expect("checkpoint read")
+            .expect("checkpoint");
+        let current =
+            StartupAuditCheckpoint::capture(&snapshot, Network::Regtest).expect("current identity");
+        assert_eq!(stored, current);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn clean_restart_uses_checkpoint_and_failed_startup_stays_unclean() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-startup-audit-{}-{}",
+            std::process::id(),
+            current_unix_time().expect("time")
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let config = NodeConfig {
+            network: Network::Regtest,
+            data_dir: Some(path.clone()),
+            ..NodeConfig::default()
+        };
+        let block_hash;
+
+        {
+            let mut node = NodeService::try_new(config.clone()).expect("initial node");
+            let block = block_with_commitments(vec![coinbase_transaction()]);
+            block_hash = block.hash();
+            node.connect_block(NodeBlockImport::fixture(block, 0, 1))
+                .expect("connect block");
+            mark_node_store_clean(&node.state.store, Network::Regtest)
+                .expect("clean first process");
+        }
+
+        {
+            let state = NodeState::from_config(&config).expect("clean checkpoint restart");
+            let lifecycle = state.startup_lifecycle.as_ref().expect("service lifecycle");
+            assert!(lifecycle.previous_shutdown_clean);
+            assert_eq!(lifecycle.audit, StartupAuditKind::CleanCheckpoint);
+            assert!(!was_clean_shutdown(&state.store).expect("claimed store is unclean"));
+            mark_node_store_clean(&state.store, Network::Regtest).expect("clean second process");
+        }
+
+        {
+            let store = open_store(&StoreConfig {
+                path: path.join("chain"),
+                backend: StoreBackend::RocksDb,
+                durability: DurabilityPolicy::Sync,
+            })
+            .expect("open fault store");
+            let mut batch = store.batch();
+            batch
+                .delete(ColumnFamily::Blocks, block_hash.as_bytes())
+                .expect("delete active body");
+            store.commit(batch).expect("commit active-body fault");
+        }
+
+        let error = NodeState::from_config(&config).expect_err("startup body audit");
+        assert!(error.to_string().contains("body"), "{error}");
+        let store = open_store(&StoreConfig {
+            path: path.join("chain"),
+            backend: StoreBackend::RocksDb,
+            durability: DurabilityPolicy::Sync,
+        })
+        .expect("reopen failed-start store");
+        assert!(!was_clean_shutdown(&store).expect("failed startup marker"));
+        drop(store);
+        std::fs::remove_dir_all(path).expect("remove startup-audit store");
     }
 
     #[cfg(feature = "rocksdb-backend")]

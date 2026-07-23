@@ -146,6 +146,12 @@ cannot promote a block or grant authority.
   `name-tree-snapshot/v1/<height-be>` for network-interval root pins and
   `name-tree-compaction/v1` for the atomically published last compaction result,
   plus `undo-pruning/v1` for the atomically advanced undo-retirement boundary.
+  `startup-audit/v1` is a checksummed commitment to the schema/profile,
+  network/genesis, best header, active tip, chain epoch, mining generation,
+  working and committed name roots, airdrop field, complete interval-pin set,
+  and maintenance checkpoints. It is written atomically with the clean marker.
+  A missing, corrupt, or mismatched commitment selects exhaustive startup
+  validation rather than authorizing a shortcut.
 - `peers`: `address-book/v1` stores one bounded, checksummed, versioned, and
   network-bound snapshot of discovered IP peers. Each entry retains services,
   advertised time, connection attempts, last success, last attempt, and stable
