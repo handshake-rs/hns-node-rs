@@ -75,6 +75,11 @@ Durable identity binds:
   the current four-core canary host and lets flush/compaction use otherwise idle
   cores; deployment-scale stall, CPU-contention, and memory qualification remain
   required on other hardware profiles.
+- Incremental name-tree updates persist only newly constructed records reachable
+  from that block's final root. Superseded paths constructed within the same
+  atomic update were never durable roots and are not written; records reachable
+  from prior block roots and retained snapshot pins remain content-addressed and
+  independently verifiable.
 - The in-memory backend exists for deterministic tests.
 - SQLite is not a consensus-state backend.
 

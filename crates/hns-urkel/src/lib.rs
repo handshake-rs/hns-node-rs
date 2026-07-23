@@ -732,6 +732,7 @@ where
             None => context.remove(current, key, 0)?.0,
         };
     }
+    context.retain_records_reachable_from(current)?;
 
     Ok(UrkelRecordUpdate {
         root: current,
@@ -749,6 +750,28 @@ impl<F> RecordMutationContext<F>
 where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
 {
+    fn retain_records_reachable_from(&mut self, root: TreeRoot) -> Result<(), UrkelError> {
+        let mut pending = vec![root];
+        let mut reachable = HashSet::with_capacity(self.records.len());
+        while let Some(root) = pending.pop() {
+            if !self.records.contains_key(&root) || !reachable.insert(root) {
+                continue;
+            }
+            let record = self.loaded.get(&root).ok_or_else(|| {
+                UrkelError::InvalidNode(format!(
+                    "constructed urkel record {root:?} is missing from the mutation cache"
+                ))
+            })?;
+            if let UrkelNodeRecord::Internal { left, right, .. } = record {
+                pending.push(*left);
+                pending.push(*right);
+            }
+        }
+        self.records
+            .retain(|record_root, _| reachable.contains(record_root));
+        Ok(())
+    }
+
     fn load_record(&mut self, root: TreeRoot) -> Result<UrkelNodeRecord, UrkelError> {
         if root == TreeRoot::ZERO {
             return Err(UrkelError::InvalidNode(
@@ -2204,6 +2227,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn multi_mutation_update_returns_only_final_reachable_records() {
+        let tree = MemoryUrkel::from_entries(
+            (0..64).map(|index| (key(index), format!("value-{index}").into_bytes())),
+        )
+        .expect("tree");
+        let base_records = tree.node_records().expect("base records");
+        let update = update_record_tree(
+            tree.root(),
+            (8..24).map(|index| {
+                (
+                    key(index),
+                    Some(format!("replacement-{index}").into_bytes()),
+                )
+            }),
+            |hash| Ok(base_records.get(&hash).cloned()),
+        )
+        .expect("multi-mutation update");
+
+        let mut merged = base_records;
+        merged.extend(update.records().clone());
+        let reachable =
+            reachable_record_roots([update.root()], |hash| Ok(merged.get(&hash).cloned()))
+                .expect("reachable final tree");
+        assert!(
+            update
+                .records()
+                .keys()
+                .all(|record_root| reachable.contains(record_root)),
+            "the staged update must not retain superseded intra-block paths"
+        );
     }
 
     #[test]

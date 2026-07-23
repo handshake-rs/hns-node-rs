@@ -159,6 +159,13 @@ background jobs allow flush and compaction work to use otherwise idle cores.
 These bounds replace fourteen independent default caches; they do not by
 themselves constitute deployment-scale compaction or memory-pressure evidence.
 
+A multi-name transition may construct several immutable versions of the same
+Urkel path while applying the block's changes. Before returning the atomic
+update, the record engine now traverses the final root and discards constructed
+records that were superseded inside that block. Historical roots committed by
+earlier blocks remain untouched; only never-committed intermediate paths avoid
+the RocksDB existence checks, writes, and later compaction work.
+
 Unclean startup, first startup after upgrade, and any stale or corrupt audit
 checkpoint perform the exhaustive materialized-name rebuild and the
 depth-sensitive reachable-union traversal of current, committed, and
