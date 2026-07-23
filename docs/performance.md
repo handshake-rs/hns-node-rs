@@ -151,6 +151,14 @@ difficulty, finality, branch, contextual state, scripts, covenants, claims,
 airdrops, name state, tree-root, and undo validation remain on their existing
 authoritative paths. A malformed member rejects the complete pre-commit group.
 
+RocksDB point-lookup and bulk-stream cache domains are now isolated: UTXO,
+name-state, Urkel, header, and index pages share a 192 MiB cache, while raw
+blocks and undo pages share 32 MiB. Full Bloom filters and cached high-priority
+index/filter blocks reduce negative and point-lookup amplification, and four
+background jobs allow flush and compaction work to use otherwise idle cores.
+These bounds replace fourteen independent default caches; they do not by
+themselves constitute deployment-scale compaction or memory-pressure evidence.
+
 Unclean startup, first startup after upgrade, and any stale or corrupt audit
 checkpoint perform the exhaustive materialized-name rebuild and the
 depth-sensitive reachable-union traversal of current, committed, and

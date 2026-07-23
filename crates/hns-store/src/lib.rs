@@ -24,6 +24,17 @@ pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v10";
 pub const AIRDROP_FIELD_BITS: usize = 217_557;
 pub const AIRDROP_FIELD_BYTES: usize = AIRDROP_FIELD_BITS.div_ceil(8);
 
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_POINT_CACHE_BYTES: usize = 192 * 1024 * 1024;
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_BULK_CACHE_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_BLOOM_BITS_PER_KEY: f64 = 10.0;
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_BACKGROUND_JOBS: i32 = 4;
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_BULK_BLOCK_BYTES: usize = 32 * 1024;
+
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -784,10 +795,27 @@ enum MemoryOperation {
 }
 
 #[cfg(feature = "rocksdb-backend")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RocksStore {
     db: Arc<rocksdb::DB>,
     durability: DurabilityPolicy,
+    // Keep both shared caches alive for exactly as long as the DB. Separating
+    // large, mostly one-pass block/undo pages prevents them from evicting hot
+    // UTXO, name-state, and Urkel point-lookup pages.
+    point_cache: rocksdb::Cache,
+    bulk_cache: rocksdb::Cache,
+}
+
+#[cfg(feature = "rocksdb-backend")]
+impl fmt::Debug for RocksStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RocksStore")
+            .field("durability", &self.durability)
+            .field("point_cache_usage", &self.point_cache.get_usage())
+            .field("bulk_cache_usage", &self.bulk_cache.get_usage())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "rocksdb-backend")]
@@ -800,15 +828,24 @@ impl RocksStore {
         path: impl AsRef<std::path::Path>,
         durability: DurabilityPolicy,
     ) -> Result<Self, StoreError> {
-        use rocksdb::{ColumnFamilyDescriptor, Options};
+        use rocksdb::{Cache, ColumnFamilyDescriptor, Options};
 
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
+        db_options.set_max_background_jobs(ROCKS_BACKGROUND_JOBS);
 
-        let descriptors = ColumnFamily::ALL
-            .into_iter()
-            .map(|family| ColumnFamilyDescriptor::new(family.name(), Options::default()));
+        let point_cache = Cache::new_lru_cache(ROCKS_POINT_CACHE_BYTES);
+        let bulk_cache = Cache::new_lru_cache(ROCKS_BULK_CACHE_BYTES);
+
+        let descriptors = ColumnFamily::ALL.into_iter().map(|family| {
+            let cache = if matches!(family, ColumnFamily::Blocks | ColumnFamily::Undo) {
+                &bulk_cache
+            } else {
+                &point_cache
+            };
+            ColumnFamilyDescriptor::new(family.name(), rocks_column_family_options(family, cache))
+        });
 
         let db = rocksdb::DB::open_cf_descriptors(&db_options, path, descriptors)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
@@ -816,6 +853,8 @@ impl RocksStore {
         Ok(Self {
             db: Arc::new(db),
             durability,
+            point_cache,
+            bulk_cache,
         })
     }
 
@@ -823,6 +862,25 @@ impl RocksStore {
         db.cf_handle(family.name())
             .ok_or_else(|| StoreError::MissingColumnFamily(family.name()))
     }
+}
+
+#[cfg(feature = "rocksdb-backend")]
+fn rocks_column_family_options(family: ColumnFamily, cache: &rocksdb::Cache) -> rocksdb::Options {
+    use rocksdb::{BlockBasedOptions, Options};
+
+    let mut table = BlockBasedOptions::default();
+    table.set_block_cache(cache);
+    table.set_bloom_filter(ROCKS_BLOOM_BITS_PER_KEY, false);
+    table.set_optimize_filters_for_memory(true);
+    table.set_cache_index_and_filter_blocks(true);
+    table.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    if matches!(family, ColumnFamily::Blocks | ColumnFamily::Undo) {
+        table.set_block_size(ROCKS_BULK_BLOCK_BYTES);
+    }
+
+    let mut options = Options::default();
+    options.set_block_based_table_factory(&table);
+    options
 }
 
 #[cfg(feature = "rocksdb-backend")]
@@ -1680,6 +1738,38 @@ mod tests {
         let store =
             RocksStore::open_with_durability(&path, DurabilityPolicy::Wal).expect("open rocksdb");
         assert_eq!(store.durability, DurabilityPolicy::Wal);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_store_configures_bounded_cache_domains() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-rocks-cache-domain-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let store = RocksStore::open(&path).expect("open rocksdb");
+
+        let point_cf = RocksStore::cf(&store.db, ColumnFamily::NameTreeNodes).expect("point cf");
+        let bulk_cf = RocksStore::cf(&store.db, ColumnFamily::Blocks).expect("bulk cf");
+        assert_eq!(
+            store
+                .db
+                .property_int_value_cf(point_cf, rocksdb::properties::BLOCK_CACHE_CAPACITY)
+                .expect("point cache capacity"),
+            Some(ROCKS_POINT_CACHE_BYTES as u64)
+        );
+        assert_eq!(
+            store
+                .db
+                .property_int_value_cf(bulk_cf, rocksdb::properties::BLOCK_CACHE_CAPACITY)
+                .expect("bulk cache capacity"),
+            Some(ROCKS_BULK_CACHE_BYTES as u64)
+        );
+        assert!(format!("{store:?}").contains("point_cache_usage"));
+
         drop(store);
         let _ = std::fs::remove_dir_all(&path);
     }

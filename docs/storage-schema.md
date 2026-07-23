@@ -66,6 +66,15 @@ Durable identity binds:
 - Required behavior: column families, atomic batches, true read snapshots,
   prefix iteration, bounded caches, explicit compaction policy, and crash
   recovery.
+- Point-oriented column families share one bounded 192 MiB LRU block cache;
+  raw blocks and undo data use a separate 32 MiB cache so one-pass replay reads
+  cannot evict hot UTXO, name-state, or Urkel pages. Every column family uses a
+  10-bit full Bloom filter, cached high-priority index/filter blocks, and pinned
+  level-zero index/filter blocks. Bulk block/undo data blocks are 32 KiB.
+- RocksDB receives four combined background flush/compaction jobs. This matches
+  the current four-core canary host and lets flush/compaction use otherwise idle
+  cores; deployment-scale stall, CPU-contention, and memory qualification remain
+  required on other hardware profiles.
 - The in-memory backend exists for deterministic tests.
 - SQLite is not a consensus-state backend.
 
