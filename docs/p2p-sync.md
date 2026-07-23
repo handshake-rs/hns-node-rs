@@ -264,8 +264,9 @@ syntax. At HSD historical heights it instead retains the always-on transaction
 start, name DoS limits, and coinbase-height checks while deferring body sanity;
 the worker has height but not sufficient branch evidence to make a durable
 checkpoint decision. A body is then revalidated through the node's strict
-import path, where exact final-checkpoint ancestry selects the historical route
-or fails closed to full validation, and is stored as a non-active block/index
+import path, where ancestry to the nearest configured checkpoint at or above
+the candidate selects the historical route or fails closed to full validation,
+and is stored as a non-active block/index
 record. Pre-connection body storage explicitly clears UTXO, name-state,
 tree-root, undo, and active-chain status bits; the native connector sets them
 only after contextual state validation commits. Retaining an orphan completes the temporary

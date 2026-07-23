@@ -41,8 +41,8 @@ use hns_chain::{
 };
 use hns_consensus::{
     advance_threshold_state, expected_next_bits, validate_block_finality, validate_coinbase_height,
-    validate_transaction_start, ConsensusParams, Deployment, DeploymentPeriod, DeploymentState,
-    DifficultyPoint, HeaderConsensus, HeaderParent, HeaderValidationContext,
+    validate_transaction_start, Checkpoint, ConsensusParams, Deployment, DeploymentPeriod,
+    DeploymentState, DifficultyPoint, HeaderConsensus, HeaderParent, HeaderValidationContext,
     HistoricalScriptPolicy, HistoricalValidationPlan, NameFlags, NativeAirdropSignatureVerifier,
     Network, OpenSslDnssecVerifier, ThresholdState, MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
 };
@@ -3379,12 +3379,23 @@ impl NodeState {
         block_hash: BlockHash,
         validation_status: &BlockStatus,
     ) -> Result<HistoricalValidationPlan> {
-        let Some(checkpoint) = self.network.checkpoints().last().copied() else {
-            return Ok(HistoricalValidationPlan::full());
-        };
-        if height == 0 || height > checkpoint.height {
+        if height == 0 || height > self.network.last_checkpoint() {
             return Ok(HistoricalValidationPlan::full());
         }
+
+        // The first configured checkpoint at or above the candidate is enough
+        // to prove its ancestry. Waiting for the final network checkpoint made
+        // early IBD re-run scripts on thousands of blocks even after a nearer
+        // pinned descendant was already canonical.
+        let Some(checkpoint) = self
+            .network
+            .checkpoints()
+            .iter()
+            .copied()
+            .find(|checkpoint| checkpoint.height >= height)
+        else {
+            return Ok(HistoricalValidationPlan::full());
+        };
 
         let candidate_canonical = self.chain.canonical_hash(height).map_err(|error| {
             anyhow::anyhow!("failed to read canonical header evidence: {error}")
@@ -3402,11 +3413,11 @@ impl NodeState {
 
         Ok(checkpoint_backed_historical_validation_plan(
             self.network,
+            checkpoint,
             height,
             block_hash,
             validation_status,
-            candidate_canonical,
-            checkpoint_canonical,
+            candidate_canonical.zip(checkpoint_canonical),
             checkpoint_record.as_ref(),
         ))
     }
@@ -3928,19 +3939,17 @@ impl Default for NodeState {
 
 fn checkpoint_backed_historical_validation_plan(
     network: Network,
+    checkpoint: Checkpoint,
     candidate_height: Height,
     candidate_hash: BlockHash,
     candidate_status: &BlockStatus,
-    canonical_candidate: Option<BlockHash>,
-    canonical_checkpoint: Option<BlockHash>,
+    canonical_path: Option<(BlockHash, BlockHash)>,
     checkpoint_record: Option<&HeaderRecord>,
 ) -> HistoricalValidationPlan {
     let full = HistoricalValidationPlan::full();
-    let Some(checkpoint) = network.checkpoints().last().copied() else {
-        return full;
-    };
     if candidate_height == 0
         || candidate_height > checkpoint.height
+        || network.checkpoint(checkpoint.height) != Some(checkpoint)
         || !candidate_status.header_context_valid
         || !candidate_status.checkpoint_valid
         || candidate_status.failed
@@ -3951,13 +3960,12 @@ fn checkpoint_backed_historical_validation_plan(
     // At the checkpoint itself the strictly validated candidate hash supplies
     // the evidence even when block delivery did not follow headers-first sync.
     // Earlier candidates must be on the same best validated header path as the
-    // exact final checkpoint. Two canonical-height lookups make that ancestry
+    // exact selected checkpoint. Two canonical-height lookups make that ancestry
     // proof constant-time without consulting the active block-height index.
     let checkpoint_evidenced = if candidate_height == checkpoint.height {
         candidate_hash == checkpoint.hash
     } else {
-        canonical_candidate == Some(candidate_hash)
-            && canonical_checkpoint == Some(checkpoint.hash)
+        canonical_path == Some((candidate_hash, checkpoint.hash))
             && checkpoint_record.is_some_and(|record| {
                 record.hash == checkpoint.hash
                     && record.height == checkpoint.height
@@ -5182,7 +5190,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_route_requires_branch_bound_final_checkpoint_evidence() {
+    fn historical_route_requires_branch_bound_checkpoint_evidence() {
         let checkpoint = *Network::Mainnet
             .checkpoints()
             .last()
@@ -5209,11 +5217,11 @@ mod tests {
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Mainnet,
+                checkpoint,
                 candidate_height,
                 candidate_hash,
                 &status,
-                Some(candidate_hash),
-                Some(checkpoint.hash),
+                Some((candidate_hash, checkpoint.hash)),
                 Some(&checkpoint_record),
             ),
             historical
@@ -5221,11 +5229,11 @@ mod tests {
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Mainnet,
+                checkpoint,
                 candidate_height,
                 candidate_hash,
                 &status,
-                Some(BlockHash::new([0x43; 32])),
-                Some(checkpoint.hash),
+                Some((BlockHash::new([0x43; 32]), checkpoint.hash)),
                 Some(&checkpoint_record),
             ),
             full,
@@ -5234,10 +5242,10 @@ mod tests {
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Mainnet,
+                checkpoint,
                 candidate_height,
                 candidate_hash,
                 &status,
-                Some(candidate_hash),
                 None,
                 Some(&checkpoint_record),
             ),
@@ -5250,11 +5258,11 @@ mod tests {
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Mainnet,
+                checkpoint,
                 candidate_height,
                 candidate_hash,
                 &status,
-                Some(candidate_hash),
-                Some(checkpoint.hash),
+                Some((candidate_hash, checkpoint.hash)),
                 Some(&invalid_checkpoint_record),
             ),
             full,
@@ -5266,11 +5274,11 @@ mod tests {
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Mainnet,
+                checkpoint,
                 candidate_height,
                 candidate_hash,
                 &unverified,
-                Some(candidate_hash),
-                Some(checkpoint.hash),
+                Some((candidate_hash, checkpoint.hash)),
                 Some(&checkpoint_record),
             ),
             full,
@@ -5279,10 +5287,10 @@ mod tests {
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Mainnet,
+                checkpoint,
                 checkpoint.height,
                 checkpoint.hash,
                 &status,
-                None,
                 None,
                 None,
             ),
@@ -5292,23 +5300,23 @@ mod tests {
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Mainnet,
+                checkpoint,
                 checkpoint.height,
                 BlockHash::new([0x45; 32]),
                 &status,
                 None,
                 None,
-                None,
             ),
             full,
-            "a wrong hash at the final checkpoint must fail closed"
+            "a wrong hash at the selected checkpoint must fail closed"
         );
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Mainnet,
+                checkpoint,
                 checkpoint.height + 1,
                 BlockHash::new([0x44; 32]),
                 &status,
-                None,
                 None,
                 None,
             ),
@@ -5317,15 +5325,61 @@ mod tests {
         assert_eq!(
             checkpoint_backed_historical_validation_plan(
                 Network::Regtest,
+                checkpoint,
                 1,
                 candidate_hash,
                 &status,
-                Some(candidate_hash),
                 None,
                 None,
             ),
             full,
             "networks without checkpoints never select the shortcut"
+        );
+
+        let intermediate = Network::Mainnet.checkpoints()[2];
+        assert_eq!(
+            checkpoint_backed_historical_validation_plan(
+                Network::Mainnet,
+                intermediate,
+                intermediate.height,
+                intermediate.hash,
+                &status,
+                None,
+                None,
+            ),
+            historical,
+            "an exact configured intermediate checkpoint must authorize its own height"
+        );
+        assert_eq!(
+            checkpoint_backed_historical_validation_plan(
+                Network::Mainnet,
+                intermediate,
+                intermediate.height + 1,
+                BlockHash::new([0x46; 32]),
+                &status,
+                None,
+                None,
+            ),
+            full,
+            "an intermediate checkpoint must not authorize later blocks"
+        );
+
+        let unknown = Checkpoint {
+            height: intermediate.height,
+            hash: BlockHash::new([0x47; 32]),
+        };
+        assert_eq!(
+            checkpoint_backed_historical_validation_plan(
+                Network::Mainnet,
+                unknown,
+                unknown.height,
+                unknown.hash,
+                &status,
+                None,
+                None,
+            ),
+            full,
+            "an unconfigured checkpoint value must fail closed"
         );
     }
 

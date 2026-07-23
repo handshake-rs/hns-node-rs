@@ -370,8 +370,10 @@ NODE_BACKEND=js npm run hsrd-mainnet-deployment-history --prefix hsd-oracle
 ```
 
 Node regressions decode HSD's real height-258,026 header and require both the
-candidate and that exact final checkpoint to occupy the same best validated
-header path before selecting the historical plan. Consensus regressions split
+candidate and the selected configured descendant checkpoint to occupy the same
+best validated header path before selecting the historical plan. They also
+prove that an exact intermediate checkpoint authorizes no later height and
+that an unconfigured checkpoint value fails closed. Consensus regressions split
 full body sanity from the historical commitment/name-limit stages and prove a
 malformed exclusive covenant returns an error rather than panicking. State
 regressions prove the BID/REDEEM NameState exception; coordinated maturity,
