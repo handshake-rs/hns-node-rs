@@ -200,7 +200,10 @@ The implemented layout is an append-only, generation-based Urkel record store:
    changed records.
 4. Group breadth-first path reads by `(segment, page)` and issue one read per
    unique page. This replaces one LSM lookup per node with page-coalesced
-   traversal while preserving the same hashing work.
+   traversal while preserving the same hashing work. Exhaustive page-backed
+   startup validation uses a bounded 65,536-root window so a mainnet tree needs
+   hundreds of page plans rather than tens of thousands; the legacy-only
+   validator keeps its conservative 1,024-key window.
 5. For a state transaction, append and sync segment data before committing the
    RocksDB root locator and chain-state batch. A crash before the batch leaves
    an unreachable tail; a committed locator can never reference unsynced data.

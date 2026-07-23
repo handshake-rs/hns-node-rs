@@ -68,11 +68,12 @@ use hns_state::{
     load_stored_name_tree_root, migrate_name_tree_interval_accumulator, name_page_root_key,
     pack_name_page_records, stage_remove_name_tree_snapshot_pin, stream_name_page_tree,
     validate_persisted_name_tree_root, validate_persisted_name_trees,
-    verify_name_tree_interval_state, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
-    BlockUndo, ConnectBlock, DisconnectBlock, NamePageRootLocator, NamePageRootRecord,
-    NamePageSnapshot, NamePageState, NamePageTreeReader, NameTreeCompactionSummary,
-    NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine, TreeRoot,
-    NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
+    validate_persisted_name_trees_with_batch, verify_name_tree_interval_state,
+    verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock,
+    DisconnectBlock, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState,
+    NamePageTreeReader, NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices,
+    StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
+    NAME_PAGE_STATE_KEY,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_unclean_start, open_store, truncate_name_pages_to_committed_tail,
@@ -94,6 +95,7 @@ const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
 const DEPLOYMENT_STATE_CACHE_VERSION: u8 = 1;
 const DEPLOYMENT_STATE_CACHE_SIZE: usize = 1 + 4 + 4;
 const TRANSACTION_INDEX_MODE_KEY: &[u8] = b"transaction-index-mode/v1";
+const PAGE_BACKED_STARTUP_VALIDATION_BATCH: usize = 65_536;
 const TRANSACTION_INDEX_MODE_VERSION: u8 = 1;
 const TRANSACTION_INDEX_MODE_BODY_BYTES: usize = 2;
 const TRANSACTION_INDEX_MODE_BYTES: usize = TRANSACTION_INDEX_MODE_BODY_BYTES + 32;
@@ -2788,11 +2790,18 @@ impl NodeState {
                 })?;
             }
         } else {
-            validate_persisted_name_trees(&snapshot, retained_name_tree_roots).map_err(
-                |error| {
-                    anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
-                },
-            )?;
+            let validation = if page_reader.is_some() {
+                validate_persisted_name_trees_with_batch(
+                    &snapshot,
+                    retained_name_tree_roots,
+                    PAGE_BACKED_STARTUP_VALIDATION_BATCH,
+                )
+            } else {
+                validate_persisted_name_trees(&snapshot, retained_name_tree_roots)
+            };
+            validation.map_err(|error| {
+                anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
+            })?;
         }
 
         match active_tip.as_ref() {

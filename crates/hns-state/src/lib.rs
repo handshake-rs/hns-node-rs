@@ -2672,7 +2672,19 @@ where
 {
     const STARTUP_VALIDATION_BATCH: usize = 1_024;
 
-    validate_record_trees_batched(roots, STARTUP_VALIDATION_BATCH, |node_roots| {
+    validate_persisted_name_trees_with_batch(snapshot, roots, STARTUP_VALIDATION_BATCH)
+}
+
+pub fn validate_persisted_name_trees_with_batch<T, I>(
+    snapshot: &T,
+    roots: I,
+    maximum_batch: usize,
+) -> Result<usize, StateError>
+where
+    T: ReadSnapshot,
+    I: IntoIterator<Item = TreeRoot>,
+{
+    validate_record_trees_batched(roots, maximum_batch, |node_roots| {
         let keys = node_roots
             .iter()
             .map(|root| root.as_bytes().as_slice())
