@@ -12,9 +12,10 @@ pub use name_page::{
 pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,
     plan_segment_page_reads, scan_segment_prefix, truncate_segment_to_committed_tail,
-    SegmentAppender, SegmentArchive, SegmentError, SegmentFileInspection, SegmentKind,
-    SegmentLocator, SegmentManifest, SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan,
-    SegmentValueLocator, SEGMENT_MAX_HINTS, SEGMENT_PAGE_BYTES, SEGMENT_TARGET_BYTES,
+    SegmentAppender, SegmentArchive, SegmentArchiveScrub, SegmentChannelScrub, SegmentError,
+    SegmentFileInspection, SegmentKind, SegmentLocator, SegmentManifest, SegmentPageRead,
+    SegmentRecord, SegmentRecordRef, SegmentScan, SegmentValueLocator, SEGMENT_MAX_HINTS,
+    SEGMENT_PAGE_BYTES, SEGMENT_TARGET_BYTES,
 };
 
 use std::{
@@ -22,7 +23,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt,
     marker::PhantomData,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     str::FromStr,
     sync::{Arc, RwLock},
@@ -41,6 +42,8 @@ pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
 pub const PRE_INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
 pub const BLOCK_SEGMENT_MANIFEST_KEY: &[u8] = b"block-segment-manifest/v1";
 pub const UNDO_SEGMENT_MANIFEST_KEY: &[u8] = b"undo-segment-manifest/v1";
+pub const SEGMENT_MIGRATION_MAX_BATCH_RECORDS: usize = 32;
+pub const SEGMENT_MIGRATION_MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// HSD's MSB-first spent-allocation field contains 216,199 airdrop positions
 /// followed by 1,358 faucet positions.
@@ -779,6 +782,28 @@ pub enum StoreHandle {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SegmentFamilyInventory {
+    pub inline_records: u64,
+    pub inline_bytes: u64,
+    pub archived_records: u64,
+    pub archived_frame_bytes: u64,
+    pub locator_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SegmentArchiveInventory {
+    pub blocks: SegmentFamilyInventory,
+    pub undo: SegmentFamilyInventory,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SegmentMigrationReport {
+    pub migrated_records: u64,
+    pub migrated_bytes: u64,
+    pub commits: u64,
+}
+
 impl StoreHandle {
     pub fn memory() -> Self {
         Self::Memory(MemoryStore::new())
@@ -839,6 +864,258 @@ impl StoreHandle {
             archive: Arc::new(archive),
         })
     }
+
+    pub fn segment_archive_inventory(&self) -> Result<SegmentArchiveInventory, StoreError> {
+        let Self::Archived { inner, .. } = self else {
+            return Err(StoreError::Schema(
+                "segment archive inventory requires an archived store".to_owned(),
+            ));
+        };
+        Ok(SegmentArchiveInventory {
+            blocks: segment_family_inventory(inner, ColumnFamily::Blocks)?,
+            undo: segment_family_inventory(inner, ColumnFamily::Undo)?,
+        })
+    }
+
+    pub fn scrub_segment_archive(&self) -> Result<SegmentArchiveScrub, StoreError> {
+        let Self::Archived { archive, .. } = self else {
+            return Err(StoreError::Schema(
+                "segment archive scrub requires an archived store".to_owned(),
+            ));
+        };
+        archive.scrub().map_err(segment_store_error)
+    }
+
+    /// Rewrite legacy inline block and undo values through the archive wrapper
+    /// in bounded, idempotent transactions. The caller must hold exclusive
+    /// ownership of the database (the maintenance CLI enforces this with the
+    /// RocksDB lock and a clean-shutdown marker).
+    pub fn migrate_inline_segment_payloads(
+        &self,
+        batch_records: usize,
+    ) -> Result<SegmentMigrationReport, StoreError> {
+        if !(1..=SEGMENT_MIGRATION_MAX_BATCH_RECORDS).contains(&batch_records) {
+            return Err(StoreError::Schema(
+                format!(
+                    "segment migration batch size must be between 1 and {SEGMENT_MIGRATION_MAX_BATCH_RECORDS}"
+                ),
+            ));
+        }
+        let Self::Archived { inner, .. } = self else {
+            return Err(StoreError::Schema(
+                "segment migration requires an archived store".to_owned(),
+            ));
+        };
+        let mut report = SegmentMigrationReport::default();
+        for family in [ColumnFamily::Blocks, ColumnFamily::Undo] {
+            for prefix in 0u8..=u8::MAX {
+                let keys = inline_segment_keys(inner, family, &[prefix])?;
+                for keys in keys.chunks(batch_records) {
+                    let snapshot = inner.snapshot()?;
+                    let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                    let values = snapshot.get_many(family, &key_refs)?;
+                    drop(snapshot);
+                    if values.len() != keys.len() {
+                        return Err(StoreError::Backend(format!(
+                            "{} multi-get returned {} values for {} keys",
+                            family.name(),
+                            values.len(),
+                            keys.len()
+                        )));
+                    }
+                    let mut batch = self.batch();
+                    let mut staged_records = 0u64;
+                    let mut staged_bytes = 0u64;
+                    for (key, value) in keys.iter().zip(values) {
+                        let value = value.ok_or_else(|| {
+                            StoreError::Schema(format!(
+                                "{} value disappeared during offline segment migration",
+                                family.name()
+                            ))
+                        })?;
+                        if SegmentValueLocator::decode(&value)
+                            .map_err(segment_store_error)?
+                            .is_some()
+                        {
+                            continue;
+                        }
+                        let value_bytes = value.len() as u64;
+                        if value_bytes > SEGMENT_MIGRATION_MAX_BATCH_BYTES {
+                            return Err(StoreError::Schema(format!(
+                                "{} inline value contains {value_bytes} bytes; migration bound is {SEGMENT_MIGRATION_MAX_BATCH_BYTES}",
+                                family.name()
+                            )));
+                        }
+                        if staged_records != 0
+                            && staged_bytes
+                                .checked_add(value_bytes)
+                                .is_none_or(|bytes| bytes > SEGMENT_MIGRATION_MAX_BATCH_BYTES)
+                        {
+                            commit_segment_migration_batch(
+                                self,
+                                batch,
+                                staged_records,
+                                staged_bytes,
+                                &mut report,
+                            )?;
+                            batch = self.batch();
+                            staged_records = 0;
+                            staged_bytes = 0;
+                        }
+                        batch.put(family, key, &value)?;
+                        staged_records = staged_records.checked_add(1).ok_or_else(|| {
+                            StoreError::Schema(
+                                "segment migration staged record count overflow".to_owned(),
+                            )
+                        })?;
+                        staged_bytes = staged_bytes.checked_add(value_bytes).ok_or_else(|| {
+                            StoreError::Schema(
+                                "segment migration staged byte count overflow".to_owned(),
+                            )
+                        })?;
+                    }
+                    commit_segment_migration_batch(
+                        self,
+                        batch,
+                        staged_records,
+                        staged_bytes,
+                        &mut report,
+                    )?;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn create_rocks_checkpoint(&self, directory: &Path) -> Result<(), StoreError> {
+        #[cfg(feature = "rocksdb-backend")]
+        {
+            return match self {
+                Self::Rocks(store) => store.create_checkpoint(directory),
+                Self::Archived { inner, .. } => inner.create_rocks_checkpoint(directory),
+                Self::Memory(_) => Err(StoreError::Backend(
+                    "RocksDB checkpoint requested for memory store".to_owned(),
+                )),
+            };
+        }
+        #[cfg(not(feature = "rocksdb-backend"))]
+        {
+            let _ = directory;
+            Err(StoreError::Backend(
+                "RocksDB checkpoint support is not compiled in".to_owned(),
+            ))
+        }
+    }
+}
+
+fn commit_segment_migration_batch(
+    store: &StoreHandle,
+    batch: StoreHandleBatch,
+    records: u64,
+    bytes: u64,
+    report: &mut SegmentMigrationReport,
+) -> Result<(), StoreError> {
+    if records == 0 {
+        return Ok(());
+    }
+    store.commit(batch)?;
+    report.migrated_records = report
+        .migrated_records
+        .checked_add(records)
+        .ok_or_else(|| StoreError::Schema("segment migration record count overflow".to_owned()))?;
+    report.migrated_bytes = report
+        .migrated_bytes
+        .checked_add(bytes)
+        .ok_or_else(|| StoreError::Schema("segment migration byte count overflow".to_owned()))?;
+    report.commits = report
+        .commits
+        .checked_add(1)
+        .ok_or_else(|| StoreError::Schema("segment migration commit overflow".to_owned()))?;
+    Ok(())
+}
+
+fn segment_family_inventory(
+    store: &StoreHandle,
+    family: ColumnFamily,
+) -> Result<SegmentFamilyInventory, StoreError> {
+    let snapshot = store.snapshot()?;
+    let mut inventory = SegmentFamilyInventory::default();
+    snapshot.visit_prefix(family, b"", &mut |key, value| {
+        validate_segment_key(family, key)?;
+        match SegmentValueLocator::decode(value).map_err(segment_store_error)? {
+            Some(locator) => {
+                let expected = segmented_kind(family).expect("archive family");
+                if locator.kind != expected {
+                    return Err(StoreError::Schema(format!(
+                        "{} locator has {:?} kind",
+                        family.name(),
+                        locator.kind
+                    )));
+                }
+                inventory.archived_records =
+                    inventory.archived_records.checked_add(1).ok_or_else(|| {
+                        StoreError::Schema("segment inventory record count overflow".to_owned())
+                    })?;
+                inventory.archived_frame_bytes = inventory
+                    .archived_frame_bytes
+                    .checked_add(u64::from(locator.locator.frame_length))
+                    .ok_or_else(|| {
+                        StoreError::Schema("segment inventory frame bytes overflow".to_owned())
+                    })?;
+                inventory.locator_bytes = inventory
+                    .locator_bytes
+                    .checked_add(value.len() as u64)
+                    .ok_or_else(|| {
+                    StoreError::Schema("segment inventory locator bytes overflow".to_owned())
+                })?;
+            }
+            None => {
+                inventory.inline_records =
+                    inventory.inline_records.checked_add(1).ok_or_else(|| {
+                        StoreError::Schema("segment inventory record count overflow".to_owned())
+                    })?;
+                inventory.inline_bytes = inventory
+                    .inline_bytes
+                    .checked_add(value.len() as u64)
+                    .ok_or_else(|| {
+                        StoreError::Schema("segment inventory inline bytes overflow".to_owned())
+                    })?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(inventory)
+}
+
+fn inline_segment_keys(
+    store: &StoreHandle,
+    family: ColumnFamily,
+    prefix: &[u8],
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    let snapshot = store.snapshot()?;
+    let mut keys = Vec::new();
+    snapshot.visit_prefix(family, prefix, &mut |key, value| {
+        validate_segment_key(family, key)?;
+        if SegmentValueLocator::decode(value)
+            .map_err(segment_store_error)?
+            .is_none()
+        {
+            keys.push(key.to_vec());
+        }
+        Ok(())
+    })?;
+    Ok(keys)
+}
+
+fn validate_segment_key(family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
+    if key.len() != 32 {
+        return Err(StoreError::Schema(format!(
+            "{} segment key contains {} bytes; expected 32",
+            family.name(),
+            key.len()
+        )));
+    }
+    Ok(())
 }
 
 impl Default for StoreHandle {
@@ -1415,6 +1692,14 @@ impl RocksStore {
             point_cache,
             bulk_cache,
         })
+    }
+
+    pub fn create_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), StoreError> {
+        let checkpoint = rocksdb::checkpoint::Checkpoint::new(&self.db)
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        checkpoint
+            .create_checkpoint(path)
+            .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
     fn cf(db: &rocksdb::DB, family: ColumnFamily) -> Result<&rocksdb::ColumnFamily, StoreError> {
@@ -2655,6 +2940,86 @@ mod tests {
             Some(b"raw block record".to_vec())
         );
         drop(reopened);
+        std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[test]
+    fn inline_archive_migration_is_bounded_idempotent_and_transparent() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-inline-archive-migration-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let raw = StoreHandle::memory();
+        let records = [
+            (ColumnFamily::Blocks, [0x11; 32], b"first block".as_slice()),
+            (ColumnFamily::Blocks, [0x12; 32], b"second block".as_slice()),
+            (ColumnFamily::Undo, [0x21; 32], b"first undo".as_slice()),
+        ];
+        let mut batch = raw.batch();
+        for (family, key, value) in &records {
+            batch.put(*family, key, value).expect("stage inline value");
+        }
+        raw.commit(batch).expect("commit inline values");
+        let archived = raw
+            .clone()
+            .with_segment_archive(directory.clone())
+            .expect("attach archive");
+
+        let before = archived
+            .segment_archive_inventory()
+            .expect("pre-migration inventory");
+        assert_eq!(before.blocks.inline_records, 2);
+        assert_eq!(before.undo.inline_records, 1);
+        assert_eq!(before.blocks.archived_records, 0);
+        assert_eq!(before.undo.archived_records, 0);
+
+        let report = archived
+            .migrate_inline_segment_payloads(1)
+            .expect("migrate inline values");
+        assert_eq!(report.migrated_records, 3);
+        assert_eq!(report.commits, 3);
+        let after = archived
+            .segment_archive_inventory()
+            .expect("post-migration inventory");
+        assert_eq!(after.blocks.inline_records, 0);
+        assert_eq!(after.undo.inline_records, 0);
+        assert_eq!(after.blocks.archived_records, 2);
+        assert_eq!(after.undo.archived_records, 1);
+        for (family, key, value) in records {
+            let stored = raw
+                .snapshot()
+                .expect("raw snapshot")
+                .get(family, &key)
+                .expect("raw value")
+                .expect("raw locator");
+            assert!(SegmentValueLocator::decode(&stored)
+                .expect("decode locator")
+                .is_some());
+            assert_eq!(
+                archived
+                    .snapshot()
+                    .expect("archived snapshot")
+                    .get(family, &key)
+                    .expect("resolved value"),
+                Some(value.to_vec())
+            );
+        }
+        assert_eq!(
+            archived
+                .migrate_inline_segment_payloads(2)
+                .expect("repeat migration"),
+            SegmentMigrationReport::default()
+        );
+        assert!(archived.migrate_inline_segment_payloads(0).is_err());
+        assert!(archived
+            .migrate_inline_segment_payloads(SEGMENT_MIGRATION_MAX_BATCH_RECORDS + 1)
+            .is_err());
+        drop(archived);
         std::fs::remove_dir_all(directory).expect("remove archive fixture");
     }
 

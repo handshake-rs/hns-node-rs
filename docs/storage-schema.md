@@ -355,6 +355,15 @@ final marker changes. Page bootstrap and segment-manifest initialization are
 idempotent; restart truncates unpublished tails. Older or mixed profiles require
 an explicit reindex.
 
+The operator workflow is specified in
+[`storage-rollout.md`](storage-rollout.md). `hsrd-storage-maintenance backup`
+accepts each reviewed source profile and publishes a complete fallback marker
+only after the RocksDB checkpoint and independent external-file copies are
+synced. `inventory` validates every committed archive frame.
+`migrate-inline` converts legacy block/undo values in bounded idempotent
+transactions; mixed inline/locator operation remains supported when disk
+headroom is insufficient.
+
 ## Persistent Urkel status
 
 At each consensus interval, inserts, replacements, and removals traverse only

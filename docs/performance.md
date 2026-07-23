@@ -219,6 +219,13 @@ schema-17 current root is bootstrapped into pages before startup audit; old
 roots. New block and undo payloads use the same fsync-before-publication rule
 with 256 MiB segment rotation and transparent locator resolution.
 
+Normal restart does not re-hash immutable historical block/undo segments.
+Recovery checks that every sealed file exists, removes unpublished future
+segments, and fully validates/truncates only the two bounded active tails.
+Individual historical reads still verify their frame checksum and key.
+`hsrd-storage-maintenance inventory` is the explicit offline O(archive) scrub
+when exhaustive media verification is required.
+
 ## Current RocksDB boundary
 
 Point-oriented column families share a bounded 192 MiB cache. New raw blocks

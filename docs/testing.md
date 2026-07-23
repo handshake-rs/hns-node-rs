@@ -548,6 +548,14 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   directory/payload layout, at least 500 average internal nodes per 64 KiB
   page, sync-before-manifest publication, and recovery of complete or partial
   uncommitted pages to an exact page boundary.
+- Block/undo archive qualification forces physical rotation at a reduced test
+  threshold, rolls back a newly created segment, reopens old and active
+  segments, rejects checksum corruption inside an authoritative manifest, and
+  proves bounded inline migration is transparent and idempotent.
+- Storage-rollout tests create a native RocksDB checkpoint, independently copy
+  external page/segment files, reopen the fallback, and prove later source-file
+  mutation cannot alter the backup. The exact offline marker is required, and
+  its presence blocks normal node startup.
 - Native-sync diagnostics distinguish activation planning, state commit, and
   post-commit time, normalize commit cost by transactions, inputs, outputs, and
   name actions, and expose peer-event and validation-result backlog during the

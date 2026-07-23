@@ -511,3 +511,9 @@ reverse pending intervals. The optional undo-retirement checkpoint uses the
 existing snapshots namespace; once present, `--prune-undo-history` is required
 on subsequent opens. Schema/profile combinations older than 16 or otherwise
 ambiguous still fail closed and require an explicit reindex.
+
+The reviewed offline backup, bounded inline-payload conversion, verification,
+and non-destructive fallback procedure is
+[`docs/storage-rollout.md`](docs/storage-rollout.md). The maintenance marker
+blocks normal node startup, and the maintenance tool requires both RocksDB
+exclusivity and an explicit clean-shutdown record.

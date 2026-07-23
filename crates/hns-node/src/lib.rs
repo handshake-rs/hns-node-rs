@@ -86,6 +86,8 @@ use tracing_subscriber::{fmt, EnvFilter};
 pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 10;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const MAX_RPC_AUTHORIZATION_BYTES: usize = 4_096;
+pub const STORAGE_MAINTENANCE_MARKER: &str = ".hsrd-storage-maintenance";
+pub const STORAGE_MAINTENANCE_MARKER_BODY: &str = "hsrd-storage-maintenance-v1\n";
 
 const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
 const DEPLOYMENT_STATE_CACHE_VERSION: u8 = 1;
@@ -2538,6 +2540,18 @@ impl NodeState {
     }
 
     pub fn from_config(config: &NodeConfig) -> Result<Self> {
+        if let Some(data_dir) = &config.data_dir {
+            let marker = data_dir.join(STORAGE_MAINTENANCE_MARKER);
+            if marker
+                .try_exists()
+                .with_context(|| format!("failed to inspect {}", marker.display()))?
+            {
+                anyhow::bail!(
+                    "offline storage maintenance marker {} is present; remove it only after maintenance and verification complete",
+                    marker.display()
+                );
+            }
+        }
         let store = match &config.data_dir {
             Some(data_dir) => open_store(&StoreConfig {
                 path: data_dir.join("chain"),
@@ -9113,6 +9127,30 @@ mod tests {
         let current =
             StartupAuditCheckpoint::capture(&snapshot, Network::Regtest).expect("current identity");
         assert_eq!(stored, current);
+    }
+
+    #[test]
+    fn offline_storage_maintenance_marker_blocks_node_startup() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-maintenance-marker-{}-{}",
+            std::process::id(),
+            current_unix_time().expect("time")
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create data root");
+        std::fs::write(
+            path.join(STORAGE_MAINTENANCE_MARKER),
+            STORAGE_MAINTENANCE_MARKER_BODY,
+        )
+        .expect("write maintenance marker");
+        let error = NodeState::from_config(&NodeConfig {
+            network: Network::Regtest,
+            data_dir: Some(path.clone()),
+            ..NodeConfig::default()
+        })
+        .expect_err("maintenance marker must block startup");
+        assert!(error.to_string().contains("maintenance marker"), "{error}");
+        std::fs::remove_dir_all(path).expect("remove marker fixture");
     }
 
     #[cfg(feature = "rocksdb-backend")]

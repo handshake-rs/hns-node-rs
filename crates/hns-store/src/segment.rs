@@ -12,6 +12,7 @@ use std::os::unix::fs::FileExt;
 use std::os::windows::fs::FileExt;
 
 use hns_primitives::blake2b_256;
+use serde::Serialize;
 use thiserror::Error;
 
 const SEGMENT_FRAME_MAGIC: &[u8; 8] = b"HSGSEG01";
@@ -229,6 +230,19 @@ pub struct SegmentFileInspection {
     pub torn_tail: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SegmentChannelScrub {
+    pub segments: u64,
+    pub records: u64,
+    pub durable_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SegmentArchiveScrub {
+    pub blocks: SegmentChannelScrub,
+    pub undo: SegmentChannelScrub,
+}
+
 #[derive(Debug)]
 pub struct SegmentAppender {
     file: File,
@@ -370,12 +384,21 @@ pub(crate) struct SegmentArchiveWriter {
 #[derive(Debug)]
 pub struct SegmentArchive {
     directory: PathBuf,
+    target_bytes: u64,
     writer: Mutex<SegmentArchiveWriter>,
     readers: Mutex<HashMap<(SegmentKind, u64, u32), Arc<File>>>,
 }
 
 impl SegmentArchive {
     pub(crate) fn create_new(directory: PathBuf, generation: u64) -> Result<Self, SegmentError> {
+        Self::create_new_with_target(directory, generation, SEGMENT_TARGET_BYTES)
+    }
+
+    fn create_new_with_target(
+        directory: PathBuf,
+        generation: u64,
+        target_bytes: u64,
+    ) -> Result<Self, SegmentError> {
         std::fs::create_dir_all(&directory).map_err(segment_io)?;
         prepare_new_archive_directory(&directory)?;
         let block = create_archive_channel(&directory, SegmentKind::Block, generation, 0)?;
@@ -383,6 +406,7 @@ impl SegmentArchive {
         sync_directory(&directory)?;
         Ok(Self {
             directory,
+            target_bytes,
             writer: Mutex::new(SegmentArchiveWriter { block, undo }),
             readers: Mutex::new(HashMap::new()),
         })
@@ -398,6 +422,7 @@ impl SegmentArchive {
         let undo = recover_archive_channel(&directory, SegmentKind::Undo, undo_manifest)?;
         Ok(Self {
             directory,
+            target_bytes: SEGMENT_TARGET_BYTES,
             writer: Mutex::new(SegmentArchiveWriter { block, undo }),
             readers: Mutex::new(HashMap::new()),
         })
@@ -412,7 +437,7 @@ impl SegmentArchive {
         writer: &mut SegmentArchiveWriter,
         payloads: &mut [ArchivePayload],
     ) -> Result<PreparedArchive, SegmentError> {
-        writer.prepare(&self.directory, payloads)
+        writer.prepare(&self.directory, self.target_bytes, payloads)
     }
 
     pub(crate) fn rollback_locked(
@@ -486,12 +511,28 @@ impl SegmentArchive {
         let writer = self.writer()?;
         Ok((writer.block.manifest, writer.undo.manifest))
     }
+
+    /// Exhaustively checksum every committed frame. Normal startup deliberately
+    /// performs only bounded active-tail recovery; the offline maintenance path
+    /// invokes this full O(archive) scrub explicitly.
+    pub fn scrub(&self) -> Result<SegmentArchiveScrub, SegmentError> {
+        let writer = self.writer()?;
+        Ok(SegmentArchiveScrub {
+            blocks: scrub_archive_channel(
+                &self.directory,
+                SegmentKind::Block,
+                writer.block.manifest,
+            )?,
+            undo: scrub_archive_channel(&self.directory, SegmentKind::Undo, writer.undo.manifest)?,
+        })
+    }
 }
 
 impl SegmentArchiveWriter {
     pub(crate) fn prepare(
         &mut self,
         directory: &Path,
+        target_bytes: u64,
         payloads: &mut [ArchivePayload],
     ) -> Result<PreparedArchive, SegmentError> {
         let mut locators = Vec::with_capacity(payloads.len());
@@ -514,7 +555,7 @@ impl SegmentArchiveWriter {
                 hints: Vec::new(),
                 payload: std::mem::take(&mut payload.payload),
             };
-            rotate_archive_channel_if_due(directory, channel, &record)?;
+            rotate_archive_channel_if_due(directory, channel, &record, target_bytes)?;
             let locator = channel
                 .appender
                 .as_mut()
@@ -590,11 +631,9 @@ fn recover_archive_channel(
     )?;
     for segment in 0..manifest.active_segment {
         let path = archive_file_path(directory, kind, manifest.generation, segment);
-        let inspection = inspect_segment_file(path)?;
-        if inspection.torn_tail {
-            return Err(SegmentError::CommittedTailNotBoundary {
-                committed: inspection.valid_bytes,
-            });
+        let metadata = std::fs::metadata(path).map_err(segment_io)?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(SegmentError::InvalidSealedSegment(segment));
         }
     }
     let path = archive_file_path(
@@ -612,10 +651,48 @@ fn recover_archive_channel(
     })
 }
 
+fn scrub_archive_channel(
+    directory: &Path,
+    kind: SegmentKind,
+    manifest: SegmentManifest,
+) -> Result<SegmentChannelScrub, SegmentError> {
+    let mut scrub = SegmentChannelScrub::default();
+    for segment in 0..=manifest.active_segment {
+        let path = archive_file_path(directory, kind, manifest.generation, segment);
+        let inspection = inspect_segment_file(path)?;
+        if inspection.torn_tail {
+            return Err(SegmentError::CommittedTailNotBoundary {
+                committed: inspection.valid_bytes,
+            });
+        }
+        if segment == manifest.active_segment && inspection.file_bytes != manifest.durable_bytes {
+            return Err(SegmentError::UncommittedTail {
+                committed: manifest.durable_bytes,
+                actual: inspection.file_bytes,
+                torn: false,
+            });
+        }
+        scrub.segments = scrub
+            .segments
+            .checked_add(1)
+            .ok_or(SegmentError::LocatorOverflow)?;
+        scrub.records = scrub
+            .records
+            .checked_add(inspection.records)
+            .ok_or(SegmentError::LocatorOverflow)?;
+        scrub.durable_bytes = scrub
+            .durable_bytes
+            .checked_add(inspection.file_bytes)
+            .ok_or(SegmentError::LocatorOverflow)?;
+    }
+    Ok(scrub)
+}
+
 fn rotate_archive_channel_if_due(
     directory: &Path,
     channel: &mut ArchiveChannel,
     record: &SegmentRecord,
+    target_bytes: u64,
 ) -> Result<(), SegmentError> {
     let encoded_bytes = u64::try_from(encoded_segment_record_length(record)?)
         .map_err(|_| SegmentError::LengthOverflow(record.payload.len()))?;
@@ -628,7 +705,7 @@ fn rotate_archive_channel_if_due(
             .next_offset()
             .checked_add(encoded_bytes)
             .ok_or(SegmentError::LocatorOverflow)?
-            <= SEGMENT_TARGET_BYTES
+            <= target_bytes
     {
         return Ok(());
     }
@@ -834,6 +911,8 @@ pub enum SegmentError {
     Poisoned,
     #[error("cannot initialize an unbound archive over non-empty segment {0}")]
     ArchiveInitializationConflict(String),
+    #[error("sealed segment {0} is missing, empty, or not a regular file")]
+    InvalidSealedSegment(u32),
     #[error(
         "segment file has uncommitted tail: committed {committed}, actual {actual}, torn {torn}"
     )]
@@ -1321,6 +1400,25 @@ mod tests {
         ))
     }
 
+    fn prepare_and_publish(
+        archive: &SegmentArchive,
+        kind: SegmentKind,
+        key: [u8; 32],
+        payload: &[u8],
+    ) -> SegmentValueLocator {
+        let mut payloads = vec![ArchivePayload {
+            kind,
+            key,
+            payload: payload.to_vec(),
+        }];
+        let mut writer = archive.writer().expect("writer");
+        let prepared = archive
+            .prepare_locked(&mut writer, &mut payloads)
+            .expect("prepare payload");
+        writer.commit_prepared(&prepared);
+        prepared.locators[0]
+    }
+
     #[test]
     fn segment_frame_round_trips_canonical_payload_and_local_hints() {
         let expected = record(b"canonical urkel node");
@@ -1396,6 +1494,157 @@ mod tests {
             std::fs::read(&orphan).expect("read preserved orphan"),
             b"unbound payload bytes"
         );
+        std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[test]
+    fn archive_rotation_rollback_and_recovery_preserve_old_and_new_segments() {
+        let directory = test_file();
+        let _ = std::fs::remove_dir_all(&directory);
+        let archive =
+            SegmentArchive::create_new_with_target(directory.clone(), 1, 180).expect("archive");
+        let first_key = [0x81; 32];
+        let second_key = [0x82; 32];
+        let first_payload = [0x31; 64];
+        let second_payload = [0x32; 64];
+        let first = prepare_and_publish(&archive, SegmentKind::Block, first_key, &first_payload);
+        assert_eq!(first.locator.segment, 0);
+
+        let mut payloads = vec![ArchivePayload {
+            kind: SegmentKind::Block,
+            key: second_key,
+            payload: second_payload.to_vec(),
+        }];
+        let prepared = {
+            let mut writer = archive.writer().expect("writer");
+            archive
+                .prepare_locked(&mut writer, &mut payloads)
+                .expect("prepare rotated payload")
+        };
+        assert_eq!(prepared.locators[0].locator.segment, 1);
+        {
+            let mut writer = archive.writer().expect("writer");
+            archive
+                .rollback_locked(&mut writer)
+                .expect("roll back rotated payload");
+        }
+        assert!(!archive_file_path(&directory, SegmentKind::Block, 1, 1).exists());
+        assert_eq!(
+            archive
+                .resolve(SegmentKind::Block, &first_key, &first.encode())
+                .expect("resolve first"),
+            Some(first_payload.to_vec())
+        );
+
+        let second = prepare_and_publish(&archive, SegmentKind::Block, second_key, &second_payload);
+        assert_eq!(second.locator.segment, 1);
+        let manifests = archive.manifests().expect("published manifests");
+        assert_eq!(manifests.0.active_segment, 1);
+        drop(archive);
+
+        let recovered = SegmentArchive::recover(directory.clone(), manifests.0, manifests.1)
+            .expect("recover rotated archive");
+        let scrub = recovered.scrub().expect("scrub rotated archive");
+        assert_eq!(scrub.blocks.segments, 2);
+        assert_eq!(scrub.blocks.records, 2);
+        assert_eq!(
+            recovered
+                .resolve(SegmentKind::Block, &first_key, &first.encode())
+                .expect("resolve old segment"),
+            Some(first_payload.to_vec())
+        );
+        assert_eq!(
+            recovered
+                .resolve(SegmentKind::Block, &second_key, &second.encode())
+                .expect("resolve active segment"),
+            Some(second_payload.to_vec())
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[test]
+    fn bounded_recovery_defers_sealed_history_to_explicit_scrub() {
+        let directory = test_file();
+        let _ = std::fs::remove_dir_all(&directory);
+        let archive =
+            SegmentArchive::create_new_with_target(directory.clone(), 1, 180).expect("archive");
+        let first_key = [0xa1; 32];
+        let first = prepare_and_publish(&archive, SegmentKind::Block, first_key, &[0x41; 64]);
+        prepare_and_publish(&archive, SegmentKind::Block, [0xa2; 32], &[0x42; 64]);
+        let manifests = archive.manifests().expect("published manifests");
+        assert_eq!(manifests.0.active_segment, 1);
+        drop(archive);
+
+        let path = archive_file_path(&directory, SegmentKind::Block, 1, 0);
+        let corrupt_at = u64::from(first.locator.frame_length) - 1;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open sealed segment");
+        file.seek(SeekFrom::Start(corrupt_at))
+            .expect("seek checksum");
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).expect("read checksum");
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(corrupt_at))
+            .expect("seek checksum");
+        file.write_all(&byte).expect("corrupt checksum");
+        file.sync_all().expect("sync corruption");
+        drop(file);
+
+        let recovered = SegmentArchive::recover(directory.clone(), manifests.0, manifests.1)
+            .expect("bounded recovery does not rescan sealed history");
+        assert!(matches!(
+            recovered.scrub(),
+            Err(SegmentError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            recovered.resolve(SegmentKind::Block, &first_key, &first.encode()),
+            Err(SegmentError::ChecksumMismatch)
+        ));
+        drop(recovered);
+        std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[test]
+    fn archive_recovery_rejects_corruption_inside_the_committed_manifest() {
+        let directory = test_file();
+        let _ = std::fs::remove_dir_all(&directory);
+        let archive = SegmentArchive::create_new(directory.clone(), 1).expect("archive");
+        let key = [0x91; 32];
+        let locator =
+            prepare_and_publish(&archive, SegmentKind::Undo, key, b"committed undo payload");
+        let manifests = archive.manifests().expect("published manifests");
+        drop(archive);
+
+        let path = archive_file_path(&directory, SegmentKind::Undo, 1, 0);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("open committed segment");
+        let corrupt_at = locator
+            .locator
+            .offset
+            .checked_add(u64::from(locator.locator.frame_length) - 1)
+            .expect("checksum offset");
+        file.seek(SeekFrom::Start(corrupt_at))
+            .expect("seek checksum");
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).expect("read checksum");
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(corrupt_at))
+            .expect("seek checksum");
+        file.write_all(&byte).expect("corrupt checksum");
+        file.sync_all().expect("sync corruption");
+        drop(file);
+
+        assert!(matches!(
+            SegmentArchive::recover(directory.clone(), manifests.0, manifests.1),
+            Err(SegmentError::ChecksumMismatch)
+        ));
         std::fs::remove_dir_all(directory).expect("remove archive fixture");
     }
 
