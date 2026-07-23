@@ -102,6 +102,9 @@ Implemented:
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
   atomic checksummed last-run checkpoint, API-v10 diagnostics, and unclean
   RocksDB reopen evidence.
+- Matching clean checkpoints audit the complete network reorganization/undo
+  suffix with keyed reads; unclean or stale checkpoints retain exhaustive
+  historical state, tree, block, deployment, and undo validation.
 - Exact HSD undo-retention horizons with opt-in atomic retirement, bounded
   startup catch-up, pruning-aware pin/compaction validation, and deep-reorg
   rejection across retired history.

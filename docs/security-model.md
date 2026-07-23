@@ -45,7 +45,8 @@ The current foundation verifies or records evidence for:
   name-state snapshots, with corruption rejected before proof exposure;
 - content-addressed authenticated nodes committed with state, path-local proof
   reads that rehash each record, bound-root/touched-path validation at
-  transition boundaries, and full reachable-tree validation at startup;
+  transition boundaries, bounded clean-start root/reorganization-horizon
+  validation, and full reachable-tree validation after unclean startup;
 - immutable path-local mutation that verifies every touched record, retains old
   roots, and uses the materialized O(N) rebuild as an independent startup and
   differential-test oracle;

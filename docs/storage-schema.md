@@ -169,7 +169,10 @@ cannot promote a block or grant authority.
   working and committed name roots, airdrop field, complete interval-pin set,
   and maintenance checkpoints. It is written atomically with the clean marker.
   A missing, corrupt, or mismatched commitment selects exhaustive startup
-  validation rather than authorizing a shortcut.
+  validation rather than authorizing a shortcut. A matching commitment bounds
+  synchronous chain validation to the complete network reorganization/undo
+  horizon; full historical validation remains the unclean-start route and a
+  requirement for the offline scrub campaign.
 - `peers`: `address-book/v1` stores one bounded, checksummed, versioned, and
   network-bound snapshot of discovered IP peers. Each entry retains services,
   advertised time, connection attempts, last success, last attempt, and stable

@@ -2047,15 +2047,41 @@ impl NodeState {
         let active_tip = best_block_tip_from_snapshot(&snapshot)?;
         let best_header = best_header_tip_from_snapshot(&snapshot)?;
         let undo_pruning_checkpoint = load_undo_pruning_checkpoint(&snapshot)?;
-        let mut heights = snapshot
-            .scan_prefix(ColumnFamily::HeightIndex, b"")
-            .context("failed to scan active height index")?;
-        heights.sort_by(|left, right| left.0.cmp(&right.0));
         let tree_interval = self.network.params().names.tree_interval;
         let retention = self
             .undo_retention_policy
             .unwrap_or_else(|| UndoRetentionPolicy::for_network(self.network));
         retention.validate()?;
+        let audit_start_height = active_tip
+            .as_ref()
+            .map(|tip| {
+                if checkpoint_matches {
+                    tip.height
+                        .saturating_sub(retention.keep_blocks.saturating_sub(1))
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        let mut heights = if let (true, Some(tip)) = (checkpoint_matches, active_tip.as_ref()) {
+            let capacity = usize::try_from(tip.height - audit_start_height)
+                .ok()
+                .and_then(|length| length.checked_add(1))
+                .ok_or_else(|| anyhow::anyhow!("startup audit suffix length overflow"))?;
+            let mut entries = Vec::with_capacity(capacity);
+            for height in audit_start_height..=tip.height {
+                let hash = read_canonical_hash(&snapshot, height)?.ok_or_else(|| {
+                    anyhow::anyhow!("clean startup audit is missing canonical height {height}")
+                })?;
+                entries.push((height.to_be_bytes().to_vec(), hash.as_bytes().to_vec()));
+            }
+            entries
+        } else {
+            snapshot
+                .scan_prefix(ColumnFamily::HeightIndex, b"")
+                .context("failed to scan active height index")?
+        };
+        heights.sort_by(|left, right| left.0.cmp(&right.0));
         if tree_interval == 0 {
             anyhow::bail!("network name-tree snapshot interval is zero");
         }
@@ -2147,29 +2173,75 @@ impl NodeState {
                         );
                     }
                 }
-                let expected_len = usize::try_from(tip.height)
+                let expected_len = usize::try_from(tip.height - audit_start_height)
                     .ok()
                     .and_then(|height| height.checked_add(1))
                     .ok_or_else(|| anyhow::anyhow!("active height index length overflow"))?;
                 if heights.len() != expected_len {
                     anyhow::bail!(
-                        "active height index has {} entries for tip height {}",
+                        "active height audit has {} entries from height {} through tip height {}",
                         heights.len(),
+                        audit_start_height,
                         tip.height
                     );
                 }
 
-                let mut previous_hash = BlockHash::ZERO;
-                let mut previous_work = Uint256::ZERO;
+                let (mut previous_hash, mut previous_work) = if audit_start_height == 0 {
+                    (BlockHash::ZERO, Uint256::ZERO)
+                } else {
+                    let previous_height = audit_start_height - 1;
+                    let hash =
+                        read_canonical_hash(&snapshot, previous_height)?.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "clean startup audit suffix is missing parent height {previous_height}"
+                            )
+                        })?;
+                    let record = load_block_index_record(&snapshot, &hash)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "clean startup audit suffix parent {} is missing its block index",
+                            hash.to_hex()
+                        )
+                    })?;
+                    if record.hash != hash
+                        || record.height != previous_height
+                        || !record.status.active_chain
+                        || !record.status.deployment_state_valid
+                    {
+                        anyhow::bail!(
+                            "clean startup audit suffix parent {} has inconsistent status",
+                            hash.to_hex()
+                        );
+                    }
+                    let header = load_header_record(&snapshot, &hash)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "clean startup audit suffix parent {} is missing its header",
+                            hash.to_hex()
+                        )
+                    })?;
+                    if header.hash != hash
+                        || header.height != previous_height
+                        || header.chainwork != record.chainwork
+                        || header.status != record.status
+                    {
+                        anyhow::bail!(
+                            "clean startup audit suffix parent {} has inconsistent indexes",
+                            hash.to_hex()
+                        );
+                    }
+                    (hash, record.chainwork)
+                };
                 let mut previous_retained_tree_root = None;
                 let mut previous_retained_committed_tree_root = None;
                 let mut tip_resulting_tree_root = None;
                 let mut tip_resulting_committed_tree_root = None;
                 for (position, (height_key, hash_bytes)) in heights.iter().enumerate() {
                     let height = decode_height_key(height_key)?;
-                    if usize::try_from(height).ok() != Some(position) {
+                    let expected_height = u32::try_from(position)
+                        .ok()
+                        .and_then(|position| audit_start_height.checked_add(position));
+                    if expected_height != Some(height) {
                         anyhow::bail!(
-                            "active height index is not contiguous at position {position}"
+                            "active height audit is not contiguous at position {position}"
                         );
                     }
                     let hash = block_hash_from_bytes(hash_bytes)?;
@@ -2397,7 +2469,7 @@ impl NodeState {
                 }
             }
         }
-        if !name_tree_pins.is_empty() {
+        if !checkpoint_matches && !name_tree_pins.is_empty() {
             anyhow::bail!("durable name-tree snapshot pins are not on active interval heights");
         }
 
@@ -7399,6 +7471,53 @@ mod tests {
                 .expect("mismatch falls back to exhaustive audit"),
             StartupAuditKind::Exhaustive
         );
+    }
+
+    #[test]
+    fn clean_checkpoint_audits_reorganization_suffix_while_unclean_audits_history() {
+        let store = StoreHandle::memory();
+        let policy = UndoRetentionPolicy {
+            prune_after_height: 0,
+            keep_blocks: 2,
+        };
+        let state = NodeState::from_store_for_network_with_undo_policy(
+            store.clone(),
+            Network::Regtest,
+            Some(policy),
+        )
+        .expect("state");
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("node");
+        node.state.undo_retention_policy = Some(policy);
+        let records = connect_fixture_chain(&mut node, 4, None);
+        let snapshot = store.snapshot().expect("checkpoint snapshot");
+        let checkpoint =
+            StartupAuditCheckpoint::capture(&snapshot, Network::Regtest).expect("checkpoint");
+        drop(snapshot);
+
+        let mut batch = store.batch();
+        batch
+            .delete(ColumnFamily::Blocks, records[0].hash.as_bytes())
+            .expect("delete dormant historical body");
+        store.commit(batch).expect("commit historical fault");
+
+        assert_eq!(
+            node.state
+                .validate_durable_chain_invariants(Some(&checkpoint))
+                .expect("bounded clean audit"),
+            StartupAuditKind::CleanCheckpoint
+        );
+        let error = node
+            .state
+            .validate_durable_chain_invariants(None)
+            .expect_err("unclean audit must inspect complete history");
+        assert!(error.to_string().contains("body"), "{error}");
     }
 
     #[test]

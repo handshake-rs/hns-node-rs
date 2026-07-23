@@ -383,7 +383,11 @@ successfully. The clean marker and exact startup-audit commitment are one atomic
 store batch. On entry the next process marks the store unclean before beginning
 recovery validation, so a crash during a long audit cannot preserve the prior
 clean state. Unexpected channel or task termination leaves the store marked
-unclean and forces the exhaustive recovery path.
+unclean and forces the exhaustive recovery path. A matching clean checkpoint
+uses keyed canonical reads to audit the complete network reorganization/undo
+horizon rather than scanning all historical bodies. Unclean and stale
+checkpoints still force the full materialized-state, retained-tree, active-chain,
+deployment, and undo audit.
 
 ## Serving behavior
 

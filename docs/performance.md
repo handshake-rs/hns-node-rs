@@ -105,6 +105,25 @@ the exact active/stored tip and reopened with zero failed blocks, bans,
 rejections, contextual failures, or terminal error. These are bounded restart
 observations, not deployment-scale crash-recovery qualification.
 
+At active height 49,715, an unclean warm-cache restart of the pre-batched
+retained-root validator reached its completed audit after 318 seconds and was
+sampled at 1.86 GiB RSS. At active height 55,933, the bulk-read/compact-depth
+validator recovered the exact same active and stored tips after a forced
+`SIGKILL`, with zero failed or unavailable blocks and no terminal error. Its
+sampled peak was 1.08 GiB RSS, but the cold-cache audit took 742 seconds and
+read approximately 51 GiB physically. Those cache states and heights are not
+an apples-to-apples wall-time comparison: the evidence supports lower memory
+amplification, while also showing that exhaustive recovery remains dominated
+by full-dataset storage reads.
+
+A matching clean checkpoint at height 54,183 still took approximately 107
+seconds before logging audit completion because the previous implementation
+reread every active body and undo record. The bounded clean-start route now
+audits the complete network reorganization horizon (288 blocks on mainnet)
+instead of all historical blocks. Unclean and stale-checkpoint starts retain
+complete historical validation. The offline comparison/scrub campaign must do
+the same and remains a qualification requirement rather than completed evidence.
+
 A 60-second persistent-store window beginning at height 9,622 connected 624
 historical blocks (10.4 blocks/s) and advanced the contiguous stored frontier
 916 blocks (15.267 blocks/s), with zero failed or unavailable blocks. The same
@@ -179,14 +198,18 @@ prevents a single height lookup from pausing replay.
 Unclean startup, first startup after upgrade, and any stale or corrupt audit
 checkpoint perform the exhaustive materialized-name rebuild and the
 depth-sensitive reachable-union traversal of current, committed, and
-interval-pinned Urkel roots. A clean shutdown now atomically binds a checksummed
-audit checkpoint to the exact durable identity. When it matches, startup checks
-the canonical encoding and content hash of every retained root record without
-walking shared descendants or rebuilding the materialized name tree. The active
-height, block/header/body, deployment, undo, root-continuity, and
-snapshot-pin-to-chain audit remains exhaustive in both routes. The process
-marks the database unclean before either audit starts, preventing a crash during
-startup from preserving an older clean marker.
+interval-pinned Urkel roots. That union traversal submits bounded bulk reads and
+stores one primary depth per unique root, retaining a second path entry only
+when the same content node is reachable at another depth. A clean shutdown
+atomically binds a checksummed audit checkpoint to the exact durable identity.
+When it matches, startup checks the canonical encoding and content hash of every
+retained root record without walking shared descendants or rebuilding the
+materialized name tree, then validates the complete active reorganization/undo
+horizon. Complete historical block, deployment, undo, root-continuity, and
+snapshot-pin-to-chain validation remains mandatory after an unclean start or a
+stale checkpoint; the explicit offline comparison/scrub campaign must cover the
+same history. The process marks the database unclean before either audit starts,
+preventing a crash during startup from preserving an older clean marker.
 
 Production qualification still needs full mainnet IBD on persistent NVMe,
 P50/P95/P99/max storage and compaction latency, loaded-mempool templates,
