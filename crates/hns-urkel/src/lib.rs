@@ -1210,6 +1210,50 @@ where
     reachable_record_roots([root], &mut load).map(|roots| roots.len())
 }
 
+/// Reconstruct an immutable logical tree from content-addressed records. This
+/// is intended for snapshot APIs and audits; steady-state proof generation
+/// should traverse only the requested path.
+pub fn materialize_record_tree<F>(root: TreeRoot, mut load: F) -> Result<MemoryUrkel, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    if root == TreeRoot::ZERO {
+        return Ok(MemoryUrkel::new());
+    }
+
+    let mut entries = BTreeMap::new();
+    let mut seen = HashSet::new();
+    let mut pending = vec![root];
+    while let Some(current) = pending.pop() {
+        if !seen.insert(current) {
+            continue;
+        }
+        match load_verified_record(current, &mut load)? {
+            UrkelNodeRecord::Leaf { key, value } => {
+                if entries.insert(key, value).is_some() {
+                    return Err(UrkelError::InvalidNode(
+                        "Urkel record tree contains a duplicate leaf key".to_owned(),
+                    ));
+                }
+            }
+            UrkelNodeRecord::Internal { left, right, .. } => {
+                pending.push(right);
+                pending.push(left);
+            }
+        }
+    }
+
+    let tree = MemoryUrkel::from_entries(entries)?;
+    let actual = tree.root();
+    if actual != root {
+        return Err(UrkelError::NodeHashMismatch {
+            expected: root,
+            actual,
+        });
+    }
+    Ok(tree)
+}
+
 /// Validate and collect the union of all content-addressed nodes reachable
 /// from one or more retained roots. Shared historical subtrees are returned
 /// once while depth-sensitive validation is preserved for every distinct path.

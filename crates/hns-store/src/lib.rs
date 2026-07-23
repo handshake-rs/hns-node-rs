@@ -30,11 +30,13 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
+pub const LEGACY_SCHEMA_VERSION: u32 = 16;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
+pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
 
 /// HSD's MSB-first spent-allocation field contains 216,199 airdrop positions
 /// followed by 1,358 faucet positions.
@@ -274,7 +276,33 @@ impl StagingOverlay {
         StagedBatch {
             inner,
             changes: Rc::clone(&self.changes),
+            defer_name_tree_nodes: false,
         }
+    }
+
+    /// Stage content-addressed name nodes for read-your-writes visibility
+    /// without forwarding them to the underlying LSM batch. The caller must
+    /// publish the captured records to its append-only page store before
+    /// committing [`StagedBatch::into_inner`].
+    pub fn batch_with_deferred_name_tree_nodes<B: WriteBatch>(&self, inner: B) -> StagedBatch<B> {
+        StagedBatch {
+            inner,
+            changes: Rc::clone(&self.changes),
+            defer_name_tree_nodes: true,
+        }
+    }
+
+    pub fn staged_family(&self, family: ColumnFamily) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        self.changes
+            .borrow()
+            .get(&family)
+            .map(|changes| {
+                changes
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -465,6 +493,7 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
 pub struct StagedBatch<B: WriteBatch> {
     inner: B,
     changes: SharedStagedChanges,
+    defer_name_tree_nodes: bool,
 }
 
 impl<B: WriteBatch> StagedBatch<B> {
@@ -475,7 +504,9 @@ impl<B: WriteBatch> StagedBatch<B> {
 
 impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.inner.put(family, key, value)?;
+        if !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes) {
+            self.inner.put(family, key, value)?;
+        }
         self.changes
             .borrow_mut()
             .entry(family)
@@ -485,7 +516,9 @@ impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
-        self.inner.delete(family, key)?;
+        if !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes) {
+            self.inner.delete(family, key)?;
+        }
         self.changes
             .borrow_mut()
             .entry(family)
@@ -1685,6 +1718,46 @@ mod tests {
                 .get(ColumnFamily::Meta, b"temporary")
                 .expect("live get"),
             None
+        );
+    }
+
+    #[test]
+    fn deferred_name_nodes_remain_visible_but_never_enter_inner_batch() {
+        let store = MemoryStore::new();
+        let base = store.snapshot().expect("base snapshot");
+        let overlay = StagingOverlay::new();
+        let staged_snapshot = overlay.snapshot(&base);
+        let mut staged_batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
+        staged_batch
+            .put(ColumnFamily::NameTreeNodes, b"node", b"canonical")
+            .expect("stage node");
+        staged_batch
+            .put(ColumnFamily::Meta, b"root", b"bound")
+            .expect("stage root");
+
+        assert_eq!(
+            staged_snapshot
+                .get(ColumnFamily::NameTreeNodes, b"node")
+                .expect("staged node"),
+            Some(b"canonical".to_vec())
+        );
+        assert_eq!(
+            overlay.staged_family(ColumnFamily::NameTreeNodes),
+            BTreeMap::from([(b"node".to_vec(), Some(b"canonical".to_vec()))])
+        );
+        store
+            .commit(staged_batch.into_inner())
+            .expect("commit inner batch");
+        let snapshot = store.snapshot().expect("committed snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::NameTreeNodes, b"node")
+                .expect("deferred node"),
+            None
+        );
+        assert_eq!(
+            snapshot.get(ColumnFamily::Meta, b"root").expect("root"),
+            Some(b"bound".to_vec())
         );
     }
 

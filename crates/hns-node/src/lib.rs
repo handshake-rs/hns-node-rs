@@ -65,8 +65,9 @@ use hns_state::{
     compact_name_tree_nodes_streaming, connect_block_to_batch_with_services, decode_coin,
     decode_name_state, disconnect_block_to_batch, load_name_tree_snapshot_pins,
     load_stored_name_tree_commit_root, load_stored_name_tree_root,
-    stage_remove_name_tree_snapshot_pin, validate_persisted_name_tree_root,
-    validate_persisted_name_trees, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
+    migrate_name_tree_interval_accumulator, stage_remove_name_tree_snapshot_pin,
+    validate_persisted_name_tree_root, validate_persisted_name_trees,
+    verify_name_tree_interval_state, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
     BlockUndo, ConnectBlock, DisconnectBlock, NameTreeCompactionSummary, NameTreeSnapshotPin,
     StateError, StateServices, StoredStateEngine,
 };
@@ -1940,6 +1941,22 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to open node store: {error}"))?,
             None => StoreHandle::memory(),
         };
+        validate_existing_store_identity(&store, config.network)?;
+        if let Some(migration) = migrate_name_tree_interval_accumulator(
+            &store,
+            config.network.params().names.tree_interval,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to migrate node state storage: {error}"))?
+        {
+            tracing::info!(
+                active_heights = migration.active_heights,
+                undos_rewritten = migration.undos_rewritten,
+                legacy_undos_backed_up = migration.legacy_undos_backed_up,
+                pending_names = migration.pending_names,
+                tip_height = migration.tip_height,
+                "migrated name-tree state to consensus-interval accumulation"
+            );
+        }
         bind_store_identity(&store, config.network)?;
         let previous_shutdown_clean = was_clean_shutdown(&store)
             .map_err(|error| anyhow::anyhow!("failed to read shutdown marker: {error}"))?;
@@ -2093,6 +2110,17 @@ impl NodeState {
         heights.sort_by(|left, right| left.0.cmp(&right.0));
         if tree_interval == 0 {
             anyhow::bail!("network name-tree snapshot interval is zero");
+        }
+        if !checkpoint_matches {
+            if let Some(tip) = active_tip.as_ref() {
+                verify_name_tree_interval_state(&snapshot, tree_interval, tip.height).map_err(
+                    |error| {
+                        anyhow::anyhow!(
+                            "durable name-tree interval accumulator invariant failed: {error}"
+                        )
+                    },
+                )?;
+            }
         }
         let pins = load_name_tree_snapshot_pins(&snapshot)
             .map_err(|error| anyhow::anyhow!("durable name-tree snapshot pin failed: {error}"))?;
@@ -2385,6 +2413,45 @@ impl NodeState {
                         {
                             anyhow::bail!("active genesis undo has a non-empty pre-state root");
                         }
+                        let interval_boundary = height.is_multiple_of(tree_interval);
+                        if undo.name_tree_interval_boundary != interval_boundary {
+                            anyhow::bail!(
+                                "active block {} has an invalid name-tree boundary marker",
+                                hash.to_hex()
+                            );
+                        }
+                        if undo.previous_tree_root != undo.previous_committed_tree_root
+                            || undo.resulting_tree_root != undo.resulting_committed_tree_root
+                        {
+                            anyhow::bail!(
+                                "active block {} retains a per-block working root under the interval-accumulator profile",
+                                hash.to_hex()
+                            );
+                        }
+                        if interval_boundary {
+                            if let Some(previous) = &undo.previous_name_tree_accumulator {
+                                if previous.base_root != undo.previous_committed_tree_root
+                                    || previous.last_height >= height
+                                    || undo.previous_name_tree_accumulator_last_height
+                                        != Some(previous.last_height)
+                                {
+                                    anyhow::bail!(
+                                        "active interval block {} has invalid accumulator rollback state",
+                                        hash.to_hex()
+                                    );
+                                }
+                            } else if undo.previous_name_tree_accumulator_last_height.is_some() {
+                                anyhow::bail!(
+                                    "active interval block {} has an accumulator height without rollback state",
+                                    hash.to_hex()
+                                );
+                            }
+                        } else if undo.previous_name_tree_accumulator.is_some() {
+                            anyhow::bail!(
+                                "active non-interval block {} stores a full accumulator rollback",
+                                hash.to_hex()
+                            );
+                        }
                         if previous_retained_tree_root
                             .is_some_and(|root| undo.previous_tree_root.as_bytes() != &root)
                         {
@@ -2401,7 +2468,7 @@ impl NodeState {
                                 hash.to_hex()
                             );
                         }
-                        let expected_resulting_committed = if height.is_multiple_of(tree_interval) {
+                        let expected_resulting_committed = if interval_boundary {
                             undo.resulting_tree_root
                         } else {
                             undo.previous_committed_tree_root
@@ -3516,7 +3583,13 @@ impl NodeState {
         )?;
         stage_best_header_if_more_work(snapshot, batch, block_hash, validated.chainwork)?;
         if let Some(policy) = self.undo_retention_policy {
-            stage_due_undo_prune(snapshot, batch, policy, request.height)?;
+            stage_due_undo_prune(
+                snapshot,
+                batch,
+                policy,
+                request.height,
+                self.network.params().names.tree_interval,
+            )?;
         }
 
         Ok(record)
@@ -4020,9 +4093,12 @@ impl NodeState {
             let Some(tip) = best_block_tip_from_snapshot(&snapshot)? else {
                 break;
             };
-            let Some(target) =
-                undo_prune_target(tip.height, policy.prune_after_height, policy.keep_blocks)
-            else {
+            let Some(target) = undo_prune_target(
+                tip.height,
+                policy.prune_after_height,
+                policy.keep_blocks,
+                self.network.params().names.tree_interval,
+            ) else {
                 break;
             };
             let previous = load_undo_pruning_checkpoint(&snapshot)?;
@@ -4208,8 +4284,16 @@ fn undo_prune_target(
     tip_height: Height,
     prune_after_height: Height,
     keep_blocks: u32,
+    tree_interval: Height,
 ) -> Option<Height> {
-    let target = tip_height.checked_sub(keep_blocks)?;
+    if tree_interval == 0 {
+        return None;
+    }
+    let retention_target = tip_height.checked_sub(keep_blocks)?;
+    // Pending interval changes are reconstructed and audited from undo. Never
+    // retire those records before the next authenticated boundary commits.
+    let last_committed_boundary = tip_height - (tip_height % tree_interval);
+    let target = retention_target.min(last_committed_boundary);
     (target > prune_after_height).then_some(target)
 }
 
@@ -4218,10 +4302,15 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
     batch: &mut B,
     policy: UndoRetentionPolicy,
     tip_height: Height,
+    tree_interval: Height,
 ) -> Result<()> {
     policy.validate()?;
-    let Some(target) = undo_prune_target(tip_height, policy.prune_after_height, policy.keep_blocks)
-    else {
+    let Some(target) = undo_prune_target(
+        tip_height,
+        policy.prune_after_height,
+        policy.keep_blocks,
+        tree_interval,
+    ) else {
         return Ok(());
     };
     let previous = load_undo_pruning_checkpoint(snapshot)?;
@@ -4539,6 +4628,27 @@ fn bind_store_identity(store: &StoreHandle, network: Network) -> Result<()> {
         )?;
     }
     store.commit(batch)?;
+    Ok(())
+}
+
+fn validate_existing_store_identity(store: &StoreHandle, network: Network) -> Result<()> {
+    let snapshot = store.snapshot()?;
+    let expected_network = [network.canonical_id()];
+    if let Some(actual) = snapshot.get(ColumnFamily::Meta, MetaKey::Network.as_bytes())? {
+        if actual.as_slice() != expected_network {
+            anyhow::bail!(
+                "node network binding mismatch before storage migration: expected {}, got {:?}",
+                network.canonical_id(),
+                actual
+            );
+        }
+    }
+    let expected_genesis = network.params().genesis_hash;
+    if let Some(actual) = snapshot.get(ColumnFamily::Meta, MetaKey::GenesisHash.as_bytes())? {
+        if actual.as_slice() != expected_genesis.as_bytes() {
+            anyhow::bail!("node genesis binding mismatch before storage migration");
+        }
+    }
     Ok(())
 }
 
@@ -6652,9 +6762,10 @@ mod tests {
             .expect("connect non-interval OPEN");
 
         let snapshot = node.state.store.snapshot().expect("post-OPEN snapshot");
-        let working_root = verify_stored_name_tree_root(&snapshot).expect("working root");
-        let committed_root = load_stored_name_tree_commit_root(&snapshot).expect("committed root");
-        assert_ne!(working_root, committed_root);
+        let committed_root = verify_stored_name_tree_root(&snapshot).expect("committed root");
+        let pending_root =
+            hns_state::rebuild_name_tree_root(&snapshot).expect("pending materialized root");
+        assert_ne!(pending_root, committed_root);
         assert_eq!(committed_root.as_bytes(), &[0; 32]);
         drop(snapshot);
         assert_eq!(
@@ -6688,14 +6799,14 @@ mod tests {
         let snapshot = node.state.store.snapshot().expect("interval snapshot");
         let resulting_commit =
             load_stored_name_tree_commit_root(&snapshot).expect("resulting commit root");
-        assert_eq!(resulting_commit, working_root);
+        assert_eq!(resulting_commit, pending_root);
         drop(snapshot);
         assert_eq!(
             node.observed_mining_snapshot()
                 .expect("observed snapshot")
                 .expect("active mining snapshot")
                 .next_tree_root,
-            *working_root.as_bytes()
+            *pending_root.as_bytes()
         );
     }
 
@@ -7547,7 +7658,7 @@ mod tests {
             proof_state
                 .connect_block(ConnectBlock {
                     block_hash: name_block.hash(),
-                    height: 201,
+                    height: 200,
                     coinbase_maturity: 0,
                     block_reward: 50,
                     block: &name_block,
@@ -7581,7 +7692,12 @@ mod tests {
 
             let error = NodeState::from_store_for_network(store, Network::Regtest)
                 .expect_err("content-addressed name-tree corruption");
-            assert!(error.to_string().contains("content-addressed"), "{error}");
+            let message = error.to_string();
+            assert!(
+                message.contains("name-tree")
+                    && (message.contains("missing") || message.contains("hash mismatch")),
+                "{error}"
+            );
         }
     }
 

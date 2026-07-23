@@ -297,6 +297,14 @@ impl NamePageAppender {
     pub const fn next_page(&self) -> u32 {
         self.next_page
     }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn segment(&self) -> u32 {
+        self.segment
+    }
 }
 
 impl<'a> NamePageRef<'a> {
