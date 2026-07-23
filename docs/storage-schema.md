@@ -92,9 +92,10 @@ Durable identity binds:
 - One atomic activation snapshot has a 65,536-entry read-through cache,
   including misses, for immutable metadata, headers, height/block/transaction
   indexes, UTXOs, name state, and snapshot records. A separate 131,072-entry
-  positive cache covers content-addressed name-tree nodes. Overlay
-  writes/deletes always take precedence and both caches are discarded with that
-  snapshot.
+  positive FIFO cache covers content-addressed name-tree nodes and is reused
+  across consecutive committed activation slices. New nodes enter it only
+  after the atomic store commit succeeds, and it is cleared before name-tree
+  compaction. Overlay writes/deletes always take precedence.
 - Every block deduplicates its non-coinbase inputs and spendable output
   collision keys, resolves them with one snapshot-bound UTXO multi-get, and
   retains the decoded results in an outpoint hash map through validation and

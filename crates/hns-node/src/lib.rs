@@ -72,8 +72,8 @@ use hns_state::{
 };
 use hns_store::{
     decode_u64, encode_u64, mark_unclean_start, open_store, was_clean_shutdown, ColumnFamily,
-    DurabilityPolicy, MetaKey, ReadSnapshot, StagingOverlay, Store, StoreBackend, StoreConfig,
-    StoreHandle, WriteBatch, SCHEMA_VERSION, STORAGE_PROFILE,
+    DurabilityPolicy, MetaKey, ReadSnapshot, SharedNameNodeReadCache, StagingOverlay, Store,
+    StoreBackend, StoreConfig, StoreHandle, WriteBatch, SCHEMA_VERSION, STORAGE_PROFILE,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -1918,6 +1918,7 @@ pub struct NodeState {
     pub blocks: StoredBlockIndex<StoreHandle>,
     pub state_engine: StoredStateEngine<StoreHandle>,
     pub mempool: MemoryMempool,
+    name_node_reads: SharedNameNodeReadCache,
 }
 
 impl NodeState {
@@ -2010,6 +2011,7 @@ impl NodeState {
             blocks,
             state_engine,
             mempool: MemoryMempool::new(),
+            name_node_reads: SharedNameNodeReadCache::new(),
         };
         let audit = state.validate_durable_chain_invariants(checkpoint)?;
         Ok((state, audit))
@@ -3720,7 +3722,7 @@ impl NodeState {
         let generation = next_mining_generation(&base).map_err(ChainActivationFailure::Internal)?;
         let chain_epoch = next_chain_epoch(&base).map_err(ChainActivationFailure::Internal)?;
         let overlay = StagingOverlay::new();
-        let staged = overlay.snapshot(&base);
+        let staged = overlay.snapshot_with_name_node_cache(&base, self.name_node_reads.clone());
         let mut batch = overlay.batch(self.store.batch());
         let mut summary = NodeReorgSummary::default();
 
@@ -3849,6 +3851,7 @@ impl NodeState {
             .commit(batch)
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
+        overlay.publish_committed_name_nodes(&self.name_node_reads);
         let committed_records = summary
             .disconnected
             .iter()
@@ -3986,6 +3989,10 @@ impl NodeState {
         }
 
         drop(snapshot);
+        // The shared cache contains only durable immutable records, but
+        // compaction is the one operation that can remove them. Clear before
+        // deletion while the mutable node coordinator excludes state readers.
+        self.name_node_reads.clear();
         let summary =
             compact_name_tree_nodes_streaming(&self.store, NAME_TREE_COMPACTION_DELETE_BATCH)
                 .map_err(|error| anyhow::anyhow!("failed to compact durable name tree: {error}"))?;
