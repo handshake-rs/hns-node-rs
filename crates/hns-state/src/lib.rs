@@ -28,7 +28,8 @@ use hns_store::{
 };
 use hns_urkel::{
     prove_hsd_from_records, reachable_record_roots, update_record_tree, validate_record_root,
-    validate_record_tree, MemoryUrkel, NameTreeSnapshot, TreeRoot, UrkelError, UrkelProof,
+    validate_record_tree, validate_record_trees_batched, MemoryUrkel, NameTreeSnapshot, TreeRoot,
+    UrkelError, UrkelProof,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2187,9 +2188,18 @@ where
     T: ReadSnapshot,
     I: IntoIterator<Item = TreeRoot>,
 {
-    reachable_record_roots(roots, |node_root| load_persisted_node(snapshot, node_root))
-        .map(|roots| roots.len())
-        .map_err(StateError::NameTree)
+    const STARTUP_VALIDATION_BATCH: usize = 1_024;
+
+    validate_record_trees_batched(roots, STARTUP_VALIDATION_BATCH, |node_roots| {
+        let keys = node_roots
+            .iter()
+            .map(|root| root.as_bytes().as_slice())
+            .collect::<Vec<_>>();
+        snapshot
+            .get_many(ColumnFamily::NameTreeNodes, &keys)
+            .map_err(|error| UrkelError::Storage(error.to_string()))
+    })
+    .map_err(StateError::NameTree)
 }
 
 /// Validate only the content-addressed record directly bound by the current

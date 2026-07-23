@@ -20,7 +20,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -1131,6 +1131,115 @@ where
     Ok(seen_nodes)
 }
 
+/// Validate the reachable union of several retained roots with bounded bulk
+/// reads. Most immutable nodes occur at one depth even when many historical
+/// roots share them, so the primary depth is stored directly beside the root;
+/// only the uncommon alternate-depth path needs a second set. This preserves
+/// depth-sensitive validation without retaining two full root sets.
+pub fn validate_record_trees_batched<F, I>(
+    roots: I,
+    maximum_batch: usize,
+    mut load_many: F,
+) -> Result<usize, UrkelError>
+where
+    F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
+    I: IntoIterator<Item = TreeRoot>,
+{
+    if maximum_batch == 0 {
+        return Err(UrkelError::InvalidNode(
+            "Urkel validation batch size is zero".to_owned(),
+        ));
+    }
+
+    let mut primary_depths = HashMap::<TreeRoot, u16>::new();
+    let mut alternate_depths = HashSet::<(TreeRoot, u16)>::new();
+    let mut pending = roots
+        .into_iter()
+        .filter(|root| *root != TreeRoot::ZERO)
+        .map(|root| (root, 0u16))
+        .collect::<Vec<_>>();
+
+    while !pending.is_empty() {
+        let mut work = Vec::with_capacity(maximum_batch.min(pending.len()));
+        while work.len() < maximum_batch {
+            let Some((current, depth)) = pending.pop() else {
+                break;
+            };
+            let unseen_path = match primary_depths.entry(current) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(depth);
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == depth => {
+                    false
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    alternate_depths.insert((current, depth))
+                }
+            };
+            if unseen_path {
+                work.push((current, depth));
+            }
+        }
+        if work.is_empty() {
+            continue;
+        }
+
+        let mut unique_roots = Vec::with_capacity(work.len());
+        let mut requested = HashSet::with_capacity(work.len());
+        for (root, _) in &work {
+            if requested.insert(*root) {
+                unique_roots.push(*root);
+            }
+        }
+        let raw_records = load_many(&unique_roots)?;
+        if raw_records.len() != unique_roots.len() {
+            return Err(UrkelError::Storage(format!(
+                "Urkel bulk loader returned {} records for {} roots",
+                raw_records.len(),
+                unique_roots.len()
+            )));
+        }
+        let mut records = HashMap::with_capacity(unique_roots.len());
+        for (root, raw) in unique_roots.into_iter().zip(raw_records) {
+            let raw = raw.ok_or(UrkelError::MissingNode(root))?;
+            records.insert(root, decode_verified_record(root, &raw)?);
+        }
+
+        for (current, depth) in work {
+            match records
+                .get(&current)
+                .expect("every validation root has one decoded bulk result")
+            {
+                UrkelNodeRecord::Leaf { .. } => {}
+                UrkelNodeRecord::Internal {
+                    prefix,
+                    left,
+                    right,
+                } => {
+                    let child_depth = usize::from(depth)
+                        .checked_add(prefix.bit_len())
+                        .and_then(|value| value.checked_add(1))
+                        .ok_or_else(|| {
+                            UrkelError::InvalidNode("Urkel record depth overflowed".to_owned())
+                        })?;
+                    if child_depth > URKEL_BITS {
+                        return Err(UrkelError::InvalidNode(
+                            "Urkel record path exceeds the key".to_owned(),
+                        ));
+                    }
+                    let child_depth = u16::try_from(child_depth).map_err(|_| {
+                        UrkelError::InvalidNode("Urkel record depth overflowed".to_owned())
+                    })?;
+                    pending.push((*right, child_depth));
+                    pending.push((*left, child_depth));
+                }
+            }
+        }
+    }
+    Ok(primary_depths.len())
+}
+
 /// Validate the record directly bound by `root` without traversing unrelated
 /// descendants. State transitions use this constant-work guard before header
 /// comparison; startup performs the full reachable-tree validation above.
@@ -2227,6 +2336,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn batched_retained_tree_validation_matches_reachable_union() {
+        let first = MemoryUrkel::from_entries(
+            (0..32u32).map(|index| (key(index), format!("first-{index}").into_bytes())),
+        )
+        .expect("first tree");
+        let second = MemoryUrkel::from_entries(
+            (16..48u32).map(|index| (key(index), format!("second-{index}").into_bytes())),
+        )
+        .expect("second tree");
+        let mut records = first.node_records().expect("first records");
+        records.extend(second.node_records().expect("second records"));
+        let roots = [first.root(), second.root()];
+        let expected = reachable_record_roots(roots, |root| Ok(records.get(&root).cloned()))
+            .expect("reachable union")
+            .len();
+
+        let mut calls = 0usize;
+        let actual = validate_record_trees_batched(roots, 3, |requested| {
+            calls += 1;
+            assert!(!requested.is_empty());
+            assert!(requested.len() <= 3);
+            Ok(requested
+                .iter()
+                .map(|root| records.get(root).cloned())
+                .collect())
+        })
+        .expect("batched validation");
+
+        assert_eq!(actual, expected);
+        assert!(calls > 1);
+    }
+
+    #[test]
+    fn batched_retained_tree_validation_fails_closed() {
+        let tree = MemoryUrkel::from_entries([(key(1), b"one".to_vec())]).expect("tree");
+        assert!(matches!(
+            validate_record_trees_batched([tree.root()], 0, |_| Ok(Vec::new())),
+            Err(UrkelError::InvalidNode(message)) if message.contains("batch size")
+        ));
+        assert!(matches!(
+            validate_record_trees_batched([tree.root()], 4, |_| Ok(Vec::new())),
+            Err(UrkelError::Storage(message)) if message.contains("returned 0 records")
+        ));
+        assert!(matches!(
+            validate_record_trees_batched([tree.root()], 4, |_| Ok(vec![None])),
+            Err(UrkelError::MissingNode(root)) if root == tree.root()
+        ));
     }
 
     #[test]
