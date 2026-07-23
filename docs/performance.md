@@ -115,6 +115,16 @@ peer making body progress remained connected under the inactivity deadline.
 This distinguishes archival-body availability from consensus or Brontide
 failure; discovery breadth and sustained multi-archival-peer IBD remain open.
 
+After adding the one-body availability probe, live diagnostics first showed
+seven transport-ready peers capped at one request each. Ten seconds later six
+had delivered an eligible body, four proven peers held 30--32 requests, and the
+global 128-request window was full. A following 60-second window connected 584
+historical blocks (9.733 blocks/s) and advanced the stored frontier 530 blocks
+(8.833 blocks/s), again with zero failed or unavailable blocks. It began with
+four ready peers but ended with zero and contained 12 zero-peer samples, so the
+probe improves scarce-body-source allocation but does not satisfy sustained
+multi-peer qualification.
+
 ## Optimization and safety boundary
 
 Native IBD now connects a newly available full eight-block state slice directly
@@ -126,6 +136,11 @@ is an inactivity deadline: each eligible response extends the bounded batch,
 while a peer that stops delivering still fails over after 15 seconds. This
 changes availability failover only; it does not accept alternate consensus
 data, weaken scoring, or alter authority readiness.
+
+Each new connection starts with one body probe. Only an eligible block response
+sets its diagnostic `body_available` flag and expands it to the 32-request
+window. The probe is connection-local and changes scheduling capacity only;
+the returned block still passes the same stateless and contextual validation.
 
 Ordered worker-validated bodies are drained in groups of at most 32 and written
 with one synchronous atomic RocksDB commit. Scheduler completion occurs only

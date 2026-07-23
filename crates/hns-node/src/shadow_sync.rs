@@ -6585,11 +6585,30 @@ mod tests {
             .poll(now, &[])
             .into_iter()
             .filter_map(|action| match action {
+                SyncAction::RequestBlock(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requested
+                .iter()
+                .map(|request| request.height)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        scheduler
+            .receive_block(PeerId(1), requested[0].hash, now + Duration::from_millis(1))
+            .expect("body probe");
+        scheduler.complete_block(requested[0].hash);
+        let expanded = scheduler
+            .poll(now + Duration::from_millis(1), &[])
+            .into_iter()
+            .filter_map(|action| match action {
                 SyncAction::RequestBlock(request) => Some(request.height),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(requested, vec![0, 1]);
+        assert_eq!(expanded, vec![1]);
     }
 
     #[test]

@@ -74,6 +74,9 @@ pub struct PeerSyncSnapshot {
     pub advertised_height: Height,
     pub ready: bool,
     pub inflight_blocks: usize,
+    /// The peer delivered at least one eligible body on this connection and
+    /// may use the configured per-peer body window instead of one probe.
+    pub body_available: bool,
     pub failures: u32,
     /// Honest block `notfound` responses observed from this peer. These are
     /// availability evidence, not validation or protocol failures.
@@ -127,6 +130,7 @@ struct PeerSyncState {
     inflight: BTreeSet<BlockHash>,
     headers_requested_at: Option<Instant>,
     last_block_received_at: Option<Instant>,
+    body_available: bool,
     failures: u32,
     unavailable_blocks: u64,
 }
@@ -275,6 +279,7 @@ impl SyncScheduler {
                 inflight: BTreeSet::new(),
                 headers_requested_at: None,
                 last_block_received_at: None,
+                body_available: false,
                 failures: 0,
                 unavailable_blocks: 0,
             },
@@ -551,6 +556,7 @@ impl SyncScheduler {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.inflight.remove(&hash);
                 state.last_block_received_at = Some(now);
+                state.body_available = true;
             }
             self.stage = SyncStage::Validating;
             self.bump_sequence();
@@ -573,6 +579,7 @@ impl SyncScheduler {
             }
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.last_block_received_at = Some(now);
+                state.body_available = true;
             }
             self.stage = SyncStage::Validating;
             self.bump_sequence();
@@ -891,6 +898,7 @@ impl SyncScheduler {
                     advertised_height: state.advertised_height,
                     ready: state.ready,
                     inflight_blocks: state.inflight.len(),
+                    body_available: state.body_available,
                     failures: state.failures,
                     unavailable_blocks: state.unavailable_blocks,
                 })
@@ -1071,9 +1079,14 @@ impl SyncScheduler {
         self.peers
             .iter()
             .filter(|(peer, state)| {
+                let body_window = if state.body_available {
+                    self.limits.maximum_inflight_per_peer
+                } else {
+                    1
+                };
                 state.ready
                     && state.services & SERVICE_NETWORK != 0
-                    && state.inflight.len() < self.limits.maximum_inflight_per_peer
+                    && state.inflight.len() < body_window
                     && pending.peer_is_eligible(**peer, now)
                     && unavailable.is_none_or(|unavailable| !unavailable.contains(peer))
             })
@@ -1216,6 +1229,11 @@ mod tests {
         scheduler
             .register_peer(peer, SERVICE_NETWORK, 10)
             .expect("peer");
+        scheduler
+            .peers
+            .get_mut(&peer)
+            .expect("registered peer")
+            .body_available = true;
         let first = BlockHash::new([3; 32]);
         let second = BlockHash::new([4; 32]);
         scheduler.queue_block(first, 1).expect("first body");
@@ -1256,6 +1274,73 @@ mod tests {
     }
 
     #[test]
+    fn new_peers_prove_body_availability_before_using_the_full_window() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 6,
+            maximum_inflight_per_peer: 3,
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        let first_peer = PeerId(1);
+        let second_peer = PeerId(2);
+        scheduler
+            .register_peer(first_peer, SERVICE_NETWORK, 10)
+            .expect("first peer");
+        scheduler
+            .register_peer(second_peer, SERVICE_NETWORK, 10)
+            .expect("second peer");
+        for index in 0..6u8 {
+            scheduler
+                .queue_block(BlockHash::new([30 + index; 32]), Height::from(index))
+                .expect("body");
+        }
+
+        let probes = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .filter_map(|action| match action {
+                SyncAction::RequestBlock(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(probes.len(), 2);
+        assert_eq!(scheduler.snapshot().pending_blocks, 4);
+        assert!(scheduler
+            .snapshot()
+            .peers
+            .iter()
+            .all(|peer| peer.inflight_blocks == 1 && !peer.body_available));
+
+        let first_probe = probes
+            .iter()
+            .find(|request| request.peer == Some(first_peer))
+            .expect("first peer probe");
+        scheduler
+            .receive_block(first_peer, first_probe.hash, now + Duration::from_millis(1))
+            .expect("body proof");
+        scheduler.complete_block(first_probe.hash);
+
+        let expanded = scheduler
+            .poll(now + Duration::from_millis(1), &[])
+            .into_iter()
+            .filter_map(|action| match action {
+                SyncAction::RequestBlock(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expanded.len(), 3);
+        assert!(expanded
+            .iter()
+            .all(|request| request.peer == Some(first_peer)));
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.inflight_blocks, 4);
+        assert!(snapshot.peers[0].body_available);
+        assert!(!snapshot.peers[1].body_available);
+    }
+
+    #[test]
     fn expired_block_batch_disconnects_peer_once() {
         let now = Instant::now();
         let limits = SyncLimits {
@@ -1269,6 +1354,11 @@ mod tests {
         scheduler
             .register_peer(peer, SERVICE_NETWORK, 10)
             .expect("peer");
+        scheduler
+            .peers
+            .get_mut(&peer)
+            .expect("registered peer")
+            .body_available = true;
         scheduler
             .queue_block(BlockHash::new([5; 32]), 1)
             .expect("first body");
@@ -1312,6 +1402,11 @@ mod tests {
         scheduler
             .register_peer(peer, SERVICE_NETWORK, 10)
             .expect("peer");
+        scheduler
+            .peers
+            .get_mut(&peer)
+            .expect("registered peer")
+            .body_available = true;
         let first = BlockHash::new([17; 32]);
         let second = BlockHash::new([18; 32]);
         scheduler.queue_block(first, 1).expect("first body");

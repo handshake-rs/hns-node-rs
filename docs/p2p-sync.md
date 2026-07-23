@@ -214,7 +214,10 @@ batch. A timed-out body batch requeues its
 per-block work and emits only one disconnect for the peer, preserving HSD's
 connection-level stall accounting instead of multiplying a score by the number
 of hashes in the packet. Retry exhaustion remains tracked per block across
-peer assignments. At most 128 blocks are in flight globally and 32 per peer.
+peer assignments. A new connection receives only one body probe until it
+delivers an eligible block. That proof expands its window to the configured
+32 requests; silent or non-archival peers therefore cannot reserve most of the
+128-request global limit merely by completing the transport handshake.
 
 The current scheduler keeps one in-flight request per block. A future latency
 optimization may use bounded, staggered hedged requests: ask the preferred peer
@@ -427,7 +430,9 @@ counts, durably failed-body count, checkpoint sequence,
 active-state connection/reorganization counts, contextual-failure count, and
 monotonic process-lifetime sent/received byte totals. Final peer counters move
 atomically into retired-session totals before peer removal, so rotation cannot
-make traffic evidence regress. The diagnostics also expose the last
+make traffic evidence regress. Each scheduler peer also exposes
+`body_available`, distinguishing a transport-ready peer from one that has
+actually delivered an eligible body. The diagnostics also expose the last
 terminal/internal supervisor error. Expected peer churn, stale
 alternate-peer deliveries, invalid peer data, and transient relay races are
 logged as warnings and reflected by their dedicated peer/rejection counters;
@@ -494,6 +499,11 @@ not consume a discovery slot while banned.
 Ready protocol-v3-or-newer outbound peers receive one `GETADDR`. A peer's first
 inbound `GETADDR` is answered with at most HSRD's 1,000-address wire bound;
 outbound or repeated requests are ignored, matching HSD's anti-scraping rule.
+The pinned HSD pool deliberately advertises only unkeyed plaintext addresses
+and ignores keyed `ADDR` entries. Public-network hsrd remains Brontide-only, so
+those unkeyed entries are rejected and counted rather than silently opening a
+plaintext fallback. Key-bearing DNS seeds and explicit keyed `--connect`
+targets are consequently the only public-network bootstrap sources.
 Eligible discovery slots are refilled on every poll, and due sockets start
 before potentially expensive historical active-state or body-queue scans.
 Only a completed Ready handshake resets a target's connection-failure history.
