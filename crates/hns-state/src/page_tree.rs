@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::File,
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
 };
 
@@ -16,10 +16,15 @@ use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_PAGE_CACHE_PAGES: usize = 512;
-const NAME_PAGE_STATE_VERSION: u32 = 1;
-const NAME_PAGE_STATE_BODY_BYTES: usize = 4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4;
+const NAME_PAGE_STATE_VERSION: u32 = 2;
+const LEGACY_NAME_PAGE_STATE_VERSION: u32 = 1;
+const LEGACY_NAME_PAGE_STATE_BODY_BYTES: usize = 4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4;
+const LEGACY_NAME_PAGE_STATE_BYTES: usize = LEGACY_NAME_PAGE_STATE_BODY_BYTES + 32;
+const NAME_PAGE_STATE_BODY_BYTES: usize =
+    LEGACY_NAME_PAGE_STATE_BODY_BYTES + 1 + std::mem::size_of::<u32>();
 const NAME_PAGE_STATE_BYTES: usize = NAME_PAGE_STATE_BODY_BYTES + 32;
 pub const NAME_PAGE_STATE_KEY: &[u8] = b"name-page-state/v1";
+pub const NAME_PAGE_SEGMENT_BLOCKS: u32 = 360;
 const NAME_PAGE_ROOT_RECORD_VERSION: u32 = 1;
 const NAME_PAGE_ROOT_RECORD_BODY_BYTES: usize = 4 + 32 + 8 + 8 + 4;
 const NAME_PAGE_ROOT_RECORD_BYTES: usize = NAME_PAGE_ROOT_RECORD_BODY_BYTES + 32;
@@ -37,6 +42,7 @@ pub struct NamePageState {
     pub root: TreeRoot,
     pub root_address: Option<NamePageAddress>,
     pub committed_height: Option<u32>,
+    pub last_sealed_height: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +153,16 @@ impl NamePageState {
                 writer.write_u32(0);
             }
         }
+        match self.last_sealed_height {
+            Some(height) => {
+                writer.write_u8(1);
+                writer.write_u32(height);
+            }
+            None => {
+                writer.write_u8(0);
+                writer.write_u32(0);
+            }
+        }
         let mut raw = writer.finish();
         if raw.len() != NAME_PAGE_STATE_BODY_BYTES {
             return Err(PageTreeError::StateCodec(
@@ -158,27 +174,33 @@ impl NamePageState {
     }
 
     pub fn decode(raw: &[u8]) -> Result<Self, PageTreeError> {
-        if raw.len() != NAME_PAGE_STATE_BYTES {
+        if raw.len() != NAME_PAGE_STATE_BYTES && raw.len() != LEGACY_NAME_PAGE_STATE_BYTES {
             return Err(PageTreeError::StateCodec(format!(
-                "name-page state contains {} bytes; expected {NAME_PAGE_STATE_BYTES}",
+                "name-page state contains {} bytes; expected {NAME_PAGE_STATE_BYTES} or {LEGACY_NAME_PAGE_STATE_BYTES}",
                 raw.len()
             )));
         }
-        let (body, checksum) = raw.split_at(NAME_PAGE_STATE_BODY_BYTES);
+        let body_bytes = raw.len() - 32;
+        let (body, checksum) = raw.split_at(body_bytes);
         if checksum != blake2b_256(body) {
             return Err(PageTreeError::StateCodec(
                 "name-page state checksum mismatch".to_owned(),
             ));
         }
-        let mut reader = Reader::new(body, NAME_PAGE_STATE_BODY_BYTES)
+        let mut reader = Reader::new(body, body_bytes)
             .map_err(|error| PageTreeError::StateCodec(error.to_string()))?;
         let version = reader
             .read_u32()
             .map_err(|error| PageTreeError::StateCodec(error.to_string()))?;
-        if version != NAME_PAGE_STATE_VERSION {
+        if version != NAME_PAGE_STATE_VERSION && version != LEGACY_NAME_PAGE_STATE_VERSION {
             return Err(PageTreeError::StateCodec(format!(
                 "unsupported name-page state version {version}"
             )));
+        }
+        if (version == NAME_PAGE_STATE_VERSION) != (body_bytes == NAME_PAGE_STATE_BODY_BYTES) {
+            return Err(PageTreeError::StateCodec(
+                "name-page state version does not match its encoded length".to_owned(),
+            ));
         }
         let generation = reader
             .read_u64()
@@ -244,6 +266,36 @@ impl NamePageState {
                 )))
             }
         };
+        let last_sealed_height = if version == LEGACY_NAME_PAGE_STATE_VERSION {
+            None
+        } else {
+            match reader
+                .read_u8()
+                .map_err(|error| PageTreeError::StateCodec(error.to_string()))?
+            {
+                0 => {
+                    let reserved = reader
+                        .read_u32()
+                        .map_err(|error| PageTreeError::StateCodec(error.to_string()))?;
+                    if reserved != 0 {
+                        return Err(PageTreeError::StateCodec(
+                            "name-page state absent seal height has nonzero payload".to_owned(),
+                        ));
+                    }
+                    None
+                }
+                1 => Some(
+                    reader
+                        .read_u32()
+                        .map_err(|error| PageTreeError::StateCodec(error.to_string()))?,
+                ),
+                value => {
+                    return Err(PageTreeError::StateCodec(format!(
+                        "invalid name-page seal-height flag {value}"
+                    )))
+                }
+            }
+        };
         reader
             .ensure_finished()
             .map_err(|error| PageTreeError::StateCodec(error.to_string()))?;
@@ -256,6 +308,7 @@ impl NamePageState {
             root,
             root_address,
             committed_height,
+            last_sealed_height,
         };
         state.validate()?;
         Ok(state)
@@ -280,11 +333,20 @@ impl NamePageState {
                 .checked_add(1)
                 .and_then(|page| page.checked_mul(NAME_PAGE_BYTES as u64))
                 .ok_or(PageTreeError::OffsetOverflow)?;
-            if address.segment() != self.manifest.active_segment
-                || page_end > self.manifest.durable_bytes
+            if address.segment() > self.manifest.active_segment {
+                return Err(PageTreeError::RootLocatorInvariant);
+            }
+            if address.segment() == self.manifest.active_segment
+                && page_end > self.manifest.durable_bytes
             {
                 return Err(PageTreeError::RootLocatorInvariant);
             }
+        }
+        if self
+            .last_sealed_height
+            .is_some_and(|height| height == 0 || !height.is_multiple_of(NAME_PAGE_SEGMENT_BLOCKS))
+        {
+            return Err(PageTreeError::RootLocatorInvariant);
         }
         Ok(())
     }
@@ -365,8 +427,8 @@ struct CachedNamePage {
 #[derive(Debug)]
 struct PageCache {
     capacity: usize,
-    pages: HashMap<u32, CachedNamePage>,
-    order: VecDeque<u32>,
+    pages: HashMap<(u32, u32), CachedNamePage>,
+    order: VecDeque<(u32, u32)>,
 }
 
 impl PageCache {
@@ -378,14 +440,14 @@ impl PageCache {
         }
     }
 
-    fn touch(&mut self, page: u32) {
+    fn touch(&mut self, page: (u32, u32)) {
         if let Some(position) = self.order.iter().position(|candidate| *candidate == page) {
             self.order.remove(position);
         }
         self.order.push_back(page);
     }
 
-    fn insert(&mut self, page: u32, value: CachedNamePage) {
+    fn insert(&mut self, page: (u32, u32), value: CachedNamePage) {
         if !self.pages.contains_key(&page) && self.pages.len() == self.capacity {
             if let Some(evicted) = self.order.pop_front() {
                 self.pages.remove(&evicted);
@@ -401,9 +463,9 @@ impl PageCache {
 /// hashes and their physical addresses for the next traversal step.
 #[derive(Debug)]
 pub struct NamePageTreeReader {
-    file: Mutex<File>,
+    files: Mutex<HashMap<u32, File>>,
     generation: u64,
-    segment: u32,
+    root_segment: u32,
     addresses: Mutex<HashMap<TreeRoot, NamePageAddress>>,
     cache: Mutex<PageCache>,
 }
@@ -495,15 +557,45 @@ impl NamePageTreeReader {
         cache_pages: usize,
     ) -> Result<Self, PageTreeError> {
         let address = locator.page_address();
-        let file = File::open(path).map_err(PageTreeError::io)?;
+        let mut paths = BTreeMap::new();
+        paths.insert(address.segment(), path.as_ref().to_path_buf());
+        Self::open_segments_with_cache(&paths, root, locator, cache_pages)
+    }
+
+    pub fn open_segments(
+        paths: &BTreeMap<u32, PathBuf>,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+    ) -> Result<Self, PageTreeError> {
+        Self::open_segments_with_cache(paths, root, locator, DEFAULT_PAGE_CACHE_PAGES)
+    }
+
+    pub fn open_segments_with_cache(
+        paths: &BTreeMap<u32, PathBuf>,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+        cache_pages: usize,
+    ) -> Result<Self, PageTreeError> {
+        let address = locator.page_address();
+        let mut files = HashMap::with_capacity(paths.len());
+        for (segment, path) in paths {
+            files.insert(
+                *segment,
+                File::open(path)
+                    .map_err(|error| PageTreeError::Io(format!("{}: {error}", path.display())))?,
+            );
+        }
+        if !files.contains_key(&address.segment()) {
+            return Err(PageTreeError::MissingSegment(address.segment()));
+        }
         let mut addresses = HashMap::new();
         if root != TreeRoot::ZERO {
             addresses.insert(root, address);
         }
         Ok(Self {
-            file: Mutex::new(file),
+            files: Mutex::new(files),
             generation: locator.generation,
-            segment: address.segment(),
+            root_segment: address.segment(),
             addresses: Mutex::new(addresses),
             cache: Mutex::new(PageCache::new(cache_pages)),
         })
@@ -514,7 +606,7 @@ impl NamePageTreeReader {
     }
 
     pub const fn segment(&self) -> u32 {
-        self.segment
+        self.root_segment
     }
 
     pub fn insert_root(
@@ -523,11 +615,19 @@ impl NamePageTreeReader {
         locator: NamePageRootLocator,
     ) -> Result<(), PageTreeError> {
         let address = locator.page_address();
-        if locator.generation != self.generation || address.segment() != self.segment {
-            return Err(PageTreeError::WrongSegment {
-                expected: self.segment,
-                actual: address.segment(),
+        if locator.generation != self.generation {
+            return Err(PageTreeError::WrongGeneration {
+                expected: self.generation,
+                actual: locator.generation,
             });
+        }
+        if !self
+            .files
+            .lock()
+            .map_err(|_| PageTreeError::Poisoned)?
+            .contains_key(&address.segment())
+        {
+            return Err(PageTreeError::MissingSegment(address.segment()));
         }
         let mut addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
         insert_discovered_address(&mut addresses, root, address)
@@ -546,19 +646,14 @@ impl NamePageTreeReader {
         else {
             return Ok(None);
         };
-        if address.segment() != self.segment {
-            return Err(PageTreeError::WrongSegment {
-                expected: self.segment,
-                actual: address.segment(),
-            });
-        }
-        self.ensure_page(address.page())?;
+        self.ensure_page(address)?;
+        let cache_key = (address.segment(), address.page());
         let mut cache = self.cache.lock().map_err(|_| PageTreeError::Poisoned)?;
-        cache.touch(address.page());
+        cache.touch(cache_key);
         let page = cache
             .pages
-            .get(&address.page())
-            .ok_or(PageTreeError::MissingCachedPage(address.page()))?;
+            .get(&cache_key)
+            .ok_or(PageTreeError::MissingCachedPage(address))?;
         let record = page
             .records
             .get(usize::from(address.slot()))
@@ -601,19 +696,23 @@ impl NamePageTreeReader {
             .map(|addresses| addresses.clone())
     }
 
-    fn ensure_page(&self, page_number: u32) -> Result<(), PageTreeError> {
+    fn ensure_page(&self, address: NamePageAddress) -> Result<(), PageTreeError> {
+        let cache_key = (address.segment(), address.page());
         {
             let cache = self.cache.lock().map_err(|_| PageTreeError::Poisoned)?;
-            if cache.pages.contains_key(&page_number) {
+            if cache.pages.contains_key(&cache_key) {
                 return Ok(());
             }
         }
-        let offset = u64::from(page_number)
+        let offset = u64::from(address.page())
             .checked_mul(NAME_PAGE_BYTES as u64)
             .ok_or(PageTreeError::OffsetOverflow)?;
         let mut encoded = vec![0u8; NAME_PAGE_BYTES];
         {
-            let mut file = self.file.lock().map_err(|_| PageTreeError::Poisoned)?;
+            let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
+            let file = files
+                .get_mut(&address.segment())
+                .ok_or(PageTreeError::MissingSegment(address.segment()))?;
             file.seek(SeekFrom::Start(offset))
                 .map_err(PageTreeError::io)?;
             file.read_exact(&mut encoded).map_err(PageTreeError::io)?;
@@ -631,7 +730,7 @@ impl NamePageTreeReader {
         self.cache
             .lock()
             .map_err(|_| PageTreeError::Poisoned)?
-            .insert(page_number, CachedNamePage { records });
+            .insert(cache_key, CachedNamePage { records });
         Ok(())
     }
 }
@@ -793,8 +892,12 @@ pub enum PageTreeError {
     OffsetOverflow,
     #[error("name-page address belongs to segment {actual}, expected {expected}")]
     WrongSegment { expected: u32, actual: u32 },
-    #[error("name-page cache did not retain page {0}")]
-    MissingCachedPage(u32),
+    #[error("name-page locator belongs to generation {actual}, expected {expected}")]
+    WrongGeneration { expected: u64, actual: u64 },
+    #[error("name-page segment {0} is unavailable")]
+    MissingSegment(u32),
+    #[error("name-page cache did not retain address {0:?}")]
+    MissingCachedPage(NamePageAddress),
     #[error("name-page address {0:?} has an out-of-range slot")]
     SlotOutOfRange(NamePageAddress),
     #[error("name-page record key is {actual:?}, expected {expected:?}")]
@@ -833,6 +936,35 @@ mod tests {
     };
 
     #[test]
+    fn name_page_state_round_trips_seals_and_decodes_legacy_state() {
+        let state = NamePageState {
+            manifest: SegmentManifest {
+                generation: 7,
+                active_segment: 1,
+                durable_bytes: 0,
+            },
+            root: TreeRoot::ZERO,
+            root_address: None,
+            committed_height: Some(205),
+            last_sealed_height: Some(360),
+        };
+        let encoded = state.encode().expect("encode state");
+        assert_eq!(
+            NamePageState::decode(&encoded).expect("decode state"),
+            state
+        );
+
+        let mut legacy_body = encoded[..LEGACY_NAME_PAGE_STATE_BODY_BYTES].to_vec();
+        legacy_body[..4].copy_from_slice(&LEGACY_NAME_PAGE_STATE_VERSION.to_le_bytes());
+        let mut legacy = legacy_body.clone();
+        legacy.extend_from_slice(&blake2b_256(&legacy_body));
+        let decoded = NamePageState::decode(&legacy).expect("decode legacy state");
+        assert_eq!(decoded.last_sealed_height, None);
+        assert_eq!(decoded.committed_height, state.committed_height);
+        assert_eq!(decoded.manifest, state.manifest);
+    }
+
+    #[test]
     fn append_only_pages_mutate_from_root_and_child_locators_without_hash_index() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -842,7 +974,12 @@ mod tests {
             "hsrd-name-pages-{}-{nonce}.pages",
             std::process::id()
         ));
+        let second_path = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-{}-{nonce}-second.pages",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&second_path);
 
         let alpha = NameHash::new([0x11; 32]);
         let beta = NameHash::new([0x88; 32]);
@@ -879,17 +1016,21 @@ mod tests {
         let updated_root = update.root();
         assert_ne!(updated_root, initial_root);
         let known = reader.known_addresses().expect("known addresses");
-        let update_pack =
-            pack_name_page_records(1, 0, appender.next_page(), update.records(), &known)
-                .expect("pack update");
+        let mut second_appender =
+            NamePageAppender::create_new(&second_path, 1, 1).expect("create second segment");
+        let update_pack = pack_name_page_records(1, 1, 0, update.records(), &known)
+            .expect("pack cross-segment update");
         assert!(update_pack.record_count() < initial_records.len() + update.records().len());
-        update_pack.append(&mut appender).expect("append update");
+        update_pack
+            .append(&mut second_appender)
+            .expect("append update");
         let updated_locator = update_pack
             .root_locator(updated_root)
             .expect("updated root locator");
 
+        let paths = BTreeMap::from([(0, path.clone()), (1, second_path.clone())]);
         let updated_reader =
-            NamePageTreeReader::open_with_cache(&path, updated_root, updated_locator, 2)
+            NamePageTreeReader::open_segments_with_cache(&paths, updated_root, updated_locator, 2)
                 .expect("open updated reader");
         let loaded = validate_record_tree(updated_root, |root| {
             updated_reader
@@ -912,6 +1053,8 @@ mod tests {
         drop(updated_reader);
         drop(reader);
         drop(appender);
+        drop(second_appender);
         std::fs::remove_file(path).expect("remove page fixture");
+        std::fs::remove_file(second_path).expect("remove second page fixture");
     }
 }

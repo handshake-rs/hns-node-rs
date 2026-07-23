@@ -71,7 +71,7 @@ use hns_state::{
     AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock, NamePageRootLocator,
     NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader,
     NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine,
-    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_STATE_KEY,
+    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_unclean_start, open_store, truncate_name_pages_to_committed_tail,
@@ -1914,6 +1914,7 @@ struct NodeReorgMutation {
 
 #[derive(Debug)]
 struct NamePageStorage {
+    directory: PathBuf,
     file_path: PathBuf,
     state: NamePageState,
     appender: Option<NamePageAppender>,
@@ -1982,6 +1983,16 @@ impl NamePageStorage {
                 state.manifest.active_segment,
             );
             drop(snapshot);
+            remove_unpublished_name_page_segments(
+                &directory,
+                state.manifest.generation,
+                state.manifest.active_segment,
+            )?;
+            validate_name_page_segment_set(
+                &directory,
+                state.manifest.generation,
+                state.manifest.active_segment,
+            )?;
             truncate_name_pages_to_committed_tail(&file_path, state.manifest.durable_bytes)
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -1998,6 +2009,7 @@ impl NamePageStorage {
                         )
                     })?;
             return Ok(Self {
+                directory,
                 file_path,
                 state,
                 appender: Some(appender),
@@ -2022,6 +2034,7 @@ impl NamePageStorage {
                     file_path.display()
                 )
             })?;
+        sync_directory(&directory)?;
         let height = best_block_tip_from_snapshot(&snapshot)?.map(|tip| tip.height);
         let (manifest, root_address) = if durable_root == TreeRoot::ZERO {
             (appender.sync_data()?, None)
@@ -2051,6 +2064,7 @@ impl NamePageStorage {
             root: durable_root,
             root_address,
             committed_height: height,
+            last_sealed_height: None,
         };
         let mut batch = store.batch();
         batch.put(
@@ -2073,6 +2087,7 @@ impl NamePageStorage {
         drop(snapshot);
         store.commit(batch)?;
         Ok(Self {
+            directory,
             file_path,
             state,
             appender: Some(appender),
@@ -2087,7 +2102,12 @@ impl NamePageStorage {
                     .expect("zero page address fits"),
             )
         });
-        let reader = NamePageTreeReader::open(&self.file_path, self.state.root, locator)
+        let paths = name_page_segment_paths(
+            &self.directory,
+            self.state.manifest.generation,
+            self.state.manifest.active_segment,
+        )?;
+        let reader = NamePageTreeReader::open_segments(&paths, self.state.root, locator)
             .map_err(|error| anyhow::anyhow!("failed to open name-page reader: {error}"))?;
         for (key, raw) in snapshot
             .scan_prefix(ColumnFamily::Snapshots, NAME_PAGE_ROOT_PREFIX)
@@ -2128,10 +2148,25 @@ impl NamePageStorage {
             })?;
             records.insert(TreeRoot::new(raw_root), value);
         }
+        // A multi-block reorganization can stage nodes for an intermediate
+        // root that is no longer reachable from its final root. Append only a
+        // final-root update; an already known final root needs no new pages.
+        if !records.contains_key(&root) {
+            records.clear();
+        }
 
         let mut next = self.state.clone();
         if records.is_empty() {
             if root == self.state.root {
+                if let Some(height) = height {
+                    if self.prepare_segment_seal(&mut next, height)? {
+                        batch.put(
+                            ColumnFamily::Snapshots,
+                            NAME_PAGE_STATE_KEY,
+                            &next.encode()?,
+                        )?;
+                    }
+                }
                 return Ok(next);
             }
             if root == TreeRoot::ZERO {
@@ -2178,6 +2213,7 @@ impl NamePageStorage {
                         root,
                         root_address: Some(address),
                         committed_height: Some(height),
+                        last_sealed_height: self.state.last_sealed_height,
                     };
                     let record = NamePageRootRecord {
                         root,
@@ -2221,6 +2257,7 @@ impl NamePageStorage {
                 root,
                 root_address: Some(address),
                 committed_height: Some(height),
+                last_sealed_height: self.state.last_sealed_height,
             };
             let record = NamePageRootRecord {
                 root,
@@ -2233,6 +2270,9 @@ impl NamePageStorage {
                 &record.encode(),
             )?;
         }
+        if let Some(height) = height {
+            self.prepare_segment_seal(&mut next, height)?;
+        }
         batch.put(
             ColumnFamily::Snapshots,
             NAME_PAGE_STATE_KEY,
@@ -2241,12 +2281,58 @@ impl NamePageStorage {
         Ok(next)
     }
 
+    fn prepare_segment_seal(&mut self, next: &mut NamePageState, height: Height) -> Result<bool> {
+        if height == 0
+            || !height.is_multiple_of(NAME_PAGE_SEGMENT_BLOCKS)
+            || next
+                .last_sealed_height
+                .is_some_and(|sealed| sealed >= height)
+        {
+            return Ok(false);
+        }
+        let next_segment = next
+            .manifest
+            .active_segment
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("name-page segment number exhausted"))?;
+        self.appender.take();
+        let file_path =
+            name_page_file_path(&self.directory, next.manifest.generation, next_segment);
+        let mut appender =
+            NamePageAppender::create_new(&file_path, next.manifest.generation, next_segment)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to create sealed successor {}: {error}",
+                        file_path.display()
+                    )
+                })?;
+        let manifest = appender
+            .sync_data()
+            .map_err(|error| anyhow::anyhow!("failed to sync sealed successor: {error}"))?;
+        sync_directory(&self.directory)?;
+        self.file_path = file_path;
+        self.appender = Some(appender);
+        next.manifest = manifest;
+        next.last_sealed_height = Some(height);
+        Ok(true)
+    }
+
     fn commit_prepared(&mut self, prepared: NamePageState) {
         self.state = prepared;
     }
 
     fn rollback_uncommitted_tail(&mut self) -> Result<()> {
         self.appender.take();
+        remove_unpublished_name_page_segments(
+            &self.directory,
+            self.state.manifest.generation,
+            self.state.manifest.active_segment,
+        )?;
+        self.file_path = name_page_file_path(
+            &self.directory,
+            self.state.manifest.generation,
+            self.state.manifest.active_segment,
+        );
         truncate_name_pages_to_committed_tail(&self.file_path, self.state.manifest.durable_bytes)
             .map_err(|error| anyhow::anyhow!("failed to roll back name-page tail: {error}"))?;
         self.appender = Some(
@@ -2259,6 +2345,92 @@ impl NamePageStorage {
 
 fn name_page_file_path(directory: &std::path::Path, generation: u64, segment: u32) -> PathBuf {
     directory.join(format!("name-g{generation:016x}-s{segment:08x}.pages"))
+}
+
+fn parse_name_page_file_name(name: &str) -> Option<(u64, u32)> {
+    let raw = name.strip_prefix("name-g")?.strip_suffix(".pages")?;
+    let (generation, segment) = raw.split_once("-s")?;
+    Some((
+        u64::from_str_radix(generation, 16).ok()?,
+        u32::from_str_radix(segment, 16).ok()?,
+    ))
+}
+
+fn name_page_segment_paths(
+    directory: &std::path::Path,
+    generation: u64,
+    active_segment: u32,
+) -> Result<BTreeMap<u32, PathBuf>> {
+    let mut paths = BTreeMap::new();
+    for segment in 0..=active_segment {
+        let path = name_page_file_path(directory, generation, segment);
+        if !path.is_file() {
+            anyhow::bail!("name-page segment {} is missing", path.display());
+        }
+        paths.insert(segment, path);
+    }
+    Ok(paths)
+}
+
+fn validate_name_page_segment_set(
+    directory: &std::path::Path,
+    generation: u64,
+    active_segment: u32,
+) -> Result<()> {
+    for (segment, path) in name_page_segment_paths(directory, generation, active_segment)? {
+        if segment == active_segment {
+            continue;
+        }
+        let bytes = std::fs::metadata(&path)
+            .with_context(|| format!("failed to inspect sealed segment {}", path.display()))?
+            .len();
+        if !bytes.is_multiple_of(hns_store::NAME_PAGE_BYTES as u64) {
+            anyhow::bail!(
+                "sealed name-page segment {} has a non-page-aligned length",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remove_unpublished_name_page_segments(
+    directory: &std::path::Path,
+    generation: u64,
+    active_segment: u32,
+) -> Result<()> {
+    let mut removed = false;
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("failed to scan {}", directory.display()))?
+    {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((candidate_generation, segment)) = parse_name_page_file_name(&name) else {
+            continue;
+        };
+        if candidate_generation == generation && segment > active_segment {
+            std::fs::remove_file(entry.path()).with_context(|| {
+                format!(
+                    "failed to discard unpublished name-page segment {}",
+                    entry.path().display()
+                )
+            })?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(directory: &std::path::Path) -> Result<()> {
+    std::fs::File::open(directory)
+        .with_context(|| format!("failed to open directory {}", directory.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to sync directory {}", directory.display()))
 }
 
 fn load_name_page_root_record(
@@ -7565,7 +7737,7 @@ mod tests {
             .append(&[hns_store::NamePageRecord {
                 key: *page_state.root.as_bytes(),
                 children: Vec::new(),
-                canonical: duplicate,
+                canonical: duplicate.clone(),
             }])
             .expect("append simulated uncommitted page");
         pages
@@ -7616,10 +7788,79 @@ mod tests {
             206,
         ))
         .expect("reconnect page boundary");
+
+        let raw = store.snapshot().expect("pre-seal snapshot");
+        let root = load_stored_name_tree_commit_root(&raw).expect("pre-seal root");
+        let reader = node
+            .state
+            .name_pages
+            .as_ref()
+            .expect("page storage")
+            .reader(&raw)
+            .expect("pre-seal reader");
+        let mut batch = store.batch();
+        let prepared = node
+            .state
+            .name_pages
+            .as_mut()
+            .expect("page storage")
+            .prepare_root(
+                &raw,
+                &mut batch,
+                &reader,
+                BTreeMap::new(),
+                root,
+                Some(NAME_PAGE_SEGMENT_BLOCKS),
+            )
+            .expect("prepare physical seal");
+        drop(reader);
+        drop(raw);
+        store.commit(batch).expect("publish physical seal");
+        node.state
+            .name_pages
+            .as_mut()
+            .expect("page storage")
+            .commit_prepared(prepared.clone());
+        assert_eq!(prepared.manifest.active_segment, 1);
+        assert_eq!(prepared.manifest.durable_bytes, 0);
+        assert_eq!(prepared.last_sealed_height, Some(NAME_PAGE_SEGMENT_BLOCKS));
+        assert_eq!(
+            prepared
+                .root_address
+                .expect("sealed root address")
+                .segment(),
+            0
+        );
+        let unpublished_path = name_page_file_path(&directory, prepared.manifest.generation, 2);
+        let mut unpublished =
+            NamePageAppender::create_new(&unpublished_path, prepared.manifest.generation, 2)
+                .expect("create unpublished successor");
+        unpublished
+            .append(&[hns_store::NamePageRecord {
+                key: *prepared.root.as_bytes(),
+                children: Vec::new(),
+                canonical: duplicate,
+            }])
+            .expect("append unpublished successor page");
+        unpublished
+            .sync_data()
+            .expect("sync unpublished successor page");
+        drop(unpublished);
         drop(node);
 
         let pages =
             NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("reopen pages");
+        assert!(!unpublished_path.exists());
+        let snapshot = store.snapshot().expect("sealed snapshot");
+        let reader = pages
+            .reader(&snapshot)
+            .expect("sealed multi-segment reader");
+        assert!(reader
+            .load(prepared.root)
+            .expect("load sealed root")
+            .is_some());
+        drop(reader);
+        drop(snapshot);
         let (_reopened, audit) = NodeState::from_store_for_network_with_startup_audit(
             store,
             Network::Regtest,
