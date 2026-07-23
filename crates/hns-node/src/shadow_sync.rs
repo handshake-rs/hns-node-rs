@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    error::Error,
+    fmt,
     fs::{self, OpenOptions},
     io::{ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -87,6 +89,19 @@ const ADDRESS_BOOK_HEADER_SIZE: usize = 26;
 const MAX_ADDRESS_BOOK_RECORD_SIZE: usize = ADDRESS_BOOK_HEADER_SIZE
     + MAX_KNOWN_PEER_ADDRESSES * ADDRESS_BOOK_ENTRY_SIZE
     + ADDRESS_BOOK_CHECKSUM_SIZE;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MissingHeaderParent {
+    parent: BlockHash,
+}
+
+impl fmt::Display for MissingHeaderParent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "missing header parent {}", self.parent.to_hex())
+    }
+}
+
+impl Error for MissingHeaderParent {}
 const ADDRESS_BOOK_FLUSH_INTERVAL: Duration = Duration::from_secs(120);
 const HSD_ADDRESS_HORIZON_SECONDS: u64 = 30 * 24 * 60 * 60;
 const HSD_ADDRESS_MIN_FAIL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -2154,9 +2169,13 @@ impl NodeService {
             let parent = if header == self.config.network.params().genesis_header() {
                 None
             } else {
-                Some(lookup(&header.prev_block)?.ok_or_else(|| {
-                    anyhow::anyhow!("missing header parent {}", header.prev_block.to_hex())
-                })?)
+                Some(
+                    lookup(&header.prev_block)?
+                        .ok_or(MissingHeaderParent {
+                            parent: header.prev_block,
+                        })
+                        .map_err(anyhow::Error::new)?,
+                )
             };
             let height = parent
                 .as_ref()
@@ -3233,14 +3252,29 @@ async fn handle_peer_event(
         PeerEvent::Packet { peer, packet } => match packet {
             Packet::Headers(headers) => {
                 let header_count = headers.len();
-                // A response consumes the outstanding request even if the
-                // supplied batch is invalid. Otherwise a malicious peer can
-                // pin the header-request slot until the timeout fires.
-                scheduler.note_headers_response(peer, header_count);
                 let imported = import_header_packet(node, headers).await;
                 let imported = match imported {
                     Ok(imported) => imported,
+                    Err(error) if error.downcast_ref::<MissingHeaderParent>().is_some() => {
+                        // SENDHEADERS peers relay a fresh tip header even while
+                        // this node is far behind. Its parent is intentionally
+                        // outside our local index and can race an outstanding
+                        // GETHEADERS response from the same peer. Ignore the
+                        // detached announcement without consuming that request
+                        // or banning every healthy peer at the network tip.
+                        tracing::debug!(
+                            ?peer,
+                            %error,
+                            "ignored detached live header announcement while synchronizing"
+                        );
+                        return Ok(());
+                    }
                     Err(error) => {
+                        // A connecting response consumes the outstanding
+                        // request even if its consensus validation fails.
+                        // Otherwise a malicious peer can pin the request slot
+                        // until the timeout fires.
+                        scheduler.note_headers_response(peer, header_count);
                         // Header packets commit atomically. Refresh from the
                         // unchanged durable index before disconnecting the
                         // sender so the scheduler retries from the last
@@ -3258,6 +3292,7 @@ async fn handle_peer_event(
                         return Err(error.context("peer header batch rejected"));
                     }
                 };
+                scheduler.note_headers_response(peer, header_count);
                 {
                     let node = node.lock().await;
                     scheduler.set_best_header(node.shadow_sync_best_header_tip()?);
@@ -6546,6 +6581,35 @@ mod tests {
                 .expect("first header lookup"),
             None
         );
+    }
+
+    #[test]
+    fn detached_live_header_is_classified_without_mutating_the_header_tip() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis");
+        let parent = BlockHash::new([0x91; 32]);
+        let error = service
+            .shadow_sync_import_headers(vec![Header {
+                prev_block: parent,
+                ..Header::default()
+            }])
+            .expect_err("detached live header");
+        assert_eq!(
+            error.downcast_ref::<MissingHeaderParent>(),
+            Some(&MissingHeaderParent { parent })
+        );
+        let tip = service
+            .shadow_sync_best_header_tip()
+            .expect("best header")
+            .expect("tip");
+        assert_eq!(tip.hash, genesis.hash);
+        assert_eq!(tip.height, genesis.height);
+        assert_eq!(tip.chainwork, genesis.chainwork);
     }
 
     #[tokio::test]
