@@ -214,10 +214,16 @@ dominant per-node work. It changes local storage metadata, not Urkel roots,
 proofs, name semantics, or reorganization atomicity.
 
 Schema 18/profile `hsrd-mining-v14` enables segment reads and writes. The
-schema-17 current root is bootstrapped into pages before startup audit; old
-`NameTreeNodes` records remain a read-only fallback for historical retained
-roots. New block and undo payloads use the same fsync-before-publication rule
-with 256 MiB segment rotation and transparent locator resolution.
+schema-17 current root is bootstrapped into pages before startup audit. That
+one-time conversion splits the upper tree into at most 4,096 deterministic
+subtrees, advances their post-order traversals together with RocksDB
+`MultiGet`s of at most 1,024 nodes, and writes each completed 64 KiB page
+immediately. It reads each reachable legacy record once and retains only a
+deduplication set, shallow traversal stacks, and one page buffer rather than a
+second all-record map and an all-page output graph. Old `NameTreeNodes` records
+remain a read-only fallback for historical retained roots. New block and undo
+payloads use the same fsync-before-publication rule with 256 MiB segment
+rotation and transparent locator resolution.
 
 Normal restart does not re-hash immutable historical block/undo segments.
 Recovery checks that every sealed file exists, removes unpublished future

@@ -548,6 +548,10 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   directory/payload layout, at least 500 average internal nodes per 64 KiB
   page, sync-before-manifest publication, and recovery of complete or partial
   uncommitted pages to an exact page boundary.
+- Bootstrap tests stream a legacy content-addressed tree through several
+  parallel post-order subtrees, reopen the resulting pages, validate every
+  reachable record and sampled proof, and reject a duplicated subtree before
+  any page is published.
 - Block/undo archive qualification forces physical rotation at a reduced test
   threshold, rolls back a newly created segment, reopens old and active
   segments, rejects checksum corruption inside an authoritative manifest, and

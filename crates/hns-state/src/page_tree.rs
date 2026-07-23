@@ -12,7 +12,7 @@ use hns_store::{
     NamePageError, NamePagePush, NamePageRecord, ReadSnapshot, ScanEntry, SegmentManifest,
     StoreError, NAME_PAGE_BYTES,
 };
-use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord};
+use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord, URKEL_BITS};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_PAGE_CACHE_PAGES: usize = 512;
@@ -29,6 +29,8 @@ const NAME_PAGE_ROOT_RECORD_VERSION: u32 = 1;
 const NAME_PAGE_ROOT_RECORD_BODY_BYTES: usize = 4 + 32 + 8 + 8 + 4;
 const NAME_PAGE_ROOT_RECORD_BYTES: usize = NAME_PAGE_ROOT_RECORD_BODY_BYTES + 32;
 pub const NAME_PAGE_ROOT_PREFIX: &[u8] = b"name-page-root/v1/";
+const NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES: usize = 4_096;
+const NAME_PAGE_BOOTSTRAP_READ_BATCH: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NamePageRootLocator {
@@ -372,6 +374,467 @@ pub struct PackedNamePages {
     first_page: u32,
     pages: Vec<Vec<NamePageRecord>>,
     addresses: BTreeMap<TreeRoot, NamePageAddress>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamedNamePages {
+    pub manifest: SegmentManifest,
+    pub root_address: Option<NamePageAddress>,
+    pub record_count: u64,
+    pub page_count: u64,
+    pub parallel_subtrees: usize,
+}
+
+#[derive(Debug)]
+struct BootstrapFrontier {
+    root: TreeRoot,
+    depth: usize,
+    raw: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct BootstrapSkeletonNode {
+    root: TreeRoot,
+    raw: Vec<u8>,
+    left: TreeRoot,
+    right: TreeRoot,
+}
+
+#[derive(Debug)]
+struct BootstrapParent {
+    root: TreeRoot,
+    raw: Vec<u8>,
+    child_depth: usize,
+    right: TreeRoot,
+    left_address: Option<NamePageAddress>,
+}
+
+#[derive(Debug)]
+struct BootstrapTask {
+    root: TreeRoot,
+    pending_root: TreeRoot,
+    pending_depth: usize,
+    pending_raw: Option<Vec<u8>>,
+    parents: Vec<BootstrapParent>,
+    result: Option<NamePageAddress>,
+}
+
+impl BootstrapTask {
+    fn new(frontier: BootstrapFrontier) -> Self {
+        Self {
+            root: frontier.root,
+            pending_root: frontier.root,
+            pending_depth: frontier.depth,
+            pending_raw: frontier.raw,
+            parents: Vec::new(),
+            result: None,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn pending_request(&self) -> Option<TreeRoot> {
+        (!self.is_complete() && self.pending_raw.is_none()).then_some(self.pending_root)
+    }
+
+    fn take_preloaded(&mut self) -> Option<Vec<u8>> {
+        self.pending_raw.take()
+    }
+
+    fn accept(
+        &mut self,
+        raw: Vec<u8>,
+        seen: &mut HashSet<TreeRoot>,
+        emitter: &mut StreamingPageEmitter<'_>,
+    ) -> Result<(), PageTreeError> {
+        let root = self.pending_root;
+        let depth = self.pending_depth;
+        let record = decode_bootstrap_record(root, &raw)?;
+        match record {
+            UrkelNodeRecord::Leaf { .. } => {
+                let address = emitter.emit(root, raw, Vec::new())?;
+                self.complete(address, seen, emitter)
+            }
+            UrkelNodeRecord::Internal {
+                prefix,
+                left,
+                right,
+            } => {
+                let child_depth = bootstrap_child_depth(depth, prefix.bit_len())?;
+                insert_bootstrap_root(seen, left)?;
+                self.parents.push(BootstrapParent {
+                    root,
+                    raw,
+                    child_depth,
+                    right,
+                    left_address: None,
+                });
+                self.pending_root = left;
+                self.pending_depth = child_depth;
+                Ok(())
+            }
+        }
+    }
+
+    fn complete(
+        &mut self,
+        mut address: NamePageAddress,
+        seen: &mut HashSet<TreeRoot>,
+        emitter: &mut StreamingPageEmitter<'_>,
+    ) -> Result<(), PageTreeError> {
+        loop {
+            let Some(parent) = self.parents.last_mut() else {
+                self.result = Some(address);
+                return Ok(());
+            };
+            if parent.left_address.is_none() {
+                parent.left_address = Some(address);
+                insert_bootstrap_root(seen, parent.right)?;
+                self.pending_root = parent.right;
+                self.pending_depth = parent.child_depth;
+                return Ok(());
+            }
+
+            let parent = self.parents.pop().expect("parent exists");
+            let left_address = parent.left_address.expect("left child completed");
+            address = emitter.emit(parent.root, parent.raw, vec![left_address, address])?;
+        }
+    }
+}
+
+struct StreamingPageEmitter<'a> {
+    appender: &'a mut NamePageAppender,
+    builder: Option<NamePageBuilder>,
+    pending_addresses: Vec<NamePageAddress>,
+    first_page: u32,
+    record_count: u64,
+}
+
+impl<'a> StreamingPageEmitter<'a> {
+    fn new(appender: &'a mut NamePageAppender) -> Result<Self, PageTreeError> {
+        let first_page = appender.next_page();
+        Ok(Self {
+            builder: Some(NamePageBuilder::new(appender.segment(), first_page)?),
+            appender,
+            pending_addresses: Vec::new(),
+            first_page,
+            record_count: 0,
+        })
+    }
+
+    fn emit(
+        &mut self,
+        root: TreeRoot,
+        canonical: Vec<u8>,
+        children: Vec<NamePageAddress>,
+    ) -> Result<NamePageAddress, PageTreeError> {
+        let mut record = NamePageRecord {
+            key: *root.as_bytes(),
+            children,
+            canonical,
+        };
+        loop {
+            match self
+                .builder
+                .as_mut()
+                .expect("streaming page builder exists")
+                .push(record)?
+            {
+                NamePagePush::Added(address) => {
+                    self.pending_addresses.push(address);
+                    self.record_count = self
+                        .record_count
+                        .checked_add(1)
+                        .ok_or(PageTreeError::OffsetOverflow)?;
+                    return Ok(address);
+                }
+                NamePagePush::Full(returned) => {
+                    self.flush_page()?;
+                    record = returned;
+                }
+            }
+        }
+    }
+
+    fn flush_page(&mut self) -> Result<(), PageTreeError> {
+        let builder = self.builder.take().expect("streaming page builder exists");
+        if builder.is_empty() {
+            return Err(PageTreeError::Page(NamePageError::EmptyPage));
+        }
+        let actual = self.appender.append(builder.records())?;
+        if actual != self.pending_addresses {
+            return Err(PageTreeError::AppenderPosition);
+        }
+        self.pending_addresses.clear();
+        self.builder = Some(NamePageBuilder::new(
+            self.appender.segment(),
+            self.appender.next_page(),
+        )?);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(SegmentManifest, u64, u64), PageTreeError> {
+        if self
+            .builder
+            .as_ref()
+            .is_some_and(|builder| !builder.is_empty())
+        {
+            self.flush_page()?;
+        }
+        let manifest = self.appender.sync_data()?;
+        let page_count = u64::from(self.appender.next_page() - self.first_page);
+        Ok((manifest, self.record_count, page_count))
+    }
+}
+
+pub fn stream_name_page_tree<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+) -> Result<StreamedNamePages, PageTreeError> {
+    stream_name_page_tree_with_parallelism(
+        snapshot,
+        root,
+        appender,
+        NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES,
+    )
+}
+
+fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+    target_subtrees: usize,
+) -> Result<StreamedNamePages, PageTreeError> {
+    let target_subtrees = target_subtrees.max(1);
+    let mut emitter = StreamingPageEmitter::new(appender)?;
+    if root == TreeRoot::ZERO {
+        let (manifest, record_count, page_count) = emitter.finish()?;
+        return Ok(StreamedNamePages {
+            manifest,
+            root_address: None,
+            record_count,
+            page_count,
+            parallel_subtrees: 0,
+        });
+    }
+
+    let mut seen = HashSet::new();
+    insert_bootstrap_root(&mut seen, root)?;
+    let mut frontier = vec![BootstrapFrontier {
+        root,
+        depth: 0,
+        raw: None,
+    }];
+    let mut skeleton = Vec::new();
+
+    while frontier.len() < target_subtrees {
+        let requests = frontier
+            .iter()
+            .filter(|node| node.raw.is_none())
+            .map(|node| node.root)
+            .collect::<Vec<_>>();
+        if !requests.is_empty() {
+            let loaded = load_bootstrap_records(snapshot, &requests)?;
+            let mut loaded = loaded.into_iter();
+            for node in &mut frontier {
+                if node.raw.is_none() {
+                    node.raw = Some(loaded.next().expect("one result per request"));
+                }
+            }
+            debug_assert!(loaded.next().is_none());
+        }
+
+        let mut next = Vec::with_capacity(frontier.len().saturating_mul(2));
+        let mut expanded = false;
+        for node in frontier {
+            let raw = node.raw.expect("frontier record loaded");
+            match decode_bootstrap_record(node.root, &raw)? {
+                UrkelNodeRecord::Leaf { .. } => next.push(BootstrapFrontier {
+                    root: node.root,
+                    depth: node.depth,
+                    raw: Some(raw),
+                }),
+                UrkelNodeRecord::Internal {
+                    prefix,
+                    left,
+                    right,
+                } => {
+                    expanded = true;
+                    let child_depth = bootstrap_child_depth(node.depth, prefix.bit_len())?;
+                    insert_bootstrap_root(&mut seen, left)?;
+                    insert_bootstrap_root(&mut seen, right)?;
+                    skeleton.push(BootstrapSkeletonNode {
+                        root: node.root,
+                        raw,
+                        left,
+                        right,
+                    });
+                    next.push(BootstrapFrontier {
+                        root: left,
+                        depth: child_depth,
+                        raw: None,
+                    });
+                    next.push(BootstrapFrontier {
+                        root: right,
+                        depth: child_depth,
+                        raw: None,
+                    });
+                }
+            }
+        }
+        frontier = next;
+        if !expanded {
+            break;
+        }
+    }
+
+    let parallel_subtrees = frontier.len();
+    let mut tasks = frontier
+        .into_iter()
+        .map(BootstrapTask::new)
+        .collect::<Vec<_>>();
+    loop {
+        let mut progressed = false;
+        for task in &mut tasks {
+            if let Some(raw) = task.take_preloaded() {
+                task.accept(raw, &mut seen, &mut emitter)?;
+                progressed = true;
+            }
+        }
+
+        let requests = tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, task)| task.pending_request().map(|root| (index, root)))
+            .collect::<Vec<_>>();
+        if requests.is_empty() {
+            if tasks.iter().all(BootstrapTask::is_complete) {
+                break;
+            }
+            if !progressed {
+                return Err(PageTreeError::StateCodec(
+                    "name-page bootstrap made no traversal progress".to_owned(),
+                ));
+            }
+            continue;
+        }
+        for chunk in requests.chunks(NAME_PAGE_BOOTSTRAP_READ_BATCH) {
+            let roots = chunk.iter().map(|(_, root)| *root).collect::<Vec<_>>();
+            let loaded = load_bootstrap_records(snapshot, &roots)?;
+            for ((task_index, _), raw) in chunk.iter().zip(loaded) {
+                tasks[*task_index].accept(raw, &mut seen, &mut emitter)?;
+            }
+        }
+    }
+
+    let mut addresses = HashMap::with_capacity(tasks.len().saturating_mul(2));
+    for task in tasks {
+        let address = task.result.ok_or_else(|| {
+            PageTreeError::StateCodec("name-page bootstrap task has no result".to_owned())
+        })?;
+        if addresses.insert(task.root, address).is_some() {
+            return Err(PageTreeError::DuplicateRecord(task.root));
+        }
+    }
+    for node in skeleton.into_iter().rev() {
+        let left = addresses
+            .remove(&node.left)
+            .ok_or(PageTreeError::MissingChildAddress(node.left))?;
+        let right = addresses
+            .remove(&node.right)
+            .ok_or(PageTreeError::MissingChildAddress(node.right))?;
+        let address = emitter.emit(node.root, node.raw, vec![left, right])?;
+        if addresses.insert(node.root, address).is_some() {
+            return Err(PageTreeError::DuplicateRecord(node.root));
+        }
+    }
+    let root_address = addresses
+        .remove(&root)
+        .ok_or(PageTreeError::MissingPackedAddress(root))?;
+    if !addresses.is_empty() {
+        return Err(PageTreeError::StateCodec(
+            "name-page bootstrap retained unreachable addresses".to_owned(),
+        ));
+    }
+
+    let (manifest, record_count, page_count) = emitter.finish()?;
+    Ok(StreamedNamePages {
+        manifest,
+        root_address: Some(root_address),
+        record_count,
+        page_count,
+        parallel_subtrees,
+    })
+}
+
+fn load_bootstrap_records<T: ReadSnapshot>(
+    snapshot: &T,
+    roots: &[TreeRoot],
+) -> Result<Vec<Vec<u8>>, PageTreeError> {
+    let keys = roots
+        .iter()
+        .map(|root| root.as_bytes().as_slice())
+        .collect::<Vec<_>>();
+    let loaded = snapshot.get_many(ColumnFamily::NameTreeNodes, &keys)?;
+    if loaded.len() != roots.len() {
+        return Err(PageTreeError::StateCodec(format!(
+            "name-page bootstrap requested {} records but received {}",
+            roots.len(),
+            loaded.len()
+        )));
+    }
+    roots
+        .iter()
+        .zip(loaded)
+        .map(|(root, raw)| raw.ok_or(PageTreeError::MissingPackedRecord(*root)))
+        .collect()
+}
+
+fn decode_bootstrap_record(
+    expected: TreeRoot,
+    raw: &[u8],
+) -> Result<UrkelNodeRecord, PageTreeError> {
+    let record = UrkelNodeRecord::decode(raw)?;
+    let actual = record.root();
+    if actual != expected {
+        return Err(PageTreeError::RecordKeyMismatch { expected, actual });
+    }
+    Ok(record)
+}
+
+fn bootstrap_child_depth(depth: usize, prefix_bits: usize) -> Result<usize, PageTreeError> {
+    let child_depth = depth
+        .checked_add(prefix_bits)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            PageTreeError::Urkel(UrkelError::InvalidNode(
+                "Urkel record depth overflowed".to_owned(),
+            ))
+        })?;
+    if child_depth > URKEL_BITS {
+        return Err(PageTreeError::Urkel(UrkelError::InvalidNode(
+            "Urkel record path exceeds the key".to_owned(),
+        )));
+    }
+    Ok(child_depth)
+}
+
+fn insert_bootstrap_root(
+    seen: &mut HashSet<TreeRoot>,
+    root: TreeRoot,
+) -> Result<(), PageTreeError> {
+    if root == TreeRoot::ZERO {
+        return Err(PageTreeError::Urkel(UrkelError::InvalidNode(
+            "Urkel record tree contains an empty child".to_owned(),
+        )));
+    }
+    if !seen.insert(root) {
+        return Err(PageTreeError::DuplicateRecord(root));
+    }
+    Ok(())
 }
 
 impl PackedNamePages {
@@ -878,6 +1341,8 @@ fn resolve_child_address(
 pub enum PageTreeError {
     #[error("name-page codec failed: {0}")]
     Page(#[from] NamePageError),
+    #[error("name-page store access failed: {0}")]
+    Store(#[from] StoreError),
     #[error("Urkel record failed: {0}")]
     Urkel(#[from] UrkelError),
     #[error("name-page I/O failed: {0}")]
@@ -915,6 +1380,8 @@ pub enum PageTreeError {
     MissingChildAddress(TreeRoot),
     #[error("name-page pack contains a cycle at {0:?}")]
     RecordCycle(TreeRoot),
+    #[error("name-page bootstrap encountered duplicate record {0:?}")]
+    DuplicateRecord(TreeRoot),
     #[error("name-page pack is missing the predicted address for {0:?}")]
     MissingPackedAddress(TreeRoot),
     #[error("name-page appender position does not match the prepared pack")]
@@ -931,6 +1398,7 @@ impl PageTreeError {
 mod tests {
     use super::*;
     use hns_primitives::NameHash;
+    use hns_store::{MemoryStore, Store, WriteBatch};
     use hns_urkel::{
         prove_hsd_from_records, update_record_tree, validate_record_tree, MemoryUrkel,
     };
@@ -962,6 +1430,150 @@ mod tests {
         assert_eq!(decoded.last_sealed_height, None);
         assert_eq!(decoded.committed_height, state.committed_height);
         assert_eq!(decoded.manifest, state.manifest);
+    }
+
+    #[test]
+    fn bootstrap_streams_one_read_tree_into_equivalent_pages() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-stream-{}-{nonce}.pages",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let entries = (0u8..64)
+            .map(|index| {
+                let mut key = [0u8; 32];
+                key[0] = index;
+                key[31] = index.rotate_left(3);
+                (NameHash::new(key), vec![index; usize::from(index % 11 + 1)])
+            })
+            .collect::<Vec<_>>();
+        let tree = MemoryUrkel::from_entries(entries.clone()).expect("tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("records");
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        for (record_root, raw) in &records {
+            batch
+                .put(ColumnFamily::NameTreeNodes, record_root.as_bytes(), raw)
+                .expect("stage record");
+        }
+        store.commit(batch).expect("commit records");
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut appender = NamePageAppender::create_new(&path, 9, 0).expect("create pages");
+        let streamed = stream_name_page_tree_with_parallelism(&snapshot, root, &mut appender, 4)
+            .expect("stream pages");
+        assert_eq!(streamed.record_count, records.len() as u64);
+        assert_eq!(
+            streamed.manifest.durable_bytes,
+            streamed.page_count * NAME_PAGE_BYTES as u64
+        );
+        assert!(streamed.parallel_subtrees >= 4);
+
+        let locator = NamePageRootLocator::new(
+            streamed.manifest.generation,
+            streamed.root_address.expect("root address"),
+        );
+        let reader =
+            NamePageTreeReader::open_with_cache(&path, root, locator, 2).expect("open pages");
+        assert_eq!(
+            validate_record_tree(root, |record_root| {
+                reader
+                    .load(record_root)
+                    .map_err(|error| UrkelError::Storage(error.to_string()))
+            })
+            .expect("validate streamed tree"),
+            records.len()
+        );
+        for (key, value) in entries.iter().step_by(9) {
+            let proof = prove_hsd_from_records(root, *key, |record_root| {
+                reader
+                    .load(record_root)
+                    .map_err(|error| UrkelError::Storage(error.to_string()))
+            })
+            .expect("page proof");
+            assert_eq!(
+                proof.verify_value(root).expect("verify proof"),
+                Some(value.clone())
+            );
+        }
+
+        drop(reader);
+        drop(appender);
+        std::fs::remove_file(path).expect("remove page fixture");
+    }
+
+    #[test]
+    fn bootstrap_rejects_a_duplicate_subtree_before_publication() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-duplicate-{}-{nonce}.pages",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let tree = MemoryUrkel::from_entries([
+            (NameHash::new([0x11; 32]), b"left".to_vec()),
+            (NameHash::new([0x91; 32]), b"right".to_vec()),
+        ])
+        .expect("tree");
+        let records = tree.node_records().expect("records");
+        let root_record = UrkelNodeRecord::decode(records.get(&tree.root()).expect("root record"))
+            .expect("decode root");
+        let UrkelNodeRecord::Internal {
+            prefix,
+            left,
+            right: _,
+        } = root_record
+        else {
+            panic!("two-leaf tree must have an internal root");
+        };
+        let duplicate = UrkelNodeRecord::Internal {
+            prefix,
+            left,
+            right: left,
+        };
+        let duplicate_root = duplicate.root();
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::NameTreeNodes,
+                duplicate_root.as_bytes(),
+                &duplicate.encode().expect("encode duplicate"),
+            )
+            .expect("stage duplicate");
+        batch
+            .put(
+                ColumnFamily::NameTreeNodes,
+                left.as_bytes(),
+                records.get(&left).expect("left record"),
+            )
+            .expect("stage child");
+        store.commit(batch).expect("commit records");
+
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut appender = NamePageAppender::create_new(&path, 1, 0).expect("create pages");
+        assert!(matches!(
+            stream_name_page_tree_with_parallelism(
+                &snapshot,
+                duplicate_root,
+                &mut appender,
+                1
+            ),
+            Err(PageTreeError::DuplicateRecord(root)) if root == left
+        ));
+        assert_eq!(std::fs::metadata(&path).expect("page metadata").len(), 0);
+
+        drop(appender);
+        std::fs::remove_file(path).expect("remove page fixture");
     }
 
     #[test]

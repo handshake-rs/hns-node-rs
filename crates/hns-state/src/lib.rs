@@ -4,9 +4,10 @@ mod page_tree;
 
 pub use hns_urkel::TreeRoot;
 pub use page_tree::{
-    name_page_root_key, pack_name_page_records, NamePageRootLocator, NamePageRootRecord,
-    NamePageSnapshot, NamePageState, NamePageTreeReader, PackedNamePages, PageTreeError,
-    NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
+    name_page_root_key, pack_name_page_records, stream_name_page_tree, NamePageRootLocator,
+    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader, PackedNamePages,
+    PageTreeError, StreamedNamePages, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
+    NAME_PAGE_STATE_KEY,
 };
 
 use std::{

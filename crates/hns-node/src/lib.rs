@@ -66,12 +66,13 @@ use hns_state::{
     decode_name_state, disconnect_block_to_batch, load_name_tree_snapshot_pins,
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
     load_stored_name_tree_root, migrate_name_tree_interval_accumulator, name_page_root_key,
-    pack_name_page_records, stage_remove_name_tree_snapshot_pin, validate_persisted_name_tree_root,
-    validate_persisted_name_trees, verify_name_tree_interval_state, verify_stored_name_tree_root,
-    AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock, NamePageRootLocator,
-    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader,
-    NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine,
-    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
+    pack_name_page_records, stage_remove_name_tree_snapshot_pin, stream_name_page_tree,
+    validate_persisted_name_tree_root, validate_persisted_name_trees,
+    verify_name_tree_interval_state, verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier,
+    BlockUndo, ConnectBlock, DisconnectBlock, NamePageRootLocator, NamePageRootRecord,
+    NamePageSnapshot, NamePageState, NamePageTreeReader, NameTreeCompactionSummary,
+    NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine, TreeRoot,
+    NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_unclean_start, open_store, truncate_name_pages_to_committed_tail,
@@ -2089,29 +2090,16 @@ impl NamePageStorage {
             })?;
         sync_directory(&directory)?;
         let height = best_block_tip_from_snapshot(&snapshot)?.map(|tip| tip.height);
-        let (manifest, root_address) = if durable_root == TreeRoot::ZERO {
-            (appender.sync_data()?, None)
-        } else {
-            let records =
-                load_persisted_name_tree_records(&snapshot, durable_root).map_err(|error| {
-                    anyhow::anyhow!("failed to load name tree for page bootstrap: {error}")
-                })?;
-            let packed = pack_name_page_records(
-                generation,
-                segment,
-                appender.next_page(),
-                &records,
-                &HashMap::new(),
-            )
-            .map_err(|error| anyhow::anyhow!("failed to pack bootstrap name pages: {error}"))?;
-            let root_address = packed.address(durable_root).ok_or_else(|| {
-                anyhow::anyhow!("page bootstrap did not assign the committed root")
-            })?;
-            let manifest = packed
-                .append(&mut appender)
-                .map_err(|error| anyhow::anyhow!("failed to append bootstrap pages: {error}"))?;
-            (manifest, Some(root_address))
-        };
+        let streamed = stream_name_page_tree(&snapshot, durable_root, &mut appender)
+            .map_err(|error| anyhow::anyhow!("failed to stream bootstrap name pages: {error}"))?;
+        tracing::info!(
+            records = streamed.record_count,
+            pages = streamed.page_count,
+            parallel_subtrees = streamed.parallel_subtrees,
+            "streamed committed name tree into authenticated pages"
+        );
+        let manifest = streamed.manifest;
+        let root_address = streamed.root_address;
         let state = NamePageState {
             manifest,
             root: durable_root,

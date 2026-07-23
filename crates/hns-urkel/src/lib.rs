@@ -1682,7 +1682,7 @@ impl BitPrefix {
         }
     }
 
-    fn bit_len(&self) -> usize {
+    pub fn bit_len(&self) -> usize {
         usize::from(self.bit_len)
     }
 
