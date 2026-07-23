@@ -552,6 +552,9 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   parallel post-order subtrees, reopen the resulting pages, validate every
   reachable record and sampled proof, and reject a duplicated subtree before
   any page is published.
+- A one-page-cache regression cycles a single multi-get across several pages
+  repeatedly and requires exactly one physical page load per unique page,
+  proving that audit/path batches are coalesced by `(segment, page)`.
 - Block/undo archive qualification forces physical rotation at a reduced test
   threshold, rolls back a newly created segment, reopens old and active
   segments, rejects checksum corruption inside an authoritative manifest, and
