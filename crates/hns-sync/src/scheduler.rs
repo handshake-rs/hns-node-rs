@@ -393,8 +393,12 @@ impl SyncScheduler {
     /// this before retaining a partial response; the completed block still
     /// passes through [`Self::receive_block`] exactly once.
     pub fn peer_can_deliver_block(&self, peer: PeerId, hash: &BlockHash) -> bool {
-        if let Some(inflight) = self.inflight.get(hash) {
-            return inflight.request.peer == Some(peer);
+        if self.inflight.contains_key(hash) {
+            // A response can cross a timeout/disconnect event after the same
+            // bounded hash has already been reassigned. The first connected
+            // peer to deliver that exact requested block may satisfy the
+            // reservation; consensus validation still authenticates the body.
+            return self.peers.contains_key(&peer);
         }
         self.pending
             .get(hash)
@@ -543,24 +547,26 @@ impl SyncScheduler {
         now: Instant,
     ) -> Result<BlockDownloadRequest, SyncError> {
         if let Some(inflight) = self.inflight.remove(&hash) {
-            if inflight.request.peer != Some(peer) {
-                let expected = inflight.request.peer;
-                self.inflight.insert(hash, inflight);
-                return Err(SyncError::UnexpectedBlock(format!(
-                    "block {} arrived from peer {:?}, expected {:?}",
-                    hash.to_hex(),
-                    peer,
-                    expected
-                )));
+            // The assigned peer can time out or disconnect after placing its
+            // response on the runtime queue, while the scheduler reassigns
+            // the hash to another peer. Accept the first exact tracked body
+            // and retire the current owner's reservation instead of wasting
+            // an already downloaded and independently validated candidate.
+            if let Some(assigned) = inflight.request.peer {
+                if let Some(state) = self.peers.get_mut(&assigned) {
+                    state.inflight.remove(&hash);
+                }
             }
             if let Some(state) = self.peers.get_mut(&peer) {
-                state.inflight.remove(&hash);
                 state.last_block_received_at = Some(now);
                 state.body_available = true;
             }
             self.stage = SyncStage::Validating;
             self.bump_sequence();
-            return Ok(inflight.request);
+            return Ok(BlockDownloadRequest {
+                peer: Some(peer),
+                ..inflight.request
+            });
         }
 
         // HSD peers may deliver an announced block before our scheduled
@@ -1516,6 +1522,52 @@ mod tests {
                     && request.peer == Some(PeerId(2))
                     && request.attempt == 2
         )));
+    }
+
+    #[test]
+    fn first_tracked_body_wins_after_peer_reassignment() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 1,
+            maximum_inflight_per_peer: 1,
+            block_request_timeout: Duration::from_millis(10),
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        scheduler
+            .register_peer(PeerId(1), SERVICE_NETWORK, 10)
+            .expect("peer 1");
+        scheduler
+            .register_peer(PeerId(2), SERVICE_NETWORK, 10)
+            .expect("peer 2");
+        let hash = BlockHash::new([5; 32]);
+        scheduler.queue_block(hash, 9).expect("queue");
+        let first = scheduler.poll(now, &[]);
+        assert!(first.iter().any(|action| matches!(
+            action,
+            SyncAction::RequestBlock(request)
+                if request.hash == hash && request.peer == Some(PeerId(1))
+        )));
+
+        let retried = scheduler.poll(now + Duration::from_millis(11), &[]);
+        assert!(retried.iter().any(|action| matches!(
+            action,
+            SyncAction::RequestBlock(request)
+                if request.hash == hash && request.peer == Some(PeerId(2))
+        )));
+        assert!(scheduler.peer_can_deliver_block(PeerId(1), &hash));
+        assert!(scheduler.peer_can_deliver_block(PeerId(2), &hash));
+
+        let accepted = scheduler
+            .receive_block(PeerId(1), hash, now + Duration::from_millis(12))
+            .expect("late first-peer response");
+        assert_eq!(accepted.peer, Some(PeerId(1)));
+        assert_eq!(accepted.attempt, 2);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert!(snapshot.peers.iter().all(|peer| peer.inflight_blocks == 0));
+        scheduler.complete_block(hash);
+        assert!(!scheduler.is_tracked_block(&hash));
     }
 
     #[test]

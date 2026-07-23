@@ -17,8 +17,8 @@ use axum::{
     Json, Router,
 };
 use hns_chain::{
-    prepare_header_record, read_canonical_hash, BlockIndexRecord, ChainTip, HeaderImport,
-    HeaderIndex, HeaderRecord,
+    prepare_header_record, read_canonical_hash, BlockIndex, BlockIndexRecord, ChainTip,
+    HeaderImport, HeaderIndex, HeaderRecord,
 };
 use hns_consensus::{
     advance_threshold_state, block_merkle_root, block_witness_root,
@@ -2393,8 +2393,8 @@ impl NodeService {
     fn shadow_sync_has_block(&self, hash: &BlockHash) -> Result<bool> {
         self.state
             .blocks
-            .load_raw_block(hash)
-            .map(|block| block.is_some())
+            .block(hash)
+            .map(|record| record.is_some_and(|record| record.status.body_present))
             .map_err(|error| anyhow::anyhow!("failed to read block availability: {error}"))
     }
 
@@ -2458,9 +2458,18 @@ impl NodeService {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn shadow_sync_connect_stored_state(
         &mut self,
         maximum_connect: usize,
+    ) -> Result<ActiveStateConnectOutcome> {
+        self.shadow_sync_connect_stored_state_with_hint(maximum_connect, None)
+    }
+
+    fn shadow_sync_connect_stored_state_with_hint(
+        &mut self,
+        maximum_connect: usize,
+        stored_tip_hint: Option<&ChainTip>,
     ) -> Result<ActiveStateConnectOutcome> {
         if maximum_connect == 0 || maximum_connect > MAX_ACTIVE_STATE_CONNECT_BATCH {
             anyhow::bail!(
@@ -2468,7 +2477,7 @@ impl NodeService {
             );
         }
 
-        let Some(stored_tip) = self.shadow_sync_contiguous_body_tip(None)? else {
+        let Some(stored_tip) = self.shadow_sync_contiguous_body_tip(stored_tip_hint)? else {
             return Ok(ActiveStateConnectOutcome::default());
         };
         let active_tip = self.shadow_sync_active_tip()?;
@@ -4490,9 +4499,14 @@ pub(super) async fn connect_stored_active_state(
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
     maximum_connect: usize,
 ) -> Result<()> {
+    // The scheduler's stored tip is already a validated contiguous frontier.
+    // Revalidate that one anchor and scan only newly available descendants;
+    // restarting at genesis here makes replay quadratic because this helper is
+    // called on every supervisor tick and after each full validation slice.
+    let stored_tip_hint = scheduler.stored_tip().cloned();
     let outcome = {
         let mut node = node.lock().await;
-        node.shadow_sync_connect_stored_state(maximum_connect)?
+        node.shadow_sync_connect_stored_state_with_hint(maximum_connect, stored_tip_hint.as_ref())?
     };
 
     if let Some(failed) = &outcome.contextual_failure {
