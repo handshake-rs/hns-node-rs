@@ -619,10 +619,9 @@ fn validate_mainnet_canary_config(config: &NodeConfig) -> Result<()> {
         || (!config.shadow_sync.discovery && config.shadow_sync.connect_keys.len() < 2)
         || !config.mining_engine.enabled
         || !config.mining_engine.transaction_relay
-        || config.undo_retention.prune_history
     {
         anyhow::bail!(
-            "mainnet canary requires native authority, persistent sync-durable state, authenticated loopback RPC, full native active-state sync, at least four outbound slots with discovery or two pinned peers, the mining engine with transaction relay, retained undo history, and no incomplete-consensus bypass"
+            "mainnet canary requires native authority, persistent sync-durable state, authenticated loopback RPC, full native active-state sync, at least four outbound slots with discovery or two pinned peers, the mining engine with transaction relay, HSD-compatible rollback history, and no incomplete-consensus bypass"
         );
     }
     Ok(())
@@ -9208,6 +9207,11 @@ mod tests {
         validate_node_config(&config).expect("hardened canary config");
         assert!(!authority_can_mine(&config));
         assert!(authority_can_mine_with_readiness(&config, true));
+
+        let mut pruned = config.clone();
+        pruned.undo_retention.prune_history = true;
+        validate_node_config(&pruned).expect("HSD-horizon pruned canary config");
+        assert!(authority_can_mine_with_readiness(&pruned, true));
 
         let mut not_enabled = config.clone();
         not_enabled.mainnet_canary = false;

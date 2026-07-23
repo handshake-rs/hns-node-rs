@@ -15,7 +15,8 @@ rejects the flag unless all of these operational constraints are present:
 - at least four outbound slots and either key-bearing discovery or two pinned
   Brontide peers;
 - the mining engine and transaction relay;
-- retained undo history; and
+- either full undo history or opt-in pruning at HSD's exact mainnet
+  `pruneAfterHeight`/`keepBlocks` rollback horizon; and
 - no incomplete-consensus acknowledgement or experimental feature bypass.
 
 Even after startup, the private mining permit remains unavailable until the
@@ -49,11 +50,17 @@ cargo run --locked --release --manifest-path hsrd/Cargo.toml \
   --mainnet-canary \
   --native-sync --p2p-discovery --maximum-outbound 8 \
   --mining-engine --transaction-relay \
+  --prune-undo-history --compact-name-tree-on-startup \
+  --name-tree-compaction-interval 10000 \
   --check-config
 ```
 
 Remove `--check-config` to start synchronization. Never add
 `--acknowledge-incomplete-consensus`; mainnet canary validation rejects it.
+The deployed mining-only profile enables undo pruning: it preserves the newest
+288 mainnet blocks exactly as HSD specifies, rejects deeper reorganizations
+before mutation, retires matching historical root pins atomically, and runs
+name-tree reclamation on the configured height interval.
 Keep the Authorization value out of command-line arguments, logs, and shell
 history. An authenticated local client may inspect `getauthorityinfo` or the
 atomic `getparentauthority` response. ASIC service must be started only through

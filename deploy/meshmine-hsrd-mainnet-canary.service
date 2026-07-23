@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Documents/MeshMine
-ExecStart=%h/Documents/MeshMine/hsrd/target/release/hsrd --network mainnet --data-dir %h/.local/share/hsrd/mainnet-canary --rpc-bind 127.0.0.1:12047 --rpc-authorization-header-file %h/.config/hsrd/mainnet-canary.authorization --authority-mode native --mainnet-canary --native-sync --p2p-discovery --maximum-outbound 8 --mining-engine --transaction-relay
+ExecStart=%h/Documents/MeshMine/hsrd/target/release/hsrd --network mainnet --data-dir %h/.local/share/hsrd/mainnet-canary --rpc-bind 127.0.0.1:12047 --rpc-authorization-header-file %h/.config/hsrd/mainnet-canary.authorization --authority-mode native --mainnet-canary --native-sync --p2p-discovery --maximum-outbound 8 --mining-engine --transaction-relay --prune-undo-history --compact-name-tree-on-startup --name-tree-compaction-interval 10000
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=120
