@@ -2985,7 +2985,7 @@ impl NodeState {
         let generation = next_mining_generation(&snapshot)?;
         let chain_epoch = next_chain_epoch(&snapshot)?;
         let mut batch = self.store.batch();
-        let record = self.stage_connect(&snapshot, &mut batch, &request, validated)?;
+        let record = self.stage_connect(&snapshot, &mut batch, &request, validated, true)?;
         batch.put(
             ColumnFamily::Meta,
             MetaKey::MiningGeneration.as_bytes(),
@@ -3012,13 +3012,13 @@ impl NodeState {
         batch: &mut B,
         request: &NodeBlockImport,
         validated: ValidatedImport,
+        persist_raw_body: bool,
     ) -> Result<BlockIndexRecord> {
         validate_active_extension(snapshot, request, validated.chainwork)?;
 
         let block_hash = request.block.hash();
         let historical_validation = validated.historical_validation;
         let mut status = validated.status;
-        let raw_record = RawBlockRecord::from_block(&request.block, request.source);
 
         let deployments = self.deployment_state_for_block(
             snapshot,
@@ -3091,8 +3091,11 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to stage header index: {error}"))?;
         write_block_index_to_batch(batch, &record)
             .map_err(|error| anyhow::anyhow!("failed to stage block index: {error}"))?;
-        write_raw_block_to_batch(batch, &raw_record)
-            .map_err(|error| anyhow::anyhow!("failed to stage raw block: {error}"))?;
+        if persist_raw_body {
+            let raw_record = RawBlockRecord::from_block(&request.block, request.source);
+            write_raw_block_to_batch(batch, &raw_record)
+                .map_err(|error| anyhow::anyhow!("failed to stage raw block: {error}"))?;
+        }
         write_tx_index_for_block_to_batch(batch, &request.block, request.height)
             .map_err(|error| anyhow::anyhow!("failed to stage tx index: {error}"))?;
         write_canonical_height_to_batch(batch, request.height, block_hash)
@@ -3310,8 +3313,44 @@ impl NodeState {
 
         for connect in request.connect {
             let hash = connect.block.hash();
+            // The durable block status is internal evidence that the bounded
+            // worker pipeline already checked transaction start, commitments,
+            // name limits, and coinbase height for these exact block bytes.
+            // Reuse that evidence while retaining header, finality, branch,
+            // UTXO, script, covenant, claim/airdrop, and Urkel validation here.
+            // Direct reorg callers and fixture imports do not necessarily pass
+            // through the strict durable-body pipeline and therefore retain
+            // the complete validation route.
+            let stored_record = load_block_index_record(&staged, &hash)
+                .map_err(ChainActivationFailure::Internal)?;
+            let stateless = stored_record
+                .as_ref()
+                .map(|stored_record| {
+                    validate_stored_activation_status(stored_record)?;
+                    if stored_record.height != connect.height {
+                        anyhow::bail!(
+                            "stored activation block {} height mismatch: expected {}, got {}",
+                            hash.to_hex(),
+                            connect.height,
+                            stored_record.height
+                        );
+                    }
+                    Ok(
+                        matches!(connect.validation, ImportValidationPolicy::Strict).then(|| {
+                            StatelessBodyValidation::for_block(
+                                &connect.block,
+                                connect.height,
+                                self.network,
+                            )
+                        }),
+                    )
+                })
+                .transpose()
+                .map_err(ChainActivationFailure::Internal)?
+                .flatten();
+            let persist_raw_body = stored_record.is_none();
             let validated = self
-                .validate_import_against(&staged, &connect)
+                .validate_import_against_policy(&staged, &connect, true, stateless)
                 .with_context(|| {
                     format!(
                         "failed to revalidate stored block {} at height {}",
@@ -3320,7 +3359,13 @@ impl NodeState {
                     )
                 })
                 .map_err(ChainActivationFailure::Internal)?;
-            let record = match self.stage_connect(&staged, &mut batch, &connect, validated) {
+            let record = match self.stage_connect(
+                &staged,
+                &mut batch,
+                &connect,
+                validated,
+                persist_raw_body,
+            ) {
                 Ok(record) => record,
                 Err(error)
                     if error
@@ -4526,11 +4571,6 @@ fn validate_reorg_plan(
                 hash.to_hex()
             );
         }
-        let raw = load_raw_block_record(snapshot, hash)?
-            .ok_or_else(|| anyhow::anyhow!("connect block body {} is missing", hash.to_hex()))?;
-        raw.decode_block()
-            .map_err(|error| anyhow::anyhow!("connect block body is corrupt: {error}"))?;
-
         expected_parent = Some(*hash);
         expected_height = expected_height
             .checked_add(1)

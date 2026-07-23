@@ -165,9 +165,12 @@ pub trait Store {
 /// Read-your-writes overlay for staging one atomic multi-step mutation against
 /// a single immutable base snapshot. The wrapped batch is committed only after
 /// every staged operation has validated successfully.
+type StagedChanges = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
+type SharedStagedChanges = Rc<RefCell<StagedChanges>>;
+
 #[derive(Clone, Debug, Default)]
 pub struct StagingOverlay {
-    changes: Rc<RefCell<HashMap<StoreKey, Option<Vec<u8>>>>>,
+    changes: SharedStagedChanges,
 }
 
 impl StagingOverlay {
@@ -192,16 +195,21 @@ impl StagingOverlay {
 
 pub struct StagedSnapshot<'a, S: ReadSnapshot> {
     base: &'a S,
-    changes: Rc<RefCell<HashMap<StoreKey, Option<Vec<u8>>>>>,
+    changes: SharedStagedChanges,
 }
 
 impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = StoreKey::new(family, key);
-        if let Some(value) = self.changes.borrow().get(&key) {
-            return Ok(value.clone());
+        let staged = self
+            .changes
+            .borrow()
+            .get(&family)
+            .and_then(|changes| changes.get(key))
+            .cloned();
+        if let Some(value) = staged {
+            return Ok(value);
         }
-        self.base.get(family, &key.key)
+        self.base.get(family, key)
     }
 
     fn scan_prefix(
@@ -215,16 +223,19 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
             .into_iter()
             .collect::<BTreeMap<_, _>>();
 
-        for (key, value) in self.changes.borrow().iter() {
-            if key.family != family || !key.key.starts_with(prefix) {
-                continue;
-            }
-            match value {
-                Some(value) => {
-                    entries.insert(key.key.clone(), value.clone());
+        let changes = self.changes.borrow();
+        if let Some(changes) = changes.get(&family) {
+            for (key, value) in changes {
+                if !key.starts_with(prefix) {
+                    continue;
                 }
-                None => {
-                    entries.remove(&key.key);
+                match value {
+                    Some(value) => {
+                        entries.insert(key.clone(), value.clone());
+                    }
+                    None => {
+                        entries.remove(key);
+                    }
                 }
             }
         }
@@ -235,7 +246,7 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
 
 pub struct StagedBatch<B: WriteBatch> {
     inner: B,
-    changes: Rc<RefCell<HashMap<StoreKey, Option<Vec<u8>>>>>,
+    changes: SharedStagedChanges,
 }
 
 impl<B: WriteBatch> StagedBatch<B> {
@@ -249,7 +260,9 @@ impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
         self.inner.put(family, key, value)?;
         self.changes
             .borrow_mut()
-            .insert(StoreKey::new(family, key), Some(value.to_vec()));
+            .entry(family)
+            .or_default()
+            .insert(key.to_vec(), Some(value.to_vec()));
         Ok(())
     }
 
@@ -257,7 +270,9 @@ impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
         self.inner.delete(family, key)?;
         self.changes
             .borrow_mut()
-            .insert(StoreKey::new(family, key), None);
+            .entry(family)
+            .or_default()
+            .insert(key.to_vec(), None);
         Ok(())
     }
 }

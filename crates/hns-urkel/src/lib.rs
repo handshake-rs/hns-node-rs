@@ -20,9 +20,12 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, HashSet},
     sync::{Arc, RwLock},
 };
+
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 use hns_primitives::{blake2b_256, blake2b_256_many, NameHash, MAX_TX_SIZE};
 use serde::{Deserialize, Serialize};
@@ -1062,13 +1065,13 @@ where
 /// Validate and collect the union of all content-addressed nodes reachable
 /// from one or more retained roots. Shared historical subtrees are returned
 /// once while depth-sensitive validation is preserved for every distinct path.
-pub fn reachable_record_roots<F, I>(roots: I, mut load: F) -> Result<BTreeSet<TreeRoot>, UrkelError>
+pub fn reachable_record_roots<F, I>(roots: I, mut load: F) -> Result<HashSet<TreeRoot>, UrkelError>
 where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
     I: IntoIterator<Item = TreeRoot>,
 {
-    let mut seen_nodes = BTreeSet::new();
-    let mut seen_paths = BTreeSet::new();
+    let mut seen_nodes = HashSet::new();
+    let mut seen_paths = HashSet::new();
     let mut pending = roots
         .into_iter()
         .filter(|root| *root != TreeRoot::ZERO)
