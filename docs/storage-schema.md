@@ -7,26 +7,32 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **16** and the storage profile is
-**`hsrd-mining-v12`**. This is an intentional clean-reindex boundary.
+The current persistent schema version is **18** and the storage profile is
+**`hsrd-mining-v14`**. Schema 17/profile `hsrd-mining-v13` receives an atomic
+profile cutover. Schema 16/profile `hsrd-mining-v12` uses the resumable,
+backup-first interval-accumulator migration. Other combinations fail closed.
 
-Version 16 contains the authority, state, shadow-synchronization, and mining
-publication schema, durable HSD airdrop duplicate prevention, active-chain
-deployment-state persistence, content-addressed authenticated name nodes, and
-durable interval-root retention metadata:
+Version 18 contains the authority, state, native synchronization, and mining
+publication schema plus the optimized storage tiers:
 
 - granular block-status bit assignments;
 - spent output address in the UTXO `Coin` codec;
 - HSD-compatible omission of null-data-address and `REVOKE` covenant outputs
   from UTXO and undo admission after all value and covenant validation;
 - expanded HSD-compatible `NameState` encoding;
-- block undo version 6 with previous/resulting working and interval-committed
-  name-tree roots plus airdrop positions to clear on disconnect;
-- mandatory 32-byte `name-tree-root` working-state metadata binding;
+- block undo version 7 with previous/resulting committed roots, reversible
+  interval-accumulator state, and airdrop positions to clear on disconnect;
+- a checksummed accumulator that composes per-block name changes and commits
+  the authenticated tree only at HSD's network `treeInterval` cadence;
+- mandatory 32-byte `name-tree-root` metadata equal to the last committed root;
 - mandatory 32-byte `name-tree-commit-root` binding for HSD's last
   `treeInterval` commitment used by candidate headers and mining templates;
-- canonical content-addressed `name_tree_nodes` records keyed by their exact
-  HSD/Urkel node hash and staged atomically with name-state/root changes;
+- append-only 64 KiB checksummed name pages with traversal-local child
+  addresses, root locators, a bounded decoded-page cache, and monotonic physical
+  seals every 360 heights without changing consensus-root timing;
+- checksummed block and undo frames in 256 MiB physical segments. RocksDB stores
+  compact locators and authoritative manifests; legacy inline values remain
+  readable during migration;
 - versioned, checksummed `name-tree-snapshot/v1/<height-be>` records written in
   the `snapshots` column family at each network name-tree interval; each value
   binds its active block hash and resulting root;
@@ -47,9 +53,9 @@ durable interval-root retention metadata:
 - an optional versioned, checksummed `undo-pruning/v1` checkpoint that binds
   the last retired canonical height/block and cumulative retired undo count.
 
-A schema/profile mismatch, nonempty unversioned database, missing/malformed
-root or airdrop-field binding, or network/genesis mismatch fails closed. The
-node does not stamp or implicitly migrate ambiguous state.
+A schema/profile mismatch outside the two reviewed migrations, nonempty
+unversioned database, missing/malformed root or airdrop-field binding, or
+network/genesis mismatch fails closed.
 
 Durable identity binds:
 
@@ -68,9 +74,9 @@ Durable identity binds:
 - Required behavior: column families, atomic batches, true read snapshots,
   prefix iteration, bounded caches, explicit compaction policy, and crash
   recovery.
-- Point-oriented column families share one bounded 192 MiB LRU block cache;
-  raw blocks and undo data use a separate 32 MiB cache so one-pass replay reads
-  cannot evict hot UTXO, name-state, or Urkel pages. Every column family uses a
+- Point-oriented column families share one bounded 192 MiB LRU block cache.
+  The RocksDB `blocks` and `undo` families contain locator-sized values for new
+  data and retain a separate 32 MiB legacy cache. Every column family uses a
   10-bit full Bloom filter, cached high-priority index/filter blocks, and pinned
   level-zero index/filter blocks. Bulk block/undo data blocks are 32 KiB.
 - RocksDB receives four combined background flush/compaction jobs. This matches
@@ -80,11 +86,10 @@ Durable identity binds:
 - Aggregate WAL retention across all column families is capped at 256 MiB.
   RocksDB otherwise derives a multi-gigabyte allowance from the sum of every
   column family's write buffers, which amplified mainnet replay disk use.
-- Incremental name-tree updates persist only newly constructed records reachable
-  from that block's final root. Superseded paths constructed within the same
-  atomic update were never durable roots and are not written; records reachable
-  from prior block roots and retained snapshot pins remain content-addressed and
-  independently verifiable.
+- Interval-boundary name-tree updates append only newly constructed records
+  reachable from the final root. Non-boundary blocks update `NameState`, undo,
+  and the accumulator without writing authenticated nodes. Segment bytes are
+  synced before their locator/manifests enter the atomic RocksDB state batch.
 - Snapshot reads expose ordered batched point lookup. The RocksDB implementation
   uses one snapshot-bound multi-get, while atomic staging overlays resolve their
   own replacements/deletions first and batch only missing keys against the base
@@ -157,6 +162,8 @@ cannot promote a block or grant authority.
 - `block_index`: `block_hash -> BlockIndexRecord` including height, parent,
   chainwork, status, transaction count, and validation timestamp.
 - `blocks`: hash-addressed raw block records with source and integrity metadata.
+  New values are compact checksummed locators into append-only block segments;
+  snapshots resolve and revalidate the frame transparently.
   Shadow-network downloads are retained as non-active records. A body whose
   authenticated commitments prove permanent invalidity is retained with a
   failed block/header status; known descendants inherit failure atomically with
@@ -173,14 +180,15 @@ cannot promote a block or grant authority.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.
-- `name_tree_nodes`: canonical leaf/internal node records keyed by their exact
-  authenticated root. Historical records are retained for undo and snapshot
-  reachability. Explicit compaction validates every retained root before
-  atomically deleting unreachable records.
+- `name_tree_nodes`: read-only migration/fallback records from profiles before
+  authenticated pages. Page-backed operation never adds LSM records. Legacy
+  compaction is disabled until every retained fallback root is explicitly
+  retired.
 - `undo`: block UTXO/name/airdrop undo records, including pre-state and
-  post-state roots. With explicit undo retirement enabled, the HSD-protected
-  prefix and newest per-network reorg window remain while the intervening
-  active records are deleted.
+  post-state roots and reversible accumulator data. New values are compact
+  locators into append-only undo segments. With explicit undo retirement
+  enabled, the HSD-protected prefix and newest per-network reorg window remain
+  addressable while intervening locator records are deleted.
 - `snapshots`: operational durable records. The mining engine uses the bounded
   `publication/v1/<block-hash>` namespace for solved-block publication intents.
   Each intent commits to its mining generation, job ID, block hash, creation
@@ -188,6 +196,8 @@ cannot promote a block or grant authority.
   `name-tree-snapshot/v1/<height-be>` for network-interval root pins and
   `name-tree-compaction/v1` for the atomically published last compaction result,
   plus `undo-pruning/v1` for the atomically advanced undo-retirement boundary.
+  `name-page-state/v1`, per-root page locators, block/undo segment manifests,
+  and `transaction-index-mode/v1` bind the optimized storage tiers.
   `startup-audit/v1` is a checksummed commitment to the schema/profile,
   network/genesis, best header, active tip, chain epoch, mining generation,
   working and committed name roots, airdrop field, complete interval-pin set,
@@ -338,21 +348,20 @@ exact bytes before fixture use.
 
 ## Migration policy
 
-Schema 16/profile `hsrd-mining-v12` requires an explicit clean reindex from every
-prior handoff. Earlier hsrd profiles may contain impossible-to-spend outputs
-that HSD never admitted to its coin database. No automatic in-place migration
-is attempted while `hsrd` remains pre-authority. A failed or interrupted
-reindex must not modify the previous database.
+Schema 17/profile `hsrd-mining-v13` already has interval semantics and receives
+only the atomic schema/profile cutover. Schema 16/profile `hsrd-mining-v12`
+backs up every rewritten undo and the old root/profile bindings before the
+final marker changes. Page bootstrap and segment-manifest initialization are
+idempotent; restart truncates unpublished tails. Older or mixed profiles require
+an explicit reindex.
 
 ## Persistent Urkel status
 
-Steady-state inserts, replacements, and removals now traverse only affected
-content-addressed paths from the bound root. They construct changed ancestors,
-stage previously unseen records with the `NameState` and root changes in the
-same atomic batch, and retain old nodes for historical roots and undo. The
-staging overlay exposes newly built records to later steps of a one-batch
-reorganization. Proof reads likewise traverse only the requested path and
-rehash every loaded record.
+At each consensus interval, inserts, replacements, and removals traverse only
+affected paths from the committed root. Changed records are packed bottom-up
+into append-only pages; unchanged child locators can point into sealed older
+segments. Proof reads traverse only the requested path and rehash every loaded
+canonical record.
 
 Startup still performs the independent O(N) rebuild from materialized
 `NameState` and validates every node reachable from the bound root. The rebuild

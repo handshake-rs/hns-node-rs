@@ -12,9 +12,9 @@ pub use name_page::{
 pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,
     plan_segment_page_reads, scan_segment_prefix, truncate_segment_to_committed_tail,
-    SegmentAppender, SegmentError, SegmentFileInspection, SegmentKind, SegmentLocator,
-    SegmentManifest, SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan,
-    SEGMENT_MAX_HINTS, SEGMENT_PAGE_BYTES,
+    SegmentAppender, SegmentArchive, SegmentError, SegmentFileInspection, SegmentKind,
+    SegmentLocator, SegmentManifest, SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan,
+    SegmentValueLocator, SEGMENT_MAX_HINTS, SEGMENT_PAGE_BYTES, SEGMENT_TARGET_BYTES,
 };
 
 use std::{
@@ -30,13 +30,17 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 17;
-pub const LEGACY_SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 18;
+pub const LEGACY_SCHEMA_VERSION: u32 = 17;
+pub const PRE_INTERVAL_SCHEMA_VERSION: u32 = 16;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
-pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v14";
+pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
+pub const PRE_INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
+pub const BLOCK_SEGMENT_MANIFEST_KEY: &[u8] = b"block-segment-manifest/v1";
+pub const UNDO_SEGMENT_MANIFEST_KEY: &[u8] = b"undo-segment-manifest/v1";
 
 /// HSD's MSB-first spent-allocation field contains 216,199 airdrop positions
 /// followed by 1,358 faucet positions.
@@ -769,6 +773,10 @@ pub enum StoreHandle {
     Memory(MemoryStore),
     #[cfg(feature = "rocksdb-backend")]
     Rocks(RocksStore),
+    Archived {
+        inner: Box<StoreHandle>,
+        archive: Arc<SegmentArchive>,
+    },
 }
 
 impl StoreHandle {
@@ -781,7 +789,55 @@ impl StoreHandle {
             Self::Memory(_) => DurabilityPolicy::Sync,
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(store) => store.durability,
+            Self::Archived { inner, .. } => inner.durability_policy(),
         }
+    }
+
+    pub fn with_segment_archive(self, directory: PathBuf) -> Result<Self, StoreError> {
+        if matches!(self, Self::Archived { .. }) {
+            return Err(StoreError::Schema(
+                "segment archive is already attached".to_owned(),
+            ));
+        }
+        let snapshot = self.snapshot()?;
+        let block = snapshot.get(ColumnFamily::Snapshots, BLOCK_SEGMENT_MANIFEST_KEY)?;
+        let undo = snapshot.get(ColumnFamily::Snapshots, UNDO_SEGMENT_MANIFEST_KEY)?;
+        drop(snapshot);
+        let archive = match (block, undo) {
+            (None, None) => {
+                let archive =
+                    SegmentArchive::create_new(directory, 1).map_err(segment_store_error)?;
+                let (block, undo) = archive.manifests().map_err(segment_store_error)?;
+                let mut batch = self.batch();
+                batch.put(
+                    ColumnFamily::Snapshots,
+                    BLOCK_SEGMENT_MANIFEST_KEY,
+                    &block.encode(),
+                )?;
+                batch.put(
+                    ColumnFamily::Snapshots,
+                    UNDO_SEGMENT_MANIFEST_KEY,
+                    &undo.encode(),
+                )?;
+                self.commit(batch)?;
+                archive
+            }
+            (Some(block), Some(undo)) => SegmentArchive::recover(
+                directory,
+                SegmentManifest::decode(&block).map_err(segment_store_error)?,
+                SegmentManifest::decode(&undo).map_err(segment_store_error)?,
+            )
+            .map_err(segment_store_error)?,
+            _ => {
+                return Err(StoreError::Schema(
+                    "block/undo segment manifests are only partially initialized".to_owned(),
+                ))
+            }
+        };
+        Ok(Self::Archived {
+            inner: Box::new(self),
+            archive: Arc::new(archive),
+        })
     }
 }
 
@@ -802,6 +858,9 @@ impl Store for StoreHandle {
                 .map(|snapshot| StoreHandleSnapshot::Memory(snapshot, PhantomData)),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(store) => store.snapshot().map(StoreHandleSnapshot::Rocks),
+            Self::Archived { inner, archive } => inner.snapshot().map(|snapshot| {
+                StoreHandleSnapshot::Archived(Box::new(snapshot), Arc::clone(archive))
+            }),
         }
     }
 
@@ -810,6 +869,7 @@ impl Store for StoreHandle {
             Self::Memory(store) => StoreHandleBatch::Memory(store.batch()),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(store) => StoreHandleBatch::Rocks(store.batch()),
+            Self::Archived { inner, .. } => inner.batch(),
         }
     }
 
@@ -818,6 +878,9 @@ impl Store for StoreHandle {
             Self::Memory(store) => commit_memory_store_handle(store, batch),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(store) => commit_rocks_store_handle(store, batch),
+            Self::Archived { inner, archive } => {
+                commit_archived_store_handle(inner, archive, batch)
+            }
         }
     }
 }
@@ -841,6 +904,86 @@ fn commit_memory_store_handle(
     }
 }
 
+fn segment_store_error(error: SegmentError) -> StoreError {
+    StoreError::Backend(format!("segment archive failed: {error}"))
+}
+
+fn segmented_kind(family: ColumnFamily) -> Option<SegmentKind> {
+    match family {
+        ColumnFamily::Blocks => Some(SegmentKind::Block),
+        ColumnFamily::Undo => Some(SegmentKind::Undo),
+        _ => None,
+    }
+}
+
+fn resolve_segmented_value(
+    archive: &SegmentArchive,
+    family: ColumnFamily,
+    key: &[u8],
+    raw: Vec<u8>,
+) -> Result<Vec<u8>, StoreError> {
+    let Some(kind) = segmented_kind(family) else {
+        return Ok(raw);
+    };
+    archive
+        .resolve(kind, key, &raw)
+        .map_err(segment_store_error)
+        .map(|resolved| resolved.unwrap_or(raw))
+}
+
+fn commit_archived_store_handle(
+    inner: &StoreHandle,
+    archive: &SegmentArchive,
+    mut batch: StoreHandleBatch,
+) -> Result<(), StoreError> {
+    let mut payloads = batch.take_archive_payloads()?;
+    if payloads.is_empty() {
+        return inner.commit(batch);
+    }
+    let mut writer = archive.writer().map_err(segment_store_error)?;
+    let prepared = match archive.prepare_locked(&mut writer, &mut payloads) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            archive
+                .rollback_locked(&mut writer)
+                .map_err(segment_store_error)?;
+            return Err(segment_store_error(error));
+        }
+    };
+    if let Err(error) = batch.replace_archive_payloads(&prepared.locators) {
+        archive
+            .rollback_locked(&mut writer)
+            .map_err(segment_store_error)?;
+        return Err(error);
+    }
+    let stage_manifests = (|| {
+        batch.put(
+            ColumnFamily::Snapshots,
+            BLOCK_SEGMENT_MANIFEST_KEY,
+            &prepared.block_manifest.encode(),
+        )?;
+        batch.put(
+            ColumnFamily::Snapshots,
+            UNDO_SEGMENT_MANIFEST_KEY,
+            &prepared.undo_manifest.encode(),
+        )
+    })();
+    if let Err(error) = stage_manifests {
+        archive
+            .rollback_locked(&mut writer)
+            .map_err(segment_store_error)?;
+        return Err(error);
+    }
+    if let Err(error) = inner.commit(batch) {
+        archive
+            .rollback_locked(&mut writer)
+            .map_err(segment_store_error)?;
+        return Err(error);
+    }
+    writer.commit_prepared(&prepared);
+    Ok(())
+}
+
 #[cfg(feature = "rocksdb-backend")]
 fn commit_rocks_store_handle(
     store: &RocksStore,
@@ -856,6 +999,7 @@ pub enum StoreHandleSnapshot<'a> {
     Memory(MemorySnapshot, PhantomData<&'a ()>),
     #[cfg(feature = "rocksdb-backend")]
     Rocks(RocksSnapshot<'a>),
+    Archived(Box<StoreHandleSnapshot<'a>>, Arc<SegmentArchive>),
 }
 
 impl ReadSnapshot for StoreHandleSnapshot<'_> {
@@ -864,6 +1008,12 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
             Self::Memory(snapshot, _) => snapshot.get(family, key),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(snapshot) => snapshot.get(family, key),
+            Self::Archived(snapshot, archive) => {
+                let Some(raw) = snapshot.get(family, key)? else {
+                    return Ok(None);
+                };
+                resolve_segmented_value(archive, family, key, raw).map(Some)
+            }
         }
     }
 
@@ -876,6 +1026,20 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
             Self::Memory(snapshot, _) => snapshot.get_many(family, keys),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(snapshot) => snapshot.get_many(family, keys),
+            Self::Archived(snapshot, archive) => {
+                let values = snapshot.get_many(family, keys)?;
+                if segmented_kind(family).is_none() {
+                    return Ok(values);
+                }
+                keys.iter()
+                    .zip(values)
+                    .map(|(key, value)| {
+                        value
+                            .map(|raw| resolve_segmented_value(archive, family, key, raw))
+                            .transpose()
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -888,6 +1052,19 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
             Self::Memory(snapshot, _) => snapshot.scan_prefix(family, prefix),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(snapshot) => snapshot.scan_prefix(family, prefix),
+            Self::Archived(snapshot, archive) => {
+                let entries = snapshot.scan_prefix(family, prefix)?;
+                if segmented_kind(family).is_none() {
+                    return Ok(entries);
+                }
+                entries
+                    .into_iter()
+                    .map(|(key, raw)| {
+                        resolve_segmented_value(archive, family, &key, raw)
+                            .map(|value| (key, value))
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -901,6 +1078,15 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
             Self::Memory(snapshot, _) => snapshot.visit_prefix(family, prefix, visitor),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(snapshot) => snapshot.visit_prefix(family, prefix, visitor),
+            Self::Archived(snapshot, _) if segmented_kind(family).is_none() => {
+                snapshot.visit_prefix(family, prefix, visitor)
+            }
+            Self::Archived(_, _) => {
+                for (key, value) in self.scan_prefix(family, prefix)? {
+                    visitor(&key, &value)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -910,6 +1096,113 @@ pub enum StoreHandleBatch {
     Memory(MemoryBatch),
     #[cfg(feature = "rocksdb-backend")]
     Rocks(RocksBatch),
+}
+
+impl StoreHandleBatch {
+    fn take_archive_payloads(&mut self) -> Result<Vec<segment::ArchivePayload>, StoreError> {
+        let mut payloads = Vec::new();
+        match self {
+            Self::Memory(batch) => {
+                for operation in &mut batch.operations {
+                    let MemoryOperation::Put { key, value } = operation else {
+                        continue;
+                    };
+                    collect_archive_payload(key.family, &key.key, value, &mut payloads)?;
+                }
+            }
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(batch) => {
+                for operation in &mut batch.operations {
+                    let RocksOperation::Put { family, key, value } = operation else {
+                        continue;
+                    };
+                    collect_archive_payload(*family, key, value, &mut payloads)?;
+                }
+            }
+        }
+        Ok(payloads)
+    }
+
+    fn replace_archive_payloads(
+        &mut self,
+        locators: &[SegmentValueLocator],
+    ) -> Result<(), StoreError> {
+        let mut locators = locators.iter();
+        match self {
+            Self::Memory(batch) => {
+                for operation in &mut batch.operations {
+                    let MemoryOperation::Put { key, value } = operation else {
+                        continue;
+                    };
+                    replace_archive_payload(key.family, value, &mut locators)?;
+                }
+            }
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(batch) => {
+                for operation in &mut batch.operations {
+                    let RocksOperation::Put { family, value, .. } = operation else {
+                        continue;
+                    };
+                    replace_archive_payload(*family, value, &mut locators)?;
+                }
+            }
+        }
+        if locators.next().is_some() {
+            return Err(StoreError::Backend(
+                "segment archive produced excess value locators".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn collect_archive_payload(
+    family: ColumnFamily,
+    key: &[u8],
+    value: &mut Vec<u8>,
+    payloads: &mut Vec<segment::ArchivePayload>,
+) -> Result<(), StoreError> {
+    let Some(kind) = segmented_kind(family) else {
+        return Ok(());
+    };
+    if SegmentValueLocator::decode(value)
+        .map_err(segment_store_error)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let key: [u8; 32] = key.try_into().map_err(|_| {
+        StoreError::Schema(format!(
+            "{} segment key contains {} bytes; expected 32",
+            family.name(),
+            key.len()
+        ))
+    })?;
+    payloads.push(segment::ArchivePayload {
+        kind,
+        key,
+        payload: std::mem::take(value),
+    });
+    Ok(())
+}
+
+fn replace_archive_payload<'a>(
+    family: ColumnFamily,
+    value: &mut Vec<u8>,
+    locators: &mut impl Iterator<Item = &'a SegmentValueLocator>,
+) -> Result<(), StoreError> {
+    if segmented_kind(family).is_none()
+        || SegmentValueLocator::decode(value)
+            .map_err(segment_store_error)?
+            .is_some()
+    {
+        return Ok(());
+    }
+    let locator = locators.next().ok_or_else(|| {
+        StoreError::Backend("segment archive produced too few value locators".to_owned())
+    })?;
+    *value = locator.encode();
+    Ok(())
 }
 
 impl WriteBatch for StoreHandleBatch {
@@ -2262,6 +2555,109 @@ mod tests {
             .is_some());
     }
 
+    #[test]
+    fn archived_store_publishes_locators_and_recovers_uncommitted_tails() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("hsrd-store-archive-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let raw = StoreHandle::memory();
+        let archived = raw
+            .clone()
+            .with_segment_archive(directory.clone())
+            .expect("attach archive");
+        let block_key = [0x41; 32];
+        let undo_key = [0x42; 32];
+        let mut batch = archived.batch();
+        batch
+            .put(ColumnFamily::Blocks, &block_key, b"raw block record")
+            .expect("stage block");
+        batch
+            .put(ColumnFamily::Undo, &undo_key, b"raw undo record")
+            .expect("stage undo");
+        archived.commit(batch).expect("commit archived payloads");
+
+        let snapshot = archived.snapshot().expect("archived snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &block_key)
+                .expect("block"),
+            Some(b"raw block record".to_vec())
+        );
+        assert_eq!(
+            snapshot.get(ColumnFamily::Undo, &undo_key).expect("undo"),
+            Some(b"raw undo record".to_vec())
+        );
+        drop(snapshot);
+        let raw_snapshot = raw.snapshot().expect("raw snapshot");
+        let raw_block = raw_snapshot
+            .get(ColumnFamily::Blocks, &block_key)
+            .expect("raw block")
+            .expect("raw block locator");
+        assert_eq!(
+            SegmentValueLocator::decode(&raw_block)
+                .expect("decode block locator")
+                .expect("block locator")
+                .kind,
+            SegmentKind::Block
+        );
+        let block_manifest = SegmentManifest::decode(
+            &raw_snapshot
+                .get(ColumnFamily::Snapshots, BLOCK_SEGMENT_MANIFEST_KEY)
+                .expect("block manifest")
+                .expect("block manifest"),
+        )
+        .expect("decode block manifest");
+        drop(raw_snapshot);
+        drop(archived);
+
+        let block_path = directory.join(format!(
+            "block-g{:016x}-s{:08x}.seg",
+            block_manifest.generation, block_manifest.active_segment
+        ));
+        let mut appender = SegmentAppender::open_at_committed_tail(&block_path, block_manifest)
+            .expect("open committed block tail");
+        appender
+            .append(&SegmentRecord {
+                kind: SegmentKind::Block,
+                key: [0x99; 32],
+                hints: Vec::new(),
+                payload: b"unpublished complete tail".to_vec(),
+            })
+            .expect("append unpublished tail");
+        appender.sync_data().expect("sync unpublished tail");
+        drop(appender);
+        assert!(
+            std::fs::metadata(&block_path)
+                .expect("unpublished metadata")
+                .len()
+                > block_manifest.durable_bytes
+        );
+
+        let reopened = raw
+            .with_segment_archive(directory.clone())
+            .expect("recover archive");
+        assert_eq!(
+            std::fs::metadata(&block_path)
+                .expect("recovered metadata")
+                .len(),
+            block_manifest.durable_bytes
+        );
+        assert_eq!(
+            reopened
+                .snapshot()
+                .expect("reopened snapshot")
+                .get(ColumnFamily::Blocks, &block_key)
+                .expect("reopened block"),
+            Some(b"raw block record".to_vec())
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
     #[cfg(feature = "rocksdb-backend")]
     #[test]
     fn rocks_store_persists_across_reopen() {
@@ -2310,6 +2706,54 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_archive_writes_locator_sized_lsm_values() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hsrd-rocks-archive-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let rocks = RocksStore::open(root.join("chain")).expect("open rocksdb");
+        let raw = StoreHandle::Rocks(rocks.clone());
+        let archived = raw
+            .with_segment_archive(root.join("payloads"))
+            .expect("attach archive");
+        let key = [0x61; 32];
+        let payload = vec![0xa5; 1024 * 1024];
+        let mut batch = archived.batch();
+        batch
+            .put(ColumnFamily::Blocks, &key, &payload)
+            .expect("stage payload");
+        archived.commit(batch).expect("commit payload");
+
+        let stored = rocks
+            .snapshot()
+            .expect("raw rocks snapshot")
+            .get(ColumnFamily::Blocks, &key)
+            .expect("raw rocks value")
+            .expect("raw rocks value");
+        assert!(stored.len() < 128);
+        assert!(SegmentValueLocator::decode(&stored)
+            .expect("decode locator")
+            .is_some());
+        assert_eq!(
+            archived
+                .snapshot()
+                .expect("archive snapshot")
+                .get(ColumnFamily::Blocks, &key)
+                .expect("resolved payload"),
+            Some(payload)
+        );
+        drop(archived);
+        drop(rocks);
+        std::fs::remove_dir_all(root).expect("remove rocks archive fixture");
     }
 
     #[cfg(feature = "rocksdb-backend")]

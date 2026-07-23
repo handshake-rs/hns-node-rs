@@ -1,9 +1,15 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs::{File, OpenOptions},
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 use hns_primitives::blake2b_256;
 use thiserror::Error;
@@ -12,6 +18,10 @@ const SEGMENT_FRAME_MAGIC: &[u8; 8] = b"HSGSEG01";
 const SEGMENT_FRAME_FIXED_BYTES: usize = 8 + 4 + 1 + 1 + 2 + 32 + 4;
 const SEGMENT_FRAME_CHECKSUM_BYTES: usize = 32;
 const SEGMENT_LOCATOR_BYTES: usize = 8 + 4 + 8 + 4;
+const SEGMENT_VALUE_MAGIC: &[u8; 8] = b"HSGLOC01";
+const SEGMENT_VALUE_VERSION: u8 = 1;
+const SEGMENT_VALUE_BODY_BYTES: usize = 8 + 1 + 1 + 2 + SEGMENT_LOCATOR_BYTES;
+const SEGMENT_VALUE_BYTES: usize = SEGMENT_VALUE_BODY_BYTES + 32;
 const SEGMENT_MANIFEST_MAGIC: &[u8; 8] = b"HSGMAN01";
 const SEGMENT_MANIFEST_VERSION: u32 = 1;
 const SEGMENT_MANIFEST_BODY_BYTES: usize = 8 + 4 + 8;
@@ -19,6 +29,7 @@ const SEGMENT_MANIFEST_BYTES: usize = 8 + 4 + SEGMENT_MANIFEST_BODY_BYTES + 32;
 pub const SEGMENT_MAX_HINTS: usize = 2;
 const MAX_SEGMENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const SEGMENT_PAGE_BYTES: u64 = 64 * 1024;
+pub const SEGMENT_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -45,6 +56,60 @@ pub struct SegmentLocator {
     pub segment: u32,
     pub offset: u64,
     pub frame_length: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentValueLocator {
+    pub kind: SegmentKind,
+    pub locator: SegmentLocator,
+}
+
+impl SegmentValueLocator {
+    pub fn encode(self) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(SEGMENT_VALUE_BYTES);
+        encoded.extend_from_slice(SEGMENT_VALUE_MAGIC);
+        encoded.push(SEGMENT_VALUE_VERSION);
+        encoded.push(self.kind as u8);
+        encoded.extend_from_slice(&0u16.to_le_bytes());
+        self.locator.encode_into(&mut encoded);
+        let checksum = blake2b_256(&encoded);
+        encoded.extend_from_slice(&checksum);
+        debug_assert_eq!(encoded.len(), SEGMENT_VALUE_BYTES);
+        encoded
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Option<Self>, SegmentError> {
+        if !encoded.starts_with(SEGMENT_VALUE_MAGIC) {
+            return Ok(None);
+        }
+        if encoded.len() != SEGMENT_VALUE_BYTES {
+            return Err(SegmentError::ValueLocatorLength {
+                actual: encoded.len(),
+                expected: SEGMENT_VALUE_BYTES,
+            });
+        }
+        let (body, checksum) = encoded.split_at(SEGMENT_VALUE_BODY_BYTES);
+        if checksum != blake2b_256(body) {
+            return Err(SegmentError::ValueLocatorChecksumMismatch);
+        }
+        let mut cursor = SEGMENT_VALUE_MAGIC.len();
+        let version = read_u8(body, &mut cursor)?;
+        if version != SEGMENT_VALUE_VERSION {
+            return Err(SegmentError::UnsupportedValueLocatorVersion(version));
+        }
+        let kind = SegmentKind::try_from(read_u8(body, &mut cursor)?)?;
+        if read_u16(body, &mut cursor)? != 0 {
+            return Err(SegmentError::ReservedBits);
+        }
+        let locator = SegmentLocator::decode(body, &mut cursor)?;
+        if cursor != body.len() || locator.frame_length == 0 {
+            return Err(SegmentError::ValueLocatorLength {
+                actual: cursor,
+                expected: body.len(),
+            });
+        }
+        Ok(Some(Self { kind, locator }))
+    }
 }
 
 impl SegmentLocator {
@@ -265,6 +330,459 @@ impl SegmentAppender {
     pub const fn next_offset(&self) -> u64 {
         self.next_offset
     }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn segment(&self) -> u32 {
+        self.segment
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArchivePayload {
+    pub kind: SegmentKind,
+    pub key: [u8; 32],
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ArchiveChannel {
+    kind: SegmentKind,
+    manifest: SegmentManifest,
+    appender: Option<SegmentAppender>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedArchive {
+    pub locators: Vec<SegmentValueLocator>,
+    pub block_manifest: SegmentManifest,
+    pub undo_manifest: SegmentManifest,
+}
+
+#[derive(Debug)]
+pub(crate) struct SegmentArchiveWriter {
+    block: ArchiveChannel,
+    undo: ArchiveChannel,
+}
+
+#[derive(Debug)]
+pub struct SegmentArchive {
+    directory: PathBuf,
+    writer: Mutex<SegmentArchiveWriter>,
+    readers: Mutex<HashMap<(SegmentKind, u64, u32), Arc<File>>>,
+}
+
+impl SegmentArchive {
+    pub(crate) fn create_new(directory: PathBuf, generation: u64) -> Result<Self, SegmentError> {
+        std::fs::create_dir_all(&directory).map_err(segment_io)?;
+        prepare_new_archive_directory(&directory)?;
+        let block = create_archive_channel(&directory, SegmentKind::Block, generation, 0)?;
+        let undo = create_archive_channel(&directory, SegmentKind::Undo, generation, 0)?;
+        sync_directory(&directory)?;
+        Ok(Self {
+            directory,
+            writer: Mutex::new(SegmentArchiveWriter { block, undo }),
+            readers: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn recover(
+        directory: PathBuf,
+        block_manifest: SegmentManifest,
+        undo_manifest: SegmentManifest,
+    ) -> Result<Self, SegmentError> {
+        std::fs::create_dir_all(&directory).map_err(segment_io)?;
+        let block = recover_archive_channel(&directory, SegmentKind::Block, block_manifest)?;
+        let undo = recover_archive_channel(&directory, SegmentKind::Undo, undo_manifest)?;
+        Ok(Self {
+            directory,
+            writer: Mutex::new(SegmentArchiveWriter { block, undo }),
+            readers: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn writer(&self) -> Result<MutexGuard<'_, SegmentArchiveWriter>, SegmentError> {
+        self.writer.lock().map_err(|_| SegmentError::Poisoned)
+    }
+
+    pub(crate) fn prepare_locked(
+        &self,
+        writer: &mut SegmentArchiveWriter,
+        payloads: &mut [ArchivePayload],
+    ) -> Result<PreparedArchive, SegmentError> {
+        writer.prepare(&self.directory, payloads)
+    }
+
+    pub(crate) fn rollback_locked(
+        &self,
+        writer: &mut SegmentArchiveWriter,
+    ) -> Result<(), SegmentError> {
+        writer.rollback(&self.directory)
+    }
+
+    pub fn resolve(
+        &self,
+        expected_kind: SegmentKind,
+        key: &[u8],
+        encoded: &[u8],
+    ) -> Result<Option<Vec<u8>>, SegmentError> {
+        let Some(value) = SegmentValueLocator::decode(encoded)? else {
+            return Ok(None);
+        };
+        if value.kind != expected_kind {
+            return Err(SegmentError::ValueLocatorKind {
+                expected: expected_kind,
+                actual: value.kind,
+            });
+        }
+        let expected_key: [u8; 32] = key
+            .try_into()
+            .map_err(|_| SegmentError::RecordKeyMismatch)?;
+        {
+            let writer = self.writer()?;
+            let manifest = match expected_kind {
+                SegmentKind::Block => writer.block.manifest,
+                SegmentKind::Undo => writer.undo.manifest,
+            };
+            let end = value
+                .locator
+                .offset
+                .checked_add(u64::from(value.locator.frame_length))
+                .ok_or(SegmentError::LocatorOverflow)?;
+            if value.locator.generation != manifest.generation
+                || value.locator.segment > manifest.active_segment
+                || (value.locator.segment == manifest.active_segment
+                    && end > manifest.durable_bytes)
+            {
+                return Err(SegmentError::LocatorBeyondManifest);
+            }
+        }
+        let path = archive_file_path(
+            &self.directory,
+            value.kind,
+            value.locator.generation,
+            value.locator.segment,
+        );
+        let file = {
+            let mut readers = self.readers.lock().map_err(|_| SegmentError::Poisoned)?;
+            Arc::clone(
+                readers
+                    .entry((value.kind, value.locator.generation, value.locator.segment))
+                    .or_insert(Arc::new(File::open(&path).map_err(segment_io)?)),
+            )
+        };
+        let mut frame = vec![0u8; value.locator.frame_length as usize];
+        read_exact_at(&file, &mut frame, value.locator.offset)?;
+        let (record, consumed) = decode_segment_record_ref(&frame)?;
+        if consumed != frame.len() || record.kind != expected_kind || record.key != expected_key {
+            return Err(SegmentError::RecordKeyMismatch);
+        }
+        Ok(Some(record.payload.to_vec()))
+    }
+
+    pub fn manifests(&self) -> Result<(SegmentManifest, SegmentManifest), SegmentError> {
+        let writer = self.writer()?;
+        Ok((writer.block.manifest, writer.undo.manifest))
+    }
+}
+
+impl SegmentArchiveWriter {
+    pub(crate) fn prepare(
+        &mut self,
+        directory: &Path,
+        payloads: &mut [ArchivePayload],
+    ) -> Result<PreparedArchive, SegmentError> {
+        let mut locators = Vec::with_capacity(payloads.len());
+        let mut touched_block = false;
+        let mut touched_undo = false;
+        for payload in payloads {
+            let channel = match payload.kind {
+                SegmentKind::Block => {
+                    touched_block = true;
+                    &mut self.block
+                }
+                SegmentKind::Undo => {
+                    touched_undo = true;
+                    &mut self.undo
+                }
+            };
+            let record = SegmentRecord {
+                kind: payload.kind,
+                key: payload.key,
+                hints: Vec::new(),
+                payload: std::mem::take(&mut payload.payload),
+            };
+            rotate_archive_channel_if_due(directory, channel, &record)?;
+            let locator = channel
+                .appender
+                .as_mut()
+                .ok_or(SegmentError::AppenderPoisoned)?
+                .append(&record)?;
+            locators.push(SegmentValueLocator {
+                kind: payload.kind,
+                locator,
+            });
+        }
+        let block_manifest = if touched_block {
+            self.block
+                .appender
+                .as_mut()
+                .ok_or(SegmentError::AppenderPoisoned)?
+                .sync_data()?
+        } else {
+            self.block.manifest
+        };
+        let undo_manifest = if touched_undo {
+            self.undo
+                .appender
+                .as_mut()
+                .ok_or(SegmentError::AppenderPoisoned)?
+                .sync_data()?
+        } else {
+            self.undo.manifest
+        };
+        Ok(PreparedArchive {
+            locators,
+            block_manifest,
+            undo_manifest,
+        })
+    }
+
+    pub(crate) fn commit_prepared(&mut self, prepared: &PreparedArchive) {
+        self.block.manifest = prepared.block_manifest;
+        self.undo.manifest = prepared.undo_manifest;
+    }
+
+    pub(crate) fn rollback(&mut self, directory: &Path) -> Result<(), SegmentError> {
+        rollback_archive_channel(directory, &mut self.block)?;
+        rollback_archive_channel(directory, &mut self.undo)
+    }
+}
+
+fn create_archive_channel(
+    directory: &Path,
+    kind: SegmentKind,
+    generation: u64,
+    segment: u32,
+) -> Result<ArchiveChannel, SegmentError> {
+    let path = archive_file_path(directory, kind, generation, segment);
+    let mut appender = SegmentAppender::create_new(path, generation, segment)?;
+    let manifest = appender.sync_data()?;
+    Ok(ArchiveChannel {
+        kind,
+        manifest,
+        appender: Some(appender),
+    })
+}
+
+fn recover_archive_channel(
+    directory: &Path,
+    kind: SegmentKind,
+    manifest: SegmentManifest,
+) -> Result<ArchiveChannel, SegmentError> {
+    remove_unpublished_archive_segments(
+        directory,
+        kind,
+        manifest.generation,
+        manifest.active_segment,
+    )?;
+    for segment in 0..manifest.active_segment {
+        let path = archive_file_path(directory, kind, manifest.generation, segment);
+        let inspection = inspect_segment_file(path)?;
+        if inspection.torn_tail {
+            return Err(SegmentError::CommittedTailNotBoundary {
+                committed: inspection.valid_bytes,
+            });
+        }
+    }
+    let path = archive_file_path(
+        directory,
+        kind,
+        manifest.generation,
+        manifest.active_segment,
+    );
+    truncate_segment_to_committed_tail(&path, manifest.durable_bytes)?;
+    let appender = SegmentAppender::open_at_committed_tail(path, manifest)?;
+    Ok(ArchiveChannel {
+        kind,
+        manifest,
+        appender: Some(appender),
+    })
+}
+
+fn rotate_archive_channel_if_due(
+    directory: &Path,
+    channel: &mut ArchiveChannel,
+    record: &SegmentRecord,
+) -> Result<(), SegmentError> {
+    let encoded_bytes = u64::try_from(encoded_segment_record_length(record)?)
+        .map_err(|_| SegmentError::LengthOverflow(record.payload.len()))?;
+    let appender = channel
+        .appender
+        .as_mut()
+        .ok_or(SegmentError::AppenderPoisoned)?;
+    if appender.next_offset() == 0
+        || appender
+            .next_offset()
+            .checked_add(encoded_bytes)
+            .ok_or(SegmentError::LocatorOverflow)?
+            <= SEGMENT_TARGET_BYTES
+    {
+        return Ok(());
+    }
+    appender.sync_data()?;
+    let generation = appender.generation();
+    let segment = appender
+        .segment()
+        .checked_add(1)
+        .ok_or(SegmentError::LocatorOverflow)?;
+    channel.appender.take();
+    let path = archive_file_path(directory, channel.kind, generation, segment);
+    let mut next = SegmentAppender::create_new(path, generation, segment)?;
+    next.sync_data()?;
+    sync_directory(directory)?;
+    channel.appender = Some(next);
+    Ok(())
+}
+
+fn rollback_archive_channel(
+    directory: &Path,
+    channel: &mut ArchiveChannel,
+) -> Result<(), SegmentError> {
+    channel.appender.take();
+    remove_unpublished_archive_segments(
+        directory,
+        channel.kind,
+        channel.manifest.generation,
+        channel.manifest.active_segment,
+    )?;
+    let path = archive_file_path(
+        directory,
+        channel.kind,
+        channel.manifest.generation,
+        channel.manifest.active_segment,
+    );
+    truncate_segment_to_committed_tail(&path, channel.manifest.durable_bytes)?;
+    channel.appender = Some(SegmentAppender::open_at_committed_tail(
+        path,
+        channel.manifest,
+    )?);
+    Ok(())
+}
+
+fn archive_kind_name(kind: SegmentKind) -> &'static str {
+    match kind {
+        SegmentKind::Block => "block",
+        SegmentKind::Undo => "undo",
+    }
+}
+
+fn archive_file_path(
+    directory: &Path,
+    kind: SegmentKind,
+    generation: u64,
+    segment: u32,
+) -> PathBuf {
+    directory.join(format!(
+        "{}-g{generation:016x}-s{segment:08x}.seg",
+        archive_kind_name(kind)
+    ))
+}
+
+fn parse_archive_file_name(name: &str) -> Option<(SegmentKind, u64, u32)> {
+    let raw = name.strip_suffix(".seg")?;
+    let (kind, raw) = raw.split_once("-g")?;
+    let kind = match kind {
+        "block" => SegmentKind::Block,
+        "undo" => SegmentKind::Undo,
+        _ => return None,
+    };
+    let (generation, segment) = raw.split_once("-s")?;
+    Some((
+        kind,
+        u64::from_str_radix(generation, 16).ok()?,
+        u32::from_str_radix(segment, 16).ok()?,
+    ))
+}
+
+fn prepare_new_archive_directory(directory: &Path) -> Result<(), SegmentError> {
+    let mut empty_archives = Vec::new();
+    for entry in std::fs::read_dir(directory).map_err(segment_io)? {
+        let entry = entry.map_err(segment_io)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if parse_archive_file_name(&name).is_none() {
+            continue;
+        }
+        if entry.metadata().map_err(segment_io)?.len() != 0 {
+            return Err(SegmentError::ArchiveInitializationConflict(name));
+        }
+        empty_archives.push(entry.path());
+    }
+    for path in &empty_archives {
+        std::fs::remove_file(path).map_err(segment_io)?;
+    }
+    if !empty_archives.is_empty() {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn remove_unpublished_archive_segments(
+    directory: &Path,
+    kind: SegmentKind,
+    generation: u64,
+    active_segment: u32,
+) -> Result<(), SegmentError> {
+    let mut removed = false;
+    for entry in std::fs::read_dir(directory).map_err(segment_io)? {
+        let entry = entry.map_err(segment_io)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((candidate_kind, candidate_generation, segment)) = parse_archive_file_name(&name)
+        else {
+            continue;
+        };
+        if candidate_kind == kind && candidate_generation == generation && segment > active_segment
+        {
+            std::fs::remove_file(entry.path()).map_err(segment_io)?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(directory: &Path) -> Result<(), SegmentError> {
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(segment_io)
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<(), SegmentError> {
+    file.read_exact_at(buffer, offset).map_err(segment_io)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> Result<(), SegmentError> {
+    while !buffer.is_empty() {
+        let read = file.seek_read(buffer, offset).map_err(segment_io)?;
+        if read == 0 {
+            return Err(segment_io(std::io::Error::from(ErrorKind::UnexpectedEof)));
+        }
+        offset = offset
+            .checked_add(read as u64)
+            .ok_or(SegmentError::LocatorOverflow)?;
+        buffer = &mut buffer[read..];
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -297,6 +815,25 @@ pub enum SegmentError {
     ManifestLength { actual: usize, expected: usize },
     #[error("segment manifest checksum mismatch")]
     ManifestChecksumMismatch,
+    #[error("segment value locator version {0} is unsupported")]
+    UnsupportedValueLocatorVersion(u8),
+    #[error("segment value locator length {actual} does not equal {expected}")]
+    ValueLocatorLength { actual: usize, expected: usize },
+    #[error("segment value locator checksum mismatch")]
+    ValueLocatorChecksumMismatch,
+    #[error("segment value locator kind {actual:?} does not match {expected:?}")]
+    ValueLocatorKind {
+        expected: SegmentKind,
+        actual: SegmentKind,
+    },
+    #[error("segment record key does not match its durable lookup key")]
+    RecordKeyMismatch,
+    #[error("segment value locator lies beyond its authoritative manifest")]
+    LocatorBeyondManifest,
+    #[error("segment mutex was poisoned")]
+    Poisoned,
+    #[error("cannot initialize an unbound archive over non-empty segment {0}")]
+    ArchiveInitializationConflict(String),
     #[error(
         "segment file has uncommitted tail: committed {committed}, actual {actual}, torn {torn}"
     )]
@@ -313,7 +850,7 @@ pub enum SegmentError {
     Io(String),
 }
 
-pub fn encode_segment_record(record: &SegmentRecord) -> Result<Vec<u8>, SegmentError> {
+fn encoded_segment_record_length(record: &SegmentRecord) -> Result<usize, SegmentError> {
     if record.hints.len() > SEGMENT_MAX_HINTS {
         return Err(SegmentError::TooManyHints {
             actual: record.hints.len(),
@@ -336,6 +873,11 @@ pub fn encode_segment_record(record: &SegmentRecord) -> Result<Vec<u8>, SegmentE
             maximum: MAX_SEGMENT_FRAME_BYTES,
         });
     }
+    Ok(frame_length)
+}
+
+pub fn encode_segment_record(record: &SegmentRecord) -> Result<Vec<u8>, SegmentError> {
+    let frame_length = encoded_segment_record_length(record)?;
     let frame_length_u32 =
         u32::try_from(frame_length).map_err(|_| SegmentError::LengthOverflow(frame_length))?;
     let payload_length = u32::try_from(record.payload.len())
@@ -796,6 +1338,65 @@ mod tests {
         assert_eq!(borrowed_consumed, encoded.len());
         assert_eq!(actual, expected);
         assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn unpublished_archive_prepare_is_manifest_invisible_and_reversible() {
+        let directory = test_file();
+        let _ = std::fs::remove_dir_all(&directory);
+        let archive = SegmentArchive::create_new(directory.clone(), 1).expect("create archive");
+        let before = archive.manifests().expect("initial manifests");
+        let key = [0x71; 32];
+        let mut payloads = vec![ArchivePayload {
+            kind: SegmentKind::Block,
+            key,
+            payload: b"prepared but unpublished".to_vec(),
+        }];
+        let prepared = {
+            let mut writer = archive.writer().expect("writer");
+            archive
+                .prepare_locked(&mut writer, &mut payloads)
+                .expect("prepare payload")
+        };
+        assert!(matches!(
+            archive.resolve(SegmentKind::Block, &key, &prepared.locators[0].encode()),
+            Err(SegmentError::LocatorBeyondManifest)
+        ));
+        {
+            let mut writer = archive.writer().expect("writer");
+            archive
+                .rollback_locked(&mut writer)
+                .expect("roll back prepare");
+        }
+        assert_eq!(archive.manifests().expect("rolled-back manifests"), before);
+        let block_path = archive_file_path(&directory, SegmentKind::Block, 1, 0);
+        assert_eq!(
+            std::fs::metadata(block_path)
+                .expect("rolled-back block file")
+                .len(),
+            0
+        );
+        drop(archive);
+        std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[test]
+    fn archive_initialization_never_erases_unbound_payloads() {
+        let directory = test_file();
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create archive directory");
+        let orphan = archive_file_path(&directory, SegmentKind::Block, 1, 0);
+        std::fs::write(&orphan, b"unbound payload bytes").expect("write orphan");
+
+        assert!(matches!(
+            SegmentArchive::create_new(directory.clone(), 1),
+            Err(SegmentError::ArchiveInitializationConflict(_))
+        ));
+        assert_eq!(
+            std::fs::read(&orphan).expect("read preserved orphan"),
+            b"unbound payload bytes"
+        );
+        std::fs::remove_dir_all(directory).expect("remove archive fixture");
     }
 
     #[test]

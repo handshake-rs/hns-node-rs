@@ -187,7 +187,7 @@ compaction adds tombstones which the LSM must compact again before reclaiming
 space. More application-level node caching cannot remove this write
 amplification and competes with RocksDB's existing block cache.
 
-The target layout is an append-only, generation-based Urkel record store:
+The implemented layout is an append-only, generation-based Urkel record store:
 
 1. Pack canonical node records into fixed 64 KiB checksummed pages. A compact
    slot index makes a node lookup within an already loaded page `O(1)` and
@@ -213,28 +213,27 @@ This layout makes authenticated hashing and canonical record verification the
 dominant per-node work. It changes local storage metadata, not Urkel roots,
 proofs, name semantics, or reorganization atomicity.
 
-Implementation is staged behind a storage-profile boundary. First add segment
-codec, corruption, torn-tail, and deterministic-compaction tests. Then support
-offline conversion from the current `NameTreeNodes` column family, verify every
-retained root in both layouts, and only then enable segment reads. The old
-column family remains available for rollback until replay, crash recovery, and
-disk-reclamation qualification pass.
+Schema 18/profile `hsrd-mining-v14` enables segment reads and writes. The
+schema-17 current root is bootstrapped into pages before startup audit; old
+`NameTreeNodes` records remain a read-only fallback for historical retained
+roots. New block and undo payloads use the same fsync-before-publication rule
+with 256 MiB segment rotation and transparent locator resolution.
 
 ## Current RocksDB boundary
 
-Point-oriented column families share a bounded 192 MiB cache. Raw blocks and
-undo use a separate 32 MiB cache so sequential replay cannot evict hot UTXO,
-name-state, header, and Urkel pages. Bloom filters, cached index/filter blocks,
-bounded WAL retention, and four background jobs constrain read and write
-amplification.
+Point-oriented column families share a bounded 192 MiB cache. New raw blocks
+and undo payloads bypass the LSM and place only compact locators in RocksDB;
+legacy inline values retain a separate 32 MiB cache. Bloom filters, cached
+index/filter blocks, bounded WAL retention, and four background jobs constrain
+the remaining read and write amplification.
 
 Name-tree compaction validates the complete retained-root union before deletion,
 performs a key-only preflight, and commits unreachable keys in 65,536-key
 chunks. The completion checkpoint is written last. A crash may leave extra
 unreachable records but cannot delete a validated reachable record; retry is
-idempotent. This is the correctness-preserving layout during segment-store
-migration, not the final performance architecture. Cached diagnostic snapshots
-keep status RPC responsive while the state lock is occupied by compaction.
+idempotent. This compactor now applies only to legacy fallback data;
+page-backed operation does not create new LSM name-node records. Cached
+diagnostic snapshots keep status RPC responsive during maintenance.
 
 ## Non-negotiable gates
 

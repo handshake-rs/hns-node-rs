@@ -60,15 +60,17 @@ Implemented:
 - Separate durable best-header and active-best-block bindings.
 - Strict greater-work activation; equal-work branches preserve the existing
   first-seen tip.
-- Schema version **16**, storage profile **`hsrd-mining-v12`**, explicit clean
-  reindex behavior, durable working and interval-committed name-tree-root
-  bindings/content-addressed nodes and HSD
-  airdrop-field bindings, versioned checksummed network-interval name-tree
-  snapshot pins, hash-keyed deployment-state caches, and a checksummed
-  synchronization checkpoint.
-- Startup checks that compare the durable working name-tree root against the
-  materialized name-state column family and validate the separately retained
-  interval-committed root.
+- Schema version **18**, storage profile **`hsrd-mining-v14`**, a reversible
+  36-block name accumulator, append-only authenticated 64 KiB name pages,
+  monotonic 360-height physical page seals, and checksummed append-only
+  block/undo segments whose compact locators publish atomically with chain
+  state. Schema 16 and 17 stores migrate in place and fail closed on ambiguous
+  profile combinations.
+- Startup checks that compare the interval accumulator and materialized
+  name-state column, validate every retained committed root, truncate
+  unpublished page/frame tails, and reject locator/manifest disagreement.
+- Optional `--transaction-index` historical lookup. The mining profile omits
+  the redundant per-transaction LSM write by default.
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
   block/header undo status and advances a checksummed checkpoint; startup
@@ -496,17 +498,16 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 
 ## Storage migration
 
-Schema version 16 and storage profile `hsrd-mining-v12` retain HSD's separate
-working and interval-committed name-tree roots from schema 15, bound aggregate
-RocksDB WAL retention, retire interval pins with expired rollback authority,
-and align coin
-admission with HSD: null-data-address and `REVOKE` covenant outputs are
-validated but never enter the UTXO set or block undo. Schema 14 added the roots
-to schema 13's checksummed
-network-interval snapshot pins, retained-root node compaction,
-content-addressed authenticated nodes, and path-local proof reads. Block undo
-version 6 carries both root pairs across disconnect and restart recovery.
-The optional undo-retirement checkpoint uses the existing snapshots namespace;
-once present, `--prune-undo-history` is required on subsequent opens. Existing
-pre-authority databases must be reindexed because older profiles may retain
-impossible-to-spend outputs. No implicit in-place migration is attempted.
+Schema 18/profile `hsrd-mining-v14` accepts the previous schema-17 interval
+state through an atomic marker cutover and converts schema-16 working-tree state
+with the resumable, backup-first undo migration. On first open it packs the
+current committed name tree into authenticated pages and initializes block/undo
+segment manifests; legacy RocksDB payloads remain readable while every new
+payload is stored only as a locator plus an append-only frame. Page state
+decodes the prior version, so interrupted rollout is restart-safe.
+
+Block undo version 7 carries the prior accumulator and boundary state needed to
+reverse pending intervals. The optional undo-retirement checkpoint uses the
+existing snapshots namespace; once present, `--prune-undo-history` is required
+on subsequent opens. Schema/profile combinations older than 16 or otherwise
+ambiguous still fail closed and require an explicit reindex.

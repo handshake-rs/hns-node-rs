@@ -2052,14 +2052,13 @@ impl NamePageStorage {
                         file_path.display()
                     )
                 })?;
-            let appender =
-                NamePageAppender::open_at_committed_tail(&file_path, state.manifest.clone())
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to open name-page appender {}: {error}",
-                            file_path.display()
-                        )
-                    })?;
+            let appender = NamePageAppender::open_at_committed_tail(&file_path, state.manifest)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to open name-page appender {}: {error}",
+                        file_path.display()
+                    )
+                })?;
             return Ok(Self {
                 directory,
                 file_path,
@@ -2388,7 +2387,7 @@ impl NamePageStorage {
         truncate_name_pages_to_committed_tail(&self.file_path, self.state.manifest.durable_bytes)
             .map_err(|error| anyhow::anyhow!("failed to roll back name-page tail: {error}"))?;
         self.appender = Some(
-            NamePageAppender::open_at_committed_tail(&self.file_path, self.state.manifest.clone())
+            NamePageAppender::open_at_committed_tail(&self.file_path, self.state.manifest)
                 .map_err(|error| anyhow::anyhow!("failed to reopen name-page appender: {error}"))?,
         );
         Ok(())
@@ -2565,6 +2564,12 @@ impl NodeState {
             );
         }
         bind_store_identity(&store, config.network)?;
+        let store = match &config.data_dir {
+            Some(data_dir) => store
+                .with_segment_archive(data_dir.join("payload-segments"))
+                .map_err(|error| anyhow::anyhow!("failed to open block/undo segments: {error}"))?,
+            None => store,
+        };
         let previous_shutdown_clean = was_clean_shutdown(&store)
             .map_err(|error| anyhow::anyhow!("failed to read shutdown marker: {error}"))?;
 
@@ -3222,17 +3227,17 @@ impl NodeState {
             .context("failed to read transaction-index mode")?
             .map(|raw| decode_transaction_index_mode(&raw))
             .transpose()?;
-        if persisted == Some(false) && enabled {
-            if best_block_tip_from_snapshot(&snapshot)?.is_some()
+        if persisted == Some(false)
+            && enabled
+            && (best_block_tip_from_snapshot(&snapshot)?.is_some()
                 || !snapshot
                     .scan_prefix(ColumnFamily::TxIndex, b"")
                     .context("failed to inspect disabled transaction index")?
-                    .is_empty()
-            {
-                anyhow::bail!(
-                    "transaction index cannot be enabled after unindexed blocks exist; rebuild it offline or use a new data directory"
-                );
-            }
+                    .is_empty())
+        {
+            anyhow::bail!(
+                "transaction index cannot be enabled after unindexed blocks exist; rebuild it offline or use a new data directory"
+            );
         }
         drop(snapshot);
         if persisted != Some(enabled) {
@@ -4187,7 +4192,6 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to read staged page root: {error}"))?;
         let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
         drop(staged);
-        drop(page_base);
         let mut inner = batch.into_inner();
         let prepared = match self
             .name_pages
@@ -4458,7 +4462,6 @@ impl NodeState {
             .map_err(|error| anyhow::anyhow!("failed to read restored page root: {error}"))?;
         let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
         drop(staged);
-        drop(page_base);
         let mut inner = batch.into_inner();
         let resulting_height = request_height.checked_sub(1);
         let prepared = match self
@@ -4770,7 +4773,6 @@ impl NodeState {
         let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
         let mut batch = batch.into_inner();
         drop(staged);
-        drop(base);
         let prepared_page_state =
             if let (Some(pages), Some(reader)) = (self.name_pages.as_mut(), page_reader.as_ref()) {
                 match pages.prepare_root(
@@ -8264,6 +8266,104 @@ mod tests {
             "{error}"
         );
         assert!(record.status.active_chain);
+    }
+
+    #[test]
+    fn archived_block_and_undo_payloads_survive_reorg_and_restart() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-node-payload-segments-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let raw = StoreHandle::memory();
+        drop(
+            NodeState::from_store_for_network(raw.clone(), Network::Regtest)
+                .expect("initialize raw schema"),
+        );
+        let archived = raw
+            .clone()
+            .with_segment_archive(directory.clone())
+            .expect("attach payload archive");
+        let state = NodeState::from_store_for_network(archived, Network::Regtest).expect("state");
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("archived node");
+        let old_block = block_with_commitments(vec![coinbase_transaction_with_address(81, 50)]);
+        let old_record = node
+            .connect_block(NodeBlockImport::fixture(old_block, 0, 1))
+            .expect("connect old archived block");
+        let snapshot = raw.snapshot().expect("raw locator snapshot");
+        for family in [ColumnFamily::Blocks, ColumnFamily::Undo] {
+            let locator = snapshot
+                .get(family, old_record.hash.as_bytes())
+                .expect("raw locator")
+                .expect("locator");
+            assert!(hns_store::SegmentValueLocator::decode(&locator)
+                .expect("decode locator")
+                .is_some());
+        }
+        drop(snapshot);
+
+        let new_block = block_with_commitments(vec![coinbase_transaction_with_address(82, 60)]);
+        let new_hash = new_block.hash();
+        node.apply_reorg(NodeReorg {
+            disconnect: vec![NodeBlockDisconnect {
+                block_hash: old_record.hash,
+                height: 0,
+            }],
+            connect: vec![NodeBlockImport::fixture(new_block.clone(), 0, 2)],
+        })
+        .expect("archived reorg");
+        assert_eq!(
+            node.state()
+                .blocks
+                .load_block(&new_hash)
+                .expect("load archived replacement"),
+            Some(new_block)
+        );
+        let snapshot = raw.snapshot().expect("post-reorg raw snapshot");
+        assert!(snapshot
+            .get(ColumnFamily::Undo, old_record.hash.as_bytes())
+            .expect("old undo")
+            .is_none());
+        for family in [ColumnFamily::Blocks, ColumnFamily::Undo] {
+            let locator = snapshot
+                .get(family, new_hash.as_bytes())
+                .expect("replacement locator")
+                .expect("replacement locator");
+            assert!(hns_store::SegmentValueLocator::decode(&locator)
+                .expect("decode replacement locator")
+                .is_some());
+        }
+        drop(snapshot);
+        drop(node);
+
+        let archived = raw
+            .with_segment_archive(directory.clone())
+            .expect("reopen payload archive");
+        let reopened =
+            NodeState::from_store_for_network(archived, Network::Regtest).expect("restart state");
+        assert!(reopened
+            .blocks
+            .load_block(&new_hash)
+            .expect("restart block")
+            .is_some());
+        assert!(reopened
+            .state_engine
+            .load_undo(&new_hash)
+            .expect("restart undo")
+            .is_some());
+        drop(reopened);
+        std::fs::remove_dir_all(directory).expect("remove payload archive fixture");
     }
 
     #[test]

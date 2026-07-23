@@ -12,12 +12,12 @@
 - Exact unsigned 256-bit chainwork and durable header/block/raw-body indexes.
 - Memory and RocksDB stores behind typed traits, atomic batches, true RocksDB
   snapshots, and a read-your-writes reorganization overlay.
-- Schema version 16, profile `hsrd-mining-v12`, network, genesis, epoch,
-  mandatory working/interval-committed name-tree-root bindings,
-  content-addressed nodes, and HSD airdrop-field
-  bindings, checksummed network-interval root pins, hash-keyed deployment-state
-  caches, checksummed sync checkpoint, and a bounded checksummed solved-block
-  publication namespace.
+- Schema version 18, profile `hsrd-mining-v14`, network, genesis, epoch,
+  interval accumulator and committed-root bindings, append-only authenticated
+  name pages, block/undo segment locators and manifests, HSD airdrop-field
+  bindings, checksummed interval pins, hash-keyed deployment-state caches,
+  checksummed sync checkpoint, and a bounded solved-block publication
+  namespace.
 - Durable alternate branches, separate best-header and active-block bindings,
   equal-work stability, strict greater-work activation, and one-batch
   replacement after ancestry/body/status/work/root checks.
