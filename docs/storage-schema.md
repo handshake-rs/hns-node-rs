@@ -164,8 +164,12 @@ cannot promote a block or grant authority.
   exact candidate-derived contextual failure from a body-valid alternate to
   failed status. Uncommitted body mismatches and classified local state faults
   are not branch evidence.
-- `tx_index`: bounded differential/debug transaction index; not required in a
-  future lean production profile.
+- `tx_index`: optional active-chain transaction lookup for historical
+  diagnostics. The mining profile leaves it disabled by default; consensus,
+  UTXO validation, block relay, reorganization, and template construction do
+  not read it. `--transaction-index` (alias `--index-tx`) opts in before the
+  first indexed block. Enabling it after unindexed history exists fails closed
+  until an offline rebuild or a new data directory is used.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.

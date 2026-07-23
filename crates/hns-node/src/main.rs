@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long, default_value_t = DurabilityPolicy::Sync)]
     storage_durability: DurabilityPolicy,
 
+    /// Maintain active-chain transaction-to-block history for diagnostics.
+    #[arg(long = "transaction-index", alias = "index-tx")]
+    transaction_index: bool,
+
     /// Compact retained durable name-tree nodes when the startup height is due.
     #[arg(long)]
     compact_name_tree_on_startup: bool,
@@ -201,6 +205,7 @@ impl Cli {
             mainnet_canary: self.mainnet_canary,
             acknowledge_incomplete_consensus: self.acknowledge_incomplete_consensus,
             storage_durability: self.storage_durability,
+            transaction_index: self.transaction_index,
             name_tree_compaction: NameTreeCompactionConfig {
                 compact_on_startup: self.compact_name_tree_on_startup,
                 startup_interval: self.name_tree_compaction_interval,
@@ -355,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
             authority_mode = config.authority_mode.as_str(),
             mainnet_canary = config.mainnet_canary,
             storage_durability = %config.storage_durability,
+            transaction_index = config.transaction_index,
             compact_name_tree_on_startup = config.name_tree_compaction.compact_on_startup,
             name_tree_compaction_interval = config.name_tree_compaction.startup_interval,
             prune_undo_history = config.undo_retention.prune_history,

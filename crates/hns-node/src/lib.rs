@@ -90,6 +90,10 @@ pub const MAX_RPC_AUTHORIZATION_BYTES: usize = 4_096;
 const DEPLOYMENT_STATE_CACHE_PREFIX: &[u8] = b"deployment-state/v1/";
 const DEPLOYMENT_STATE_CACHE_VERSION: u8 = 1;
 const DEPLOYMENT_STATE_CACHE_SIZE: usize = 1 + 4 + 4;
+const TRANSACTION_INDEX_MODE_KEY: &[u8] = b"transaction-index-mode/v1";
+const TRANSACTION_INDEX_MODE_VERSION: u8 = 1;
+const TRANSACTION_INDEX_MODE_BODY_BYTES: usize = 2;
+const TRANSACTION_INDEX_MODE_BYTES: usize = TRANSACTION_INDEX_MODE_BODY_BYTES + 32;
 const NAME_TREE_COMPACTION_CHECKPOINT_KEY: &[u8] = b"name-tree-compaction/v1";
 const NAME_TREE_COMPACTION_CHECKPOINT_VERSION: u32 = 1;
 const NAME_TREE_COMPACTION_DELETE_BATCH: usize = 65_536;
@@ -530,6 +534,10 @@ pub struct NodeConfig {
     pub mainnet_canary: bool,
     pub acknowledge_incomplete_consensus: bool,
     pub storage_durability: DurabilityPolicy,
+    /// Maintain the active-chain transaction lookup index used by historical
+    /// diagnostics. Consensus, mining, block relay, and UTXO validation do not
+    /// depend on this index.
+    pub transaction_index: bool,
     pub name_tree_compaction: NameTreeCompactionConfig,
     pub undo_retention: UndoRetentionConfig,
     pub shadow_sync: ShadowSyncConfig,
@@ -548,12 +556,55 @@ impl Default for NodeConfig {
             mainnet_canary: false,
             acknowledge_incomplete_consensus: false,
             storage_durability: DurabilityPolicy::Sync,
+            transaction_index: false,
             name_tree_compaction: NameTreeCompactionConfig::default(),
             undo_retention: UndoRetentionConfig::default(),
             shadow_sync: ShadowSyncConfig::default(),
             mining_engine: MiningEngineConfig::default(),
         }
     }
+}
+
+fn encode_transaction_index_mode(enabled: bool) -> Vec<u8> {
+    let mut writer = Writer::with_capacity(TRANSACTION_INDEX_MODE_BYTES);
+    writer.write_u8(TRANSACTION_INDEX_MODE_VERSION);
+    writer.write_u8(u8::from(enabled));
+    let mut raw = writer.finish();
+    raw.extend_from_slice(&blake2b_256(&raw));
+    raw
+}
+
+fn decode_transaction_index_mode(raw: &[u8]) -> Result<bool> {
+    if raw.len() != TRANSACTION_INDEX_MODE_BYTES {
+        anyhow::bail!(
+            "transaction-index mode contains {} bytes; expected {TRANSACTION_INDEX_MODE_BYTES}",
+            raw.len()
+        );
+    }
+    let (body, checksum) = raw.split_at(TRANSACTION_INDEX_MODE_BODY_BYTES);
+    if checksum != blake2b_256(body) {
+        anyhow::bail!("transaction-index mode checksum mismatch");
+    }
+    let mut reader = Reader::new(body, TRANSACTION_INDEX_MODE_BODY_BYTES)
+        .map_err(|error| anyhow::anyhow!("invalid transaction-index mode: {error}"))?;
+    let version = reader
+        .read_u8()
+        .map_err(|error| anyhow::anyhow!("invalid transaction-index mode: {error}"))?;
+    if version != TRANSACTION_INDEX_MODE_VERSION {
+        anyhow::bail!("unsupported transaction-index mode version {version}");
+    }
+    let enabled = match reader
+        .read_u8()
+        .map_err(|error| anyhow::anyhow!("invalid transaction-index mode: {error}"))?
+    {
+        0 => false,
+        1 => true,
+        value => anyhow::bail!("invalid transaction-index mode flag {value}"),
+    };
+    reader
+        .ensure_finished()
+        .map_err(|error| anyhow::anyhow!("invalid transaction-index mode: {error}"))?;
+    Ok(enabled)
 }
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
@@ -938,6 +989,7 @@ impl NodeService {
                 config.network
             );
         }
+        state.configure_transaction_index(config.transaction_index)?;
         let pruning_checkpoint = {
             let snapshot = state.store.snapshot()?;
             load_undo_pruning_checkpoint(&snapshot)?
@@ -2473,6 +2525,7 @@ pub struct NodeState {
     pub state_engine: StoredStateEngine<StoreHandle>,
     pub mempool: MemoryMempool,
     name_pages: Option<NamePageStorage>,
+    transaction_index: bool,
 }
 
 impl NodeState {
@@ -2597,6 +2650,7 @@ impl NodeState {
             state_engine,
             mempool: MemoryMempool::new(),
             name_pages,
+            transaction_index: true,
         };
         let audit = state.validate_durable_chain_invariants(checkpoint)?;
         Ok((state, audit))
@@ -3159,6 +3213,39 @@ impl NodeState {
         } else {
             StartupAuditKind::Exhaustive
         })
+    }
+
+    fn configure_transaction_index(&mut self, enabled: bool) -> Result<()> {
+        let snapshot = self.store.snapshot()?;
+        let persisted = snapshot
+            .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+            .context("failed to read transaction-index mode")?
+            .map(|raw| decode_transaction_index_mode(&raw))
+            .transpose()?;
+        if persisted == Some(false) && enabled {
+            if best_block_tip_from_snapshot(&snapshot)?.is_some()
+                || !snapshot
+                    .scan_prefix(ColumnFamily::TxIndex, b"")
+                    .context("failed to inspect disabled transaction index")?
+                    .is_empty()
+            {
+                anyhow::bail!(
+                    "transaction index cannot be enabled after unindexed blocks exist; rebuild it offline or use a new data directory"
+                );
+            }
+        }
+        drop(snapshot);
+        if persisted != Some(enabled) {
+            let mut batch = self.store.batch();
+            batch.put(
+                ColumnFamily::Snapshots,
+                TRANSACTION_INDEX_MODE_KEY,
+                &encode_transaction_index_mode(enabled),
+            )?;
+            self.store.commit(batch)?;
+        }
+        self.transaction_index = enabled;
+        Ok(())
     }
 
     pub const fn network(&self) -> Network {
@@ -4235,8 +4322,10 @@ impl NodeState {
             write_raw_block_to_batch(batch, &raw_record)
                 .map_err(|error| anyhow::anyhow!("failed to stage raw block: {error}"))?;
         }
-        write_tx_index_for_block_to_batch(batch, &request.block, request.height)
-            .map_err(|error| anyhow::anyhow!("failed to stage tx index: {error}"))?;
+        if self.transaction_index {
+            write_tx_index_for_block_to_batch(batch, &request.block, request.height)
+                .map_err(|error| anyhow::anyhow!("failed to stage tx index: {error}"))?;
+        }
         write_canonical_height_to_batch(batch, request.height, block_hash)
             .map_err(|error| anyhow::anyhow!("failed to stage canonical height: {error}"))?;
         batch.put(
@@ -4479,8 +4568,10 @@ impl NodeState {
             &undo,
         )
         .map_err(|error| anyhow::anyhow!("failed to stage state disconnect: {error}"))?;
-        delete_tx_index_for_block_from_batch(batch, &block)
-            .map_err(|error| anyhow::anyhow!("failed to stage tx-index deletion: {error}"))?;
+        if self.transaction_index {
+            delete_tx_index_for_block_from_batch(batch, &block)
+                .map_err(|error| anyhow::anyhow!("failed to stage tx-index deletion: {error}"))?;
+        }
         write_block_index_to_batch(batch, &record)
             .map_err(|error| anyhow::anyhow!("failed to stage block index update: {error}"))?;
         write_record_to_batch(batch, &header_record)
@@ -7414,6 +7505,7 @@ mod tests {
     fn node_connect_block_commits_indexes_state_and_metadata_atomically() {
         let mut node = NodeService::new(NodeConfig {
             network: Network::Regtest,
+            transaction_index: true,
             ..NodeConfig::default()
         });
         let block = block_with_commitments(vec![coinbase_transaction()]);
@@ -8120,6 +8212,58 @@ mod tests {
             Some(block_hash.as_bytes().to_vec())
         );
         assert!(subscription.latest_snapshot.borrow().is_none());
+    }
+
+    #[test]
+    fn mining_profile_omits_transaction_history_without_changing_consensus_state() {
+        let store = StoreHandle::memory();
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("lean node");
+        let block = block_with_commitments(vec![coinbase_transaction()]);
+        let txid = block.transactions[0].txid();
+        let record = node
+            .connect_block(NodeBlockImport::fixture(block, 0, 1))
+            .expect("connect without transaction index");
+        let snapshot = store.snapshot().expect("lean snapshot");
+        assert!(snapshot
+            .scan_prefix(ColumnFamily::TxIndex, b"")
+            .expect("transaction index")
+            .is_empty());
+        drop(snapshot);
+        assert!(node
+            .state()
+            .state_engine
+            .coin(&Outpoint { txid, index: 0 })
+            .expect("coin read")
+            .is_some());
+        drop(node);
+
+        let state =
+            NodeState::from_store_for_network(store, Network::Regtest).expect("reopen state");
+        let error = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                transaction_index: true,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect_err("partial historical index must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be enabled after unindexed blocks"),
+            "{error}"
+        );
+        assert!(record.status.active_chain);
     }
 
     #[test]
@@ -9337,6 +9481,7 @@ mod tests {
     fn node_apply_reorg_disconnects_then_connects_new_tip() {
         let mut node = NodeService::new(NodeConfig {
             network: Network::Regtest,
+            transaction_index: true,
             ..NodeConfig::default()
         });
         let old_block = block_with_commitments(vec![coinbase_transaction_with_address(7, 50)]);
@@ -10159,6 +10304,7 @@ mod tests {
     fn higher_work_side_chain_is_reorganized_atomically() {
         let mut node = NodeService::new(NodeConfig {
             network: Network::Regtest,
+            transaction_index: true,
             ..NodeConfig::default()
         });
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(43, 50)]);

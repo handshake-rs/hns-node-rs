@@ -52,6 +52,11 @@ tree, and either can change the next valid header commitment. Consequently the
 full consensus transition engine is mandatory even when wallet, DNS, and
 general RPC product surfaces are absent.
 
+The active-chain transaction lookup is therefore disabled by default and can
+be added with `--transaction-index` for diagnostics. This removes a redundant
+per-transaction LSM write from the mining profile without removing raw blocks,
+UTXOs, transaction validation, mempool admission, or any consensus transition.
+
 ## Native MeshMine handoff
 
 The Core-side bridge consumes only `TipCommitted` snapshots. It derives a
