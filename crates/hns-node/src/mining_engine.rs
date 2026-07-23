@@ -646,6 +646,18 @@ impl NodeService {
         if !self.config.mining_engine.enabled {
             return None;
         }
+        let pool = self.state.mempool.info();
+        if disconnected_transactions.is_empty()
+            && pool.transaction_count == 0
+            && pool.orphan_count == 0
+            && pool.claim_count == 0
+            && pool.airdrop_count == 0
+        {
+            // A direct IBD slice cannot remove or revalidate anything from an
+            // empty pool. Avoid reopening chain/name snapshots after every
+            // historical state commit solely to rediscover that fact.
+            return None;
+        }
         let revalidation = (|| -> Result<hns_mempool::MempoolRevalidation> {
             let snapshot = self
                 .state

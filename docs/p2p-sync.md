@@ -318,9 +318,13 @@ connected blocks per atomic reorganization by default, matching
 mainnet's retained reorganization window (hard maximum 1,024). Straight-line
 IBD progress is limited to eight connected blocks per state transaction so
 RPC, peer work, and shutdown are polled between small atomic commits. A valid
-body completion triggers the next full state slice immediately; partial tails
-are flushed by the periodic poll. This retains batched storage work without
-making the polling interval a sustained throughput ceiling.
+body completion is durably sequenced without recursively entering the state
+writer. Network maintenance retains its configured polling cadence. A separate
+10 ms minimum activation cadence connects exactly one slice per scheduler turn
+and delays its next tick after an overrun, leaving an inter-slice opportunity
+for peer events, validation results, and shutdown. This prevents a full stored
+buffer from monopolizing the supervisor without making the general polling
+interval a replay throughput ceiling.
 Each batch uses the node's existing deployment, script, sequence-lock,
 claim/airdrop, covenant, UTXO, name-state, Urkel-root, undo, and reorganization
 pipeline; no second consensus implementation exists in the sync runtime. The
@@ -436,7 +440,9 @@ usage, compact-capable peers, pending/received/reconstructed/fallback compact
 blocks, served compact blocks and block transactions, ordinary received/served
 counts, durably failed-body count, checkpoint sequence,
 active-state connection/reorganization counts, contextual-failure count, and
-monotonic process-lifetime sent/received byte totals. Final peer counters move
+monotonic process-lifetime sent/received byte totals. Active-state diagnostics
+also report slice count, blocks, total duration, planning/state-commit/post-commit
+phase durations, and peer-event/validation-result channel backlogs. Final peer counters move
 atomically into retired-session totals before peer removal, so rotation cannot
 make traffic evidence regress. Each scheduler peer also exposes
 `body_available`, distinguishing a transport-ready peer from one that has

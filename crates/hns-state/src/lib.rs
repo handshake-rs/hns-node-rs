@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
+    cell::RefCell,
     collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     sync::Arc,
@@ -978,6 +979,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         .transactions
         .first()
         .ok_or(StateError::MissingCoinbase)?;
+    let prefetched_utxos = prefetch_block_utxos(snapshot, request.block)?;
     let chain_context =
         SnapshotChainContext::new(snapshot, request.height, services.historical_validation);
     let has_claim = coinbase
@@ -1035,7 +1037,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     for (transaction_index, transaction) in request.block.transactions.iter().enumerate() {
         if transaction_index != 0 {
             let resolved = resolve_transaction_inputs(
-                snapshot,
+                &prefetched_utxos,
                 &pending_created,
                 &mut spent_outpoints,
                 transaction,
@@ -1141,11 +1143,10 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
             if !created_set.insert(outpoint.clone()) {
                 return Err(StateError::DuplicateCoin(outpoint));
             }
-            if !spent_outpoints.contains(&outpoint)
-                && snapshot
-                    .get(ColumnFamily::Utxo, &encode_outpoint_key(&outpoint))?
-                    .is_some()
-            {
+            let existing = prefetched_utxos.get(&outpoint).ok_or_else(|| {
+                StateError::Codec("prefetched UTXO set is missing a block output".to_owned())
+            })?;
+            if !spent_outpoints.contains(&outpoint) && existing.is_some() {
                 return Err(StateError::DuplicateCoin(outpoint));
             }
 
@@ -1299,8 +1300,8 @@ impl ResolvedInputs {
     }
 }
 
-fn resolve_transaction_inputs<T: ReadSnapshot>(
-    snapshot: &T,
+fn resolve_transaction_inputs(
+    prefetched_utxos: &HashMap<Outpoint, Option<Coin>>,
     pending_created: &HashMap<Outpoint, Coin>,
     spent_outpoints: &mut HashSet<Outpoint>,
     transaction: &Transaction,
@@ -1316,7 +1317,7 @@ fn resolve_transaction_inputs<T: ReadSnapshot>(
         let (coin, source) = match pending_created.get(&input.previous_output) {
             Some(coin) => (coin.clone(), ResolvedCoinSource::Pending),
             None => (
-                load_existing_coin(snapshot, &input.previous_output)?,
+                prefetched_existing_coin(prefetched_utxos, &input.previous_output)?,
                 ResolvedCoinSource::Existing,
             ),
         };
@@ -1326,6 +1327,80 @@ fn resolve_transaction_inputs<T: ReadSnapshot>(
         resolved.push(coin, source);
     }
     Ok(resolved)
+}
+
+fn prefetch_block_utxos<T: ReadSnapshot>(
+    snapshot: &T,
+    block: &Block,
+) -> Result<HashMap<Outpoint, Option<Coin>>, StateError> {
+    let mut unique = HashSet::new();
+    let mut outpoints = Vec::new();
+    for (transaction_index, transaction) in block.transactions.iter().enumerate() {
+        if transaction_index != 0 {
+            for input in &transaction.inputs {
+                if unique.insert(input.previous_output.clone()) {
+                    outpoints.push(input.previous_output.clone());
+                }
+            }
+        }
+        let txid = transaction.txid();
+        for (output_index, output) in transaction.outputs.iter().enumerate() {
+            if output.is_unspendable() {
+                continue;
+            }
+            let index = u32::try_from(output_index).map_err(|_| {
+                StateError::Codec(format!("output index {output_index} exceeds u32"))
+            })?;
+            let outpoint = Outpoint { txid, index };
+            if unique.insert(outpoint.clone()) {
+                outpoints.push(outpoint);
+            }
+        }
+    }
+    if outpoints.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let keys = outpoints
+        .iter()
+        .map(encode_outpoint_key)
+        .collect::<Vec<_>>();
+    let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let values = snapshot.get_many(ColumnFamily::Utxo, &key_refs)?;
+    if values.len() != outpoints.len() {
+        return Err(StateError::Codec(format!(
+            "UTXO multi-get returned {} values for {} block outpoints",
+            values.len(),
+            outpoints.len()
+        )));
+    }
+
+    outpoints
+        .into_iter()
+        .zip(values)
+        .map(|(outpoint, raw)| {
+            let coin = raw.map(|raw| decode_coin(&raw)).transpose()?;
+            if coin.as_ref().is_some_and(|coin| coin.outpoint != outpoint) {
+                return Err(StateError::Codec(
+                    "coin payload does not match its prefetched UTXO key".to_owned(),
+                ));
+            }
+            Ok((outpoint, coin))
+        })
+        .collect()
+}
+
+fn prefetched_existing_coin(
+    prefetched_utxos: &HashMap<Outpoint, Option<Coin>>,
+    outpoint: &Outpoint,
+) -> Result<Coin, StateError> {
+    prefetched_utxos
+        .get(outpoint)
+        .ok_or_else(|| {
+            StateError::Codec("prefetched UTXO set is missing a transaction input".to_owned())
+        })?
+        .clone()
+        .ok_or_else(|| StateError::MissingCoin(outpoint.clone()))
 }
 
 fn verify_transaction_sequence_locks<T: ReadSnapshot>(
@@ -1811,10 +1886,12 @@ struct SnapshotChainContext<'a, T: ReadSnapshot> {
     snapshot: &'a T,
     candidate_height: Height,
     historical_validation: HistoricalValidationPlan,
+    headers_by_height: RefCell<HashMap<Height, Option<HeaderRecord>>>,
+    median_times: RefCell<HashMap<Height, u64>>,
 }
 
 impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
-    const fn new(
+    fn new(
         snapshot: &'a T,
         candidate_height: Height,
         historical_validation: HistoricalValidationPlan,
@@ -1823,11 +1900,17 @@ impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
             snapshot,
             candidate_height,
             historical_validation,
+            headers_by_height: RefCell::new(HashMap::new()),
+            median_times: RefCell::new(HashMap::new()),
         }
     }
 
     fn header_at(&self, height: Height) -> Result<Option<HeaderRecord>, StateError> {
+        if let Some(cached) = self.headers_by_height.borrow().get(&height) {
+            return Ok(cached.clone());
+        }
         let Some(hash) = read_canonical_hash(self.snapshot, height)? else {
+            self.headers_by_height.borrow_mut().insert(height, None);
             return Ok(None);
         };
         let Some(bytes) = self.snapshot.get(ColumnFamily::Headers, hash.as_bytes())? else {
@@ -1841,10 +1924,16 @@ impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
                 "canonical header payload disagrees with height {height}"
             )));
         }
+        self.headers_by_height
+            .borrow_mut()
+            .insert(height, Some(record.clone()));
         Ok(Some(record))
     }
 
     fn median_time_past(&self, height: Height) -> Result<u64, StateError> {
+        if let Some(cached) = self.median_times.borrow().get(&height) {
+            return Ok(*cached);
+        }
         let mut times = Vec::with_capacity(MEDIAN_TIMESPAN);
         let mut cursor = height;
         for _ in 0..MEDIAN_TIMESPAN {
@@ -1863,7 +1952,9 @@ impl<'a, T: ReadSnapshot> SnapshotChainContext<'a, T> {
             )));
         }
         times.sort_unstable();
-        Ok(times[times.len() / 2])
+        let median = times[times.len() / 2];
+        self.median_times.borrow_mut().insert(height, median);
+        Ok(median)
     }
 
     fn block_time(&self, height: Height) -> Result<u64, StateError> {
@@ -2136,7 +2227,7 @@ fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
     root: TreeRoot,
     overrides: &BTreeMap<NameHash, Option<NameState>>,
 ) -> Result<TreeRoot, StateError> {
-    const MUTATION_MULTI_GET_THRESHOLD: usize = 4;
+    const MUTATION_MULTI_GET_THRESHOLD: usize = 2;
     const MUTATION_READ_BATCH: usize = 1_024;
 
     if overrides.is_empty() {
@@ -3123,6 +3214,9 @@ mod tests {
         name_node_reads: Cell<usize>,
         name_node_batches: Cell<usize>,
         maximum_name_node_batch: Cell<usize>,
+        utxo_reads: Cell<usize>,
+        utxo_batches: Cell<usize>,
+        maximum_utxo_batch: Cell<usize>,
     }
 
     #[derive(Clone)]
@@ -3259,6 +3353,8 @@ mod tests {
             if family == ColumnFamily::NameTreeNodes {
                 self.name_node_reads
                     .set(self.name_node_reads.get().saturating_add(1));
+            } else if family == ColumnFamily::Utxo {
+                self.utxo_reads.set(self.utxo_reads.get().saturating_add(1));
             }
             self.inner.get(family, key)
         }
@@ -3273,6 +3369,11 @@ mod tests {
                     .set(self.name_node_batches.get().saturating_add(1));
                 self.maximum_name_node_batch
                     .set(self.maximum_name_node_batch.get().max(keys.len()));
+            } else if family == ColumnFamily::Utxo {
+                self.utxo_batches
+                    .set(self.utxo_batches.get().saturating_add(1));
+                self.maximum_utxo_batch
+                    .set(self.maximum_utxo_batch.get().max(keys.len()));
             }
             self.inner.get_many(family, keys)
         }
@@ -3545,6 +3646,82 @@ mod tests {
             },
             transactions,
         }
+    }
+
+    #[test]
+    fn block_utxos_are_prefetched_in_one_storage_batch() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let first_outpoint = Outpoint {
+            txid: Txid::new([1; 32]),
+            index: 0,
+        };
+        let second_outpoint = Outpoint {
+            txid: Txid::new([2; 32]),
+            index: 1,
+        };
+        let mut initial = store.batch();
+        for (outpoint, value) in [(first_outpoint.clone(), 11), (second_outpoint.clone(), 13)] {
+            write_coin_to_batch(
+                &mut initial,
+                &Coin {
+                    outpoint,
+                    value,
+                    height: 1,
+                    coinbase: false,
+                    address: address(),
+                    covenant: covenant(),
+                },
+            )
+            .expect("write input coin");
+        }
+        store.commit(initial).expect("commit input coins");
+
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![
+                Input {
+                    previous_output: first_outpoint.clone(),
+                    sequence: u32::MAX,
+                    witness: Witness::default(),
+                },
+                Input {
+                    previous_output: second_outpoint.clone(),
+                    sequence: u32::MAX,
+                    witness: Witness::default(),
+                },
+            ],
+            outputs: vec![output(20)],
+            locktime: 0,
+        };
+        let created = Outpoint {
+            txid: spend.txid(),
+            index: 0,
+        };
+        let candidate = block(88, vec![coinbase(Vec::new()), spend]);
+        let guarded = NoNameStateScanSnapshot {
+            inner: store.snapshot().expect("snapshot"),
+            name_node_reads: Cell::new(0),
+            name_node_batches: Cell::new(0),
+            maximum_name_node_batch: Cell::new(0),
+            utxo_reads: Cell::new(0),
+            utxo_batches: Cell::new(0),
+            maximum_utxo_batch: Cell::new(0),
+        };
+        let prefetched = prefetch_block_utxos(&guarded, &candidate).expect("prefetch");
+
+        assert_eq!(guarded.utxo_reads.get(), 0);
+        assert_eq!(guarded.utxo_batches.get(), 1);
+        assert_eq!(guarded.maximum_utxo_batch.get(), 3);
+        assert_eq!(
+            prefetched[&first_outpoint].as_ref().map(|coin| coin.value),
+            Some(11)
+        );
+        assert_eq!(
+            prefetched[&second_outpoint].as_ref().map(|coin| coin.value),
+            Some(13)
+        );
+        assert_eq!(prefetched[&created], None);
     }
 
     #[test]
@@ -4351,7 +4528,7 @@ mod tests {
             .expect("bind root");
         store.commit(initial).expect("commit initial tree");
 
-        let overrides = states[16..32]
+        let overrides = states[16..18]
             .iter()
             .cloned()
             .map(|mut replacement| {
@@ -4367,6 +4544,9 @@ mod tests {
             name_node_reads: Cell::new(0),
             name_node_batches: Cell::new(0),
             maximum_name_node_batch: Cell::new(0),
+            utxo_reads: Cell::new(0),
+            utxo_batches: Cell::new(0),
+            maximum_utxo_batch: Cell::new(0),
         };
         let mut batch = store.batch();
         let actual = stage_name_tree_with_overrides(&guarded, &mut batch, root, &overrides)
@@ -4376,7 +4556,7 @@ mod tests {
         assert_eq!(
             guarded.name_node_reads.get(),
             0,
-            "multi-mutation path must not issue individual storage reads"
+            "two-name mutation must batch independent path reads"
         );
         assert!(guarded.name_node_batches.get() > 1);
         assert!(guarded.maximum_name_node_batch.get() > 1);
@@ -4387,6 +4567,9 @@ mod tests {
             name_node_reads: Cell::new(0),
             name_node_batches: Cell::new(0),
             maximum_name_node_batch: Cell::new(0),
+            utxo_reads: Cell::new(0),
+            utxo_batches: Cell::new(0),
+            maximum_utxo_batch: Cell::new(0),
         };
         let mut empty_batch = store.batch();
         assert_eq!(

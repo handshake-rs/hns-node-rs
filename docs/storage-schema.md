@@ -89,10 +89,16 @@ Durable identity binds:
   uses one snapshot-bound multi-get, while atomic staging overlays resolve their
   own replacements/deletions first and batch only missing keys against the base
   snapshot.
-- One atomic activation snapshot has bounded read-through caches for immutable
-  name-tree nodes and materialized name state, including absent name-state
-  lookups. Overlay writes/deletes always take precedence and the caches are
-  discarded with that snapshot.
+- One atomic activation snapshot has a 65,536-entry read-through cache,
+  including misses, for immutable metadata, headers, height/block/transaction
+  indexes, UTXOs, name state, and snapshot records. A separate 131,072-entry
+  positive cache covers content-addressed name-tree nodes. Overlay
+  writes/deletes always take precedence and both caches are discarded with that
+  snapshot.
+- Every block deduplicates its non-coinbase inputs and spendable output
+  collision keys, resolves them with one snapshot-bound UTXO multi-get, and
+  retains the decoded results in an outpoint hash map through validation and
+  spend staging.
 - Name-tree garbage collection validates the complete retained-root union
   before mutation, preflights durable key shape without materializing values,
   and streams unreachable deletes in 65,536-key commits. Its completion

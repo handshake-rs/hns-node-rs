@@ -533,6 +533,14 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   testnet jobs expire at HSD's timestamp-driven target-reset boundary.
 - Tip commit to job activation and candidate receipt to first accepted relay.
 - Priority isolation under sync, compaction, diagnostics, and slow-peer load.
+- Activation-overlay tests require repeated present and absent metadata,
+  header, UTXO, and name-state reads to reach the base snapshot once; name-tree
+  nodes retain their separate bounded cache.
+- Block-state tests require all existing-input and output-collision UTXO probes
+  to use one multi-get with no individual UTXO point reads.
+- Native-sync diagnostics distinguish activation planning, state commit, and
+  post-commit time and expose peer-event and validation-result backlog during
+  the bounded writer slice.
 - Live diagnostic snapshots that preserve exact block-status counts without
   materializing historical RPC payload collections.
 - Lock-held native status/authority/parity/mining diagnostics that return an

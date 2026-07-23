@@ -2935,7 +2935,13 @@ impl NodeState {
     }
 
     fn best_chain_activation_plan(&self, candidate: BlockHash) -> Result<Option<NodeReorg>> {
-        let snapshot = self.store.snapshot()?;
+        let base = self.store.snapshot()?;
+        // Planning revisits candidate, fork, and connect-path records while it
+        // proves eligibility, validates path shape, and materializes imports.
+        // Reuse the same bounded immutable point cache as activation staging so
+        // each logical record reaches the base snapshot at most once.
+        let reads = StagingOverlay::new();
+        let snapshot = reads.snapshot(&base);
         let candidate_record = load_block_index_record(&snapshot, &candidate)?
             .ok_or_else(|| anyhow::anyhow!("candidate block index is missing"))?;
         if candidate_record.status.failed || candidate_record.status.active_chain {
@@ -3226,6 +3232,58 @@ impl NodeState {
                 absolute_finality_valid: true,
                 ..status
             },
+            historical_validation,
+        })
+    }
+
+    fn validate_stored_activation<T: ReadSnapshot>(
+        &self,
+        snapshot: &T,
+        request: &NodeBlockImport,
+        record: &BlockIndexRecord,
+    ) -> Result<ValidatedImport> {
+        validate_stored_activation_status(record)?;
+        let hash = request.block.hash();
+        if record.hash != hash
+            || record.height != request.height
+            || record.prev_hash != request.block.header.prev_block
+            || usize::try_from(record.tx_count).ok() != Some(request.block.transactions.len())
+        {
+            anyhow::bail!(
+                "stored activation record does not identify block {} at height {}",
+                hash.to_hex(),
+                request.height
+            );
+        }
+        let header = load_header_record(snapshot, &hash)?.ok_or_else(|| {
+            anyhow::anyhow!("stored activation header {} is missing", hash.to_hex())
+        })?;
+        if header.hash != record.hash
+            || header.height != record.height
+            || header.chainwork != record.chainwork
+            || header.header != request.block.header
+            || header.status != record.status
+        {
+            anyhow::bail!(
+                "stored activation header and block record disagree for {}",
+                hash.to_hex()
+            );
+        }
+        // The durable status was produced for the raw body stored with this
+        // header. Recompute the transaction and witness commitments so a
+        // separately corrupted/replaced raw record cannot borrow that status
+        // merely because block identity is header-derived.
+        HeaderConsensus::new(ConsensusParams::for_network(self.network))
+            .validate_block_commitments(&request.block)
+            .map_err(|error| {
+                anyhow::anyhow!("stored activation body commitment validation failed: {error}")
+            })?;
+        validate_branch_extension(snapshot, request, record.chainwork, self.network, true)?;
+        let historical_validation =
+            self.historical_validation_plan_for_block(request.height, hash, &record.status)?;
+        Ok(ValidatedImport {
+            chainwork: record.chainwork,
+            status: record.status.clone(),
             historical_validation,
         })
     }
@@ -3685,42 +3743,31 @@ impl NodeState {
             // the complete validation route.
             let stored_record = load_block_index_record(&staged, &hash)
                 .map_err(ChainActivationFailure::Internal)?;
-            let stateless = stored_record
-                .as_ref()
-                .map(|stored_record| {
-                    validate_stored_activation_status(stored_record)?;
-                    if stored_record.height != connect.height {
-                        anyhow::bail!(
-                            "stored activation block {} height mismatch: expected {}, got {}",
-                            hash.to_hex(),
-                            connect.height,
-                            stored_record.height
-                        );
-                    }
-                    Ok(
-                        matches!(connect.validation, ImportValidationPolicy::Strict).then(|| {
-                            StatelessBodyValidation::for_block(
-                                &connect.block,
-                                connect.height,
-                                self.network,
-                            )
-                        }),
-                    )
-                })
-                .transpose()
-                .map_err(ChainActivationFailure::Internal)?
-                .flatten();
             let persist_raw_body = stored_record.is_none();
-            let validated = self
-                .validate_import_against_policy(&staged, &connect, true, stateless)
-                .with_context(|| {
-                    format!(
-                        "failed to revalidate stored block {} at height {}",
-                        hash.to_hex(),
-                        connect.height
-                    )
-                })
-                .map_err(ChainActivationFailure::Internal)?;
+            let validated = match stored_record.as_ref() {
+                Some(stored_record)
+                    if matches!(connect.validation, ImportValidationPolicy::Strict) =>
+                {
+                    self.validate_stored_activation(&staged, &connect, stored_record)
+                        .with_context(|| {
+                            format!(
+                                "failed to authenticate stored block {} at height {}",
+                                hash.to_hex(),
+                                connect.height
+                            )
+                        })
+                }
+                Some(_) | None => self
+                    .validate_import_against_policy(&staged, &connect, true, None)
+                    .with_context(|| {
+                        format!(
+                            "failed to validate unstored block {} at height {}",
+                            hash.to_hex(),
+                            connect.height
+                        )
+                    }),
+            }
+            .map_err(ChainActivationFailure::Internal)?;
             let record = match self.stage_connect(
                 &staged,
                 &mut batch,
@@ -8580,6 +8627,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stored_activation_rebinds_durable_status_to_body_commitments() {
+        let mut node = NodeService::new(active_state_shadow_config());
+        let original = block_with_commitments(vec![coinbase_transaction_with_address(103, 50)]);
+        let record = store_fixture_alternate(&mut node, original.clone(), 0, 1);
+
+        let mut replaced = original;
+        replaced.transactions[0].outputs[0].value = 49;
+        assert_eq!(replaced.hash(), record.hash);
+        let replacement = RawBlockRecord::from_block(&replaced, RawBlockSource::Peer);
+        let mut batch = node.state.store.batch();
+        batch
+            .put(
+                ColumnFamily::Blocks,
+                record.hash.as_bytes(),
+                &replacement.encode(),
+            )
+            .expect("replace raw body");
+        node.state.store.commit(batch).expect("commit replacement");
+
+        let error = node
+            .shadow_sync_connect_stored_state(1)
+            .expect_err("replacement body must not borrow durable validation status");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("body commitment"),
+            "unexpected error: {error_chain}"
+        );
+        assert_eq!(
+            node.state.best_block_tip().expect("active tip"),
+            None,
+            "failed activation must preserve the empty active chain"
+        );
+    }
+
     #[tokio::test]
     async fn shadow_active_state_runtime_updates_scheduler_and_diagnostics() {
         let config = active_state_shadow_config();
@@ -8628,6 +8710,11 @@ mod tests {
         );
         let diagnostics = diagnostics.read().await;
         assert_eq!(diagnostics.connected_blocks, 1);
+        assert_eq!(diagnostics.active_state_slices, 1);
+        assert_eq!(diagnostics.active_state_last_slice_blocks, 1);
+        assert!(
+            diagnostics.active_state_max_slice_millis >= diagnostics.active_state_last_slice_millis
+        );
         assert!(!diagnostics.observation_only);
         assert!(diagnostics.active_state);
         assert_eq!(

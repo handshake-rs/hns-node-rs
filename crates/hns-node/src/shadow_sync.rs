@@ -471,6 +471,15 @@ pub struct ShadowSyncDiagnostics {
     pub stored_bodies: u64,
     pub stored_failed_bodies: u64,
     pub connected_blocks: u64,
+    pub active_state_slices: u64,
+    pub active_state_last_slice_blocks: usize,
+    pub active_state_last_slice_millis: u64,
+    pub active_state_max_slice_millis: u64,
+    pub active_state_last_planning_micros: u64,
+    pub active_state_last_commit_micros: u64,
+    pub active_state_last_post_commit_micros: u64,
+    pub peer_event_backlog: usize,
+    pub validation_result_backlog: usize,
     pub reorganizations: u64,
     pub contextual_failed_bodies: u64,
     pub received_transactions: u64,
@@ -533,6 +542,9 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) connected: usize,
     pub(super) disconnected: usize,
     pub(super) contextual_failure: Option<FailedBlockMutation>,
+    pub(super) planning_micros: u64,
+    pub(super) state_commit_micros: u64,
+    pub(super) post_commit_micros: u64,
 }
 
 impl HnsBodyValidator {
@@ -1730,6 +1742,9 @@ impl NodeService {
         let mut poll = tokio::time::interval(shadow_sync_config.poll_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         poll.tick().await;
+        let mut active_state_poll = tokio::time::interval(MIN_SHADOW_SYNC_POLL_INTERVAL);
+        active_state_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        active_state_poll.tick().await;
         let mut peer_state_flush = tokio::time::interval(ADDRESS_BOOK_FLUSH_INTERVAL);
         peer_state_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         peer_state_flush.tick().await;
@@ -1747,6 +1762,50 @@ impl NodeService {
                         flush_address_book(&store, &mut address_book, &diagnostics).await;
                     }
                     flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
+                }
+                _ = active_state_poll.tick(),
+                    if shadow_sync_config.connect_active_state
+                        && active_state_work_ready(&scheduler) =>
+                {
+                    // One atomic slice per scheduler turn. The independent
+                    // short cadence removes the general poll-rate ceiling,
+                    // while Delay semantics force an inter-slice opportunity
+                    // for peer events, validation results, and shutdown.
+                    if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
+                        &node,
+                        &peers,
+                        &mut scheduler,
+                        &mut orphan_pool,
+                        &diagnostics,
+                        &diagnostic_rpc,
+                        shadow_sync_config.active_state_connect_batch,
+                    )
+                    .await
+                    {
+                        let error = error.context("active-state synchronization failed");
+                        record_error(&diagnostics, format!("{error:#}")).await;
+                        terminal_error = Some(error);
+                        break;
+                    }
+                    active_state_poll.reset_after(MIN_SHADOW_SYNC_POLL_INTERVAL);
+                    update_diagnostics(&diagnostics, |state| {
+                        state.peer_event_backlog = peer_events.len();
+                        state.validation_result_backlog = validated.len();
+                    })
+                    .await;
+                    refresh_diagnostics(
+                        &diagnostics,
+                        &peers,
+                        &scheduler,
+                        &orphan_pool,
+                        &reconnects,
+                        &address_book,
+                        &ban_list,
+                        &compact_peers,
+                        &pending_compact_blocks,
+                        checkpoint_sequence,
+                    )
+                    .await;
                 }
                 _ = poll.tick() => {
                     if rpc_task.is_finished() {
@@ -1826,25 +1885,6 @@ impl NodeService {
                         .await;
                     }
 
-                    if shadow_sync_config.connect_active_state {
-                        if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
-                            &node,
-                            &peers,
-                            &mut scheduler,
-                            &mut orphan_pool,
-                            &diagnostics,
-                            &diagnostic_rpc,
-                            shadow_sync_config.active_state_connect_batch,
-                        )
-                        .await
-                        {
-                            let error = error.context("active-state synchronization failed");
-                            record_error(&diagnostics, format!("{error:#}")).await;
-                            terminal_error = Some(error);
-                            break;
-                        }
-                    }
-
                     let queue_result = {
                         let node = node.lock().await;
                         node.shadow_sync_queue_missing_canonical_bodies(&mut scheduler)
@@ -1895,6 +1935,7 @@ impl NodeService {
                             record_warning(format!("{error:#}"));
                         }
                     }
+
                     refresh_diagnostics(
                         &diagnostics,
                         &peers,
@@ -2019,31 +2060,6 @@ impl NodeService {
                     .await;
                     if let Err(error) = &validation_result {
                         record_warning(format!("{error:#}"));
-                    }
-                    // A newly durable body can close an earlier download gap.
-                    // Connect immediately instead of waiting for the periodic
-                    // supervisor tick, which otherwise caps IBD at one small
-                    // active-state slice per polling interval.
-                    if validation_result.is_ok()
-                        && shadow_sync_config.connect_active_state
-                        && active_state_full_slice_ready(&scheduler)
-                    {
-                        if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
-                            &node,
-                            &peers,
-                            &mut scheduler,
-                            &mut orphan_pool,
-                            &diagnostics,
-                            &diagnostic_rpc,
-                            shadow_sync_config.active_state_connect_batch,
-                        )
-                        .await
-                        {
-                            let error = error.context("event-driven active-state synchronization failed");
-                            record_error(&diagnostics, format!("{error:#}")).await;
-                            terminal_error = Some(error);
-                            break;
-                        }
                     }
                     refresh_diagnostics(
                         &diagnostics,
@@ -2504,6 +2520,7 @@ impl NodeService {
         maximum_connect: usize,
         stored_tip_hint: Option<&ChainTip>,
     ) -> Result<ActiveStateConnectOutcome> {
+        let planning_started = StdInstant::now();
         if maximum_connect == 0 || maximum_connect > MAX_ACTIVE_STATE_CONNECT_BATCH {
             anyhow::bail!(
                 "active-state connector batch {maximum_connect} is outside 1..={MAX_ACTIVE_STATE_CONNECT_BATCH}"
@@ -2599,6 +2616,8 @@ impl NodeService {
             self.mining_events.candidate_tip_seen(summary.clone());
             self.mining_events.block_syntax_validated(summary);
         }
+        let planning_micros =
+            u64::try_from(planning_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         let disconnected_transactions =
             self.disconnected_mempool_transactions(&activation.disconnect)?;
@@ -2612,10 +2631,15 @@ impl NodeService {
             self.mining_events
                 .reorg_started(activation.disconnect.len(), activation.connect.len());
         }
-        match self.state.apply_reorg_classified(NodeReorg {
+        let state_commit_started = StdInstant::now();
+        let mutation = self.state.apply_reorg_classified(NodeReorg {
             disconnect: activation.disconnect,
             connect: activation.connect,
-        }) {
+        });
+        let state_commit_micros =
+            u64::try_from(state_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let post_commit_started = StdInstant::now();
+        match mutation {
             Ok(reorg) => {
                 let mining_publication = self.publish_durable_mining_state(&reorg.mining);
                 let mempool_generation = self.mining_engine_reconcile_chain_transition(
@@ -2627,10 +2651,15 @@ impl NodeService {
                     reorg.mining.generation,
                     mempool_generation,
                 )?;
+                let post_commit_micros =
+                    u64::try_from(post_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 Ok(ActiveStateConnectOutcome {
                     connected: reorg.summary.connected.len(),
                     disconnected: reorg.summary.disconnected.len(),
                     contextual_failure: None,
+                    planning_micros,
+                    state_commit_micros,
+                    post_commit_micros,
                 })
             }
             Err(ChainActivationFailure::ContextualInvalid(failure)) => {
@@ -2646,8 +2675,13 @@ impl NodeService {
                 let failed = self
                     .state
                     .store_failed_block(failure.request, FailedBlockStage::ContextualState)?;
+                let post_commit_micros =
+                    u64::try_from(post_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 Ok(ActiveStateConnectOutcome {
                     contextual_failure: Some(failed),
+                    planning_micros,
+                    state_commit_micros,
+                    post_commit_micros,
                     ..ActiveStateConnectOutcome::default()
                 })
             }
@@ -4719,10 +4753,26 @@ async fn connect_stored_active_state_with_diagnostic_rpc(
     // restarting at genesis here makes replay quadratic because this helper is
     // called on every supervisor tick and after each full validation slice.
     let stored_tip_hint = scheduler.stored_tip().cloned();
+    let slice_started = StdInstant::now();
     let outcome = {
         let mut node = node.lock().await;
         node.shadow_sync_connect_stored_state_with_hint(maximum_connect, stored_tip_hint.as_ref())?
     };
+    let slice_blocks = outcome.connected.saturating_add(outcome.disconnected);
+    if slice_blocks != 0 || outcome.contextual_failure.is_some() {
+        let slice_millis = u64::try_from(slice_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        update_diagnostics(diagnostics, |state| {
+            state.active_state_slices = state.active_state_slices.saturating_add(1);
+            state.active_state_last_slice_blocks = slice_blocks;
+            state.active_state_last_slice_millis = slice_millis;
+            state.active_state_max_slice_millis =
+                state.active_state_max_slice_millis.max(slice_millis);
+            state.active_state_last_planning_micros = outcome.planning_micros;
+            state.active_state_last_commit_micros = outcome.state_commit_micros;
+            state.active_state_last_post_commit_micros = outcome.post_commit_micros;
+        })
+        .await;
+    }
     // Capture the newly committed tip before a due compaction takes the
     // state-coordination lock for its long, stable-snapshot deletion pass.
     // Diagnostic RPC can serve this explicitly marked snapshot while all
@@ -4790,15 +4840,12 @@ async fn connect_stored_active_state_with_diagnostic_rpc(
     Ok(())
 }
 
-fn active_state_full_slice_ready(scheduler: &SyncScheduler) -> bool {
-    let stored_count = scheduler
-        .stored_tip()
-        .map_or(0u64, |tip| u64::from(tip.height).saturating_add(1));
-    let active_count = scheduler
-        .active_tip()
-        .map_or(0u64, |tip| u64::from(tip.height).saturating_add(1));
-    stored_count.saturating_sub(active_count)
-        >= u64::try_from(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE).unwrap_or(u64::MAX)
+fn active_state_work_ready(scheduler: &SyncScheduler) -> bool {
+    match (scheduler.stored_tip(), scheduler.active_tip()) {
+        (Some(stored), Some(active)) => stored != active,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 fn discard_orphan_descendants(root: BlockHash, orphans: &mut BoundedOrphanPool) {
@@ -5434,9 +5481,9 @@ mod tests {
         wire
     }
 
-    fn scheduler_tip(height: Height) -> ChainTip {
+    fn scheduler_tip(height: Height, tag: u8) -> ChainTip {
         ChainTip {
-            hash: BlockHash::new([height as u8; 32]),
+            hash: BlockHash::new([tag; 32]),
             height,
             chainwork: Uint256::from_u64(u64::from(height).saturating_add(1)),
         }
@@ -5492,20 +5539,23 @@ mod tests {
     }
 
     #[test]
-    fn event_driven_connector_waits_for_a_full_storage_slice() {
+    fn active_state_cadence_runs_only_for_a_distinct_stored_frontier() {
         let now = StdInstant::now();
         let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
-        scheduler.set_stored_tip(Some(scheduler_tip(6)));
-        assert!(!active_state_full_slice_ready(&scheduler));
+        assert!(!active_state_work_ready(&scheduler));
 
-        scheduler.set_stored_tip(Some(scheduler_tip(7)));
-        assert!(active_state_full_slice_ready(&scheduler));
+        let stored = scheduler_tip(7, 1);
+        scheduler.set_stored_tip(Some(stored.clone()));
+        assert!(active_state_work_ready(&scheduler));
 
-        scheduler.set_active_tip(Some(scheduler_tip(7)));
-        scheduler.set_stored_tip(Some(scheduler_tip(14)));
-        assert!(!active_state_full_slice_ready(&scheduler));
-        scheduler.set_stored_tip(Some(scheduler_tip(15)));
-        assert!(active_state_full_slice_ready(&scheduler));
+        scheduler.set_active_tip(Some(stored));
+        assert!(!active_state_work_ready(&scheduler));
+
+        scheduler.set_stored_tip(Some(scheduler_tip(7, 2)));
+        assert!(
+            active_state_work_ready(&scheduler),
+            "a same-height divergent stored frontier still requires reorg evaluation"
+        );
     }
 
     #[test]

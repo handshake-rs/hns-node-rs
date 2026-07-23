@@ -1,35 +1,36 @@
 # Native synchronization and mining-path performance
 
-Performance qualification uses release builds and never requires a running HSD
-process. HSD remains only the pinned offline behavioral oracle for fixtures.
+Performance work must preserve consensus, crash consistency, and reorganization
+atomicity. The target is to remove redundant storage and coordination work until
+the irreducible costs are block decoding, cryptographic verification,
+authenticated-tree mutation, and one durable commit per bounded state slice.
 
-## Reproducible commands
+## Reproducible measurements
 
 Measure an already-running native mainnet node:
 
 ```bash
 python3 scripts/measure-hsrd-native-sync.py \
-  --hsrd-url http://127.0.0.1:12037 \
+  --hsrd-url http://127.0.0.1:12047 \
   --authorization-header-file /absolute/path/hsrd-authorization-header \
   --duration-seconds 60 --interval-seconds 2 \
   --output /path/to/native-sync-measurement.json
 ```
 
-The sampler accepts only a literal loopback HTTP origin unless the operator
-explicitly opts into a remote endpoint. Its optional Authorization value is
-read from an absolute, non-symlink, mode-0600 regular file and is never placed
-in arguments, output, or logs. It requires active-state native sync,
-binds every sample to one runtime instance, rejects counter regression and any
-reported runtime error, bounds response size and request time, and records:
+The sampler accepts a loopback HTTP origin unless remote access is explicitly
+enabled. It reads authorization from an absolute, non-symlink, mode-0600 file
+and never writes the value to arguments, reports, or logs. Each report is bound
+to one runtime instance and rejects counter regression, runtime errors, or
+malformed diagnostics.
 
-- overall and interval P50/P95/P99/maximum header, body, state, and byte rates;
-- active-state stalls, starting/ending/minimum ready peers, zero-peer samples,
-  peer failures, failed blocks, and unavailable evidence;
-- starting, ending, and raw samples so derived claims can be audited.
+Sampler schema 2 records:
 
-Network-byte rates use the runtime-lifetime traffic total. A peer's final
-snapshot is atomically transferred into retired-session counters before it is
-removed, so rotation and reconnects cannot make the sampled counter regress.
+- overall and interval header, body, state, and byte rates;
+- active-state slice count, block count, total duration, and planning,
+  state-commit, and post-commit phase durations;
+- peer-event and validation-result backlogs;
+- stored-to-active buffer depth, pending and inflight body work, active stalls,
+  ready peers, failures, and unavailable evidence.
 
 Measure the local mining critical path:
 
@@ -37,247 +38,168 @@ Measure the local mining critical path:
 cargo run --locked --release -p hns-node --bin hsrd-performance-gate
 ```
 
-The gate strictly imports canonical HSD regtest genesis, warms ten blocks, then
-builds and connects 100 consecutive native blocks. It reports count,
-P50/P95/P99/maximum, failure count, and unavailable evidence for template
-assembly, cached job preparation, combined tip-to-job work, solved-candidate
-validation, and local consensus connection. Its intentionally conservative
-development-host P99 gates are 25 ms tip-to-job, 5 ms candidate validation, and
-50 ms in-memory local connection.
+`hsrd-performance-gate` imports canonical HSD regtest genesis, warms ten blocks,
+then builds and connects 100 native blocks. It reports count, P50, P95, P99,
+maximum, failure count, and unavailable evidence for template assembly, cached
+job preparation, tip-to-job work, solved-candidate validation, and local
+connection. This is a regression gate, not a full-mainnet IBD completion claim
+or an ASIC/WAN qualification.
 
-## 2026-07-22 development-host evidence
+## Chokepoint model
 
-Host: four Cortex-A76 cores at up to 2.8 GHz, aarch64. The bounded native IBD
-samples used a tmpfs datastore, eight configured outbound slots, seven Ready
-Brontide peers, four stateless validation workers, a 1,024-entry validation
-queue, synchronous durability, and the 250 ms default supervisor poll.
+The live pipeline has five distinct resource domains:
 
-Before the IBD scheduler change, a 68-second startup smoke reached header
-50,000, stored height 2,523, and active height 1,942: 28.6 connected blocks/s
-from process start. Active replay was visibly capped by the eight-block periodic
-slice.
+```text
+Brontide peer tasks
+       |
+       v
+peer-event coordinator -> body scheduler -> stateless validation workers
+       |                                      |
+       +<----------- ordered results ----------+
+       |
+       v
+durable body batch
+       |
+       v
+single contextual state writer -> one synchronous RocksDB transaction
+```
 
-After immediate full-slice activation, a 15-second stalled-body failover, and a
-32-request per-peer limit within the unchanged 128-request global bound, the
-versioned sampler measured this uninterrupted 60-second window:
+Brontide is required HNS transport, but current replay is not transport-crypto
+limited. Ready peers can be at the network header tip while the contiguous
+stored-body frontier remains ahead of active state. A process trace of that
+condition was dominated by random RocksDB point reads and synchronous durability
+boundaries. The active writer used only part of one CPU core; body acquisition
+also paused when the coordinator was occupied by a multi-second state slice.
 
-| Metric | Result |
-|---|---:|
-| Best-header overall rate | 833.332 headers/s |
-| Received-body overall rate | 46.767 blocks/s |
-| Stored-body overall rate | 43.967 blocks/s |
-| Contiguous stored-height rate | 48.133 blocks/s |
-| Active-height / connected-block rate | 47.667 blocks/s |
-| Active interval P50 / P95 / P99 / max | 27.000 / 166.498 / 169.994 / 169.994 blocks/s |
-| Received network bytes | 1,270,006.807 bytes/s |
-| Active stall intervals | 2 of 30 |
-| Ready peers | 7 |
-| Block / peer failures / unavailable | 0 / 0 / 0 |
+This produces two coupled limits:
 
-The comparable startup rate improved by about 67%, while active and stored
-frontiers remained within 28 blocks at the end of the measured window. This is
-bounded early-chain WAN evidence, not a full-mainnet IBD completion claim;
-later blocks, name-state growth, RocksDB on persistent media, pruning, and
-compaction require a longer campaign.
+1. Buffered replay is limited by contextual state transition, authenticated
+   name-tree mutation, point reads, batch construction, and durable commit.
+2. When the stored buffer drains, coordinator latency delays peer-event
+   consumption, scheduler replenishment, and validation-result commits.
 
-The same host produced:
+The phase and backlog counters make these cases distinguishable. A high
+`active_state_last_commit_micros` with a nonzero stored-active buffer identifies
+local state/storage work. Growing `peer_event_backlog` or
+`validation_result_backlog` identifies coordinator starvation. Zero buffer with
+idle inflight work identifies acquisition/scheduling rather than state replay.
 
-| Mining-path stage (100 blocks) | P50 | P95 | P99 | Max |
-|---|---:|---:|---:|---:|
-| Template build | 188 us | 704 us | 2,715 us | 3,320 us |
-| Cached job preparation | 98 us | 392 us | 638 us | 757 us |
-| Tip to prepared job | 286 us | 1,179 us | 3,015 us | 4,078 us |
-| Solved-candidate validation | 9 us | 12 us | 13 us | 14 us |
-| Local consensus connection | 642 us | 2,427 us | 4,283 us | 4,752 us |
+## Implemented replay refactor
 
-All 100 samples passed with zero failure or unavailable evidence. These are
-local empty-mempool regtest critical-path measurements using the in-memory
-store. They establish a regression gate, not ASIC, mainnet-state, persistent
-storage, or first-peer-acceptance qualification.
+Network maintenance retains its configured polling cadence, while active-state
+work has a separate 10 ms minimum cadence. The activation branch connects
+exactly one atomic slice per scheduler turn and uses delay-on-missed-tick
+semantics, guaranteeing an inter-slice opportunity for peer events, validation
+results, and shutdown. Ordered validation completion no longer recursively
+invokes another state slice. This removes both the immediate slice-to-slice
+feedback loop and the general polling interval as a replay throughput ceiling.
 
-## Persistent mainnet canary evidence
+Direct canonical progress remains limited to eight connected blocks per atomic
+slice. A real divergent best-work branch retains the configured reorganization
+bound so disconnect and replacement connect remain one transaction. Increasing
+the direct slice without separating coordinator and state ownership is not a
+safe throughput optimization: it amortizes durability but proportionally
+extends network starvation and shutdown latency.
 
-The release canary's exhaustive RocksDB startup audit reached its authenticated
-RPC in 20.228 seconds at active height 9,396, 21.624 seconds at height 9,622,
-and 27.519 seconds at height 10,952. Before the retained-root union traversal,
-the same audit took roughly 70 seconds at height 8,328. Every restart preserved
-the exact active/stored tip and reopened with zero failed blocks, bans,
-rejections, contextual failures, or terminal error. These are bounded restart
-observations, not deployment-scale crash-recovery qualification.
+The state path removes redundant reads at several levels:
 
-At active height 49,715, an unclean warm-cache restart of the pre-batched
-retained-root validator reached its completed audit after 318 seconds and was
-sampled at 1.86 GiB RSS. At active height 55,933, the bulk-read/compact-depth
-validator recovered the exact same active and stored tips after a forced
-`SIGKILL`, with zero failed or unavailable blocks and no terminal error. Its
-sampled peak was 1.08 GiB RSS, but the cold-cache audit took 742 seconds and
-read approximately 51 GiB physically. Those cache states and heights are not
-an apples-to-apples wall-time comparison: the evidence supports lower memory
-amplification, while also showing that exhaustive recovery remains dominated
-by full-dataset storage reads.
+- Every non-coinbase input and spendable output collision key in a block is
+  deduplicated, fetched with one snapshot-bound UTXO multi-get, decoded once,
+  and retained in an outpoint hash map. In-block outputs still override the
+  base snapshot and duplicate-spend, collision, and maturity checks are
+  unchanged.
+- One atomic activation overlay caches up to 65,536 immutable base point reads,
+  including misses, for metadata, headers, height/block/transaction indexes,
+  UTXOs, name state, and snapshot records. Staged puts and deletes always take
+  precedence.
+- Content-addressed Urkel nodes use a separate 131,072-entry positive cache.
+  Two or more name mutations traverse their independent paths with bounded
+  breadth-first multi-get. Newly constructed records are collision-checked in
+  one multi-get, and superseded records that never formed a committed root are
+  discarded.
+- Header-by-height and median-time values are memoized for the lifetime of each
+  block transition.
+- A strict body already stored by the native validation pipeline reuses its
+  exact durable header/body/finality evidence after checking record identity,
+  header equality, transaction count, merkle/witness commitments, status
+  prerequisites, parent shape, body availability, and historical-route
+  evidence. Activation still performs deployment, relative
+  lock, script, covenant, claim/airdrop, UTXO, name-state, Urkel-root, undo, and
+  active-chain validation in the atomic state transaction.
+- Empty-pool direct replay skips post-commit mempool snapshot construction.
 
-A matching clean checkpoint at height 54,183 still took approximately 107
-seconds before logging audit completion because the previous implementation
-reread every active body and undo record. The bounded clean-start route now
-audits the complete network reorganization horizon (288 blocks on mainnet)
-instead of all historical blocks. Unclean and stale-checkpoint starts retain
-complete historical validation. The offline comparison/scrub campaign must do
-the same and remains a qualification requirement rather than completed evidence.
-After deployment, a matching clean checkpoint at height 57,428 completed its
-audit in approximately 14 seconds and exposed authenticated RPC in 15.727
-seconds. The first RPC-ready sample showed 626 MiB RSS and 670 MiB of physical
-reads. This single restart is a direct regression observation, not yet a
-P50/P95/P99 campaign.
+These caches are activation-snapshot local. They cannot expose stale data across
+commits or replace durable validation.
 
-A 60-second persistent-store window beginning at height 9,622 connected 624
-historical blocks (10.4 blocks/s) and advanced the contiguous stored frontier
-916 blocks (15.267 blocks/s), with zero failed or unavailable blocks. The same
-window fell from seven ready peers to zero, so it is explicitly not sustained
-multi-peer evidence. Debug qualification subsequently showed six authenticated
-public peers timing out without serving an assigned historical body while a
-peer making body progress remained connected under the inactivity deadline.
-This distinguishes archival-body availability from consensus or Brontide
-failure; discovery breadth and sustained multi-archival-peer IBD remain open.
+## Complexity and storage round trips
 
-After adding the one-body availability probe, live diagnostics first showed
-seven transport-ready peers capped at one request each. Ten seconds later six
-had delivered an eligible body, four proven peers held 30--32 requests, and the
-global 128-request window was full. A following 60-second window connected 584
-historical blocks (9.733 blocks/s) and advanced the stored frontier 530 blocks
-(8.833 blocks/s), again with zero failed or unavailable blocks. It began with
-four ready peers but ended with zero and contained 12 zero-peer samples, so the
-probe improves scarce-body-source allocation but does not satisfy sustained
-multi-peer qualification.
+| Operation | CPU/data-structure cost | Base-store access shape |
+|---|---|---|
+| Body scheduling | bounded `O(P × W)` over peers and request window | none |
+| Block UTXO resolution | `O(I + O)` dedup and hash lookup | one multi-get per block |
+| Header/MTP context | `O(H)` unique heights, with `H` bounded by requested contexts | one read per unique staged key |
+| `K` name mutations | `O(K × 256)` authenticated-path hashing | breadth-first batched reads for `K >= 2` |
+| Eight-block direct slice | sequential consensus work over block contents | one stable snapshot and one sync commit |
+| Reorganization | `O(D + C + transactions + name paths)` | one stable snapshot and one atomic commit |
 
-## Optimization and safety boundary
+Without the staged point cache, repeated validation layers can turn one logical
+key dependency into several Rust/RocksDB crossings. With it, base point reads
+are bounded by the number of unique keys in the slice. UTXO multi-get changes
+the FFI/storage scheduling cost from `O(I + O)` calls to one call while
+preserving the same number of logical key probes.
 
-Native IBD now connects a newly available full eight-block state slice directly
-from the ordered validation completion path; periodic polling flushes partial
-tails and provides recovery. It does not enlarge the atomic state transaction
-or the global 128-body inflight limit. Body requests remain single-flight and
-all reassigned responses pass the same strict validation. The shorter timeout
-is an inactivity deadline: each eligible response extends the bounded batch,
-while a peer that stops delivering still fails over after 15 seconds. This
-changes availability failover only; it does not accept alternate consensus
-data, weaken scoring, or alter authority readiness.
+## Optimal ownership boundary
 
-Each new connection starts with one body probe. Only an eligible block response
-sets its diagnostic `body_available` flag and expands it to the 32-request
-window. The probe is connection-local and changes scheduling capacity only;
-the returned block still passes the same stateless and contextual validation.
+The long-term topology is a dedicated chain-state actor that exclusively owns
+the mutable `NodeService` consensus state. The network coordinator should own
+peer sessions and the body scheduler, submit bounded activation commands, and
+consume immutable completion records. That separation permits a larger or
+adaptive commit batch without blocking peer-event intake.
 
-Ordered worker-validated bodies are drained in groups of at most 32 and written
-with one synchronous atomic RocksDB commit. Scheduler completion occurs only
-after that transaction succeeds. The worker result is bound to the exact block
-hash and height; it may skip duplicate coordinator body work only when it
-covers the branch's checkpoint-derived historical validation plan. Header,
-difficulty, finality, branch, contextual state, scripts, covenants, claims,
-airdrops, name state, tree-root, and undo validation remain on their existing
-authoritative paths. A malformed member rejects the complete pre-commit group.
+It must not be implemented as concurrent consensus writers or as unlocked
+snapshots. Required properties are:
 
-RocksDB point-lookup and bulk-stream cache domains are now isolated: UTXO,
-name-state, Urkel, header, and index pages share a 192 MiB cache, while raw
-blocks and undo pages share 32 MiB. Full Bloom filters and cached high-priority
-index/filter blocks reduce negative and point-lookup amplification, and four
-background jobs allow flush and compaction work to use otherwise idle cores.
-These bounds replace fourteen independent default caches; they do not by
-themselves constitute deployment-scale compaction or memory-pressure evidence.
+- exactly one ordered state writer;
+- one snapshot and one atomic batch for a complete direct slice or reorg;
+- backpressure on activation commands and immutable result messages;
+- generation/tip fencing so stale commands are rejected before mutation;
+- shutdown only between transactions;
+- diagnostic reads served from immutable published snapshots;
+- contextual-invalid evidence returned to the coordinator for durable branch
+  rejection and scheduler cleanup.
 
-A multi-name transition may construct several immutable versions of the same
-Urkel path while applying the block's changes. Before returning the atomic
-update, the record engine now traverses the final root and discards constructed
-records that were superseded inside that block. Historical roots committed by
-earlier blocks remain untouched; only never-committed intermediate paths avoid
-the RocksDB existence checks, writes, and later compaction work.
-The remaining final-record collision checks use one snapshot-bound RocksDB
-multi-get per block instead of crossing the Rust/C++ boundary once per node;
-the atomic staging overlay composes its own puts and deletes over the same
-ordered base result.
+The current network-first coordinator is the safe first stage. The schema-2
+backlog and phase distributions decide whether actor separation is warranted:
+split ownership when coordinator backlog grows during otherwise healthy state
+slices; continue storage optimization when state-commit time dominates without
+backlog.
 
-Multi-name mutation now also prefetches every affected original Urkel path
-breadth-first with bounded snapshot `MultiGet` calls. One activation snapshot
-caches at most 131,072 positive content-addressed node records and 32,768
-present-or-absent materialized `NameState` reads; staged writes and deletes are
-always consulted first, and neither cache survives the snapshot. Resolved
-transaction coins are stored contiguously from input resolution through script,
-covenant, fee, and spend processing instead of cloning the full vector.
+## RocksDB and compaction
 
-On the persistent mainnet canary at heights 70,766--71,154, a 30.004-second
-window committed 388 blocks (12.932 blocks/s) with zero failed or unavailable
-blocks. RSS moved from 864 to 875 MiB. The process issued about 408 read
-syscalls and 1.66 MiB of logical reads per committed block. The earlier
-height-60,331--60,703 window issued about 522 read syscalls and 2.05 MiB per
-block, so the normalized reductions were approximately 22% and 19% while the
-later chain region was denser. An adjacent traced window committed 132 blocks
-in eight seconds and issued about 494 `pread64` calls per block, versus 568 in
-the immediately preceding dense-region build. These cross-height results are
-directional rather than an A/B replay of identical blocks. Stack sampling
-confirmed that recursive point-loaded Urkel traversal, repeated `NameState`
-point reads, and the resolved-coin vector clone were gone; RocksDB `MultiGet`,
-memtable insertion/commit, block decoding, and Urkel allocation remained.
-At 71% of one core, replay was therefore still not cryptography-limited.
+Point-oriented column families share a bounded 192 MiB cache. Raw blocks and
+undo use a separate 32 MiB cache so sequential replay cannot evict hot UTXO,
+name-state, header, and Urkel pages. Bloom filters, cached index/filter blocks,
+bounded WAL retention, and four background jobs constrain read and write
+amplification.
 
-The pre-streaming compactor's height-70,021 run exposed a separate
-deployment-scale defect: it scanned 21,780,645 records, retained 3,058,228,
-deleted 18,722,417, and sampled roughly 3.9 GiB resident plus 1.25 GiB swapped
-(with a transient RSS reading above 5 GiB). It materialized every key/value,
-duplicated every key, and retained every deletion in one batch. The production
-path now validates one batched reachable-root set, performs a key-only
-preflight scan, then streams the stable snapshot and commits unreachable
-deletions in 65,536-key chunks. Only the final completion checkpoint is delayed
-until every chunk succeeds. A crash can leave extra unreachable records but
-cannot delete a validated reachable record; retry is idempotent.
+Name-tree compaction validates the complete retained-root union before deletion,
+performs a key-only preflight, and commits unreachable keys in 65,536-key
+chunks. The completion checkpoint is written last. A crash may leave extra
+unreachable records but cannot delete a validated reachable record; retry is
+idempotent. Cached diagnostic snapshots keep status RPC responsive while the
+state lock is occupied by compaction.
 
-The next live scheduled run completed at height 80,026 over 19,864,432 nodes:
-3,684,694 were retained and 16,179,738 were deleted. Two-second process
-sampling observed a 1,146,448 KiB peak RSS and 118,672 KiB peak swap, roughly a
-77% resident-memory reduction from the old transient reading above 5 GiB.
-The node reported zero failed blocks, wrote the completed checkpoint, and
-resumed replay through height 80,650 during the observation. This qualifies
-the bounded-memory shape on the deployment-scale datastore. A separate real
-RocksDB subprocess test exits immediately after its first synced 64-key delete
-chunk without running Rust destructors; reopen preserves the complete retained
-authenticated tree, observes only a partial garbage deletion, and an
-idempotent retry removes the remainder. Deployment-scale external `SIGKILL`
-and latency-distribution campaigns remain open.
+## Non-negotiable gates
 
-The height-90,000 scheduled run exposed an observability defect distinct from
-memory safety: the state coordinator correctly serialized compaction against
-connect/disconnect, but diagnostic RPC waited behind the same lock for minutes.
-Native sync now binds authenticated RPC before startup replay and captures a
-constant-payload diagnostic snapshot after each committed connect slice and
-immediately before a due compaction. Status, authority, parity, and
-mining-engine diagnostic reads use the live snapshot when the coordinator is
-available or return the cached snapshot immediately with
-`diagnostic_snapshot_cached` and `diagnostic_snapshot_captured_at`. The
-authoritative `getparentauthority` path is never cached and continues to wait
-for a coherent live state. A lock-held HTTP regression requires the cached
-status response to complete within one second. Deployment evidence from a
-production RocksDB compaction remains required.
+Optimization is accepted only with:
 
-Native-sync `getblockhash` is a keyed canonical-height read under the
-coordinator lock. It does not construct the general compatibility RPC snapshot,
-whose complete header/block/transaction/UTXO/name materialization is reserved
-for broad diagnostic methods. This keeps historical probes constant-space and
-prevents a single height lookup from pausing replay.
-
-Unclean startup, first startup after upgrade, and any stale or corrupt audit
-checkpoint perform the exhaustive materialized-name rebuild and the
-depth-sensitive reachable-union traversal of current, committed, and
-interval-pinned Urkel roots. That union traversal submits bounded bulk reads and
-stores one primary depth per unique root, retaining a second path entry only
-when the same content node is reachable at another depth. A clean shutdown
-atomically binds a checksummed audit checkpoint to the exact durable identity.
-When it matches, startup checks the canonical encoding and content hash of every
-retained root record without walking shared descendants or rebuilding the
-materialized name tree, then validates the complete active reorganization/undo
-horizon. Complete historical block, deployment, undo, root-continuity, and
-snapshot-pin-to-chain validation remains mandatory after an unclean start or a
-stale checkpoint; the explicit offline comparison/scrub campaign must cover the
-same history. The process marks the database unclean before either audit starts,
-preventing a crash during startup from preserving an older clean marker.
-
-Production qualification still needs full mainnet IBD on persistent NVMe,
-P50/P95/P99/max storage and compaction latency, loaded-mempool templates,
-candidate-to-first-peer acceptance under WAN load, restart/reorganization
-campaigns, and physical ASIC job-switch measurements.
+- exact UTXO, name-state, Urkel-root, deployment, undo, disconnect, reconnect,
+  and reorganization results;
+- independently generated invalid blocks and transactions rejected at the same
+  rule boundary;
+- no new failed, unavailable, or terminal-error evidence;
+- restart and crash recovery of the exact committed tip;
+- sustained phase/backlog measurements on persistent mainnet storage;
+- template-to-job, candidate-validation, local-connect, and first-peer
+  publication latency distributions;
+- reproducible builds and a reviewed migration and fallback procedure.

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap},
     fmt,
     marker::PhantomData,
@@ -209,15 +209,29 @@ pub trait Store {
 type StagedChanges = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
 type SharedStagedChanges = Rc<RefCell<StagedChanges>>;
 type NameNodeReadCache = HashMap<Vec<u8>, Vec<u8>>;
-type NameStateReadCache = HashMap<Vec<u8>, Option<Vec<u8>>>;
+type StatePointReadCache = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
 /// Bound one active-state transaction's positive cache for content-addressed
 /// name-tree nodes. The cache belongs to a single immutable base snapshot;
 /// staged replacements and deletions are always resolved before it.
 const STAGED_NAME_NODE_READ_CACHE_LIMIT: usize = 131_072;
-/// Bound mutable name-state values read from one immutable base snapshot.
-/// Missing values are cached too; writes in the staging overlay take
-/// precedence, so a later OPEN or other transition cannot be masked.
-const STAGED_NAME_STATE_READ_CACHE_LIMIT: usize = 32_768;
+/// Bound point values read from one immutable active-state base snapshot.
+/// Missing values are cached too. Overlay writes always take precedence, so
+/// caching cannot mask a later mutation in the same atomic transaction.
+const STAGED_STATE_POINT_READ_CACHE_LIMIT: usize = 65_536;
+
+const fn caches_staged_state_point_read(family: ColumnFamily) -> bool {
+    matches!(
+        family,
+        ColumnFamily::Meta
+            | ColumnFamily::Headers
+            | ColumnFamily::HeightIndex
+            | ColumnFamily::BlockIndex
+            | ColumnFamily::TxIndex
+            | ColumnFamily::Utxo
+            | ColumnFamily::NameState
+            | ColumnFamily::Snapshots
+    )
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct StagingOverlay {
@@ -234,7 +248,8 @@ impl StagingOverlay {
             base,
             changes: Rc::clone(&self.changes),
             name_node_reads: RefCell::default(),
-            name_state_reads: RefCell::default(),
+            state_point_reads: RefCell::default(),
+            state_point_read_count: Cell::new(0),
         }
     }
 
@@ -250,7 +265,8 @@ pub struct StagedSnapshot<'a, S: ReadSnapshot> {
     base: &'a S,
     changes: SharedStagedChanges,
     name_node_reads: RefCell<NameNodeReadCache>,
-    name_state_reads: RefCell<NameStateReadCache>,
+    state_point_reads: RefCell<StatePointReadCache>,
+    state_point_read_count: Cell<usize>,
 }
 
 impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
@@ -268,8 +284,13 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
             if let Some(value) = self.name_node_reads.borrow().get(key) {
                 return Ok(Some(value.clone()));
             }
-        } else if family == ColumnFamily::NameState {
-            if let Some(value) = self.name_state_reads.borrow().get(key) {
+        } else if caches_staged_state_point_read(family) {
+            if let Some(value) = self
+                .state_point_reads
+                .borrow()
+                .get(&family)
+                .and_then(|reads| reads.get(key))
+            {
                 return Ok(value.clone());
             }
         }
@@ -281,10 +302,19 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
                     cache.insert(key.to_vec(), value.clone());
                 }
             }
-        } else if family == ColumnFamily::NameState {
-            let mut cache = self.name_state_reads.borrow_mut();
-            if cache.len() < STAGED_NAME_STATE_READ_CACHE_LIMIT {
-                cache.insert(key.to_vec(), value.clone());
+        } else if caches_staged_state_point_read(family)
+            && self.state_point_read_count.get() < STAGED_STATE_POINT_READ_CACHE_LIMIT
+        {
+            let inserted = self
+                .state_point_reads
+                .borrow_mut()
+                .entry(family)
+                .or_default()
+                .insert(key.to_vec(), value.clone())
+                .is_none();
+            if inserted {
+                self.state_point_read_count
+                    .set(self.state_point_read_count.get().saturating_add(1));
             }
         }
         Ok(value)
@@ -298,7 +328,7 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
         let resolved = {
             let changes = self.changes.borrow();
             let name_node_reads = self.name_node_reads.borrow();
-            let name_state_reads = self.name_state_reads.borrow();
+            let state_point_reads = self.state_point_reads.borrow();
             keys.iter()
                 .map(|key| {
                     let staged = changes
@@ -311,8 +341,11 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
                     if family == ColumnFamily::NameTreeNodes {
                         return name_node_reads.get(*key).cloned().map(Some);
                     }
-                    if family == ColumnFamily::NameState {
-                        return name_state_reads.get(*key).cloned();
+                    if caches_staged_state_point_read(family) {
+                        return state_point_reads
+                            .get(&family)
+                            .and_then(|reads| reads.get(*key))
+                            .cloned();
                     }
                     None
                 })
@@ -353,10 +386,19 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
                                 cache.insert(key.to_vec(), value.clone());
                             }
                         }
-                    } else if family == ColumnFamily::NameState {
-                        let mut cache = self.name_state_reads.borrow_mut();
-                        if cache.len() < STAGED_NAME_STATE_READ_CACHE_LIMIT {
-                            cache.insert(key.to_vec(), value.clone());
+                    } else if caches_staged_state_point_read(family)
+                        && self.state_point_read_count.get() < STAGED_STATE_POINT_READ_CACHE_LIMIT
+                    {
+                        let inserted = self
+                            .state_point_reads
+                            .borrow_mut()
+                            .entry(family)
+                            .or_default()
+                            .insert(key.to_vec(), value.clone())
+                            .is_none();
+                        if inserted {
+                            self.state_point_read_count
+                                .set(self.state_point_read_count.get().saturating_add(1));
                         }
                     }
                     values.push(value);
@@ -1461,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn staging_overlay_caches_name_nodes_and_snapshot_name_state() {
+    fn staging_overlay_caches_name_nodes_and_active_state_point_reads() {
         let store = MemoryStore::new();
         let mut initial = store.batch();
         initial
@@ -1473,6 +1515,9 @@ mod tests {
         initial
             .put(ColumnFamily::Headers, b"header", b"value")
             .expect("put header");
+        initial
+            .put(ColumnFamily::Utxo, b"coin-present", b"coin")
+            .expect("put coin");
         initial
             .put(ColumnFamily::NameState, b"name-present", b"old-state")
             .expect("put name state");
@@ -1574,11 +1619,27 @@ mod tests {
             assert_eq!(
                 staged_snapshot
                     .get(ColumnFamily::Headers, b"header")
-                    .expect("uncached header get"),
+                    .expect("cached header get"),
                 Some(b"value".to_vec())
             );
+            assert_eq!(
+                staged_snapshot
+                    .get(ColumnFamily::Utxo, b"coin-present")
+                    .expect("cached present coin"),
+                Some(b"coin".to_vec())
+            );
+            assert_eq!(
+                staged_snapshot
+                    .get(ColumnFamily::Utxo, b"coin-absent")
+                    .expect("cached absent coin"),
+                None
+            );
         }
-        assert_eq!(base.gets.get(), 4);
+        assert_eq!(
+            base.gets.get(),
+            5,
+            "each immutable point value, including misses, must reach the base once"
+        );
     }
 
     #[test]
