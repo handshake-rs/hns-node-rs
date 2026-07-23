@@ -40,8 +40,8 @@ use hns_store::{mark_clean_shutdown, ColumnFamily, ReadSnapshot, Store, StoreHan
 use hns_sync::{
     spawn_validation_pipeline, BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult,
     OrphanLimits, OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction,
-    SyncCheckpoint, SyncLimits, SyncScheduler, SyncSnapshot, ValidationFailureKind,
-    ValidationRejection, ValidationRequest, ValidationSubmitter,
+    SyncCheckpoint, SyncLimits, SyncScheduler, SyncSnapshot, ValidatedBlock, ValidationFailure,
+    ValidationFailureKind, ValidationRejection, ValidationRequest, ValidationSubmitter,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -97,6 +97,7 @@ const MIN_ADDR_TIMESTAMP: u64 = 100_000_000;
 const MAX_SHADOW_SYNC_PEERS: usize = 256;
 const MAX_SHADOW_SYNC_VALIDATION_WORKERS: usize = 128;
 const MAX_SHADOW_SYNC_VALIDATION_QUEUE: usize = 8_192;
+const MAX_VALIDATED_BODY_COMMIT_BATCH: usize = 32;
 const MAX_SHADOW_SYNC_ORPHAN_BLOCKS: usize = 8_192;
 const MAX_SHADOW_SYNC_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
@@ -439,6 +440,9 @@ pub struct ShadowSyncDiagnostics {
     pub served_compact_blocks: u64,
     pub served_block_transactions: u64,
     pub started_at: u64,
+    /// Monotonic process-lifetime totals, including disconnected peers.
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
     pub peers: Vec<PeerSnapshot>,
     pub sync: SyncSnapshot,
     pub orphans: OrphanSnapshot,
@@ -1859,7 +1863,7 @@ impl NodeService {
                         )
                         .await
                         {
-                            record_error(&diagnostics, format!("{error:#}")).await;
+                            record_warning(format!("{error:#}"));
                         }
                     }
                     refresh_diagnostics(
@@ -1933,7 +1937,7 @@ impl NodeService {
                         break;
                     };
                     if let Err(error) = handled {
-                        record_error(&diagnostics, format!("{error:#}")).await;
+                        record_warning(format!("{error:#}"));
                     }
                     if shadow_sync_config.discovery {
                         fill_discovery_slots(
@@ -1966,8 +1970,16 @@ impl NodeService {
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
                     };
-                    let validation_result = handle_validation_result(
-                        result,
+                    let mut results = Vec::with_capacity(MAX_VALIDATED_BODY_COMMIT_BATCH);
+                    results.push(result);
+                    while results.len() < MAX_VALIDATED_BODY_COMMIT_BATCH {
+                        match validated.try_recv() {
+                            Ok(result) => results.push(result),
+                            Err(_) => break,
+                        }
+                    }
+                    let validation_result = handle_validation_results(
+                        results,
                         &node,
                         &peers,
                         &validation,
@@ -1977,7 +1989,7 @@ impl NodeService {
                     )
                     .await;
                     if let Err(error) = &validation_result {
-                        record_error(&diagnostics, format!("{error:#}")).await;
+                        record_warning(format!("{error:#}"));
                     }
                     // A newly durable body can close an earlier download gap.
                     // Connect immediately instead of waiting for the periodic
@@ -2408,20 +2420,31 @@ impl NodeService {
             .map_err(|error| anyhow::anyhow!("failed to load block: {error}"))
     }
 
-    fn shadow_sync_store_shadow_block(
+    fn shadow_sync_store_validated_blocks(
         &mut self,
-        block: Block,
-        height: Height,
-        canonical: bool,
-    ) -> Result<BlockIndexRecord> {
-        let request = NodeBlockImport::from_peer(block, height);
-        let validated = if canonical {
-            self.state.validate_canonical_shadow_import(&request)?
-        } else {
-            self.state.validate_import(&request)?
-        };
-        let stored = self.state.store_validated_alternate(request, validated)?;
-        Ok(stored.record)
+        blocks: Vec<(ValidatedBlock, bool)>,
+    ) -> Result<Vec<BlockIndexRecord>> {
+        let mut candidates = Vec::with_capacity(blocks.len());
+        for (validated, canonical) in blocks {
+            let stateless = super::StatelessBodyValidation::for_block(
+                &validated.block,
+                validated.height,
+                self.config.network,
+            );
+            let request = NodeBlockImport::from_peer(validated.block, validated.height);
+            let import = self
+                .state
+                .validate_prevalidated_shadow_import(&request, canonical, stateless)?;
+            candidates.push((request, import));
+        }
+        self.state
+            .store_validated_alternates(candidates)
+            .map(|mutations| {
+                mutations
+                    .into_iter()
+                    .map(|mutation| mutation.record)
+                    .collect()
+            })
     }
 
     fn shadow_sync_store_failed_block(
@@ -4214,8 +4237,8 @@ async fn submit_released_orphans(
     Ok(())
 }
 
-async fn handle_validation_result(
-    result: OrderedValidationResult,
+async fn handle_validation_results(
+    results: Vec<OrderedValidationResult>,
     node: &Arc<Mutex<NodeService>>,
     peers: &LivePeerManager,
     validation: &ValidationSubmitter,
@@ -4223,166 +4246,240 @@ async fn handle_validation_result(
     orphans: &mut BoundedOrphanPool,
     diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
 ) -> Result<()> {
-    match result {
-        Ok(validated) => {
-            let hash = validated.block.hash();
-            let (parent_available, canonical) = {
-                let node = node.lock().await;
-                (
-                    validated.block.header == node.config.network.params().genesis_header()
-                        || node.shadow_sync_has_block(&validated.block.header.prev_block)?,
-                    node.shadow_sync_is_canonical_header(hash, validated.height)?,
-                )
-            };
-            if !parent_available && !canonical {
-                let outcome = match orphans.insert_with_evictions(validated.block) {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        scheduler
-                            .requeue_tracked_block(hash, validated.height)
-                            .context("failed to requeue unretained validated orphan")?;
-                        return Err(anyhow::anyhow!(
-                            "failed to retain validated orphan: {error}"
-                        ));
-                    }
-                };
-                for evicted in outcome.evicted {
-                    let evicted_hash = evicted.hash();
-                    let node = node.lock().await;
-                    if let Some(record) = node.shadow_sync_header_record(&evicted_hash)? {
-                        if !node.shadow_sync_has_block(&evicted_hash)? {
-                            scheduler
-                                .requeue_tracked_block(evicted_hash, record.height)
-                                .context("failed to requeue evicted orphan body")?;
-                        }
-                    }
-                }
-                scheduler.complete_orphan_validation();
-                return Ok(());
-            }
+    let mut validated = Vec::new();
+    let mut first_failure = None;
 
-            // Canonical header ancestry is already independently validated and
-            // `store_shadow_block` deliberately writes a non-active record. It
-            // therefore does not need the parent body: retaining it immediately
-            // makes an out-of-order download window restart-durable, while the
-            // contiguous stored tip and active-state connector remain pinned at
-            // the first missing body. Non-canonical descendants still use the
-            // bounded in-memory orphan pool above.
-            let stored = {
-                let mut node = node.lock().await;
-                node.shadow_sync_store_shadow_block(validated.block, validated.height, canonical)?
-            };
-            scheduler.complete_block(hash);
-            {
-                let node = node.lock().await;
-                let stored_tip = node.shadow_sync_contiguous_body_tip(scheduler.stored_tip())?;
-                if scheduler.stored_tip() != stored_tip.as_ref() {
-                    scheduler.set_stored_tip(stored_tip);
+    for result in results {
+        match result {
+            Ok(block) => validated.push(block),
+            Err(failure) => {
+                if !validated.is_empty() {
+                    handle_validated_blocks(
+                        std::mem::take(&mut validated),
+                        node,
+                        validation,
+                        scheduler,
+                        orphans,
+                        diagnostics,
+                    )
+                    .await?;
                 }
-                node.shadow_sync_queue_missing_canonical_bodies(scheduler)?;
+                if let Err(error) =
+                    handle_validation_failure(failure, node, peers, scheduler, orphans, diagnostics)
+                        .await
+                {
+                    first_failure.get_or_insert(error);
+                }
             }
-            update_diagnostics(diagnostics, |state| {
-                state.stored_bodies = state.stored_bodies.saturating_add(1);
-            })
-            .await;
-            submit_released_orphans(stored.hash, node, validation, scheduler, orphans).await?;
         }
-        Err(failure) => {
-            let hash = failure.block.hash();
-            match failure.kind {
-                ValidationFailureKind::WorkerFailure => {
-                    scheduler.retry_validation_failure(
-                        hash,
-                        failure.height,
-                        failure.attempt,
-                        None,
-                        StdInstant::now(),
-                    );
-                    anyhow::bail!(
-                        "stateless block validation worker failed at {}: {}",
-                        failure.height,
-                        failure.reason
-                    );
-                }
-                ValidationFailureKind::InvalidResponse => {
-                    scheduler.retry_validation_failure(
-                        hash,
-                        failure.height,
-                        failure.attempt,
-                        (failure.peer != LOCAL_ORPHAN_PEER).then_some(failure.peer),
-                        StdInstant::now(),
-                    );
-                    if failure.peer != LOCAL_ORPHAN_PEER {
-                        penalize_peer(
-                            peers,
-                            failure.peer,
-                            100,
-                            "block body did not match its header",
-                        )
-                        .await?;
-                    }
-                    update_diagnostics(diagnostics, |state| {
-                        state.rejected_messages = state.rejected_messages.saturating_add(1);
-                    })
-                    .await;
-                    anyhow::bail!(
-                        "peer body response failed header commitments at {}: {}",
-                        failure.height,
-                        failure.reason
-                    );
-                }
-                ValidationFailureKind::InvalidBlock => {}
-            }
+    }
 
-            let stored = {
-                let mut node = node.lock().await;
-                node.shadow_sync_store_failed_block(failure.block, failure.height)
-            };
-            let stored = match stored {
-                Ok(stored) => stored,
-                Err(error) => {
-                    scheduler.retry_validation_failure(
-                        hash,
-                        failure.height,
-                        failure.attempt,
-                        (failure.peer != LOCAL_ORPHAN_PEER).then_some(failure.peer),
-                        StdInstant::now(),
-                    );
-                    return Err(error.context("failed to persist invalid block branch"));
-                }
-            };
-            for affected in &stored.affected {
-                scheduler.reject_block(
-                    (*affected == hash).then_some(failure.peer),
-                    *affected,
-                    false,
-                    StdInstant::now(),
-                );
+    if !validated.is_empty() {
+        handle_validated_blocks(validated, node, validation, scheduler, orphans, diagnostics)
+            .await?;
+    }
+
+    match first_failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn handle_validated_blocks(
+    validated: Vec<ValidatedBlock>,
+    node: &Arc<Mutex<NodeService>>,
+    validation: &ValidationSubmitter,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut BoundedOrphanPool,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) -> Result<()> {
+    let mut eligible = Vec::with_capacity(validated.len());
+    for validated in validated {
+        let hash = validated.block.hash();
+        let (parent_available, canonical) = {
+            let node = node.lock().await;
+            (
+                validated.block.header == node.config.network.params().genesis_header()
+                    || node.shadow_sync_has_block(&validated.block.header.prev_block)?,
+                node.shadow_sync_is_canonical_header(hash, validated.height)?,
+            )
+        };
+        if parent_available || canonical {
+            eligible.push((validated, canonical));
+            continue;
+        }
+
+        let outcome = match orphans.insert_with_evictions(validated.block) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                scheduler
+                    .requeue_tracked_block(hash, validated.height)
+                    .context("failed to requeue unretained validated orphan")?;
+                return Err(anyhow::anyhow!(
+                    "failed to retain validated orphan: {error}"
+                ));
             }
-            discard_orphan_descendants(hash, orphans);
+        };
+        for evicted in outcome.evicted {
+            let evicted_hash = evicted.hash();
+            let node = node.lock().await;
+            if let Some(record) = node.shadow_sync_header_record(&evicted_hash)? {
+                if !node.shadow_sync_has_block(&evicted_hash)? {
+                    scheduler
+                        .requeue_tracked_block(evicted_hash, record.height)
+                        .context("failed to requeue evicted orphan body")?;
+                }
+            }
+        }
+        scheduler.complete_orphan_validation();
+    }
+
+    if eligible.is_empty() {
+        return Ok(());
+    }
+
+    // Canonical header ancestry is independently validated. Persist all
+    // available worker-validated bodies in one atomic transaction, then move
+    // scheduler state as a group. A crash can expose either none or all of the
+    // records, never a partially acknowledged validation batch.
+    let expected = eligible
+        .iter()
+        .map(|(validated, _)| validated.block.hash())
+        .collect::<Vec<_>>();
+    let stored = {
+        let mut node = node.lock().await;
+        node.shadow_sync_store_validated_blocks(eligible)?
+    };
+    if stored.len() != expected.len()
+        || stored
+            .iter()
+            .zip(&expected)
+            .any(|(record, hash)| record.hash != *hash)
+    {
+        anyhow::bail!("durable validated-body batch result is not input-order exact");
+    }
+    for hash in &expected {
+        scheduler.complete_block(*hash);
+    }
+    {
+        let node = node.lock().await;
+        let stored_tip = node.shadow_sync_contiguous_body_tip(scheduler.stored_tip())?;
+        if scheduler.stored_tip() != stored_tip.as_ref() {
+            scheduler.set_stored_tip(stored_tip);
+        }
+        node.shadow_sync_queue_missing_canonical_bodies(scheduler)?;
+    }
+    let stored_count = u64::try_from(stored.len()).unwrap_or(u64::MAX);
+    update_diagnostics(diagnostics, |state| {
+        state.stored_bodies = state.stored_bodies.saturating_add(stored_count);
+    })
+    .await;
+    for record in stored {
+        submit_released_orphans(record.hash, node, validation, scheduler, orphans).await?;
+    }
+    Ok(())
+}
+
+async fn handle_validation_failure(
+    failure: ValidationFailure,
+    node: &Arc<Mutex<NodeService>>,
+    peers: &LivePeerManager,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut BoundedOrphanPool,
+    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+) -> Result<()> {
+    let hash = failure.block.hash();
+    match failure.kind {
+        ValidationFailureKind::WorkerFailure => {
+            scheduler.retry_validation_failure(
+                hash,
+                failure.height,
+                failure.attempt,
+                None,
+                StdInstant::now(),
+            );
+            anyhow::bail!(
+                "stateless block validation worker failed at {}: {}",
+                failure.height,
+                failure.reason
+            );
+        }
+        ValidationFailureKind::InvalidResponse => {
+            scheduler.retry_validation_failure(
+                hash,
+                failure.height,
+                failure.attempt,
+                (failure.peer != LOCAL_ORPHAN_PEER).then_some(failure.peer),
+                StdInstant::now(),
+            );
             if failure.peer != LOCAL_ORPHAN_PEER {
                 penalize_peer(
                     peers,
                     failure.peer,
                     100,
-                    "stateless block validation failed",
+                    "block body did not match its header",
                 )
                 .await?;
             }
             update_diagnostics(diagnostics, |state| {
                 state.rejected_messages = state.rejected_messages.saturating_add(1);
-                state.stored_failed_bodies = state.stored_failed_bodies.saturating_add(1);
             })
             .await;
             anyhow::bail!(
-                "stateless block validation failed and block {} was durably marked failed at {}: {}",
-                stored.record.hash.to_hex(),
+                "peer body response failed header commitments at {}: {}",
                 failure.height,
                 failure.reason
             );
         }
+        ValidationFailureKind::InvalidBlock => {}
     }
-    Ok(())
+
+    let stored = {
+        let mut node = node.lock().await;
+        node.shadow_sync_store_failed_block(failure.block, failure.height)
+    };
+    let stored = match stored {
+        Ok(stored) => stored,
+        Err(error) => {
+            scheduler.retry_validation_failure(
+                hash,
+                failure.height,
+                failure.attempt,
+                (failure.peer != LOCAL_ORPHAN_PEER).then_some(failure.peer),
+                StdInstant::now(),
+            );
+            return Err(error.context("failed to persist invalid block branch"));
+        }
+    };
+    for affected in &stored.affected {
+        scheduler.reject_block(
+            (*affected == hash).then_some(failure.peer),
+            *affected,
+            false,
+            StdInstant::now(),
+        );
+    }
+    discard_orphan_descendants(hash, orphans);
+    if failure.peer != LOCAL_ORPHAN_PEER {
+        penalize_peer(
+            peers,
+            failure.peer,
+            100,
+            "stateless block validation failed",
+        )
+        .await?;
+    }
+    update_diagnostics(diagnostics, |state| {
+        state.rejected_messages = state.rejected_messages.saturating_add(1);
+        state.stored_failed_bodies = state.stored_failed_bodies.saturating_add(1);
+    })
+    .await;
+    anyhow::bail!(
+        "stateless block validation failed and block {} was durably marked failed at {}: {}",
+        stored.record.hash.to_hex(),
+        failure.height,
+        failure.reason
+    );
 }
 
 pub(super) async fn connect_stored_active_state(
@@ -4825,11 +4922,7 @@ async fn handle_connect_attempt_result(
         Err(error) => {
             note_reconnect_failure(result.address, reconnects, Instant::now());
             if persistent {
-                record_error(
-                    diagnostics,
-                    format!("outbound peer {} failed: {error}", result.address),
-                )
-                .await;
+                record_warning(format!("outbound peer {} failed: {error}", result.address));
             } else {
                 update_diagnostics(diagnostics, |state| {
                     state.discovery_connection_failures =
@@ -4855,8 +4948,11 @@ async fn refresh_diagnostics(
     pending_compact_blocks: &HashMap<BlockHash, PendingCompactBlock>,
     checkpoint_sequence: u64,
 ) {
+    let traffic = peers.traffic_totals().await;
     let snapshots = peers.snapshots().await;
     let mut state = diagnostics.write().await;
+    state.bytes_sent = traffic.bytes_sent;
+    state.bytes_received = traffic.bytes_received;
     state.peers = snapshots;
     state.sync = scheduler.snapshot();
     state.orphans = orphans.snapshot();
@@ -5031,6 +5127,10 @@ where
 async fn record_error(diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>, error: String) {
     tracing::warn!(%error, "Native sync runtime error");
     update_diagnostics(diagnostics, |state| state.last_error = Some(error)).await;
+}
+
+fn record_warning(warning: String) {
+    tracing::warn!(%warning, "Native sync peer/runtime warning");
 }
 
 async fn await_task(name: &str, task: JoinHandle<Result<()>>) -> Result<()> {
@@ -6152,13 +6252,13 @@ mod tests {
         .expect("orphan pool");
         let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
 
-        handle_validation_result(
-            Ok(hns_sync::ValidatedBlock {
+        handle_validation_results(
+            vec![Ok(hns_sync::ValidatedBlock {
                 sequence: 0,
                 peer: PeerId(1),
                 height: 2,
                 block: second,
-            }),
+            })],
             &node,
             &peers,
             &validation,
@@ -6185,6 +6285,92 @@ mod tests {
         assert!(!scheduler.is_tracked_block(&second_hash));
         assert_eq!(orphans.snapshot().blocks, 0);
         assert_eq!(diagnostics.read().await.stored_bodies, 1);
+    }
+
+    #[test]
+    fn validated_body_batch_is_all_or_nothing_before_durable_commit() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            shadow_sync: ShadowSyncConfig {
+                enabled: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..ShadowSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis");
+        let first = linked_validator_block(1, &genesis.header);
+        let second = linked_validator_block(2, &first.header);
+        let first_hash = first.hash();
+        let second_hash = second.hash();
+        service
+            .shadow_sync_import_headers(vec![first.header.clone(), second.header.clone()])
+            .expect("canonical headers");
+
+        let invalid_batch = vec![
+            (
+                ValidatedBlock {
+                    sequence: 0,
+                    peer: PeerId(1),
+                    height: 1,
+                    block: first.clone(),
+                },
+                true,
+            ),
+            (
+                ValidatedBlock {
+                    sequence: 1,
+                    peer: PeerId(1),
+                    height: 3,
+                    block: second.clone(),
+                },
+                true,
+            ),
+        ];
+        service
+            .shadow_sync_store_validated_blocks(invalid_batch)
+            .expect_err("one mismatched member rejects the complete batch");
+        assert!(!service
+            .shadow_sync_has_block(&first_hash)
+            .expect("first body after rejected batch"));
+        assert!(!service
+            .shadow_sync_has_block(&second_hash)
+            .expect("second body after rejected batch"));
+
+        let stored = service
+            .shadow_sync_store_validated_blocks(vec![
+                (
+                    ValidatedBlock {
+                        sequence: 0,
+                        peer: PeerId(1),
+                        height: 1,
+                        block: first,
+                    },
+                    true,
+                ),
+                (
+                    ValidatedBlock {
+                        sequence: 1,
+                        peer: PeerId(1),
+                        height: 2,
+                        block: second,
+                    },
+                    true,
+                ),
+            ])
+            .expect("valid body batch");
+        assert_eq!(
+            stored.iter().map(|record| record.hash).collect::<Vec<_>>(),
+            vec![first_hash, second_hash]
+        );
+        assert!(service
+            .shadow_sync_has_block(&first_hash)
+            .expect("first stored body"));
+        assert!(service
+            .shadow_sync_has_block(&second_hash)
+            .expect("second stored body"));
     }
 
     #[cfg(feature = "rocksdb-backend")]
@@ -6222,7 +6408,15 @@ mod tests {
                 .shadow_sync_import_headers(vec![first.header.clone(), second.header.clone()])
                 .expect("canonical headers");
             service
-                .shadow_sync_store_shadow_block(second, 2, true)
+                .shadow_sync_store_validated_blocks(vec![(
+                    ValidatedBlock {
+                        sequence: 0,
+                        peer: PeerId(1),
+                        height: 2,
+                        block: second,
+                    },
+                    true,
+                )])
                 .expect("store out-of-order canonical body");
             mark_clean_shutdown(&service.state.store).expect("clean first shutdown");
         }

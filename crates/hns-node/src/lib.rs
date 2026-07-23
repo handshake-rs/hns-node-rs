@@ -64,7 +64,7 @@ use hns_rpc::{
 use hns_state::{
     connect_block_to_batch_with_services, decode_coin, decode_name_state,
     disconnect_block_to_batch, load_name_tree_snapshot_pins, load_stored_name_tree_commit_root,
-    stage_name_tree_node_compaction, validate_persisted_name_tree, verify_stored_name_tree_root,
+    stage_name_tree_node_compaction, validate_persisted_name_trees, verify_stored_name_tree_root,
     AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock,
     NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine,
 };
@@ -1603,6 +1603,41 @@ struct ValidatedImport {
     historical_validation: HistoricalValidationPlan,
 }
 
+/// In-process evidence that the bounded native-sync validation pipeline has
+/// already completed every context-independent body check for this exact
+/// block and height. The type is private to the node crate so an RPC/P2P
+/// caller cannot manufacture the fast-path capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StatelessBodyValidation {
+    hash: BlockHash,
+    height: Height,
+    body_sanity_validated: bool,
+}
+
+impl StatelessBodyValidation {
+    fn for_block(block: &Block, height: Height, network: Network) -> Self {
+        Self {
+            hash: block.hash(),
+            height,
+            body_sanity_validated: !hns_consensus::is_hsd_historical_block(network, true, height),
+        }
+    }
+
+    fn verify(self, request: &NodeBlockImport) -> Result<()> {
+        if !matches!(request.validation, ImportValidationPolicy::Strict) {
+            anyhow::bail!("stateless body evidence requires strict block validation");
+        }
+        if self.height != request.height || self.hash != request.block.hash() {
+            anyhow::bail!("stateless body evidence does not match the imported block");
+        }
+        Ok(())
+    }
+
+    const fn covers(self, plan: HistoricalValidationPlan) -> bool {
+        !plan.body_sanity || self.body_sanity_validated
+    }
+}
+
 #[derive(Clone, Debug)]
 struct NodeBlockMutation {
     record: BlockIndexRecord,
@@ -1759,16 +1794,10 @@ impl NodeState {
         }
         let durable_name_tree_root = verify_stored_name_tree_root(&snapshot)
             .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?;
-        validate_persisted_name_tree(&snapshot, durable_name_tree_root).map_err(|error| {
-            anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
-        })?;
         let durable_name_tree_commit_root =
             load_stored_name_tree_commit_root(&snapshot).map_err(|error| {
                 anyhow::anyhow!("durable name-tree commit invariant failed: {error}")
             })?;
-        validate_persisted_name_tree(&snapshot, durable_name_tree_commit_root).map_err(
-            |error| anyhow::anyhow!("durable committed name-tree invariant failed: {error}"),
-        )?;
         let active_tip = best_block_tip_from_snapshot(&snapshot)?;
         let best_header = best_header_tip_from_snapshot(&snapshot)?;
         let undo_pruning_checkpoint = load_undo_pruning_checkpoint(&snapshot)?;
@@ -1794,6 +1823,15 @@ impl NodeState {
         if name_tree_pins.len() != pin_count {
             anyhow::bail!("durable name-tree snapshot pins contain duplicate heights");
         }
+        validate_persisted_name_trees(
+            &snapshot,
+            [durable_name_tree_root, durable_name_tree_commit_root]
+                .into_iter()
+                .chain(name_tree_pins.values().map(|pin| pin.root)),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
+        })?;
 
         match active_tip.as_ref() {
             None if !heights.is_empty() => {
@@ -2077,11 +2115,6 @@ impl NodeState {
                                 "active interval height {height} has an inconsistent name-tree snapshot pin"
                             );
                         }
-                        validate_persisted_name_tree(&snapshot, pin.root).map_err(|error| {
-                            anyhow::anyhow!(
-                                "durable name-tree snapshot at height {height} is invalid: {error}"
-                            )
-                        })?;
                     }
                     previous_hash = hash;
                     previous_work = record.chainwork;
@@ -2326,63 +2359,95 @@ impl NodeState {
         request: NodeBlockImport,
         validated: ValidatedImport,
     ) -> Result<StoredBlockMutation> {
-        let block_hash = request.block.hash();
-        let snapshot = self.store.snapshot()?;
+        self.store_validated_alternates(vec![(request, validated)])?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("single alternate-body store returned no result"))
+    }
 
-        if let Some(existing) = load_block_index_record(&snapshot, &block_hash)? {
-            let stored = load_block(&snapshot, &block_hash)?.ok_or_else(|| {
-                anyhow::anyhow!("known block {} has no raw body", block_hash.to_hex())
-            })?;
-            if stored.encode() != request.block.encode() {
-                anyhow::bail!(
-                    "known block {} has conflicting raw bytes",
-                    block_hash.to_hex()
-                );
+    /// Commit a group of independently body-validated blocks in one durable
+    /// transaction. The overlay preserves read-your-writes behavior for a
+    /// duplicate hash or best-header update inside the group; scheduler state
+    /// is advanced only after this complete transaction returns successfully.
+    fn store_validated_alternates(
+        &mut self,
+        candidates: Vec<(NodeBlockImport, ValidatedImport)>,
+    ) -> Result<Vec<StoredBlockMutation>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let base = self.store.snapshot()?;
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&base);
+        let mut batch = overlay.batch(self.store.batch());
+        let mut mutations = Vec::with_capacity(candidates.len());
+        let mut committed_records = Vec::with_capacity(candidates.len());
+
+        for (request, validated) in candidates {
+            let block_hash = request.block.hash();
+            if let Some(existing) = load_block_index_record(&staged, &block_hash)? {
+                let stored = load_block(&staged, &block_hash)?.ok_or_else(|| {
+                    anyhow::anyhow!("known block {} has no raw body", block_hash.to_hex())
+                })?;
+                if stored.encode() != request.block.encode() {
+                    anyhow::bail!(
+                        "known block {} has conflicting raw bytes",
+                        block_hash.to_hex()
+                    );
+                }
+                mutations.push(StoredBlockMutation {
+                    record: existing,
+                    already_known: true,
+                });
+                continue;
             }
-            return Ok(StoredBlockMutation {
-                record: existing,
-                already_known: true,
+
+            let mut status = validated.status;
+            status.utxo_connected = false;
+            status.name_state_connected = false;
+            status.tree_root_valid = false;
+            status.undo_present = false;
+            status.active_chain = false;
+
+            let mut record =
+                BlockIndexRecord::from_block(&request.block, request.height, validated.chainwork)
+                    .map_err(|error| {
+                    anyhow::anyhow!("failed to build alternate block index: {error}")
+                })?;
+            record.status = status.clone();
+            record.validated_at = Some(current_unix_time()?);
+            let header_record = HeaderRecord {
+                hash: block_hash,
+                height: request.height,
+                chainwork: validated.chainwork,
+                header: request.block.header.clone(),
+                status,
+            };
+            let raw_record = RawBlockRecord::from_block(&request.block, request.source);
+            write_record_to_batch(&mut batch, &header_record)
+                .map_err(|error| anyhow::anyhow!("failed to stage alternate header: {error}"))?;
+            write_block_index_to_batch(&mut batch, &record).map_err(|error| {
+                anyhow::anyhow!("failed to stage alternate block index: {error}")
+            })?;
+            write_raw_block_to_batch(&mut batch, &raw_record).map_err(|error| {
+                anyhow::anyhow!("failed to stage alternate block body: {error}")
+            })?;
+            stage_best_header_if_more_work(&staged, &mut batch, block_hash, validated.chainwork)?;
+            committed_records.push(record.clone());
+            mutations.push(StoredBlockMutation {
+                record,
+                already_known: false,
             });
         }
 
-        let mut status = validated.status;
-        status.utxo_connected = false;
-        status.name_state_connected = false;
-        status.tree_root_valid = false;
-        status.undo_present = false;
-        status.active_chain = false;
-
-        let mut record =
-            BlockIndexRecord::from_block(&request.block, request.height, validated.chainwork)
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to build alternate block index: {error}")
-                })?;
-        record.status = status.clone();
-        record.validated_at = Some(current_unix_time()?);
-        let header_record = HeaderRecord {
-            hash: block_hash,
-            height: request.height,
-            chainwork: validated.chainwork,
-            header: request.block.header.clone(),
-            status,
-        };
-        let raw_record = RawBlockRecord::from_block(&request.block, request.source);
-        let mut batch = self.store.batch();
-        write_record_to_batch(&mut batch, &header_record)
-            .map_err(|error| anyhow::anyhow!("failed to stage alternate header: {error}"))?;
-        write_block_index_to_batch(&mut batch, &record)
-            .map_err(|error| anyhow::anyhow!("failed to stage alternate block index: {error}"))?;
-        write_raw_block_to_batch(&mut batch, &raw_record)
-            .map_err(|error| anyhow::anyhow!("failed to stage alternate block body: {error}"))?;
-        stage_best_header_if_more_work(&snapshot, &mut batch, block_hash, validated.chainwork)?;
-        drop(snapshot);
-        self.store.commit(batch)?;
-        self.cache_committed_block_records(std::slice::from_ref(&record))?;
-
-        Ok(StoredBlockMutation {
-            record,
-            already_known: false,
-        })
+        let batch = batch.into_inner();
+        drop(staged);
+        drop(base);
+        if !committed_records.is_empty() {
+            self.store.commit(batch)?;
+            self.cache_committed_block_records(&committed_records)?;
+        }
+        Ok(mutations)
     }
 
     fn store_failed_block(
@@ -2609,25 +2674,27 @@ impl NodeState {
     /// durable even when network delivery has not supplied its parent body.
     /// Active connection still uses `validate_import` and therefore requires
     /// the complete parent block/index chain.
-    fn validate_canonical_shadow_import(
+    fn validate_prevalidated_shadow_import(
         &self,
         request: &NodeBlockImport,
+        canonical: bool,
+        stateless: StatelessBodyValidation,
     ) -> Result<ValidatedImport> {
-        let hash = request.block.hash();
-        if self
-            .chain
-            .canonical_hash(request.height)
-            .map_err(|error| anyhow::anyhow!("failed to read canonical shadow header: {error}"))?
-            != Some(hash)
-        {
-            anyhow::bail!(
-                "shadow body {} is not the canonical header at height {}",
-                hash.to_hex(),
-                request.height
-            );
+        if canonical {
+            let hash = request.block.hash();
+            if self.chain.canonical_hash(request.height).map_err(|error| {
+                anyhow::anyhow!("failed to read canonical shadow header: {error}")
+            })? != Some(hash)
+            {
+                anyhow::bail!(
+                    "shadow body {} is not the canonical header at height {}",
+                    hash.to_hex(),
+                    request.height
+                );
+            }
         }
         let snapshot = self.store.snapshot()?;
-        self.validate_import_against_policy(&snapshot, request, false)
+        self.validate_import_against_policy(&snapshot, request, !canonical, Some(stateless))
     }
 
     /// Preflight only the context-independent portion represented by the
@@ -2683,7 +2750,7 @@ impl NodeState {
         snapshot: &T,
         request: &NodeBlockImport,
     ) -> Result<ValidatedImport> {
-        self.validate_import_against_policy(snapshot, request, true)
+        self.validate_import_against_policy(snapshot, request, true, None)
     }
 
     fn validate_import_against_policy<T: ReadSnapshot>(
@@ -2691,7 +2758,11 @@ impl NodeState {
         snapshot: &T,
         request: &NodeBlockImport,
         require_parent_body: bool,
+        stateless: Option<StatelessBodyValidation>,
     ) -> Result<ValidatedImport> {
+        if let Some(stateless) = stateless {
+            stateless.verify(request)?;
+        }
         let parent = if request.height == 0 {
             None
         } else {
@@ -2757,7 +2828,7 @@ impl NodeState {
         };
 
         let strict = matches!(request.validation, ImportValidationPolicy::Strict);
-        if strict {
+        if strict && stateless.is_none() {
             validate_transaction_start(&request.block, request.height, self.network)
                 .map_err(|error| anyhow::anyhow!("transaction-start validation failed: {error}"))?;
         }
@@ -2773,7 +2844,9 @@ impl NodeState {
             request.block.hash(),
             &status,
         )?;
-        self.validate_block_body_for_plan(&request.block, historical_validation)?;
+        if stateless.is_none_or(|proof| !proof.covers(historical_validation)) {
+            self.validate_block_body_for_plan(&request.block, historical_validation)?;
+        }
         status.body_syntax_valid = true;
 
         validate_block_finality(
@@ -2783,7 +2856,7 @@ impl NodeState {
         )
         .map_err(|error| anyhow::anyhow!("transaction finality validation failed: {error}"))?;
 
-        if strict {
+        if strict && stateless.is_none() {
             validate_coinbase_height(&request.block, request.height)
                 .map_err(|error| anyhow::anyhow!("coinbase height validation failed: {error}"))?;
         }
@@ -5069,6 +5142,30 @@ mod tests {
         block
     }
 
+    #[test]
+    fn stateless_body_validation_evidence_is_bound_to_exact_block_and_height() {
+        let block = block_with_commitments(vec![coinbase_transaction()]);
+        let proof = StatelessBodyValidation::for_block(&block, 17, Network::Regtest);
+        let request = NodeBlockImport::from_peer(block.clone(), 17);
+        proof.verify(&request).expect("matching worker evidence");
+
+        let wrong_height = NodeBlockImport::from_peer(block.clone(), 18);
+        assert!(proof.verify(&wrong_height).is_err());
+
+        let mut mutated = block;
+        mutated.header.nonce = mutated.header.nonce.saturating_add(1);
+        let mutated = NodeBlockImport::from_peer(mutated, 17);
+        assert!(proof.verify(&mutated).is_err());
+
+        let historical = StatelessBodyValidation::for_block(
+            request.block(),
+            Network::Mainnet.params().tx_start,
+            Network::Mainnet,
+        );
+        assert!(historical.covers(HistoricalValidationPlan::hsd_checkpointed()));
+        assert!(!historical.covers(HistoricalValidationPlan::full()));
+    }
+
     fn connect_empty_chain_to_height_one(node: &mut NodeService) -> BlockIndexRecord {
         let first = block_with_commitments(vec![coinbase_transaction_with_address(60, 50)]);
         let first = node
@@ -6569,7 +6666,8 @@ mod tests {
             .expect("height-200 pin");
         assert_ne!(pin.root.as_bytes(), &[0; 32]);
         assert_eq!(pin.block_hash, records[200].hash);
-        validate_persisted_name_tree(&snapshot, pin.root).expect("pinned tree before compaction");
+        hns_state::validate_persisted_name_tree(&snapshot, pin.root)
+            .expect("pinned tree before compaction");
         let fork_root = load_header_record(&snapshot, &records[200].hash)
             .expect("fork child header read")
             .expect("fork child header")
@@ -6580,7 +6678,8 @@ mod tests {
         let compacted = node.compact_name_tree_nodes().expect("compact pruned tree");
         assert!(compacted.summary.retained_roots >= 2);
         let snapshot = store.snapshot().expect("compacted snapshot");
-        validate_persisted_name_tree(&snapshot, pin.root).expect("pinned tree after compaction");
+        hns_state::validate_persisted_name_tree(&snapshot, pin.root)
+            .expect("pinned tree after compaction");
         drop(snapshot);
 
         let mut side_parent = records[199].hash;

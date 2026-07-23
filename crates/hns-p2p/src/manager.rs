@@ -124,6 +124,12 @@ pub struct BroadcastReport {
     pub failed: Vec<(PeerId, String)>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeerTrafficTotals {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerBan {
     pub address: IpAddr,
@@ -139,6 +145,8 @@ pub struct LivePeerManager {
     events: mpsc::Sender<PeerEvent>,
     next_peer_id: Arc<AtomicU64>,
     local_height: Arc<AtomicU32>,
+    retired_bytes_sent: Arc<AtomicU64>,
+    retired_bytes_received: Arc<AtomicU64>,
     local_nonce: [u8; 8],
     registration_lock: Arc<Mutex<()>>,
     banned: Arc<RwLock<HashMap<IpAddr, u64>>>,
@@ -160,6 +168,8 @@ impl LivePeerManager {
                 events,
                 next_peer_id: Arc::new(AtomicU64::new(1)),
                 local_height: Arc::new(AtomicU32::new(0)),
+                retired_bytes_sent: Arc::new(AtomicU64::new(0)),
+                retired_bytes_received: Arc::new(AtomicU64::new(0)),
                 // Use one unpredictable process-local nonce across all live
                 // connections. A loopback outbound/inbound pair will therefore
                 // observe its own nonce and fail the VERSION handshake.
@@ -347,6 +357,25 @@ impl LivePeerManager {
         }
         snapshots.sort_by_key(|snapshot| snapshot.id.0);
         snapshots
+    }
+
+    /// Return process-lifetime traffic counters without losing completed peer
+    /// sessions. The peer-map read lock makes the handoff from a final live
+    /// snapshot to the retired counters atomic to this observation.
+    pub async fn traffic_totals(&self) -> PeerTrafficTotals {
+        let handles = self.peers.read().await;
+        let mut totals = PeerTrafficTotals {
+            bytes_sent: self.retired_bytes_sent.load(Ordering::Acquire),
+            bytes_received: self.retired_bytes_received.load(Ordering::Acquire),
+        };
+        for handle in handles.values() {
+            let snapshot = handle.snapshot().await;
+            totals.bytes_sent = totals.bytes_sent.saturating_add(snapshot.bytes_sent);
+            totals.bytes_received = totals
+                .bytes_received
+                .saturating_add(snapshot.bytes_received);
+        }
+        totals
     }
 
     pub async fn peer_count(&self) -> usize {
@@ -616,13 +645,23 @@ impl LivePeerManager {
 
         let peers = Arc::clone(&self.peers);
         let events = self.events.clone();
+        let retired_bytes_sent = Arc::clone(&self.retired_bytes_sent);
+        let retired_bytes_received = Arc::clone(&self.retired_bytes_received);
+        let handle = spawned.handle.clone();
+        let task = spawned.task;
         tokio::spawn(async move {
-            let reason = match spawned.task.await {
+            let reason = match task.await {
                 Ok(Ok(())) => "peer task completed".to_owned(),
                 Ok(Err(error)) => error.to_string(),
                 Err(error) => format!("peer task join failed: {error}"),
             };
-            peers.write().await.remove(&id);
+            let final_snapshot = handle.snapshot().await;
+            let mut active_peers = peers.write().await;
+            if active_peers.remove(&id).is_some() {
+                atomic_saturating_add(&retired_bytes_sent, final_snapshot.bytes_sent);
+                atomic_saturating_add(&retired_bytes_received, final_snapshot.bytes_received);
+            }
+            drop(active_peers);
             let _ = events
                 .send(PeerEvent::Disconnected {
                     peer: id,
@@ -634,6 +673,12 @@ impl LivePeerManager {
         });
         Ok(id)
     }
+}
+
+fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(value))
+    });
 }
 
 pub fn normalize_peer_ip(address: IpAddr) -> IpAddr {
@@ -728,6 +773,9 @@ mod tests {
         .await
         .expect("packet");
         assert_eq!(packet, Packet::GetAddr);
+        let traffic_before_disconnect = client_manager.traffic_totals().await;
+        assert!(traffic_before_disconnect.bytes_sent > 0);
+        assert!(traffic_before_disconnect.bytes_received > 0);
 
         assert_eq!(
             client_manager
@@ -756,6 +804,24 @@ mod tests {
             .await
             .expect_err("ban must reject before socket work");
         assert!(matches!(error, P2pError::BannedAddress { .. }));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    client_events.recv().await,
+                    Some(PeerEvent::Disconnected { peer, .. }) if peer == client_peer
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("client disconnect");
+        let traffic_after_disconnect = client_manager.traffic_totals().await;
+        assert!(traffic_after_disconnect.bytes_sent >= traffic_before_disconnect.bytes_sent);
+        assert!(
+            traffic_after_disconnect.bytes_received >= traffic_before_disconnect.bytes_received
+        );
+        assert_eq!(client_manager.peer_count().await, 0);
         client_manager.disconnect_all().await;
         server_manager.disconnect_all().await;
     }

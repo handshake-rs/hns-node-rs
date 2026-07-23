@@ -2166,6 +2166,19 @@ pub fn validate_persisted_name_tree<T: ReadSnapshot>(
         .map_err(StateError::NameTree)
 }
 
+/// Verify the reachable union of multiple durable content-addressed roots.
+/// Shared historical subtrees are loaded once at each depth while preserving
+/// the same canonical-record and path-depth checks as individual validation.
+pub fn validate_persisted_name_trees<T, I>(snapshot: &T, roots: I) -> Result<usize, StateError>
+where
+    T: ReadSnapshot,
+    I: IntoIterator<Item = TreeRoot>,
+{
+    reachable_record_roots(roots, |node_root| load_persisted_node(snapshot, node_root))
+        .map(|roots| roots.len())
+        .map_err(StateError::NameTree)
+}
+
 /// Validate only the content-addressed record directly bound by the current
 /// root. This keeps steady-state transitions path-local; node startup performs
 /// the full materialized-state and reachable-record validation.
@@ -3839,6 +3852,7 @@ mod tests {
 
         let store = MemoryStore::new();
         hns_store::initialize_schema(&store).expect("schema");
+        let mut historical_roots = Vec::new();
         for (index, (state, expected)) in fixture
             .states
             .iter()
@@ -3887,6 +3901,16 @@ mod tests {
             assert_eq!(
                 validate_persisted_name_tree(&snapshot, staged_root).expect("persisted node tree"),
                 index * 2 + 1
+            );
+            historical_roots.push(staged_root);
+            let stored_nodes = snapshot
+                .scan_prefix(ColumnFamily::NameTreeNodes, b"")
+                .expect("stored persistent nodes")
+                .len();
+            assert_eq!(
+                validate_persisted_name_trees(&snapshot, historical_roots.iter().copied())
+                    .expect("persisted historical node trees"),
+                stored_nodes
             );
             assert_eq!(
                 prove_persisted_name_tree(&snapshot, staged_root, name_hash)

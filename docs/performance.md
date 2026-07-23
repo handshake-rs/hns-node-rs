@@ -10,19 +10,26 @@ Measure an already-running native mainnet node:
 ```bash
 python3 scripts/measure-hsrd-native-sync.py \
   --hsrd-url http://127.0.0.1:12037 \
+  --authorization-header-file /absolute/path/hsrd-authorization-header \
   --duration-seconds 60 --interval-seconds 2 \
   --output /path/to/native-sync-measurement.json
 ```
 
 The sampler accepts only a literal loopback HTTP origin unless the operator
-explicitly opts into a remote endpoint. It requires active-state native sync,
+explicitly opts into a remote endpoint. Its optional Authorization value is
+read from an absolute, non-symlink, mode-0600 regular file and is never placed
+in arguments, output, or logs. It requires active-state native sync,
 binds every sample to one runtime instance, rejects counter regression and any
 reported runtime error, bounds response size and request time, and records:
 
 - overall and interval P50/P95/P99/maximum header, body, state, and byte rates;
-- active-state stalls, peer count/failures, failed blocks, and unavailable
-  evidence;
+- active-state stalls, starting/ending/minimum ready peers, zero-peer samples,
+  peer failures, failed blocks, and unavailable evidence;
 - starting, ending, and raw samples so derived claims can be audited.
+
+Network-byte rates use the runtime-lifetime traffic total. A peer's final
+snapshot is atomically transferred into retired-session counters before it is
+removed, so rotation and reconnects cannot make the sampled counter regress.
 
 Measure the local mining critical path:
 
@@ -88,6 +95,26 @@ local empty-mempool regtest critical-path measurements using the in-memory
 store. They establish a regression gate, not ASIC, mainnet-state, persistent
 storage, or first-peer-acceptance qualification.
 
+## Persistent mainnet canary evidence
+
+The release canary's exhaustive RocksDB startup audit reached its authenticated
+RPC in 20.228 seconds at active height 9,396, 21.624 seconds at height 9,622,
+and 27.519 seconds at height 10,952. Before the retained-root union traversal,
+the same audit took roughly 70 seconds at height 8,328. Every restart preserved
+the exact active/stored tip and reopened with zero failed blocks, bans,
+rejections, contextual failures, or terminal error. These are bounded restart
+observations, not deployment-scale crash-recovery qualification.
+
+A 60-second persistent-store window beginning at height 9,622 connected 624
+historical blocks (10.4 blocks/s) and advanced the contiguous stored frontier
+916 blocks (15.267 blocks/s), with zero failed or unavailable blocks. The same
+window fell from seven ready peers to zero, so it is explicitly not sustained
+multi-peer evidence. Debug qualification subsequently showed six authenticated
+public peers timing out without serving an assigned historical body while a
+peer making body progress remained connected under the inactivity deadline.
+This distinguishes archival-body availability from consensus or Brontide
+failure; discovery breadth and sustained multi-archival-peer IBD remain open.
+
 ## Optimization and safety boundary
 
 Native IBD now connects a newly available full eight-block state slice directly
@@ -95,8 +122,27 @@ from the ordered validation completion path; periodic polling flushes partial
 tails and provides recovery. It does not enlarge the atomic state transaction
 or the global 128-body inflight limit. Body requests remain single-flight and
 all reassigned responses pass the same strict validation. The shorter timeout
-changes availability failover only: it does not accept alternate consensus
+is an inactivity deadline: each eligible response extends the bounded batch,
+while a peer that stops delivering still fails over after 15 seconds. This
+changes availability failover only; it does not accept alternate consensus
 data, weaken scoring, or alter authority readiness.
+
+Ordered worker-validated bodies are drained in groups of at most 32 and written
+with one synchronous atomic RocksDB commit. Scheduler completion occurs only
+after that transaction succeeds. The worker result is bound to the exact block
+hash and height; it may skip duplicate coordinator body work only when it
+covers the branch's checkpoint-derived historical validation plan. Header,
+difficulty, finality, branch, contextual state, scripts, covenants, claims,
+airdrops, name state, tree-root, and undo validation remain on their existing
+authoritative paths. A malformed member rejects the complete pre-commit group.
+
+Startup still performs the exhaustive durable-chain audit after both clean and
+unclean shutdowns. Current, committed, and interval-pinned Urkel roots are now
+verified through one depth-sensitive reachable-union traversal. This preserves
+canonical decoding, record-hash, missing-child, non-empty-child, and maximum
+path-depth checks for every retained root while avoiding repeated reads of
+shared historical subtrees. The active height, block/header/body, deployment,
+undo, root-continuity, and snapshot-pin audit remains exhaustive and unchanged.
 
 Production qualification still needs full mainnet IBD on persistent NVMe,
 P50/P95/P99/max storage and compaction latency, loaded-mempool templates,

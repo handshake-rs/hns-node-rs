@@ -206,8 +206,11 @@ Header-request admission is rolled back under the same rule.
 
 HSD uses a 60-second response deadline for `GETHEADERS` and a conservative
 120-second block deadline. Native IBD retains the header deadline but fails a
-stalled block connection over after 15 seconds so one slow peer cannot pin the
-contiguous state frontier for two minutes. A timed-out body batch requeues its
+stalled block connection over after 15 seconds of body inactivity so one slow
+peer cannot pin the contiguous state frontier for two minutes. Each eligible
+block response advances that peer's progress timestamp; an absolute per-item
+deadline therefore cannot disconnect a peer that is still draining its bounded
+batch. A timed-out body batch requeues its
 per-block work and emits only one disconnect for the peer, preserving HSD's
 connection-level stall accounting instead of multiplying a score by the number
 of hashes in the packet. Retry exhaustion remains tracked per block across
@@ -422,7 +425,14 @@ usage, compact-capable peers, pending/received/reconstructed/fallback compact
 blocks, served compact blocks and block transactions, ordinary received/served
 counts, durably failed-body count, checkpoint sequence,
 active-state connection/reorganization counts, contextual-failure count, and
-the last supervisor error. Discovery diagnostics additionally expose durable
+monotonic process-lifetime sent/received byte totals. Final peer counters move
+atomically into retired-session totals before peer removal, so rotation cannot
+make traffic evidence regress. The diagnostics also expose the last
+terminal/internal supervisor error. Expected peer churn, stale
+alternate-peer deliveries, invalid peer data, and transient relay races are
+logged as warnings and reflected by their dedicated peer/rejection counters;
+they do not poison `last_error` after healthy synchronization continues.
+Discovery diagnostics additionally expose durable
 address-book availability, loaded/pruned counts, generation, dirty state,
 successful/failed flushes, decode failures, the last flush time, and its last
 storage error. API-v10 node status separately counts valid non-active blocks and

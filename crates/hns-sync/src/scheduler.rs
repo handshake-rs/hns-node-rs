@@ -126,6 +126,7 @@ struct PeerSyncState {
     ready: bool,
     inflight: BTreeSet<BlockHash>,
     headers_requested_at: Option<Instant>,
+    last_block_received_at: Option<Instant>,
     failures: u32,
     unavailable_blocks: u64,
 }
@@ -273,6 +274,7 @@ impl SyncScheduler {
                 ready: true,
                 inflight: BTreeSet::new(),
                 headers_requested_at: None,
+                last_block_received_at: None,
                 failures: 0,
                 unavailable_blocks: 0,
             },
@@ -533,7 +535,7 @@ impl SyncScheduler {
         &mut self,
         peer: PeerId,
         hash: BlockHash,
-        _now: Instant,
+        now: Instant,
     ) -> Result<BlockDownloadRequest, SyncError> {
         if let Some(inflight) = self.inflight.remove(&hash) {
             if inflight.request.peer != Some(peer) {
@@ -548,6 +550,7 @@ impl SyncScheduler {
             }
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.inflight.remove(&hash);
+                state.last_block_received_at = Some(now);
             }
             self.stage = SyncStage::Validating;
             self.bump_sequence();
@@ -567,6 +570,9 @@ impl SyncScheduler {
                     peer,
                     hash.to_hex()
                 )));
+            }
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.last_block_received_at = Some(now);
             }
             self.stage = SyncStage::Validating;
             self.bump_sequence();
@@ -933,8 +939,18 @@ impl SyncScheduler {
             .inflight
             .iter()
             .filter_map(|(hash, item)| {
-                (now.duration_since(item.requested_at) >= self.limits.block_request_timeout)
-                    .then_some(*hash)
+                let request_expired =
+                    now.duration_since(item.requested_at) >= self.limits.block_request_timeout;
+                let peer_is_delivering = item
+                    .request
+                    .peer
+                    .and_then(|peer| self.peers.get(&peer))
+                    .and_then(|state| state.last_block_received_at)
+                    .is_some_and(|last_received| {
+                        last_received > item.requested_at
+                            && now.duration_since(last_received) < self.limits.block_request_timeout
+                    });
+                (request_expired && !peer_is_delivering).then_some(*hash)
             })
             .collect::<Vec<_>>();
         let mut disconnects = BTreeMap::new();
@@ -1280,6 +1296,50 @@ mod tests {
         assert_eq!(snapshot.pending_blocks, 2);
         assert_eq!(snapshot.inflight_blocks, 0);
         assert_eq!(snapshot.failed_blocks, 0);
+    }
+
+    #[test]
+    fn progressive_block_batch_uses_an_inactivity_deadline() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 2,
+            maximum_inflight_per_peer: 2,
+            block_request_timeout: Duration::from_millis(10),
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        let peer = PeerId(1);
+        scheduler
+            .register_peer(peer, SERVICE_NETWORK, 10)
+            .expect("peer");
+        let first = BlockHash::new([17; 32]);
+        let second = BlockHash::new([18; 32]);
+        scheduler.queue_block(first, 1).expect("first body");
+        scheduler.queue_block(second, 2).expect("second body");
+        assert_eq!(
+            scheduler
+                .poll(now, &[])
+                .into_iter()
+                .filter(|action| matches!(action, SyncAction::RequestBlock(_)))
+                .count(),
+            2
+        );
+
+        scheduler
+            .receive_block(peer, first, now + Duration::from_millis(9))
+            .expect("progressing response");
+        scheduler.complete_block(first);
+        let progressing = scheduler.poll(now + Duration::from_millis(11), &[]);
+        assert!(!progressing
+            .iter()
+            .any(|action| matches!(action, SyncAction::Disconnect { .. })));
+        assert_eq!(scheduler.snapshot().inflight_blocks, 1);
+
+        let stalled = scheduler.poll(now + Duration::from_millis(20), &[]);
+        assert!(stalled.iter().any(
+            |action| matches!(action, SyncAction::Disconnect { peer: target, .. } if *target == peer)
+        ));
+        assert_eq!(scheduler.snapshot().pending_blocks, 1);
     }
 
     #[test]

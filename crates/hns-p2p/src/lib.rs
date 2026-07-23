@@ -24,7 +24,8 @@ pub use brontide::{
 pub use constants::*;
 pub use handshake::{HandshakeUpdate, PeerDirection, PeerHandshake, PeerState};
 pub use manager::{
-    normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, PeerBan, PeerTransport,
+    normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, PeerBan,
+    PeerTrafficTotals, PeerTransport,
 };
 pub use runtime::{
     OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot,
