@@ -23,11 +23,13 @@ and never writes the value to arguments, reports, or logs. Each report is bound
 to one runtime instance and rejects counter regression, runtime errors, or
 malformed diagnostics.
 
-Sampler schema 2 records:
+Sampler schema 3 records:
 
 - overall and interval header, body, state, and byte rates;
 - active-state slice count, block count, total duration, and planning,
   state-commit, and post-commit phase durations;
+- per-slice transaction, non-coinbase input, output, and name-action counts,
+  plus state-commit time normalized by each nonzero workload dimension;
 - peer-event and validation-result backlogs;
 - stored-to-active buffer depth, pending and inflight body work, active stalls,
   ready peers, failures, and unavailable evidence.
@@ -64,12 +66,12 @@ durable body batch
 single contextual state writer -> one synchronous RocksDB transaction
 ```
 
-Brontide is required HNS transport, but current replay is not transport-crypto
+Brontide is required HNS transport, but buffered replay is not transport-crypto
 limited. Ready peers can be at the network header tip while the contiguous
-stored-body frontier remains ahead of active state. A process trace of that
-condition was dominated by random RocksDB point reads and synchronous durability
-boundaries. The active writer used only part of one CPU core; body acquisition
-also paused when the coordinator was occupied by a multi-second state slice.
+stored-body frontier remains ahead of active state. In that condition the
+limiting resource is random persistent-state access, LSM maintenance, and the
+synchronous durability boundary. Workload-normalized phase counters distinguish
+that condition from unusually large blocks or expensive name activity.
 
 This produces two coupled limits:
 
@@ -168,13 +170,55 @@ snapshots. Required properties are:
 - contextual-invalid evidence returned to the coordinator for durable branch
   rejection and scheduler cleanup.
 
-The current network-first coordinator is the safe first stage. The schema-2
+The current network-first coordinator is the safe first stage. The schema-3
 backlog and phase distributions decide whether actor separation is warranted:
 split ownership when coordinator backlog grows during otherwise healthy state
 slices; continue storage optimization when state-commit time dominates without
 backlog.
 
-## RocksDB and compaction
+## Authenticated-tree storage decision
+
+The name tree is content addressed: keys are cryptographic hashes, records are
+immutable, and every mutation creates a new path while retaining old paths for
+undo and pinned roots. A leveled LSM is a poor physical match for that workload.
+Hash keys destroy locality, immutable records receive no overwrite benefit, and
+level compaction repeatedly rewrites live records. Logical reachability
+compaction adds tombstones which the LSM must compact again before reclaiming
+space. More application-level node caching cannot remove this write
+amplification and competes with RocksDB's existing block cache.
+
+The target layout is an append-only, generation-based Urkel record store:
+
+1. Pack canonical node records into checksummed immutable segment pages.
+2. Store unauthenticated child-locator hints beside the canonical bytes. A
+   locator is accepted only after the canonical record hashes to the expected
+   child root, so it cannot change consensus meaning.
+3. Persist the current and retained root locators with their root hashes. New
+   paths reuse locators loaded from their unchanged parents and append only the
+   changed records.
+4. Group breadth-first path reads by `(segment, page)` and issue one read per
+   unique page. This replaces one LSM lookup per node with page-coalesced
+   traversal while preserving the same hashing work.
+5. For a state transaction, append and sync segment data before committing the
+   RocksDB root locator and chain-state batch. A crash before the batch leaves
+   an unreachable tail; a committed locator can never reference unsynced data.
+6. Compact by tracing retained locators into a new generation, rewriting local
+   hints, syncing the new generation, and atomically switching a checksummed
+   manifest. Old generations remain rollback material until the switch is
+   audited.
+
+This layout makes authenticated hashing and canonical record verification the
+dominant per-node work. It changes local storage metadata, not Urkel roots,
+proofs, name semantics, or reorganization atomicity.
+
+Implementation is staged behind a storage-profile boundary. First add segment
+codec, corruption, torn-tail, and deterministic-compaction tests. Then support
+offline conversion from the current `NameTreeNodes` column family, verify every
+retained root in both layouts, and only then enable segment reads. The old
+column family remains available for rollback until replay, crash recovery, and
+disk-reclamation qualification pass.
+
+## Current RocksDB boundary
 
 Point-oriented column families share a bounded 192 MiB cache. Raw blocks and
 undo use a separate 32 MiB cache so sequential replay cannot evict hot UTXO,
@@ -186,8 +230,9 @@ Name-tree compaction validates the complete retained-root union before deletion,
 performs a key-only preflight, and commits unreachable keys in 65,536-key
 chunks. The completion checkpoint is written last. A crash may leave extra
 unreachable records but cannot delete a validated reachable record; retry is
-idempotent. Cached diagnostic snapshots keep status RPC responsive while the
-state lock is occupied by compaction.
+idempotent. This is the correctness-preserving layout during segment-store
+migration, not the final performance architecture. Cached diagnostic snapshots
+keep status RPC responsive while the state lock is occupied by compaction.
 
 ## Non-negotiable gates
 

@@ -36,7 +36,9 @@ use hns_p2p::{
     P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot, PeerTransport,
     SERVICE_NETWORK,
 };
-use hns_primitives::{blake2b_256, Block, BlockHash, Header, Height, Reader, Txid, Writer};
+use hns_primitives::{
+    blake2b_256, Block, BlockHash, CovenantKind, Header, Height, Reader, Txid, Writer,
+};
 use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use hns_store::mark_clean_shutdown;
@@ -478,6 +480,10 @@ pub struct ShadowSyncDiagnostics {
     pub active_state_last_planning_micros: u64,
     pub active_state_last_commit_micros: u64,
     pub active_state_last_post_commit_micros: u64,
+    pub active_state_last_transactions: usize,
+    pub active_state_last_non_coinbase_inputs: usize,
+    pub active_state_last_outputs: usize,
+    pub active_state_last_name_actions: usize,
     pub peer_event_backlog: usize,
     pub validation_result_backlog: usize,
     pub reorganizations: u64,
@@ -545,6 +551,15 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) planning_micros: u64,
     pub(super) state_commit_micros: u64,
     pub(super) post_commit_micros: u64,
+    pub(super) workload: ActiveStateWorkload,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ActiveStateWorkload {
+    transactions: usize,
+    non_coinbase_inputs: usize,
+    outputs: usize,
+    name_actions: usize,
 }
 
 impl HnsBodyValidator {
@@ -2616,6 +2631,33 @@ impl NodeService {
             self.mining_events.candidate_tip_seen(summary.clone());
             self.mining_events.block_syntax_validated(summary);
         }
+        let workload =
+            activation
+                .connect
+                .iter()
+                .fold(ActiveStateWorkload::default(), |mut total, connect| {
+                    total.transactions = total
+                        .transactions
+                        .saturating_add(connect.block.transactions.len());
+                    for (transaction_index, transaction) in
+                        connect.block.transactions.iter().enumerate()
+                    {
+                        if transaction_index != 0 {
+                            total.non_coinbase_inputs = total
+                                .non_coinbase_inputs
+                                .saturating_add(transaction.inputs.len());
+                        }
+                        total.outputs = total.outputs.saturating_add(transaction.outputs.len());
+                        total.name_actions = total.name_actions.saturating_add(
+                            transaction
+                                .outputs
+                                .iter()
+                                .filter(|output| output.covenant.kind != CovenantKind::None)
+                                .count(),
+                        );
+                    }
+                    total
+                });
         let planning_micros =
             u64::try_from(planning_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
@@ -2660,6 +2702,7 @@ impl NodeService {
                     planning_micros,
                     state_commit_micros,
                     post_commit_micros,
+                    workload,
                 })
             }
             Err(ChainActivationFailure::ContextualInvalid(failure)) => {
@@ -2682,6 +2725,7 @@ impl NodeService {
                     planning_micros,
                     state_commit_micros,
                     post_commit_micros,
+                    workload,
                     ..ActiveStateConnectOutcome::default()
                 })
             }
@@ -4770,6 +4814,10 @@ async fn connect_stored_active_state_with_diagnostic_rpc(
             state.active_state_last_planning_micros = outcome.planning_micros;
             state.active_state_last_commit_micros = outcome.state_commit_micros;
             state.active_state_last_post_commit_micros = outcome.post_commit_micros;
+            state.active_state_last_transactions = outcome.workload.transactions;
+            state.active_state_last_non_coinbase_inputs = outcome.workload.non_coinbase_inputs;
+            state.active_state_last_outputs = outcome.workload.outputs;
+            state.active_state_last_name_actions = outcome.workload.name_actions;
         })
         .await;
     }

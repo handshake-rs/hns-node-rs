@@ -8712,6 +8712,10 @@ mod tests {
         assert_eq!(diagnostics.connected_blocks, 1);
         assert_eq!(diagnostics.active_state_slices, 1);
         assert_eq!(diagnostics.active_state_last_slice_blocks, 1);
+        assert_eq!(diagnostics.active_state_last_transactions, 1);
+        assert_eq!(diagnostics.active_state_last_non_coinbase_inputs, 0);
+        assert_eq!(diagnostics.active_state_last_outputs, 1);
+        assert_eq!(diagnostics.active_state_last_name_actions, 0);
         assert!(
             diagnostics.active_state_max_slice_millis >= diagnostics.active_state_last_slice_millis
         );

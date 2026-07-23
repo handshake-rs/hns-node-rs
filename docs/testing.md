@@ -539,8 +539,9 @@ A mismatch fails closed and cannot become a silent compatibility exception.
 - Block-state tests require all existing-input and output-collision UTXO probes
   to use one multi-get with no individual UTXO point reads.
 - Native-sync diagnostics distinguish activation planning, state commit, and
-  post-commit time and expose peer-event and validation-result backlog during
-  the bounded writer slice.
+  post-commit time, normalize commit cost by transactions, inputs, outputs, and
+  name actions, and expose peer-event and validation-result backlog during the
+  bounded writer slice.
 - Live diagnostic snapshots that preserve exact block-status counts without
   materializing historical RPC payload collections.
 - Lock-held native status/authority/parity/mining diagnostics that return an
