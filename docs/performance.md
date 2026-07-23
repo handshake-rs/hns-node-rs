@@ -123,6 +123,11 @@ audits the complete network reorganization horizon (288 blocks on mainnet)
 instead of all historical blocks. Unclean and stale-checkpoint starts retain
 complete historical validation. The offline comparison/scrub campaign must do
 the same and remains a qualification requirement rather than completed evidence.
+After deployment, a matching clean checkpoint at height 57,428 completed its
+audit in approximately 14 seconds and exposed authenticated RPC in 15.727
+seconds. The first RPC-ready sample showed 626 MiB RSS and 670 MiB of physical
+reads. This single restart is a direct regression observation, not yet a
+P50/P95/P99 campaign.
 
 A 60-second persistent-store window beginning at height 9,622 connected 624
 historical blocks (10.4 blocks/s) and advanced the contiguous stored frontier
