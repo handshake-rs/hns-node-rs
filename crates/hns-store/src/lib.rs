@@ -990,13 +990,13 @@ impl StoreHandle {
     pub fn create_rocks_checkpoint(&self, directory: &Path) -> Result<(), StoreError> {
         #[cfg(feature = "rocksdb-backend")]
         {
-            return match self {
+            match self {
                 Self::Rocks(store) => store.create_checkpoint(directory),
                 Self::Archived { inner, .. } => inner.create_rocks_checkpoint(directory),
                 Self::Memory(_) => Err(StoreError::Backend(
                     "RocksDB checkpoint requested for memory store".to_owned(),
                 )),
-            };
+            }
         }
         #[cfg(not(feature = "rocksdb-backend"))]
         {

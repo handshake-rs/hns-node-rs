@@ -9,6 +9,7 @@ use blake2::{
     Blake2bVar,
 };
 use clap::Parser;
+use hns_consensus::Network;
 use hns_primitives::{hex_encode, Coin, Writer};
 use hns_state::{decode_coin, encode_outpoint_key, BlockUndo};
 use hns_store::{
@@ -168,7 +169,7 @@ fn run() -> Result<()> {
     let snapshot = store.snapshot().context("failed to snapshot hsrd store")?;
 
     let network = required_meta(&snapshot, MetaKey::Network, "network")?;
-    let network = String::from_utf8(network).context("network metadata is not UTF-8")?;
+    let network = decode_network_binding(&network)?;
     let genesis_hash = required_hash_meta(&snapshot, MetaKey::GenesisHash, "genesis hash")?;
     let block_hash = required_hash_meta(&snapshot, MetaKey::BestBlockHash, "best block hash")?;
     let working_root =
@@ -205,6 +206,18 @@ fn run() -> Result<()> {
     serde_json::to_writer_pretty(std::io::stdout().lock(), &manifest)?;
     println!();
     Ok(())
+}
+
+fn decode_network_binding(binding: &[u8]) -> Result<String> {
+    let [canonical_id] = binding else {
+        bail!(
+            "network metadata must contain exactly one canonical network byte, got {} bytes",
+            binding.len()
+        );
+    };
+    let network = Network::from_canonical_id(*canonical_id)
+        .with_context(|| format!("unknown canonical network id {canonical_id}"))?;
+    Ok(network.to_string())
 }
 
 fn require_audit_copy(path: &Path) -> Result<PathBuf> {
@@ -456,6 +469,24 @@ mod tests {
             path.canonicalize().expect("canonical")
         );
         let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn network_binding_uses_canonical_network_names() {
+        for (canonical_id, expected) in [
+            (0, "mainnet"),
+            (1, "testnet"),
+            (2, "regtest"),
+            (3, "simnet"),
+        ] {
+            assert_eq!(
+                decode_network_binding(&[canonical_id]).expect("canonical network"),
+                expected
+            );
+        }
+        assert!(decode_network_binding(&[]).is_err());
+        assert!(decode_network_binding(&[0, 1]).is_err());
+        assert!(decode_network_binding(&[4]).is_err());
     }
 
     #[test]
