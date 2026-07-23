@@ -2978,10 +2978,17 @@ async fn serve_shadow_sync_rpc(
         .context("Native sync RPC server failed")
 }
 
-async fn shadow_sync_rpc_service(state: &ShadowSyncHttpState) -> Result<BasicRpcService> {
+async fn shadow_sync_rpc_service(
+    state: &ShadowSyncHttpState,
+    include_entries: bool,
+) -> Result<BasicRpcService> {
     let diagnostics = state.diagnostics.read().await.clone();
     let node = state.node.lock().await;
-    let mut snapshot = node.rpc_snapshot()?;
+    let mut snapshot = if include_entries {
+        node.rpc_snapshot()?
+    } else {
+        node.rpc_diagnostic_snapshot()?
+    };
     snapshot.network_active = diagnostics.enabled;
     snapshot.peer_count = diagnostics.peers.len();
     snapshot.node_status.release_stage = if node.config.mainnet_canary {
@@ -3066,7 +3073,7 @@ async fn handle_shadow_sync_rpc(
             Err(error) => Json(json_rpc_error(id, -32603, error.to_string())),
         };
     }
-    match shadow_sync_rpc_service(&state).await {
+    match shadow_sync_rpc_service(&state, true).await {
         Ok(service) => Json(
             service
                 .handle(request)
@@ -3077,7 +3084,7 @@ async fn handle_shadow_sync_rpc(
 }
 
 async fn diagnostic_method(state: &ShadowSyncHttpState, method: &str) -> serde_json::Value {
-    match shadow_sync_rpc_service(state).await {
+    match shadow_sync_rpc_service(state, false).await {
         Ok(service) => {
             let response = service.handle(JsonRpcRequest {
                 jsonrpc: Some("2.0".to_owned()),

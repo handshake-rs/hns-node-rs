@@ -660,6 +660,19 @@ impl MemoryBlockIndex {
                 .collect(),
         }
     }
+
+    pub fn status_counts(&self) -> (usize, usize) {
+        let mut alternates = 0usize;
+        let mut failed = 0usize;
+        for record in self.records.values() {
+            if record.status.failed {
+                failed = failed.saturating_add(1);
+            } else if !record.status.active_chain {
+                alternates = alternates.saturating_add(1);
+            }
+        }
+        (alternates, failed)
+    }
 }
 
 impl BlockIndex for MemoryBlockIndex {
@@ -1205,6 +1218,13 @@ impl<S: Store> StoredBlockIndex<S> {
 
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    /// Read diagnostic status counts from the post-commit in-memory index.
+    /// This avoids decoding the complete durable block-index column for every
+    /// live status request.
+    pub fn status_counts(&self) -> (usize, usize) {
+        self.memory.status_counts()
     }
 
     pub fn store_block(
@@ -2021,6 +2041,44 @@ mod tests {
         index.insert_block_record(record.clone()).expect("insert");
 
         assert_eq!(index.block(&record.hash).expect("block"), Some(record));
+    }
+
+    #[test]
+    fn memory_block_index_status_counts_exclude_active_and_failed_overlap() {
+        let mut active = BlockIndexRecord::from_block(
+            &Block {
+                header: header(BlockHash::ZERO, 21),
+                transactions: Vec::new(),
+            },
+            0,
+            Uint256::ONE,
+        )
+        .expect("active");
+        active.status.active_chain = true;
+
+        let alternate = BlockIndexRecord::from_block(
+            &Block {
+                header: header(active.hash, 22),
+                transactions: Vec::new(),
+            },
+            1,
+            Uint256::from(2u64),
+        )
+        .expect("alternate");
+
+        let mut failed = BlockIndexRecord::from_block(
+            &Block {
+                header: header(active.hash, 23),
+                transactions: Vec::new(),
+            },
+            1,
+            Uint256::from(3u64),
+        )
+        .expect("failed");
+        failed.status.failed = true;
+
+        let index = MemoryBlockIndex::from_records([active, alternate, failed]);
+        assert_eq!(index.status_counts(), (1, 1));
     }
 
     #[test]

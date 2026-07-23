@@ -1416,8 +1416,20 @@ impl NodeService {
     }
 
     fn rpc_snapshot(&self) -> Result<RpcSnapshot> {
+        self.rpc_snapshot_with_entries(true)
+    }
+
+    fn rpc_diagnostic_snapshot(&self) -> Result<RpcSnapshot> {
+        self.rpc_snapshot_with_entries(false)
+    }
+
+    fn rpc_snapshot_with_entries(&self, include_entries: bool) -> Result<RpcSnapshot> {
         let chain_tip = self.state.best_block_tip()?;
-        let entries = self.state.rpc_entries()?;
+        let entries = if include_entries {
+            self.state.rpc_entries()?
+        } else {
+            RpcStoreEntries::default()
+        };
         let durable = self.state.durable_mining_state()?;
         let tip_validation = match chain_tip.as_ref() {
             Some(tip) => self
@@ -1431,23 +1443,7 @@ impl NodeService {
         let metadata = self.state.store.snapshot()?;
         let best_header = best_header_tip_from_snapshot(&metadata)?;
         let chain_epoch = chain_epoch_from_snapshot(&metadata)?;
-        let stored_block_records = metadata
-            .scan_prefix(ColumnFamily::BlockIndex, b"")
-            .context("failed to scan durable block statuses")?
-            .into_iter()
-            .map(|(_, bytes)| {
-                BlockIndexRecord::decode(&bytes)
-                    .map_err(|error| anyhow::anyhow!("failed to decode block index: {error}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let alternate_block_count = stored_block_records
-            .iter()
-            .filter(|record| !record.status.active_chain && !record.status.failed)
-            .count();
-        let failed_block_count = stored_block_records
-            .into_iter()
-            .filter(|record| record.status.failed)
-            .count();
+        let (alternate_block_count, failed_block_count) = self.state.blocks.status_counts();
         let name_tree_compaction_checkpoint = load_name_tree_compaction_checkpoint(&metadata)?;
         let undo_pruning_checkpoint = load_undo_pruning_checkpoint(&metadata)?;
         let pending_best_chain_activation = match (&best_header, &chain_tip) {
@@ -8422,6 +8418,16 @@ mod tests {
         let rpc = restarted.rpc_service().expect("rpc");
         assert_eq!(rpc.snapshot().node_status.failed_block_count, 1);
         assert_eq!(rpc.snapshot().node_status.alternate_block_count, 0);
+        let diagnostics = restarted
+            .rpc_diagnostic_snapshot()
+            .expect("diagnostic snapshot");
+        assert_eq!(diagnostics.node_status.failed_block_count, 1);
+        assert_eq!(diagnostics.node_status.alternate_block_count, 0);
+        assert!(diagnostics.headers.is_empty());
+        assert!(diagnostics.blocks.is_empty());
+        assert!(diagnostics.transactions.is_empty());
+        assert!(diagnostics.coins.is_empty());
+        assert!(diagnostics.names.is_empty());
 
         let mut later = block_with_commitments(vec![coinbase_transaction_with_address(84, 50)]);
         later.header.prev_block = descendant.hash;

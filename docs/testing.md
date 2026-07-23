@@ -513,6 +513,8 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   testnet jobs expire at HSD's timestamp-driven target-reset boundary.
 - Tip commit to job activation and candidate receipt to first accepted relay.
 - Priority isolation under sync, compaction, diagnostics, and slow-peer load.
+- Live diagnostic snapshots that preserve exact block-status counts without
+  materializing historical RPC payload collections.
 
 ## Fuzzing
 

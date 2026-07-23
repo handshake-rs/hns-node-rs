@@ -327,6 +327,9 @@ Implemented:
   compact bodies, requested block transactions, learned routable addresses,
   and accepted ordinary/claim/airdrop mempool inventory and payloads.
 - Read-only peer and synchronization diagnostics.
+- Constant-payload live status snapshots: diagnostic routes use point-read
+  metadata plus post-commit in-memory block-status counts instead of decoding
+  every historical block, transaction, UTXO, and name record.
 - Native mainnet body and active-state synchronization by default, plus explicit
   headers-only and observe-only reductions. Synchronization alone cannot mint
   the private mining authority capability.
