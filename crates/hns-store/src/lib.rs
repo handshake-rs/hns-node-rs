@@ -12,8 +12,8 @@ pub use name_page::{
 };
 #[cfg(unix)]
 pub use name_page::{
-    read_name_page_directory_at, read_name_page_record_at, read_name_page_subpages_at,
-    NamePageSubpage, PositionedNamePageReader,
+    prefetch_name_page_records_at, read_name_page_directory_at, read_name_page_record_at,
+    NamePagePrefetch, PositionedNamePageReader,
 };
 pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,

@@ -107,13 +107,27 @@ pub struct NamePageDirectory {
     layout: NamePageDirectoryLayout,
 }
 
-/// One validated version-2 record subpage prepared by positioned read-ahead.
-/// Its fields stay private so only this module can construct trusted cached
-/// bytes for [`PositionedNamePageReader`].
+/// Opaque page-local bytes prepared by positioned read-ahead. Version-1
+/// records share one covering payload span; version-2 records retain only the
+/// independently authenticated subpages selected by the traversal.
 #[cfg(unix)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NamePageSubpage {
+pub struct NamePagePrefetch {
     page: u32,
+    legacy_span: Option<NamePageLegacySpan>,
+    subpages: Vec<NamePageSubpage>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NamePageLegacySpan {
+    start: usize,
+    encoded: Vec<u8>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NamePageSubpage {
     subpage: u8,
     encoded: Vec<u8>,
 }
@@ -126,6 +140,7 @@ pub struct PositionedNamePageReader<'a> {
     file: &'a File,
     page: u32,
     directory: &'a NamePageDirectory,
+    legacy_span: Option<NamePageLegacySpan>,
     subpages: BTreeMap<u8, Vec<u8>>,
 }
 
@@ -544,6 +559,7 @@ impl<'a> PositionedNamePageReader<'a> {
             file,
             page,
             directory,
+            legacy_span: None,
             subpages: BTreeMap::new(),
         }
     }
@@ -552,11 +568,26 @@ impl<'a> PositionedNamePageReader<'a> {
         file: &'a File,
         page: u32,
         directory: &'a NamePageDirectory,
-        prefetched: Vec<NamePageSubpage>,
+        prefetched: NamePagePrefetch,
     ) -> Result<Self, NamePageError> {
         let mut reader = Self::new(file, page, directory);
-        for subpage in prefetched {
-            if subpage.page != page || !directory.contains_subpage(subpage.subpage) {
+        if prefetched.page != page {
+            return Err(NamePageError::DirectoryInvariant);
+        }
+        if let Some(span) = prefetched.legacy_span {
+            if directory.contains_subpage(1)
+                || span.encoded.is_empty()
+                || span
+                    .start
+                    .checked_add(span.encoded.len())
+                    .is_none_or(|end| end > NAME_PAGE_BYTES)
+            {
+                return Err(NamePageError::DirectoryInvariant);
+            }
+            reader.legacy_span = Some(span);
+        }
+        for subpage in prefetched.subpages {
+            if !directory.contains_subpage(subpage.subpage) {
                 return Err(NamePageError::DirectoryInvariant);
             }
             if reader
@@ -572,6 +603,20 @@ impl<'a> PositionedNamePageReader<'a> {
 
     pub fn record(&mut self, slot: u16) -> Result<NamePageRecord, NamePageError> {
         let Some((subpage, local_slot)) = self.directory.subpage_location(slot)? else {
+            if let Some(span) = &self.legacy_span {
+                let location = self.directory.record(slot)?;
+                if let Some(start) = location.payload_offset.checked_sub(span.start) {
+                    if let Some(end) = start.checked_add(location.payload_length) {
+                        if let Some(canonical) = span.encoded.get(start..end) {
+                            return Ok(NamePageRecord {
+                                key: location.key,
+                                children: location.children.into_iter().flatten().collect(),
+                                canonical: canonical.to_vec(),
+                            });
+                        }
+                    }
+                }
+            }
             return read_name_page_record_at(self.file, self.page, self.directory, slot);
         };
         if !self.subpages.contains_key(&subpage) {
@@ -1677,16 +1722,16 @@ pub fn read_name_page_directory_at(
     })
 }
 
-/// Read, authenticate, and deduplicate the version-2 record subpages selected
-/// by a set of logical record slots. Legacy pages have no record subpages and
-/// return an empty set.
+/// Prepare the physical bytes selected by a set of logical record slots using
+/// one positioned read for a version-1 covering payload span, or one read per
+/// deduplicated and authenticated version-2 record subpage.
 #[cfg(unix)]
-pub fn read_name_page_subpages_at(
+pub fn prefetch_name_page_records_at(
     file: &File,
     page: u32,
     directory: &NamePageDirectory,
     slots: &[u16],
-) -> Result<Vec<NamePageSubpage>, NamePageError> {
+) -> Result<NamePagePrefetch, NamePageError> {
     let mut selected = BTreeSet::new();
     for slot in slots {
         if let Some((subpage, _)) = directory.subpage_location(*slot)? {
@@ -1696,7 +1741,42 @@ pub fn read_name_page_subpages_at(
     let page_offset = u64::from(page)
         .checked_mul(NAME_PAGE_BYTES as u64)
         .ok_or(NamePageError::OffsetOverflow)?;
-    selected
+    if selected.is_empty() {
+        let mut span_start = usize::MAX;
+        let mut span_end = 0usize;
+        for slot in slots {
+            let location = directory.record(*slot)?;
+            span_start = span_start.min(location.payload_offset);
+            span_end = span_end.max(
+                location
+                    .payload_offset
+                    .checked_add(location.payload_length)
+                    .ok_or(NamePageError::OffsetOverflow)?,
+            );
+        }
+        let legacy_span = if span_start < span_end {
+            let mut encoded = vec![0u8; span_end - span_start];
+            file.read_exact_at(
+                &mut encoded,
+                page_offset
+                    .checked_add(span_start as u64)
+                    .ok_or(NamePageError::OffsetOverflow)?,
+            )
+            .map_err(name_page_io)?;
+            Some(NamePageLegacySpan {
+                start: span_start,
+                encoded,
+            })
+        } else {
+            None
+        };
+        return Ok(NamePagePrefetch {
+            page,
+            legacy_span,
+            subpages: Vec::new(),
+        });
+    }
+    let subpages = selected
         .into_iter()
         .map(|subpage| {
             let offset = page_offset
@@ -1706,13 +1786,14 @@ pub fn read_name_page_subpages_at(
             file.read_exact_at(&mut encoded, offset)
                 .map_err(name_page_io)?;
             decode_name_subpage_record_header(&encoded, subpage)?;
-            Ok(NamePageSubpage {
-                page,
-                subpage,
-                encoded,
-            })
+            Ok(NamePageSubpage { subpage, encoded })
         })
-        .collect()
+        .collect::<Result<Vec<_>, NamePageError>>()?;
+    Ok(NamePagePrefetch {
+        page,
+        legacy_span: None,
+        subpages,
+    })
 }
 
 /// Positioned variant of [`read_name_page_record`] for immutable page
@@ -2021,6 +2102,21 @@ mod tests {
                 read_name_page_record_at(&file, 0, &positioned, 1).expect("read positioned record"),
                 internal
             );
+            let prefetched = prefetch_name_page_records_at(&file, 0, &positioned, &[0, 1])
+                .expect("prefetch legacy payload span");
+            assert!(prefetched.legacy_span.is_some());
+            let mut cached =
+                PositionedNamePageReader::with_prefetched(&file, 0, &positioned, prefetched)
+                    .expect("positioned legacy reader with prefetch");
+            assert_eq!(cached.record(0).expect("cached leaf"), leaf);
+            assert_eq!(cached.record(1).expect("cached internal"), internal);
+            let trailing_prefetch = prefetch_name_page_records_at(&file, 0, &positioned, &[1])
+                .expect("prefetch trailing legacy payload");
+            let mut fallback =
+                PositionedNamePageReader::with_prefetched(&file, 0, &positioned, trailing_prefetch)
+                    .expect("positioned legacy reader with trailing prefetch");
+            assert_eq!(fallback.record(0).expect("record before cached span"), leaf);
+            assert_eq!(fallback.record(1).expect("record in cached span"), internal);
             fs::remove_file(path).expect("remove positioned fixture");
         }
     }
@@ -2172,9 +2268,9 @@ mod tests {
             let file = File::open(&path).expect("open subpage fixture");
             let positioned =
                 read_name_page_directory_at(&file, 0).expect("positioned subpage index");
-            let prefetched = read_name_page_subpages_at(&file, 0, &positioned, &[32, 63])
+            let prefetched = prefetch_name_page_records_at(&file, 0, &positioned, &[32, 63])
                 .expect("prefetch shared subpage");
-            assert_eq!(prefetched.len(), 1);
+            assert_eq!(prefetched.subpages.len(), 1);
             let mut reader =
                 PositionedNamePageReader::with_prefetched(&file, 0, &positioned, prefetched)
                     .expect("positioned reader with prefetch");

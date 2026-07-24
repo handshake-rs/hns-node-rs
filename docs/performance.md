@@ -200,13 +200,15 @@ The implemented layout is an append-only, generation-based Urkel record store:
    paths reuse locators loaded from their unchanged parents and append only the
    changed records.
 4. Group affected paths by `(segment, page)` and traverse immutable addresses
-   in descending physical order. Schema-18 pages retain compact-directory
-   read-ahead; schema-19 pages read one 4 KiB index and only selected 4 KiB
+   in descending physical order. One bounded worker pool serves the complete
+   traversal instead of creating threads at every read-ahead refill.
+   Schema-18 pages combine selected legacy records into one covering payload
+   read per page; schema-19 pages read one 4 KiB index and only selected 4 KiB
    record subpages. A mutation Patricia frontier then reconstructs and hashes
-   every final shared path once rather than once per key. Exhaustive page-backed
-   startup validation uses a bounded 65,536-root window so a mainnet tree needs
-   hundreds of page plans rather than tens of thousands; the legacy-only
-   validator keeps its conservative 1,024-key window.
+   every final shared path once rather than once per key. Exhaustive
+   page-backed startup validation uses a bounded 65,536-root window so a
+   mainnet tree needs hundreds of page plans rather than tens of thousands;
+   the legacy-only validator keeps its conservative 1,024-key window.
 5. For a state transaction, append and sync segment data before committing the
    RocksDB root locator and chain-state batch. A crash before the batch leaves
    an unreachable tail; a committed locator can never reference unsynced data.

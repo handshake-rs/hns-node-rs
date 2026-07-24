@@ -8,6 +8,11 @@ use std::{
         Mutex,
     },
 };
+#[cfg(unix)]
+use std::{
+    sync::{mpsc, Arc},
+    thread::JoinHandle,
+};
 
 use hns_primitives::{blake2b_256, NameHash, Reader, Writer};
 use hns_store::{
@@ -15,13 +20,13 @@ use hns_store::{
     NamePageError, NamePagePush, NamePageRecord, NameTreePathRecord, ReadSnapshot, ScanEntry,
     SegmentManifest, StoreError, NAME_PAGE_BYTES,
 };
-#[cfg(not(unix))]
-use hns_store::{read_name_page_directory, read_name_page_record};
 #[cfg(unix)]
 use hns_store::{
-    read_name_page_directory_at, read_name_page_subpages_at, NamePageDirectory, NamePageSubpage,
-    PositionedNamePageReader,
+    prefetch_name_page_records_at, read_name_page_directory_at, NamePageDirectory,
+    NamePagePrefetch, PositionedNamePageReader,
 };
+#[cfg(not(unix))]
+use hns_store::{read_name_page_directory, read_name_page_record};
 use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord, URKEL_BITS};
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +56,103 @@ const NAME_PAGE_BOOTSTRAP_READ_BATCH: usize = 1_024;
 #[cfg(unix)]
 struct ReadAheadNamePage {
     directory: NamePageDirectory,
-    subpages: Vec<NamePageSubpage>,
+    records: NamePagePrefetch,
+}
+
+#[cfg(unix)]
+type NamePageReadAheadJob = ((u32, u32), Vec<u16>);
+
+#[cfg(unix)]
+type LoadedNamePage = ((u32, u32), ReadAheadNamePage);
+
+#[cfg(unix)]
+type NamePageReadAheadResult = Result<LoadedNamePage, PageTreeError>;
+
+#[cfg(unix)]
+struct NamePageReadAheadPool {
+    jobs: mpsc::SyncSender<Option<NamePageReadAheadJob>>,
+    results: mpsc::Receiver<NamePageReadAheadResult>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl NamePageReadAheadPool {
+    fn new(files: Arc<HashMap<u32, File>>) -> Self {
+        let (job_sender, job_receiver) =
+            mpsc::sync_channel::<Option<NamePageReadAheadJob>>(NAME_PAGE_READ_AHEAD_PAGES);
+        let (result_sender, result_receiver) = mpsc::sync_channel::<
+            Result<((u32, u32), ReadAheadNamePage), PageTreeError>,
+        >(NAME_PAGE_READ_AHEAD_PAGES);
+        let job_receiver = Arc::new(Mutex::new(job_receiver));
+        let mut workers = Vec::with_capacity(NAME_PAGE_READ_AHEAD_WORKERS);
+        for _ in 0..NAME_PAGE_READ_AHEAD_WORKERS {
+            let files = Arc::clone(&files);
+            let jobs = Arc::clone(&job_receiver);
+            let results = result_sender.clone();
+            workers.push(std::thread::spawn(move || loop {
+                let job = match jobs.lock() {
+                    Ok(receiver) => receiver.recv(),
+                    Err(_) => return,
+                };
+                let Ok(Some((page, slots))) = job else {
+                    return;
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let file = files
+                        .get(&page.0)
+                        .ok_or(PageTreeError::MissingSegment(page.0))?;
+                    let directory = read_name_page_directory_at(file, page.1)?;
+                    let records = prefetch_name_page_records_at(file, page.1, &directory, &slots)?;
+                    Ok((page, ReadAheadNamePage { directory, records }))
+                }))
+                .unwrap_or_else(|_| {
+                    Err(PageTreeError::StateCodec(
+                        "name-page read-ahead worker panicked".to_owned(),
+                    ))
+                });
+                if results.send(result).is_err() {
+                    return;
+                }
+            }));
+        }
+        drop(result_sender);
+        Self {
+            jobs: job_sender,
+            results: result_receiver,
+            workers,
+        }
+    }
+
+    fn load(
+        &self,
+        candidates: Vec<NamePageReadAheadJob>,
+    ) -> Result<Vec<LoadedNamePage>, PageTreeError> {
+        let result_count = candidates.len();
+        for candidate in candidates {
+            self.jobs.send(Some(candidate)).map_err(|_| {
+                PageTreeError::StateCodec("name-page read-ahead workers stopped".to_owned())
+            })?;
+        }
+        (0..result_count)
+            .map(|_| {
+                self.results.recv().map_err(|_| {
+                    PageTreeError::StateCodec("name-page read-ahead workers stopped".to_owned())
+                })?
+            })
+            .collect()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for NamePageReadAheadPool {
+    fn drop(&mut self) {
+        for _ in 0..self.workers.len() {
+            let _ = self.jobs.send(None);
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1322,17 +1423,20 @@ impl NamePageTreeReader {
         )?;
         let mut records = BTreeMap::<TreeRoot, Vec<u8>>::new();
         #[cfg(unix)]
-        let path_files = self
-            .files
-            .lock()
-            .map_err(|_| PageTreeError::Poisoned)?
-            .iter()
-            .map(|(segment, file)| {
-                file.try_clone()
-                    .map(|file| (*segment, file))
-                    .map_err(PageTreeError::io)
-            })
-            .collect::<Result<HashMap<_, _>, _>>()?;
+        let path_files = Arc::new(
+            self.files
+                .lock()
+                .map_err(|_| PageTreeError::Poisoned)?
+                .iter()
+                .map(|(segment, file)| {
+                    file.try_clone()
+                        .map(|file| (*segment, file))
+                        .map_err(PageTreeError::io)
+                })
+                .collect::<Result<HashMap<_, _>, _>>()?,
+        );
+        #[cfg(unix)]
+        let read_ahead_pool = NamePageReadAheadPool::new(Arc::clone(&path_files));
         #[cfg(unix)]
         let mut page_read_ahead = BTreeMap::<(u32, u32), ReadAheadNamePage>::new();
 
@@ -1340,7 +1444,7 @@ impl NamePageTreeReader {
             let page_address = NamePageAddress::new(page_key.0, page_key.1, 0)?;
             #[cfg(unix)]
             let prepared_page =
-                read_ahead_name_page(&path_files, &pending, &mut page_read_ahead, page_key)?;
+                read_ahead_name_page(&read_ahead_pool, &pending, &mut page_read_ahead, page_key)?;
             #[cfg(not(unix))]
             let directory = {
                 let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
@@ -1360,7 +1464,7 @@ impl NamePageTreeReader {
             #[cfg(unix)]
             let ReadAheadNamePage {
                 directory,
-                subpages,
+                records: prefetched_records,
             } = prepared_page;
             #[cfg(unix)]
             let mut page_reader = PositionedNamePageReader::with_prefetched(
@@ -1369,7 +1473,7 @@ impl NamePageTreeReader {
                     .ok_or(PageTreeError::MissingSegment(page_address.segment()))?,
                 page_address.page(),
                 &directory,
-                subpages,
+                prefetched_records,
             )?;
             while let Some((slot, work)) = page_work.pop_last() {
                 let address = NamePageAddress::new(page_key.0, page_key.1, slot)?;
@@ -1691,7 +1795,7 @@ impl NamePageTreeReader {
 
 #[cfg(unix)]
 fn read_ahead_name_page(
-    files: &HashMap<u32, File>,
+    pool: &NamePageReadAheadPool,
     pending: &BTreeMap<(u32, u32), BTreeMap<u16, NamePagePathWork>>,
     cache: &mut BTreeMap<(u32, u32), ReadAheadNamePage>,
     target: (u32, u32),
@@ -1718,43 +1822,7 @@ fn read_ahead_name_page(
                 (page, slots)
             })
             .collect::<Vec<_>>();
-        let worker_count = NAME_PAGE_READ_AHEAD_WORKERS.min(candidates.len()).max(1);
-        let chunk_size = candidates.len().div_ceil(worker_count);
-        let loaded = std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(worker_count);
-            for chunk in candidates.chunks(chunk_size) {
-                workers.push(scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|(page, slots)| {
-                            let file = files
-                                .get(&page.0)
-                                .ok_or(PageTreeError::MissingSegment(page.0))?;
-                            let directory = read_name_page_directory_at(file, page.1)?;
-                            let subpages =
-                                read_name_page_subpages_at(file, page.1, &directory, slots)?;
-                            Ok((
-                                *page,
-                                ReadAheadNamePage {
-                                    directory,
-                                    subpages,
-                                },
-                            ))
-                        })
-                        .collect::<Result<Vec<_>, PageTreeError>>()
-                }));
-            }
-            let mut loaded = Vec::with_capacity(candidates.len());
-            for worker in workers {
-                loaded.extend(worker.join().map_err(|_| {
-                    PageTreeError::StateCodec(
-                        "name-page directory read-ahead worker panicked".to_owned(),
-                    )
-                })??);
-            }
-            Ok::<_, PageTreeError>(loaded)
-        })?;
-        cache.extend(loaded);
+        cache.extend(pool.load(candidates)?);
     }
     cache.remove(&target).ok_or_else(|| {
         PageTreeError::StateCodec("name-page read-ahead missed its target".to_owned())
