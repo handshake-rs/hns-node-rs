@@ -2412,11 +2412,11 @@ impl NamePageStorage {
     }
 
     fn prepare_segment_seal(&mut self, next: &mut NamePageState, height: Height) -> Result<bool> {
-        if height == 0
-            || !height.is_multiple_of(NAME_PAGE_SEGMENT_BLOCKS)
+        let seal_height = height - (height % NAME_PAGE_SEGMENT_BLOCKS);
+        if seal_height == 0
             || next
                 .last_sealed_height
-                .is_some_and(|sealed| sealed >= height)
+                .is_some_and(|sealed| sealed >= seal_height)
         {
             return Ok(false);
         }
@@ -2443,7 +2443,7 @@ impl NamePageStorage {
         self.file_path = file_path;
         self.appender = Some(appender);
         next.manifest = manifest;
-        next.last_sealed_height = Some(height);
+        next.last_sealed_height = Some(seal_height);
         Ok(true)
     }
 
@@ -8033,6 +8033,10 @@ mod tests {
             .reader(&raw)
             .expect("pre-seal reader");
         let mut batch = store.batch();
+        let skipped_seal_height = NAME_PAGE_SEGMENT_BLOCKS
+            .checked_mul(2)
+            .and_then(|height| height.checked_add(17))
+            .expect("skipped seal height");
         let prepared = node
             .state
             .name_pages
@@ -8045,7 +8049,7 @@ mod tests {
                 BTreeMap::new(),
                 &[],
                 root,
-                Some(NAME_PAGE_SEGMENT_BLOCKS),
+                Some(skipped_seal_height),
             )
             .expect("prepare physical seal");
         drop(reader);
@@ -8058,7 +8062,10 @@ mod tests {
             .commit_prepared(prepared.clone());
         assert_eq!(prepared.manifest.active_segment, 1);
         assert_eq!(prepared.manifest.durable_bytes, 0);
-        assert_eq!(prepared.last_sealed_height, Some(NAME_PAGE_SEGMENT_BLOCKS));
+        assert_eq!(
+            prepared.last_sealed_height,
+            Some(NAME_PAGE_SEGMENT_BLOCKS * 2)
+        );
         assert_eq!(
             prepared
                 .root_address

@@ -1078,8 +1078,9 @@ struct ValidatedPageRecord {
 }
 
 /// Result of one physical-order audit of the immutable authenticated page
-/// store. Roots remain sorted only for the short legacy-overlay audit and are
-/// released with this value before steady-state operation.
+/// store. Only explicitly published durable roots remain in the short
+/// legacy-overlay summary; retaining and sorting every historical page record
+/// made unclean startup proportional to the entire append history in memory.
 #[derive(Debug)]
 pub struct NamePageValidation {
     pub segments: usize,
@@ -1777,6 +1778,7 @@ impl NamePageTreeReader {
         drop(files);
 
         let addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
+        let mut roots = Vec::with_capacity(addresses.len());
         for (root, address) in addresses.iter() {
             let record = indexed_page_record(&indexed, *address)
                 .ok_or(PageTreeError::MissingEarlierRecord(*address))?;
@@ -1786,16 +1788,10 @@ impl NamePageTreeReader {
                     actual: record.root,
                 });
             }
+            roots.push(*record);
         }
         drop(addresses);
-
-        let capacity = usize::try_from(record_count).map_err(|_| PageTreeError::OffsetOverflow)?;
-        let mut roots = Vec::with_capacity(capacity);
-        for segments in indexed.into_values() {
-            for page in segments {
-                roots.extend(page);
-            }
-        }
+        drop(indexed);
         roots.sort_unstable_by_key(|record| record.root);
         if roots.windows(2).any(|pair| {
             pair[0].root == pair[1].root && pair[0].maximum_path_bits != pair[1].maximum_path_bits
