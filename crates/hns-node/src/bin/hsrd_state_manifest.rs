@@ -14,7 +14,7 @@ use hns_primitives::{hex_encode, Coin, Writer};
 use hns_state::{decode_coin, encode_outpoint_key, BlockUndo};
 use hns_store::{
     open_store, ColumnFamily, DurabilityPolicy, MetaKey, ReadSnapshot, Store, StoreBackend,
-    StoreConfig, StoreError,
+    StoreConfig, StoreError, BLOCK_SEGMENT_MANIFEST_KEY, UNDO_SEGMENT_MANIFEST_KEY,
 };
 use serde::Serialize;
 
@@ -161,11 +161,43 @@ fn run() -> Result<()> {
     let arguments = Arguments::parse();
     let data_dir = require_audit_copy(&arguments.data_dir)?;
     let store = open_store(&StoreConfig {
-        path: data_dir,
+        path: data_dir.clone(),
         backend: StoreBackend::RocksDb,
         durability: DurabilityPolicy::Sync,
     })
     .context("failed to open copied hsrd store")?;
+    let snapshot = store
+        .snapshot()
+        .context("failed to inspect copied hsrd segment manifests")?;
+    let block_segments = snapshot
+        .get(ColumnFamily::Snapshots, BLOCK_SEGMENT_MANIFEST_KEY)
+        .context("failed to inspect copied block-segment manifest")?;
+    let undo_segments = snapshot
+        .get(ColumnFamily::Snapshots, UNDO_SEGMENT_MANIFEST_KEY)
+        .context("failed to inspect copied undo-segment manifest")?;
+    drop(snapshot);
+    let store = match (block_segments, undo_segments) {
+        (None, None) => store,
+        (Some(_), Some(_)) => {
+            let backup_root = data_dir.parent().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "copied chain directory {} has no backup root",
+                    data_dir.display()
+                )
+            })?;
+            let payload_segments = backup_root.join("payload-segments");
+            if !payload_segments.is_dir() {
+                bail!(
+                    "copied store has segment manifests but sibling archive {} is missing",
+                    payload_segments.display()
+                );
+            }
+            store
+                .with_segment_archive(payload_segments)
+                .context("failed to attach copied block/undo segment archive")?
+        }
+        _ => bail!("copied store has only one of the block/undo segment manifests"),
+    };
     let snapshot = store.snapshot().context("failed to snapshot hsrd store")?;
 
     let network = required_meta(&snapshot, MetaKey::Network, "network")?;
