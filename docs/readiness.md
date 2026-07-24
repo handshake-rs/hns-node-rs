@@ -286,13 +286,17 @@ Implemented:
   subsidy, and deterministic coinbase behavior;
 - static integrity checks, native secp256k1 smoke verification, and exact
   vendored-Goosig source comparison against HSD's pinned dependency;
+- reproducible independently generated invalid-corpus qualification against
+  pinned HSD: 24 noncontextual transaction/block cases and 12 contextual
+  state-boundary cases, with 30 invalid mutations, six valid controls, semantic
+  failure-class agreement, and atomic state rejection;
 - a self-tested live comparison runner that verifies an operator-selected clean
   HSD source revision, canonical block identity, and post-tip authenticated
   root while keeping HSD outside hsrd's consensus/authority path.
 
 Remaining:
 
-- complete mainnet replay and invalid corpora at every state boundary;
+- complete mainnet replay and its offline state/root audit;
 - long-duration native multi-peer evidence through restarts, partitions, and
   reorganizations, plus offline differential audits;
 - production mempool/template/publication differential and latency evidence.

@@ -28,13 +28,15 @@ requires `mainnet_canary_enabled=true`, `mainnet_canary_active=true`, exact
 header/block synchronization, a parent no older than 30 minutes, and at most a
 one-second qualification cache.
 
-The native script, contextual covenant, claim/airdrop, name-state, and Urkel
-engines now report functional readiness from their pinned differential suites.
-Historical full-mainnet replay and broad invalid/mutated-corpus qualification
-remain incomplete. Therefore the command below can run a native mainnet node
-and accumulate qualification evidence, but it cannot yet activate an ASIC job.
-That refusal is the intended result until those two gates are backed by real
-evidence and changed in source review.
+The native script, contextual covenant, claim/airdrop, name-state, Urkel, and
+invalid-corpus engines report functional readiness from their pinned
+differential suites. The invalid qualification is reproduced from 24
+independently generated noncontextual transaction/block cases and 12 contextual
+state-boundary cases, including valid controls and atomic rejection checks.
+Historical full-mainnet replay and offline state/root qualification remain
+incomplete. Therefore the command below can run a native mainnet node and
+accumulate that final qualification evidence, but it cannot yet activate a
+mining job.
 
 Create a private file containing one complete Authorization value, such as
 `Bearer <random-secret>`, then check the operational configuration:

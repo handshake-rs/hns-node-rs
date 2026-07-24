@@ -773,7 +773,11 @@ fn consensus_readiness() -> RpcConsensusReadiness {
         atomic_reorganizations: true,
         wal_durability: true,
         historical_replay: false,
-        invalid_corpus: false,
+        // Qualified by the independently generated pinned-HSD corpora consumed
+        // by hns-consensus and hns-state. The generators cover 24
+        // noncontextual transaction/block cases and 12 contextual
+        // state-boundary cases, including atomic rejection controls.
+        invalid_corpus: true,
     }
 }
 
@@ -953,7 +957,7 @@ fn parity_info() -> RpcParityInfo {
         state: "not-configured".to_owned(),
         configured: false,
         historical_replay_complete: false,
-        invalid_corpus_complete: false,
+        invalid_corpus_complete: true,
         live_shadow_active: false,
         last_compared_height: None,
         last_matching_block: None,
@@ -10865,13 +10869,10 @@ mod tests {
         assert!(readiness.name_state);
         assert!(readiness.urkel_roots);
         assert!(!readiness.historical_replay);
-        assert!(!readiness.invalid_corpus);
+        assert!(readiness.invalid_corpus);
         assert_eq!(
             readiness_blockers(&readiness),
-            vec![
-                "complete historical mainnet replay".to_owned(),
-                "invalid and mutated corpus parity".to_owned(),
-            ]
+            vec!["complete historical mainnet replay".to_owned()]
         );
     }
 
