@@ -80,6 +80,24 @@ pub struct NamePageRecordRef<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamePageRecordLocation {
+    pub key: [u8; 32],
+    pub children: [Option<NamePageAddress>; 2],
+    record_offset: usize,
+    record_end: usize,
+    payload_offset: usize,
+    payload_length: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamePageDirectory {
+    encoded: Vec<u8>,
+    record_count: u16,
+    directory_end: usize,
+    payload_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamePageRef<'a> {
     encoded: &'a [u8],
     record_count: u16,
@@ -313,61 +331,42 @@ impl<'a> NamePageRef<'a> {
     }
 
     pub fn record(self, slot: u16) -> Result<NamePageRecordRef<'a>, NamePageError> {
-        if slot >= self.record_count {
-            return Err(NamePageError::SlotOutOfRange {
-                slot,
-                records: self.record_count,
-            });
-        }
-        let index_offset = NAME_PAGE_HEADER_BYTES
-            .checked_add(usize::from(slot) * NAME_PAGE_INDEX_BYTES)
+        let location = decode_name_page_record_location(
+            self.encoded,
+            self.record_count,
+            self.directory_end,
+            self.payload_end,
+            slot,
+        )?;
+        let payload_end = location
+            .payload_offset
+            .checked_add(location.payload_length)
             .ok_or(NamePageError::DirectoryInvariant)?;
-        let mut index_cursor = index_offset;
-        let record_offset = usize::from(read_u16(self.encoded, &mut index_cursor)?);
-        if record_offset < NAME_PAGE_HEADER_BYTES
-            || record_offset + NAME_PAGE_RECORD_FIXED_BYTES > self.directory_end
-        {
-            return Err(NamePageError::DirectoryInvariant);
-        }
-        let mut cursor = record_offset;
-        let key = read_array::<32>(self.encoded, &mut cursor)?;
-        let payload_offset = usize::from(read_u16(self.encoded, &mut cursor)?);
-        let payload_length = usize::from(read_u16(self.encoded, &mut cursor)?);
-        let child_count = usize::from(read_u8(self.encoded, &mut cursor)?);
-        if child_count != 0 && child_count != 2 {
-            return Err(NamePageError::ChildCount(child_count));
-        }
-        if read_u8(self.encoded, &mut cursor)? != 0 {
-            return Err(NamePageError::ReservedBits);
-        }
-        let children_end = cursor
-            .checked_add(child_count * NAME_PAGE_CHILD_BYTES)
-            .ok_or(NamePageError::DirectoryInvariant)?;
-        if children_end > self.directory_end {
-            return Err(NamePageError::DirectoryInvariant);
-        }
-        let mut children = [None; 2];
-        for child in children.iter_mut().take(child_count) {
-            *child = Some(NamePageAddress::from_raw(read_u64(
-                self.encoded,
-                &mut cursor,
-            )?));
-        }
-        let payload_end = payload_offset
-            .checked_add(payload_length)
-            .ok_or(NamePageError::DirectoryInvariant)?;
-        if payload_offset < self.directory_end || payload_end > self.payload_end {
-            return Err(NamePageError::DirectoryInvariant);
-        }
         let canonical = self
             .encoded
-            .get(payload_offset..payload_end)
+            .get(location.payload_offset..payload_end)
             .ok_or(NamePageError::DirectoryInvariant)?;
         Ok(NamePageRecordRef {
-            key,
-            children,
+            key: location.key,
+            children: location.children,
             canonical,
         })
+    }
+}
+
+impl NamePageDirectory {
+    pub const fn record_count(&self) -> u16 {
+        self.record_count
+    }
+
+    pub fn record(&self, slot: u16) -> Result<NamePageRecordLocation, NamePageError> {
+        decode_name_page_record_location(
+            &self.encoded,
+            self.record_count,
+            self.directory_end,
+            self.payload_end,
+            slot,
+        )
     }
 }
 
@@ -545,19 +544,22 @@ fn name_page_record_bytes(record: &NamePageRecord) -> Result<usize, NamePageErro
         .ok_or(NamePageError::OffsetOverflow)
 }
 
-pub fn decode_name_page(encoded: &[u8]) -> Result<NamePageRef<'_>, NamePageError> {
-    if encoded.len() != NAME_PAGE_BYTES {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NamePageHeader {
+    record_count: u16,
+    directory_end: usize,
+    payload_end: usize,
+}
+
+fn decode_name_page_header(encoded: &[u8]) -> Result<NamePageHeader, NamePageError> {
+    if encoded.len() < NAME_PAGE_HEADER_BYTES {
         return Err(NamePageError::Length {
             actual: encoded.len(),
-            expected: NAME_PAGE_BYTES,
+            expected: NAME_PAGE_HEADER_BYTES,
         });
     }
     if &encoded[..8] != NAME_PAGE_MAGIC {
         return Err(NamePageError::InvalidMagic);
-    }
-    let checksum_offset = NAME_PAGE_BYTES - NAME_PAGE_CHECKSUM_BYTES;
-    if encoded[checksum_offset..] != blake2b_256(&encoded[..checksum_offset]) {
-        return Err(NamePageError::ChecksumMismatch);
     }
     let mut cursor = 8;
     let version = read_u16(encoded, &mut cursor)?;
@@ -575,55 +577,189 @@ pub fn decode_name_page(encoded: &[u8]) -> Result<NamePageRef<'_>, NamePageError
     let index_end = NAME_PAGE_HEADER_BYTES
         .checked_add(usize::from(record_count) * NAME_PAGE_INDEX_BYTES)
         .ok_or(NamePageError::OffsetOverflow)?;
+    let checksum_offset = NAME_PAGE_BYTES - NAME_PAGE_CHECKSUM_BYTES;
     if index_end > directory_end || directory_end > payload_end || payload_end > checksum_offset {
         return Err(NamePageError::DirectoryInvariant);
     }
-    let page = NamePageRef {
-        encoded,
+    Ok(NamePageHeader {
         record_count,
         directory_end,
         payload_end,
-    };
-    let mut expected_entry = index_end;
-    let mut expected_payload = directory_end;
-    let mut keys = BTreeSet::new();
-    for slot in 0..record_count {
-        let index_offset = NAME_PAGE_HEADER_BYTES + usize::from(slot) * NAME_PAGE_INDEX_BYTES;
-        let mut index_cursor = index_offset;
-        let record_offset = usize::from(read_u16(encoded, &mut index_cursor)?);
-        if record_offset != expected_entry {
-            return Err(NamePageError::DirectoryInvariant);
-        }
-        let mut entry_cursor = record_offset;
-        let key = read_array::<32>(encoded, &mut entry_cursor)?;
-        if !keys.insert(key) {
-            return Err(NamePageError::DuplicateKey);
-        }
-        let payload_offset = usize::from(read_u16(encoded, &mut entry_cursor)?);
-        let payload_length = usize::from(read_u16(encoded, &mut entry_cursor)?);
-        let child_count = usize::from(read_u8(encoded, &mut entry_cursor)?);
-        if child_count != 0 && child_count != 2 {
-            return Err(NamePageError::ChildCount(child_count));
-        }
-        if read_u8(encoded, &mut entry_cursor)? != 0 {
-            return Err(NamePageError::ReservedBits);
-        }
-        entry_cursor = entry_cursor
-            .checked_add(child_count * NAME_PAGE_CHILD_BYTES)
-            .ok_or(NamePageError::OffsetOverflow)?;
-        if entry_cursor > directory_end || payload_offset != expected_payload {
-            return Err(NamePageError::DirectoryInvariant);
-        }
-        expected_entry = entry_cursor;
-        expected_payload = expected_payload
-            .checked_add(payload_length)
-            .ok_or(NamePageError::OffsetOverflow)?;
-        page.record(slot)?;
+    })
+}
+
+fn decode_name_page_record_location(
+    encoded: &[u8],
+    record_count: u16,
+    directory_end: usize,
+    payload_end: usize,
+    slot: u16,
+) -> Result<NamePageRecordLocation, NamePageError> {
+    if slot >= record_count {
+        return Err(NamePageError::SlotOutOfRange {
+            slot,
+            records: record_count,
+        });
     }
-    if expected_entry != directory_end || expected_payload != payload_end {
+    let index_end = NAME_PAGE_HEADER_BYTES
+        .checked_add(usize::from(record_count) * NAME_PAGE_INDEX_BYTES)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    let index_offset = NAME_PAGE_HEADER_BYTES
+        .checked_add(usize::from(slot) * NAME_PAGE_INDEX_BYTES)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    let mut index_cursor = index_offset;
+    let record_offset = usize::from(read_u16(encoded, &mut index_cursor)?);
+    if record_offset < index_end || record_offset + NAME_PAGE_RECORD_FIXED_BYTES > directory_end {
         return Err(NamePageError::DirectoryInvariant);
     }
+    let mut cursor = record_offset;
+    let key = read_array::<32>(encoded, &mut cursor)?;
+    let payload_offset = usize::from(read_u16(encoded, &mut cursor)?);
+    let payload_length = usize::from(read_u16(encoded, &mut cursor)?);
+    let child_count = usize::from(read_u8(encoded, &mut cursor)?);
+    if child_count != 0 && child_count != 2 {
+        return Err(NamePageError::ChildCount(child_count));
+    }
+    if read_u8(encoded, &mut cursor)? != 0 {
+        return Err(NamePageError::ReservedBits);
+    }
+    let record_end = cursor
+        .checked_add(child_count * NAME_PAGE_CHILD_BYTES)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    if record_end > directory_end {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let mut children = [None; 2];
+    for child in children.iter_mut().take(child_count) {
+        *child = Some(NamePageAddress::from_raw(read_u64(encoded, &mut cursor)?));
+    }
+    let canonical_end = payload_offset
+        .checked_add(payload_length)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    if payload_offset < directory_end || canonical_end > payload_end {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    Ok(NamePageRecordLocation {
+        key,
+        children,
+        record_offset,
+        record_end,
+        payload_offset,
+        payload_length,
+    })
+}
+
+fn validate_name_page_directory(
+    encoded: &[u8],
+    header: NamePageHeader,
+) -> Result<(), NamePageError> {
+    let index_end = NAME_PAGE_HEADER_BYTES
+        .checked_add(usize::from(header.record_count) * NAME_PAGE_INDEX_BYTES)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let mut expected_entry = index_end;
+    let mut expected_payload = header.directory_end;
+    let mut keys = BTreeSet::new();
+    for slot in 0..header.record_count {
+        let location = decode_name_page_record_location(
+            encoded,
+            header.record_count,
+            header.directory_end,
+            header.payload_end,
+            slot,
+        )?;
+        if location.record_offset != expected_entry || location.payload_offset != expected_payload {
+            return Err(NamePageError::DirectoryInvariant);
+        }
+        if !keys.insert(location.key) {
+            return Err(NamePageError::DuplicateKey);
+        }
+        expected_entry = location.record_end;
+        expected_payload = expected_payload
+            .checked_add(location.payload_length)
+            .ok_or(NamePageError::OffsetOverflow)?;
+    }
+    if expected_entry != header.directory_end || expected_payload != header.payload_end {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    Ok(())
+}
+
+pub fn decode_name_page(encoded: &[u8]) -> Result<NamePageRef<'_>, NamePageError> {
+    if encoded.len() != NAME_PAGE_BYTES {
+        return Err(NamePageError::Length {
+            actual: encoded.len(),
+            expected: NAME_PAGE_BYTES,
+        });
+    }
+    if &encoded[..8] != NAME_PAGE_MAGIC {
+        return Err(NamePageError::InvalidMagic);
+    }
+    let checksum_offset = NAME_PAGE_BYTES - NAME_PAGE_CHECKSUM_BYTES;
+    if encoded[checksum_offset..] != blake2b_256(&encoded[..checksum_offset]) {
+        return Err(NamePageError::ChecksumMismatch);
+    }
+    let header = decode_name_page_header(encoded)?;
+    let page = NamePageRef {
+        encoded,
+        record_count: header.record_count,
+        directory_end: header.directory_end,
+        payload_end: header.payload_end,
+    };
+    validate_name_page_directory(encoded, header)?;
     Ok(page)
+}
+
+/// Read and validate only a page's compact record directory. The canonical
+/// payload remains content-addressed and is read separately; full-page
+/// checksums remain mandatory during publication, recovery, and scrub.
+pub fn read_name_page_directory<R: Read + Seek>(
+    reader: &mut R,
+    page: u32,
+) -> Result<NamePageDirectory, NamePageError> {
+    let page_offset = u64::from(page)
+        .checked_mul(NAME_PAGE_BYTES as u64)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    reader
+        .seek(SeekFrom::Start(page_offset))
+        .map_err(name_page_io)?;
+    let mut encoded = vec![0u8; NAME_PAGE_HEADER_BYTES];
+    reader.read_exact(&mut encoded).map_err(name_page_io)?;
+    let header = decode_name_page_header(&encoded)?;
+    encoded.resize(header.directory_end, 0);
+    reader
+        .read_exact(&mut encoded[NAME_PAGE_HEADER_BYTES..])
+        .map_err(name_page_io)?;
+    validate_name_page_directory(&encoded, header)?;
+    Ok(NamePageDirectory {
+        encoded,
+        record_count: header.record_count,
+        directory_end: header.directory_end,
+        payload_end: header.payload_end,
+    })
+}
+
+/// Read one canonical record selected by a validated compact directory.
+pub fn read_name_page_record<R: Read + Seek>(
+    reader: &mut R,
+    page: u32,
+    directory: &NamePageDirectory,
+    slot: u16,
+) -> Result<NamePageRecord, NamePageError> {
+    let location = directory.record(slot)?;
+    let page_offset = u64::from(page)
+        .checked_mul(NAME_PAGE_BYTES as u64)
+        .and_then(|offset| offset.checked_add(location.payload_offset as u64))
+        .ok_or(NamePageError::OffsetOverflow)?;
+    reader
+        .seek(SeekFrom::Start(page_offset))
+        .map_err(name_page_io)?;
+    let mut canonical = vec![0u8; location.payload_length];
+    reader.read_exact(&mut canonical).map_err(name_page_io)?;
+    Ok(NamePageRecord {
+        key: location.key,
+        children: location.children.into_iter().flatten().collect(),
+        canonical,
+    })
 }
 
 pub fn plan_name_page_reads<I>(
@@ -843,6 +979,36 @@ mod tests {
         assert_eq!(actual_internal.canonical, internal.canonical);
         assert!(matches!(
             page.record(2),
+            Err(NamePageError::SlotOutOfRange {
+                slot: 2,
+                records: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn compact_directory_reads_selected_records_without_loading_a_full_page() {
+        let leaf = leaf(0x31, 70);
+        let internal = NamePageRecord {
+            key: [0x32; 32],
+            children: vec![address(9, 6), address(9, 7)],
+            canonical: vec![0x33; 74],
+        };
+        let encoded = encode_name_page(&[leaf.clone(), internal.clone()]).expect("encode");
+        let mut reader = std::io::Cursor::new(encoded);
+        let directory = read_name_page_directory(&mut reader, 0).expect("read directory");
+        assert_eq!(directory.record_count(), 2);
+        assert!(directory.encoded.len() < NAME_PAGE_BYTES);
+        assert_eq!(
+            read_name_page_record(&mut reader, 0, &directory, 0).expect("read leaf"),
+            leaf
+        );
+        assert_eq!(
+            read_name_page_record(&mut reader, 0, &directory, 1).expect("read internal"),
+            internal
+        );
+        assert!(matches!(
+            read_name_page_record(&mut reader, 0, &directory, 2),
             Err(NamePageError::SlotOutOfRange {
                 slot: 2,
                 records: 2

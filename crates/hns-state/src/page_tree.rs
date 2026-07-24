@@ -3,14 +3,18 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
 use hns_primitives::{blake2b_256, NameHash, Reader, Writer};
 use hns_store::{
-    decode_name_page, ColumnFamily, NamePageAddress, NamePageAppender, NamePageBuilder,
-    NamePageError, NamePagePush, NamePageRecord, NameTreePathRecord, ReadSnapshot, ScanEntry,
-    SegmentManifest, StoreError, NAME_PAGE_BYTES,
+    decode_name_page, read_name_page_directory, read_name_page_record, ColumnFamily,
+    NamePageAddress, NamePageAppender, NamePageBuilder, NamePageError, NamePagePush,
+    NamePageRecord, NameTreePathRecord, ReadSnapshot, ScanEntry, SegmentManifest, StoreError,
+    NAME_PAGE_BYTES,
 };
 use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord, URKEL_BITS};
 use serde::{Deserialize, Serialize};
@@ -945,6 +949,7 @@ pub struct NamePageTreeReader {
     root_segment: u32,
     addresses: Mutex<HashMap<TreeRoot, NamePageAddress>>,
     cache: Mutex<PageCache>,
+    path_page_reads: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1162,6 +1167,7 @@ impl NamePageTreeReader {
             root_segment: address.segment(),
             addresses: Mutex::new(addresses),
             cache: Mutex::new(PageCache::new(cache_pages)),
+            path_page_reads: AtomicU64::new(0),
         })
     }
 
@@ -1300,18 +1306,17 @@ impl NamePageTreeReader {
 
         while let Some((page_key, mut page_work)) = pending.pop_last() {
             let page_address = NamePageAddress::new(page_key.0, page_key.1, 0)?;
-            self.ensure_page(page_address)?;
+            let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
+            let file = files
+                .get_mut(&page_address.segment())
+                .ok_or(PageTreeError::MissingSegment(page_address.segment()))?;
+            let directory = read_name_page_directory(file, page_address.page())?;
+            self.path_page_reads.fetch_add(1, Ordering::Relaxed);
             while let Some((slot, work)) = page_work.pop_last() {
                 let address = NamePageAddress::new(page_key.0, page_key.1, slot)?;
-                let loaded = {
-                    let mut cache = self.cache.lock().map_err(|_| PageTreeError::Poisoned)?;
-                    cache.touch(page_key);
-                    let page = cache
-                        .pages
-                        .get(&page_key)
-                        .ok_or(PageTreeError::MissingCachedPage(address))?;
-                    read_cached_name_page_record(page, work.root, address)?
-                };
+                let record =
+                    read_name_page_record(file, page_address.page(), &directory, address.slot())?;
+                let loaded = validate_loaded_name_page_record(record, work.root)?;
                 if let Some(existing) = records.insert(work.root, loaded.canonical.clone()) {
                     if existing != loaded.canonical {
                         return Err(PageTreeError::StateCodec(
@@ -1564,6 +1569,11 @@ impl NamePageTreeReader {
             .map(|cache| cache.loads)
     }
 
+    #[cfg(test)]
+    fn path_page_read_count(&self) -> u64 {
+        self.path_page_reads.load(Ordering::Relaxed)
+    }
+
     fn insert_discovered(
         &self,
         discovered: Vec<(TreeRoot, NamePageAddress)>,
@@ -1720,6 +1730,13 @@ fn read_cached_name_page_record(
         .records
         .get(usize::from(address.slot()))
         .ok_or(PageTreeError::SlotOutOfRange(address))?;
+    validate_loaded_name_page_record(record.clone(), expected)
+}
+
+fn validate_loaded_name_page_record(
+    record: NamePageRecord,
+    expected: TreeRoot,
+) -> Result<LoadedNamePageRecord, PageTreeError> {
     if record.key != *expected.as_bytes() {
         return Err(PageTreeError::RecordKeyMismatch {
             expected,
@@ -1744,7 +1761,7 @@ fn read_cached_name_page_record(
         UrkelNodeRecord::Leaf { .. } => Vec::new(),
     };
     Ok(LoadedNamePageRecord {
-        canonical: record.canonical.clone(),
+        canonical: record.canonical,
         discovered,
     })
 }
@@ -2175,7 +2192,7 @@ mod tests {
         let reader =
             NamePageTreeReader::open_with_cache(&path, root, root_locator, 1).expect("reader");
 
-        let before = reader.page_load_count().expect("path load count");
+        let before = reader.path_page_read_count();
         let prefetched = reader
             .prefetch_paths(
                 root,
@@ -2183,7 +2200,7 @@ mod tests {
             )
             .expect("physical-order path prefetch")
             .expect("page-backed root");
-        let after = reader.page_load_count().expect("path load count");
+        let after = reader.path_page_read_count();
         assert_eq!(prefetched, records);
         assert_eq!(after - before, packed.page_count() as u64);
         drop(reader);
