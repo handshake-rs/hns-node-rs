@@ -10,6 +10,8 @@ pub use name_page::{
     NamePageFileInspection, NamePagePush, NamePageRecord, NamePageRecordLocation,
     NamePageRecordRef, NamePageRef, NAME_PAGE_BYTES,
 };
+#[cfg(unix)]
+pub use name_page::{read_name_page_directory_at, read_name_page_record_at};
 pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,
     plan_segment_page_reads, scan_segment_prefix, truncate_segment_to_committed_tail,

@@ -11,15 +11,24 @@ use std::{
 
 use hns_primitives::{blake2b_256, NameHash, Reader, Writer};
 use hns_store::{
-    decode_name_page, read_name_page_directory, read_name_page_record, ColumnFamily,
-    NamePageAddress, NamePageAppender, NamePageBuilder, NamePageError, NamePagePush,
-    NamePageRecord, NameTreePathRecord, ReadSnapshot, ScanEntry, SegmentManifest, StoreError,
-    NAME_PAGE_BYTES,
+    decode_name_page, ColumnFamily, NamePageAddress, NamePageAppender, NamePageBuilder,
+    NamePageError, NamePagePush, NamePageRecord, NameTreePathRecord, ReadSnapshot, ScanEntry,
+    SegmentManifest, StoreError, NAME_PAGE_BYTES,
 };
+#[cfg(not(unix))]
+use hns_store::{read_name_page_directory, read_name_page_record};
+#[cfg(unix)]
+use hns_store::{read_name_page_directory_at, read_name_page_record_at, NamePageDirectory};
 use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord, URKEL_BITS};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_PAGE_CACHE_PAGES: usize = 512;
+#[cfg(unix)]
+const NAME_PAGE_READ_AHEAD_PAGES: usize = 64;
+#[cfg(unix)]
+const NAME_PAGE_READ_AHEAD_CACHE_PAGES: usize = 128;
+#[cfg(unix)]
+const NAME_PAGE_READ_AHEAD_WORKERS: usize = 4;
 const NAME_PAGE_STATE_VERSION: u32 = 2;
 const LEGACY_NAME_PAGE_STATE_VERSION: u32 = 1;
 const LEGACY_NAME_PAGE_STATE_BODY_BYTES: usize = 4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4;
@@ -1303,17 +1312,58 @@ impl NamePageTreeReader {
             keys.iter().copied().map(|key| (key, 0usize)),
         )?;
         let mut records = BTreeMap::<TreeRoot, Vec<u8>>::new();
+        #[cfg(unix)]
+        let path_files = self
+            .files
+            .lock()
+            .map_err(|_| PageTreeError::Poisoned)?
+            .iter()
+            .map(|(segment, file)| {
+                file.try_clone()
+                    .map(|file| (*segment, file))
+                    .map_err(PageTreeError::io)
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        #[cfg(unix)]
+        let mut directory_cache = BTreeMap::<(u32, u32), NamePageDirectory>::new();
 
-        while let Some((page_key, mut page_work)) = pending.pop_last() {
+        while let Some(page_key) = pending.last_key_value().map(|(page, _)| *page) {
             let page_address = NamePageAddress::new(page_key.0, page_key.1, 0)?;
+            #[cfg(unix)]
+            let directory = read_ahead_name_page_directory(
+                &path_files,
+                &pending,
+                &mut directory_cache,
+                page_key,
+            )?;
+            #[cfg(not(unix))]
+            let directory = {
+                let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
+                let file = files
+                    .get_mut(&page_address.segment())
+                    .ok_or(PageTreeError::MissingSegment(page_address.segment()))?;
+                read_name_page_directory(file, page_address.page())?
+            };
+            let (_, mut page_work) = pending.pop_last().expect("pending page exists");
+            self.path_page_reads.fetch_add(1, Ordering::Relaxed);
+            #[cfg(not(unix))]
             let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
+            #[cfg(not(unix))]
             let file = files
                 .get_mut(&page_address.segment())
                 .ok_or(PageTreeError::MissingSegment(page_address.segment()))?;
-            let directory = read_name_page_directory(file, page_address.page())?;
-            self.path_page_reads.fetch_add(1, Ordering::Relaxed);
             while let Some((slot, work)) = page_work.pop_last() {
                 let address = NamePageAddress::new(page_key.0, page_key.1, slot)?;
+                #[cfg(unix)]
+                let record = read_name_page_record_at(
+                    path_files
+                        .get(&page_address.segment())
+                        .ok_or(PageTreeError::MissingSegment(page_address.segment()))?,
+                    page_address.page(),
+                    &directory,
+                    address.slot(),
+                )?;
+                #[cfg(not(unix))]
                 let record =
                     read_name_page_record(file, page_address.page(), &directory, address.slot())?;
                 let loaded = validate_loaded_name_page_record(record, work.root)?;
@@ -1625,6 +1675,62 @@ impl NamePageTreeReader {
             .insert(cache_key, CachedNamePage { records });
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn read_ahead_name_page_directory(
+    files: &HashMap<u32, File>,
+    pending: &BTreeMap<(u32, u32), BTreeMap<u16, NamePagePathWork>>,
+    cache: &mut BTreeMap<(u32, u32), NamePageDirectory>,
+    target: (u32, u32),
+) -> Result<NamePageDirectory, PageTreeError> {
+    if !cache.contains_key(&target) {
+        let retained_pages =
+            NAME_PAGE_READ_AHEAD_CACHE_PAGES.saturating_sub(NAME_PAGE_READ_AHEAD_PAGES);
+        while cache.len() > retained_pages {
+            cache.pop_first();
+        }
+        let candidates = pending
+            .keys()
+            .rev()
+            .copied()
+            .filter(|page| !cache.contains_key(page))
+            .take(NAME_PAGE_READ_AHEAD_PAGES)
+            .collect::<Vec<_>>();
+        let worker_count = NAME_PAGE_READ_AHEAD_WORKERS.min(candidates.len()).max(1);
+        let chunk_size = candidates.len().div_ceil(worker_count);
+        let loaded = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(worker_count);
+            for chunk in candidates.chunks(chunk_size) {
+                workers.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .copied()
+                        .map(|page| {
+                            let file = files
+                                .get(&page.0)
+                                .ok_or(PageTreeError::MissingSegment(page.0))?;
+                            let directory = read_name_page_directory_at(file, page.1)?;
+                            Ok((page, directory))
+                        })
+                        .collect::<Result<Vec<_>, PageTreeError>>()
+                }));
+            }
+            let mut loaded = Vec::with_capacity(candidates.len());
+            for worker in workers {
+                loaded.extend(worker.join().map_err(|_| {
+                    PageTreeError::StateCodec(
+                        "name-page directory read-ahead worker panicked".to_owned(),
+                    )
+                })??);
+            }
+            Ok::<_, PageTreeError>(loaded)
+        })?;
+        cache.extend(loaded);
+    }
+    cache.remove(&target).ok_or_else(|| {
+        PageTreeError::StateCodec("name-page directory read-ahead missed its target".to_owned())
+    })
 }
 
 fn insert_name_page_path_work<I>(

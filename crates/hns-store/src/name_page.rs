@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::{
     collections::BTreeSet,
     fs::{File, OpenOptions},
@@ -762,6 +764,61 @@ pub fn read_name_page_record<R: Read + Seek>(
     })
 }
 
+/// Positioned variant of [`read_name_page_directory`] for concurrent immutable
+/// page read-ahead without sharing or mutating a file cursor.
+#[cfg(unix)]
+pub fn read_name_page_directory_at(
+    file: &File,
+    page: u32,
+) -> Result<NamePageDirectory, NamePageError> {
+    let page_offset = u64::from(page)
+        .checked_mul(NAME_PAGE_BYTES as u64)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let mut encoded = vec![0u8; NAME_PAGE_HEADER_BYTES];
+    file.read_exact_at(&mut encoded, page_offset)
+        .map_err(name_page_io)?;
+    let header = decode_name_page_header(&encoded)?;
+    encoded.resize(header.directory_end, 0);
+    file.read_exact_at(
+        &mut encoded[NAME_PAGE_HEADER_BYTES..],
+        page_offset
+            .checked_add(NAME_PAGE_HEADER_BYTES as u64)
+            .ok_or(NamePageError::OffsetOverflow)?,
+    )
+    .map_err(name_page_io)?;
+    validate_name_page_directory(&encoded, header)?;
+    Ok(NamePageDirectory {
+        encoded,
+        record_count: header.record_count,
+        directory_end: header.directory_end,
+        payload_end: header.payload_end,
+    })
+}
+
+/// Positioned variant of [`read_name_page_record`] for immutable page
+/// traversal that can overlap independent physical reads.
+#[cfg(unix)]
+pub fn read_name_page_record_at(
+    file: &File,
+    page: u32,
+    directory: &NamePageDirectory,
+    slot: u16,
+) -> Result<NamePageRecord, NamePageError> {
+    let location = directory.record(slot)?;
+    let offset = u64::from(page)
+        .checked_mul(NAME_PAGE_BYTES as u64)
+        .and_then(|page_offset| page_offset.checked_add(location.payload_offset as u64))
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let mut canonical = vec![0u8; location.payload_length];
+    file.read_exact_at(&mut canonical, offset)
+        .map_err(name_page_io)?;
+    Ok(NamePageRecord {
+        key: location.key,
+        children: location.children.into_iter().flatten().collect(),
+        canonical,
+    })
+}
+
 pub fn plan_name_page_reads<I>(
     generation: u64,
     addresses: I,
@@ -995,7 +1052,7 @@ mod tests {
             canonical: vec![0x33; 74],
         };
         let encoded = encode_name_page(&[leaf.clone(), internal.clone()]).expect("encode");
-        let mut reader = std::io::Cursor::new(encoded);
+        let mut reader = std::io::Cursor::new(encoded.clone());
         let directory = read_name_page_directory(&mut reader, 0).expect("read directory");
         assert_eq!(directory.record_count(), 2);
         assert!(directory.encoded.len() < NAME_PAGE_BYTES);
@@ -1014,6 +1071,21 @@ mod tests {
                 records: 2
             })
         ));
+
+        #[cfg(unix)]
+        {
+            let path = test_file();
+            fs::write(&path, encoded).expect("write positioned fixture");
+            let file = File::open(&path).expect("open positioned fixture");
+            let positioned =
+                read_name_page_directory_at(&file, 0).expect("read positioned directory");
+            assert_eq!(positioned, directory);
+            assert_eq!(
+                read_name_page_record_at(&file, 0, &positioned, 1).expect("read positioned record"),
+                internal
+            );
+            fs::remove_file(path).expect("remove positioned fixture");
+        }
     }
 
     #[test]
