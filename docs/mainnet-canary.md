@@ -89,5 +89,31 @@ paths, restarts on failure, and delivers SIGTERM for a clean checkpoint and
 shutdown marker. Review the `%h/Documents/MeshMine` paths if the checkout lives
 elsewhere.
 
+After replay/state qualification enables the final readiness bit, the unified
+miner replaces the sync-only unit. It owns the same hsrd state and RPC endpoint,
+starts native CPU and Vulkan workers from the process-local authoritative
+template, and exposes the same job through a password-protected HandyStratum
+listener for ASICs:
+
+```sh
+cargo build --locked --release --manifest-path hsrd/Cargo.toml \
+  -p meshmine-minerd
+install -d -m 700 "$HOME/.local/libexec" "$HOME/.local/share/meshmine" \
+  "$HOME/.config/meshmine" "$HOME/.config/systemd/user"
+install -m 755 hsrd/target/release/meshmine-minerd \
+  "$HOME/.local/libexec/meshmine-minerd"
+install -m 600 hsrd/deploy/meshmine-minerd-mainnet.service \
+  "$HOME/.config/systemd/user/meshmine-minerd-mainnet.service"
+systemctl --user daemon-reload
+systemctl --user enable --now meshmine-minerd-mainnet.service
+```
+
+The checked-in unit mines to the operator's configured mainnet payout address
+with three CPU threads, hardware Vulkan device zero, and HandyStratum on TCP
+port 3008. The RPC Authorization and gateway password remain separate
+mode-0600 files. CPU and GPU use distinct extra-nonce domains, ASIC sessions
+receive unique prefixes, and every network-target result is re-admitted,
+connected locally, durably captured, and published to all writable peers.
+
 This profile is a bounded canary mechanism, not production eligibility,
 independent review, or permission to turn incomplete readiness flags on.

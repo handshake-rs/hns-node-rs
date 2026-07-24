@@ -4,9 +4,10 @@ mod mining_engine;
 mod peer_bans;
 mod shadow_sync;
 
+pub use hns_p2p::LivePeerManager;
 pub use mining_engine::{
     MiningEngineConfig, MiningEngineDiagnostics, MiningPublicationAttempt, MiningPublicationResult,
-    MiningTemplateRequest,
+    MiningTemplateRequest, NativeMiningJob, NativeMiningJobRequest,
 };
 pub use shadow_sync::{
     NativeSyncConfig, NativeSyncDiagnostics, ShadowSyncConfig, ShadowSyncDiagnostics,
@@ -84,7 +85,7 @@ use hns_store::{
     STORAGE_PROFILE,
 };
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 10;
@@ -975,6 +976,22 @@ pub struct NodeService {
     airdrop_signatures: NativeAirdropSignatureVerifier,
 }
 
+pub type SharedNodeService = Arc<tokio::sync::Mutex<NodeService>>;
+
+/// Process-local extension capability for a unified MeshMine mining runtime.
+///
+/// The node supplies its exact mutable service, live peer publication manager,
+/// and shutdown watch after native runtime initialization. An observed RPC
+/// snapshot cannot construct this capability.
+pub trait NativeRuntimeExtension: Send {
+    fn spawn(
+        self: Box<Self>,
+        node: SharedNodeService,
+        peers: LivePeerManager,
+        shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<Result<()>>;
+}
+
 impl NodeService {
     pub fn new(config: NodeConfig) -> Self {
         let state = NodeState::memory_for_network(config.network);
@@ -1451,6 +1468,18 @@ impl NodeService {
         } else {
             self.run_rpc_until_shutdown(shutdown).await
         }
+    }
+
+    pub async fn run_until_shutdown_with_extension(
+        self,
+        shutdown: ShutdownSignal,
+        extension: Box<dyn NativeRuntimeExtension>,
+    ) -> Result<()> {
+        if !self.config.shadow_sync.enabled {
+            anyhow::bail!("native runtime extensions require native sync");
+        }
+        self.run_shadow_sync_until_shutdown_with_extension(shutdown, Some(extension))
+            .await
     }
 
     pub(crate) async fn run_rpc_until_shutdown(&self, shutdown: ShutdownSignal) -> Result<()> {
@@ -10065,11 +10094,11 @@ mod tests {
     }
 
     #[test]
-    fn shadow_active_state_direct_progress_yields_between_small_atomic_slices() {
+    fn shadow_active_state_direct_progress_yields_between_bounded_atomic_slices() {
         let mut node = NodeService::new(active_state_shadow_config());
         let mut previous = BlockHash::ZERO;
         let mut records = Vec::new();
-        for height in 0..10 {
+        for height in 0..320 {
             let mut block = block_with_commitments(vec![coinbase_transaction_with_tag(height, 50)]);
             block.header.prev_block = previous;
             let record = store_fixture_alternate(
@@ -10083,7 +10112,7 @@ mod tests {
         }
 
         let first = node
-            .shadow_sync_connect_stored_state(64)
+            .shadow_sync_connect_stored_state(320)
             .expect("first direct connector slice");
         assert_eq!(
             first.connected,
@@ -10100,9 +10129,9 @@ mod tests {
         );
 
         let second = node
-            .shadow_sync_connect_stored_state(64)
+            .shadow_sync_connect_stored_state(320)
             .expect("second direct connector slice");
-        assert_eq!(second.connected, 2);
+        assert_eq!(second.connected, 32);
         assert_eq!(second.disconnected, 0);
         assert_eq!(
             node.state()
@@ -10969,6 +10998,46 @@ mod tests {
             error.to_string().contains("exceeds maximum consensus time"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn process_local_native_job_derives_header_context_and_zero_mask_commitment() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::NativeExperimental,
+            acknowledge_incomplete_consensus: true,
+            mining_engine: MiningEngineConfig {
+                enabled: true,
+                ..MiningEngineConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = block_with_commitments(vec![coinbase_transaction()]);
+        node.connect_block(NodeBlockImport::fixture(genesis.clone(), 0, 1))
+            .expect("fixture genesis");
+
+        let job = node
+            .mining_engine_build_native_job(NativeMiningJobRequest {
+                variant: 0,
+                payout_address: Address::new(0, vec![0x74; 20]).expect("payout address"),
+                coinbase_flags: b"meshmine-native-job".to_vec(),
+                reserved_root: [0; 32],
+                mask: [0; 32],
+                policy: hns_mining::TemplatePolicy::default(),
+            })
+            .expect("native job");
+        assert_eq!(job.snapshot.tip.hash, genesis.hash());
+        assert_eq!(job.prepared.header().parent_hash, job.snapshot.tip.hash);
+        assert_eq!(
+            job.prepared.header().mask_hash,
+            hns_primitives::blake2b_256_many([
+                job.snapshot.tip.hash.as_bytes().as_slice(),
+                [0u8; 32].as_slice(),
+            ])
+        );
+        job.prepared
+            .validate_for_snapshot(&job.snapshot)
+            .expect("job matches authoritative snapshot");
     }
 
     #[test]

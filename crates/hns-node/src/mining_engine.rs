@@ -15,9 +15,9 @@ use hns_mempool::{
     Mempool, MempoolContext, MempoolInfo, MempoolLimits, MempoolView, HSD_MINIMUM_RELAY_FEE_RATE,
 };
 use hns_mining::{
-    MiningTemplate, PreparedMiningJob, SolvedBlockPublicationIntent, SolvedMiningCandidate,
-    TemplateCacheKey, TemplatePolicy, TemplateVariant, MAX_TEMPLATE_VARIANTS,
-    PUBLICATION_KEY_PREFIX,
+    MiningSnapshot, MiningTemplate, PreparedMiningJob, SolvedBlockPublicationIntent,
+    SolvedMiningCandidate, TemplateCacheKey, TemplatePolicy, TemplateVariant,
+    MAX_TEMPLATE_VARIANTS, PUBLICATION_KEY_PREFIX,
 };
 use hns_p2p::{BroadcastReport, LivePeerManager, Packet};
 use hns_primitives::{
@@ -356,6 +356,22 @@ pub struct MiningTemplateRequest {
     pub policy: TemplatePolicy,
 }
 
+#[derive(Clone, Debug)]
+pub struct NativeMiningJobRequest {
+    pub variant: u32,
+    pub payout_address: Address,
+    pub coinbase_flags: Vec<u8>,
+    pub reserved_root: [u8; 32],
+    pub mask: [u8; 32],
+    pub policy: TemplatePolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeMiningJob {
+    pub snapshot: Arc<MiningSnapshot>,
+    pub prepared: Arc<PreparedMiningJob>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MiningPublicationAttempt {
     pub block_hash: BlockHash,
@@ -486,6 +502,80 @@ impl NodeService {
             .first()
             .map(|template| template.as_ref().clone())
             .ok_or_else(|| anyhow::anyhow!("Mining engine template rebuild returned no template"))
+    }
+
+    /// Build and activate one current authoritative job without asking a
+    /// worker to duplicate deployment, MTP, or difficulty derivation.
+    pub fn mining_engine_build_native_job(
+        &self,
+        request: NativeMiningJobRequest,
+    ) -> Result<NativeMiningJob> {
+        let durable = self.state.durable_mining_state()?;
+        let permit = issue_authority_permit(&self.config, &durable)
+            .ok_or_else(|| anyhow::anyhow!("native mining authority is unavailable"))?;
+        let snapshot = durable
+            .snapshot
+            .ok_or_else(|| anyhow::anyhow!("native mining snapshot is unavailable"))?;
+        if permit.generation != snapshot.generation || permit.tip != snapshot.tip.hash {
+            anyhow::bail!("native mining permit disagrees with its durable snapshot");
+        }
+        let next_height = snapshot
+            .tip
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("mining template height exhausted"))?;
+        let metadata = self.state.store.snapshot()?;
+        let tip_record =
+            super::load_header_record(&metadata, &snapshot.tip.hash)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "durable mining tip {} has no header record",
+                    snapshot.tip.hash.to_hex()
+                )
+            })?;
+        let parent_median_time = self.state.median_time_past(&metadata, &tip_record)?;
+        let deployments =
+            self.state
+                .deployment_state_for_block(&metadata, next_height, snapshot.tip.hash)?;
+        let version =
+            compute_block_version_from_state(self.config.network.deployments(), deployments)?;
+        let minimum_time = super::current_unix_time()?.max(parent_median_time.saturating_add(1));
+        let mut lookup = |hash: &BlockHash| super::load_header_record(&metadata, hash);
+        let bits = super::expected_bits_with_lookup(
+            self.config.network,
+            minimum_time,
+            Some(&tip_record),
+            &mut lookup,
+        )?;
+        drop(metadata);
+        let mask_hash = hns_primitives::blake2b_256_many([
+            snapshot.tip.hash.as_bytes().as_slice(),
+            request.mask.as_slice(),
+        ]);
+        let templates = self.mining_engine_rebuild_templates(vec![MiningTemplateRequest {
+            variant: request.variant,
+            payout_address: request.payout_address,
+            coinbase_flags: request.coinbase_flags,
+            version,
+            bits,
+            minimum_time,
+            reserved_root: request.reserved_root,
+            mask_hash,
+            policy: request.policy,
+        }])?;
+        let template = templates
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("native mining template rebuild returned no job"))?;
+        let key = TemplateCacheKey {
+            snapshot_generation: template.snapshot_generation(),
+            mempool_generation: template.mempool_generation(),
+            variant: request.variant,
+        };
+        let prepared = self.mining_engine_prepare_cached_job(&key)?;
+        prepared
+            .validate_for_snapshot(&snapshot)
+            .map_err(|error| anyhow::anyhow!("native mining job is stale: {error}"))?;
+        Ok(NativeMiningJob { snapshot, prepared })
     }
 
     /// Atomically replace the complete future-template set for one immutable

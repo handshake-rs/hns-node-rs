@@ -96,12 +96,13 @@ results, and shutdown. Ordered validation completion no longer recursively
 invokes another state slice. This removes both the immediate slice-to-slice
 feedback loop and the general polling interval as a replay throughput ceiling.
 
-Direct canonical progress remains limited to eight connected blocks per atomic
-slice. A real divergent best-work branch retains the configured reorganization
-bound so disconnect and replacement connect remain one transaction. Increasing
-the direct slice without separating coordinator and state ownership is not a
-safe throughput optimization: it amortizes durability but proportionally
-extends network starvation and shutdown latency.
+Direct canonical progress is limited to 288 connected blocks per atomic slice,
+the same bounded rollback horizon as HSD mainnet's retained reorganization
+window. This amortizes one ordered name-page durability barrier over the
+configured mainnet replay batch while the independent 10 ms state cadence still
+returns between slices for network work and shutdown. A real divergent
+best-work branch retains the configured reorganization bound so disconnect and
+replacement connect remain one transaction.
 
 The state path removes redundant reads at several levels:
 
@@ -141,7 +142,7 @@ commits or replace durable validation.
 | Block UTXO resolution | `O(I + O)` dedup and hash lookup | one multi-get per block |
 | Header/MTP context | `O(H)` unique heights, with `H` bounded by requested contexts | one read per unique staged key |
 | `K` name mutations | `O(K × 256)` authenticated-path hashing | breadth-first batched reads for `K >= 2` |
-| Eight-block direct slice | sequential consensus work over block contents | one stable snapshot and one sync commit |
+| 288-block direct slice | sequential consensus work over block contents | one stable snapshot and one sync commit |
 | Reorganization | `O(D + C + transactions + name paths)` | one stable snapshot and one atomic commit |
 
 Without the staged point cache, repeated validation layers can turn one logical

@@ -63,8 +63,8 @@ use super::{
     json_rpc_error, load_block_index_record, load_header_record, mark_node_store_clean,
     median_time_past_with_lookup, mining_generation_from_snapshot, mining_snapshot_for_hash,
     require_rpc_authorization, AuthorityMode, ChainActivationFailure, DurableMiningState,
-    FailedBlockMutation, FailedBlockStage, HeaderSummary, NodeBlockImport, NodeReorg, NodeService,
-    RpcAuthorizationHeader, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
+    FailedBlockMutation, FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport,
+    NodeReorg, NodeService, RpcAuthorizationHeader, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
 };
 use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
@@ -120,7 +120,7 @@ const MAX_VALIDATED_BODY_COMMIT_BATCH: usize = 32;
 const MAX_SHADOW_SYNC_ORPHAN_BLOCKS: usize = 8_192;
 const MAX_SHADOW_SYNC_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
-pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 8;
+pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 288;
 const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
 const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // Native IBD deliberately fails over stalled body reservations sooner than
@@ -1453,6 +1453,15 @@ fn load_or_create_brontide_identity(data_dir: Option<&Path>) -> Result<BrontideI
 
 impl NodeService {
     pub async fn run_shadow_sync_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
+        self.run_shadow_sync_until_shutdown_with_extension(shutdown, None)
+            .await
+    }
+
+    pub(crate) async fn run_shadow_sync_until_shutdown_with_extension(
+        self,
+        shutdown: ShutdownSignal,
+        extension: Option<Box<dyn NativeRuntimeExtension>>,
+    ) -> Result<()> {
         self.config
             .shadow_sync
             .validate(self.config.authority_mode, self.config.network)?;
@@ -1740,6 +1749,9 @@ impl NodeService {
         } else {
             None
         };
+        let mut extension_task = extension.map(|extension| {
+            extension.spawn(Arc::clone(&node), peers.clone(), shutdown_rx.clone())
+        });
 
         let (connect_results_tx, mut connect_results_rx) =
             mpsc::channel::<ConnectAttemptResult>(shadow_sync_config.maximum_outbound.max(1));
@@ -1831,6 +1843,23 @@ impl NodeService {
                     }
                     if listener_task.as_ref().is_some_and(|task| task.is_finished()) {
                         let message = "Native sync P2P listener terminated unexpectedly".to_owned();
+                        record_error(&diagnostics, message.clone()).await;
+                        terminal_error = Some(anyhow::anyhow!(message));
+                        break;
+                    }
+                    if extension_task.as_ref().is_some_and(|task| task.is_finished()) {
+                        let task = extension_task.take().expect("finished extension task");
+                        let message = match task.await {
+                            Ok(Ok(())) => {
+                                "native runtime extension terminated unexpectedly".to_owned()
+                            }
+                            Ok(Err(error)) => {
+                                format!("native runtime extension failed: {error:#}")
+                            }
+                            Err(error) => {
+                                format!("native runtime extension task failed: {error}")
+                            }
+                        };
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
@@ -2126,8 +2155,12 @@ impl NodeService {
                 terminal_error = Some(error);
             }
         }
-        peers.disconnect_all().await;
         let _ = shutdown_tx.send(true);
+        let extension_result = match extension_task {
+            Some(task) => await_task("native runtime extension", task).await,
+            None => Ok(()),
+        };
+        peers.disconnect_all().await;
 
         let rpc_result = await_task("RPC", rpc_task).await;
         let listener_result = match listener_task {
@@ -2135,7 +2168,11 @@ impl NodeService {
             None => Ok(()),
         };
 
-        if terminal_error.is_none() && rpc_result.is_ok() && listener_result.is_ok() {
+        if terminal_error.is_none()
+            && rpc_result.is_ok()
+            && listener_result.is_ok()
+            && extension_result.is_ok()
+        {
             mark_node_store_clean(&store, network)?;
         }
         if let Some(error) = terminal_error {
@@ -2143,6 +2180,7 @@ impl NodeService {
         }
         rpc_result?;
         listener_result?;
+        extension_result?;
         tracing::info!("hsrd native-sync runtime stopped");
         Ok(())
     }
@@ -2549,11 +2587,11 @@ impl NodeService {
         if active_tip.as_ref() == Some(&stored_tip) {
             return Ok(ActiveStateConnectOutcome::default());
         }
-        // Direct IBD progress does not require a reorganization-sized atomic
-        // transaction. Keep each supervisor slice small enough to return to
-        // the shutdown/network select loop promptly. A divergent best-work
-        // branch still uses the operator's full configured bound below so its
-        // disconnect/connect transition remains one atomic commit.
+        // Direct IBD progress amortizes the ordered name-page durability
+        // barrier across one HSD mainnet rollback horizon. The connector still
+        // returns to the shutdown/network select loop between slices, while a
+        // divergent best-work branch uses the operator's full configured bound
+        // below so its disconnect/connect transition remains one atomic commit.
         let direct_connect_limit = maximum_connect.min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
 
         let candidate_hash = match active_tip.as_ref() {
