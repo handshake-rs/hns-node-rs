@@ -756,6 +756,32 @@ where
     apply_record_updates(root, updates, load_one, loaded)
 }
 
+/// Apply mutations from a storage-native prefetched path union. The fallback
+/// loader is retained for uncommon compression siblings that are not on an
+/// affected key path.
+pub fn update_record_tree_prefetched<F, I, P>(
+    root: TreeRoot,
+    updates: I,
+    prefetched: P,
+    load: F,
+) -> Result<UrkelRecordUpdate, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
+    P: IntoIterator<Item = (TreeRoot, Vec<u8>)>,
+{
+    let mut loaded = BTreeMap::new();
+    for (record_root, raw) in prefetched {
+        let record = decode_verified_record(record_root, &raw)?;
+        if let Some(existing) = loaded.insert(record_root, record.clone()) {
+            if existing != record {
+                return Err(UrkelError::NodeHashCollision(record_root));
+            }
+        }
+    }
+    apply_record_updates(root, updates, load, loaded)
+}
+
 fn apply_record_updates<F, I>(
     root: TreeRoot,
     updates: I,
@@ -1741,7 +1767,7 @@ impl BitPrefix {
         count
     }
 
-    fn matches_key(&self, key: &[u8; 32], depth: usize) -> bool {
+    pub fn matches_key(&self, key: &[u8; 32], depth: usize) -> bool {
         depth
             .checked_add(self.bit_len())
             .is_some_and(|end| end <= URKEL_BITS)
@@ -2740,18 +2766,25 @@ mod tests {
 
         let mut batch_calls = 0usize;
         let mut maximum_batch = 0usize;
-        let batched = update_record_tree_batched(tree.root(), updates, 1_024, |record_roots| {
-            batch_calls += 1;
-            maximum_batch = maximum_batch.max(record_roots.len());
-            Ok(record_roots
-                .iter()
-                .map(|record_root| records.get(record_root).cloned())
-                .collect())
-        })
-        .expect("batch-loaded mutation");
+        let batched =
+            update_record_tree_batched(tree.root(), updates.clone(), 1_024, |record_roots| {
+                batch_calls += 1;
+                maximum_batch = maximum_batch.max(record_roots.len());
+                Ok(record_roots
+                    .iter()
+                    .map(|record_root| records.get(record_root).cloned())
+                    .collect())
+            })
+            .expect("batch-loaded mutation");
+        let prefetched =
+            update_record_tree_prefetched(tree.root(), updates, records.clone(), |_record_root| {
+                panic!("complete prefetched tree must not fall back to point loading")
+            })
+            .expect("prefetched mutation");
 
         assert_eq!(batched.root(), point.root());
         assert_eq!(batched.records(), point.records());
+        assert_eq!(prefetched, point);
         assert!(maximum_batch > 1, "fixture must exercise a real MultiGet");
         assert!(
             batch_calls * 4 < point_calls,

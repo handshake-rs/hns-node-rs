@@ -6,11 +6,11 @@ use std::{
     sync::Mutex,
 };
 
-use hns_primitives::{blake2b_256, Reader, Writer};
+use hns_primitives::{blake2b_256, NameHash, Reader, Writer};
 use hns_store::{
     decode_name_page, ColumnFamily, NamePageAddress, NamePageAppender, NamePageBuilder,
-    NamePageError, NamePagePush, NamePageRecord, ReadSnapshot, ScanEntry, SegmentManifest,
-    StoreError, NAME_PAGE_BYTES,
+    NamePageError, NamePagePush, NamePageRecord, NameTreePathRecord, ReadSnapshot, ScanEntry,
+    SegmentManifest, StoreError, NAME_PAGE_BYTES,
 };
 use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord, URKEL_BITS};
 use serde::{Deserialize, Serialize};
@@ -893,6 +893,12 @@ struct LoadedNamePageRecord {
 }
 
 #[derive(Debug)]
+struct NamePagePathWork {
+    root: TreeRoot,
+    traversals: Vec<(NameHash, usize)>,
+}
+
+#[derive(Debug)]
 struct PageCache {
     capacity: usize,
     pages: HashMap<(u32, u32), CachedNamePage>,
@@ -1075,6 +1081,28 @@ impl<S: ReadSnapshot> ReadSnapshot for NamePageSnapshot<'_, S> {
         }
         self.base.scan_prefix(family, prefix)
     }
+
+    fn prefetch_name_tree_paths(
+        &self,
+        root: [u8; 32],
+        keys: &[[u8; 32]],
+    ) -> Result<Option<Vec<NameTreePathRecord>>, StoreError> {
+        let keys = keys.iter().copied().map(NameHash::new).collect::<Vec<_>>();
+        self.pages
+            .prefetch_paths(TreeRoot::new(root), &keys)
+            .map(|records| {
+                records.map(|records| {
+                    records
+                        .into_iter()
+                        .map(|(root, canonical)| NameTreePathRecord {
+                            root: *root.as_bytes(),
+                            canonical,
+                        })
+                        .collect()
+                })
+            })
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
 }
 
 impl NamePageTreeReader {
@@ -1237,6 +1265,108 @@ impl NamePageTreeReader {
             self.insert_discovered(discovered)?;
         }
         Ok(loaded)
+    }
+
+    /// Traverse an affected path union in descending physical page order.
+    /// Child locators point backward, so every incoming traversal for a page
+    /// is known before that page is decoded and no logical tree depth can
+    /// force the same page to be reread.
+    pub fn prefetch_paths(
+        &self,
+        root: TreeRoot,
+        keys: &[NameHash],
+    ) -> Result<Option<BTreeMap<TreeRoot, Vec<u8>>>, PageTreeError> {
+        if root == TreeRoot::ZERO || keys.is_empty() {
+            return Ok(Some(BTreeMap::new()));
+        }
+        let Some(root_address) = self
+            .addresses
+            .lock()
+            .map_err(|_| PageTreeError::Poisoned)?
+            .get(&root)
+            .copied()
+        else {
+            return Ok(None);
+        };
+
+        let mut pending = BTreeMap::<(u32, u32), BTreeMap<u16, NamePagePathWork>>::new();
+        insert_name_page_path_work(
+            &mut pending,
+            root,
+            root_address,
+            keys.iter().copied().map(|key| (key, 0usize)),
+        )?;
+        let mut records = BTreeMap::<TreeRoot, Vec<u8>>::new();
+
+        while let Some((page_key, mut page_work)) = pending.pop_last() {
+            let page_address = NamePageAddress::new(page_key.0, page_key.1, 0)?;
+            self.ensure_page(page_address)?;
+            while let Some((slot, work)) = page_work.pop_last() {
+                let address = NamePageAddress::new(page_key.0, page_key.1, slot)?;
+                let loaded = {
+                    let mut cache = self.cache.lock().map_err(|_| PageTreeError::Poisoned)?;
+                    cache.touch(page_key);
+                    let page = cache
+                        .pages
+                        .get(&page_key)
+                        .ok_or(PageTreeError::MissingCachedPage(address))?;
+                    read_cached_name_page_record(page, work.root, address)?
+                };
+                if let Some(existing) = records.insert(work.root, loaded.canonical.clone()) {
+                    if existing != loaded.canonical {
+                        return Err(PageTreeError::StateCodec(
+                            "page path prefetch found conflicting canonical records".to_owned(),
+                        ));
+                    }
+                }
+                self.insert_discovered(loaded.discovered.clone())?;
+
+                let decoded = UrkelNodeRecord::decode(&loaded.canonical)?;
+                let UrkelNodeRecord::Internal {
+                    prefix,
+                    left,
+                    right,
+                } = decoded
+                else {
+                    continue;
+                };
+                let [(discovered_left, left_address), (discovered_right, right_address)] =
+                    loaded.discovered.as_slice()
+                else {
+                    return Err(PageTreeError::ChildLocatorMismatch(work.root));
+                };
+                if *discovered_left != left || *discovered_right != right {
+                    return Err(PageTreeError::ChildLocatorMismatch(work.root));
+                }
+                for (key, depth) in work.traversals {
+                    if !prefix.matches_key(key.as_bytes(), depth) {
+                        continue;
+                    }
+                    let branch_depth = page_branch_depth(&prefix, depth)?;
+                    let (child, child_address) = if key_bit_at(key.as_bytes(), branch_depth) == 0 {
+                        (left, *left_address)
+                    } else {
+                        (right, *right_address)
+                    };
+                    if child_address >= address {
+                        return Err(PageTreeError::ChildLocatorMismatch(work.root));
+                    }
+                    let traversal = std::iter::once((key, branch_depth + 1));
+                    if (child_address.segment(), child_address.page()) == page_key {
+                        insert_name_page_slot_work(
+                            &mut page_work,
+                            child,
+                            child_address,
+                            traversal,
+                        )?;
+                    } else {
+                        insert_name_page_path_work(&mut pending, child, child_address, traversal)?;
+                    }
+                }
+            }
+        }
+
+        Ok(Some(records))
     }
 
     pub fn known_addresses(&self) -> Result<HashMap<TreeRoot, NamePageAddress>, PageTreeError> {
@@ -1485,6 +1615,65 @@ impl NamePageTreeReader {
             .insert(cache_key, CachedNamePage { records });
         Ok(())
     }
+}
+
+fn insert_name_page_path_work<I>(
+    pending: &mut BTreeMap<(u32, u32), BTreeMap<u16, NamePagePathWork>>,
+    root: TreeRoot,
+    address: NamePageAddress,
+    traversals: I,
+) -> Result<(), PageTreeError>
+where
+    I: IntoIterator<Item = (NameHash, usize)>,
+{
+    insert_name_page_slot_work(
+        pending
+            .entry((address.segment(), address.page()))
+            .or_default(),
+        root,
+        address,
+        traversals,
+    )
+}
+
+fn insert_name_page_slot_work<I>(
+    page: &mut BTreeMap<u16, NamePagePathWork>,
+    root: TreeRoot,
+    address: NamePageAddress,
+    traversals: I,
+) -> Result<(), PageTreeError>
+where
+    I: IntoIterator<Item = (NameHash, usize)>,
+{
+    let work = page
+        .entry(address.slot())
+        .or_insert_with(|| NamePagePathWork {
+            root,
+            traversals: Vec::new(),
+        });
+    if work.root != root {
+        return Err(PageTreeError::AddressConflict(root));
+    }
+    work.traversals.extend(traversals);
+    Ok(())
+}
+
+fn page_branch_depth(prefix: &hns_urkel::BitPrefix, depth: usize) -> Result<usize, PageTreeError> {
+    let branch_depth = depth.checked_add(prefix.bit_len()).ok_or_else(|| {
+        PageTreeError::Urkel(UrkelError::InvalidNode(
+            "Urkel record depth overflowed".to_owned(),
+        ))
+    })?;
+    if branch_depth >= URKEL_BITS {
+        return Err(PageTreeError::Urkel(UrkelError::InvalidNode(
+            "Urkel internal path exceeds the key".to_owned(),
+        )));
+    }
+    Ok(branch_depth)
+}
+
+fn key_bit_at(key: &[u8; 32], bit: usize) -> u8 {
+    (key[bit / 8] >> (7 - bit % 8)) & 1
 }
 
 fn earlier_page_record<'a>(
@@ -1966,13 +2155,15 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let tree = MemoryUrkel::from_entries((0u8..128).map(|index| {
-            let mut key = [0u8; 32];
-            key[0] = index;
-            key[31] = index.reverse_bits();
-            (NameHash::new(key), vec![index; 2_048])
-        }))
-        .expect("tree");
+        let entries = (0u8..128)
+            .map(|index| {
+                let mut key = [0u8; 32];
+                key[0] = index;
+                key[31] = index.reverse_bits();
+                (NameHash::new(key), vec![index; 2_048])
+            })
+            .collect::<Vec<_>>();
+        let tree = MemoryUrkel::from_entries(entries.clone()).expect("tree");
         let root = tree.root();
         let records = tree.node_records().expect("records");
         let packed =
@@ -1984,6 +2175,21 @@ mod tests {
         let reader =
             NamePageTreeReader::open_with_cache(&path, root, root_locator, 1).expect("reader");
 
+        let before = reader.page_load_count().expect("path load count");
+        let prefetched = reader
+            .prefetch_paths(
+                root,
+                &entries.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            )
+            .expect("physical-order path prefetch")
+            .expect("page-backed root");
+        let after = reader.page_load_count().expect("path load count");
+        assert_eq!(prefetched, records);
+        assert_eq!(after - before, packed.page_count() as u64);
+        drop(reader);
+
+        let reader =
+            NamePageTreeReader::open_with_cache(&path, root, root_locator, 1).expect("reader");
         let mut by_page = BTreeMap::<u32, Vec<TreeRoot>>::new();
         for record_root in records.keys().copied() {
             let address = packed.address(record_root).expect("record address");

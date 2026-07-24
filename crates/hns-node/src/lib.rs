@@ -2017,6 +2017,17 @@ impl<S: ReadSnapshot> ReadSnapshot for NodeReadSnapshot<'_, S> {
             Self::Pages(snapshot) => snapshot.scan_prefix(family, prefix),
         }
     }
+
+    fn prefetch_name_tree_paths(
+        &self,
+        root: [u8; 32],
+        keys: &[[u8; 32]],
+    ) -> Result<Option<Vec<hns_store::NameTreePathRecord>>, hns_store::StoreError> {
+        match self {
+            Self::Base(snapshot) => snapshot.prefetch_name_tree_paths(root, keys),
+            Self::Pages(snapshot) => snapshot.prefetch_name_tree_paths(root, keys),
+        }
+    }
 }
 
 impl NamePageStorage {

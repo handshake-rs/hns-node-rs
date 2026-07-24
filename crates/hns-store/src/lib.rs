@@ -176,6 +176,12 @@ impl ColumnFamily {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NameTreePathRecord {
+    pub root: [u8; 32],
+    pub canonical: Vec<u8>,
+}
+
 pub trait ReadSnapshot {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError>;
 
@@ -192,6 +198,17 @@ pub trait ReadSnapshot {
         family: ColumnFamily,
         prefix: &[u8],
     ) -> Result<Vec<ScanEntry>, StoreError>;
+
+    /// Storage-native union of authenticated paths for a set of name keys.
+    /// Page-backed snapshots override this to visit each physical page once;
+    /// ordinary stores return `None` and use generic content-hash MultiGet.
+    fn prefetch_name_tree_paths(
+        &self,
+        _root: [u8; 32],
+        _keys: &[[u8; 32]],
+    ) -> Result<Option<Vec<NameTreePathRecord>>, StoreError> {
+        Ok(None)
+    }
 
     /// Visit a lexicographically ordered prefix range without requiring the
     /// caller to materialize the entire range. Backends should override this
@@ -494,6 +511,22 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
         }
 
         Ok(entries.into_iter().collect())
+    }
+
+    fn prefetch_name_tree_paths(
+        &self,
+        root: [u8; 32],
+        keys: &[[u8; 32]],
+    ) -> Result<Option<Vec<NameTreePathRecord>>, StoreError> {
+        if self
+            .changes
+            .borrow()
+            .get(&ColumnFamily::NameTreeNodes)
+            .is_some_and(|changes| !changes.is_empty())
+        {
+            return Ok(None);
+        }
+        self.base.prefetch_name_tree_paths(root, keys)
     }
 }
 
