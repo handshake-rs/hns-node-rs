@@ -69,14 +69,15 @@ use hns_state::{
     decode_name_state, disconnect_block_to_batch, load_name_tree_snapshot_pins,
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
     load_stored_name_tree_root, migrate_name_tree_interval_accumulator, name_page_root_key,
-    pack_name_page_records, stage_remove_name_tree_snapshot_pin, stream_name_page_tree,
-    validate_persisted_name_tree_overlays, validate_persisted_name_tree_root,
-    validate_persisted_name_trees, verify_name_tree_interval_state,
-    verify_stored_name_tree_root_binding, AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock,
-    DisconnectBlock, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState,
-    NamePageTreeReader, NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices,
-    StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
-    NAME_PAGE_STATE_KEY,
+    name_tree_snapshot_pin_key, pack_name_page_records, stage_remove_name_tree_snapshot_pin,
+    stream_name_page_tree, validate_persisted_name_tree_overlays,
+    validate_persisted_name_tree_root, validate_persisted_name_trees,
+    verify_name_tree_interval_state, verify_stored_name_tree_root_binding,
+    AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock, NamePageRootLocator,
+    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader,
+    NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine,
+    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
+    NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_unclean_start, open_store, truncate_name_pages_to_committed_tail,
@@ -2221,6 +2222,7 @@ impl NamePageStorage {
         batch: &mut B,
         reader: &NamePageTreeReader,
         staged_nodes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+        snapshot_pins: &[NameTreeSnapshotPin],
         root: TreeRoot,
         height: Option<Height>,
     ) -> Result<NamePageState> {
@@ -2237,10 +2239,14 @@ impl NamePageStorage {
             })?;
             records.insert(TreeRoot::new(raw_root), value);
         }
-        // A multi-block reorganization can stage nodes for an intermediate
-        // root that is no longer reachable from its final root. Append only a
-        // final-root update; an already known final root needs no new pages.
-        if !records.contains_key(&root) {
+        // A multi-block activation can cross several name-tree intervals.
+        // Retain records for the final root and every intermediate root pinned
+        // for rollback; unrelated intermediate working roots need no pages.
+        if !records.contains_key(&root)
+            && !snapshot_pins
+                .iter()
+                .any(|pin| records.contains_key(&pin.root))
+        {
             records.clear();
         }
 
@@ -2335,9 +2341,44 @@ impl NamePageStorage {
                 &known,
             )
             .map_err(|error| anyhow::anyhow!("failed to pack name-page update: {error}"))?;
-            let address = packed.address(root).ok_or_else(|| {
-                anyhow::anyhow!("name-page update did not assign its resulting root")
-            })?;
+            let address = packed
+                .address(root)
+                .or_else(|| known.get(&root).copied())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("name-page update did not resolve its resulting root")
+                })?;
+            let mut published_pins = BTreeMap::<TreeRoot, Height>::new();
+            for pin in snapshot_pins {
+                if pin.root != TreeRoot::ZERO && pin.root != root {
+                    published_pins
+                        .entry(pin.root)
+                        .and_modify(|height| *height = (*height).min(pin.height))
+                        .or_insert(pin.height);
+                }
+            }
+            for (pin_root, pin_height) in published_pins {
+                if load_name_page_root_record(snapshot, pin_root)?.is_some() {
+                    continue;
+                }
+                let pin_address = packed
+                    .address(pin_root)
+                    .or_else(|| known.get(&pin_root).copied())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "snapshot-pinned name root {pin_root:?} has no page address"
+                        )
+                    })?;
+                let record = NamePageRootRecord {
+                    root: pin_root,
+                    locator: NamePageRootLocator::new(self.state.manifest.generation, pin_address),
+                    height: pin_height,
+                };
+                batch.put(
+                    ColumnFamily::Snapshots,
+                    &name_page_root_key(pin_root),
+                    &record.encode(),
+                )?;
+            }
             let manifest = packed
                 .append(appender)
                 .map_err(|error| anyhow::anyhow!("failed to append name-page update: {error}"))?;
@@ -2430,6 +2471,29 @@ impl NamePageStorage {
         );
         Ok(())
     }
+}
+
+fn staged_name_tree_snapshot_pins(overlay: &StagingOverlay) -> Result<Vec<NameTreeSnapshotPin>> {
+    let mut pins = Vec::new();
+    for (key, value) in overlay.staged_family(ColumnFamily::Snapshots) {
+        if !key.starts_with(NAME_TREE_SNAPSHOT_PIN_PREFIX) {
+            continue;
+        }
+        let Some(raw) = value else {
+            continue;
+        };
+        let pin = NameTreeSnapshotPin::decode(&raw)
+            .map_err(|error| anyhow::anyhow!("failed to decode staged name-tree pin: {error}"))?;
+        if key != name_tree_snapshot_pin_key(pin.height) {
+            anyhow::bail!(
+                "staged name-tree pin at height {} has a mismatched key",
+                pin.height
+            );
+        }
+        pins.push(pin);
+    }
+    pins.sort_unstable_by_key(|pin| pin.height);
+    Ok(pins)
 }
 
 fn name_page_file_path(directory: &std::path::Path, generation: u64, segment: u32) -> PathBuf {
@@ -4259,6 +4323,7 @@ impl NodeState {
         let root = load_stored_name_tree_commit_root(&staged)
             .map_err(|error| anyhow::anyhow!("failed to read staged page root: {error}"))?;
         let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
+        let staged_pins = staged_name_tree_snapshot_pins(&overlay)?;
         drop(staged);
         let mut inner = batch.into_inner();
         let prepared = match self
@@ -4270,6 +4335,7 @@ impl NodeState {
                 &mut inner,
                 &reader,
                 staged_nodes,
+                &staged_pins,
                 root,
                 Some(request.height),
             ) {
@@ -4529,6 +4595,7 @@ impl NodeState {
         let root = load_stored_name_tree_commit_root(&staged)
             .map_err(|error| anyhow::anyhow!("failed to read restored page root: {error}"))?;
         let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
+        let staged_pins = staged_name_tree_snapshot_pins(&overlay)?;
         drop(staged);
         let mut inner = batch.into_inner();
         let resulting_height = request_height.checked_sub(1);
@@ -4541,6 +4608,7 @@ impl NodeState {
                 &mut inner,
                 &reader,
                 staged_nodes,
+                &staged_pins,
                 root,
                 resulting_height,
             ) {
@@ -4839,6 +4907,8 @@ impl NodeState {
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
         let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
+        let staged_pins =
+            staged_name_tree_snapshot_pins(&overlay).map_err(ChainActivationFailure::Internal)?;
         let mut batch = batch.into_inner();
         drop(staged);
         let prepared_page_state =
@@ -4848,6 +4918,7 @@ impl NodeState {
                     &mut batch,
                     reader,
                     staged_nodes,
+                    &staged_pins,
                     root,
                     Some(final_tip.height),
                 ) {
@@ -6371,6 +6442,7 @@ mod tests {
         StateEngine, StateView,
     };
     use hns_store::ReadSnapshot;
+    use hns_urkel::MemoryUrkel;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -7971,6 +8043,7 @@ mod tests {
                 &mut batch,
                 &reader,
                 BTreeMap::new(),
+                &[],
                 root,
                 Some(NAME_PAGE_SEGMENT_BLOCKS),
             )
@@ -8032,6 +8105,89 @@ mod tests {
         )
         .expect("restart page-backed node");
         assert_eq!(audit, StartupAuditKind::Exhaustive);
+        std::fs::remove_dir_all(directory).expect("remove page fixture");
+    }
+
+    #[test]
+    fn page_batch_publishes_every_intermediate_snapshot_pin_locator() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-node-name-page-pins-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        drop(state);
+        let mut pages =
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages");
+        let first = MemoryUrkel::from_entries([
+            (NameHash::new([0x11; 32]), b"alpha".to_vec()),
+            (NameHash::new([0x91; 32]), b"beta".to_vec()),
+        ])
+        .expect("first tree");
+        let second = MemoryUrkel::from_entries([
+            (NameHash::new([0x11; 32]), b"alpha-updated".to_vec()),
+            (NameHash::new([0x91; 32]), b"beta".to_vec()),
+            (NameHash::new([0xe1; 32]), b"gamma".to_vec()),
+        ])
+        .expect("second tree");
+        let first_root = first.root();
+        let second_root = second.root();
+        let mut records = first.node_records().expect("first records");
+        records.extend(second.node_records().expect("second records"));
+        let staged_nodes = records
+            .into_iter()
+            .map(|(root, raw)| (root.as_bytes().to_vec(), Some(raw)))
+            .collect::<BTreeMap<_, _>>();
+        let pins = [
+            NameTreeSnapshotPin {
+                height: 5,
+                block_hash: BlockHash::new([0x51; 32]),
+                root: first_root,
+            },
+            NameTreeSnapshotPin {
+                height: 10,
+                block_hash: BlockHash::new([0x52; 32]),
+                root: second_root,
+            },
+        ];
+
+        let raw = store.snapshot().expect("base snapshot");
+        let reader = pages.reader(&raw).expect("base reader");
+        let mut batch = store.batch();
+        let prepared = pages
+            .prepare_root(
+                &raw,
+                &mut batch,
+                &reader,
+                staged_nodes,
+                &pins,
+                second_root,
+                Some(12),
+            )
+            .expect("prepare multi-boundary page batch");
+        drop(reader);
+        drop(raw);
+        store.commit(batch).expect("publish page batch");
+        pages.commit_prepared(prepared);
+
+        let snapshot = store.snapshot().expect("published snapshot");
+        for (root, expected_height) in [(first_root, 5), (second_root, 12)] {
+            let record = load_name_page_root_record(&snapshot, root)
+                .expect("load locator")
+                .expect("published locator");
+            assert_eq!(record.height, expected_height);
+            let reader = pages.reader(&snapshot).expect("published reader");
+            assert!(reader.load(root).expect("load pinned root").is_some());
+        }
+        drop(snapshot);
+        drop(pages);
         std::fs::remove_dir_all(directory).expect("remove page fixture");
     }
 
@@ -10331,7 +10487,9 @@ mod tests {
 
         let mut previous = genesis.hash;
         let mut side = Vec::new();
-        for offset in 0..10u32 {
+        for offset in 0..=u32::try_from(shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE)
+            .expect("direct slice fits u32")
+        {
             let height = offset + 1;
             let mut block =
                 block_with_commitments(vec![coinbase_transaction_with_tag(202 + offset, 50)]);
@@ -10348,7 +10506,7 @@ mod tests {
 
         assert!(side.len() > shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
         let outcome = node
-            .shadow_sync_connect_stored_state(64)
+            .shadow_sync_connect_stored_state(side.len())
             .expect("deep stored reorganization");
         assert_eq!(outcome.connected, side.len());
         assert_eq!(outcome.disconnected, 1);

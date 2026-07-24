@@ -473,7 +473,8 @@ impl MemoryUrkel {
     }
 
     pub fn root(&self) -> TreeRoot {
-        TreeRoot::new(build_root(&self.entries).hash())
+        let entries = self.entries.iter().collect::<Vec<_>>();
+        sorted_entries_root(&entries, 0)
     }
 
     pub fn prove_memory(&self, key: NameHash) -> MemoryProof {
@@ -500,10 +501,35 @@ impl MemoryUrkel {
     /// history-independent and content-addressed: an unchanged subtree keeps
     /// the same key and bytes across generations.
     pub fn node_records(&self) -> Result<BTreeMap<TreeRoot, Vec<u8>>, UrkelError> {
+        self.node_records_with_root().map(|(_, records)| records)
+    }
+
+    /// Encode every reachable node and return the root computed by that same
+    /// traversal. Large trees must not be rebuilt merely to assert that the
+    /// record traversal produced the expected root.
+    pub fn node_records_with_root(
+        &self,
+    ) -> Result<(TreeRoot, BTreeMap<TreeRoot, Vec<u8>>), UrkelError> {
         let mut records = BTreeMap::new();
         let root = build_root(&self.entries).collect_records(&mut records)?;
-        debug_assert_eq!(root, self.root());
-        Ok(records)
+        Ok((root, records))
+    }
+
+    /// Recompute the root while retaining canonical bytes only for the path
+    /// from `target` to that root. Offline corruption diagnosis therefore
+    /// remains linear in tree size without retaining every encoded record.
+    pub fn record_path_to_root(
+        &self,
+        target: TreeRoot,
+    ) -> Result<(TreeRoot, usize, Option<Vec<(TreeRoot, Vec<u8>)>>), UrkelError> {
+        let entries = self.entries.iter().collect::<Vec<_>>();
+        let record_count = entries
+            .len()
+            .checked_mul(2)
+            .and_then(|count| count.checked_sub(usize::from(!entries.is_empty())))
+            .ok_or_else(|| UrkelError::Codec("record count overflowed".to_owned()))?;
+        let (root, path) = sorted_entries_record_path(&entries, 0, target)?;
+        Ok((root, record_count, path))
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&NameHash, &[u8])> {
@@ -2410,6 +2436,99 @@ impl Node {
     }
 }
 
+fn sorted_entries_root(entries: &[(&NameHash, &Vec<u8>)], depth: usize) -> TreeRoot {
+    match entries {
+        [] => TreeRoot::ZERO,
+        [(key, value)] => TreeRoot::new(hash_leaf(key.as_bytes(), &blake2b_256(value))),
+        _ => {
+            let first = entries.first().expect("nonempty entries").0;
+            let last = entries.last().expect("nonempty entries").0;
+            let shared = common_key_bits(first.as_bytes(), last.as_bytes(), depth);
+            let branch_depth = depth + shared;
+            debug_assert!(branch_depth < URKEL_BITS);
+            let split =
+                entries.partition_point(|(key, _)| key_bit(key.as_bytes(), branch_depth) == 0);
+            debug_assert!(split > 0 && split < entries.len());
+            let left = sorted_entries_root(&entries[..split], branch_depth + 1);
+            let right = sorted_entries_root(&entries[split..], branch_depth + 1);
+            let prefix = BitPrefix::from_key_range(first.as_bytes(), depth, shared);
+            TreeRoot::new(hash_internal(&prefix, left.as_bytes(), right.as_bytes()))
+        }
+    }
+}
+
+fn sorted_entries_record_path(
+    entries: &[(&NameHash, &Vec<u8>)],
+    depth: usize,
+    target: TreeRoot,
+) -> Result<(TreeRoot, Option<Vec<(TreeRoot, Vec<u8>)>>), UrkelError> {
+    match entries {
+        [] => Ok((TreeRoot::ZERO, None)),
+        [(key, value)] => {
+            let root = TreeRoot::new(hash_leaf(key.as_bytes(), &blake2b_256(value)));
+            let path = if root == target {
+                Some(vec![(
+                    root,
+                    UrkelNodeRecord::Leaf {
+                        key: **key,
+                        value: (*value).clone(),
+                    }
+                    .encode()?,
+                )])
+            } else {
+                None
+            };
+            Ok((root, path))
+        }
+        _ => {
+            let first = entries.first().expect("nonempty entries").0;
+            let last = entries.last().expect("nonempty entries").0;
+            let shared = common_key_bits(first.as_bytes(), last.as_bytes(), depth);
+            let branch_depth = depth.checked_add(shared).ok_or_else(|| {
+                UrkelError::InvalidNode("sorted entry branch depth overflowed".to_owned())
+            })?;
+            if branch_depth >= URKEL_BITS {
+                return Err(UrkelError::InvalidNode(
+                    "sorted entries contain colliding key ranges".to_owned(),
+                ));
+            }
+            let split =
+                entries.partition_point(|(key, _)| key_bit(key.as_bytes(), branch_depth) == 0);
+            if split == 0 || split == entries.len() {
+                return Err(UrkelError::InvalidNode(
+                    "sorted entries failed to partition at their first divergent bit".to_owned(),
+                ));
+            }
+            let (left, left_path) =
+                sorted_entries_record_path(&entries[..split], branch_depth + 1, target)?;
+            let (right, right_path) =
+                sorted_entries_record_path(&entries[split..], branch_depth + 1, target)?;
+            if left_path.is_some() && right_path.is_some() {
+                return Err(UrkelError::InvalidNode(
+                    "target node appears in both sorted subtrees".to_owned(),
+                ));
+            }
+            let record = UrkelNodeRecord::Internal {
+                prefix: BitPrefix::from_key_range(first.as_bytes(), depth, shared),
+                left,
+                right,
+            };
+            let root = record.root();
+            let mut path = if root == target {
+                Vec::new()
+            } else {
+                left_path.or(right_path).unwrap_or_default()
+            };
+            if root == target || !path.is_empty() {
+                path.push((root, record.encode()?));
+                Ok((root, Some(path)))
+            } else {
+                Ok((root, None))
+            }
+        }
+    }
+}
+
 fn build_root(entries: &BTreeMap<NameHash, Vec<u8>>) -> Node {
     let mut root = Node::Null;
     for (key, value) in entries {
@@ -2892,6 +3011,43 @@ mod tests {
                 .expect("incremental record tree"),
             reachable.len()
         );
+    }
+
+    #[test]
+    fn record_path_reconstruction_is_bounded_and_rooted() {
+        let tree = MemoryUrkel::from_entries(
+            (0..64).map(|index| (key(index), format!("value-{index}").into_bytes())),
+        )
+        .expect("tree");
+        let (expected_root, records) = tree.node_records_with_root().expect("records");
+        let target = records
+            .keys()
+            .copied()
+            .find(|root| *root != expected_root)
+            .expect("non-root record");
+
+        let (actual_root, record_count, path) = tree
+            .record_path_to_root(target)
+            .expect("target record path");
+        let path = path.expect("target is reachable");
+        assert_eq!(actual_root, expected_root);
+        assert_eq!(record_count, records.len());
+        assert_eq!(path.first().map(|(root, _)| *root), Some(target));
+        assert_eq!(path.last().map(|(root, _)| *root), Some(expected_root));
+        for (root, raw) in &path {
+            assert_eq!(records.get(root), Some(raw));
+        }
+
+        let mut missing = [0xff; 32];
+        while records.contains_key(&TreeRoot::new(missing)) {
+            missing[0] = missing[0].wrapping_sub(1);
+        }
+        let (missing_root, missing_count, missing_path) = tree
+            .record_path_to_root(TreeRoot::new(missing))
+            .expect("missing record path");
+        assert_eq!(missing_root, expected_root);
+        assert_eq!(missing_count, records.len());
+        assert!(missing_path.is_none());
     }
 
     #[test]

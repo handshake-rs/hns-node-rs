@@ -1392,6 +1392,94 @@ impl NamePageTreeReader {
         Ok(loaded)
     }
 
+    /// Locate one immutable record by scanning committed pages newest-first.
+    ///
+    /// Root locators are normally published atomically with page appends. This
+    /// bounded-memory path exists for offline recovery when the page bytes
+    /// survived but their small RocksDB locator did not. A returned locator is
+    /// content-hash checked and its child addresses must point backward.
+    pub fn locate_record(
+        &self,
+        target: TreeRoot,
+    ) -> Result<Option<NamePageRootLocator>, PageTreeError> {
+        Ok(self.locate_records([target])?.get(&target).copied())
+    }
+
+    /// Locate several recovery roots in one newest-first physical pass.
+    pub fn locate_records<I>(
+        &self,
+        targets: I,
+    ) -> Result<BTreeMap<TreeRoot, NamePageRootLocator>, PageTreeError>
+    where
+        I: IntoIterator<Item = TreeRoot>,
+    {
+        let mut remaining = targets
+            .into_iter()
+            .filter(|target| *target != TreeRoot::ZERO)
+            .collect::<HashSet<_>>();
+        let mut located = BTreeMap::new();
+        if remaining.is_empty() {
+            return Ok(located);
+        }
+        let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
+        let mut segments = files.keys().copied().collect::<Vec<_>>();
+        segments.sort_unstable_by(|left, right| right.cmp(left));
+        let mut encoded = vec![0u8; NAME_PAGE_BYTES];
+
+        for segment in segments {
+            let file = files
+                .get_mut(&segment)
+                .ok_or(PageTreeError::MissingSegment(segment))?;
+            let bytes = file.metadata().map_err(PageTreeError::io)?.len();
+            if !bytes.is_multiple_of(NAME_PAGE_BYTES as u64) {
+                return Err(PageTreeError::UnalignedSegment { segment, bytes });
+            }
+            let pages = bytes / NAME_PAGE_BYTES as u64;
+            let pages_u32 = u32::try_from(pages)
+                .map_err(|_| PageTreeError::PageCountOverflow { segment, pages })?;
+
+            for page_number in (0..pages_u32).rev() {
+                file.seek(SeekFrom::Start(
+                    u64::from(page_number)
+                        .checked_mul(NAME_PAGE_BYTES as u64)
+                        .ok_or(PageTreeError::OffsetOverflow)?,
+                ))
+                .map_err(PageTreeError::io)?;
+                file.read_exact(&mut encoded).map_err(PageTreeError::io)?;
+                let page = decode_name_page(&encoded)?;
+                for slot in (0..page.record_count()).rev() {
+                    let raw = page.record(slot)?;
+                    let target = TreeRoot::new(raw.key);
+                    if !remaining.contains(&target) {
+                        continue;
+                    }
+                    let address = NamePageAddress::new(segment, page_number, slot)?;
+                    let loaded = validate_loaded_name_page_record(
+                        NamePageRecord {
+                            key: raw.key,
+                            children: raw.children.into_iter().flatten().collect(),
+                            canonical: raw.canonical.to_vec(),
+                        },
+                        target,
+                    )?;
+                    if loaded
+                        .discovered
+                        .iter()
+                        .any(|(_, child_address)| *child_address >= address)
+                    {
+                        return Err(PageTreeError::ChildLocatorMismatch(target));
+                    }
+                    located.insert(target, NamePageRootLocator::new(self.generation, address));
+                    remaining.remove(&target);
+                    if remaining.is_empty() {
+                        return Ok(located);
+                    }
+                }
+            }
+        }
+        Ok(located)
+    }
+
     /// Traverse an affected path union in descending physical page order.
     /// Child locators point backward, so every incoming traversal for a page
     /// is known before that page is decoded and no logical tree depth can
@@ -2402,6 +2490,27 @@ mod tests {
         let root_locator = packed.root_locator(root).expect("root locator");
         let reader =
             NamePageTreeReader::open_with_cache(&path, root, root_locator, 1).expect("reader");
+        assert_eq!(
+            reader.locate_record(root).expect("locate root"),
+            Some(root_locator)
+        );
+        let another = *records
+            .keys()
+            .find(|record| **record != root)
+            .expect("child");
+        assert_eq!(
+            reader
+                .locate_records([root, another])
+                .expect("locate roots")
+                .len(),
+            2
+        );
+        assert_eq!(
+            reader
+                .locate_record(TreeRoot::new([0xff; 32]))
+                .expect("locate missing root"),
+            None
+        );
 
         let before = reader.path_page_read_count();
         let prefetched = reader

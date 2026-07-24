@@ -3488,11 +3488,11 @@ pub fn verify_stored_name_tree_root_binding<T: ReadSnapshot>(
 /// Exhaustively bind the current materialized NameState view, the pending
 /// interval accumulator, canonical undo, and the latest committed root.
 /// Startup calls this once; steady-state block admission remains path-local.
-pub fn verify_name_tree_interval_state<T: ReadSnapshot>(
+fn prepare_committed_name_tree<T: ReadSnapshot>(
     snapshot: &T,
     tree_interval: Height,
     tip_height: Height,
-) -> Result<TreeRoot, StateError> {
+) -> Result<(TreeRoot, MemoryUrkel), StateError> {
     if tree_interval == 0 {
         return Err(StateError::Codec(
             "network name-tree snapshot interval is zero".to_owned(),
@@ -3513,11 +3513,7 @@ pub fn verify_name_tree_interval_state<T: ReadSnapshot>(
                 "active tip height {tip_height} is between tree intervals but has no accumulator"
             )));
         }
-        let actual = rebuild_name_tree_root(snapshot)?;
-        if stored != actual {
-            return Err(StateError::StoredTreeRootMismatch { stored, actual });
-        }
-        return Ok(stored);
+        return Ok((stored, materialize_name_tree(snapshot)?));
     };
 
     if tip_height.is_multiple_of(tree_interval) {
@@ -3585,11 +3581,77 @@ pub fn verify_name_tree_interval_state<T: ReadSnapshot>(
         ));
     }
 
-    let actual = rebuild_name_tree_root_with_overrides(snapshot, &boundary_overrides)?;
+    Ok((
+        stored,
+        materialize_name_tree_with_overrides(snapshot, &boundary_overrides)?,
+    ))
+}
+
+pub fn materialize_committed_name_tree<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+) -> Result<MemoryUrkel, StateError> {
+    let (stored, tree) = prepare_committed_name_tree(snapshot, tree_interval, tip_height)?;
+    let actual = tree.root();
     if stored != actual {
         return Err(StateError::StoredTreeRootMismatch { stored, actual });
     }
-    Ok(stored)
+    Ok(tree)
+}
+
+/// Reconstruct the interval-committed tree and its canonical node records in
+/// one radix-tree traversal. This is intended for offline diagnosis and repair:
+/// it derives bytes from NameState plus canonical undo rather than trusting the
+/// content-addressed page store under examination.
+pub fn reconstruct_committed_name_tree_records<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+) -> Result<(TreeRoot, usize, BTreeMap<TreeRoot, Vec<u8>>), StateError> {
+    let (stored, tree) = prepare_committed_name_tree(snapshot, tree_interval, tip_height)?;
+    let name_count = tree.len();
+    let (actual, records) = tree.node_records_with_root()?;
+    if stored != actual {
+        return Err(StateError::StoredTreeRootMismatch { stored, actual });
+    }
+    Ok((actual, name_count, records))
+}
+
+pub type NameTreeRecordPath = Vec<(TreeRoot, Vec<u8>)>;
+
+/// Reconstruct one committed tree while retaining only a requested node's
+/// canonical path. This is the bounded diagnostic counterpart to exporting
+/// every content-addressed record.
+pub fn diagnose_committed_name_tree_node<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+    target: TreeRoot,
+) -> Result<(TreeRoot, usize, usize, Option<NameTreeRecordPath>), StateError> {
+    let (stored, tree) = prepare_committed_name_tree(snapshot, tree_interval, tip_height)?;
+    let name_count = tree.len();
+    let (actual, record_count, path) = tree.record_path_to_root(target)?;
+    if stored != actual {
+        return Err(StateError::StoredTreeRootMismatch { stored, actual });
+    }
+    Ok((actual, name_count, record_count, path))
+}
+
+/// Exhaustively bind the current materialized NameState view, the pending
+/// interval accumulator, canonical undo, and the latest committed root.
+/// Startup calls this once; steady-state block admission remains path-local.
+pub fn verify_name_tree_interval_state<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+) -> Result<TreeRoot, StateError> {
+    let (stored, tree) = prepare_committed_name_tree(snapshot, tree_interval, tip_height)?;
+    let actual = tree.root();
+    if stored != actual {
+        return Err(StateError::StoredTreeRootMismatch { stored, actual });
+    }
+    Ok(actual)
 }
 
 pub fn encode_coin(coin: &Coin) -> Vec<u8> {

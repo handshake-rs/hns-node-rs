@@ -24,12 +24,16 @@ hns-rpc = { path = "../hns-rpc" }
 hns-state = { path = "../hns-state" }
 hns-store = { path = "../hns-store", default-features = false }
 hns-sync = { path = "../hns-sync" }
+hex = "0.4"
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+hns-urkel = { path = "../hns-urkel" }
 
 [[bin]]
 name = "hsrd"
@@ -46,3 +50,7 @@ path = "src/bin/hsrd_state_manifest.rs"
 [[bin]]
 name = "hsrd-storage-maintenance"
 path = "src/bin/hsrd_storage_maintenance.rs"
+
+[[bin]]
+name = "hsrd-name-tree-diagnose"
+path = "src/bin/hsrd_name_tree_diagnose.rs"
