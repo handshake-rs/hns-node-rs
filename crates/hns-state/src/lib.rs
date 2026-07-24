@@ -5,9 +5,9 @@ mod page_tree;
 pub use hns_urkel::TreeRoot;
 pub use page_tree::{
     name_page_root_key, pack_name_page_records, stream_name_page_tree, NamePageRootLocator,
-    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader, PackedNamePages,
-    PageTreeError, StreamedNamePages, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
-    NAME_PAGE_STATE_KEY,
+    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader, NamePageValidation,
+    PackedNamePages, PageTreeError, StreamedNamePages, NAME_PAGE_ROOT_PREFIX,
+    NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
 };
 
 use std::{
@@ -42,8 +42,9 @@ use hns_store::{
 use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
     reachable_record_roots_batched, update_record_tree, update_record_tree_batched,
-    validate_record_root, validate_record_tree, validate_record_trees_batched, MemoryUrkel,
-    NameTreeSnapshot, UrkelError, UrkelProof,
+    validate_record_root, validate_record_tree, validate_record_trees_batched,
+    validate_record_trees_batched_until, MemoryUrkel, NameTreeSnapshot, UrkelError, UrkelProof,
+    URKEL_BITS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2696,6 +2697,51 @@ where
     .map_err(StateError::NameTree)
 }
 
+/// Validate only the legacy records above an already audited immutable page
+/// subtree. The page summary supplies the subtree's maximum relative path so
+/// an overlay cannot hide a path that exceeds Urkel's 256-bit key bound.
+pub fn validate_persisted_name_tree_overlays<T, I>(
+    snapshot: &T,
+    roots: I,
+    pages: &NamePageValidation,
+    maximum_batch: usize,
+) -> Result<usize, StateError>
+where
+    T: ReadSnapshot,
+    I: IntoIterator<Item = TreeRoot>,
+{
+    validate_record_trees_batched_until(
+        roots,
+        maximum_batch,
+        |root, depth| {
+            let Some(relative) = pages.maximum_path_bits(root) else {
+                return Ok(false);
+            };
+            let absolute = usize::from(depth)
+                .checked_add(usize::from(relative))
+                .ok_or_else(|| {
+                    UrkelError::InvalidNode("Urkel record depth overflowed".to_owned())
+                })?;
+            if absolute > URKEL_BITS {
+                return Err(UrkelError::InvalidNode(
+                    "Urkel record path exceeds the key".to_owned(),
+                ));
+            }
+            Ok(true)
+        },
+        |node_roots| {
+            let keys = node_roots
+                .iter()
+                .map(|root| root.as_bytes().as_slice())
+                .collect::<Vec<_>>();
+            snapshot
+                .get_many(ColumnFamily::NameTreeNodes, &keys)
+                .map_err(|error| UrkelError::Storage(error.to_string()))
+        },
+    )
+    .map_err(StateError::NameTree)
+}
+
 /// Validate only the content-addressed record directly bound by the current
 /// root. This keeps steady-state transitions path-local; node startup performs
 /// the full materialized-state and reachable-record validation.
@@ -3384,6 +3430,18 @@ pub fn load_stored_name_tree_commit_root<T: ReadSnapshot>(
 /// the committed tree exactly. With pending changes, the node startup audit
 /// validates accumulator/undo continuity separately.
 pub fn verify_stored_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot, StateError> {
+    let stored = verify_stored_name_tree_root_binding(snapshot)?;
+    validate_persisted_name_tree(snapshot, stored)?;
+    Ok(stored)
+}
+
+/// Verify the materialized/interval root binding without traversing its
+/// content-addressed records. Node startup chooses a storage-native exhaustive
+/// audit immediately afterward; callers that need the legacy combined check
+/// continue to use `verify_stored_name_tree_root`.
+pub fn verify_stored_name_tree_root_binding<T: ReadSnapshot>(
+    snapshot: &T,
+) -> Result<TreeRoot, StateError> {
     let stored = load_stored_name_tree_root(snapshot)?;
     let committed = load_stored_name_tree_commit_root(snapshot)?;
     if stored != committed {
@@ -3392,7 +3450,6 @@ pub fn verify_stored_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<Tre
             actual: committed,
         });
     }
-    validate_persisted_name_tree(snapshot, stored)?;
     match load_name_tree_accumulator(snapshot)? {
         Some(accumulator) if accumulator.base_root != stored => {
             return Err(StateError::Codec(

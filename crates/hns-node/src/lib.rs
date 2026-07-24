@@ -61,15 +61,17 @@ use hns_rpc::{
     RpcNameTreeCompactionInfo, RpcNodeStatus, RpcParityInfo, RpcService, RpcSnapshot,
     RpcTransactionEntry, RpcUndoRetentionInfo,
 };
+#[cfg(test)]
+use hns_state::verify_stored_name_tree_root;
 use hns_state::{
     compact_name_tree_nodes_streaming, connect_block_to_batch_with_services, decode_coin,
     decode_name_state, disconnect_block_to_batch, load_name_tree_snapshot_pins,
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
     load_stored_name_tree_root, migrate_name_tree_interval_accumulator, name_page_root_key,
     pack_name_page_records, stage_remove_name_tree_snapshot_pin, stream_name_page_tree,
-    validate_persisted_name_tree_root, validate_persisted_name_trees,
-    validate_persisted_name_trees_with_batch, verify_name_tree_interval_state,
-    verify_stored_name_tree_root, AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock,
+    validate_persisted_name_tree_overlays, validate_persisted_name_tree_root,
+    validate_persisted_name_trees, verify_name_tree_interval_state,
+    verify_stored_name_tree_root_binding, AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock,
     DisconnectBlock, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState,
     NamePageTreeReader, NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices,
     StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
@@ -2708,7 +2710,7 @@ impl NodeState {
             load_stored_name_tree_root(&snapshot)
                 .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?
         } else {
-            verify_stored_name_tree_root(&snapshot)
+            verify_stored_name_tree_root_binding(&snapshot)
                 .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?
         };
         let durable_name_tree_commit_root =
@@ -2790,10 +2792,21 @@ impl NodeState {
                 })?;
             }
         } else {
-            let validation = if page_reader.is_some() {
-                validate_persisted_name_trees_with_batch(
-                    &snapshot,
+            let validation = if let Some(reader) = page_reader.as_ref() {
+                let pages = reader.validate_committed_pages().map_err(|error| {
+                    anyhow::anyhow!("authenticated name-page audit failed: {error}")
+                })?;
+                tracing::info!(
+                    segments = pages.segments,
+                    pages = pages.pages,
+                    records = pages.records,
+                    bytes = pages.bytes,
+                    "validated authenticated name pages in physical order"
+                );
+                validate_persisted_name_tree_overlays(
+                    &raw_snapshot,
                     retained_name_tree_roots,
+                    &pages,
                     PAGE_BACKED_STARTUP_VALIDATION_BATCH,
                 )
             } else {

@@ -941,6 +941,33 @@ pub struct NamePageTreeReader {
     cache: Mutex<PageCache>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedPageRecord {
+    root: TreeRoot,
+    maximum_path_bits: u16,
+}
+
+/// Result of one physical-order audit of the immutable authenticated page
+/// store. Roots remain sorted only for the short legacy-overlay audit and are
+/// released with this value before steady-state operation.
+#[derive(Debug)]
+pub struct NamePageValidation {
+    pub segments: usize,
+    pub pages: u64,
+    pub records: u64,
+    pub bytes: u64,
+    roots: Vec<ValidatedPageRecord>,
+}
+
+impl NamePageValidation {
+    pub fn maximum_path_bits(&self, root: TreeRoot) -> Option<u16> {
+        self.roots
+            .binary_search_by_key(&root, |record| record.root)
+            .ok()
+            .map(|index| self.roots[index].maximum_path_bits)
+    }
+}
+
 pub struct NamePageSnapshot<'a, S: ReadSnapshot> {
     base: &'a S,
     pages: &'a NamePageTreeReader,
@@ -1219,6 +1246,186 @@ impl NamePageTreeReader {
             .map(|addresses| addresses.clone())
     }
 
+    /// Validate every committed page exactly once in physical order. Page
+    /// records are append-postordered, so child hash/address consistency,
+    /// acyclicity, canonical encoding, and maximum path depth can all be
+    /// proven while retaining only a compact address-indexed summary.
+    pub fn validate_committed_pages(&self) -> Result<NamePageValidation, PageTreeError> {
+        let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
+        let mut segments = files.keys().copied().collect::<Vec<_>>();
+        segments.sort_unstable();
+        let mut indexed = BTreeMap::<u32, Vec<Vec<ValidatedPageRecord>>>::new();
+        let mut page_count = 0u64;
+        let mut record_count = 0u64;
+        let mut byte_count = 0u64;
+        let mut encoded = vec![0u8; NAME_PAGE_BYTES];
+
+        for segment in segments.iter().copied() {
+            let file = files
+                .get_mut(&segment)
+                .ok_or(PageTreeError::MissingSegment(segment))?;
+            let bytes = file.metadata().map_err(PageTreeError::io)?.len();
+            if !bytes.is_multiple_of(NAME_PAGE_BYTES as u64) {
+                return Err(PageTreeError::UnalignedSegment { segment, bytes });
+            }
+            let pages = bytes / NAME_PAGE_BYTES as u64;
+            let pages_u32 = u32::try_from(pages)
+                .map_err(|_| PageTreeError::PageCountOverflow { segment, pages })?;
+            NamePageAddress::new(segment, pages_u32.saturating_sub(1), 0)?;
+            file.seek(SeekFrom::Start(0)).map_err(PageTreeError::io)?;
+            let segment_capacity =
+                usize::try_from(pages_u32).map_err(|_| PageTreeError::OffsetOverflow)?;
+            let mut segment_pages = Vec::with_capacity(segment_capacity);
+
+            for page_number in 0..pages_u32 {
+                file.read_exact(&mut encoded).map_err(PageTreeError::io)?;
+                let page = decode_name_page(&encoded)?;
+                if page.record_count() == 0 {
+                    return Err(PageTreeError::EmptyCommittedPage {
+                        segment,
+                        page: page_number,
+                    });
+                }
+                let mut current = Vec::with_capacity(usize::from(page.record_count()));
+                for slot in 0..page.record_count() {
+                    let raw = page.record(slot)?;
+                    let root = TreeRoot::new(raw.key);
+                    let decoded = UrkelNodeRecord::decode(raw.canonical)?;
+                    let actual = decoded.root();
+                    if actual != root {
+                        return Err(PageTreeError::RecordKeyMismatch {
+                            expected: root,
+                            actual,
+                        });
+                    }
+                    if decoded.encode()? != raw.canonical {
+                        return Err(PageTreeError::Urkel(UrkelError::InvalidNode(
+                            "Urkel node record is not canonically encoded".to_owned(),
+                        )));
+                    }
+                    let maximum_path_bits = match decoded {
+                        UrkelNodeRecord::Leaf { .. } => {
+                            if raw.children != [None, None] {
+                                return Err(PageTreeError::ChildLocatorMismatch(root));
+                            }
+                            0
+                        }
+                        UrkelNodeRecord::Internal {
+                            prefix,
+                            left,
+                            right,
+                        } => {
+                            let [Some(left_address), Some(right_address)] = raw.children else {
+                                return Err(PageTreeError::ChildLocatorMismatch(root));
+                            };
+                            let left_record = earlier_page_record(
+                                &indexed,
+                                &segment_pages,
+                                &current,
+                                segment,
+                                page_number,
+                                left_address,
+                            )
+                            .ok_or(PageTreeError::MissingEarlierRecord(left_address))?;
+                            let right_record = earlier_page_record(
+                                &indexed,
+                                &segment_pages,
+                                &current,
+                                segment,
+                                page_number,
+                                right_address,
+                            )
+                            .ok_or(PageTreeError::MissingEarlierRecord(right_address))?;
+                            if left_record.root != left || right_record.root != right {
+                                return Err(PageTreeError::ChildLocatorMismatch(root));
+                            }
+                            let branch_bits = prefix.bit_len().checked_add(1).ok_or_else(|| {
+                                PageTreeError::Urkel(UrkelError::InvalidNode(
+                                    "Urkel record depth overflowed".to_owned(),
+                                ))
+                            })?;
+                            let maximum_child = usize::from(
+                                left_record
+                                    .maximum_path_bits
+                                    .max(right_record.maximum_path_bits),
+                            );
+                            let maximum =
+                                branch_bits.checked_add(maximum_child).ok_or_else(|| {
+                                    PageTreeError::Urkel(UrkelError::InvalidNode(
+                                        "Urkel record depth overflowed".to_owned(),
+                                    ))
+                                })?;
+                            if maximum > URKEL_BITS {
+                                return Err(PageTreeError::Urkel(UrkelError::InvalidNode(
+                                    "Urkel record path exceeds the key".to_owned(),
+                                )));
+                            }
+                            u16::try_from(maximum).map_err(|_| {
+                                PageTreeError::Urkel(UrkelError::InvalidNode(
+                                    "Urkel record depth overflowed".to_owned(),
+                                ))
+                            })?
+                        }
+                    };
+                    current.push(ValidatedPageRecord {
+                        root,
+                        maximum_path_bits,
+                    });
+                    record_count = record_count
+                        .checked_add(1)
+                        .ok_or(PageTreeError::OffsetOverflow)?;
+                }
+                segment_pages.push(current);
+                page_count = page_count
+                    .checked_add(1)
+                    .ok_or(PageTreeError::OffsetOverflow)?;
+            }
+            indexed.insert(segment, segment_pages);
+            byte_count = byte_count
+                .checked_add(bytes)
+                .ok_or(PageTreeError::OffsetOverflow)?;
+        }
+        drop(files);
+
+        let addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
+        for (root, address) in addresses.iter() {
+            let record = indexed_page_record(&indexed, *address)
+                .ok_or(PageTreeError::MissingEarlierRecord(*address))?;
+            if record.root != *root {
+                return Err(PageTreeError::RecordKeyMismatch {
+                    expected: *root,
+                    actual: record.root,
+                });
+            }
+        }
+        drop(addresses);
+
+        let capacity = usize::try_from(record_count).map_err(|_| PageTreeError::OffsetOverflow)?;
+        let mut roots = Vec::with_capacity(capacity);
+        for segments in indexed.into_values() {
+            for page in segments {
+                roots.extend(page);
+            }
+        }
+        roots.sort_unstable_by_key(|record| record.root);
+        if roots.windows(2).any(|pair| {
+            pair[0].root == pair[1].root && pair[0].maximum_path_bits != pair[1].maximum_path_bits
+        }) {
+            return Err(PageTreeError::StateCodec(
+                "duplicate name-page roots derived inconsistent path depths".to_owned(),
+            ));
+        }
+        roots.dedup_by_key(|record| record.root);
+
+        Ok(NamePageValidation {
+            segments: segments.len(),
+            pages: page_count,
+            records: record_count,
+            bytes: byte_count,
+            roots,
+        })
+    }
+
     #[cfg(test)]
     fn page_load_count(&self) -> Result<u64, PageTreeError> {
         self.cache
@@ -1278,6 +1485,41 @@ impl NamePageTreeReader {
             .insert(cache_key, CachedNamePage { records });
         Ok(())
     }
+}
+
+fn earlier_page_record<'a>(
+    prior_segments: &'a BTreeMap<u32, Vec<Vec<ValidatedPageRecord>>>,
+    current_segment_pages: &'a [Vec<ValidatedPageRecord>],
+    current_page: &'a [ValidatedPageRecord],
+    segment: u32,
+    page: u32,
+    address: NamePageAddress,
+) -> Option<&'a ValidatedPageRecord> {
+    if address.segment() < segment {
+        return indexed_page_record(prior_segments, address);
+    }
+    if address.segment() != segment {
+        return None;
+    }
+    if address.page() < page {
+        return current_segment_pages
+            .get(address.page() as usize)?
+            .get(usize::from(address.slot()));
+    }
+    if address.page() == page {
+        return current_page.get(usize::from(address.slot()));
+    }
+    None
+}
+
+fn indexed_page_record(
+    indexed: &BTreeMap<u32, Vec<Vec<ValidatedPageRecord>>>,
+    address: NamePageAddress,
+) -> Option<&ValidatedPageRecord> {
+    indexed
+        .get(&address.segment())?
+        .get(address.page() as usize)?
+        .get(usize::from(address.slot()))
 }
 
 fn read_cached_name_page_record(
@@ -1481,6 +1723,14 @@ pub enum PageTreeError {
     WrongGeneration { expected: u64, actual: u64 },
     #[error("name-page segment {0} is unavailable")]
     MissingSegment(u32),
+    #[error("name-page segment {segment} has non-page-aligned length {bytes}")]
+    UnalignedSegment { segment: u32, bytes: u64 },
+    #[error("name-page segment {segment} contains {pages} pages, exceeding its address space")]
+    PageCountOverflow { segment: u32, pages: u64 },
+    #[error("name-page segment {segment} page {page} is empty")]
+    EmptyCommittedPage { segment: u32, page: u32 },
+    #[error("name-page child or root address {0:?} does not name an earlier committed record")]
+    MissingEarlierRecord(NamePageAddress),
     #[error("name-page cache did not retain address {0:?}")]
     MissingCachedPage(NamePageAddress),
     #[error("name-page address {0:?} has an out-of-range slot")]
@@ -1600,6 +1850,14 @@ mod tests {
         );
         let reader =
             NamePageTreeReader::open_with_cache(&path, root, locator, 2).expect("open pages");
+        let audited = reader
+            .validate_committed_pages()
+            .expect("linear page audit");
+        assert_eq!(audited.segments, 1);
+        assert_eq!(audited.pages, streamed.page_count);
+        assert_eq!(audited.records, records.len() as u64);
+        assert_eq!(audited.bytes, streamed.manifest.durable_bytes);
+        assert!(audited.maximum_path_bits(root).is_some());
         assert_eq!(
             validate_record_tree(root, |record_root| {
                 reader

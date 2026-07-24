@@ -1317,6 +1317,24 @@ where
     reachable_record_roots_batched(roots, maximum_batch, load_many).map(|reachable| reachable.len())
 }
 
+/// Validate the reachable union until a caller-validated immutable subtree is
+/// reached. The terminal receives the absolute path depth of that subtree so
+/// it can preserve the same 256-bit path bound as a complete traversal.
+pub fn validate_record_trees_batched_until<F, I, T>(
+    roots: I,
+    maximum_batch: usize,
+    terminal: T,
+    load_many: F,
+) -> Result<usize, UrkelError>
+where
+    F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
+    I: IntoIterator<Item = TreeRoot>,
+    T: FnMut(TreeRoot, u16) -> Result<bool, UrkelError>,
+{
+    reachable_record_roots_batched_until(roots, maximum_batch, terminal, load_many)
+        .map(|reachable| reachable.len())
+}
+
 /// Validated, deduplicated content-addressed roots reachable from a retained
 /// root set. The retained depth value is also the primary path-depth evidence
 /// used during validation, so compaction does not need a second full hash set.
@@ -1344,11 +1362,25 @@ impl ReachableRecordRoots {
 pub fn reachable_record_roots_batched<F, I>(
     roots: I,
     maximum_batch: usize,
+    load_many: F,
+) -> Result<ReachableRecordRoots, UrkelError>
+where
+    F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
+    I: IntoIterator<Item = TreeRoot>,
+{
+    reachable_record_roots_batched_until(roots, maximum_batch, |_root, _depth| Ok(false), load_many)
+}
+
+fn reachable_record_roots_batched_until<F, I, T>(
+    roots: I,
+    maximum_batch: usize,
+    mut terminal: T,
     mut load_many: F,
 ) -> Result<ReachableRecordRoots, UrkelError>
 where
     F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
     I: IntoIterator<Item = TreeRoot>,
+    T: FnMut(TreeRoot, u16) -> Result<bool, UrkelError>,
 {
     if maximum_batch == 0 {
         return Err(UrkelError::InvalidNode(
@@ -1370,6 +1402,9 @@ where
             let Some((current, depth)) = pending.pop() else {
                 break;
             };
+            if terminal(current, depth)? {
+                continue;
+            }
             let unseen_path = match primary_depths.entry(current) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(depth);
@@ -2585,6 +2620,49 @@ mod tests {
             expected.len()
         );
         assert!(calls > 1);
+    }
+
+    #[test]
+    fn batched_validation_stops_at_prevalidated_subtrees() {
+        let base = MemoryUrkel::from_entries(
+            (0..32u32).map(|index| (key(index), format!("base-{index}").into_bytes())),
+        )
+        .expect("base tree");
+        let base_records = base.node_records().expect("base records");
+        let update = update_record_tree(
+            base.root(),
+            [(key(10_000), Some(b"overlay".to_vec()))],
+            |root| Ok(base_records.get(&root).cloned()),
+        )
+        .expect("overlay update");
+        let overlay_root = update.root();
+        let overlay_records = update.into_records();
+        let mut terminals = 0usize;
+        let loaded = validate_record_trees_batched_until(
+            [overlay_root],
+            8,
+            |root, _depth| {
+                let terminal = base_records.contains_key(&root);
+                terminals += usize::from(terminal);
+                Ok(terminal)
+            },
+            |requested| {
+                assert!(
+                    requested
+                        .iter()
+                        .all(|root| !base_records.contains_key(root)),
+                    "prevalidated base records must not reach the loader"
+                );
+                Ok(requested
+                    .iter()
+                    .map(|root| overlay_records.get(root).cloned())
+                    .collect())
+            },
+        )
+        .expect("overlay validation");
+
+        assert_eq!(loaded, overlay_records.len());
+        assert!(terminals > 0);
     }
 
     #[test]
