@@ -107,6 +107,17 @@ pub struct NamePageDirectory {
     layout: NamePageDirectoryLayout,
 }
 
+/// One validated version-2 record subpage prepared by positioned read-ahead.
+/// Its fields stay private so only this module can construct trusted cached
+/// bytes for [`PositionedNamePageReader`].
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamePageSubpage {
+    page: u32,
+    subpage: u8,
+    encoded: Vec<u8>,
+}
+
 /// Page-local positioned reader. Version-2 record subpages are immutable and
 /// cached after one aligned read, so several affected paths sharing a physical
 /// subpage never issue duplicate I/O.
@@ -516,6 +527,14 @@ impl NamePageDirectory {
             .map(Some),
         }
     }
+
+    fn contains_subpage(&self, subpage: u8) -> bool {
+        matches!(
+            &self.layout,
+            NamePageDirectoryLayout::Subpages { subpage_count, .. }
+                if subpage != 0 && subpage <= *subpage_count
+        )
+    }
 }
 
 #[cfg(unix)]
@@ -527,6 +546,28 @@ impl<'a> PositionedNamePageReader<'a> {
             directory,
             subpages: BTreeMap::new(),
         }
+    }
+
+    pub fn with_prefetched(
+        file: &'a File,
+        page: u32,
+        directory: &'a NamePageDirectory,
+        prefetched: Vec<NamePageSubpage>,
+    ) -> Result<Self, NamePageError> {
+        let mut reader = Self::new(file, page, directory);
+        for subpage in prefetched {
+            if subpage.page != page || !directory.contains_subpage(subpage.subpage) {
+                return Err(NamePageError::DirectoryInvariant);
+            }
+            if reader
+                .subpages
+                .insert(subpage.subpage, subpage.encoded)
+                .is_some()
+            {
+                return Err(NamePageError::DirectoryInvariant);
+            }
+        }
+        Ok(reader)
     }
 
     pub fn record(&mut self, slot: u16) -> Result<NamePageRecord, NamePageError> {
@@ -1636,6 +1677,44 @@ pub fn read_name_page_directory_at(
     })
 }
 
+/// Read, authenticate, and deduplicate the version-2 record subpages selected
+/// by a set of logical record slots. Legacy pages have no record subpages and
+/// return an empty set.
+#[cfg(unix)]
+pub fn read_name_page_subpages_at(
+    file: &File,
+    page: u32,
+    directory: &NamePageDirectory,
+    slots: &[u16],
+) -> Result<Vec<NamePageSubpage>, NamePageError> {
+    let mut selected = BTreeSet::new();
+    for slot in slots {
+        if let Some((subpage, _)) = directory.subpage_location(*slot)? {
+            selected.insert(subpage);
+        }
+    }
+    let page_offset = u64::from(page)
+        .checked_mul(NAME_PAGE_BYTES as u64)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    selected
+        .into_iter()
+        .map(|subpage| {
+            let offset = page_offset
+                .checked_add(u64::from(subpage) * NAME_SUBPAGE_BYTES as u64)
+                .ok_or(NamePageError::OffsetOverflow)?;
+            let mut encoded = vec![0u8; NAME_SUBPAGE_BYTES];
+            file.read_exact_at(&mut encoded, offset)
+                .map_err(name_page_io)?;
+            decode_name_subpage_record_header(&encoded, subpage)?;
+            Ok(NamePageSubpage {
+                page,
+                subpage,
+                encoded,
+            })
+        })
+        .collect()
+}
+
 /// Positioned variant of [`read_name_page_record`] for immutable page
 /// traversal that can overlap independent physical reads.
 #[cfg(unix)]
@@ -2093,7 +2172,13 @@ mod tests {
             let file = File::open(&path).expect("open subpage fixture");
             let positioned =
                 read_name_page_directory_at(&file, 0).expect("positioned subpage index");
-            let mut reader = PositionedNamePageReader::new(&file, 0, &positioned);
+            let prefetched = read_name_page_subpages_at(&file, 0, &positioned, &[32, 63])
+                .expect("prefetch shared subpage");
+            assert_eq!(prefetched.len(), 1);
+            let mut reader =
+                PositionedNamePageReader::with_prefetched(&file, 0, &positioned, prefetched)
+                    .expect("positioned reader with prefetch");
+            assert_eq!(reader.cached_subpages(), 1);
             assert_eq!(reader.record(32).expect("first shared record"), records[32]);
             assert_eq!(
                 reader.record(63).expect("second shared record"),
