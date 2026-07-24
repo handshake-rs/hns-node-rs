@@ -782,6 +782,398 @@ where
     apply_record_updates(root, updates, load, loaded)
 }
 
+/// Apply one mutation set by tracing the affected Patricia frontier once and
+/// rebuilding its canonical union bottom-up.
+///
+/// The point-update implementation above is useful for small mutations, but
+/// it reconstructs and hashes a shared ancestor once for every key. Interval
+/// commits can contain thousands of distinct keys. This implementation keeps
+/// unchanged subtrees as authenticated opaque roots, expands only paths that
+/// contain a mutation, and then hashes every final frontier node once.
+///
+/// Duplicate keys retain the ordinary sequential API's last-write-wins
+/// behavior. The result is history-independent and byte-identical at the root
+/// to applying the same final key/value map with [`update_record_tree`].
+pub fn update_record_tree_mutation_trie_prefetched<F, I, P>(
+    root: TreeRoot,
+    updates: I,
+    prefetched: P,
+    load: F,
+) -> Result<UrkelRecordUpdate, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
+    P: IntoIterator<Item = (TreeRoot, Vec<u8>)>,
+{
+    let mut mutations = BTreeMap::<NameHash, Option<Vec<u8>>>::new();
+    for (key, value) in updates {
+        if let Some(value) = value.as_ref() {
+            validate_value_size(value.len())?;
+        }
+        mutations.insert(key, value);
+    }
+    if mutations.is_empty() {
+        return Ok(UrkelRecordUpdate {
+            root,
+            records: BTreeMap::new(),
+        });
+    }
+
+    let mut loaded = BTreeMap::new();
+    for (record_root, raw) in prefetched {
+        let record = decode_verified_record(record_root, &raw)?;
+        if let Some(existing) = loaded.insert(record_root, record.clone()) {
+            if existing != record {
+                return Err(UrkelError::NodeHashCollision(record_root));
+            }
+        }
+    }
+
+    let mutations = mutations
+        .into_iter()
+        .map(|(key, value)| RecordMutation { key, value })
+        .collect::<Vec<_>>();
+    let mutation_refs = mutations.iter().collect::<Vec<_>>();
+    let mut context = RecordMutationContext {
+        load,
+        loaded,
+        records: BTreeMap::new(),
+    };
+    let mut frontier = Vec::new();
+    collect_record_mutation_frontier(
+        &mut context,
+        root,
+        0,
+        NameHash::new([0; 32]),
+        &mutation_refs,
+        &mut frontier,
+    )?;
+    frontier.sort_unstable_by_key(RecordMutationFrontier::representative);
+    for adjacent in frontier.windows(2) {
+        if adjacent[0].representative() == adjacent[1].representative() {
+            return Err(UrkelError::InvalidNode(
+                "mutation frontier contains overlapping authenticated ranges".to_owned(),
+            ));
+        }
+    }
+    let root = build_record_mutation_frontier(&mut context, &frontier, 0)?;
+    Ok(UrkelRecordUpdate {
+        root,
+        records: context.records,
+    })
+}
+
+#[derive(Debug)]
+struct RecordMutation {
+    key: NameHash,
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+enum RecordMutationFrontier {
+    Existing {
+        root: TreeRoot,
+        original_depth: usize,
+        representative: NameHash,
+    },
+    Leaf {
+        key: NameHash,
+        value: Vec<u8>,
+    },
+}
+
+impl RecordMutationFrontier {
+    const fn representative(&self) -> NameHash {
+        match self {
+            Self::Existing { representative, .. } => *representative,
+            Self::Leaf { key, .. } => *key,
+        }
+    }
+}
+
+fn collect_record_mutation_frontier<F>(
+    context: &mut RecordMutationContext<F>,
+    root: TreeRoot,
+    depth: usize,
+    path_key: NameHash,
+    mutations: &[&RecordMutation],
+    frontier: &mut Vec<RecordMutationFrontier>,
+) -> Result<(), UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    if root == TreeRoot::ZERO {
+        for mutation in mutations {
+            if let Some(value) = mutation.value.as_ref() {
+                frontier.push(RecordMutationFrontier::Leaf {
+                    key: mutation.key,
+                    value: value.clone(),
+                });
+            }
+        }
+        return Ok(());
+    }
+
+    let record = context.load_record(root)?;
+    match record {
+        UrkelNodeRecord::Leaf {
+            key: existing_key,
+            value: existing_value,
+        } => {
+            let mut existing = Some((root, existing_value));
+            for mutation in mutations {
+                if mutation.key == existing_key {
+                    existing = mutation
+                        .value
+                        .as_ref()
+                        .map(|value| (TreeRoot::ZERO, value.clone()));
+                } else if let Some(value) = mutation.value.as_ref() {
+                    frontier.push(RecordMutationFrontier::Leaf {
+                        key: mutation.key,
+                        value: value.clone(),
+                    });
+                }
+            }
+            if let Some((existing_root, value)) = existing {
+                if existing_root == root {
+                    frontier.push(RecordMutationFrontier::Existing {
+                        root,
+                        original_depth: depth,
+                        representative: existing_key,
+                    });
+                } else {
+                    frontier.push(RecordMutationFrontier::Leaf {
+                        key: existing_key,
+                        value,
+                    });
+                }
+            }
+        }
+        UrkelNodeRecord::Internal {
+            prefix,
+            left,
+            right,
+        } => {
+            let branch_depth = checked_branch_depth(&prefix, depth)?;
+            let mut left_mutations = Vec::new();
+            let mut right_mutations = Vec::new();
+            for mutation in mutations {
+                if !prefix.matches_key(mutation.key.as_bytes(), depth) {
+                    if let Some(value) = mutation.value.as_ref() {
+                        frontier.push(RecordMutationFrontier::Leaf {
+                            key: mutation.key,
+                            value: value.clone(),
+                        });
+                    }
+                    continue;
+                }
+                if key_bit(mutation.key.as_bytes(), branch_depth) == 0 {
+                    left_mutations.push(*mutation);
+                } else {
+                    right_mutations.push(*mutation);
+                }
+            }
+
+            if left_mutations.is_empty() && right_mutations.is_empty() {
+                frontier.push(RecordMutationFrontier::Existing {
+                    root,
+                    original_depth: depth,
+                    representative: internal_record_representative(path_key, depth, &prefix, 0),
+                });
+                return Ok(());
+            }
+
+            let left_path = internal_record_representative(path_key, depth, &prefix, 0);
+            if left_mutations.is_empty() {
+                frontier.push(RecordMutationFrontier::Existing {
+                    root: left,
+                    original_depth: branch_depth + 1,
+                    representative: left_path,
+                });
+            } else {
+                collect_record_mutation_frontier(
+                    context,
+                    left,
+                    branch_depth + 1,
+                    left_path,
+                    &left_mutations,
+                    frontier,
+                )?;
+            }
+
+            let right_path = internal_record_representative(path_key, depth, &prefix, 1);
+            if right_mutations.is_empty() {
+                frontier.push(RecordMutationFrontier::Existing {
+                    root: right,
+                    original_depth: branch_depth + 1,
+                    representative: right_path,
+                });
+            } else {
+                collect_record_mutation_frontier(
+                    context,
+                    right,
+                    branch_depth + 1,
+                    right_path,
+                    &right_mutations,
+                    frontier,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn internal_record_representative(
+    path_key: NameHash,
+    depth: usize,
+    prefix: &BitPrefix,
+    branch: u8,
+) -> NameHash {
+    debug_assert!(branch <= 1);
+    let mut key = *path_key.as_bytes();
+    for index in 0..prefix.bit_len() {
+        set_key_bit(&mut key, depth + index, prefix.bit(index));
+    }
+    set_key_bit(&mut key, depth + prefix.bit_len(), branch);
+    NameHash::new(key)
+}
+
+fn build_record_mutation_frontier<F>(
+    context: &mut RecordMutationContext<F>,
+    frontier: &[RecordMutationFrontier],
+    depth: usize,
+) -> Result<TreeRoot, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    match frontier {
+        [] => return Ok(TreeRoot::ZERO),
+        [item] => return attach_record_mutation_frontier(context, item, depth),
+        _ => {}
+    }
+
+    let first = frontier
+        .first()
+        .expect("nonempty mutation frontier")
+        .representative();
+    let last = frontier
+        .last()
+        .expect("nonempty mutation frontier")
+        .representative();
+    let shared = common_key_bits(first.as_bytes(), last.as_bytes(), depth);
+    let branch_depth = depth.checked_add(shared).ok_or_else(|| {
+        UrkelError::InvalidNode("mutation frontier branch depth overflowed".to_owned())
+    })?;
+    if branch_depth >= URKEL_BITS {
+        return Err(UrkelError::InvalidNode(
+            "mutation frontier contains colliding key ranges".to_owned(),
+        ));
+    }
+    let split = frontier
+        .partition_point(|item| key_bit(item.representative().as_bytes(), branch_depth) == 0);
+    if split == 0 || split == frontier.len() {
+        return Err(UrkelError::InvalidNode(
+            "mutation frontier failed to partition at its first divergent bit".to_owned(),
+        ));
+    }
+    let left = build_record_mutation_frontier(context, &frontier[..split], branch_depth + 1)?;
+    let right = build_record_mutation_frontier(context, &frontier[split..], branch_depth + 1)?;
+    context.intern_final(UrkelNodeRecord::Internal {
+        prefix: BitPrefix::from_key_range(first.as_bytes(), depth, shared),
+        left,
+        right,
+    })
+}
+
+fn attach_record_mutation_frontier<F>(
+    context: &mut RecordMutationContext<F>,
+    frontier: &RecordMutationFrontier,
+    depth: usize,
+) -> Result<TreeRoot, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    match frontier {
+        RecordMutationFrontier::Leaf { key, value } => {
+            context.intern_final(UrkelNodeRecord::Leaf {
+                key: *key,
+                value: value.clone(),
+            })
+        }
+        RecordMutationFrontier::Existing {
+            root,
+            original_depth,
+            representative,
+        } => {
+            if depth == *original_depth {
+                return Ok(*root);
+            }
+            match context.load_record(*root)? {
+                UrkelNodeRecord::Leaf { .. } => Ok(*root),
+                UrkelNodeRecord::Internal {
+                    prefix,
+                    left,
+                    right,
+                } => {
+                    let prefix =
+                        rebase_record_prefix(&prefix, *representative, *original_depth, depth)?;
+                    context.intern_final(UrkelNodeRecord::Internal {
+                        prefix,
+                        left,
+                        right,
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn rebase_record_prefix(
+    prefix: &BitPrefix,
+    representative: NameHash,
+    original_depth: usize,
+    depth: usize,
+) -> Result<BitPrefix, UrkelError> {
+    let (leading, skipped) = if depth < original_depth {
+        (original_depth - depth, 0)
+    } else {
+        (0, depth - original_depth)
+    };
+    if skipped > prefix.bit_len() {
+        return Err(UrkelError::InvalidNode(
+            "mutation frontier entered an opaque subtree beyond its branch".to_owned(),
+        ));
+    }
+    let bit_len = leading
+        .checked_add(prefix.bit_len() - skipped)
+        .ok_or_else(|| {
+            UrkelError::InvalidNode("mutation frontier prefix length overflowed".to_owned())
+        })?;
+    if depth
+        .checked_add(bit_len)
+        .is_none_or(|branch_depth| branch_depth >= URKEL_BITS)
+    {
+        return Err(UrkelError::InvalidNode(
+            "mutation frontier prefix exceeds the key boundary".to_owned(),
+        ));
+    }
+    let mut bytes = vec![0u8; bit_len.div_ceil(8)];
+    for index in 0..leading {
+        set_packed_bit(
+            &mut bytes,
+            index,
+            key_bit(representative.as_bytes(), depth + index),
+        );
+    }
+    for index in skipped..prefix.bit_len() {
+        set_packed_bit(&mut bytes, leading + index - skipped, prefix.bit(index));
+    }
+    Ok(BitPrefix {
+        bit_len: bit_len as u16,
+        bytes,
+    })
+}
+
 fn apply_record_updates<F, I>(
     root: TreeRoot,
     updates: I,
@@ -940,6 +1332,24 @@ where
     fn intern(&mut self, record: UrkelNodeRecord) -> Result<TreeRoot, UrkelError> {
         let root = record.root();
         let raw = record.encode()?;
+        if let Some(existing) = self.records.insert(root, raw.clone()) {
+            if existing != raw {
+                return Err(UrkelError::NodeHashCollision(root));
+            }
+        }
+        self.loaded.insert(root, record);
+        Ok(root)
+    }
+
+    fn intern_final(&mut self, record: UrkelNodeRecord) -> Result<TreeRoot, UrkelError> {
+        let root = record.root();
+        let raw = record.encode()?;
+        if let Some(existing) = self.loaded.get(&root) {
+            if existing != &record {
+                return Err(UrkelError::NodeHashCollision(root));
+            }
+            return Ok(root);
+        }
         if let Some(existing) = self.records.insert(root, raw.clone()) {
             if existing != raw {
                 return Err(UrkelError::NodeHashCollision(root));
@@ -2175,6 +2585,13 @@ fn set_packed_bit(bytes: &mut [u8], index: usize, bit: u8) {
     bytes[index / 8] |= bit << (7 - (index % 8));
 }
 
+fn set_key_bit(bytes: &mut [u8; 32], index: usize, bit: u8) {
+    debug_assert!(index < URKEL_BITS);
+    debug_assert!(bit <= 1);
+    let mask = 1 << (7 - (index % 8));
+    bytes[index / 8] = (bytes[index / 8] & !mask) | (bit << (7 - (index % 8)));
+}
+
 fn common_key_bits(left: &[u8; 32], right: &[u8; 32], depth: usize) -> usize {
     let mut count = 0usize;
     for index in depth..URKEL_BITS {
@@ -2789,6 +3206,147 @@ mod tests {
         assert!(
             batch_calls * 4 < point_calls,
             "batch calls {batch_calls} did not materially reduce {point_calls} point loads"
+        );
+    }
+
+    #[test]
+    fn mutation_trie_matches_sequential_updates_and_reuses_opaque_subtrees() {
+        let entries = (0..1_024)
+            .map(|index| (key(index), format!("value-{index}").into_bytes()))
+            .collect::<Vec<_>>();
+        let tree = MemoryUrkel::from_entries(entries.clone()).expect("tree");
+        let records = tree.node_records().expect("records");
+        let updates = (128..384)
+            .map(|index| {
+                (
+                    key(index),
+                    Some(format!("replacement-{index}").into_bytes()),
+                )
+            })
+            .chain((384..512).map(|index| (key(index), None)))
+            .chain(
+                (2_000..2_128)
+                    .map(|index| (key(index), Some(format!("inserted-{index}").into_bytes()))),
+            )
+            .collect::<Vec<_>>();
+
+        let expected = update_record_tree(tree.root(), updates.clone(), |record_root| {
+            Ok(records.get(&record_root).cloned())
+        })
+        .expect("sequential update");
+        let actual = update_record_tree_mutation_trie_prefetched(
+            tree.root(),
+            updates,
+            records.clone(),
+            |_record_root| panic!("complete prefetch must cover mutation-trie fallback loads"),
+        )
+        .expect("mutation-trie update");
+
+        assert_eq!(actual.root(), expected.root());
+        let mut merged = records;
+        merged.extend(actual.records().clone());
+        validate_record_tree(actual.root(), |record_root| {
+            Ok(merged.get(&record_root).cloned())
+        })
+        .expect("validate mutation-trie result");
+        assert!(
+            actual.records().len() < 1_500,
+            "shared frontier should remain proportional to the final path union"
+        );
+    }
+
+    #[test]
+    fn mutation_trie_matches_history_independent_randomized_roots() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next_key = || {
+            let mut bytes = [0u8; 32];
+            for chunk in bytes.chunks_exact_mut(8) {
+                seed ^= seed << 7;
+                seed ^= seed >> 9;
+                seed ^= seed << 8;
+                chunk.copy_from_slice(&seed.to_be_bytes());
+            }
+            NameHash::new(bytes)
+        };
+
+        let mut entries = BTreeMap::new();
+        while entries.len() < 400 {
+            let key = next_key();
+            entries.insert(key, key.as_bytes()[..8].to_vec());
+        }
+        let tree = MemoryUrkel::from_entries(
+            entries
+                .iter()
+                .map(|(key, value)| (*key, value.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .expect("base tree");
+        let records = tree.node_records().expect("base records");
+        let existing = entries.keys().copied().collect::<Vec<_>>();
+        let mut updates = Vec::new();
+        for (index, key) in existing.iter().copied().enumerate().take(180) {
+            let value = if index % 3 == 0 {
+                None
+            } else {
+                Some(format!("updated-{index}").into_bytes())
+            };
+            updates.push((key, value.clone()));
+            entries.entry(key).and_modify(|current| {
+                if let Some(value) = value.as_ref() {
+                    *current = value.clone();
+                }
+            });
+            if value.is_none() {
+                entries.remove(&key);
+            }
+        }
+        for index in 0..160 {
+            let key = next_key();
+            let value = format!("new-{index}").into_bytes();
+            updates.push((key, Some(value.clone())));
+            entries.insert(key, value);
+        }
+        let duplicate = existing[200];
+        updates.push((duplicate, Some(b"superseded".to_vec())));
+        updates.push((duplicate, Some(b"final".to_vec())));
+        entries.insert(duplicate, b"final".to_vec());
+        updates.reverse();
+        updates.rotate_left(73);
+
+        // Restore last-write-wins expected state after deliberately scrambling
+        // the input sequence.
+        let mut expected_entries = tree
+            .entries()
+            .map(|(key, value)| (*key, value.to_vec()))
+            .collect::<BTreeMap<_, _>>();
+        for (key, value) in &updates {
+            match value {
+                Some(value) => {
+                    expected_entries.insert(*key, value.clone());
+                }
+                None => {
+                    expected_entries.remove(key);
+                }
+            }
+        }
+        let expected = MemoryUrkel::from_entries(expected_entries).expect("expected tree");
+        let actual = update_record_tree_mutation_trie_prefetched(
+            tree.root(),
+            updates,
+            records.clone(),
+            |_record_root| panic!("complete prefetch must cover randomized mutation loads"),
+        )
+        .expect("randomized mutation-trie update");
+
+        assert_eq!(actual.root(), expected.root());
+        let mut merged = records;
+        merged.extend(actual.records().clone());
+        assert_eq!(
+            materialize_record_tree(actual.root(), |record_root| {
+                Ok(merged.get(&record_root).cloned())
+            })
+            .expect("materialize updated tree"),
+            expected
         );
     }
 

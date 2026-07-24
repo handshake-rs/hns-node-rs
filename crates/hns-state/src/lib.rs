@@ -42,7 +42,7 @@ use hns_store::{
 use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
     reachable_record_roots_batched, update_record_tree, update_record_tree_batched,
-    update_record_tree_prefetched, validate_record_root, validate_record_tree,
+    update_record_tree_mutation_trie_prefetched, validate_record_root, validate_record_tree,
     validate_record_trees_batched, validate_record_trees_batched_until, MemoryUrkel,
     NameTreeSnapshot, UrkelError, UrkelProof, URKEL_BITS,
 };
@@ -2593,7 +2593,7 @@ fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
         .collect::<Vec<_>>();
     let page_prefetched = snapshot.prefetch_name_tree_paths(*root.as_bytes(), &mutation_keys)?;
     let update = if let Some(prefetched) = page_prefetched {
-        update_record_tree_prefetched(
+        update_record_tree_mutation_trie_prefetched(
             root,
             mutations,
             prefetched
