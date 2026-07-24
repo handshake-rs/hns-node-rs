@@ -120,6 +120,10 @@ The state path removes redundant reads at several levels:
   breadth-first multi-get. Newly constructed records are collision-checked in
   one multi-get, and superseded records that never formed a committed root are
   discarded.
+- Final name-page packing preserves deterministic ordered traversal but builds
+  hash-indexed record and address tables once. Child resolution and emission
+  are therefore expected `O(1)` per node instead of repeatedly probing ordered
+  maps and turning a large replay delta into `O(N log N)` post-validation work.
 - Header-by-height and median-time values are memoized for the lifetime of each
   block transition.
 - A strict body already stored by the native validation pipeline reuses its

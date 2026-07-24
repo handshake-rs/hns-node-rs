@@ -496,7 +496,7 @@ pub struct PackedNamePages {
     segment: u32,
     first_page: u32,
     pages: Vec<Vec<NamePageRecord>>,
-    addresses: BTreeMap<TreeRoot, NamePageAddress>,
+    addresses: HashMap<TreeRoot, NamePageAddress>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1986,13 +1986,22 @@ pub fn pack_name_page_records(
     records: &BTreeMap<TreeRoot, Vec<u8>>,
     known_addresses: &HashMap<TreeRoot, NamePageAddress>,
 ) -> Result<PackedNamePages, PageTreeError> {
+    // The input remains ordered so independent runs choose the same DFS roots
+    // and therefore assign identical page addresses. Build a separate lookup
+    // table once: using the ordered map for every child probe and every
+    // emitted record makes a large replay delta O(N log N) after consensus
+    // work is already complete.
+    let record_lookup = records
+        .iter()
+        .map(|(root, raw)| (*root, raw.as_slice()))
+        .collect::<HashMap<_, _>>();
     let mut order = Vec::with_capacity(records.len());
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
     for root in records.keys().copied() {
         visit_new_record(
             root,
-            records,
+            &record_lookup,
             known_addresses,
             &mut visiting,
             &mut visited,
@@ -2000,12 +2009,12 @@ pub fn pack_name_page_records(
         )?;
     }
 
-    let mut addresses = BTreeMap::new();
+    let mut addresses = HashMap::with_capacity(records.len());
     let mut pages = Vec::<Vec<NamePageRecord>>::new();
     let mut page_number = first_page;
     let mut builder = NamePageBuilder::new(segment, page_number)?;
     for root in order {
-        let canonical = records
+        let canonical = record_lookup
             .get(&root)
             .ok_or(PageTreeError::MissingPackedRecord(root))?;
         let decoded = UrkelNodeRecord::decode(canonical)?;
@@ -2025,7 +2034,7 @@ pub fn pack_name_page_records(
         let mut record = NamePageRecord {
             key: *root.as_bytes(),
             children,
-            canonical: canonical.clone(),
+            canonical: canonical.to_vec(),
         };
         loop {
             match builder.push(record)? {
@@ -2058,7 +2067,7 @@ pub fn pack_name_page_records(
 
 fn visit_new_record(
     root: TreeRoot,
-    records: &BTreeMap<TreeRoot, Vec<u8>>,
+    records: &HashMap<TreeRoot, &[u8]>,
     known_addresses: &HashMap<TreeRoot, NamePageAddress>,
     visiting: &mut HashSet<TreeRoot>,
     visited: &mut HashSet<TreeRoot>,
@@ -2097,7 +2106,7 @@ fn visit_new_record(
 
 fn resolve_child_address(
     root: TreeRoot,
-    new_addresses: &BTreeMap<TreeRoot, NamePageAddress>,
+    new_addresses: &HashMap<TreeRoot, NamePageAddress>,
     known_addresses: &HashMap<TreeRoot, NamePageAddress>,
 ) -> Result<NamePageAddress, PageTreeError> {
     new_addresses
