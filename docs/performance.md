@@ -189,18 +189,21 @@ amplification and competes with RocksDB's existing block cache.
 
 The implemented layout is an append-only, generation-based Urkel record store:
 
-1. Pack canonical node records into fixed 64 KiB checksummed pages. A compact
-   slot index makes a node lookup within an already loaded page `O(1)` and
-   returns the canonical payload without copying it.
+1. Append canonical node records in fixed 64 KiB publication units. New units
+   contain one authenticated 4 KiB slot index and up to fifteen independently
+   authenticated 4 KiB record subpages. One index read selects the aligned
+   record subpages, and paths sharing a subpage reuse one physical read.
 2. Store two eight-byte, generation-local child addresses beside each internal
    node. An address is accepted only after the canonical child record hashes to
    the expected child root, so it cannot change consensus meaning.
 3. Persist the current and retained root locators with their root hashes. New
    paths reuse locators loaded from their unchanged parents and append only the
    changed records.
-4. Group breadth-first path reads by `(segment, page)` and issue one read per
-   unique page. This replaces one LSM lookup per node with page-coalesced
-   traversal while preserving the same hashing work. Exhaustive page-backed
+4. Group affected paths by `(segment, page)` and traverse immutable addresses
+   in descending physical order. Schema-18 pages retain compact-directory
+   read-ahead; schema-19 pages read one 4 KiB index and only selected 4 KiB
+   record subpages. A mutation Patricia frontier then reconstructs and hashes
+   every final shared path once rather than once per key. Exhaustive page-backed
    startup validation uses a bounded 65,536-root window so a mainnet tree needs
    hundreds of page plans rather than tens of thousands; the legacy-only
    validator keeps its conservative 1,024-key window.
@@ -216,8 +219,9 @@ This layout makes authenticated hashing and canonical record verification the
 dominant per-node work. It changes local storage metadata, not Urkel roots,
 proofs, name semantics, or reorganization atomicity.
 
-Schema 18/profile `hsrd-mining-v14` enables segment reads and writes. The
-schema-17 current root is bootstrapped into pages before startup audit. That
+Schema 19/profile `hsrd-mining-v15` enables authenticated record subpages.
+Schema-18 pages remain readable without rewriting, and schema-17 current roots
+are bootstrapped into the current format before startup audit. That
 one-time conversion splits the upper tree into at most 4,096 deterministic
 subtrees, advances their post-order traversals together with RocksDB
 `MultiGet`s of at most 1,024 nodes, and writes each completed 64 KiB page

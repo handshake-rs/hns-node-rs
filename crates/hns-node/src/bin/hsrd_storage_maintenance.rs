@@ -12,9 +12,10 @@ use hns_primitives::{blake2b_256, hex_encode};
 use hns_store::{
     decode_u32, open_store, ColumnFamily, DurabilityPolicy, MetaKey, ReadSnapshot,
     SegmentArchiveInventory, SegmentArchiveScrub, SegmentMigrationReport, Store, StoreBackend,
-    StoreConfig, BLOCK_SEGMENT_MANIFEST_KEY, LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE,
-    PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION,
-    SEGMENT_MIGRATION_MAX_BATCH_RECORDS, STORAGE_PROFILE, UNDO_SEGMENT_MANIFEST_KEY,
+    StoreConfig, BLOCK_SEGMENT_MANIFEST_KEY, INTERVAL_SCHEMA_VERSION, INTERVAL_STORAGE_PROFILE,
+    LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION,
+    PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION, SEGMENT_MIGRATION_MAX_BATCH_RECORDS,
+    STORAGE_PROFILE, UNDO_SEGMENT_MANIFEST_KEY,
 };
 use serde::Serialize;
 
@@ -206,6 +207,7 @@ fn validate_clean_store(store: &hns_store::StoreHandle) -> Result<StoreIdentity>
         .context("storage profile marker is missing")?;
     let supported = (schema == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE)
         || (schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE)
+        || (schema == INTERVAL_SCHEMA_VERSION && profile.as_slice() == INTERVAL_STORAGE_PROFILE)
         || (schema == PRE_INTERVAL_SCHEMA_VERSION
             && profile.as_slice() == PRE_INTERVAL_STORAGE_PROFILE);
     if !supported {

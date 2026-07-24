@@ -60,12 +60,13 @@ Implemented:
 - Separate durable best-header and active-best-block bindings.
 - Strict greater-work activation; equal-work branches preserve the existing
   first-seen tip.
-- Schema version **18**, storage profile **`hsrd-mining-v14`**, a reversible
-  36-block name accumulator, append-only authenticated 64 KiB name pages,
-  monotonic 360-height physical page seals, and checksummed append-only
-  block/undo segments whose compact locators publish atomically with chain
-  state. Schema 16 and 17 stores migrate in place and fail closed on ambiguous
-  profile combinations.
+- Schema version **19**, storage profile **`hsrd-mining-v15`**, a reversible
+  36-block name accumulator, one-pass Patricia mutation frontiers, append-only
+  64 KiB name pages with authenticated 4 KiB indexes/record subpages, monotonic
+  360-height physical page seals, and checksummed append-only block/undo
+  segments whose compact locators publish atomically with chain state. Schema
+  16, 17, and 18 stores migrate in place and fail closed on ambiguous profile
+  combinations.
 - Startup checks that compare the interval accumulator and materialized
   name-state column, validate every retained committed root, truncate
   unpublished page/frame tails, and reject locator/manifest disagreement.
@@ -498,13 +499,14 @@ They are not substitutes for the strict dependency audit or Cargo gates.
 
 ## Storage migration
 
-Schema 18/profile `hsrd-mining-v14` accepts the previous schema-17 interval
-state through an atomic marker cutover and converts schema-16 working-tree state
-with the resumable, backup-first undo migration. On first open it packs the
-current committed name tree into authenticated pages and initializes block/undo
-segment manifests; legacy RocksDB payloads remain readable while every new
-payload is stored only as a locator plus an append-only frame. Page state
-decodes the prior version, so interrupted rollout is restart-safe.
+Schema 19/profile `hsrd-mining-v15` accepts schema-17 and schema-18 interval
+state through an atomic marker cutover and converts schema-16 working-tree
+state with the resumable, backup-first undo migration. New name records use
+authenticated 4 KiB subpages while every schema-18 64 KiB page remains
+readable in place. On first open without page state it packs the current
+committed name tree and initializes block/undo segment manifests; legacy
+RocksDB payloads remain readable while every new payload is stored only as a
+locator plus an append-only frame. Interrupted rollout is restart-safe.
 
 Block undo version 7 carries the prior accumulator and boundary state needed to
 reverse pending intervals. The optional undo-retirement checkpoint uses the

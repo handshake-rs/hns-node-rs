@@ -7,12 +7,13 @@ committed through an atomic batch.
 
 ## Current schema boundary
 
-The current persistent schema version is **18** and the storage profile is
-**`hsrd-mining-v14`**. Schema 17/profile `hsrd-mining-v13` receives an atomic
-profile cutover. Schema 16/profile `hsrd-mining-v12` uses the resumable,
-backup-first interval-accumulator migration. Other combinations fail closed.
+The current persistent schema version is **19** and the storage profile is
+**`hsrd-mining-v15`**. Schema 18/profile `hsrd-mining-v14` and schema
+17/profile `hsrd-mining-v13` receive an atomic profile cutover. Schema
+16/profile `hsrd-mining-v12` uses the resumable, backup-first
+interval-accumulator migration. Other combinations fail closed.
 
-Version 18 contains the authority, state, native synchronization, and mining
+Version 19 contains the authority, state, native synchronization, and mining
 publication schema plus the optimized storage tiers:
 
 - granular block-status bit assignments;
@@ -27,9 +28,11 @@ publication schema plus the optimized storage tiers:
 - mandatory 32-byte `name-tree-root` metadata equal to the last committed root;
 - mandatory 32-byte `name-tree-commit-root` binding for HSD's last
   `treeInterval` commitment used by candidate headers and mining templates;
-- append-only 64 KiB checksummed name pages with traversal-local child
-  addresses, root locators, a bounded decoded-page cache, and monotonic physical
-  seals every 360 heights without changing consensus-root timing;
+- append-only 64 KiB name-page publication units with traversal-local child
+  addresses, root locators, one authenticated 4 KiB slot index, up to fifteen
+  authenticated 4 KiB record subpages, bounded path-local subpage reuse, and
+  monotonic physical seals every 360 heights without changing consensus-root
+  timing. Legacy schema-18 pages remain readable in place;
 - checksummed block and undo frames in 256 MiB physical segments. RocksDB stores
   compact locators and authoritative manifests; legacy inline values remain
   readable during migration;
@@ -348,12 +351,12 @@ exact bytes before fixture use.
 
 ## Migration policy
 
-Schema 17/profile `hsrd-mining-v13` already has interval semantics and receives
-only the atomic schema/profile cutover. Schema 16/profile `hsrd-mining-v12`
-backs up every rewritten undo and the old root/profile bindings before the
-final marker changes. Page bootstrap and segment-manifest initialization are
-idempotent; restart truncates unpublished tails. Older or mixed profiles require
-an explicit reindex.
+Schemas 17/profile `hsrd-mining-v13` and 18/profile `hsrd-mining-v14` already
+have interval semantics and receive only the atomic schema/profile cutover.
+Schema 16/profile `hsrd-mining-v12` backs up every rewritten undo and the old
+root/profile bindings before the final marker changes. Page bootstrap and
+segment-manifest initialization are idempotent; restart truncates unpublished
+tails. Older or mixed profiles require an explicit reindex.
 
 The operator workflow is specified in
 [`storage-rollout.md`](storage-rollout.md). `hsrd-storage-maintenance backup`
@@ -366,8 +369,10 @@ headroom is insufficient.
 
 ## Persistent Urkel status
 
-At each consensus interval, inserts, replacements, and removals traverse only
-affected paths from the committed root. Changed records are packed bottom-up
+At each consensus interval, inserts, replacements, and removals form one sorted
+Patricia mutation frontier. It retains unaffected subtrees as opaque
+authenticated roots and reconstructs each final shared path once. Changed
+records are packed bottom-up
 into append-only pages; unchanged child locators can point into sealed older
 segments. Proof reads traverse only the requested path and rehash every loaded
 canonical record.

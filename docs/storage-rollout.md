@@ -55,11 +55,11 @@ hsrd/target/release/hsrd-storage-maintenance \
 ```
 
 `backup` accepts the reviewed schema/profile sources 16/`hsrd-mining-v12`,
-17/`hsrd-mining-v13`, and 18/`hsrd-mining-v14`. It requires a clean-shutdown
-marker, creates `BACKUP/chain` with RocksDB's checkpoint API, copies any
-`name-pages/` and `payload-segments/`, installs the offline state-audit marker
-inside the checkpoint, syncs every copied file and directory, and writes the
-checksummed fallback manifest last.
+17/`hsrd-mining-v13`, 18/`hsrd-mining-v14`, and 19/`hsrd-mining-v15`. It
+requires a clean-shutdown marker, creates `BACKUP/chain` with RocksDB's
+checkpoint API, copies any `name-pages/` and `payload-segments/`, installs the
+offline state-audit marker inside the checkpoint, syncs every copied file and
+directory, and writes the checksummed fallback manifest last.
 
 Confirm that `BACKUP/.hsrd-storage-fallback.json` exists. Keep the maintenance
 marker in place until the backup and any desired state-manifest comparison have
@@ -70,10 +70,11 @@ rm "$DATA/.hsrd-storage-maintenance"
 systemctl --user start meshmine-hsrd-mainnet-canary.service
 ```
 
-On first current-binary open, schema 17 receives an atomic profile cutover.
-Schema 16 runs the resumable, backup-first interval-accumulator migration.
-The node then bootstraps authenticated name pages and block/undo manifests.
-Ambiguous marker combinations fail closed.
+On first current-binary open, schemas 17 and 18 receive an atomic profile
+cutover. Schema 16 runs the resumable, backup-first interval-accumulator
+migration. Existing schema-18 pages remain readable; all new name pages use
+authenticated subpages. The node bootstraps missing name pages and block/undo
+manifests. Ambiguous marker combinations fail closed.
 
 ## 3. Audit the current layout
 
@@ -155,8 +156,9 @@ reference artifact.
    its `chain/` directory.
 5. Point the service at the replacement path.
 6. Use the binary matching the backed-up schema/profile. A schema-16/17 backup
-   is the rollback input for the pinned prior binary; schema 18 requires the
-   current storage-aware binary.
+   is the rollback input for its pinned prior binary, schema 18 uses the
+   schema-18 storage-aware binary, and schema 19 requires the current
+   authenticated-subpage binary.
 7. Start without a maintenance marker and confirm the exact tip hash, height,
    roots, deployment diagnostics, and mining generation before restoring
    authority.

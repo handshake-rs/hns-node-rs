@@ -36,8 +36,9 @@ use hns_primitives::{
 };
 use hns_store::{
     decode_u32, encode_u32, ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch,
-    AIRDROP_FIELD_BYTES, LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE,
-    PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION, STORAGE_PROFILE,
+    AIRDROP_FIELD_BYTES, INTERVAL_SCHEMA_VERSION, INTERVAL_STORAGE_PROFILE, LEGACY_SCHEMA_VERSION,
+    LEGACY_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE,
+    SCHEMA_VERSION, STORAGE_PROFILE,
 };
 use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
@@ -2790,11 +2791,12 @@ pub fn load_name_tree_accumulator<T: ReadSnapshot>(
 }
 
 /// Upgrade the schema-16 per-block working-tree layout to the current interval
-/// accumulator profile. Schema 17 already has the consensus transformation and
-/// receives only the fail-closed storage-profile cutover. Legacy schema-16 undo
-/// bytes are retained under a migration prefix before their active records are
-/// rewritten, and the schema/profile marker changes only after every undo chunk
-/// is durable. Re-entering after a crash is idempotent.
+/// accumulator profile. Schemas 17 and 18 already have the consensus
+/// transformation and receive only the fail-closed storage-profile cutover.
+/// Legacy schema-16 undo bytes are retained under a migration prefix before
+/// their active records are rewritten, and the schema/profile marker changes
+/// only after every undo chunk is durable. Re-entering after a crash is
+/// idempotent.
 pub fn migrate_name_tree_interval_accumulator<S: Store>(
     store: &S,
     tree_interval: Height,
@@ -2819,7 +2821,9 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
     if schema == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE {
         return Ok(None);
     }
-    if schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE {
+    if (schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE)
+        || (schema == INTERVAL_SCHEMA_VERSION && profile.as_slice() == INTERVAL_STORAGE_PROFILE)
+    {
         drop(snapshot);
         let mut batch = store.batch();
         batch.put(
@@ -4498,59 +4502,64 @@ mod tests {
     }
 
     #[test]
-    fn schema_17_interval_state_receives_atomic_storage_profile_cutover() {
-        let store = MemoryStore::new();
-        hns_store::initialize_schema(&store).expect("initialize current schema");
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::SchemaVersion.as_bytes(),
-                &encode_u32(LEGACY_SCHEMA_VERSION),
-            )
-            .expect("legacy schema");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::StorageProfile.as_bytes(),
-                LEGACY_STORAGE_PROFILE,
-            )
-            .expect("legacy profile");
-        batch
-            .put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[1])
-            .expect("legacy clean marker");
-        store.commit(batch).expect("commit legacy markers");
+    fn schema_17_and_18_interval_state_receive_atomic_storage_profile_cutover() {
+        for (schema, profile) in [
+            (LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE),
+            (INTERVAL_SCHEMA_VERSION, INTERVAL_STORAGE_PROFILE),
+        ] {
+            let store = MemoryStore::new();
+            hns_store::initialize_schema(&store).expect("initialize current schema");
+            let mut batch = store.batch();
+            batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::SchemaVersion.as_bytes(),
+                    &encode_u32(schema),
+                )
+                .expect("legacy schema");
+            batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::StorageProfile.as_bytes(),
+                    profile,
+                )
+                .expect("legacy profile");
+            batch
+                .put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[1])
+                .expect("legacy clean marker");
+            store.commit(batch).expect("commit legacy markers");
 
-        assert!(migrate_name_tree_interval_accumulator(
-            &store,
-            Network::Regtest.params().names.tree_interval,
-        )
-        .expect("profile migration")
-        .is_none());
-        let snapshot = store.snapshot().expect("migrated snapshot");
-        assert_eq!(
-            decode_u32(
-                &snapshot
-                    .get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())
-                    .expect("schema read")
-                    .expect("schema")
+            assert!(migrate_name_tree_interval_accumulator(
+                &store,
+                Network::Regtest.params().names.tree_interval,
             )
-            .expect("decode schema"),
-            SCHEMA_VERSION
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())
-                .expect("profile read")
-                .expect("profile"),
-            STORAGE_PROFILE
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes())
-                .expect("clean marker"),
-            Some(vec![0])
-        );
+            .expect("profile migration")
+            .is_none());
+            let snapshot = store.snapshot().expect("migrated snapshot");
+            assert_eq!(
+                decode_u32(
+                    &snapshot
+                        .get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())
+                        .expect("schema read")
+                        .expect("schema")
+                )
+                .expect("decode schema"),
+                SCHEMA_VERSION
+            );
+            assert_eq!(
+                snapshot
+                    .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())
+                    .expect("profile read")
+                    .expect("profile"),
+                STORAGE_PROFILE
+            );
+            assert_eq!(
+                snapshot
+                    .get(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes())
+                    .expect("clean marker"),
+                Some(vec![0])
+            );
+        }
     }
 
     #[test]

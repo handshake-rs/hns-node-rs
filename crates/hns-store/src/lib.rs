@@ -4,14 +4,16 @@ mod name_page;
 mod segment;
 
 pub use name_page::{
-    decode_name_page, encode_name_page, inspect_name_page_file, plan_name_page_reads,
-    read_name_page_directory, read_name_page_record, truncate_name_pages_to_committed_tail,
-    NamePageAddress, NamePageAppender, NamePageBuilder, NamePageDirectory, NamePageError,
-    NamePageFileInspection, NamePagePush, NamePageRecord, NamePageRecordLocation,
-    NamePageRecordRef, NamePageRef, NAME_PAGE_BYTES,
+    decode_name_page, encode_name_page, encode_name_subpage_page, inspect_name_page_file,
+    plan_name_page_reads, read_name_page_directory, read_name_page_record,
+    truncate_name_pages_to_committed_tail, NamePageAddress, NamePageAppender, NamePageBuilder,
+    NamePageDirectory, NamePageError, NamePageFileInspection, NamePagePush, NamePageRecord,
+    NamePageRecordLocation, NamePageRecordRef, NamePageRef, NAME_PAGE_BYTES, NAME_SUBPAGE_BYTES,
 };
 #[cfg(unix)]
-pub use name_page::{read_name_page_directory_at, read_name_page_record_at};
+pub use name_page::{
+    read_name_page_directory_at, read_name_page_record_at, PositionedNamePageReader,
+};
 pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,
     plan_segment_page_reads, scan_segment_prefix, truncate_segment_to_committed_tail,
@@ -34,14 +36,16 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 18;
-pub const LEGACY_SCHEMA_VERSION: u32 = 17;
+pub const SCHEMA_VERSION: u32 = 19;
+pub const LEGACY_SCHEMA_VERSION: u32 = 18;
+pub const INTERVAL_SCHEMA_VERSION: u32 = 17;
 pub const PRE_INTERVAL_SCHEMA_VERSION: u32 = 16;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v14";
-pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v15";
+pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v14";
+pub const INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
 pub const PRE_INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
 pub const BLOCK_SEGMENT_MANIFEST_KEY: &[u8] = b"block-segment-manifest/v1";
 pub const UNDO_SEGMENT_MANIFEST_KEY: &[u8] = b"undo-segment-manifest/v1";

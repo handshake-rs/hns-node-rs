@@ -18,7 +18,7 @@ use hns_store::{
 #[cfg(not(unix))]
 use hns_store::{read_name_page_directory, read_name_page_record};
 #[cfg(unix)]
-use hns_store::{read_name_page_directory_at, read_name_page_record_at, NamePageDirectory};
+use hns_store::{read_name_page_directory_at, NamePageDirectory, PositionedNamePageReader};
 use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord, URKEL_BITS};
 use serde::{Deserialize, Serialize};
 
@@ -1352,17 +1352,18 @@ impl NamePageTreeReader {
             let file = files
                 .get_mut(&page_address.segment())
                 .ok_or(PageTreeError::MissingSegment(page_address.segment()))?;
+            #[cfg(unix)]
+            let mut page_reader = PositionedNamePageReader::new(
+                path_files
+                    .get(&page_address.segment())
+                    .ok_or(PageTreeError::MissingSegment(page_address.segment()))?,
+                page_address.page(),
+                &directory,
+            );
             while let Some((slot, work)) = page_work.pop_last() {
                 let address = NamePageAddress::new(page_key.0, page_key.1, slot)?;
                 #[cfg(unix)]
-                let record = read_name_page_record_at(
-                    path_files
-                        .get(&page_address.segment())
-                        .ok_or(PageTreeError::MissingSegment(page_address.segment()))?,
-                    page_address.page(),
-                    &directory,
-                    address.slot(),
-                )?;
+                let record = page_reader.record(address.slot())?;
                 #[cfg(not(unix))]
                 let record =
                     read_name_page_record(file, page_address.page(), &directory, address.slot())?;

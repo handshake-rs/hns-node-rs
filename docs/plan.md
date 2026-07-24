@@ -37,8 +37,9 @@ reserved low-latency paths.
 - Sequence-consistent RocksDB snapshots.
 - Atomic read-your-writes multi-block reorganizations.
 - Separate best-header and active-block bindings.
-- Schema 18/profile `hsrd-mining-v14`, a durable interval accumulator,
-  append-only authenticated name pages, recoverable block/undo segments,
+- Schema 19/profile `hsrd-mining-v15`, a durable interval accumulator,
+  one-pass Patricia mutation frontiers, append-only name pages with
+  authenticated 4 KiB record subpages, recoverable block/undo segments,
   committed-root and HSD airdrop-field bindings, checksummed network-interval
   pins, hash-keyed deployment-state caches, a synchronization checkpoint, and
   a versioned solved-block publication namespace.

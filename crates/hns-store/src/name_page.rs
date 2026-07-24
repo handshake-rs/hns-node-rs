@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -21,6 +21,17 @@ const NAME_PAGE_RECORD_FIXED_BYTES: usize = 32 + 2 + 2 + 1 + 1;
 const NAME_PAGE_CHILD_BYTES: usize = 8;
 const NAME_PAGE_ADDRESS_FIELD_MAX: u32 = (1 << 24) - 1;
 pub const NAME_PAGE_BYTES: usize = 64 * 1024;
+pub const NAME_SUBPAGE_BYTES: usize = 4 * 1024;
+const NAME_SUBPAGE_COUNT: usize = NAME_PAGE_BYTES / NAME_SUBPAGE_BYTES;
+const NAME_SUBPAGE_DATA_COUNT: usize = NAME_SUBPAGE_COUNT - 1;
+const NAME_SUBPAGE_INDEX_MAGIC: &[u8; 8] = b"HSGNPI02";
+const NAME_SUBPAGE_RECORD_MAGIC: &[u8; 8] = b"HSGNPR02";
+const NAME_SUBPAGE_VERSION: u16 = 2;
+const NAME_SUBPAGE_CHECKSUM_BYTES: usize = 32;
+const NAME_SUBPAGE_INDEX_HEADER_BYTES: usize = 8 + 2 + 2 + 1 + 3;
+const NAME_SUBPAGE_INDEX_ENTRY_BYTES: usize = 2;
+const NAME_SUBPAGE_RECORD_HEADER_BYTES: usize = 8 + 2 + 1 + 1 + 2 + 2 + 4;
+const NAME_SUBPAGE_LOCAL_RECORD_MAX: usize = u8::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NamePageAddress(u64);
@@ -93,18 +104,53 @@ pub struct NamePageRecordLocation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamePageDirectory {
-    encoded: Vec<u8>,
-    record_count: u16,
-    directory_end: usize,
-    payload_end: usize,
+    layout: NamePageDirectoryLayout,
+}
+
+/// Page-local positioned reader. Version-2 record subpages are immutable and
+/// cached after one aligned read, so several affected paths sharing a physical
+/// subpage never issue duplicate I/O.
+#[cfg(unix)]
+pub struct PositionedNamePageReader<'a> {
+    file: &'a File,
+    page: u32,
+    directory: &'a NamePageDirectory,
+    subpages: BTreeMap<u8, Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NamePageDirectoryLayout {
+    Legacy {
+        encoded: Vec<u8>,
+        record_count: u16,
+        directory_end: usize,
+        payload_end: usize,
+    },
+    Subpages {
+        encoded_index: Vec<u8>,
+        record_count: u16,
+        subpage_count: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NamePageRef<'a> {
-    encoded: &'a [u8],
-    record_count: u16,
-    directory_end: usize,
-    payload_end: usize,
+    layout: NamePageRefLayout<'a>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamePageRefLayout<'a> {
+    Legacy {
+        encoded: &'a [u8],
+        record_count: u16,
+        directory_end: usize,
+        payload_end: usize,
+    },
+    Subpages {
+        encoded: &'a [u8],
+        record_count: u16,
+        subpage_count: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,7 +182,8 @@ pub struct NamePageBuilder {
     page: u32,
     records: Vec<NamePageRecord>,
     keys: BTreeSet<[u8; 32]>,
-    record_bytes: usize,
+    subpage_record_counts: Vec<usize>,
+    subpage_record_bytes: Vec<usize>,
 }
 
 impl NamePageBuilder {
@@ -147,7 +194,8 @@ impl NamePageBuilder {
             page,
             records: Vec::new(),
             keys: BTreeSet::new(),
-            record_bytes: 0,
+            subpage_record_counts: Vec::new(),
+            subpage_record_bytes: Vec::new(),
         })
     }
 
@@ -159,29 +207,63 @@ impl NamePageBuilder {
             return Err(NamePageError::DuplicateKey);
         }
         let added_bytes = name_page_record_bytes(&record)?;
-        let next_record_bytes = self
-            .record_bytes
-            .checked_add(added_bytes)
+        let index_required = NAME_SUBPAGE_INDEX_HEADER_BYTES
+            .checked_add(
+                self.records
+                    .len()
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(NAME_SUBPAGE_INDEX_ENTRY_BYTES))
+                    .ok_or(NamePageError::OffsetOverflow)?,
+            )
+            .and_then(|bytes| bytes.checked_add(NAME_SUBPAGE_CHECKSUM_BYTES))
             .ok_or(NamePageError::OffsetOverflow)?;
-        let required = NAME_PAGE_HEADER_BYTES
-            .checked_add(NAME_PAGE_CHECKSUM_BYTES)
-            .and_then(|bytes| bytes.checked_add(next_record_bytes))
-            .ok_or(NamePageError::OffsetOverflow)?;
-        if required > NAME_PAGE_BYTES {
-            if self.records.is_empty() {
-                return Err(NamePageError::PageFull {
-                    required,
-                    capacity: NAME_PAGE_BYTES,
+        if index_required > NAME_SUBPAGE_BYTES {
+            return Ok(NamePagePush::Full(record));
+        }
+        let mut subpage = self.subpage_record_counts.len().saturating_sub(1);
+        let current_count = self
+            .subpage_record_counts
+            .get(subpage)
+            .copied()
+            .unwrap_or(0);
+        let current_bytes = self.subpage_record_bytes.get(subpage).copied().unwrap_or(0);
+        let mut required = name_subpage_required_bytes(
+            current_count
+                .checked_add(1)
+                .ok_or(NamePageError::OffsetOverflow)?,
+            current_bytes
+                .checked_add(added_bytes)
+                .ok_or(NamePageError::OffsetOverflow)?,
+        )?;
+        if current_count >= NAME_SUBPAGE_LOCAL_RECORD_MAX || required > NAME_SUBPAGE_BYTES {
+            if self.subpage_record_counts.len() == NAME_SUBPAGE_DATA_COUNT {
+                return Ok(NamePagePush::Full(record));
+            }
+            subpage = self.subpage_record_counts.len();
+            required = name_subpage_required_bytes(1, added_bytes)?;
+            if required > NAME_SUBPAGE_BYTES {
+                return Err(NamePageError::RecordTooLarge {
+                    index: self.records.len(),
+                    actual: added_bytes,
+                    maximum: NAME_SUBPAGE_BYTES
+                        - NAME_SUBPAGE_RECORD_HEADER_BYTES
+                        - NAME_SUBPAGE_CHECKSUM_BYTES,
                 });
             }
-            return Ok(NamePagePush::Full(record));
+            self.subpage_record_counts.push(0);
+            self.subpage_record_bytes.push(0);
+        } else if self.subpage_record_counts.is_empty() {
+            self.subpage_record_counts.push(0);
+            self.subpage_record_bytes.push(0);
         }
         let slot = u16::try_from(self.records.len())
             .map_err(|_| NamePageError::TooManyRecords(self.records.len()))?;
         let address = NamePageAddress::new(self.segment, self.page, slot)?;
         self.keys.insert(record.key);
         self.records.push(record);
-        self.record_bytes = next_record_bytes;
+        self.subpage_record_counts[subpage] += 1;
+        self.subpage_record_bytes[subpage] =
+            required - NAME_SUBPAGE_RECORD_HEADER_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES;
         Ok(NamePagePush::Added(address))
     }
 
@@ -189,7 +271,7 @@ impl NamePageBuilder {
         if self.records.is_empty() {
             return Err(NamePageError::EmptyPage);
         }
-        encode_name_page(&self.records)
+        encode_name_subpage_page(&self.records)
     }
 
     pub fn records(&self) -> &[NamePageRecord] {
@@ -278,7 +360,7 @@ impl NamePageAppender {
                 pages: u64::from(self.next_page),
             });
         }
-        let encoded = encode_name_page(records)?;
+        let encoded = encode_name_subpage_page(records)?;
         let mut addresses = Vec::with_capacity(records.len());
         for slot in 0..records.len() {
             addresses.push(NamePageAddress::new(
@@ -329,46 +411,156 @@ impl NamePageAppender {
 
 impl<'a> NamePageRef<'a> {
     pub const fn record_count(self) -> u16 {
-        self.record_count
+        match self.layout {
+            NamePageRefLayout::Legacy { record_count, .. }
+            | NamePageRefLayout::Subpages { record_count, .. } => record_count,
+        }
     }
 
     pub fn record(self, slot: u16) -> Result<NamePageRecordRef<'a>, NamePageError> {
-        let location = decode_name_page_record_location(
-            self.encoded,
-            self.record_count,
-            self.directory_end,
-            self.payload_end,
-            slot,
-        )?;
-        let payload_end = location
-            .payload_offset
-            .checked_add(location.payload_length)
-            .ok_or(NamePageError::DirectoryInvariant)?;
-        let canonical = self
-            .encoded
-            .get(location.payload_offset..payload_end)
-            .ok_or(NamePageError::DirectoryInvariant)?;
-        Ok(NamePageRecordRef {
-            key: location.key,
-            children: location.children,
-            canonical,
-        })
+        match self.layout {
+            NamePageRefLayout::Legacy {
+                encoded,
+                record_count,
+                directory_end,
+                payload_end,
+            } => {
+                let location = decode_name_page_record_location(
+                    encoded,
+                    record_count,
+                    directory_end,
+                    payload_end,
+                    slot,
+                )?;
+                let payload_end = location
+                    .payload_offset
+                    .checked_add(location.payload_length)
+                    .ok_or(NamePageError::DirectoryInvariant)?;
+                let canonical = encoded
+                    .get(location.payload_offset..payload_end)
+                    .ok_or(NamePageError::DirectoryInvariant)?;
+                Ok(NamePageRecordRef {
+                    key: location.key,
+                    children: location.children,
+                    canonical,
+                })
+            }
+            NamePageRefLayout::Subpages {
+                encoded,
+                record_count,
+                subpage_count,
+            } => {
+                let (subpage, local_slot) =
+                    decode_name_subpage_index_location(encoded, record_count, subpage_count, slot)?;
+                let start = usize::from(subpage)
+                    .checked_mul(NAME_SUBPAGE_BYTES)
+                    .ok_or(NamePageError::OffsetOverflow)?;
+                let end = start
+                    .checked_add(NAME_SUBPAGE_BYTES)
+                    .ok_or(NamePageError::OffsetOverflow)?;
+                let block = encoded
+                    .get(start..end)
+                    .ok_or(NamePageError::DirectoryInvariant)?;
+                decode_name_subpage_record_prevalidated(block, subpage, local_slot)
+            }
+        }
     }
 }
 
 impl NamePageDirectory {
     pub const fn record_count(&self) -> u16 {
-        self.record_count
+        match &self.layout {
+            NamePageDirectoryLayout::Legacy { record_count, .. }
+            | NamePageDirectoryLayout::Subpages { record_count, .. } => *record_count,
+        }
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        match &self.layout {
+            NamePageDirectoryLayout::Legacy { encoded, .. } => encoded.len(),
+            NamePageDirectoryLayout::Subpages { encoded_index, .. } => encoded_index.len(),
+        }
     }
 
     pub fn record(&self, slot: u16) -> Result<NamePageRecordLocation, NamePageError> {
-        decode_name_page_record_location(
-            &self.encoded,
-            self.record_count,
-            self.directory_end,
-            self.payload_end,
-            slot,
-        )
+        match &self.layout {
+            NamePageDirectoryLayout::Legacy {
+                encoded,
+                record_count,
+                directory_end,
+                payload_end,
+            } => decode_name_page_record_location(
+                encoded,
+                *record_count,
+                *directory_end,
+                *payload_end,
+                slot,
+            ),
+            NamePageDirectoryLayout::Subpages { .. } => Err(NamePageError::DirectoryInvariant),
+        }
+    }
+
+    fn subpage_location(&self, slot: u16) -> Result<Option<(u8, u8)>, NamePageError> {
+        match &self.layout {
+            NamePageDirectoryLayout::Legacy { .. } => Ok(None),
+            NamePageDirectoryLayout::Subpages {
+                encoded_index,
+                record_count,
+                subpage_count,
+            } => decode_name_subpage_index_location(
+                encoded_index,
+                *record_count,
+                *subpage_count,
+                slot,
+            )
+            .map(Some),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<'a> PositionedNamePageReader<'a> {
+    pub fn new(file: &'a File, page: u32, directory: &'a NamePageDirectory) -> Self {
+        Self {
+            file,
+            page,
+            directory,
+            subpages: BTreeMap::new(),
+        }
+    }
+
+    pub fn record(&mut self, slot: u16) -> Result<NamePageRecord, NamePageError> {
+        let Some((subpage, local_slot)) = self.directory.subpage_location(slot)? else {
+            return read_name_page_record_at(self.file, self.page, self.directory, slot);
+        };
+        if !self.subpages.contains_key(&subpage) {
+            let offset = u64::from(self.page)
+                .checked_mul(NAME_PAGE_BYTES as u64)
+                .and_then(|page_offset| {
+                    page_offset.checked_add(u64::from(subpage) * NAME_SUBPAGE_BYTES as u64)
+                })
+                .ok_or(NamePageError::OffsetOverflow)?;
+            let mut encoded = vec![0u8; NAME_SUBPAGE_BYTES];
+            self.file
+                .read_exact_at(&mut encoded, offset)
+                .map_err(name_page_io)?;
+            decode_name_subpage_record_header(&encoded, subpage)?;
+            self.subpages.insert(subpage, encoded);
+        }
+        let encoded = self
+            .subpages
+            .get(&subpage)
+            .ok_or(NamePageError::DirectoryInvariant)?;
+        let record = decode_name_subpage_record_prevalidated(encoded, subpage, local_slot)?;
+        Ok(NamePageRecord {
+            key: record.key,
+            children: record.children.into_iter().flatten().collect(),
+            canonical: record.canonical.to_vec(),
+        })
+    }
+
+    pub fn cached_subpages(&self) -> usize {
+        self.subpages.len()
     }
 }
 
@@ -521,6 +713,275 @@ pub fn encode_name_page(records: &[NamePageRecord]) -> Result<Vec<u8>, NamePageE
     Ok(encoded)
 }
 
+/// Encode the current page layout: one authenticated 4 KiB slot index followed
+/// by up to fifteen independently authenticated 4 KiB record subpages. A
+/// lookup reads the index once and only the subpages containing selected
+/// records; the enclosing append unit remains one crash-atomic 64 KiB page.
+pub fn encode_name_subpage_page(records: &[NamePageRecord]) -> Result<Vec<u8>, NamePageError> {
+    let ranges = plan_name_subpage_ranges(records)?;
+    let record_count =
+        u16::try_from(records.len()).map_err(|_| NamePageError::TooManyRecords(records.len()))?;
+    let subpage_count =
+        u8::try_from(ranges.len()).map_err(|_| NamePageError::TooManyRecords(records.len()))?;
+    let mut encoded = vec![0u8; NAME_PAGE_BYTES];
+
+    let mut cursor = 0usize;
+    write_bytes(&mut encoded, &mut cursor, NAME_SUBPAGE_INDEX_MAGIC)?;
+    write_bytes(
+        &mut encoded,
+        &mut cursor,
+        &NAME_SUBPAGE_VERSION.to_le_bytes(),
+    )?;
+    write_bytes(&mut encoded, &mut cursor, &record_count.to_le_bytes())?;
+    write_bytes(&mut encoded, &mut cursor, &[subpage_count, 0, 0, 0])?;
+    debug_assert_eq!(cursor, NAME_SUBPAGE_INDEX_HEADER_BYTES);
+    for (subpage_index, (start, end)) in ranges.iter().copied().enumerate() {
+        let subpage = u8::try_from(subpage_index + 1).map_err(|_| NamePageError::OffsetOverflow)?;
+        for local_slot in 0..end - start {
+            write_bytes(
+                &mut encoded,
+                &mut cursor,
+                &[
+                    subpage,
+                    u8::try_from(local_slot)
+                        .map_err(|_| NamePageError::TooManyRecords(end.saturating_sub(start)))?,
+                ],
+            )?;
+        }
+        let block_start = (subpage_index + 1)
+            .checked_mul(NAME_SUBPAGE_BYTES)
+            .ok_or(NamePageError::OffsetOverflow)?;
+        let block_end = block_start
+            .checked_add(NAME_SUBPAGE_BYTES)
+            .ok_or(NamePageError::OffsetOverflow)?;
+        encode_name_record_subpage(
+            encoded
+                .get_mut(block_start..block_end)
+                .ok_or(NamePageError::DirectoryInvariant)?,
+            subpage,
+            &records[start..end],
+        )?;
+    }
+    let index_checksum_offset = NAME_SUBPAGE_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES;
+    if cursor > index_checksum_offset {
+        return Err(NamePageError::PageFull {
+            required: cursor + NAME_SUBPAGE_CHECKSUM_BYTES,
+            capacity: NAME_SUBPAGE_BYTES,
+        });
+    }
+    let checksum = blake2b_256(&encoded[..index_checksum_offset]);
+    encoded[index_checksum_offset..NAME_SUBPAGE_BYTES].copy_from_slice(&checksum);
+    Ok(encoded)
+}
+
+fn plan_name_subpage_ranges(
+    records: &[NamePageRecord],
+) -> Result<Vec<(usize, usize)>, NamePageError> {
+    if records.is_empty() {
+        return Err(NamePageError::EmptyPage);
+    }
+    let index_required = NAME_SUBPAGE_INDEX_HEADER_BYTES
+        .checked_add(
+            records
+                .len()
+                .checked_mul(NAME_SUBPAGE_INDEX_ENTRY_BYTES)
+                .ok_or(NamePageError::OffsetOverflow)?,
+        )
+        .and_then(|bytes| bytes.checked_add(NAME_SUBPAGE_CHECKSUM_BYTES))
+        .ok_or(NamePageError::OffsetOverflow)?;
+    if index_required > NAME_SUBPAGE_BYTES {
+        return Err(NamePageError::PageFull {
+            required: index_required,
+            capacity: NAME_SUBPAGE_BYTES,
+        });
+    }
+
+    let mut keys = BTreeSet::new();
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut count = 0usize;
+    let mut record_bytes = 0usize;
+    for (index, record) in records.iter().enumerate() {
+        if !keys.insert(record.key) {
+            return Err(NamePageError::DuplicateKey);
+        }
+        validate_name_page_record(index, record)?;
+        let added = name_page_record_bytes(record)?;
+        let next_count = count.checked_add(1).ok_or(NamePageError::OffsetOverflow)?;
+        let next_bytes = record_bytes
+            .checked_add(added)
+            .ok_or(NamePageError::OffsetOverflow)?;
+        let required = name_subpage_required_bytes(next_count, next_bytes)?;
+        if count >= NAME_SUBPAGE_LOCAL_RECORD_MAX || required > NAME_SUBPAGE_BYTES {
+            if count == 0 {
+                return Err(NamePageError::RecordTooLarge {
+                    index,
+                    actual: added,
+                    maximum: NAME_SUBPAGE_BYTES
+                        - NAME_SUBPAGE_RECORD_HEADER_BYTES
+                        - NAME_SUBPAGE_CHECKSUM_BYTES,
+                });
+            }
+            ranges.push((start, index));
+            if ranges.len() == NAME_SUBPAGE_DATA_COUNT {
+                return Err(NamePageError::PageFull {
+                    required: NAME_PAGE_BYTES + 1,
+                    capacity: NAME_PAGE_BYTES,
+                });
+            }
+            start = index;
+            count = 1;
+            record_bytes = added;
+            let required = name_subpage_required_bytes(count, record_bytes)?;
+            if required > NAME_SUBPAGE_BYTES {
+                return Err(NamePageError::RecordTooLarge {
+                    index,
+                    actual: added,
+                    maximum: NAME_SUBPAGE_BYTES
+                        - NAME_SUBPAGE_RECORD_HEADER_BYTES
+                        - NAME_SUBPAGE_CHECKSUM_BYTES,
+                });
+            }
+        } else {
+            count = next_count;
+            record_bytes = next_bytes;
+        }
+    }
+    ranges.push((start, records.len()));
+    if ranges.len() > NAME_SUBPAGE_DATA_COUNT {
+        return Err(NamePageError::PageFull {
+            required: NAME_PAGE_BYTES + 1,
+            capacity: NAME_PAGE_BYTES,
+        });
+    }
+    Ok(ranges)
+}
+
+fn name_subpage_required_bytes(
+    record_count: usize,
+    record_bytes: usize,
+) -> Result<usize, NamePageError> {
+    if record_count > NAME_SUBPAGE_LOCAL_RECORD_MAX {
+        return Ok(NAME_SUBPAGE_BYTES + 1);
+    }
+    NAME_SUBPAGE_RECORD_HEADER_BYTES
+        .checked_add(record_bytes)
+        .and_then(|bytes| bytes.checked_add(NAME_SUBPAGE_CHECKSUM_BYTES))
+        .ok_or(NamePageError::OffsetOverflow)
+}
+
+fn encode_name_record_subpage(
+    encoded: &mut [u8],
+    subpage: u8,
+    records: &[NamePageRecord],
+) -> Result<(), NamePageError> {
+    if encoded.len() != NAME_SUBPAGE_BYTES {
+        return Err(NamePageError::Length {
+            actual: encoded.len(),
+            expected: NAME_SUBPAGE_BYTES,
+        });
+    }
+    let record_count =
+        u8::try_from(records.len()).map_err(|_| NamePageError::TooManyRecords(records.len()))?;
+    if record_count == 0 || usize::from(subpage) > NAME_SUBPAGE_DATA_COUNT {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let index_bytes = records
+        .len()
+        .checked_mul(NAME_PAGE_INDEX_BYTES)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let mut directory_bytes = index_bytes;
+    let mut payload_bytes = 0usize;
+    for (index, record) in records.iter().enumerate() {
+        validate_name_page_record(index, record)?;
+        directory_bytes = directory_bytes
+            .checked_add(NAME_PAGE_RECORD_FIXED_BYTES)
+            .and_then(|bytes| bytes.checked_add(record.children.len() * NAME_PAGE_CHILD_BYTES))
+            .ok_or(NamePageError::OffsetOverflow)?;
+        payload_bytes = payload_bytes
+            .checked_add(record.canonical.len())
+            .ok_or(NamePageError::OffsetOverflow)?;
+    }
+    let directory_end = NAME_SUBPAGE_RECORD_HEADER_BYTES
+        .checked_add(directory_bytes)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let payload_end = directory_end
+        .checked_add(payload_bytes)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let checksum_offset = NAME_SUBPAGE_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES;
+    if payload_end > checksum_offset {
+        return Err(NamePageError::PageFull {
+            required: payload_end + NAME_SUBPAGE_CHECKSUM_BYTES,
+            capacity: NAME_SUBPAGE_BYTES,
+        });
+    }
+
+    let mut cursor = 0usize;
+    write_bytes(encoded, &mut cursor, NAME_SUBPAGE_RECORD_MAGIC)?;
+    write_bytes(encoded, &mut cursor, &NAME_SUBPAGE_VERSION.to_le_bytes())?;
+    write_bytes(encoded, &mut cursor, &[subpage, record_count])?;
+    write_bytes(
+        encoded,
+        &mut cursor,
+        &u16::try_from(directory_end)
+            .map_err(|_| NamePageError::OffsetOverflow)?
+            .to_le_bytes(),
+    )?;
+    write_bytes(
+        encoded,
+        &mut cursor,
+        &u16::try_from(payload_end)
+            .map_err(|_| NamePageError::OffsetOverflow)?
+            .to_le_bytes(),
+    )?;
+    write_bytes(encoded, &mut cursor, &0u32.to_le_bytes())?;
+    debug_assert_eq!(cursor, NAME_SUBPAGE_RECORD_HEADER_BYTES);
+
+    let mut entry_cursor = NAME_SUBPAGE_RECORD_HEADER_BYTES + index_bytes;
+    let mut payload_cursor = directory_end;
+    for (slot, record) in records.iter().enumerate() {
+        let index_offset = NAME_SUBPAGE_RECORD_HEADER_BYTES + slot * NAME_PAGE_INDEX_BYTES;
+        encoded[index_offset..index_offset + 2].copy_from_slice(
+            &u16::try_from(entry_cursor)
+                .map_err(|_| NamePageError::OffsetOverflow)?
+                .to_le_bytes(),
+        );
+        write_bytes(encoded, &mut entry_cursor, &record.key)?;
+        write_bytes(
+            encoded,
+            &mut entry_cursor,
+            &u16::try_from(payload_cursor)
+                .map_err(|_| NamePageError::OffsetOverflow)?
+                .to_le_bytes(),
+        )?;
+        write_bytes(
+            encoded,
+            &mut entry_cursor,
+            &u16::try_from(record.canonical.len())
+                .map_err(|_| NamePageError::RecordTooLarge {
+                    index: slot,
+                    actual: record.canonical.len(),
+                    maximum: usize::from(u16::MAX),
+                })?
+                .to_le_bytes(),
+        )?;
+        write_bytes(
+            encoded,
+            &mut entry_cursor,
+            &[record.children.len() as u8, 0],
+        )?;
+        for child in &record.children {
+            write_bytes(encoded, &mut entry_cursor, &child.raw().to_le_bytes())?;
+        }
+        write_bytes(encoded, &mut payload_cursor, &record.canonical)?;
+    }
+    debug_assert_eq!(entry_cursor, directory_end);
+    debug_assert_eq!(payload_cursor, payload_end);
+    let checksum = blake2b_256(&encoded[..checksum_offset]);
+    encoded[checksum_offset..].copy_from_slice(&checksum);
+    Ok(())
+}
+
 fn validate_name_page_record(index: usize, record: &NamePageRecord) -> Result<(), NamePageError> {
     if !record.children.is_empty() && record.children.len() != 2 {
         return Err(NamePageError::ChildCount(record.children.len()));
@@ -544,6 +1005,279 @@ fn name_page_record_bytes(record: &NamePageRecord) -> Result<usize, NamePageErro
         .and_then(|bytes| bytes.checked_add(record.children.len() * NAME_PAGE_CHILD_BYTES))
         .and_then(|bytes| bytes.checked_add(record.canonical.len()))
         .ok_or(NamePageError::OffsetOverflow)
+}
+
+fn decode_name_subpage_index(encoded: &[u8]) -> Result<(u16, u8), NamePageError> {
+    if encoded.len() < NAME_SUBPAGE_BYTES {
+        return Err(NamePageError::Length {
+            actual: encoded.len(),
+            expected: NAME_SUBPAGE_BYTES,
+        });
+    }
+    if &encoded[..8] != NAME_SUBPAGE_INDEX_MAGIC {
+        return Err(NamePageError::InvalidMagic);
+    }
+    let checksum_offset = NAME_SUBPAGE_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES;
+    if encoded[checksum_offset..NAME_SUBPAGE_BYTES] != blake2b_256(&encoded[..checksum_offset]) {
+        return Err(NamePageError::ChecksumMismatch);
+    }
+    let mut cursor = 8usize;
+    let version = read_u16(encoded, &mut cursor)?;
+    if version != NAME_SUBPAGE_VERSION {
+        return Err(NamePageError::UnsupportedVersion(version));
+    }
+    let record_count = read_u16(encoded, &mut cursor)?;
+    let subpage_count = read_u8(encoded, &mut cursor)?;
+    if read_array::<3>(encoded, &mut cursor)? != [0; 3]
+        || record_count == 0
+        || subpage_count == 0
+        || usize::from(subpage_count) > NAME_SUBPAGE_DATA_COUNT
+    {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let index_end = NAME_SUBPAGE_INDEX_HEADER_BYTES
+        .checked_add(usize::from(record_count) * NAME_SUBPAGE_INDEX_ENTRY_BYTES)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    if index_end > checksum_offset {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let mut expected_local = vec![0u16; usize::from(subpage_count) + 1];
+    let mut previous_subpage = 0u8;
+    for slot in 0..record_count {
+        let (subpage, local_slot) = decode_name_subpage_index_location_unchecked(encoded, slot)?;
+        if subpage == 0
+            || subpage > subpage_count
+            || subpage < previous_subpage
+            || u16::from(local_slot) != expected_local[usize::from(subpage)]
+        {
+            return Err(NamePageError::DirectoryInvariant);
+        }
+        expected_local[usize::from(subpage)] += 1;
+        previous_subpage = subpage;
+    }
+    if expected_local[1..].contains(&0) {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    Ok((record_count, subpage_count))
+}
+
+fn decode_name_subpage_index_location(
+    encoded: &[u8],
+    record_count: u16,
+    subpage_count: u8,
+    slot: u16,
+) -> Result<(u8, u8), NamePageError> {
+    if slot >= record_count {
+        return Err(NamePageError::SlotOutOfRange {
+            slot,
+            records: record_count,
+        });
+    }
+    let (subpage, local_slot) = decode_name_subpage_index_location_unchecked(encoded, slot)?;
+    if subpage == 0 || subpage > subpage_count {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    Ok((subpage, local_slot))
+}
+
+fn decode_name_subpage_index_location_unchecked(
+    encoded: &[u8],
+    slot: u16,
+) -> Result<(u8, u8), NamePageError> {
+    let offset = NAME_SUBPAGE_INDEX_HEADER_BYTES
+        .checked_add(usize::from(slot) * NAME_SUBPAGE_INDEX_ENTRY_BYTES)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let entry = encoded
+        .get(offset..offset + NAME_SUBPAGE_INDEX_ENTRY_BYTES)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    Ok((entry[0], entry[1]))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NameSubpageRecordHeader {
+    record_count: u8,
+    directory_end: usize,
+    payload_end: usize,
+}
+
+fn decode_name_subpage_record_header(
+    encoded: &[u8],
+    expected_subpage: u8,
+) -> Result<NameSubpageRecordHeader, NamePageError> {
+    let header = parse_name_subpage_record_header(encoded, expected_subpage)?;
+    let checksum_offset = NAME_SUBPAGE_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES;
+    if encoded[checksum_offset..] != blake2b_256(&encoded[..checksum_offset]) {
+        return Err(NamePageError::ChecksumMismatch);
+    }
+    validate_name_subpage_record_directory(encoded, header)?;
+    Ok(header)
+}
+
+fn parse_name_subpage_record_header(
+    encoded: &[u8],
+    expected_subpage: u8,
+) -> Result<NameSubpageRecordHeader, NamePageError> {
+    if encoded.len() != NAME_SUBPAGE_BYTES {
+        return Err(NamePageError::Length {
+            actual: encoded.len(),
+            expected: NAME_SUBPAGE_BYTES,
+        });
+    }
+    if &encoded[..8] != NAME_SUBPAGE_RECORD_MAGIC {
+        return Err(NamePageError::InvalidMagic);
+    }
+    let checksum_offset = NAME_SUBPAGE_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES;
+    let mut cursor = 8usize;
+    let version = read_u16(encoded, &mut cursor)?;
+    if version != NAME_SUBPAGE_VERSION {
+        return Err(NamePageError::UnsupportedVersion(version));
+    }
+    let subpage = read_u8(encoded, &mut cursor)?;
+    let record_count = read_u8(encoded, &mut cursor)?;
+    let directory_end = usize::from(read_u16(encoded, &mut cursor)?);
+    let payload_end = usize::from(read_u16(encoded, &mut cursor)?);
+    if read_u32(encoded, &mut cursor)? != 0 || subpage != expected_subpage || record_count == 0 {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let index_end = NAME_SUBPAGE_RECORD_HEADER_BYTES
+        .checked_add(usize::from(record_count) * NAME_PAGE_INDEX_BYTES)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    if index_end > directory_end || directory_end > payload_end || payload_end > checksum_offset {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let header = NameSubpageRecordHeader {
+        record_count,
+        directory_end,
+        payload_end,
+    };
+    Ok(header)
+}
+
+fn decode_name_subpage_record_location(
+    encoded: &[u8],
+    header: NameSubpageRecordHeader,
+    slot: u8,
+) -> Result<NamePageRecordLocation, NamePageError> {
+    if slot >= header.record_count {
+        return Err(NamePageError::SlotOutOfRange {
+            slot: u16::from(slot),
+            records: u16::from(header.record_count),
+        });
+    }
+    let index_end = NAME_SUBPAGE_RECORD_HEADER_BYTES
+        .checked_add(usize::from(header.record_count) * NAME_PAGE_INDEX_BYTES)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    let index_offset = NAME_SUBPAGE_RECORD_HEADER_BYTES
+        .checked_add(usize::from(slot) * NAME_PAGE_INDEX_BYTES)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    let mut index_cursor = index_offset;
+    let record_offset = usize::from(read_u16(encoded, &mut index_cursor)?);
+    if record_offset < index_end
+        || record_offset + NAME_PAGE_RECORD_FIXED_BYTES > header.directory_end
+    {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let mut cursor = record_offset;
+    let key = read_array::<32>(encoded, &mut cursor)?;
+    let payload_offset = usize::from(read_u16(encoded, &mut cursor)?);
+    let payload_length = usize::from(read_u16(encoded, &mut cursor)?);
+    let child_count = usize::from(read_u8(encoded, &mut cursor)?);
+    if child_count != 0 && child_count != 2 {
+        return Err(NamePageError::ChildCount(child_count));
+    }
+    if read_u8(encoded, &mut cursor)? != 0 {
+        return Err(NamePageError::ReservedBits);
+    }
+    let record_end = cursor
+        .checked_add(child_count * NAME_PAGE_CHILD_BYTES)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    if record_end > header.directory_end {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let mut children = [None; 2];
+    for child in children.iter_mut().take(child_count) {
+        *child = Some(NamePageAddress::from_raw(read_u64(encoded, &mut cursor)?));
+    }
+    let canonical_end = payload_offset
+        .checked_add(payload_length)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    if payload_offset < header.directory_end || canonical_end > header.payload_end {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    Ok(NamePageRecordLocation {
+        key,
+        children,
+        record_offset,
+        record_end,
+        payload_offset,
+        payload_length,
+    })
+}
+
+fn validate_name_subpage_record_directory(
+    encoded: &[u8],
+    header: NameSubpageRecordHeader,
+) -> Result<(), NamePageError> {
+    let index_end = NAME_SUBPAGE_RECORD_HEADER_BYTES
+        .checked_add(usize::from(header.record_count) * NAME_PAGE_INDEX_BYTES)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let mut expected_entry = index_end;
+    let mut expected_payload = header.directory_end;
+    let mut keys = BTreeSet::new();
+    for slot in 0..header.record_count {
+        let location = decode_name_subpage_record_location(encoded, header, slot)?;
+        if location.record_offset != expected_entry || location.payload_offset != expected_payload {
+            return Err(NamePageError::DirectoryInvariant);
+        }
+        if !keys.insert(location.key) {
+            return Err(NamePageError::DuplicateKey);
+        }
+        expected_entry = location.record_end;
+        expected_payload = expected_payload
+            .checked_add(location.payload_length)
+            .ok_or(NamePageError::OffsetOverflow)?;
+    }
+    if expected_entry != header.directory_end || expected_payload != header.payload_end {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    Ok(())
+}
+
+fn decode_name_subpage_record<'a>(
+    encoded: &'a [u8],
+    subpage: u8,
+    slot: u8,
+) -> Result<NamePageRecordRef<'a>, NamePageError> {
+    let header = decode_name_subpage_record_header(encoded, subpage)?;
+    decode_name_subpage_record_with_header(encoded, header, slot)
+}
+
+fn decode_name_subpage_record_prevalidated<'a>(
+    encoded: &'a [u8],
+    subpage: u8,
+    slot: u8,
+) -> Result<NamePageRecordRef<'a>, NamePageError> {
+    let header = parse_name_subpage_record_header(encoded, subpage)?;
+    decode_name_subpage_record_with_header(encoded, header, slot)
+}
+
+fn decode_name_subpage_record_with_header(
+    encoded: &[u8],
+    header: NameSubpageRecordHeader,
+    slot: u8,
+) -> Result<NamePageRecordRef<'_>, NamePageError> {
+    let location = decode_name_subpage_record_location(encoded, header, slot)?;
+    let payload_end = location
+        .payload_offset
+        .checked_add(location.payload_length)
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    Ok(NamePageRecordRef {
+        key: location.key,
+        children: location.children,
+        canonical: encoded
+            .get(location.payload_offset..payload_end)
+            .ok_or(NamePageError::DirectoryInvariant)?,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -693,6 +1427,60 @@ pub fn decode_name_page(encoded: &[u8]) -> Result<NamePageRef<'_>, NamePageError
             expected: NAME_PAGE_BYTES,
         });
     }
+    if &encoded[..8] == NAME_SUBPAGE_INDEX_MAGIC {
+        let (record_count, subpage_count) =
+            decode_name_subpage_index(&encoded[..NAME_SUBPAGE_BYTES])?;
+        let mut keys = BTreeSet::new();
+        let mut mapped_counts = vec![0u16; usize::from(subpage_count) + 1];
+        let mut headers = Vec::with_capacity(usize::from(subpage_count));
+        for subpage in 1..=subpage_count {
+            let start = usize::from(subpage) * NAME_SUBPAGE_BYTES;
+            let end = start + NAME_SUBPAGE_BYTES;
+            headers.push(decode_name_subpage_record_header(
+                &encoded[start..end],
+                subpage,
+            )?);
+        }
+        for slot in 0..record_count {
+            let (subpage, local_slot) =
+                decode_name_subpage_index_location(encoded, record_count, subpage_count, slot)?;
+            let start = usize::from(subpage)
+                .checked_mul(NAME_SUBPAGE_BYTES)
+                .ok_or(NamePageError::OffsetOverflow)?;
+            let end = start
+                .checked_add(NAME_SUBPAGE_BYTES)
+                .ok_or(NamePageError::OffsetOverflow)?;
+            let block = encoded
+                .get(start..end)
+                .ok_or(NamePageError::DirectoryInvariant)?;
+            let header = headers
+                .get(usize::from(subpage) - 1)
+                .copied()
+                .ok_or(NamePageError::DirectoryInvariant)?;
+            let record = decode_name_subpage_record_with_header(block, header, local_slot)?;
+            if !keys.insert(record.key) {
+                return Err(NamePageError::DuplicateKey);
+            }
+            mapped_counts[usize::from(subpage)] += 1;
+        }
+        for subpage in 1..=subpage_count {
+            let header = headers[usize::from(subpage) - 1];
+            if u16::from(header.record_count) != mapped_counts[usize::from(subpage)] {
+                return Err(NamePageError::DirectoryInvariant);
+            }
+        }
+        let used_end = (usize::from(subpage_count) + 1) * NAME_SUBPAGE_BYTES;
+        if encoded[used_end..].iter().any(|byte| *byte != 0) {
+            return Err(NamePageError::DirectoryInvariant);
+        }
+        return Ok(NamePageRef {
+            layout: NamePageRefLayout::Subpages {
+                encoded,
+                record_count,
+                subpage_count,
+            },
+        });
+    }
     if &encoded[..8] != NAME_PAGE_MAGIC {
         return Err(NamePageError::InvalidMagic);
     }
@@ -702,10 +1490,12 @@ pub fn decode_name_page(encoded: &[u8]) -> Result<NamePageRef<'_>, NamePageError
     }
     let header = decode_name_page_header(encoded)?;
     let page = NamePageRef {
-        encoded,
-        record_count: header.record_count,
-        directory_end: header.directory_end,
-        payload_end: header.payload_end,
+        layout: NamePageRefLayout::Legacy {
+            encoded,
+            record_count: header.record_count,
+            directory_end: header.directory_end,
+            payload_end: header.payload_end,
+        },
     };
     validate_name_page_directory(encoded, header)?;
     Ok(page)
@@ -724,8 +1514,22 @@ pub fn read_name_page_directory<R: Read + Seek>(
     reader
         .seek(SeekFrom::Start(page_offset))
         .map_err(name_page_io)?;
-    let mut encoded = vec![0u8; NAME_PAGE_HEADER_BYTES];
+    let mut encoded = vec![0u8; 8];
     reader.read_exact(&mut encoded).map_err(name_page_io)?;
+    if encoded.as_slice() == NAME_SUBPAGE_INDEX_MAGIC {
+        encoded.resize(NAME_SUBPAGE_BYTES, 0);
+        reader.read_exact(&mut encoded[8..]).map_err(name_page_io)?;
+        let (record_count, subpage_count) = decode_name_subpage_index(&encoded)?;
+        return Ok(NamePageDirectory {
+            layout: NamePageDirectoryLayout::Subpages {
+                encoded_index: encoded,
+                record_count,
+                subpage_count,
+            },
+        });
+    }
+    encoded.resize(NAME_PAGE_HEADER_BYTES, 0);
+    reader.read_exact(&mut encoded[8..]).map_err(name_page_io)?;
     let header = decode_name_page_header(&encoded)?;
     encoded.resize(header.directory_end, 0);
     reader
@@ -733,10 +1537,12 @@ pub fn read_name_page_directory<R: Read + Seek>(
         .map_err(name_page_io)?;
     validate_name_page_directory(&encoded, header)?;
     Ok(NamePageDirectory {
-        encoded,
-        record_count: header.record_count,
-        directory_end: header.directory_end,
-        payload_end: header.payload_end,
+        layout: NamePageDirectoryLayout::Legacy {
+            encoded,
+            record_count: header.record_count,
+            directory_end: header.directory_end,
+            payload_end: header.payload_end,
+        },
     })
 }
 
@@ -747,6 +1553,23 @@ pub fn read_name_page_record<R: Read + Seek>(
     directory: &NamePageDirectory,
     slot: u16,
 ) -> Result<NamePageRecord, NamePageError> {
+    if let Some((subpage, local_slot)) = directory.subpage_location(slot)? {
+        let offset = u64::from(page)
+            .checked_mul(NAME_PAGE_BYTES as u64)
+            .and_then(|page_offset| {
+                page_offset.checked_add(u64::from(subpage) * NAME_SUBPAGE_BYTES as u64)
+            })
+            .ok_or(NamePageError::OffsetOverflow)?;
+        reader.seek(SeekFrom::Start(offset)).map_err(name_page_io)?;
+        let mut encoded = vec![0u8; NAME_SUBPAGE_BYTES];
+        reader.read_exact(&mut encoded).map_err(name_page_io)?;
+        let record = decode_name_subpage_record(&encoded, subpage, local_slot)?;
+        return Ok(NamePageRecord {
+            key: record.key,
+            children: record.children.into_iter().flatten().collect(),
+            canonical: record.canonical.to_vec(),
+        });
+    }
     let location = directory.record(slot)?;
     let page_offset = u64::from(page)
         .checked_mul(NAME_PAGE_BYTES as u64)
@@ -774,8 +1597,24 @@ pub fn read_name_page_directory_at(
     let page_offset = u64::from(page)
         .checked_mul(NAME_PAGE_BYTES as u64)
         .ok_or(NamePageError::OffsetOverflow)?;
-    let mut encoded = vec![0u8; NAME_PAGE_HEADER_BYTES];
+    let mut encoded = vec![0u8; 8];
     file.read_exact_at(&mut encoded, page_offset)
+        .map_err(name_page_io)?;
+    if encoded.as_slice() == NAME_SUBPAGE_INDEX_MAGIC {
+        encoded.resize(NAME_SUBPAGE_BYTES, 0);
+        file.read_exact_at(&mut encoded[8..], page_offset + 8)
+            .map_err(name_page_io)?;
+        let (record_count, subpage_count) = decode_name_subpage_index(&encoded)?;
+        return Ok(NamePageDirectory {
+            layout: NamePageDirectoryLayout::Subpages {
+                encoded_index: encoded,
+                record_count,
+                subpage_count,
+            },
+        });
+    }
+    encoded.resize(NAME_PAGE_HEADER_BYTES, 0);
+    file.read_exact_at(&mut encoded[8..], page_offset + 8)
         .map_err(name_page_io)?;
     let header = decode_name_page_header(&encoded)?;
     encoded.resize(header.directory_end, 0);
@@ -788,10 +1627,12 @@ pub fn read_name_page_directory_at(
     .map_err(name_page_io)?;
     validate_name_page_directory(&encoded, header)?;
     Ok(NamePageDirectory {
-        encoded,
-        record_count: header.record_count,
-        directory_end: header.directory_end,
-        payload_end: header.payload_end,
+        layout: NamePageDirectoryLayout::Legacy {
+            encoded,
+            record_count: header.record_count,
+            directory_end: header.directory_end,
+            payload_end: header.payload_end,
+        },
     })
 }
 
@@ -804,6 +1645,23 @@ pub fn read_name_page_record_at(
     directory: &NamePageDirectory,
     slot: u16,
 ) -> Result<NamePageRecord, NamePageError> {
+    if let Some((subpage, local_slot)) = directory.subpage_location(slot)? {
+        let offset = u64::from(page)
+            .checked_mul(NAME_PAGE_BYTES as u64)
+            .and_then(|page_offset| {
+                page_offset.checked_add(u64::from(subpage) * NAME_SUBPAGE_BYTES as u64)
+            })
+            .ok_or(NamePageError::OffsetOverflow)?;
+        let mut encoded = vec![0u8; NAME_SUBPAGE_BYTES];
+        file.read_exact_at(&mut encoded, offset)
+            .map_err(name_page_io)?;
+        let record = decode_name_subpage_record(&encoded, subpage, local_slot)?;
+        return Ok(NamePageRecord {
+            key: record.key,
+            children: record.children.into_iter().flatten().collect(),
+            canonical: record.canonical.to_vec(),
+        });
+    }
     let location = directory.record(slot)?;
     let offset = u64::from(page)
         .checked_mul(NAME_PAGE_BYTES as u64)
@@ -1055,7 +1913,7 @@ mod tests {
         let mut reader = std::io::Cursor::new(encoded.clone());
         let directory = read_name_page_directory(&mut reader, 0).expect("read directory");
         assert_eq!(directory.record_count(), 2);
-        assert!(directory.encoded.len() < NAME_PAGE_BYTES);
+        assert!(directory.resident_bytes() < NAME_PAGE_BYTES);
         assert_eq!(
             read_name_page_record(&mut reader, 0, &directory, 0).expect("read leaf"),
             leaf
@@ -1185,15 +2043,83 @@ mod tests {
                 }
             }
         }
-        assert_eq!(builder.records().len(), 519);
+        assert_eq!(builder.records().len(), 480);
         assert_eq!(
             rejected.expect("full record").key[..2],
-            519u16.to_le_bytes()
+            480u16.to_le_bytes()
         );
         let encoded = builder.finish().expect("finish");
         assert_eq!(
             decode_name_page(&encoded).expect("decode").record_count(),
-            519
+            480
+        );
+    }
+
+    #[test]
+    fn authenticated_subpages_bound_hot_reads_and_cache_shared_blocks() {
+        let records = (0u16..96)
+            .map(|index| NamePageRecord {
+                key: {
+                    let mut key = [0u8; 32];
+                    key[..2].copy_from_slice(&index.to_le_bytes());
+                    key
+                },
+                children: vec![address(1, index), address(2, index)],
+                canonical: vec![(index & 0xff) as u8; 70],
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_name_subpage_page(&records).expect("encode subpages");
+        let page = decode_name_page(&encoded).expect("decode subpages");
+        assert_eq!(page.record_count(), 96);
+        for slot in [0u16, 31, 32, 63, 64, 95] {
+            let actual = page.record(slot).expect("subpage record");
+            assert_eq!(actual.key, records[usize::from(slot)].key);
+            assert_eq!(actual.canonical, records[usize::from(slot)].canonical);
+        }
+
+        let mut cursor = std::io::Cursor::new(encoded.clone());
+        let directory = read_name_page_directory(&mut cursor, 0).expect("subpage index");
+        assert_eq!(directory.record_count(), 96);
+        assert_eq!(directory.resident_bytes(), NAME_SUBPAGE_BYTES);
+        assert_eq!(
+            read_name_page_record(&mut cursor, 0, &directory, 63).expect("selected subpage record"),
+            records[63]
+        );
+
+        #[cfg(unix)]
+        {
+            let path = test_file();
+            fs::write(&path, encoded).expect("write subpage fixture");
+            let file = File::open(&path).expect("open subpage fixture");
+            let positioned =
+                read_name_page_directory_at(&file, 0).expect("positioned subpage index");
+            let mut reader = PositionedNamePageReader::new(&file, 0, &positioned);
+            assert_eq!(reader.record(32).expect("first shared record"), records[32]);
+            assert_eq!(
+                reader.record(63).expect("second shared record"),
+                records[63]
+            );
+            assert_eq!(reader.cached_subpages(), 1);
+            assert_eq!(reader.record(64).expect("next subpage record"), records[64]);
+            assert_eq!(reader.cached_subpages(), 2);
+            fs::remove_file(path).expect("remove subpage fixture");
+        }
+    }
+
+    #[test]
+    fn authenticated_subpage_corruption_fails_before_record_use() {
+        let records = (0u8..40).map(|key| leaf(key, 70)).collect::<Vec<_>>();
+        let mut encoded = encode_name_subpage_page(&records).expect("encode subpages");
+        encoded[NAME_SUBPAGE_BYTES + 200] ^= 1;
+        assert_eq!(
+            decode_name_page(&encoded),
+            Err(NamePageError::ChecksumMismatch)
+        );
+        let mut cursor = std::io::Cursor::new(encoded);
+        let directory = read_name_page_directory(&mut cursor, 0).expect("intact index");
+        assert_eq!(
+            read_name_page_record(&mut cursor, 0, &directory, 0),
+            Err(NamePageError::ChecksumMismatch)
         );
     }
 
