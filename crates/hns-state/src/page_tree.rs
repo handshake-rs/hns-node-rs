@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    fs::File,
-    io::{Read, Seek, SeekFrom},
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -1064,6 +1064,7 @@ impl PageCache {
 #[derive(Debug)]
 pub struct NamePageTreeReader {
     files: Mutex<HashMap<u32, File>>,
+    audit_directory: PathBuf,
     generation: u64,
     root_segment: u32,
     addresses: Mutex<HashMap<TreeRoot, NamePageAddress>>,
@@ -1077,10 +1078,169 @@ struct ValidatedPageRecord {
     maximum_path_bits: u16,
 }
 
+const VALIDATED_PAGE_RECORD_BYTES: usize = 32 + 2;
+const VALIDATED_PAGE_CACHE_PAGES: usize = 4_096;
+static VALIDATION_SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedPageSpan {
+    first_record: u64,
+    record_count: u16,
+}
+
+struct CachedValidatedPage {
+    key: u64,
+    records: Box<[ValidatedPageRecord]>,
+}
+
+/// Exact address-indexed audit records backed by an immediately unlinked
+/// local file. A small direct-mapped page cache preserves child-reference
+/// locality while the kernel can evict the spill itself without consuming
+/// anonymous swap. Full 256-bit roots preserve deterministic child-hash
+/// verification.
+struct ValidatedPageSpill {
+    file: File,
+    cache: Vec<Option<CachedValidatedPage>>,
+    record_count: u64,
+}
+
+impl ValidatedPageSpill {
+    fn create(directory: &Path) -> Result<Self, PageTreeError> {
+        let sequence = VALIDATION_SPILL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            ".hsrd-name-page-audit-{}-{sequence}.tmp",
+            std::process::id()
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(PageTreeError::io)?;
+        if let Err(error) = std::fs::remove_file(&path) {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(PageTreeError::io(error));
+        }
+        Ok(Self {
+            file,
+            cache: std::iter::repeat_with(|| None)
+                .take(VALIDATED_PAGE_CACHE_PAGES)
+                .collect(),
+            record_count: 0,
+        })
+    }
+
+    fn push_page(
+        &mut self,
+        segment: u32,
+        page: u32,
+        records: &[ValidatedPageRecord],
+    ) -> Result<ValidatedPageSpan, PageTreeError> {
+        let first_record = self.record_count;
+        let record_count =
+            u16::try_from(records.len()).map_err(|_| PageTreeError::OffsetOverflow)?;
+        let next_record_count = self
+            .record_count
+            .checked_add(u64::from(record_count))
+            .ok_or(PageTreeError::OffsetOverflow)?;
+        let offset = first_record
+            .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
+            .ok_or(PageTreeError::OffsetOverflow)?;
+        let mut encoded = Vec::with_capacity(
+            records
+                .len()
+                .checked_mul(VALIDATED_PAGE_RECORD_BYTES)
+                .ok_or(PageTreeError::OffsetOverflow)?,
+        );
+        for record in records {
+            encoded.extend_from_slice(record.root.as_bytes());
+            encoded.extend_from_slice(&record.maximum_path_bits.to_le_bytes());
+        }
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| self.file.write_all(&encoded))
+            .map_err(PageTreeError::io)?;
+
+        self.record_count = next_record_count;
+        self.cache_page(segment, page, records.to_vec().into_boxed_slice());
+        Ok(ValidatedPageSpan {
+            first_record,
+            record_count,
+        })
+    }
+
+    fn get(
+        &mut self,
+        segment: u32,
+        page: u32,
+        span: ValidatedPageSpan,
+        slot: u16,
+    ) -> Result<Option<ValidatedPageRecord>, PageTreeError> {
+        if slot >= span.record_count {
+            return Ok(None);
+        }
+        let key = validation_page_key(segment, page);
+        let cache_index = validation_cache_index(key);
+        let cache_hit = self.cache[cache_index]
+            .as_ref()
+            .is_some_and(|entry| entry.key == key);
+        if !cache_hit {
+            let bytes = usize::from(span.record_count)
+                .checked_mul(VALIDATED_PAGE_RECORD_BYTES)
+                .ok_or(PageTreeError::OffsetOverflow)?;
+            let offset = span
+                .first_record
+                .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
+                .ok_or(PageTreeError::OffsetOverflow)?;
+            let mut encoded = vec![0u8; bytes];
+            self.file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| self.file.read_exact(&mut encoded))
+                .map_err(PageTreeError::io)?;
+            let mut records = Vec::with_capacity(usize::from(span.record_count));
+            for record in encoded.chunks_exact(VALIDATED_PAGE_RECORD_BYTES) {
+                let mut root = [0u8; 32];
+                root.copy_from_slice(&record[..32]);
+                records.push(ValidatedPageRecord {
+                    root: TreeRoot::new(root),
+                    maximum_path_bits: u16::from_le_bytes([record[32], record[33]]),
+                });
+            }
+            self.cache_page(segment, page, records.into_boxed_slice());
+        }
+        Ok(self.cache[cache_index]
+            .as_ref()
+            .and_then(|entry| entry.records.get(usize::from(slot)))
+            .copied())
+    }
+
+    fn cache_page(&mut self, segment: u32, page: u32, records: Box<[ValidatedPageRecord]>) {
+        let key = validation_page_key(segment, page);
+        self.cache[validation_cache_index(key)] = Some(CachedValidatedPage { key, records });
+    }
+}
+
+impl Drop for ValidatedPageSpill {
+    fn drop(&mut self) {
+        let _ = self.file.set_len(0);
+    }
+}
+
+const fn validation_page_key(segment: u32, page: u32) -> u64 {
+    (segment as u64) << 32 | page as u64
+}
+
+fn validation_cache_index(key: u64) -> usize {
+    let mixed = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (mixed as usize) % VALIDATED_PAGE_CACHE_PAGES
+}
+
 /// Result of one physical-order audit of the immutable authenticated page
-/// store. Only explicitly published durable roots remain in the short
-/// legacy-overlay summary; retaining and sorting every historical page record
-/// made unclean startup proportional to the entire append history in memory.
+/// store. The exact historical address index is mmap-backed and immediately
+/// unlinked during validation, so unclean startup stays bounded by the page
+/// table rather than anonymous memory or swap. Only explicitly published
+/// durable roots remain in the short legacy-overlay summary.
 #[derive(Debug)]
 pub struct NamePageValidation {
     pub segments: usize,
@@ -1277,12 +1437,19 @@ impl NamePageTreeReader {
         if !files.contains_key(&address.segment()) {
             return Err(PageTreeError::MissingSegment(address.segment()));
         }
+        let audit_directory = paths
+            .values()
+            .next()
+            .and_then(|path| path.parent())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         let mut addresses = HashMap::new();
         if root != TreeRoot::ZERO {
             addresses.insert(root, address);
         }
         Ok(Self {
             files: Mutex::new(files),
+            audit_directory,
             generation: locator.generation,
             root_segment: address.segment(),
             addresses: Mutex::new(addresses),
@@ -1644,15 +1811,11 @@ impl NamePageTreeReader {
         let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
         let mut segments = files.keys().copied().collect::<Vec<_>>();
         segments.sort_unstable();
-        let mut indexed = BTreeMap::<u32, Vec<Vec<ValidatedPageRecord>>>::new();
-        let mut page_count = 0u64;
-        let mut record_count = 0u64;
+        let mut layouts = Vec::with_capacity(segments.len());
         let mut byte_count = 0u64;
-        let mut encoded = vec![0u8; NAME_PAGE_BYTES];
-
         for segment in segments.iter().copied() {
             let file = files
-                .get_mut(&segment)
+                .get(&segment)
                 .ok_or(PageTreeError::MissingSegment(segment))?;
             let bytes = file.metadata().map_err(PageTreeError::io)?.len();
             if !bytes.is_multiple_of(NAME_PAGE_BYTES as u64) {
@@ -1662,6 +1825,21 @@ impl NamePageTreeReader {
             let pages_u32 = u32::try_from(pages)
                 .map_err(|_| PageTreeError::PageCountOverflow { segment, pages })?;
             NamePageAddress::new(segment, pages_u32.saturating_sub(1), 0)?;
+            byte_count = byte_count
+                .checked_add(bytes)
+                .ok_or(PageTreeError::OffsetOverflow)?;
+            layouts.push((segment, pages_u32));
+        }
+        let mut spill = ValidatedPageSpill::create(&self.audit_directory)?;
+        let mut indexed = BTreeMap::<u32, Vec<ValidatedPageSpan>>::new();
+        let mut page_count = 0u64;
+        let mut record_count = 0u64;
+        let mut encoded = vec![0u8; NAME_PAGE_BYTES];
+
+        for (segment, pages_u32) in layouts {
+            let file = files
+                .get_mut(&segment)
+                .ok_or(PageTreeError::MissingSegment(segment))?;
             file.seek(SeekFrom::Start(0)).map_err(PageTreeError::io)?;
             let segment_capacity =
                 usize::try_from(pages_u32).map_err(|_| PageTreeError::OffsetOverflow)?;
@@ -1709,22 +1887,24 @@ impl NamePageTreeReader {
                                 return Err(PageTreeError::ChildLocatorMismatch(root));
                             };
                             let left_record = earlier_page_record(
+                                &mut spill,
                                 &indexed,
                                 &segment_pages,
                                 &current,
                                 segment,
                                 page_number,
                                 left_address,
-                            )
+                            )?
                             .ok_or(PageTreeError::MissingEarlierRecord(left_address))?;
                             let right_record = earlier_page_record(
+                                &mut spill,
                                 &indexed,
                                 &segment_pages,
                                 &current,
                                 segment,
                                 page_number,
                                 right_address,
-                            )
+                            )?
                             .ok_or(PageTreeError::MissingEarlierRecord(right_address))?;
                             if left_record.root != left || right_record.root != right {
                                 return Err(PageTreeError::ChildLocatorMismatch(root));
@@ -1765,22 +1945,19 @@ impl NamePageTreeReader {
                         .checked_add(1)
                         .ok_or(PageTreeError::OffsetOverflow)?;
                 }
-                segment_pages.push(current);
+                segment_pages.push(spill.push_page(segment, page_number, &current)?);
                 page_count = page_count
                     .checked_add(1)
                     .ok_or(PageTreeError::OffsetOverflow)?;
             }
             indexed.insert(segment, segment_pages);
-            byte_count = byte_count
-                .checked_add(bytes)
-                .ok_or(PageTreeError::OffsetOverflow)?;
         }
         drop(files);
 
         let addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
         let mut roots = Vec::with_capacity(addresses.len());
         for (root, address) in addresses.iter() {
-            let record = indexed_page_record(&indexed, *address)
+            let record = indexed_page_record(&mut spill, &indexed, *address)?
                 .ok_or(PageTreeError::MissingEarlierRecord(*address))?;
             if record.root != *root {
                 return Err(PageTreeError::RecordKeyMismatch {
@@ -1788,10 +1965,11 @@ impl NamePageTreeReader {
                     actual: record.root,
                 });
             }
-            roots.push(*record);
+            roots.push(record);
         }
         drop(addresses);
         drop(indexed);
+        drop(spill);
         roots.sort_unstable_by_key(|record| record.root);
         if roots.windows(2).any(|pair| {
             pair[0].root == pair[1].root && pair[0].maximum_path_bits != pair[1].maximum_path_bits
@@ -1972,39 +2150,46 @@ fn key_bit_at(key: &[u8; 32], bit: usize) -> u8 {
     (key[bit / 8] >> (7 - bit % 8)) & 1
 }
 
-fn earlier_page_record<'a>(
-    prior_segments: &'a BTreeMap<u32, Vec<Vec<ValidatedPageRecord>>>,
-    current_segment_pages: &'a [Vec<ValidatedPageRecord>],
-    current_page: &'a [ValidatedPageRecord],
+fn earlier_page_record(
+    spill: &mut ValidatedPageSpill,
+    prior_segments: &BTreeMap<u32, Vec<ValidatedPageSpan>>,
+    current_segment_pages: &[ValidatedPageSpan],
+    current_page: &[ValidatedPageRecord],
     segment: u32,
     page: u32,
     address: NamePageAddress,
-) -> Option<&'a ValidatedPageRecord> {
+) -> Result<Option<ValidatedPageRecord>, PageTreeError> {
     if address.segment() < segment {
-        return indexed_page_record(prior_segments, address);
+        return indexed_page_record(spill, prior_segments, address);
     }
     if address.segment() != segment {
-        return None;
+        return Ok(None);
     }
     if address.page() < page {
-        return current_segment_pages
-            .get(address.page() as usize)?
-            .get(usize::from(address.slot()));
+        let Some(span) = current_segment_pages.get(address.page() as usize).copied() else {
+            return Ok(None);
+        };
+        return spill.get(address.segment(), address.page(), span, address.slot());
     }
     if address.page() == page {
-        return current_page.get(usize::from(address.slot()));
+        return Ok(current_page.get(usize::from(address.slot())).copied());
     }
-    None
+    Ok(None)
 }
 
 fn indexed_page_record(
-    indexed: &BTreeMap<u32, Vec<Vec<ValidatedPageRecord>>>,
+    spill: &mut ValidatedPageSpill,
+    indexed: &BTreeMap<u32, Vec<ValidatedPageSpan>>,
     address: NamePageAddress,
-) -> Option<&ValidatedPageRecord> {
-    indexed
-        .get(&address.segment())?
-        .get(address.page() as usize)?
-        .get(usize::from(address.slot()))
+) -> Result<Option<ValidatedPageRecord>, PageTreeError> {
+    let Some(span) = indexed
+        .get(&address.segment())
+        .and_then(|pages| pages.get(address.page() as usize))
+        .copied()
+    else {
+        return Ok(None);
+    };
+    spill.get(address.segment(), address.page(), span, address.slot())
 }
 
 fn read_cached_name_page_record(
@@ -2273,6 +2458,57 @@ mod tests {
     use hns_urkel::{
         prove_hsd_from_records, update_record_tree, validate_record_tree, MemoryUrkel,
     };
+
+    #[test]
+    fn validation_spill_reloads_evicted_pages_without_a_visible_temp_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-name-page-audit-test-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create spill directory");
+
+        let first = ValidatedPageRecord {
+            root: TreeRoot::new([0x11; 32]),
+            maximum_path_bits: 17,
+        };
+        let second = ValidatedPageRecord {
+            root: TreeRoot::new([0xa5; 32]),
+            maximum_path_bits: 255,
+        };
+        let mut spill = ValidatedPageSpill::create(&directory).expect("create spill");
+        assert_eq!(
+            std::fs::read_dir(&directory)
+                .expect("read spill directory")
+                .count(),
+            0
+        );
+        let first_span = spill.push_page(3, 0, &[first]).expect("write first page");
+        let second_span = spill
+            .push_page(3, VALIDATED_PAGE_CACHE_PAGES as u32, &[second])
+            .expect("write colliding page");
+        assert_eq!(
+            spill.get(3, 0, first_span, 0).expect("reload first page"),
+            Some(first)
+        );
+        assert_eq!(
+            spill
+                .get(3, VALIDATED_PAGE_CACHE_PAGES as u32, second_span, 0)
+                .expect("reload second page"),
+            Some(second)
+        );
+        drop(spill);
+        assert_eq!(
+            std::fs::read_dir(&directory)
+                .expect("read spill directory")
+                .count(),
+            0
+        );
+        std::fs::remove_dir(&directory).expect("remove spill directory");
+    }
 
     #[test]
     fn name_page_state_round_trips_seals_and_decodes_legacy_state() {
