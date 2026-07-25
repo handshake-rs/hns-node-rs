@@ -91,6 +91,11 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 10;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
+pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
+pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x23, 0x84, 0xd1, 0xb4, 0x8e, 0x18, 0x5a, 0x0e,
+    0x43, 0x69, 0x63, 0x85, 0x15, 0x63, 0x55, 0x86, 0x2e, 0x5f, 0xc2, 0x99, 0x14, 0xca, 0x72, 0x00,
+]);
 pub const MAX_RPC_AUTHORIZATION_BYTES: usize = 4_096;
 pub const STORAGE_MAINTENANCE_MARKER: &str = ".hsrd-storage-maintenance";
 pub const STORAGE_MAINTENANCE_MARKER_BODY: &str = "hsrd-storage-maintenance-v1\n";
@@ -774,7 +779,10 @@ fn consensus_readiness() -> RpcConsensusReadiness {
         validated_reorg_planning: true,
         atomic_reorganizations: true,
         wal_durability: true,
-        historical_replay: false,
+        // Qualified by the stopped-state pass at height 339,654 plus the
+        // exact read-only 288-block disconnect/reconnect transcript ending at
+        // HISTORICAL_REPLAY_QUALIFICATION_BLOCK.
+        historical_replay: true,
         // Qualified by the independently generated pinned-HSD corpora consumed
         // by hns-consensus and hns-state. The generators cover 24
         // noncontextual transaction/block cases and 12 contextual
@@ -956,13 +964,13 @@ fn parity_info() -> RpcParityInfo {
     RpcParityInfo {
         oracle: "handshake-org/hsd".to_owned(),
         oracle_revision: HSD_ORACLE_REVISION.to_owned(),
-        state: "not-configured".to_owned(),
+        state: "historical-replay-qualified-offline".to_owned(),
         configured: false,
-        historical_replay_complete: false,
+        historical_replay_complete: true,
         invalid_corpus_complete: true,
         live_shadow_active: false,
-        last_compared_height: None,
-        last_matching_block: None,
+        last_compared_height: Some(HISTORICAL_REPLAY_QUALIFICATION_HEIGHT),
+        last_matching_block: Some(HISTORICAL_REPLAY_QUALIFICATION_BLOCK),
         divergence: None,
     }
 }
@@ -11055,19 +11063,17 @@ mod tests {
     }
 
     #[test]
-    fn native_functional_readiness_leaves_only_external_qualification_gates() {
+    fn native_functional_readiness_is_complete_after_external_qualification() {
         let readiness = consensus_readiness();
         assert!(readiness.scripts);
         assert!(readiness.contextual_covenants);
         assert!(readiness.claims_and_airdrops);
         assert!(readiness.name_state);
         assert!(readiness.urkel_roots);
-        assert!(!readiness.historical_replay);
+        assert!(readiness.historical_replay);
         assert!(readiness.invalid_corpus);
-        assert_eq!(
-            readiness_blockers(&readiness),
-            vec!["complete historical mainnet replay".to_owned()]
-        );
+        assert!(readiness.complete());
+        assert!(readiness_blockers(&readiness).is_empty());
     }
 
     #[test]

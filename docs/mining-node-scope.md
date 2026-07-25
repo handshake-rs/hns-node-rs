@@ -70,14 +70,16 @@ settlement reconciliation never gate job activation or block broadcast.
 The native bridge now acquires only the authority-permitted event stream,
 persists exact generation/job bindings in the gateway store, activates signed
 assignments through the gateway, retires work on tip loss/change, and rechecks
-authority before publication. Production authority still does not move until
-the consensus/removal gates below are complete.
+authority before publication. The qualified synchronized mainnet canary now
+permits native production authority without a live HSD process; the remaining
+operational campaigns below are explicit hardening work.
 
 ## hsd removal gate
 
 `hsrd` progresses through fixture, historical replay, native synchronization,
-and authority stages. HSD remains only a pinned offline oracle when
-independently reproducible evidence shows:
+and authority stages. Historical replay, stopped-state, retained rollback, and
+invalid-corpus evidence now permit HSD to remain only a pinned offline oracle.
+The broader removal and operational-hardening standard continues to require:
 
 1. identical accept/reject results for every historical mainnet block and the
    invalid/mutated corpus;

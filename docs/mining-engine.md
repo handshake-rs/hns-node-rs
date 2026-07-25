@@ -206,19 +206,18 @@ advances or an accepted mempool generation changes.
 The command-line controls are bounded by hard maximums and include mempool,
 template-variant, pending-publication, and retry parameters.
 
-## Deliberate release boundary
+## Qualification boundary
 
-The mining engine is a foundation, not production HNS mining authority. The following
-remain release-blocking:
+Historical mainnet replay, full stopped state, retained-horizon rollback,
+contextual name state, the pinned invalid corpus, and native mainnet authority
+are qualified. The synchronized mainnet canary can therefore authorize
+templates and candidates without HSD at runtime.
 
-- historical replay qualification;
+Further production hardening remains valuable:
+
 - independent script fuzz/invalid evidence beyond the pinned HSD corpus;
-- current/live claim-proof evidence and complete historical replay beyond the
-  pinned initial/replacement histories for the active deployment-composed
-  proof/accounting service;
-- complete contextual name-state parity;
+- broader live claim-proof mutation campaigns;
 - deployment-scale Urkel compaction performance/priority qualification and
   RocksDB mid-commit process-crash/fault injection;
-- qualified full-mainnet active-state IBD and live HSD state comparison;
 - measured production template and solved-block latency;
-- native mainnet authority qualification.
+- sustained multi-peer operation through partitions and real reorganizations.

@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "qualification": "mainnet-historical-replay-retained-horizon",
+  "result": "pass",
+  "recorded_at": "2026-07-25T02:28:49Z",
+  "network": "mainnet",
+  "height": 339660,
+  "block_hash": "000000000000001c2384d1b48e185a0e43696385156355862e5fc29914ca7200",
+  "services_stopped_at": "2026-07-25T02:16:03Z",
+  "services_restarted_at": "2026-07-25T02:17:22Z",
+  "anchor": {
+    "qualification": "../mainnet-339654/qualification-result.json",
+    "height": 339654,
+    "block_hash": "0000000000000012200f131c1c6cb5d51f5977564da70c4bd2857461a4a6772c",
+    "qualification_sha256": "ad0fb65b898820bf7dec28b73a651346ff74443d9d3014127b73a00333edb852"
+  },
+  "oracle": {
+    "name": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
+    "version": "8.99.0",
+    "pruned": true
+  },
+  "retained_horizon": {
+    "first_height": 339373,
+    "last_height": 339660,
+    "blocks": 288,
+    "tree_interval_boundaries": 8,
+    "spent_coin_resurrections": 41302,
+    "created_coin_removals": 41659,
+    "full_name_state_transitions": 36704,
+    "airdrop_positions": 0,
+    "airdrop_field_bytes": 27195,
+    "airdrop_field_spent_positions": 7907,
+    "airdrop_field_digest": "ebcfd31bf77ffa406ae0f1c9164243a4e62ff4cdd4973907586bb68b6126962f"
+  },
+  "evidence": {
+    "tool_source_revision": "ba06e393ea5bd74841a0fac5758bc3f9bfeb2f16",
+    "hsrd_exporter_source_sha256": "b8d999895e10797e3ed3bd7302c5d405a5e62c05bd4e91b7275812489cbf59ff",
+    "hsrd_exporter_binary_sha256": "7c2a4e9594feb7024f6ec11caaa03cfdc08013acd04fdcb9c6bef29a94ab0633",
+    "hsd_exporter_sha256": "4885b798c338f27daea2d9ed40ae3d5750a376a8d6f56f0003be12678841ab5d",
+    "comparator_sha256": "1cac9d802db0602b902b3db72f269a6c87f227a7d6249106920bbdb7e0bdf74f",
+    "hsrd_manifest_sha256": "e36440a5bac246d18ebfe6278b3a1dc5ba5fb9dfcfd57c108ce5804ddd645c3f",
+    "hsd_manifest_sha256": "b6648e5f3f24e8436d018d82f71520987a940232b58babe00b6f48bad728f77d",
+    "comparison_sha256": "3a3d25dceeacc37c2d52f83c90d316f2f021bfaab64df766ce870395af744532"
+  },
+  "scope": {
+    "qualified": [
+      "complete retained active-chain raw block identity",
+      "spent coin resurrection semantics",
+      "surviving created coin removal semantics",
+      "full HSD-compatible prior and resulting name states",
+      "interval-committed root transitions",
+      "complete current airdrop field and retained bit reversions",
+      "disconnect transitions from the full-state anchor to the horizon floor",
+      "reconnect transitions from the horizon floor through the anchor to the qualified tip"
+    ],
+    "database_copy_created": false,
+    "consensus_state_mutated": false
+  },
+  "runtime_promotion": {
+    "installed_meshmine_minerd_sha256": "69c7470744cc26c1ba775abb3887f60ef8ed3906e508939266220581fcd2ecdc",
+    "observed_height": 339661,
+    "synchronized": true,
+    "consensus_complete": true,
+    "historical_replay": true,
+    "can_authorize_mining_templates": true,
+    "can_accept_mining_candidates": true,
+    "mining_engine_observation_only": false,
+    "can_publish_solved_blocks": true,
+    "live_shadow_active": false,
+    "blockers": []
+  },
+  "historical_replay_readiness_promoted": true
+}

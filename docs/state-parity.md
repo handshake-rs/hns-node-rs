@@ -150,10 +150,14 @@ python3 scripts/compare-hsrd-hsd-rollback-manifests.py \
   --output /local/temp/rollback-comparison.json
 ```
 
-Likewise, deployments remain in the pinned live comparison because their state
-is derived from historical headers and the candidate parent rather than being
-one portable database record. Final mainnet evidence must contain all three:
+Likewise, deployments remain in the pinned comparison because their state is
+derived from historical headers and the candidate parent rather than being one
+portable database record. Mainnet qualification evidence contains all three:
 
 1. a passing state-manifest comparison;
-2. a passing pinned deployment comparison at that same block hash; and
-3. a passing disconnect/reconnect rollback campaign for the retained horizon.
+2. a passing pinned deployment comparison at the full-state anchor; and
+3. a passing anchored disconnect/reconnect transcript for the complete
+   retained horizon.
+
+The retained mainnet result through height 339,660 is recorded in
+[`../qualification/mainnet-339660/`](../qualification/mainnet-339660/).

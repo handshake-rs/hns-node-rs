@@ -33,14 +33,18 @@ invalid-corpus engines report functional readiness from their pinned
 differential suites. The invalid qualification is reproduced from 24
 independently generated noncontextual transaction/block cases and 12 contextual
 state-boundary cases, including valid controls and atomic rejection checks.
-Native active-state replay reached mainnet height 339,654 and its stopped
+Native active-state replay reached mainnet height 339,660. At height 339,654
+its stopped
 physical UTXO set, HSD-compatible name state, pending/committed Urkel roots,
 deployments, and checkpoint ancestry all matched pinned HSD. The retained
 evidence is in
 [`../qualification/mainnet-339654/`](../qualification/mainnet-339654/).
-Cross-implementation disconnect/reconnect behavior across the retained
-reorganization horizon remains unqualified, so the historical-replay readiness
-bit stays false and the command below still cannot activate a mining job.
+The read-only normalized disconnect/reconnect comparison then matched every
+transition across the complete 288-block retained horizon through height
+339,660. Its evidence is in
+[`../qualification/mainnet-339660/`](../qualification/mainnet-339660/).
+Historical replay readiness is promoted; a synchronized mainnet canary may now
+activate mining jobs without a live HSD or shadow connection.
 
 Create a private file containing one complete Authorization value, such as
 `Bearer <random-secret>`, then check the operational configuration:

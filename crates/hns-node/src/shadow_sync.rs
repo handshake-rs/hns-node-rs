@@ -3149,7 +3149,8 @@ fn compose_shadow_sync_rpc_service(
     };
     snapshot.node_status.parity.configured = false;
     snapshot.node_status.parity.live_shadow_active = false;
-    snapshot.node_status.parity.state = "native-sync-network-no-hsd-oracle".to_owned();
+    snapshot.node_status.parity.state =
+        "historical-replay-qualified-native-no-live-oracle".to_owned();
     Ok(BasicRpcService::new(snapshot))
 }
 

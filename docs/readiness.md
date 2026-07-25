@@ -177,9 +177,11 @@ Implemented:
 - API-v10 next-header committed-root material plus a pinned-source, race-safe external HSD
   block/root comparator with checksummed bounded evidence and explicit
   restart/reorganization accounting;
-- complete native mainnet active-state replay through height 339,654 and a
+- complete native mainnet active-state replay through height 339,660, a
   passing stopped-state comparison of physical UTXOs, HSD-compatible name
-  state, pending/committed Urkel roots, deployments, and checkpoint ancestry;
+  state, pending/committed Urkel roots, deployments, and checkpoint ancestry,
+  plus exact normalized disconnect/reconnect parity over the complete
+  288-block retained horizon;
 - bounded read-only header, inventory, block, and transaction serving;
 - reserved critical-lane parallel fan-out used by the mining publication path.
 
@@ -187,7 +189,6 @@ Remaining:
 
 - long-lived subthreshold reputation, broader peer-diversity controls, and
   adversarial network qualification;
-- read-only normalized retained-horizon rollback transition qualification;
 - production-complete contextual transaction admission and relay;
 - sustained native multi-peer campaigns across restarts, partitions, and real
   reorganizations, with offline differential audits of retained history.
@@ -300,27 +301,32 @@ Implemented:
 - a passing height-339,654 stopped-state comparison against pinned HSD for all
   23,728,438 physical UTXOs, all 12,853,528 name states, both Urkel roots, and
   the same-tip deployment/checkpoint view, with checksummed retained evidence.
+- a passing read-only normalized comparison of all 288 retained mainnet
+  disconnect/reconnect transitions through height 339,660, anchored to that
+  full-state pass and covering raw blocks, coins, full name states, committed
+  roots, and the complete airdrop field.
 
 Remaining:
 
-- normalized retained-horizon undo/disconnect/reconnect comparison;
 - long-duration native multi-peer evidence through restarts, partitions, and
   reorganizations, plus offline differential audits;
 - production mempool/template/publication differential and latency evidence.
 
-## Authority and HSD removal — blocked by design
+## Authority and HSD removal
 
 - Default mode is `native`; HSD is not a runtime dependency.
-- Native networking may connect downloaded bodies to active state, but neither
-  synchronization nor staged templates can create a mining permit.
+- Native networking connects downloaded bodies through authoritative state;
+  a mining permit is available only for the synchronized, fully qualified
+  durable tip.
 - Mainnet additionally requires the explicit hardened canary profile, exact
   header/active-state synchronization, durable authority, and every readiness
   bit.
 - Native experimental authority remains feature-gated, explicitly
   acknowledged, and restricted to regtest/simnet.
 
-Promote `hsrd` only after every readiness gate is reproducibly satisfied and
-reviewed.
+The historical replay, stopped-state, retained rollback, and invalid-corpus
+readiness gates have reproducible retained evidence. Longer operational
+campaigns remain hardening work rather than hidden consensus-readiness flags.
 
 ## Production hardening — future
 

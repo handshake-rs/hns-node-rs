@@ -1,0 +1,53 @@
+{
+  "anchor": {
+    "block_hash": "0000000000000012200f131c1c6cb5d51f5977564da70c4bd2857461a4a6772c",
+    "height": 339654
+  },
+  "block_hash": "000000000000001c2384d1b48e185a0e43696385156355862e5fc29914ca7200",
+  "comparisons": {
+    "airdrop_bit_reversions": true,
+    "committed_root_transitions": true,
+    "created_coin_removals": true,
+    "disconnect_transitions": true,
+    "full_name_state_reversions": true,
+    "raw_active_blocks": true,
+    "reconnect_transitions": true,
+    "spent_coin_resurrections": true
+  },
+  "first_height": 339373,
+  "first_mismatch": null,
+  "height": 339660,
+  "inputs": {
+    "anchor_qualification_sha256": "ad0fb65b898820bf7dec28b73a651346ff74443d9d3014127b73a00333edb852",
+    "hsd_manifest_sha256": "b6648e5f3f24e8436d018d82f71520987a940232b58babe00b6f48bad728f77d",
+    "hsrd_manifest_sha256": "e36440a5bac246d18ebfe6278b3a1dc5ba5fb9dfcfd57c108ce5804ddd645c3f"
+  },
+  "metadata_comparisons": {
+    "first_height": true,
+    "keep_blocks": true,
+    "network": true,
+    "source_airdrop_field_digest": true,
+    "source_airdrop_field_size": true,
+    "source_airdrop_spent": true,
+    "source_block_hash": true,
+    "source_height": true,
+    "tree_interval": true
+  },
+  "network": "mainnet",
+  "proof": {
+    "database_mutation": false,
+    "disconnect": "inverse transition from the anchor toward the horizon floor",
+    "method": "full-state anchor plus exact normalized bidirectional transitions",
+    "reconnect": "forward transition from the horizon floor through the anchor to the tip"
+  },
+  "schema_version": 1,
+  "status": "pass",
+  "transition_counts": {
+    "airdrop_positions": 0,
+    "blocks": 288,
+    "created_coins": 41659,
+    "interval_boundaries": 8,
+    "name_transitions": 36704,
+    "spent_coins": 41302
+  }
+}
