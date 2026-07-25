@@ -397,6 +397,9 @@ fn reverse_names(
                 )
             })?;
         overlay.insert(key, before.clone());
+        if before == after {
+            continue;
+        }
         names.push(NameTransition {
             name_hash: hex_encode(&key),
             before: before.map(|bytes| hex_encode(&bytes)),

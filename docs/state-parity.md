@@ -119,14 +119,15 @@ retained active block is bound by its raw-block digest and exact normalized:
 - previous and resulting interval-committed roots.
 
 Each exporter first validates its own undo against the raw block. Outputs
-created and spent within one block are removed from the net transition, and
-HSD's originating transaction version remains excluded for the same reason as
-in the full-state manifest. The comparator requires a previously passing
-full-state qualification whose height and hash occur inside both complete
-retained transcripts. Equality at that anchor plus equality of every
-transition proves each disconnected and reconnected state by induction. No
-database copy and no state-mutating disconnect are required, but both services
-must be stopped so each producer can obtain its database lock.
+created and spent within one block are removed from the net transition.
+Producer-only name undo entries whose full before/after bytes are equal are
+removed as semantic no-ops. HSD's originating transaction version remains
+excluded for the same reason as in the full-state manifest. The comparator
+requires a previously passing full-state qualification whose height and hash
+occur inside both complete retained transcripts. Equality at that anchor plus
+equality of every transition proves each disconnected and reconnected state by
+induction. No database copy and no state-mutating disconnect are required, but
+both services must be stopped so each producer can obtain its database lock.
 
 ```sh
 cargo run --release --manifest-path hsrd/Cargo.toml \
