@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "qualification": "mainnet-historical-replay-stopped-state",
+  "result": "pass",
+  "recorded_at": "2026-07-25T01:16:02Z",
+  "network": "mainnet",
+  "height": 339654,
+  "block_hash": "0000000000000012200f131c1c6cb5d51f5977564da70c4bd2857461a4a6772c",
+  "services_stopped_at": "2026-07-25T00:09:18Z",
+  "replay": {
+    "synchronized_before_stop": true,
+    "pending_blocks_before_stop": 0,
+    "base_source_revision": "663dd177018e5456f697824e6964699cafd7df46",
+    "meshmine_minerd_sha256": "89fc2b3e786d20c12ce93382f7abd279e5b7d1d4d60307a762bdec8db7c9c418"
+  },
+  "oracle": {
+    "name": "handshake-org/hsd",
+    "revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
+    "version": "8.99.0",
+    "pruned": true
+  },
+  "pinned_deployment_comparison": {
+    "status": "pass",
+    "observed_at": "2026-07-25T00:09:10Z",
+    "comparator_sha256": "7e980fc413c595db18cad8c33f969e60a7620e0043a08f0bd593fff89e5c898b",
+    "header_matched": true,
+    "caught_up": true,
+    "deployment_parameters_matched": true,
+    "deployment_states_matched": true,
+    "deployment_effects_matched": true,
+    "checkpoint_anchored": true
+  },
+  "stopped_state_comparison": {
+    "status": "pass",
+    "comparator_sha256": "39e783d5a1dcb49d248ee153e6d7c599d810251cc1e01edeb8ea2c9b0718e55e",
+    "hsrd_exporter_sha256": "145e496c7d6c62c658c8ff4e5957a28945689640830c62dfbc8c3b7fd8be747b",
+    "hsd_exporter_sha256": "58415d1a375cd5ecea41625d9352983ee52b56cf230e919490712724def70366",
+    "hsrd_manifest_sha256": "ecbc39779e0f719c7ac33ae776b906151cdae0633b32a5eeb28853608cb94c42",
+    "hsd_manifest_sha256": "ef842a8b0f96826ec8be2d5bfa2522dfd5bff9de37e1c886abb13941e3b93aed",
+    "utxo_count": 23728438,
+    "utxo_total_value": 791160806369223,
+    "name_count": 12853528,
+    "all_comparisons_matched": true
+  },
+  "retained_undo_inventory": {
+    "hsrd_records": 1289,
+    "hsrd_minimum_height": 0,
+    "hsrd_maximum_height": 339654,
+    "hsd_coin_records": 237,
+    "hsd_coin_minimum_height": 339367,
+    "hsd_coin_maximum_height": 339654,
+    "hsd_coin_unavailable_in_reorg_horizon": 51,
+    "hsd_name_records": 284759,
+    "hsd_name_minimum_height": 2024,
+    "hsd_name_maximum_height": 339654
+  },
+  "scope": {
+    "qualified": [
+      "active-chain identity",
+      "physical UTXO count, value, and ordered semantic digest",
+      "name-state count and ordered HSD-compatible digest",
+      "pending working Urkel root",
+      "interval-committed Urkel root",
+      "deployment parameters, states, effects, and checkpoint ancestry"
+    ],
+    "not_qualified": [
+      "cross-implementation retained-horizon disconnect and reconnect behavior"
+    ]
+  },
+  "historical_replay_readiness_promoted": false,
+  "next_required_evidence": "read-only normalized retained-horizon rollback transition comparison"
+}

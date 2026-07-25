@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -11,7 +12,11 @@ use blake2::{
 use clap::Parser;
 use hns_consensus::Network;
 use hns_primitives::{hex_encode, Coin, Writer};
-use hns_state::{decode_coin, encode_outpoint_key, BlockUndo};
+use hns_state::{
+    decode_coin, derive_working_name_tree_root, encode_outpoint_key, BlockUndo, NamePageRootRecord,
+    NamePageSnapshot, NamePageState, NamePageTreeReader, NAME_PAGE_ROOT_PREFIX,
+    NAME_PAGE_STATE_KEY,
+};
 use hns_store::{
     open_store, ColumnFamily, DurabilityPolicy, MetaKey, ReadSnapshot, Store, StoreBackend,
     StoreConfig, StoreError, BLOCK_SEGMENT_MANIFEST_KEY, UNDO_SEGMENT_MANIFEST_KEY,
@@ -204,17 +209,28 @@ fn run() -> Result<()> {
     let network = decode_network_binding(&network)?;
     let genesis_hash = required_hash_meta(&snapshot, MetaKey::GenesisHash, "genesis hash")?;
     let block_hash = required_hash_meta(&snapshot, MetaKey::BestBlockHash, "best block hash")?;
-    let working_root =
-        required_hash_meta(&snapshot, MetaKey::NameTreeRoot, "working name-tree root")?;
+    let stored_root =
+        required_hash_meta(&snapshot, MetaKey::NameTreeRoot, "stored name-tree root")?;
     let committed_root = required_hash_meta(
         &snapshot,
         MetaKey::NameTreeCommitRoot,
         "committed name-tree root",
     )?;
+    if stored_root != committed_root {
+        bail!("stored and committed name-tree roots disagree");
+    }
 
     let height = active_chain_height(&snapshot, &block_hash)?;
     let utxo = audit_utxos(&snapshot)?;
     let names = audit_raw_component(&snapshot, ColumnFamily::NameState, b"name-state")?;
+    let page_reader = open_name_page_reader(&snapshot, &data_dir)?;
+    let working_root = match page_reader.as_ref() {
+        Some(reader) => derive_working_name_tree_root(&NamePageSnapshot::with_legacy_fallback(
+            &snapshot, reader,
+        )),
+        None => derive_working_name_tree_root(&snapshot),
+    }
+    .context("failed to derive current working name-tree root")?;
     let undo = audit_undo(&snapshot)?;
 
     let manifest = Manifest {
@@ -228,7 +244,7 @@ fn run() -> Result<()> {
             utxo,
             names,
             roots: RootManifest {
-                working: hex_encode(&working_root),
+                working: hex_encode(working_root.as_bytes()),
                 committed: hex_encode(&committed_root),
             },
             undo,
@@ -238,6 +254,53 @@ fn run() -> Result<()> {
     serde_json::to_writer_pretty(std::io::stdout().lock(), &manifest)?;
     println!();
     Ok(())
+}
+
+fn open_name_page_reader<S: ReadSnapshot>(
+    snapshot: &S,
+    chain_dir: &Path,
+) -> Result<Option<NamePageTreeReader>> {
+    let Some(raw) = snapshot
+        .get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)
+        .context("failed to read name-page state")?
+    else {
+        return Ok(None);
+    };
+    let state = NamePageState::decode(&raw).context("failed to decode name-page state")?;
+    let root_locator = state
+        .root_locator()
+        .context("non-empty name-page state has no root locator")?;
+    let root = chain_dir
+        .parent()
+        .context("chain directory has no parent for name-page segments")?;
+    let directory = root.join("name-pages");
+    let mut paths = BTreeMap::new();
+    for segment in 0..=state.manifest.active_segment {
+        let path = directory.join(format!(
+            "name-g{:016x}-s{segment:08x}.pages",
+            state.manifest.generation
+        ));
+        if !path.is_file() {
+            bail!("name-page segment {} is missing", path.display());
+        }
+        paths.insert(segment, path);
+    }
+    let reader = NamePageTreeReader::open_segments(&paths, state.root, root_locator)
+        .context("failed to open name-page segments")?;
+    for (key, raw) in snapshot
+        .scan_prefix(ColumnFamily::Snapshots, NAME_PAGE_ROOT_PREFIX)
+        .context("failed to scan name-page root locators")?
+    {
+        let record =
+            NamePageRootRecord::decode(&raw).context("failed to decode name-page root locator")?;
+        if key != hns_state::name_page_root_key(record.root) {
+            bail!("name-page root locator key does not match its record");
+        }
+        reader
+            .insert_root(record.root, record.locator)
+            .context("failed to seed name-page root locator")?;
+    }
+    Ok(Some(reader))
 }
 
 fn decode_network_binding(binding: &[u8]) -> Result<String> {

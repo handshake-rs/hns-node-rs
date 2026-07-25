@@ -3,7 +3,10 @@
 Full mainnet semantic-state comparison is specified in
 [`state-parity.md`](state-parity.md). The paired exporters use a shared
 constant-space transcript for UTXOs and names; deployment parity and
-disconnect/reconnect undo parity remain separate evidence gates.
+disconnect/reconnect undo parity remain separate evidence gates. The complete
+mainnet replay stopped-state and pinned deployment comparisons passed at height
+339,654; the retained artifacts and exact remaining undo scope are recorded in
+[`../qualification/mainnet-339654/`](../qualification/mainnet-339654/).
 
 ## Fast static gate
 

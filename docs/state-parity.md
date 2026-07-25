@@ -83,10 +83,14 @@ python3 scripts/compare-hsrd-hsd-state-manifests.py \
 ```
 
 The HSD exporter requires the clean tracked revision
-`698e252ebc7b5c1dd0a9587e342fdd153d020ae4`. It checks HSD's scanned UTXO count
-and total against HSD's own chain-state aggregates before emitting a manifest.
-The two implementations share a fixed cross-language digest vector, and HSD's
-integration self-test opens a real pinned regtest Chain/BlockStore:
+`698e252ebc7b5c1dd0a9587e342fdd153d020ae4`. Its canonical UTXO component is
+the physical LevelDB scan. HSD's `ChainState.coin`, `value`, and `burned`
+fields are emitted separately as diagnostics, not asserted as physical-set
+aggregates: REGISTER through REVOKE deliberately has no chain-accounting
+effect after the initial burn, while REVOKE has no physical UTXO, and claim
+replacement has separate accounting rules. The two implementations share a
+fixed cross-language digest vector, and HSD's integration self-test opens a
+real pinned regtest Chain/BlockStore:
 
 ```sh
 node hsd-oracle/export-hsd-state-manifest.js --self-test

@@ -45,7 +45,7 @@ use hns_urkel::{
     reachable_record_roots_batched, update_record_tree, update_record_tree_batched,
     update_record_tree_mutation_trie_prefetched, validate_record_root, validate_record_tree,
     validate_record_trees_batched, validate_record_trees_batched_until, MemoryUrkel,
-    NameTreeSnapshot, UrkelError, UrkelProof, URKEL_BITS,
+    NameTreeSnapshot, UrkelError, UrkelProof, UrkelRecordUpdate, URKEL_BITS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2559,17 +2559,16 @@ fn materialize_name_tree_with_overrides<T: ReadSnapshot>(
 /// content-addressed records in the same state batch. Existing records must be
 /// byte-identical; conflicting bytes under an authenticated key are durable
 /// corruption.
-fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
+fn calculate_name_tree_update<T: ReadSnapshot>(
     snapshot: &T,
-    batch: &mut B,
     root: TreeRoot,
     overrides: &BTreeMap<NameHash, Option<NameState>>,
-) -> Result<TreeRoot, StateError> {
+) -> Result<Option<UrkelRecordUpdate>, StateError> {
     const MUTATION_MULTI_GET_THRESHOLD: usize = 2;
     const MUTATION_READ_BATCH: usize = 1_024;
 
     if overrides.is_empty() {
-        return Ok(root);
+        return Ok(None);
     }
 
     let mut mutations = Vec::with_capacity(overrides.len());
@@ -2616,6 +2615,63 @@ fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
         update_record_tree(root, mutations, |node_root| {
             load_persisted_node(snapshot, node_root)
         })?
+    };
+    Ok(Some(update))
+}
+
+/// Derive a working authenticated root by applying explicit current-state
+/// overrides to one persisted immutable base root. No constructed node is
+/// written, making this suitable for stopped-state qualification.
+pub fn derive_name_tree_root_with_overrides<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+    overrides: &BTreeMap<NameHash, Option<NameState>>,
+) -> Result<TreeRoot, StateError> {
+    Ok(calculate_name_tree_update(snapshot, root, overrides)?
+        .map(|update| update.root())
+        .unwrap_or(root))
+}
+
+/// Derive the current HSD working root from the interval-committed tree and
+/// only the names recorded in the compact pending-interval accumulator.
+///
+/// This is `O(changed names × authenticated path)` instead of rebuilding all
+/// name states. It does not persist the constructed frontier.
+pub fn derive_working_name_tree_root<T: ReadSnapshot>(
+    snapshot: &T,
+) -> Result<TreeRoot, StateError> {
+    let stored = load_stored_name_tree_root(snapshot)?;
+    let committed = load_stored_name_tree_commit_root(snapshot)?;
+    if stored != committed {
+        return Err(StateError::StoredTreeRootMismatch {
+            stored,
+            actual: committed,
+        });
+    }
+    let Some(accumulator) = load_name_tree_accumulator(snapshot)? else {
+        return Ok(stored);
+    };
+    if accumulator.base_root != stored {
+        return Err(StateError::Codec(
+            "name-tree accumulator base root does not match the durable root".to_owned(),
+        ));
+    }
+
+    let mut overrides = BTreeMap::new();
+    for name_hash in accumulator.names.keys() {
+        overrides.insert(*name_hash, load_name_state(snapshot, name_hash)?);
+    }
+    derive_name_tree_root_with_overrides(snapshot, stored, &overrides)
+}
+
+fn stage_name_tree_with_overrides<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    root: TreeRoot,
+    overrides: &BTreeMap<NameHash, Option<NameState>>,
+) -> Result<TreeRoot, StateError> {
+    let Some(update) = calculate_name_tree_update(snapshot, root, overrides)? else {
+        return Ok(root);
     };
     let record_keys = update
         .records()

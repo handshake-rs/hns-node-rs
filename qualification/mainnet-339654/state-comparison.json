@@ -1,0 +1,28 @@
+{
+  "block_hash": "0000000000000012200f131c1c6cb5d51f5977564da70c4bd2857461a4a6772c",
+  "comparisons": {
+    "block_hash": true,
+    "committed_name_root": true,
+    "genesis_hash": true,
+    "height": true,
+    "name_count": true,
+    "name_digest": true,
+    "network": true,
+    "utxo_count": true,
+    "utxo_digest": true,
+    "utxo_total_value": true,
+    "working_name_root": true
+  },
+  "height": 339654,
+  "inputs": {
+    "hsd_manifest_sha256": "ef842a8b0f96826ec8be2d5bfa2522dfd5bff9de37e1c886abb13941e3b93aed",
+    "hsrd_manifest_sha256": "ecbc39779e0f719c7ac33ae776b906151cdae0633b32a5eeb28853608cb94c42"
+  },
+  "mismatches": [],
+  "not_qualified_by_manifest_digest": {
+    "deployments": "qualified by the pinned live deployment comparison",
+    "undo": "requires the cross-implementation rollback campaign"
+  },
+  "schema_version": 1,
+  "status": "pass"
+}

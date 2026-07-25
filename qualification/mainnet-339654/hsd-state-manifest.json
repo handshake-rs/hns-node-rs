@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "producer": "hsd",
+  "oracle_revision": "698e252ebc7b5c1dd0a9587e342fdd153d020ae4",
+  "network": "main",
+  "height": 339654,
+  "block_hash": "0000000000000012200f131c1c6cb5d51f5977564da70c4bd2857461a4a6772c",
+  "genesis_hash": "5b6ef2d3c1f3cdcadfd9a030ba1811efdd17740f14e166489760741d075992e0",
+  "components": {
+    "utxo": {
+      "count": 23728438,
+      "digest": "759929a6fec08efabe2b94a3aa4a28e387c4b9fbbea69db2ac5eb7e3ff3e02fe",
+      "total_value": 791160806369223,
+      "hsd_chain_state_coin": 23728472,
+      "hsd_chain_state_value": 685183806783348,
+      "hsd_chain_state_burned": 105742360574691,
+      "physical_count_delta_from_chain_state": -34,
+      "physical_value_delta_from_chain_state": 234639011184,
+      "semantic_projection": [
+        "outpoint",
+        "value",
+        "height",
+        "coinbase",
+        "address",
+        "covenant"
+      ],
+      "excluded_hsd_archival_fields": [
+        "origin_transaction_version"
+      ]
+    },
+    "names": {
+      "count": 12853528,
+      "digest": "b46f95dc6f9e662f86be74278725dcd032cc4cc15f9451bb94ca61550109990f"
+    },
+    "roots": {
+      "working": "f9c8df9ff00b32beee5bbead391657934665d796b7e6094519ebc8bdf8127a58",
+      "committed": "e3f04c4a6b1a8bf83429efa103b136314de0cb766a953bdda8e720d1edd05c27"
+    },
+    "undo": {
+      "coin": {
+        "count": 237,
+        "digest": "4c370f0f0e64ffba92e3b4ef9b955ea0fd0685b065e9789417378411827c6fe8",
+        "minimum_height": 339367,
+        "maximum_height": 339654,
+        "unavailable_in_reorg_horizon": 51
+      },
+      "name": {
+        "count": 284759,
+        "digest": "d49cb55c6dca1285e0d60296d3c1db759b32543d44ad6ae0eda147866f0f891e",
+        "minimum_height": 2024,
+        "maximum_height": 339654
+      },
+      "comparison": "producer-native-digests; qualify cross-implementation undo by rollback campaign"
+    }
+  }
+}

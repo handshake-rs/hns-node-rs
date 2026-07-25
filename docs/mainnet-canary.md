@@ -33,10 +33,14 @@ invalid-corpus engines report functional readiness from their pinned
 differential suites. The invalid qualification is reproduced from 24
 independently generated noncontextual transaction/block cases and 12 contextual
 state-boundary cases, including valid controls and atomic rejection checks.
-Historical full-mainnet replay and offline state/root qualification remain
-incomplete. Therefore the command below can run a native mainnet node and
-accumulate that final qualification evidence, but it cannot yet activate a
-mining job.
+Native active-state replay reached mainnet height 339,654 and its stopped
+physical UTXO set, HSD-compatible name state, pending/committed Urkel roots,
+deployments, and checkpoint ancestry all matched pinned HSD. The retained
+evidence is in
+[`../qualification/mainnet-339654/`](../qualification/mainnet-339654/).
+Cross-implementation disconnect/reconnect behavior across the retained
+reorganization horizon remains unqualified, so the historical-replay readiness
+bit stays false and the command below still cannot activate a mining job.
 
 Create a private file containing one complete Authorization value, such as
 `Bearer <random-secret>`, then check the operational configuration:

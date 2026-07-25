@@ -177,6 +177,9 @@ Implemented:
 - API-v10 next-header committed-root material plus a pinned-source, race-safe external HSD
   block/root comparator with checksummed bounded evidence and explicit
   restart/reorganization accounting;
+- complete native mainnet active-state replay through height 339,654 and a
+  passing stopped-state comparison of physical UTXOs, HSD-compatible name
+  state, pending/committed Urkel roots, deployments, and checkpoint ancestry;
 - bounded read-only header, inventory, block, and transaction serving;
 - reserved critical-lane parallel fan-out used by the mining publication path.
 
@@ -184,7 +187,7 @@ Remaining:
 
 - long-lived subthreshold reputation, broader peer-diversity controls, and
   adversarial network qualification;
-- full-mainnet replay and pruning-aware qualification of active-state IBD;
+- read-only normalized retained-horizon rollback transition qualification;
 - production-complete contextual transaction admission and relay;
 - sustained native multi-peer campaigns across restarts, partitions, and real
   reorganizations, with offline differential audits of retained history.
@@ -235,7 +238,8 @@ Implemented:
 
 Remaining:
 
-- full-mainnet active-state IBD and offline HSD state/root qualification;
+- retained-horizon disconnect/reconnect qualification before native mainnet
+  authority promotion;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
 - native mainnet authority qualification.
 
@@ -293,10 +297,13 @@ Implemented:
 - a self-tested live comparison runner that verifies an operator-selected clean
   HSD source revision, canonical block identity, and post-tip authenticated
   root while keeping HSD outside hsrd's consensus/authority path.
+- a passing height-339,654 stopped-state comparison against pinned HSD for all
+  23,728,438 physical UTXOs, all 12,853,528 name states, both Urkel roots, and
+  the same-tip deployment/checkpoint view, with checksummed retained evidence.
 
 Remaining:
 
-- complete mainnet replay and its offline state/root audit;
+- normalized retained-horizon undo/disconnect/reconnect comparison;
 - long-duration native multi-peer evidence through restarts, partitions, and
   reorganizations, plus offline differential audits;
 - production mempool/template/publication differential and latency evidence.
