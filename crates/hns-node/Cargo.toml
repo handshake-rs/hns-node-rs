@@ -48,6 +48,10 @@ name = "hsrd-state-manifest"
 path = "src/bin/hsrd_state_manifest.rs"
 
 [[bin]]
+name = "hsrd-rollback-manifest"
+path = "src/bin/hsrd_rollback_manifest.rs"
+
+[[bin]]
 name = "hsrd-storage-maintenance"
 path = "src/bin/hsrd_storage_maintenance.rs"
 

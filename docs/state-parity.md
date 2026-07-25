@@ -100,15 +100,54 @@ node hsd-oracle/export-hsd-state-manifest.js \
 python3 scripts/compare-hsrd-hsd-state-manifests.py --self-test
 ```
 
-## What a manifest pass does not prove
+## Retained-horizon rollback qualification
 
 A manifest pass proves equality of the listed chain, UTXO, name, and root
 projections at one block hash. It does not prove that the producer-native undo
 bytes are structurally identical. HSD separates spent-coin undo, name deltas,
-and its airdrop bitfield, whereas hsrd records a composed block undo. The
-correct cross-implementation test is to disconnect the same retained suffix in
-copies, compare the normalized state after every disconnect, reconnect it, and
-compare again.
+and its airdrop bitfield, whereas hsrd records a composed block undo.
+
+`hsrd-rollback-manifest` and `export-hsd-rollback-manifest.js` instead expand
+both representations into the same read-only transition transcript. Each
+retained active block is bound by its raw-block digest and exact normalized:
+
+- spent outpoint plus resurrected coin;
+- surviving created outpoint plus coin;
+- airdrop positions, with a full current-field digest and simulated
+  disconnect/reconnect bit operations;
+- changed name hash plus full prior and resulting HSD-compatible `NameState`;
+- previous and resulting interval-committed roots.
+
+Each exporter first validates its own undo against the raw block. Outputs
+created and spent within one block are removed from the net transition, and
+HSD's originating transaction version remains excluded for the same reason as
+in the full-state manifest. The comparator requires a previously passing
+full-state qualification whose height and hash occur inside both complete
+retained transcripts. Equality at that anchor plus equality of every
+transition proves each disconnected and reconnected state by induction. No
+database copy and no state-mutating disconnect are required, but both services
+must be stopped so each producer can obtain its database lock.
+
+```sh
+cargo run --release --manifest-path hsrd/Cargo.toml \
+  -p hns-node --bin hsrd-rollback-manifest -- \
+  --data-dir /absolute/stopped/hsrd-data \
+  --output /local/temp/hsrd-rollback-manifest.json
+
+NODE_BACKEND=js node hsd-oracle/export-hsd-rollback-manifest.js \
+  --hsd-source /absolute/pinned/hsd \
+  --prefix /absolute/stopped/hsd-prefix \
+  --network main \
+  --prune \
+  --output /local/temp/hsd-rollback-manifest.json
+
+python3 scripts/compare-hsrd-hsd-rollback-manifests.py \
+  --hsrd-manifest /local/temp/hsrd-rollback-manifest.json \
+  --hsd-manifest /local/temp/hsd-rollback-manifest.json \
+  --anchor-qualification \
+    hsrd/qualification/mainnet-339654/qualification-result.json \
+  --output /local/temp/rollback-comparison.json
+```
 
 Likewise, deployments remain in the pinned live comparison because their state
 is derived from historical headers and the candidate parent rather than being
