@@ -32,7 +32,9 @@ publication schema plus the optimized storage tiers:
   addresses, root locators, one authenticated 4 KiB slot index, up to fifteen
   authenticated 4 KiB record subpages, bounded path-local subpage reuse, and
   monotonic physical seals every 360 heights without changing consensus-root
-  timing. Legacy schema-18 pages remain readable in place;
+  timing. Pruned mode rewrites the reachable union into a fresh generation
+  after sixteen sealed segments. Legacy schema-18 pages remain readable in
+  place;
 - checksummed block and undo frames in 256 MiB physical segments. RocksDB stores
   compact locators and authoritative manifests; legacy inline values remain
   readable during migration;
@@ -412,17 +414,42 @@ live state. Unclean RocksDB reopen tests verify that interrupted deletion
 resumes safely and that a completion checkpoint agrees with the compacted node
 set.
 
-Undo retirement is separately opt-in. It uses HSD's exact network constants:
-no height through `pruneAfterHeight` is retired, and the newest `keepBlocks`
-remain disconnectable. The target comparison is strict, matching HSD. Each
-retirement deletes the undo bytes, clears the matching header/block status,
-deletes any matching interval pin, and advances `undo-pruning/v1` in the same
-batch. Startup validates the protected prefix, retired band, retained suffix,
-canonical checkpoint binding, root continuity, and the absence/presence of
+Pruned mode is the default mining profile. It uses HSD's exact network
+constants: no height through `pruneAfterHeight` is retired, and the newest
+`keepBlocks` remain disconnectable and serveable. The target comparison is
+strict, matching HSD. Each retirement deletes both raw-block and undo
+locators, clears their matching header/block presence bits, deletes any
+matching interval pin, and advances the checksummed `undo-pruning/v1`
+checkpoint in the same batch.
+
+Checkpoint version 2 records independent block and undo frontiers, hashes, and
+counts. Version 1 undo-only checkpoints decode without mutation and drive a
+bounded raw-block backfill that never rereads historical payload bytes.
+Startup validates the protected prefix, retired band, retained suffix,
+canonical checkpoint bindings, root continuity, and the absence/presence of
 interval pins on the retired/retained sides; missed retirements are caught up
 in bounded batches. Reorganizations crossing the retired band fail before any
-state mutation. A store with a pruning checkpoint cannot later open with
-retirement disabled.
+state mutation. A store with a pruning checkpoint cannot later open in
+`archive` mode.
+
+Deleting RocksDB locators does not itself shrink append-only segment files.
+When dead committed frames exceed 256 MiB, pruned startup rewrites only live
+locators into a fresh generation. New files are synced before one RocksDB batch
+publishes every replacement locator and both manifests. Recovery keeps the
+manifest-selected generation and removes either unpublished new files or
+superseded predecessors. The stopped-node
+`hsrd-storage-maintenance compact` command performs the same rewrite with full
+pre/post frame scrubs and a JSON reclamation report.
+
+Append-only name pages use the same publish-then-retire generation discipline.
+At sixteen sealed 360-block segments, pruned startup streams the current tree
+once, builds its authenticated hash-to-address index, and appends only
+divergent subtrees for the other roots still required by undo and interval
+pins. One RocksDB batch replaces `name-page-state/v1`, publishes every retained
+root locator in the new generation, and deletes stale locators. Only then are
+the old files removed. Recovery follows the manifest-selected generation, so a
+crash before publication removes the future generation and a crash after
+publication removes the superseded one.
 
 Production closure still requires deployment-scale performance and priority
 isolation plus RocksDB mid-commit process-kill/fault injection without weakening

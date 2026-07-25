@@ -557,6 +557,10 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   parallel post-order subtrees, reopen the resulting pages, validate every
   reachable record and sampled proof, and reject a duplicated subtree before
   any page is published.
+- Name-page generation tests stream one base tree and only the divergent nodes
+  of a nearby retained root, validate both roots after the atomic locator swap,
+  remove stale root locators, and prove reopen deletes both an unpublished
+  future generation and a restored superseded generation.
 - A one-page-cache regression cycles a single multi-get across several pages
   repeatedly and requires exactly one physical page load per unique page,
   proving that audit/path batches are coalesced by `(segment, page)`.
@@ -564,6 +568,12 @@ A mismatch fails closed and cannot become a silent compatibility exception.
   threshold, rolls back a newly created segment, reopens old and active
   segments, rejects checksum corruption inside an authoritative manifest, and
   proves bounded inline migration is transparent and idempotent.
+- Pruning qualification deletes raw blocks and undo together, upgrades a
+  version-1 undo-only checkpoint without rereading historical bodies, retains
+  the exact rollback horizon, rejects deeper activation before mutation, and
+  rewrites only live locators and retained name roots into fresh generations.
+  Reopen removes both unpublished future generations and superseded
+  predecessors.
 - Storage-rollout tests create a native RocksDB checkpoint, independently copy
   external page/segment files, reopen the fallback, and prove later source-file
   mutation cannot alter the backup. The exact offline marker is required, and

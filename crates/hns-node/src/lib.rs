@@ -69,15 +69,15 @@ use hns_state::{
     decode_name_state, disconnect_block_to_batch, load_name_tree_snapshot_pins,
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
     load_stored_name_tree_root, migrate_name_tree_interval_accumulator, name_page_root_key,
-    name_tree_snapshot_pin_key, pack_name_page_records, stage_remove_name_tree_snapshot_pin,
-    stream_name_page_tree, validate_persisted_name_tree_overlays,
-    validate_persisted_name_tree_root, validate_persisted_name_trees,
-    verify_name_tree_interval_state, verify_stored_name_tree_root_binding,
-    AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock, DisconnectBlock, NamePageRootLocator,
-    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader,
-    NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices, StoredStateEngine,
-    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
-    NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    name_tree_snapshot_pin_key, pack_name_page_records, retained_name_tree_roots,
+    stage_remove_name_tree_snapshot_pin, stream_name_page_tree, stream_name_page_tree_delta,
+    validate_persisted_name_tree_overlays, validate_persisted_name_tree_root,
+    validate_persisted_name_trees, verify_name_tree_interval_state,
+    verify_stored_name_tree_root_binding, AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock,
+    DisconnectBlock, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState,
+    NamePageTreeReader, NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices,
+    StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
+    NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 use hns_store::{
     decode_u64, encode_u64, mark_unclean_start, open_store, truncate_name_pages_to_committed_tail,
@@ -89,7 +89,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 10;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 11;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -115,10 +115,15 @@ const NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE: usize = 4 + 4 + 32 + (4 * 8);
 const NAME_TREE_COMPACTION_CHECKPOINT_SIZE: usize = NAME_TREE_COMPACTION_CHECKPOINT_BODY_SIZE + 32;
 pub const DEFAULT_NAME_TREE_COMPACTION_INTERVAL: Height = 10_000;
 const UNDO_PRUNING_CHECKPOINT_KEY: &[u8] = b"undo-pruning/v1";
-const UNDO_PRUNING_CHECKPOINT_VERSION: u32 = 1;
-const UNDO_PRUNING_CHECKPOINT_BODY_SIZE: usize = 4 + 4 + 32 + 8;
+const UNDO_PRUNING_CHECKPOINT_LEGACY_VERSION: u32 = 1;
+const UNDO_PRUNING_CHECKPOINT_LEGACY_BODY_SIZE: usize = 4 + 4 + 32 + 8;
+const UNDO_PRUNING_CHECKPOINT_LEGACY_SIZE: usize = UNDO_PRUNING_CHECKPOINT_LEGACY_BODY_SIZE + 32;
+const UNDO_PRUNING_CHECKPOINT_VERSION: u32 = 2;
+const UNDO_PRUNING_CHECKPOINT_BODY_SIZE: usize = 4 + 4 + 32 + 8 + 4 + 32 + 8;
 const UNDO_PRUNING_CHECKPOINT_SIZE: usize = UNDO_PRUNING_CHECKPOINT_BODY_SIZE + 32;
 const MAX_UNDO_PRUNES_PER_BATCH: usize = 1_024;
+const PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES: u64 = 256 * 1024 * 1024;
+const NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD: u32 = 16;
 const STARTUP_AUDIT_CHECKPOINT_KEY: &[u8] = b"startup-audit/v1";
 const STARTUP_AUDIT_CHECKPOINT_VERSION: u32 = 1;
 const STARTUP_AUDIT_CHECKPOINT_BODY_SIZE: usize = 4 + 32;
@@ -137,6 +142,26 @@ pub enum AuthorityMode {
     #[default]
     Native,
     NativeExperimental,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
+pub enum StorageMode {
+    /// Retain headers and consensus state while keeping only the network's
+    /// bounded raw-block and undo reorganization horizon.
+    #[default]
+    Pruned,
+    /// Retain every raw block and undo record for historical peer serving and
+    /// offline analysis. A store that has already pruned cannot be reopened in
+    /// this mode.
+    Archive,
+}
+
+impl StorageMode {
+    pub const fn prunes_payload_history(self) -> bool {
+        matches!(self, Self::Pruned)
+    }
 }
 
 /// Exact HTTP Authorization value required by the hsrd RPC listener.
@@ -239,6 +264,9 @@ pub struct UndoPruningCheckpoint {
     pub pruned_through: Height,
     pub block_hash: BlockHash,
     pub pruned_undos: u64,
+    pub blocks_pruned_through: Height,
+    pub blocks_checkpoint: BlockHash,
+    pub pruned_blocks: u64,
 }
 
 impl UndoPruningCheckpoint {
@@ -248,6 +276,9 @@ impl UndoPruningCheckpoint {
         writer.write_u32(self.pruned_through);
         writer.write_bytes(self.block_hash.as_bytes());
         writer.write_u64(self.pruned_undos);
+        writer.write_u32(self.blocks_pruned_through);
+        writer.write_bytes(self.blocks_checkpoint.as_bytes());
+        writer.write_u64(self.pruned_blocks);
         let mut raw = writer.finish();
         debug_assert_eq!(raw.len(), UNDO_PRUNING_CHECKPOINT_BODY_SIZE);
         raw.extend_from_slice(&blake2b_256(&raw));
@@ -255,25 +286,48 @@ impl UndoPruningCheckpoint {
     }
 
     fn decode(raw: &[u8]) -> Result<Self> {
-        if raw.len() != UNDO_PRUNING_CHECKPOINT_SIZE {
+        if raw.len() != UNDO_PRUNING_CHECKPOINT_SIZE
+            && raw.len() != UNDO_PRUNING_CHECKPOINT_LEGACY_SIZE
+        {
             anyhow::bail!(
-                "undo-pruning checkpoint contains {} bytes; expected {UNDO_PRUNING_CHECKPOINT_SIZE}",
+                "undo-pruning checkpoint contains {} bytes; expected {UNDO_PRUNING_CHECKPOINT_SIZE} or legacy {UNDO_PRUNING_CHECKPOINT_LEGACY_SIZE}",
                 raw.len()
             );
         }
-        let (body, checksum) = raw.split_at(UNDO_PRUNING_CHECKPOINT_BODY_SIZE);
+        let body_size = raw.len() - 32;
+        let (body, checksum) = raw.split_at(body_size);
         if checksum != blake2b_256(body) {
             anyhow::bail!("undo-pruning checkpoint checksum mismatch");
         }
-        let mut reader = Reader::new(body, UNDO_PRUNING_CHECKPOINT_BODY_SIZE)?;
+        let mut reader = Reader::new(body, body_size)?;
         let version = reader.read_u32()?;
-        if version != UNDO_PRUNING_CHECKPOINT_VERSION {
+        if version == UNDO_PRUNING_CHECKPOINT_LEGACY_VERSION {
+            if body_size != UNDO_PRUNING_CHECKPOINT_LEGACY_BODY_SIZE {
+                anyhow::bail!("legacy undo-pruning checkpoint has an invalid size");
+            }
+            let checkpoint = Self {
+                pruned_through: reader.read_u32()?,
+                block_hash: BlockHash::new(reader.read_hash()?),
+                pruned_undos: reader.read_u64()?,
+                blocks_pruned_through: 0,
+                blocks_checkpoint: BlockHash::ZERO,
+                pruned_blocks: 0,
+            };
+            reader.ensure_finished()?;
+            return Ok(checkpoint);
+        }
+        if version != UNDO_PRUNING_CHECKPOINT_VERSION
+            || body_size != UNDO_PRUNING_CHECKPOINT_BODY_SIZE
+        {
             anyhow::bail!("unsupported undo-pruning checkpoint version {version}");
         }
         let checkpoint = Self {
             pruned_through: reader.read_u32()?,
             block_hash: BlockHash::new(reader.read_hash()?),
             pruned_undos: reader.read_u64()?,
+            blocks_pruned_through: reader.read_u32()?,
+            blocks_checkpoint: BlockHash::new(reader.read_hash()?),
+            pruned_blocks: reader.read_u64()?,
         };
         reader.ensure_finished()?;
         Ok(checkpoint)
@@ -285,6 +339,18 @@ pub struct NameTreeCompactionCheckpoint {
     pub height: Height,
     pub tip: BlockHash,
     pub summary: NameTreeCompactionSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamePageCompactionReport {
+    pub previous_generation: u64,
+    pub generation: u64,
+    pub retained_roots: usize,
+    pub records_written: u64,
+    pub pages_written: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub reclaimed_bytes: u64,
 }
 
 impl NameTreeCompactionCheckpoint {
@@ -1033,7 +1099,7 @@ impl NodeService {
         };
         if pruning_checkpoint.is_some() && !config.undo_retention.prune_history {
             anyhow::bail!(
-                "undo history was previously pruned; --prune-undo-history cannot be disabled"
+                "block/undo history was previously pruned; storage mode cannot be changed to archive"
             );
         }
         state.undo_retention_policy = config
@@ -1068,6 +1134,10 @@ impl NodeService {
 
         if config.undo_retention.prune_history {
             state.prune_undo_history_to_policy()?;
+            if config.data_dir.is_some() {
+                state.compact_pruned_payload_segments_if_due()?;
+                state.compact_pruned_name_pages_if_due()?;
+            }
         }
 
         if config.name_tree_compaction.compact_on_startup {
@@ -1599,6 +1669,15 @@ impl NodeService {
             pruned_undos: undo_pruning_checkpoint
                 .as_ref()
                 .map(|checkpoint| checkpoint.pruned_undos),
+            blocks_pruned_through: undo_pruning_checkpoint.as_ref().and_then(|checkpoint| {
+                (checkpoint.blocks_pruned_through != 0).then_some(checkpoint.blocks_pruned_through)
+            }),
+            blocks_checkpoint: undo_pruning_checkpoint.as_ref().and_then(|checkpoint| {
+                (checkpoint.blocks_pruned_through != 0).then_some(checkpoint.blocks_checkpoint)
+            }),
+            pruned_blocks: undo_pruning_checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.pruned_blocks),
         };
         let node_status = RpcNodeStatus {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
@@ -2224,6 +2303,220 @@ impl NamePageStorage {
         Ok(reader)
     }
 
+    fn compact_generation(&mut self, store: &StoreHandle) -> Result<NamePageCompactionReport> {
+        let previous_generation = self.state.manifest.generation;
+        let generation = previous_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("name-page generation number exhausted"))?;
+        let bytes_before = name_page_generation_bytes(&self.directory, previous_generation)?;
+        remove_name_page_generation(&self.directory, generation)?;
+
+        let snapshot = store.snapshot()?;
+        let retained_roots = retained_name_tree_roots(&snapshot)
+            .map_err(|error| anyhow::anyhow!("failed to select retained name roots: {error}"))?;
+        if !retained_roots.contains(&self.state.root) {
+            anyhow::bail!("retained name roots omit the committed page root");
+        }
+
+        let mut old_records = BTreeMap::new();
+        let mut old_keys = Vec::new();
+        for (key, raw) in snapshot
+            .scan_prefix(ColumnFamily::Snapshots, NAME_PAGE_ROOT_PREFIX)
+            .context("failed to scan name-page root locators for compaction")?
+        {
+            let record = NamePageRootRecord::decode(&raw).map_err(|error| {
+                anyhow::anyhow!("failed to decode name-page root locator: {error}")
+            })?;
+            if key != name_page_root_key(record.root) {
+                anyhow::bail!("name-page root locator key does not match its record");
+            }
+            old_keys.push(key);
+            if old_records.insert(record.root, record).is_some() {
+                anyhow::bail!("duplicate name-page root locator");
+            }
+        }
+        for root in retained_roots
+            .iter()
+            .copied()
+            .filter(|root| *root != TreeRoot::ZERO)
+        {
+            if !old_records.contains_key(&root) {
+                anyhow::bail!("retained name root {root:?} has no durable page locator");
+            }
+        }
+
+        let file_path = name_page_file_path(&self.directory, generation, 0);
+        let mut commit_attempted = false;
+        let staged = (|| -> Result<(
+            NamePageState,
+            NamePageAppender,
+            u64,
+            u64,
+            BTreeMap<TreeRoot, hns_store::NamePageAddress>,
+        )> {
+            let mut appender = NamePageAppender::create_new(&file_path, generation, 0)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to create compacted name-page generation {}: {error}",
+                        file_path.display()
+                    )
+                })?;
+            sync_directory(&self.directory)?;
+
+            let base = {
+                let source_reader = self.reader(&snapshot)?;
+                let source_snapshot = NamePageSnapshot::new(&snapshot, &source_reader);
+                stream_name_page_tree(&source_snapshot, self.state.root, &mut appender).map_err(
+                    |error| {
+                        anyhow::anyhow!("failed to stream compacted name-page base: {error}")
+                    },
+                )?
+            };
+            let mut manifest = base.manifest;
+            let mut records_written = base.record_count;
+            let mut pages_written = base.page_count;
+
+            let paths = BTreeMap::from([(0, file_path.clone())]);
+            let locator = base.root_address.map_or_else(
+                || {
+                    NamePageRootLocator::new(
+                        generation,
+                        hns_store::NamePageAddress::new(0, 0, 0)
+                            .expect("zero page address fits"),
+                    )
+                },
+                |address| NamePageRootLocator::new(generation, address),
+            );
+            let output_reader =
+                NamePageTreeReader::open_segments(&paths, self.state.root, locator).map_err(
+                    |error| anyhow::anyhow!("failed to open compacted name pages: {error}"),
+                )?;
+            output_reader
+                .discover_tree_addresses(self.state.root)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to index compacted name-page base: {error}")
+                })?;
+            let mut known = output_reader.into_known_addresses().map_err(|error| {
+                anyhow::anyhow!("failed to collect compacted name-page addresses: {error}")
+            })?;
+
+            let source_reader = self.reader(&snapshot)?;
+            let source_snapshot = NamePageSnapshot::new(&snapshot, &source_reader);
+            for root in retained_roots
+                .iter()
+                .copied()
+                .filter(|root| *root != TreeRoot::ZERO && *root != self.state.root)
+            {
+                let delta = stream_name_page_tree_delta(
+                    &source_snapshot,
+                    root,
+                    &mut appender,
+                    &mut known,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to stream retained name root {root:?}: {error}")
+                })?;
+                manifest = delta.manifest;
+                records_written = records_written
+                    .checked_add(delta.record_count)
+                    .ok_or_else(|| anyhow::anyhow!("compacted name record count overflow"))?;
+                pages_written = pages_written
+                    .checked_add(delta.page_count)
+                    .ok_or_else(|| anyhow::anyhow!("compacted name page count overflow"))?;
+            }
+
+            let root_address = if self.state.root == TreeRoot::ZERO {
+                None
+            } else {
+                Some(
+                    known
+                        .get(&self.state.root)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("compacted committed root has no address"))?,
+                )
+            };
+            let next = NamePageState {
+                manifest,
+                root: self.state.root,
+                root_address,
+                committed_height: self.state.committed_height,
+                last_sealed_height: self.state.last_sealed_height,
+            };
+            let mut batch = store.batch();
+            for key in &old_keys {
+                batch.delete(ColumnFamily::Snapshots, key)?;
+            }
+            let fallback_height = self.state.committed_height.unwrap_or(0);
+            let mut published = BTreeMap::new();
+            for root in retained_roots
+                .iter()
+                .copied()
+                .filter(|root| *root != TreeRoot::ZERO)
+            {
+                let address = known.get(&root).copied().ok_or_else(|| {
+                    anyhow::anyhow!("compacted retained root {root:?} has no address")
+                })?;
+                let record = NamePageRootRecord {
+                    root,
+                    locator: NamePageRootLocator::new(generation, address),
+                    height: old_records
+                        .get(&root)
+                        .map(|record| record.height)
+                        .unwrap_or(fallback_height),
+                };
+                batch.put(
+                    ColumnFamily::Snapshots,
+                    &name_page_root_key(root),
+                    &record.encode(),
+                )?;
+                published.insert(root, address);
+            }
+            batch.put(
+                ColumnFamily::Snapshots,
+                NAME_PAGE_STATE_KEY,
+                &next.encode()?,
+            )?;
+            commit_attempted = true;
+            store.commit(batch)?;
+            Ok((
+                next,
+                appender,
+                records_written,
+                pages_written,
+                published,
+            ))
+        })();
+
+        let (next, appender, records_written, pages_written, published) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                if !commit_attempted {
+                    let _ = remove_name_page_generation(&self.directory, generation);
+                }
+                return Err(error);
+            }
+        };
+        drop(snapshot);
+
+        self.appender.take();
+        self.file_path = file_path;
+        self.state = next;
+        self.appender = Some(appender);
+        remove_name_page_generations_except(&self.directory, generation)?;
+
+        let bytes_after = name_page_generation_bytes(&self.directory, generation)?;
+        Ok(NamePageCompactionReport {
+            previous_generation,
+            generation,
+            retained_roots: published.len(),
+            records_written,
+            pages_written,
+            bytes_before,
+            bytes_after,
+            reclaimed_bytes: bytes_before.saturating_sub(bytes_after),
+        })
+    }
+
     fn prepare_root<B: WriteBatch, S: ReadSnapshot>(
         &mut self,
         snapshot: &S,
@@ -2571,10 +2864,10 @@ fn remove_unpublished_name_page_segments(
         let Some((candidate_generation, segment)) = parse_name_page_file_name(&name) else {
             continue;
         };
-        if candidate_generation == generation && segment > active_segment {
+        if candidate_generation != generation || segment > active_segment {
             std::fs::remove_file(entry.path()).with_context(|| {
                 format!(
-                    "failed to discard unpublished name-page segment {}",
+                    "failed to discard non-authoritative name-page segment {}",
                     entry.path().display()
                 )
             })?;
@@ -2585,6 +2878,83 @@ fn remove_unpublished_name_page_segments(
         sync_directory(directory)?;
     }
     Ok(())
+}
+
+fn remove_name_page_generation(directory: &std::path::Path, generation: u64) -> Result<()> {
+    let mut removed = false;
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("failed to scan {}", directory.display()))?
+    {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((candidate_generation, _)) = parse_name_page_file_name(&name) else {
+            continue;
+        };
+        if candidate_generation == generation {
+            std::fs::remove_file(entry.path()).with_context(|| {
+                format!(
+                    "failed to discard name-page generation file {}",
+                    entry.path().display()
+                )
+            })?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn remove_name_page_generations_except(directory: &std::path::Path, generation: u64) -> Result<()> {
+    let mut removed = false;
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("failed to scan {}", directory.display()))?
+    {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((candidate_generation, _)) = parse_name_page_file_name(&name) else {
+            continue;
+        };
+        if candidate_generation != generation {
+            std::fs::remove_file(entry.path()).with_context(|| {
+                format!(
+                    "failed to discard superseded name-page generation file {}",
+                    entry.path().display()
+                )
+            })?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn name_page_generation_bytes(directory: &std::path::Path, generation: u64) -> Result<u64> {
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("failed to scan {}", directory.display()))?
+    {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((candidate_generation, _)) = parse_name_page_file_name(&name) else {
+            continue;
+        };
+        if candidate_generation == generation {
+            bytes = bytes
+                .checked_add(entry.metadata()?.len())
+                .ok_or_else(|| anyhow::anyhow!("name-page byte count overflow"))?;
+        }
+    }
+    Ok(bytes)
 }
 
 fn sync_directory(directory: &std::path::Path) -> Result<()> {
@@ -2990,6 +3360,48 @@ impl NodeState {
                             checkpoint.pruned_through
                         );
                     }
+                    if checkpoint.blocks_pruned_through == 0 {
+                        if checkpoint.pruned_blocks != 0
+                            || checkpoint.blocks_checkpoint != BlockHash::ZERO
+                        {
+                            anyhow::bail!(
+                                "legacy block-pruning checkpoint has non-empty block progress"
+                            );
+                        }
+                    } else {
+                        if checkpoint.blocks_pruned_through <= retention.prune_after_height {
+                            anyhow::bail!(
+                                "block-pruning checkpoint height {} does not exceed prune-after height {}",
+                                checkpoint.blocks_pruned_through,
+                                retention.prune_after_height
+                            );
+                        }
+                        if checkpoint.blocks_pruned_through > tip.height {
+                            anyhow::bail!(
+                                "block-pruning checkpoint height {} exceeds active tip height {}",
+                                checkpoint.blocks_pruned_through,
+                                tip.height
+                            );
+                        }
+                        let expected_pruned = u64::from(
+                            checkpoint.blocks_pruned_through - retention.prune_after_height,
+                        );
+                        if checkpoint.pruned_blocks != expected_pruned {
+                            anyhow::bail!(
+                                "block-pruning checkpoint count {} disagrees with its retained boundary {expected_pruned}",
+                                checkpoint.pruned_blocks
+                            );
+                        }
+                        if read_canonical_hash(&snapshot, checkpoint.blocks_pruned_through)?
+                            != Some(checkpoint.blocks_checkpoint)
+                        {
+                            anyhow::bail!(
+                                "block-pruning checkpoint block {} is not canonical at height {}",
+                                checkpoint.blocks_checkpoint.to_hex(),
+                                checkpoint.blocks_pruned_through
+                            );
+                        }
+                    }
                 }
                 let expected_len = usize::try_from(tip.height - audit_start_height)
                     .ok()
@@ -3102,25 +3514,49 @@ impl NodeState {
                             hash.to_hex()
                         );
                     }
-                    let raw = load_raw_block_record(&snapshot, &hash)?.ok_or_else(|| {
-                        anyhow::anyhow!("active block body {} is missing", hash.to_hex())
-                    })?;
-                    let block = raw.decode_block().map_err(|error| {
-                        anyhow::anyhow!("active block body {} is corrupt: {error}", hash.to_hex())
-                    })?;
-                    if block.hash() != hash
-                        || block.header.prev_block != record.prev_hash
-                        || block.header != header.header
-                    {
-                        anyhow::bail!(
-                            "active block body {} disagrees with its index",
-                            hash.to_hex()
-                        );
+                    let block_should_be_pruned =
+                        undo_pruning_checkpoint.as_ref().is_some_and(|checkpoint| {
+                            height > retention.prune_after_height
+                                && height <= checkpoint.blocks_pruned_through
+                        });
+                    let raw_block = load_raw_block_record(&snapshot, &hash)?;
+                    if block_should_be_pruned {
+                        if record.status.body_present || raw_block.is_some() {
+                            anyhow::bail!(
+                                "pruned active block {} still has body data",
+                                hash.to_hex()
+                            );
+                        }
+                    } else {
+                        if !record.status.body_present {
+                            anyhow::bail!(
+                                "retained active block {} is missing body status",
+                                hash.to_hex()
+                            );
+                        }
+                        let raw = raw_block.ok_or_else(|| {
+                            anyhow::anyhow!("active block body {} is missing", hash.to_hex())
+                        })?;
+                        let block = raw.decode_block().map_err(|error| {
+                            anyhow::anyhow!(
+                                "active block body {} is corrupt: {error}",
+                                hash.to_hex()
+                            )
+                        })?;
+                        if block.hash() != hash
+                            || block.header.prev_block != record.prev_hash
+                            || block.header != header.header
+                        {
+                            anyhow::bail!(
+                                "active block body {} disagrees with its index",
+                                hash.to_hex()
+                            );
+                        }
                     }
                     let expected_deployments = self.deployment_state_for_block(
                         &snapshot,
                         height,
-                        block.header.prev_block,
+                        header.header.prev_block,
                     )?;
                     let cached_deployments =
                         load_deployment_state(&snapshot, hash)?.ok_or_else(|| {
@@ -3182,7 +3618,8 @@ impl NodeState {
                                 hash.to_hex()
                             );
                         }
-                        if block.header.tree_root != *undo.previous_committed_tree_root.as_bytes() {
+                        if header.header.tree_root != *undo.previous_committed_tree_root.as_bytes()
+                        {
                             anyhow::bail!(
                                 "active block {} header root disagrees with undo pre-state",
                                 hash.to_hex()
@@ -3911,7 +4348,8 @@ impl NodeState {
     /// Validate a canonical native-sync body whose header ancestry is already
     /// durable even when network delivery has not supplied its parent body.
     /// Active connection still uses `validate_import` and therefore requires
-    /// the complete parent block/index chain.
+    /// the complete parent index chain. Pruned active ancestors retain that
+    /// index even though their raw bodies are intentionally unavailable.
     fn validate_prevalidated_shadow_import(
         &self,
         request: &NodeBlockImport,
@@ -3995,7 +4433,7 @@ impl NodeState {
         &self,
         snapshot: &T,
         request: &NodeBlockImport,
-        require_parent_body: bool,
+        require_parent_index: bool,
         stateless: Option<StatelessBodyValidation>,
     ) -> Result<ValidatedImport> {
         if let Some(stateless) = stateless {
@@ -4104,7 +4542,7 @@ impl NodeState {
             request,
             chainwork,
             self.network,
-            require_parent_body,
+            require_parent_index,
         )?;
 
         Ok(ValidatedImport {
@@ -5126,7 +5564,7 @@ impl NodeState {
 
     fn prune_undo_history_to_policy(&mut self) -> Result<()> {
         let policy = self.undo_retention_policy.ok_or_else(|| {
-            anyhow::anyhow!("undo retention pruning requested without an active policy")
+            anyhow::anyhow!("payload retention pruning requested without an active policy")
         })?;
         policy.validate()?;
         let mut changed = false;
@@ -5144,38 +5582,79 @@ impl NodeState {
                 break;
             };
             let previous = load_undo_pruning_checkpoint(&snapshot)?;
-            let start = match previous.as_ref() {
-                Some(previous) if previous.pruned_through >= target => break,
-                Some(previous) => previous
-                    .pruned_through
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("undo-pruning height exhausted"))?,
-                None => policy
-                    .prune_after_height
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow::anyhow!("undo-pruning height exhausted"))?,
-            };
+            let first_prunable = policy
+                .prune_after_height
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("payload-pruning height exhausted"))?;
+            let undo_start = previous
+                .as_ref()
+                .map(|state| state.pruned_through.saturating_add(1))
+                .unwrap_or(first_prunable)
+                .max(first_prunable);
+            let block_start = previous
+                .as_ref()
+                .map(|state| state.blocks_pruned_through.saturating_add(1))
+                .unwrap_or(first_prunable)
+                .max(first_prunable);
+            if undo_start > target && block_start > target {
+                break;
+            }
+            let start = undo_start.min(block_start);
             let batch_end = start
                 .saturating_add((MAX_UNDO_PRUNES_PER_BATCH - 1) as u32)
                 .min(target);
             let mut batch = self.store.batch();
             let mut pruned_undos = previous.as_ref().map_or(0, |state| state.pruned_undos);
+            let mut pruned_blocks = previous.as_ref().map_or(0, |state| state.pruned_blocks);
             let mut last_hash = None;
             for height in start..=batch_end {
-                let (hash, pruned) = stage_prune_undo_height(&snapshot, &mut batch, height)?;
-                if pruned {
+                let (hash, undo_pruned, block_pruned) =
+                    stage_prune_payload_height(&snapshot, &mut batch, height)?;
+                if undo_pruned {
                     pruned_undos = pruned_undos
                         .checked_add(1)
                         .ok_or_else(|| anyhow::anyhow!("pruned undo count exhausted"))?;
                 }
+                if block_pruned {
+                    pruned_blocks = pruned_blocks
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("pruned block count exhausted"))?;
+                }
                 last_hash = Some(hash);
             }
+            let last_hash = last_hash
+                .ok_or_else(|| anyhow::anyhow!("payload-pruning batch contained no heights"))?;
+            let previous_undo_through = previous
+                .as_ref()
+                .map_or(policy.prune_after_height, |state| state.pruned_through);
+            let previous_block_through = previous
+                .as_ref()
+                .map_or(policy.prune_after_height, |state| {
+                    state.blocks_pruned_through.max(policy.prune_after_height)
+                });
+            let pruned_through = previous_undo_through.max(batch_end);
+            let blocks_pruned_through = previous_block_through.max(batch_end);
             let checkpoint = UndoPruningCheckpoint {
-                pruned_through: batch_end,
-                block_hash: last_hash.ok_or_else(|| {
-                    anyhow::anyhow!("undo-pruning batch contained no active heights")
-                })?,
+                pruned_through,
+                block_hash: if pruned_through == batch_end {
+                    last_hash
+                } else {
+                    previous
+                        .as_ref()
+                        .map(|state| state.block_hash)
+                        .ok_or_else(|| anyhow::anyhow!("missing undo-pruning checkpoint hash"))?
+                },
                 pruned_undos,
+                blocks_pruned_through,
+                blocks_checkpoint: if blocks_pruned_through == batch_end {
+                    last_hash
+                } else {
+                    previous
+                        .as_ref()
+                        .map(|state| state.blocks_checkpoint)
+                        .ok_or_else(|| anyhow::anyhow!("missing block-pruning checkpoint hash"))?
+                },
+                pruned_blocks,
             };
             batch.put(
                 ColumnFamily::Snapshots,
@@ -5189,6 +5668,64 @@ impl NodeState {
         if changed {
             self.refresh_indexes()?;
         }
+        Ok(())
+    }
+
+    fn compact_pruned_payload_segments_if_due(&self) -> Result<()> {
+        let inventory = self
+            .store
+            .segment_archive_inventory()
+            .context("failed to inspect pruned payload locators")?;
+        let (physical_block_bytes, physical_undo_bytes) = self
+            .store
+            .segment_archive_frame_bytes()
+            .context("failed to inspect payload segment footprint")?;
+        let physical_bytes = physical_block_bytes
+            .checked_add(physical_undo_bytes)
+            .ok_or_else(|| anyhow::anyhow!("payload segment byte count overflow"))?;
+        let live_bytes = inventory
+            .blocks
+            .archived_frame_bytes
+            .checked_add(inventory.undo.archived_frame_bytes)
+            .ok_or_else(|| anyhow::anyhow!("live payload byte count overflow"))?;
+        let dead_bytes = physical_bytes.saturating_sub(live_bytes);
+        if dead_bytes < PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES {
+            return Ok(());
+        }
+        let report = self
+            .store
+            .compact_segment_archive()
+            .context("failed to compact pruned payload segments")?;
+        tracing::info!(
+            previous_block_generation = report.previous_block_generation,
+            previous_undo_generation = report.previous_undo_generation,
+            generation = report.generation,
+            live_records = report.live_records,
+            reclaimed_frame_bytes = report.reclaimed_frame_bytes,
+            "compacted pruned block/undo payload segments"
+        );
+        Ok(())
+    }
+
+    fn compact_pruned_name_pages_if_due(&mut self) -> Result<()> {
+        let Some(name_pages) = self.name_pages.as_mut() else {
+            return Ok(());
+        };
+        if name_pages.state.manifest.active_segment < NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD {
+            return Ok(());
+        }
+        let report = name_pages
+            .compact_generation(&self.store)
+            .context("failed to compact pruned name pages")?;
+        tracing::info!(
+            previous_generation = report.previous_generation,
+            generation = report.generation,
+            retained_roots = report.retained_roots,
+            records_written = report.records_written,
+            pages_written = report.pages_written,
+            reclaimed_bytes = report.reclaimed_bytes,
+            "compacted retained name roots into a fresh page generation"
+        );
         Ok(())
     }
 }
@@ -5356,23 +5893,30 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
         return Ok(());
     };
     let previous = load_undo_pruning_checkpoint(snapshot)?;
-    if previous
-        .as_ref()
-        .is_some_and(|state| state.pruned_through >= target)
-    {
+    if previous.as_ref().is_some_and(|state| {
+        state.pruned_through >= target && state.blocks_pruned_through >= target
+    }) {
         return Ok(());
     }
-    let expected = previous
+    let first_prunable = policy.prune_after_height.saturating_add(1);
+    let undo_expected = previous
         .as_ref()
         .map(|state| state.pruned_through.saturating_add(1))
-        .unwrap_or_else(|| policy.prune_after_height.saturating_add(1));
+        .unwrap_or(first_prunable)
+        .max(first_prunable);
+    let block_expected = previous
+        .as_ref()
+        .map(|state| state.blocks_pruned_through.saturating_add(1))
+        .unwrap_or(first_prunable)
+        .max(first_prunable);
+    let expected = undo_expected.min(block_expected);
     let due = target
         .checked_sub(expected)
         .and_then(|distance| distance.checked_add(1))
-        .ok_or_else(|| anyhow::anyhow!("undo-pruning range is invalid"))?;
+        .ok_or_else(|| anyhow::anyhow!("payload-pruning range is invalid"))?;
     if due > tree_interval {
         anyhow::bail!(
-            "undo history requires startup catch-up through height {} before pruning height {target}",
+            "block/undo history requires startup catch-up through height {} before pruning height {target}",
             target.saturating_sub(1)
         );
     }
@@ -5381,18 +5925,27 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
     // atomically with the boundary block.
     let mut block_hash = None;
     let mut pruned_undos = previous.as_ref().map_or(0, |state| state.pruned_undos);
+    let mut pruned_blocks = previous.as_ref().map_or(0, |state| state.pruned_blocks);
     for height in expected..=target {
-        let (hash, pruned) = stage_prune_undo_height(snapshot, batch, height)?;
+        let (hash, undo_pruned, block_pruned) =
+            stage_prune_payload_height(snapshot, batch, height)?;
         pruned_undos = pruned_undos
-            .checked_add(u64::from(pruned))
+            .checked_add(u64::from(undo_pruned))
             .ok_or_else(|| anyhow::anyhow!("pruned undo count exhausted"))?;
+        pruned_blocks = pruned_blocks
+            .checked_add(u64::from(block_pruned))
+            .ok_or_else(|| anyhow::anyhow!("pruned block count exhausted"))?;
         block_hash = Some(hash);
     }
+    let block_hash =
+        block_hash.ok_or_else(|| anyhow::anyhow!("payload-pruning range contained no heights"))?;
     let checkpoint = UndoPruningCheckpoint {
         pruned_through: target,
-        block_hash: block_hash
-            .ok_or_else(|| anyhow::anyhow!("undo-pruning range contained no active heights"))?,
+        block_hash,
         pruned_undos,
+        blocks_pruned_through: target,
+        blocks_checkpoint: block_hash,
+        pruned_blocks,
     };
     batch.put(
         ColumnFamily::Snapshots,
@@ -5402,11 +5955,11 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
     Ok(())
 }
 
-fn stage_prune_undo_height<T: ReadSnapshot, B: WriteBatch>(
+fn stage_prune_payload_height<T: ReadSnapshot, B: WriteBatch>(
     snapshot: &T,
     batch: &mut B,
     height: Height,
-) -> Result<(BlockHash, bool)> {
+) -> Result<(BlockHash, bool, bool)> {
     let hash = read_canonical_hash(snapshot, height)?
         .ok_or_else(|| anyhow::anyhow!("undo-pruning height {height} is not canonical"))?;
     let mut block = load_block_index_record(snapshot, &hash)?
@@ -5416,8 +5969,29 @@ fn stage_prune_undo_height<T: ReadSnapshot, B: WriteBatch>(
     if block.height != height || header.height != height || !block.status.active_chain {
         anyhow::bail!("undo-pruning target at height {height} is not the active block");
     }
+    if block.status != header.status {
+        anyhow::bail!(
+            "payload-pruning target {} has inconsistent header/block status",
+            hash.to_hex()
+        );
+    }
+
+    let block_pruned = if !block.status.body_present {
+        false
+    } else {
+        // The body was authenticated when its status was committed. Retiring
+        // an append-only locator must not read and decode the historical
+        // payload again: startup backfill would otherwise turn pruning into a
+        // full-chain I/O replay. The subsequent invariant audit checks that
+        // status and logical presence agree on the retained/pruned boundary.
+        block.status.body_present = false;
+        header.status.body_present = false;
+        batch.delete(ColumnFamily::Blocks, hash.as_bytes())?;
+        true
+    };
+
     let raw_undo = snapshot.get(ColumnFamily::Undo, hash.as_bytes())?;
-    if !block.status.undo_present {
+    let undo_pruned = if !block.status.undo_present {
         if raw_undo.is_some() {
             anyhow::bail!(
                 "undo-pruning target {} has undo bytes without status",
@@ -5430,34 +6004,36 @@ fn stage_prune_undo_height<T: ReadSnapshot, B: WriteBatch>(
                 hash.to_hex()
             );
         }
-        return Ok((hash, false));
-    }
-    let raw_undo = raw_undo.ok_or_else(|| {
-        anyhow::anyhow!(
-            "undo-pruning target {} is missing its undo bytes",
-            hash.to_hex()
-        )
-    })?;
-    let undo = BlockUndo::decode(&raw_undo)
-        .map_err(|error| anyhow::anyhow!("undo-pruning target is corrupt: {error}"))?;
-    if undo.block_hash != hash || undo.height != height || !header.status.undo_present {
-        anyhow::bail!(
-            "undo-pruning target {} disagrees with its undo metadata",
-            hash.to_hex()
-        );
-    }
-    stage_remove_name_tree_snapshot_pin(snapshot, batch, &undo).map_err(|error| {
-        anyhow::anyhow!(
-            "undo-pruning target {} could not retire its name-tree pin: {error}",
-            hash.to_hex()
-        )
-    })?;
-    block.status.undo_present = false;
-    header.status.undo_present = false;
-    batch.delete(ColumnFamily::Undo, hash.as_bytes())?;
+        false
+    } else {
+        let raw_undo = raw_undo.ok_or_else(|| {
+            anyhow::anyhow!(
+                "undo-pruning target {} is missing its undo bytes",
+                hash.to_hex()
+            )
+        })?;
+        let undo = BlockUndo::decode(&raw_undo)
+            .map_err(|error| anyhow::anyhow!("undo-pruning target is corrupt: {error}"))?;
+        if undo.block_hash != hash || undo.height != height || !header.status.undo_present {
+            anyhow::bail!(
+                "undo-pruning target {} disagrees with its undo metadata",
+                hash.to_hex()
+            );
+        }
+        stage_remove_name_tree_snapshot_pin(snapshot, batch, &undo).map_err(|error| {
+            anyhow::anyhow!(
+                "undo-pruning target {} could not retire its name-tree pin: {error}",
+                hash.to_hex()
+            )
+        })?;
+        block.status.undo_present = false;
+        header.status.undo_present = false;
+        batch.delete(ColumnFamily::Undo, hash.as_bytes())?;
+        true
+    };
     write_block_index_to_batch(batch, &block)?;
     write_record_to_batch(batch, &header)?;
-    Ok((hash, true))
+    Ok((hash, undo_pruned, block_pruned))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6198,7 +6774,7 @@ fn validate_branch_extension(
     request: &NodeBlockImport,
     chainwork: Uint256,
     network: Network,
-    require_parent_body: bool,
+    require_parent_index: bool,
 ) -> Result<()> {
     if request.height == 0 {
         if matches!(request.validation, ImportValidationPolicy::Strict) {
@@ -6236,7 +6812,7 @@ fn validate_branch_extension(
     if chainwork <= parent_header.chainwork {
         anyhow::bail!("block chainwork must increase over its parent");
     }
-    if !require_parent_body {
+    if !require_parent_index {
         return Ok(());
     }
 
@@ -6244,9 +6820,6 @@ fn validate_branch_extension(
         .ok_or_else(|| anyhow::anyhow!("block parent index {} is missing", parent_hash.to_hex()))?;
     if parent.height != parent_header.height || parent.chainwork != parent_header.chainwork {
         anyhow::bail!("block parent index disagrees with its header record");
-    }
-    if load_raw_block_record(snapshot, &parent_hash)?.is_none() {
-        anyhow::bail!("block parent body {} is missing", parent_hash.to_hex());
     }
     Ok(())
 }
@@ -7044,6 +7617,7 @@ mod tests {
     fn active_state_shadow_config() -> NodeConfig {
         NodeConfig {
             network: Network::Regtest,
+            authority_mode: AuthorityMode::Shadow,
             acknowledge_incomplete_consensus: true,
             shadow_sync: ShadowSyncConfig {
                 enabled: true,
@@ -8202,7 +8776,83 @@ mod tests {
             assert!(reader.load(root).expect("load pinned root").is_some());
         }
         drop(snapshot);
+
+        let stale_root = TreeRoot::new([0x77; 32]);
+        let first_locator = store
+            .snapshot()
+            .expect("locator snapshot")
+            .get(ColumnFamily::Snapshots, &name_page_root_key(first_root))
+            .expect("first locator read")
+            .map(|raw| NamePageRootRecord::decode(&raw).expect("first locator decode"))
+            .expect("first locator");
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                first_root.as_bytes(),
+            )
+            .expect("bind working root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                second_root.as_bytes(),
+            )
+            .expect("bind committed root");
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                &name_page_root_key(stale_root),
+                &NamePageRootRecord {
+                    root: stale_root,
+                    locator: first_locator.locator,
+                    height: 1,
+                }
+                .encode(),
+            )
+            .expect("stage stale locator");
+        store.commit(batch).expect("publish retained root bindings");
+
+        let report = pages
+            .compact_generation(&store)
+            .expect("compact page generation");
+        assert_eq!(report.previous_generation, 1);
+        assert_eq!(report.generation, 2);
+        assert_eq!(report.retained_roots, 2);
+        assert!(report.records_written > 0);
+        let snapshot = store.snapshot().expect("compacted snapshot");
+        assert!(load_name_page_root_record(&snapshot, stale_root)
+            .expect("stale locator read")
+            .is_none());
+        let reader = pages.reader(&snapshot).expect("compacted reader");
+        let page_snapshot = NamePageSnapshot::new(&snapshot, &reader);
+        assert!(
+            validate_persisted_name_trees(&page_snapshot, [first_root, second_root])
+                .expect("validate compacted retained roots")
+                >= 2
+        );
+        drop(page_snapshot);
+        drop(reader);
+        drop(snapshot);
+
+        let orphan_path = name_page_file_path(&directory, 3, 0);
+        let superseded_path = name_page_file_path(&directory, 1, 0);
+        drop(
+            NamePageAppender::create_new(&orphan_path, 3, 0)
+                .expect("create orphan future generation"),
+        );
+        drop(
+            NamePageAppender::create_new(&superseded_path, 1, 0)
+                .expect("restore superseded generation"),
+        );
         drop(pages);
+        let reopened =
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("recover pages");
+        assert!(!orphan_path.exists());
+        assert!(!superseded_path.exists());
+        assert_eq!(reopened.state.manifest.generation, 2);
+        drop(reopened);
         std::fs::remove_dir_all(directory).expect("remove page fixture");
     }
 
@@ -8840,6 +9490,9 @@ mod tests {
         assert_eq!(checkpoint.pruned_through, 200);
         assert_eq!(checkpoint.block_hash, records[200].hash);
         assert_eq!(checkpoint.pruned_undos, 200);
+        assert_eq!(checkpoint.blocks_pruned_through, 200);
+        assert_eq!(checkpoint.blocks_checkpoint, records[200].hash);
+        assert_eq!(checkpoint.pruned_blocks, 200);
 
         let snapshot = store.snapshot().expect("retention snapshot");
         for (height, record) in records.iter().enumerate() {
@@ -8852,10 +9505,20 @@ mod tests {
                 .expect("header");
             assert_eq!(stored.status.undo_present, retained, "height {height}");
             assert_eq!(header.status.undo_present, retained, "height {height}");
+            assert_eq!(stored.status.body_present, retained, "height {height}");
+            assert_eq!(header.status.body_present, retained, "height {height}");
             assert_eq!(
                 snapshot
                     .get(ColumnFamily::Undo, record.hash.as_bytes())
                     .expect("undo read")
+                    .is_some(),
+                retained,
+                "height {height}"
+            );
+            assert_eq!(
+                snapshot
+                    .get(ColumnFamily::Blocks, record.hash.as_bytes())
+                    .expect("block read")
                     .is_some(),
                 retained,
                 "height {height}"
@@ -8983,7 +9646,10 @@ mod tests {
             state,
         )
         .expect_err("disabled pruning after retirement");
-        assert!(error.to_string().contains("cannot be disabled"), "{error}");
+        assert!(
+            error.to_string().contains("cannot be changed to archive"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -8994,6 +9660,9 @@ mod tests {
             pruned_through: 1_001,
             block_hash: BlockHash::new([0x91; 32]),
             pruned_undos: 1,
+            blocks_pruned_through: 1_001,
+            blocks_checkpoint: BlockHash::new([0x91; 32]),
+            pruned_blocks: 1,
         }
         .encode();
         *raw.last_mut().expect("checksum byte") ^= 1;
@@ -9005,6 +9674,125 @@ mod tests {
         let error = NodeState::from_store_for_network(store, Network::Regtest)
             .expect_err("corrupt undo-pruning checkpoint");
         assert!(error.to_string().contains("checksum mismatch"), "{error}");
+    }
+
+    #[test]
+    fn legacy_undo_only_checkpoint_upgrades_with_block_backfill_pending() {
+        let block_hash = BlockHash::new([0x52; 32]);
+        let mut writer = Writer::with_capacity(UNDO_PRUNING_CHECKPOINT_LEGACY_BODY_SIZE);
+        writer.write_u32(UNDO_PRUNING_CHECKPOINT_LEGACY_VERSION);
+        writer.write_u32(1_234);
+        writer.write_bytes(block_hash.as_bytes());
+        writer.write_u64(234);
+        let mut raw = writer.finish();
+        raw.extend_from_slice(&blake2b_256(&raw));
+
+        let legacy = UndoPruningCheckpoint::decode(&raw).expect("decode legacy checkpoint");
+        assert_eq!(legacy.pruned_through, 1_234);
+        assert_eq!(legacy.block_hash, block_hash);
+        assert_eq!(legacy.pruned_undos, 234);
+        assert_eq!(legacy.blocks_pruned_through, 0);
+        assert_eq!(legacy.blocks_checkpoint, BlockHash::ZERO);
+        assert_eq!(legacy.pruned_blocks, 0);
+
+        let upgraded =
+            UndoPruningCheckpoint::decode(&legacy.encode()).expect("decode upgraded checkpoint");
+        assert_eq!(upgraded, legacy);
+    }
+
+    #[test]
+    fn legacy_undo_only_store_backfills_pruned_blocks_without_replaying_undos() {
+        let store = StoreHandle::memory();
+        let state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("node");
+        let records = connect_fixture_chain(&mut node, 7, None);
+        drop(node);
+
+        let snapshot = store.snapshot().expect("legacy snapshot");
+        let mut batch = store.batch();
+        for record in records.iter().take(6).skip(1) {
+            let raw_undo = snapshot
+                .get(ColumnFamily::Undo, record.hash.as_bytes())
+                .expect("undo read")
+                .expect("undo bytes");
+            let undo = BlockUndo::decode(&raw_undo).expect("undo decode");
+            stage_remove_name_tree_snapshot_pin(&snapshot, &mut batch, &undo)
+                .expect("retire legacy pin");
+            let mut block = load_block_index_record(&snapshot, &record.hash)
+                .expect("block index read")
+                .expect("block index");
+            let mut header = load_header_record(&snapshot, &record.hash)
+                .expect("header read")
+                .expect("header");
+            block.status.undo_present = false;
+            header.status.undo_present = false;
+            write_block_index_to_batch(&mut batch, &block).expect("stage block index");
+            write_record_to_batch(&mut batch, &header).expect("stage header");
+            batch
+                .delete(ColumnFamily::Undo, record.hash.as_bytes())
+                .expect("delete legacy undo");
+        }
+        let mut writer = Writer::with_capacity(UNDO_PRUNING_CHECKPOINT_LEGACY_BODY_SIZE);
+        writer.write_u32(UNDO_PRUNING_CHECKPOINT_LEGACY_VERSION);
+        writer.write_u32(5);
+        writer.write_bytes(records[5].hash.as_bytes());
+        writer.write_u64(5);
+        let mut legacy = writer.finish();
+        legacy.extend_from_slice(&blake2b_256(&legacy));
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                UNDO_PRUNING_CHECKPOINT_KEY,
+                &legacy,
+            )
+            .expect("stage legacy checkpoint");
+        drop(snapshot);
+        store.commit(batch).expect("commit legacy store");
+
+        let policy = UndoRetentionPolicy {
+            prune_after_height: 0,
+            keep_blocks: 2,
+        };
+        let mut state = NodeState::from_store_for_network_with_undo_policy(
+            store.clone(),
+            Network::Regtest,
+            Some(policy),
+        )
+        .expect("open legacy store");
+        state
+            .prune_undo_history_to_policy()
+            .expect("backfill block pruning");
+
+        let checkpoint = {
+            let snapshot = store.snapshot().expect("checkpoint snapshot");
+            load_undo_pruning_checkpoint(&snapshot)
+                .expect("checkpoint read")
+                .expect("checkpoint")
+        };
+        assert_eq!(checkpoint.pruned_through, 5);
+        assert_eq!(checkpoint.pruned_undos, 5);
+        assert_eq!(checkpoint.blocks_pruned_through, 5);
+        assert_eq!(checkpoint.blocks_checkpoint, records[5].hash);
+        assert_eq!(checkpoint.pruned_blocks, 5);
+        let snapshot = store.snapshot().expect("backfilled snapshot");
+        for record in records.iter().take(6).skip(1) {
+            assert!(
+                snapshot
+                    .get(ColumnFamily::Blocks, record.hash.as_bytes())
+                    .expect("block read")
+                    .is_none(),
+                "legacy body {} was not pruned",
+                record.hash.to_hex()
+            );
+        }
     }
 
     #[test]
@@ -9047,6 +9835,9 @@ mod tests {
         assert_eq!(checkpoint.pruned_through, 5);
         assert_eq!(checkpoint.block_hash, records[5].hash);
         assert_eq!(checkpoint.pruned_undos, 5);
+        assert_eq!(checkpoint.blocks_pruned_through, 5);
+        assert_eq!(checkpoint.blocks_checkpoint, records[5].hash);
+        assert_eq!(checkpoint.pruned_blocks, 5);
         drop(snapshot);
         NodeState::from_store_for_network_with_undo_policy(store, Network::Regtest, Some(policy))
             .expect("caught-up state reopens");
@@ -9624,6 +10415,9 @@ mod tests {
                 pruned_through: 5,
                 block_hash: records[5].hash,
                 pruned_undos: 5,
+                blocks_pruned_through: 5,
+                blocks_checkpoint: records[5].hash,
+                pruned_blocks: 5,
             };
             assert_eq!(
                 node.undo_pruning_checkpoint()
@@ -10989,8 +11783,8 @@ mod tests {
 
         let rpc_service = experimental.rpc_service().expect("rpc");
         let authority = &rpc_service.snapshot().node_status.authority;
-        assert!(!authority.consensus_complete);
-        assert!(authority.experimental_bypass_active);
+        assert!(authority.consensus_complete);
+        assert!(!authority.experimental_bypass_active);
         assert!(authority.can_authorize_mining_templates);
         assert!(authority.can_accept_mining_candidates);
     }
@@ -10999,7 +11793,7 @@ mod tests {
     fn mainnet_canary_requires_explicit_hardened_config_and_complete_readiness() {
         let config = mainnet_canary_config();
         validate_node_config(&config).expect("hardened canary config");
-        assert!(!authority_can_mine(&config));
+        assert!(authority_can_mine(&config));
         assert!(authority_can_mine_with_readiness(&config, true));
 
         let mut pruned = config.clone();
@@ -11327,6 +12121,9 @@ mod tests {
         assert_eq!(json["undo_retention"]["prune_after_height"], 1_000);
         assert_eq!(json["undo_retention"]["keep_blocks"], 10_000);
         assert!(json["undo_retention"]["pruned_through"].is_null());
+        assert!(json["undo_retention"]["blocks_pruned_through"].is_null());
+        assert!(json["undo_retention"]["blocks_checkpoint"].is_null());
+        assert!(json["undo_retention"]["pruned_blocks"].is_null());
         assert!(json["active_state_resulting_root"].is_null());
         assert!(json["active_state_resulting_root_height"].is_null());
 

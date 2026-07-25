@@ -26,7 +26,7 @@ use hns_node::{
     init_logging, validate_node_config, AuthorityMode, LivePeerManager, MiningEngineConfig,
     NameTreeCompactionConfig, NativeMiningJob, NativeMiningJobRequest, NativeRuntimeExtension,
     NativeSyncConfig, NodeConfig, NodeService, RpcAuthorizationHeader, SharedNodeService,
-    ShutdownSignal, UndoRetentionConfig,
+    ShutdownSignal, StorageMode, UndoRetentionConfig,
 };
 use hns_primitives::Address;
 use hns_store::DurabilityPolicy;
@@ -71,6 +71,16 @@ struct Cli {
     gateway_username: String,
     #[arg(long, default_value = "0.0.0.0:3008")]
     gateway_listen: SocketAddr,
+    /// Raw block/undo retention policy. The mining default is pruned.
+    #[arg(long, value_enum, default_value_t = StorageMode::Pruned)]
+    storage_mode: StorageMode,
+    /// Optional inbound Handshake Brontide listener. Omit for outbound-only.
+    #[arg(long)]
+    p2p_listen: Option<SocketAddr>,
+    #[arg(long, default_value_t = 32)]
+    maximum_inbound: usize,
+    #[arg(long, default_value_t = 8)]
+    maximum_outbound: usize,
     #[arg(long)]
     payout_version: u8,
     #[arg(long)]
@@ -704,15 +714,17 @@ async fn main() -> Result<()> {
             startup_interval: 10_000,
         },
         undo_retention: UndoRetentionConfig {
-            prune_history: true,
+            prune_history: cli.storage_mode.prunes_payload_history(),
         },
         shadow_sync: NativeSyncConfig {
             enabled: true,
             headers_only: false,
             connect_active_state: true,
             active_state_connect_batch: 288,
+            listen: cli.p2p_listen,
             discovery: true,
-            maximum_outbound: 8,
+            maximum_inbound: cli.maximum_inbound,
+            maximum_outbound: cli.maximum_outbound,
             ..NativeSyncConfig::default()
         },
         mining_engine: MiningEngineConfig {

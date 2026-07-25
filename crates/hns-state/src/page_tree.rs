@@ -725,6 +725,137 @@ pub fn stream_name_page_tree<T: ReadSnapshot>(
     )
 }
 
+/// Append only the portion of `root` that is not already present in
+/// `known_addresses`.
+///
+/// This is used by generation compaction after the current tree has been
+/// streamed once. Nearby rollback roots normally diverge in only a small
+/// number of subtrees, so retaining the hash-to-address index for the new
+/// generation avoids rewriting a complete copy of the tree for every root.
+/// Traversal state is bounded by the Urkel depth plus the newly appended
+/// records; existing subtrees terminate immediately at the address index.
+pub fn stream_name_page_tree_delta<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+    known_addresses: &mut HashMap<TreeRoot, NamePageAddress>,
+) -> Result<StreamedNamePages, PageTreeError> {
+    #[derive(Debug)]
+    enum Work {
+        Visit {
+            root: TreeRoot,
+            depth: usize,
+        },
+        Emit {
+            root: TreeRoot,
+            canonical: Vec<u8>,
+            left: TreeRoot,
+            right: TreeRoot,
+        },
+    }
+
+    let mut emitter = StreamingPageEmitter::new(appender)?;
+    if root == TreeRoot::ZERO {
+        let (manifest, record_count, page_count) = emitter.finish()?;
+        return Ok(StreamedNamePages {
+            manifest,
+            root_address: None,
+            record_count,
+            page_count,
+            parallel_subtrees: 0,
+        });
+    }
+    if let Some(address) = known_addresses.get(&root).copied() {
+        let (manifest, record_count, page_count) = emitter.finish()?;
+        return Ok(StreamedNamePages {
+            manifest,
+            root_address: Some(address),
+            record_count,
+            page_count,
+            parallel_subtrees: 0,
+        });
+    }
+
+    let mut scheduled = HashSet::new();
+    let mut work = vec![Work::Visit { root, depth: 0 }];
+    while let Some(next) = work.pop() {
+        match next {
+            Work::Visit { root, depth } => {
+                if known_addresses.contains_key(&root) {
+                    continue;
+                }
+                if !scheduled.insert(root) {
+                    return Err(PageTreeError::DuplicateRecord(root));
+                }
+                let raw = snapshot
+                    .get(ColumnFamily::NameTreeNodes, root.as_bytes())?
+                    .ok_or(PageTreeError::MissingPackedRecord(root))?;
+                match decode_bootstrap_record(root, &raw)? {
+                    UrkelNodeRecord::Leaf { .. } => {
+                        let address = emitter.emit(root, raw, Vec::new())?;
+                        if known_addresses.insert(root, address).is_some() {
+                            return Err(PageTreeError::DuplicateRecord(root));
+                        }
+                    }
+                    UrkelNodeRecord::Internal {
+                        prefix,
+                        left,
+                        right,
+                    } => {
+                        let child_depth = bootstrap_child_depth(depth, prefix.bit_len())?;
+                        work.push(Work::Emit {
+                            root,
+                            canonical: raw,
+                            left,
+                            right,
+                        });
+                        work.push(Work::Visit {
+                            root: right,
+                            depth: child_depth,
+                        });
+                        work.push(Work::Visit {
+                            root: left,
+                            depth: child_depth,
+                        });
+                    }
+                }
+            }
+            Work::Emit {
+                root,
+                canonical,
+                left,
+                right,
+            } => {
+                let left_address = known_addresses
+                    .get(&left)
+                    .copied()
+                    .ok_or(PageTreeError::MissingChildAddress(left))?;
+                let right_address = known_addresses
+                    .get(&right)
+                    .copied()
+                    .ok_or(PageTreeError::MissingChildAddress(right))?;
+                let address = emitter.emit(root, canonical, vec![left_address, right_address])?;
+                if known_addresses.insert(root, address).is_some() {
+                    return Err(PageTreeError::DuplicateRecord(root));
+                }
+            }
+        }
+    }
+
+    let root_address = known_addresses
+        .get(&root)
+        .copied()
+        .ok_or(PageTreeError::MissingPackedAddress(root))?;
+    let (manifest, record_count, page_count) = emitter.finish()?;
+    Ok(StreamedNamePages {
+        manifest,
+        root_address: Some(root_address),
+        record_count,
+        page_count,
+        parallel_subtrees: 0,
+    })
+}
+
 fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
     snapshot: &T,
     root: TreeRoot,
@@ -1803,6 +1934,44 @@ impl NamePageTreeReader {
             .map(|addresses| addresses.clone())
     }
 
+    /// Consume a short-lived reader and transfer its discovered address index
+    /// without cloning the potentially large current-tree map.
+    pub fn into_known_addresses(self) -> Result<HashMap<TreeRoot, NamePageAddress>, PageTreeError> {
+        self.addresses
+            .into_inner()
+            .map_err(|_| PageTreeError::Poisoned)
+    }
+
+    /// Traverse a published root so every reachable hash-to-address binding is
+    /// available to an incremental generation rewrite. `load` authenticates
+    /// each record and discovers its child addresses before they are queued.
+    pub fn discover_tree_addresses(&self, root: TreeRoot) -> Result<u64, PageTreeError> {
+        if root == TreeRoot::ZERO {
+            return Ok(0);
+        }
+        let mut discovered = 0u64;
+        let mut work = vec![(root, 0usize)];
+        while let Some((root, depth)) = work.pop() {
+            let raw = self
+                .load(root)?
+                .ok_or(PageTreeError::MissingPackedRecord(root))?;
+            discovered = discovered
+                .checked_add(1)
+                .ok_or(PageTreeError::OffsetOverflow)?;
+            if let UrkelNodeRecord::Internal {
+                prefix,
+                left,
+                right,
+            } = decode_bootstrap_record(root, &raw)?
+            {
+                let child_depth = bootstrap_child_depth(depth, prefix.bit_len())?;
+                work.push((right, child_depth));
+                work.push((left, child_depth));
+            }
+        }
+        Ok(discovered)
+    }
+
     /// Validate every committed page exactly once in physical order. Page
     /// records are append-postordered, so child hash/address consistency,
     /// acyclicity, canonical encoding, and maximum path depth can all be
@@ -2614,6 +2783,105 @@ mod tests {
             assert_eq!(
                 proof.verify_value(root).expect("verify proof"),
                 Some(value.clone())
+            );
+        }
+
+        drop(reader);
+        drop(appender);
+        std::fs::remove_file(path).expect("remove page fixture");
+    }
+
+    #[test]
+    fn delta_stream_reuses_an_existing_tree_and_publishes_both_roots() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-delta-{}-{nonce}.pages",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let base_entries = (0u8..64)
+            .map(|index| {
+                let mut key = [0u8; 32];
+                key[0] = index;
+                key[31] = index.rotate_left(3);
+                (NameHash::new(key), vec![index; 4])
+            })
+            .collect::<Vec<_>>();
+        let mut updated_entries = base_entries.clone();
+        updated_entries[31].1 = b"changed".to_vec();
+        let base_tree = MemoryUrkel::from_entries(base_entries).expect("base tree");
+        let updated_tree = MemoryUrkel::from_entries(updated_entries).expect("updated tree");
+        let base_records = base_tree.node_records().expect("base records");
+        let updated_records = updated_tree.node_records().expect("updated records");
+        let expected_delta = updated_records
+            .keys()
+            .filter(|root| !base_records.contains_key(root))
+            .count();
+        assert!(expected_delta < updated_records.len());
+
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        for records in [&base_records, &updated_records] {
+            for (root, raw) in records {
+                batch
+                    .put(ColumnFamily::NameTreeNodes, root.as_bytes(), raw)
+                    .expect("stage record");
+            }
+        }
+        store.commit(batch).expect("commit records");
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut appender = NamePageAppender::create_new(&path, 12, 0).expect("create pages");
+        let base =
+            stream_name_page_tree(&snapshot, base_tree.root(), &mut appender).expect("base stream");
+        let base_address = base.root_address.expect("base address");
+
+        let base_reader = NamePageTreeReader::open(
+            &path,
+            base_tree.root(),
+            NamePageRootLocator::new(12, base_address),
+        )
+        .expect("base reader");
+        assert_eq!(
+            base_reader
+                .discover_tree_addresses(base_tree.root())
+                .expect("discover base"),
+            base_records.len() as u64
+        );
+        let mut known = base_reader.known_addresses().expect("known base addresses");
+        drop(base_reader);
+
+        let delta =
+            stream_name_page_tree_delta(&snapshot, updated_tree.root(), &mut appender, &mut known)
+                .expect("delta stream");
+        assert_eq!(delta.record_count, expected_delta as u64);
+        assert!(delta.record_count < updated_records.len() as u64);
+        let updated_address = delta.root_address.expect("updated address");
+
+        let reader = NamePageTreeReader::open(
+            &path,
+            updated_tree.root(),
+            NamePageRootLocator::new(12, updated_address),
+        )
+        .expect("updated reader");
+        reader
+            .insert_root(base_tree.root(), NamePageRootLocator::new(12, base_address))
+            .expect("insert base root");
+        for (root, expected) in [
+            (base_tree.root(), base_records.len()),
+            (updated_tree.root(), updated_records.len()),
+        ] {
+            assert_eq!(
+                validate_record_tree(root, |record_root| {
+                    reader
+                        .load(record_root)
+                        .map_err(|error| UrkelError::Storage(error.to_string()))
+                })
+                .expect("validate retained tree"),
+                expected
             );
         }
 

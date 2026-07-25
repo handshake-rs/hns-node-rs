@@ -15,8 +15,8 @@ rejects the flag unless all of these operational constraints are present:
 - at least four outbound slots and either key-bearing discovery or two pinned
   Brontide peers;
 - the mining engine and transaction relay;
-- either full undo history or opt-in pruning at HSD's exact mainnet
-  `pruneAfterHeight`/`keepBlocks` rollback horizon; and
+- either explicit archive storage or the default pruned mode at HSD's exact
+  mainnet `pruneAfterHeight`/`keepBlocks` rollback horizon; and
 - no incomplete-consensus acknowledgement or experimental feature bypass.
 
 Even after startup, the private mining permit remains unavailable until the
@@ -60,17 +60,28 @@ cargo run --locked --release --manifest-path hsrd/Cargo.toml \
   --mainnet-canary \
   --native-sync --p2p-discovery --maximum-outbound 8 \
   --mining-engine --transaction-relay \
-  --prune-undo-history --compact-name-tree-on-startup \
+  --storage-mode pruned --compact-name-tree-on-startup \
   --name-tree-compaction-interval 10000 \
   --check-config
 ```
 
 Remove `--check-config` to start synchronization. Never add
 `--acknowledge-incomplete-consensus`; mainnet canary validation rejects it.
-The deployed mining-only profile enables undo pruning: it preserves the newest
-288 mainnet blocks exactly as HSD specifies, rejects deeper reorganizations
-before mutation, retires matching historical root pins atomically, and runs
-name-tree reclamation on the configured height interval.
+`pruned` is the default. It preserves the newest 288 mainnet raw blocks and
+undo records exactly as HSD specifies, rejects deeper reorganizations before
+mutation, retires matching historical root pins atomically, and runs name-tree
+reclamation on the configured height interval. Existing undo-only v1 stores
+upgrade in place by deleting old raw-block locators without replaying their
+payloads. On startup, at least 256 MiB of dead append-only frames triggers a
+crash-safe generation rewrite so logical pruning also returns disk space.
+After sixteen sealed 360-block name-page segments, startup likewise rewrites
+only the reachable union of the current and rollback roots, atomically swaps
+their locators, and deletes the superseded page generation.
+
+Use `--storage-mode archive` only with a new, never-pruned data directory to
+retain every raw block and undo for historical serving. A pruned store cannot
+be changed back to archive because deleted history cannot be reconstructed
+locally.
 Keep the Authorization value out of command-line arguments, logs, and shell
 history. An authenticated local client may inspect `getauthorityinfo` or the
 atomic `getparentauthority` response. ASIC service must be started only through
@@ -122,6 +133,12 @@ port 3008. The RPC Authorization and gateway password remain separate
 mode-0600 files. CPU and GPU use distinct extra-nonce domains, ASIC sessions
 receive unique prefixes, and every network-target result is re-admitted,
 connected locally, durably captured, and published to all writable peers.
+
+The node is outbound-only unless `--p2p-listen <address>:12038` is supplied to
+`meshmine-minerd`. With a reachable firewall/NAT mapping it accepts inbound
+Brontide peers. A pruned node serves headers and its retained block horizon;
+an archive node can serve the complete historical block chain. The listener
+choice is independent of pruning.
 
 This profile is a bounded canary mechanism, not production eligibility,
 independent review, or permission to turn incomplete readiness flags on.

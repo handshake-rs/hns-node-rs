@@ -19,7 +19,7 @@ use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
     init_logging, validate_node_config, AuthorityMode, MiningEngineConfig,
     NameTreeCompactionConfig, NativeSyncConfig, NodeConfig, NodeService, RpcAuthorizationHeader,
-    ShutdownSignal, UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
+    ShutdownSignal, StorageMode, UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
     MAX_RPC_AUTHORIZATION_BYTES,
 };
 use hns_store::DurabilityPolicy;
@@ -70,8 +70,13 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_NAME_TREE_COMPACTION_INTERVAL)]
     name_tree_compaction_interval: u32,
 
-    /// Retire active-chain undo records beyond the HSD network reorg horizon.
-    #[arg(long)]
+    /// Raw block/undo retention policy. Pruned is the default mining profile;
+    /// archive retains complete history for historical peer serving.
+    #[arg(long, value_enum, default_value_t = StorageMode::Pruned)]
+    storage_mode: StorageMode,
+
+    /// Legacy spelling for `--storage-mode pruned`.
+    #[arg(long, hide = true)]
     prune_undo_history: bool,
 
     /// Enable native P2P, headers, block-body, and active-state synchronization.
@@ -180,6 +185,9 @@ struct Cli {
 
 impl Cli {
     fn into_config(self) -> anyhow::Result<NodeConfig> {
+        if self.prune_undo_history && self.storage_mode == StorageMode::Archive {
+            anyhow::bail!("--prune-undo-history conflicts with explicit --storage-mode archive");
+        }
         let connect = self
             .p2p_connect
             .iter()
@@ -211,7 +219,8 @@ impl Cli {
                 startup_interval: self.name_tree_compaction_interval,
             },
             undo_retention: UndoRetentionConfig {
-                prune_history: self.prune_undo_history,
+                prune_history: self.prune_undo_history
+                    || self.storage_mode.prunes_payload_history(),
             },
             shadow_sync: NativeSyncConfig {
                 enabled: self.native_sync,
@@ -381,6 +390,28 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_mode_defaults_to_pruned_and_archive_is_explicit() {
+        let default = Cli::try_parse_from(["hsrd"])
+            .expect("default CLI")
+            .into_config()
+            .expect("default config");
+        assert!(default.undo_retention.prune_history);
+
+        let archive = Cli::try_parse_from(["hsrd", "--storage-mode", "archive"])
+            .expect("archive CLI")
+            .into_config()
+            .expect("archive config");
+        assert!(!archive.undo_retention.prune_history);
+
+        let conflict =
+            Cli::try_parse_from(["hsrd", "--storage-mode", "archive", "--prune-undo-history"])
+                .expect("legacy conflict parses")
+                .into_config()
+                .expect_err("archive and legacy prune flag conflict");
+        assert!(conflict.to_string().contains("conflicts"));
+    }
 
     #[test]
     fn explicit_peer_parser_preserves_brontide_key_and_socket() {

@@ -236,6 +236,9 @@ pub struct RpcUndoRetentionInfo {
     pub pruned_through: Option<Height>,
     pub checkpoint_block: Option<BlockHash>,
     pub pruned_undos: Option<u64>,
+    pub blocks_pruned_through: Option<Height>,
+    pub blocks_checkpoint: Option<BlockHash>,
+    pub pruned_blocks: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

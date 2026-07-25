@@ -11,11 +11,12 @@ use hns_node::{STORAGE_MAINTENANCE_MARKER, STORAGE_MAINTENANCE_MARKER_BODY};
 use hns_primitives::{blake2b_256, hex_encode};
 use hns_store::{
     decode_u32, open_store, ColumnFamily, DurabilityPolicy, MetaKey, ReadSnapshot,
-    SegmentArchiveInventory, SegmentArchiveScrub, SegmentMigrationReport, Store, StoreBackend,
-    StoreConfig, BLOCK_SEGMENT_MANIFEST_KEY, INTERVAL_SCHEMA_VERSION, INTERVAL_STORAGE_PROFILE,
-    LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION,
-    PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION, SEGMENT_MIGRATION_MAX_BATCH_RECORDS,
-    STORAGE_PROFILE, UNDO_SEGMENT_MANIFEST_KEY,
+    SegmentArchiveCompactionReport, SegmentArchiveInventory, SegmentArchiveScrub,
+    SegmentMigrationReport, Store, StoreBackend, StoreConfig, BLOCK_SEGMENT_MANIFEST_KEY,
+    INTERVAL_SCHEMA_VERSION, INTERVAL_STORAGE_PROFILE, LEGACY_SCHEMA_VERSION,
+    LEGACY_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE,
+    SCHEMA_VERSION, SEGMENT_MIGRATION_MAX_BATCH_RECORDS, STORAGE_PROFILE,
+    UNDO_SEGMENT_MANIFEST_KEY,
 };
 use serde::Serialize;
 
@@ -48,6 +49,8 @@ enum Command {
     },
     /// Validate manifests and every committed frame, then report inline/archive inventory.
     Inventory,
+    /// Rewrite live payloads into one fresh generation and reclaim dead segment frames.
+    Compact,
     /// Idempotently rewrite legacy inline block/undo values into append-only segments.
     MigrateInline {
         /// Maximum number of logical payloads in one atomic RocksDB/archive commit.
@@ -83,6 +86,20 @@ struct MigrationOutput {
     pre_migration_scrub: SegmentArchiveScrub,
     migration: SegmentMigrationReport,
     after: SegmentArchiveInventory,
+    committed_frames_validated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactionOutput {
+    schema_version: u32,
+    operation: &'static str,
+    storage_schema: u32,
+    storage_profile: String,
+    before: SegmentArchiveInventory,
+    pre_compaction_scrub: SegmentArchiveScrub,
+    compaction: SegmentArchiveCompactionReport,
+    after: SegmentArchiveInventory,
+    post_compaction_scrub: SegmentArchiveScrub,
     committed_frames_validated: bool,
 }
 
@@ -130,7 +147,7 @@ fn run() -> Result<()> {
         return write_output(&output);
     }
     require_current_store(&identity)?;
-    if matches!(&arguments.command, Command::Inventory) {
+    if matches!(&arguments.command, Command::Inventory | Command::Compact) {
         require_archive_manifests(&raw)?;
     }
     let store = raw
@@ -149,6 +166,26 @@ fn run() -> Result<()> {
                 storage_profile: String::from_utf8_lossy(STORAGE_PROFILE).into_owned(),
                 inventory,
                 scrub,
+                committed_frames_validated: true,
+            };
+            write_output(&output)
+        }
+        Command::Compact => {
+            let before = store.segment_archive_inventory()?;
+            let pre_compaction_scrub = store.scrub_segment_archive()?;
+            let compaction = store.compact_segment_archive()?;
+            let after = store.segment_archive_inventory()?;
+            let post_compaction_scrub = store.scrub_segment_archive()?;
+            let output = CompactionOutput {
+                schema_version: OUTPUT_SCHEMA_VERSION,
+                operation: "compact",
+                storage_schema: SCHEMA_VERSION,
+                storage_profile: String::from_utf8_lossy(STORAGE_PROFILE).into_owned(),
+                before,
+                pre_compaction_scrub,
+                compaction,
+                after,
+                post_compaction_scrub,
                 committed_frames_validated: true,
             };
             write_output(&output)

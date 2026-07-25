@@ -839,6 +839,18 @@ pub struct SegmentArchiveInventory {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SegmentArchiveCompactionReport {
+    pub previous_block_generation: u64,
+    pub previous_undo_generation: u64,
+    pub generation: u64,
+    pub live_records: u64,
+    pub live_payload_bytes: u64,
+    pub before_frame_bytes: u64,
+    pub after_frame_bytes: u64,
+    pub reclaimed_frame_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct SegmentMigrationReport {
     pub migrated_records: u64,
     pub migrated_bytes: u64,
@@ -925,6 +937,163 @@ impl StoreHandle {
             ));
         };
         archive.scrub().map_err(segment_store_error)
+    }
+
+    pub fn segment_archive_frame_bytes(&self) -> Result<(u64, u64), StoreError> {
+        let Self::Archived { archive, .. } = self else {
+            return Err(StoreError::Schema(
+                "segment archive footprint requires an archived store".to_owned(),
+            ));
+        };
+        archive.committed_frame_bytes().map_err(segment_store_error)
+    }
+
+    /// Rewrite only live block/undo locators into a fresh segment generation
+    /// and atomically publish every replacement locator with both manifests.
+    /// The caller must hold exclusive database ownership. Crash recovery uses
+    /// the committed manifests to discard either an unpublished new
+    /// generation or the superseded old generation.
+    pub fn compact_segment_archive(&self) -> Result<SegmentArchiveCompactionReport, StoreError> {
+        let Self::Archived { inner, archive } = self else {
+            return Err(StoreError::Schema(
+                "segment compaction requires an archived store".to_owned(),
+            ));
+        };
+        let (before_block_bytes, before_undo_bytes) = archive
+            .committed_frame_bytes()
+            .map_err(segment_store_error)?;
+        let (previous_block, previous_undo) = archive.manifests().map_err(segment_store_error)?;
+        let snapshot = inner.snapshot()?;
+        let block_entries = snapshot.scan_prefix(ColumnFamily::Blocks, b"")?;
+        let undo_entries = snapshot.scan_prefix(ColumnFamily::Undo, b"")?;
+        drop(snapshot);
+
+        let mut rewrite = archive.begin_rewrite().map_err(segment_store_error)?;
+        let prepared = (|| {
+            let mut batch = inner.batch();
+            let mut live_records = 0u64;
+            let mut live_payload_bytes = 0u64;
+            for (family, kind, entries) in [
+                (ColumnFamily::Blocks, SegmentKind::Block, block_entries),
+                (ColumnFamily::Undo, SegmentKind::Undo, undo_entries),
+            ] {
+                for (key, raw) in entries {
+                    let Some(locator) =
+                        SegmentValueLocator::decode(&raw).map_err(segment_store_error)?
+                    else {
+                        continue;
+                    };
+                    if locator.kind != kind {
+                        return Err(StoreError::Schema(format!(
+                            "{} locator has kind {:?}; expected {kind:?}",
+                            family.name(),
+                            locator.kind
+                        )));
+                    }
+                    let key_array: [u8; 32] = key.as_slice().try_into().map_err(|_| {
+                        StoreError::Schema(format!(
+                            "{} archive key contains {} bytes; expected 32",
+                            family.name(),
+                            key.len()
+                        ))
+                    })?;
+                    let payload = archive
+                        .resolve(kind, &key, &raw)
+                        .map_err(segment_store_error)?
+                        .ok_or_else(|| {
+                            StoreError::Schema(format!(
+                                "{} locator did not resolve to an archived payload",
+                                family.name()
+                            ))
+                        })?;
+                    live_records = live_records.checked_add(1).ok_or_else(|| {
+                        StoreError::Schema("segment compaction record count overflow".to_owned())
+                    })?;
+                    live_payload_bytes = live_payload_bytes
+                        .checked_add(u64::try_from(payload.len()).map_err(|_| {
+                            StoreError::Schema(
+                                "segment compaction payload length overflow".to_owned(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            StoreError::Schema(
+                                "segment compaction payload byte count overflow".to_owned(),
+                            )
+                        })?;
+                    let replacement = archive
+                        .append_rewrite(&mut rewrite, kind, key_array, payload)
+                        .map_err(segment_store_error)?;
+                    batch.put(family, &key, &replacement.encode())?;
+                }
+            }
+            let (block_manifest, undo_manifest, after) = archive
+                .finish_rewrite(&mut rewrite)
+                .map_err(segment_store_error)?;
+            batch.put(
+                ColumnFamily::Snapshots,
+                BLOCK_SEGMENT_MANIFEST_KEY,
+                &block_manifest.encode(),
+            )?;
+            batch.put(
+                ColumnFamily::Snapshots,
+                UNDO_SEGMENT_MANIFEST_KEY,
+                &undo_manifest.encode(),
+            )?;
+            Ok::<_, StoreError>((
+                batch,
+                block_manifest,
+                undo_manifest,
+                after,
+                live_records,
+                live_payload_bytes,
+            ))
+        })();
+        let (batch, block_manifest, undo_manifest, after, live_records, live_payload_bytes) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    archive
+                        .abort_rewrite(rewrite)
+                        .map_err(segment_store_error)?;
+                    return Err(error);
+                }
+            };
+        if let Err(error) = inner.commit(batch) {
+            archive
+                .abort_rewrite(rewrite)
+                .map_err(segment_store_error)?;
+            return Err(error);
+        }
+        // After the atomic database commit the new generation is
+        // authoritative. Never delete it on an installation/cleanup error;
+        // reopening will select it from the manifests and remove predecessors.
+        archive
+            .install_rewrite(rewrite)
+            .map_err(segment_store_error)?;
+
+        let before_frame_bytes = before_block_bytes
+            .checked_add(before_undo_bytes)
+            .ok_or_else(|| {
+                StoreError::Schema("pre-compaction frame byte count overflow".to_owned())
+            })?;
+        let after_frame_bytes = after
+            .blocks
+            .durable_bytes
+            .checked_add(after.undo.durable_bytes)
+            .ok_or_else(|| {
+                StoreError::Schema("post-compaction frame byte count overflow".to_owned())
+            })?;
+        debug_assert_eq!(block_manifest.generation, undo_manifest.generation);
+        Ok(SegmentArchiveCompactionReport {
+            previous_block_generation: previous_block.generation,
+            previous_undo_generation: previous_undo.generation,
+            generation: block_manifest.generation,
+            live_records,
+            live_payload_bytes,
+            before_frame_bytes,
+            after_frame_bytes,
+            reclaimed_frame_bytes: before_frame_bytes.saturating_sub(after_frame_bytes),
+        })
     }
 
     /// Rewrite legacy inline block and undo values through the archive wrapper
@@ -2982,6 +3151,144 @@ mod tests {
         );
         drop(reopened);
         std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[test]
+    fn segment_compaction_rewrites_only_live_locators_and_reclaims_old_generation() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-segment-compaction-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let raw = StoreHandle::memory();
+        let archived = raw
+            .clone()
+            .with_segment_archive(directory.clone())
+            .expect("attach archive");
+        let live_block = [0x31; 32];
+        let dead_block = [0x32; 32];
+        let live_undo = [0x41; 32];
+        let dead_undo = [0x42; 32];
+        let mut batch = archived.batch();
+        for (family, key, payload) in [
+            (ColumnFamily::Blocks, live_block, b"live block".as_slice()),
+            (ColumnFamily::Blocks, dead_block, b"dead block".as_slice()),
+            (ColumnFamily::Undo, live_undo, b"live undo".as_slice()),
+            (ColumnFamily::Undo, dead_undo, b"dead undo".as_slice()),
+        ] {
+            batch.put(family, &key, payload).expect("stage payload");
+        }
+        archived.commit(batch).expect("commit payloads");
+        let mut batch = archived.batch();
+        batch
+            .delete(ColumnFamily::Blocks, &dead_block)
+            .expect("delete dead block locator");
+        batch
+            .delete(ColumnFamily::Undo, &dead_undo)
+            .expect("delete dead undo locator");
+        archived
+            .commit(batch)
+            .expect("commit dead locator deletion");
+
+        let before = archived.scrub_segment_archive().expect("pre scrub");
+        assert_eq!(before.blocks.records, 2);
+        assert_eq!(before.undo.records, 2);
+        let report = archived
+            .compact_segment_archive()
+            .expect("compact segment archive");
+        assert_eq!(report.previous_block_generation, 1);
+        assert_eq!(report.previous_undo_generation, 1);
+        assert_eq!(report.generation, 2);
+        assert_eq!(report.live_records, 2);
+        assert!(report.reclaimed_frame_bytes > 0);
+
+        let after = archived.scrub_segment_archive().expect("post scrub");
+        assert_eq!(after.blocks.records, 1);
+        assert_eq!(after.undo.records, 1);
+        let snapshot = archived.snapshot().expect("compacted snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &live_block)
+                .expect("live block"),
+            Some(b"live block".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Undo, &live_undo)
+                .expect("live undo"),
+            Some(b"live undo".to_vec())
+        );
+        assert!(snapshot
+            .get(ColumnFamily::Blocks, &dead_block)
+            .expect("dead block")
+            .is_none());
+        assert!(snapshot
+            .get(ColumnFamily::Undo, &dead_undo)
+            .expect("dead undo")
+            .is_none());
+        drop(snapshot);
+        for entry in std::fs::read_dir(&directory).expect("segment directory") {
+            let name = entry
+                .expect("segment entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            assert!(name.contains("-g0000000000000002-"), "{name}");
+        }
+
+        drop(archived);
+        for (kind, name, key) in [
+            (SegmentKind::Block, "block", [0x71; 32]),
+            (SegmentKind::Undo, "undo", [0x72; 32]),
+        ] {
+            let path = directory.join(format!("{name}-g0000000000000003-s00000000.seg"));
+            let mut orphan =
+                SegmentAppender::create_new(&path, 3, 0).expect("create crash-residue generation");
+            orphan
+                .append(&SegmentRecord {
+                    kind,
+                    key,
+                    hints: Vec::new(),
+                    payload: b"unpublished compaction payload".to_vec(),
+                })
+                .expect("append crash-residue payload");
+            orphan.sync_data().expect("sync crash-residue payload");
+        }
+        std::fs::copy(
+            directory.join("block-g0000000000000002-s00000000.seg"),
+            directory.join("block-g0000000000000001-s00000000.seg"),
+        )
+        .expect("restore superseded block generation");
+        std::fs::copy(
+            directory.join("undo-g0000000000000002-s00000000.seg"),
+            directory.join("undo-g0000000000000001-s00000000.seg"),
+        )
+        .expect("restore superseded undo generation");
+        let reopened = raw
+            .with_segment_archive(directory.clone())
+            .expect("reopen compacted archive");
+        assert_eq!(
+            reopened
+                .snapshot()
+                .expect("reopened snapshot")
+                .get(ColumnFamily::Blocks, &live_block)
+                .expect("reopened live block"),
+            Some(b"live block".to_vec())
+        );
+        for entry in std::fs::read_dir(&directory).expect("recovered segment directory") {
+            let name = entry
+                .expect("recovered segment entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            assert!(name.contains("-g0000000000000002-"), "{name}");
+        }
+        drop(reopened);
+        std::fs::remove_dir_all(directory).expect("remove compaction fixture");
     }
 
     #[test]

@@ -14,6 +14,13 @@ operation does not by itself grant mining authority: the separate readiness
 gate and the durable tip's complete consensus-authoritative status remain
 mandatory.
 
+The standalone node and unified miner are outbound-only unless
+`--p2p-listen` is supplied. Listener mode accepts inbound Brontide sessions
+under the same bounded peer manager. Default-pruned storage answers historical
+block requests only inside its retained horizon and sends `notfound` outside
+it; `--storage-mode archive` retains complete block bodies for full historical
+serving. Storage retention and inbound reachability are independent choices.
+
 ## Runtime flow
 
 ```text

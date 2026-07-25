@@ -246,6 +246,19 @@ Individual historical reads still verify their frame checksum and key.
 `hsrd-storage-maintenance inventory` is the explicit offline O(archive) scrub
 when exhaustive media verification is required.
 
+Pruned startup compares committed segment file bytes with the live locator
+footprint without scanning dead payloads. At 256 MiB of reclaimable frames it
+rewrites only live block/undo records into a new generation and atomically
+publishes all locators plus both manifests. The offline
+`hsrd-storage-maintenance compact` variant adds exhaustive pre/post scrubs.
+
+Page-backed name state is compacted by retained-root union rather than by
+historical replay. Once sixteen physical 360-block segments accumulate, pruned
+startup streams the current tree once. A hash-to-address index terminates
+traversal at already copied subtrees, so each nearby undo/pin root contributes
+only its divergent nodes. Publication swaps the generation and all retained
+root locators atomically before old files are removed.
+
 ## Current RocksDB boundary
 
 Point-oriented column families share a bounded 192 MiB cache. New raw blocks

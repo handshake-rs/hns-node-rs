@@ -120,11 +120,11 @@ Implemented:
 
 Remaining:
 
-- deployment-scale compaction performance/priority qualification and RocksDB
-  mid-commit process-crash/fault injection;
+- deployment-scale compaction performance/priority qualification and broader
+  RocksDB mid-commit process-crash/fault injection;
 - full-mainnet qualification of historical contextual claim/airdrop behavior;
-- pruning and RocksDB crash/fault qualification;
-- complete mainnet reorganization/root replay.
+- production-scale pruning and RocksDB crash/fault qualification;
+- sustained live mainnet reorganization/root campaigns.
 
 ## Live P2P and synchronization — native foundation implemented
 

@@ -4,9 +4,9 @@ mod page_tree;
 
 pub use hns_urkel::TreeRoot;
 pub use page_tree::{
-    name_page_root_key, pack_name_page_records, stream_name_page_tree, NamePageRootLocator,
-    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader, NamePageValidation,
-    PackedNamePages, PageTreeError, StreamedNamePages, NAME_PAGE_ROOT_PREFIX,
+    name_page_root_key, pack_name_page_records, stream_name_page_tree, stream_name_page_tree_delta,
+    NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader,
+    NamePageValidation, PackedNamePages, PageTreeError, StreamedNamePages, NAME_PAGE_ROOT_PREFIX,
     NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
 };
 
@@ -3198,7 +3198,7 @@ pub fn stage_remove_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
     Ok(())
 }
 
-fn retained_name_tree_roots<T: ReadSnapshot>(
+pub fn retained_name_tree_roots<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<BTreeSet<TreeRoot>, StateError> {
     let current_root = load_stored_name_tree_root(snapshot)?;

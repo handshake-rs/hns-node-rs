@@ -5621,8 +5621,8 @@ mod tests {
         assert_eq!(value["header"]["hash"], hash.to_hex());
         assert_eq!(value["header"]["confirmations"], 1);
         assert_eq!(value["authority"]["mode"], "native");
-        assert_eq!(value["authority"]["consensus_complete"], false);
-        assert_eq!(value["authoritative_mining_tip"], false);
+        assert_eq!(value["authority"]["consensus_complete"], true);
+        assert_eq!(value["authoritative_mining_tip"], true);
     }
 
     #[test]
@@ -6771,6 +6771,7 @@ mod tests {
         let config = NodeConfig {
             network: Network::Regtest,
             data_dir: Some(path.clone()),
+            authority_mode: AuthorityMode::Shadow,
             shadow_sync: ShadowSyncConfig {
                 enabled: true,
                 connect: vec!["127.0.0.1:14038".parse().expect("peer")],

@@ -389,6 +389,11 @@ pub struct SegmentArchive {
     readers: Mutex<HashMap<(SegmentKind, u64, u32), Arc<File>>>,
 }
 
+pub(crate) struct SegmentArchiveRewrite {
+    writer: SegmentArchiveWriter,
+    generation: u64,
+}
+
 impl SegmentArchive {
     pub(crate) fn create_new(directory: PathBuf, generation: u64) -> Result<Self, SegmentError> {
         Self::create_new_with_target(directory, generation, SEGMENT_TARGET_BYTES)
@@ -526,6 +531,122 @@ impl SegmentArchive {
             undo: scrub_archive_channel(&self.directory, SegmentKind::Undo, writer.undo.manifest)?,
         })
     }
+
+    pub(crate) fn committed_frame_bytes(&self) -> Result<(u64, u64), SegmentError> {
+        let (block, undo) = self.manifests()?;
+        Ok((
+            committed_archive_channel_bytes(&self.directory, SegmentKind::Block, block)?,
+            committed_archive_channel_bytes(&self.directory, SegmentKind::Undo, undo)?,
+        ))
+    }
+
+    /// Start a new complete segment generation. Callers must hold exclusive
+    /// database ownership until the replacement locators/manifests are
+    /// atomically committed and `install_rewrite` completes.
+    pub(crate) fn begin_rewrite(&self) -> Result<SegmentArchiveRewrite, SegmentError> {
+        let (block, undo) = self.manifests()?;
+        remove_other_archive_generations(&self.directory, SegmentKind::Block, block.generation)?;
+        remove_other_archive_generations(&self.directory, SegmentKind::Undo, undo.generation)?;
+        let generation = block
+            .generation
+            .max(undo.generation)
+            .checked_add(1)
+            .ok_or(SegmentError::LocatorOverflow)?;
+        let block = create_archive_channel(&self.directory, SegmentKind::Block, generation, 0)?;
+        let undo = match create_archive_channel(&self.directory, SegmentKind::Undo, generation, 0) {
+            Ok(undo) => undo,
+            Err(error) => {
+                drop(block);
+                remove_archive_generation(&self.directory, SegmentKind::Block, generation)?;
+                return Err(error);
+            }
+        };
+        sync_directory(&self.directory)?;
+        Ok(SegmentArchiveRewrite {
+            writer: SegmentArchiveWriter { block, undo },
+            generation,
+        })
+    }
+
+    pub(crate) fn append_rewrite(
+        &self,
+        rewrite: &mut SegmentArchiveRewrite,
+        kind: SegmentKind,
+        key: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<SegmentValueLocator, SegmentError> {
+        let channel = match kind {
+            SegmentKind::Block => &mut rewrite.writer.block,
+            SegmentKind::Undo => &mut rewrite.writer.undo,
+        };
+        let record = SegmentRecord {
+            kind,
+            key,
+            hints: Vec::new(),
+            payload,
+        };
+        rotate_archive_channel_if_due(&self.directory, channel, &record, self.target_bytes)?;
+        let locator = channel
+            .appender
+            .as_mut()
+            .ok_or(SegmentError::AppenderPoisoned)?
+            .append(&record)?;
+        Ok(SegmentValueLocator { kind, locator })
+    }
+
+    pub(crate) fn finish_rewrite(
+        &self,
+        rewrite: &mut SegmentArchiveRewrite,
+    ) -> Result<(SegmentManifest, SegmentManifest, SegmentArchiveScrub), SegmentError> {
+        let block_manifest = rewrite
+            .writer
+            .block
+            .appender
+            .as_mut()
+            .ok_or(SegmentError::AppenderPoisoned)?
+            .sync_data()?;
+        let undo_manifest = rewrite
+            .writer
+            .undo
+            .appender
+            .as_mut()
+            .ok_or(SegmentError::AppenderPoisoned)?
+            .sync_data()?;
+        rewrite.writer.block.manifest = block_manifest;
+        rewrite.writer.undo.manifest = undo_manifest;
+        sync_directory(&self.directory)?;
+        let scrub = SegmentArchiveScrub {
+            blocks: scrub_archive_channel(&self.directory, SegmentKind::Block, block_manifest)?,
+            undo: scrub_archive_channel(&self.directory, SegmentKind::Undo, undo_manifest)?,
+        };
+        Ok((block_manifest, undo_manifest, scrub))
+    }
+
+    pub(crate) fn abort_rewrite(&self, rewrite: SegmentArchiveRewrite) -> Result<(), SegmentError> {
+        let generation = rewrite.generation;
+        drop(rewrite);
+        remove_archive_generation(&self.directory, SegmentKind::Block, generation)?;
+        remove_archive_generation(&self.directory, SegmentKind::Undo, generation)?;
+        sync_directory(&self.directory)
+    }
+
+    pub(crate) fn install_rewrite(
+        &self,
+        rewrite: SegmentArchiveRewrite,
+    ) -> Result<(), SegmentError> {
+        let generation = rewrite.generation;
+        {
+            let mut writer = self.writer()?;
+            *writer = rewrite.writer;
+        }
+        self.readers
+            .lock()
+            .map_err(|_| SegmentError::Poisoned)?
+            .clear();
+        remove_other_archive_generations(&self.directory, SegmentKind::Block, generation)?;
+        remove_other_archive_generations(&self.directory, SegmentKind::Undo, generation)?;
+        sync_directory(&self.directory)
+    }
 }
 
 impl SegmentArchiveWriter {
@@ -623,6 +744,10 @@ fn recover_archive_channel(
     kind: SegmentKind,
     manifest: SegmentManifest,
 ) -> Result<ArchiveChannel, SegmentError> {
+    // The RocksDB manifest is the atomic publication point for generation
+    // rewrites. Any other generation is either pre-commit crash residue or a
+    // post-commit predecessor and is safe to remove during exclusive reopen.
+    remove_other_archive_generations(directory, kind, manifest.generation)?;
     remove_unpublished_archive_segments(
         directory,
         kind,
@@ -686,6 +811,39 @@ fn scrub_archive_channel(
             .ok_or(SegmentError::LocatorOverflow)?;
     }
     Ok(scrub)
+}
+
+fn committed_archive_channel_bytes(
+    directory: &Path,
+    kind: SegmentKind,
+    manifest: SegmentManifest,
+) -> Result<u64, SegmentError> {
+    let mut bytes = manifest.durable_bytes;
+    for segment in 0..manifest.active_segment {
+        let path = archive_file_path(directory, kind, manifest.generation, segment);
+        let metadata = std::fs::metadata(path).map_err(segment_io)?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err(SegmentError::InvalidSealedSegment(segment));
+        }
+        bytes = bytes
+            .checked_add(metadata.len())
+            .ok_or(SegmentError::LocatorOverflow)?;
+    }
+    let active = archive_file_path(
+        directory,
+        kind,
+        manifest.generation,
+        manifest.active_segment,
+    );
+    let metadata = std::fs::metadata(active).map_err(segment_io)?;
+    if !metadata.is_file() || metadata.len() < manifest.durable_bytes {
+        return Err(SegmentError::UncommittedTail {
+            committed: manifest.durable_bytes,
+            actual: metadata.len(),
+            torn: false,
+        });
+    }
+    Ok(bytes)
 }
 
 fn rotate_archive_channel_if_due(
@@ -832,6 +990,55 @@ fn remove_unpublished_archive_segments(
     }
     if removed {
         sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn remove_archive_generation(
+    directory: &Path,
+    kind: SegmentKind,
+    generation: u64,
+) -> Result<(), SegmentError> {
+    let mut removed = false;
+    for entry in std::fs::read_dir(directory).map_err(segment_io)? {
+        let entry = entry.map_err(segment_io)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((candidate_kind, candidate_generation, _)) = parse_archive_file_name(&name) else {
+            continue;
+        };
+        if candidate_kind == kind && candidate_generation == generation {
+            std::fs::remove_file(entry.path()).map_err(segment_io)?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(directory)?;
+    }
+    Ok(())
+}
+
+fn remove_other_archive_generations(
+    directory: &Path,
+    kind: SegmentKind,
+    retained_generation: u64,
+) -> Result<(), SegmentError> {
+    let mut generations = BTreeSet::new();
+    for entry in std::fs::read_dir(directory).map_err(segment_io)? {
+        let entry = entry.map_err(segment_io)?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((candidate_kind, generation, _)) = parse_archive_file_name(&name) else {
+            continue;
+        };
+        if candidate_kind == kind && generation != retained_generation {
+            generations.insert(generation);
+        }
+    }
+    for generation in generations {
+        remove_archive_generation(directory, kind, generation)?;
     }
     Ok(())
 }
