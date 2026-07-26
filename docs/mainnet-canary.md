@@ -1,8 +1,10 @@
 # Native mainnet mining canary
 
 The mainnet canary is an explicit fail-closed authority profile. It uses native
-Brontide peers, native active-state synchronization, native templates, and the
-native MeshMine gateway bridge. HSD is not started or queried at runtime; its
+Brontide peers, native active-state synchronization, and native templates. The
+node exposes the capability-gated in-process boundary consumed by the separate
+MeshMine gateway composition; the standalone `hsrd` binary does not embed
+MeshMine workers or a gateway. HSD is not started or queried at runtime; its
 pinned source and fixtures remain offline development evidence only.
 
 `--mainnet-canary` is necessary but not sufficient to authorize work. Startup
@@ -50,7 +52,7 @@ Create a private file containing one complete Authorization value, such as
 `Bearer <random-secret>`, then check the operational configuration:
 
 ```sh
-cargo run --locked --release --manifest-path hsrd/Cargo.toml \
+cargo run --locked --release --manifest-path Cargo.toml \
   -p hns-node --bin hsrd -- \
   --network mainnet \
   --data-dir /absolute/path/hsrd-mainnet \
@@ -92,11 +94,13 @@ For restart-surviving operation, build the release binary and install the
 provided user-service unit:
 
 ```sh
-cargo build --locked --release --manifest-path hsrd/Cargo.toml \
+cargo build --locked --release --manifest-path Cargo.toml \
   -p hns-node --bin hsrd
 install -d -m 700 "$HOME/.config/systemd/user" \
-  "$HOME/.config/hsrd" "$HOME/.local/share/hsrd/mainnet-canary"
-install -m 600 hsrd/deploy/meshmine-hsrd-mainnet-canary.service \
+  "$HOME/.config/hsrd" "$HOME/.local/share/hsrd/mainnet-canary" \
+  "$HOME/.local/libexec"
+install -m 755 target/release/hsrd "$HOME/.local/libexec/hsrd"
+install -m 600 deploy/meshmine-hsrd-mainnet-canary.service \
   "$HOME/.config/systemd/user/meshmine-hsrd-mainnet-canary.service"
 systemctl --user daemon-reload
 systemctl --user enable --now meshmine-hsrd-mainnet-canary.service
@@ -105,37 +109,15 @@ systemctl --user enable --now meshmine-hsrd-mainnet-canary.service
 Create the mode-0600 Authorization-value file before starting the unit. The
 service has no HSD argument or dependency, is restricted to its state and auth
 paths, restarts on failure, and delivers SIGTERM for a clean checkpoint and
-shutdown marker. Review the `%h/Documents/MeshMine` paths if the checkout lives
-elsewhere.
+shutdown marker.
 
-After replay/state qualification enables the final readiness bit, the unified
-miner replaces the sync-only unit. It owns the same hsrd state and RPC endpoint,
-starts native CPU and Vulkan workers from the process-local authoritative
-template, and exposes the same job through a password-protected HandyStratum
-listener for ASICs:
-
-```sh
-cargo build --locked --release --manifest-path hsrd/Cargo.toml \
-  -p meshmine-minerd
-install -d -m 700 "$HOME/.local/libexec" "$HOME/.local/share/meshmine" \
-  "$HOME/.config/meshmine" "$HOME/.config/systemd/user"
-install -m 755 hsrd/target/release/meshmine-minerd \
-  "$HOME/.local/libexec/meshmine-minerd"
-install -m 600 hsrd/deploy/meshmine-minerd-mainnet.service \
-  "$HOME/.config/systemd/user/meshmine-minerd-mainnet.service"
-systemctl --user daemon-reload
-systemctl --user enable --now meshmine-minerd-mainnet.service
-```
-
-The checked-in unit mines to the operator's configured mainnet payout address
-with three CPU threads, hardware Vulkan device zero, and HandyStratum on TCP
-port 3008. The RPC Authorization and gateway password remain separate
-mode-0600 files. CPU and GPU use distinct extra-nonce domains, ASIC sessions
-receive unique prefixes, and every network-target result is re-admitted,
-connected locally, durably captured, and published to all writable peers.
+The MeshMine-specific `meshmine-minerd` combined node/CPU/Vulkan/HandyStratum
+binary remains in the source MeshMine repository. It is intentionally not a
+member of this standalone workspace; see
+[the extraction provenance](extraction-provenance.md).
 
 The node is outbound-only unless `--p2p-listen <address>:12038` is supplied to
-`meshmine-minerd`. With a reachable firewall/NAT mapping it accepts inbound
+`hsrd`. With a reachable firewall/NAT mapping it accepts inbound
 Brontide peers. A pruned node serves headers and its retained block horizon;
 an archive node can serve the complete historical block chain. The listener
 choice is independent of pruning.

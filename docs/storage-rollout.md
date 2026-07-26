@@ -27,12 +27,12 @@ its clean shutdown.
 From a clean, reviewed source revision:
 
 ```sh
-cargo build --locked --release --manifest-path hsrd/Cargo.toml \
+cargo build --locked --release --manifest-path Cargo.toml \
   -p hns-node --bin hsrd --bin hsrd-storage-maintenance \
   --bin hsrd-state-manifest
-sha256sum hsrd/target/release/hsrd \
-  hsrd/target/release/hsrd-storage-maintenance \
-  hsrd/target/release/hsrd-state-manifest
+sha256sum target/release/hsrd \
+  target/release/hsrd-storage-maintenance \
+  target/release/hsrd-state-manifest
 git rev-parse HEAD
 rustc --version --verbose
 ```
@@ -49,7 +49,7 @@ absolute path outside `DATA`.
 systemctl --user stop meshmine-hsrd-mainnet-canary.service
 printf 'hsrd-storage-maintenance-v1\n' > "$DATA/.hsrd-storage-maintenance"
 
-hsrd/target/release/hsrd-storage-maintenance \
+target/release/hsrd-storage-maintenance \
   --data-dir "$DATA" \
   backup --backup-dir "$BACKUP"
 ```
@@ -82,7 +82,7 @@ After the upgraded node completes a clean shutdown, recreate the marker and
 run:
 
 ```sh
-hsrd/target/release/hsrd-storage-maintenance \
+target/release/hsrd-storage-maintenance \
   --data-dir "$DATA" inventory
 ```
 
@@ -109,11 +109,11 @@ preflight is safe:
 Run bounded, restart-idempotent conversion:
 
 ```sh
-hsrd/target/release/hsrd-storage-maintenance \
+target/release/hsrd-storage-maintenance \
   --data-dir "$DATA" \
   migrate-inline --batch-records 32
 
-hsrd/target/release/hsrd-storage-maintenance \
+target/release/hsrd-storage-maintenance \
   --data-dir "$DATA" inventory
 ```
 
@@ -134,7 +134,7 @@ The backup checkpoint already contains the exact
 `.hsrd-state-audit-copy` marker required by `hsrd-state-manifest`:
 
 ```sh
-hsrd/target/release/hsrd-state-manifest \
+target/release/hsrd-state-manifest \
   --data-dir "$BACKUP/chain" > hsrd-pre-rollout-state.json
 ```
 

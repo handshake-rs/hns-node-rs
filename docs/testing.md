@@ -10,6 +10,12 @@ mainnet replay stopped-state and pinned deployment comparisons passed at height
 [`../qualification/mainnet-339654/`](../qualification/mainnet-339654/) and
 [`../qualification/mainnet-339660/`](../qualification/mainnet-339660/).
 
+The `scripts/` and `hsd-oracle/` commands below are source-only evidence tools
+that were outside the extracted `hsrd/` prefix. Run them from the exact
+MeshMine source commit recorded in
+[`extraction-provenance.md`](extraction-provenance.md). Cargo commands and
+committed fixture tests run directly from this standalone repository.
+
 ## Fast static gate
 
 `python3 scripts/validate-hsrd-static.py` runs without a Rust toolchain and
@@ -241,22 +247,23 @@ surface without depending on Cargo.
 
 ## Cargo gates
 
-The nested workspace is independently exercised:
+The standalone workspace is independently exercised:
 
 ```bash
-cargo metadata --locked --manifest-path hsrd/Cargo.toml --format-version 1
-cargo fmt --manifest-path hsrd/Cargo.toml --all --check
-cargo clippy --locked --manifest-path hsrd/Cargo.toml \
+cargo metadata --locked --manifest-path Cargo.toml --format-version 1
+cargo fmt --manifest-path Cargo.toml --all --check
+cargo clippy --locked --manifest-path Cargo.toml \
   --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --manifest-path hsrd/Cargo.toml \
+cargo test --locked --manifest-path Cargo.toml \
   --workspace --all-targets --all-features
-cargo test --locked --manifest-path hsrd/Cargo.toml \
+cargo test --locked --manifest-path Cargo.toml \
   --workspace --all-targets --no-default-features
-cargo build --locked --release --manifest-path hsrd/Cargo.toml \
+cargo build --locked --release --manifest-path Cargo.toml \
   --workspace --all-targets --all-features
 ```
 
-Root and nested lockfiles are audited separately with pinned `cargo-audit`.
+The root and independent fuzz-workspace lockfiles are audited separately with
+pinned `cargo-audit`.
 
 ## State and storage invariants
 
@@ -359,7 +366,7 @@ the committed fixture set:
 NODE_BACKEND=js node hsd-oracle/generate-hsrd-script-fixtures.js \
   --hsd-source /path/to/hsd \
   --full-script-output /tmp/hsrd-hsd-script-corpus.json
-cargo run --locked --manifest-path hsrd/Cargo.toml -p hns-consensus \
+cargo run --locked --manifest-path Cargo.toml -p hns-consensus \
   --example verify_hsd_script_corpus -- /tmp/hsrd-hsd-script-corpus.json
 ```
 

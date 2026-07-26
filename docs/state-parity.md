@@ -62,10 +62,15 @@ database. An operator may use an actual consistent copy/checkpoint, or may
 place the marker only while both user services are stopped and remove it before
 restart. Opening two processes against either live database is forbidden.
 
+The Rust binaries below build from this standalone repository. The
+`hsd-oracle/` and `scripts/` comparison tools were outside the extracted
+prefix; run those commands from the MeshMine source commit pinned in
+[`extraction-provenance.md`](extraction-provenance.md).
+
 At an identical stopped block hash:
 
 ```sh
-cargo run --release --manifest-path hsrd/Cargo.toml \
+cargo run --release --manifest-path Cargo.toml \
   -p hns-node --bin hsrd-state-manifest -- \
   --data-dir /absolute/offline/hsrd-chain \
   > hsrd-state-manifest.json
@@ -130,7 +135,7 @@ induction. No database copy and no state-mutating disconnect are required, but
 both services must be stopped so each producer can obtain its database lock.
 
 ```sh
-cargo run --release --manifest-path hsrd/Cargo.toml \
+cargo run --release --manifest-path Cargo.toml \
   -p hns-node --bin hsrd-rollback-manifest -- \
   --data-dir /absolute/stopped/hsrd-data \
   --output /local/temp/hsrd-rollback-manifest.json
@@ -146,7 +151,7 @@ python3 scripts/compare-hsrd-hsd-rollback-manifests.py \
   --hsrd-manifest /local/temp/hsrd-rollback-manifest.json \
   --hsd-manifest /local/temp/hsd-rollback-manifest.json \
   --anchor-qualification \
-    hsrd/qualification/mainnet-339654/qualification-result.json \
+    qualification/mainnet-339654/qualification-result.json \
   --output /local/temp/rollback-comparison.json
 ```
 

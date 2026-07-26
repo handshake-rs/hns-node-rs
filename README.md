@@ -10,6 +10,14 @@ server, explorer, or general `hsd` compatibility distribution. MeshMine uses
 native in-process Rust interfaces for mining; the bounded HTTP control surface
 exists for diagnostics, operations, and differential testing.
 
+## Standalone extraction
+
+This repository preserves the history of MeshMine's former `hsrd/` subtree.
+See [the extraction provenance](docs/extraction-provenance.md) for the exact
+source and split commits, the standalone boundary, and an important unresolved
+inconsistency between the readiness code/evidence and older release-stage
+prose.
+
 ## Current release stage
 
 `hsrd` remains **pre-authority**. The pinned `hsd` revision is still the
@@ -471,21 +479,28 @@ npm run hsrd-mining-template-fixtures --prefix hsd-oracle
 scripts/verify-hsrd-secp256k1.sh
 ```
 
+Those source-handoff, oracle-generation, and comparison commands still live in
+the source MeshMine repository and were not part of the history-preserving
+`hsrd/` prefix extraction. The committed Rust fixtures remain in this
+repository. Until the independent tooling is ported, run those checks against
+the source commit recorded in
+[the extraction provenance](docs/extraction-provenance.md).
+
 Compiler gates:
 
 ```bash
-cargo metadata --locked --manifest-path hsrd/Cargo.toml --format-version 1
-cargo metadata --locked --manifest-path hsrd/fuzz/Cargo.toml --format-version 1
-cargo fmt --manifest-path hsrd/Cargo.toml --all --check
-cargo fmt --manifest-path hsrd/fuzz/Cargo.toml --all --check
-cargo check --locked --manifest-path hsrd/fuzz/Cargo.toml --all-targets
-cargo clippy --locked --manifest-path hsrd/Cargo.toml \
+cargo metadata --locked --manifest-path Cargo.toml --format-version 1
+cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1
+cargo fmt --manifest-path Cargo.toml --all --check
+cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+cargo clippy --locked --manifest-path Cargo.toml \
   --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --manifest-path hsrd/Cargo.toml \
+cargo test --locked --manifest-path Cargo.toml \
   --workspace --all-targets --all-features
-cargo test --locked --manifest-path hsrd/Cargo.toml \
+cargo test --locked --manifest-path Cargo.toml \
   --workspace --all-targets --no-default-features
-cargo build --locked --release --manifest-path hsrd/Cargo.toml \
+cargo build --locked --release --manifest-path Cargo.toml \
   --workspace --all-targets --all-features
 ```
 

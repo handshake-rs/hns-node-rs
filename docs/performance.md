@@ -7,6 +7,12 @@ authenticated-tree mutation, and one durable commit per bounded state slice.
 
 ## Reproducible measurements
 
+The live sampler remains in the source MeshMine repository because `scripts/`
+was outside the extracted `hsrd/` prefix. Run that command from the source
+commit pinned in
+[`extraction-provenance.md`](extraction-provenance.md). The Rust performance
+gate runs directly from this standalone repository.
+
 Measure an already-running native mainnet node:
 
 ```bash

@@ -29,6 +29,11 @@ observations spanning hsrd restarts.
 
 ## Runner
 
+The comparison runner remains in the source MeshMine repository because
+`scripts/` was outside the extracted `hsrd/` prefix. Run the commands in this
+document from the source commit pinned in
+[`extraction-provenance.md`](extraction-provenance.md).
+
 Run hsrd on a diagnostic port distinct from HSD's RPC port, with active-state
 connection explicitly acknowledged. Then run:
 
