@@ -1,6 +1,7 @@
-# hsrd
+# hns-node-rs (`hsrd`)
 
-`hsrd` is the lean Handshake mining full node being built for MeshMine. Its
+This is the canonical source repository for `hsrd`, the lean Handshake mining
+full node being built for MeshMine. Its
 product boundary is the smallest complete consensus, state, synchronization,
 template, and relay path required to mine valid HNS blocks with predictable
 latency.
