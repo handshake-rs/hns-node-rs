@@ -3,6 +3,7 @@ name = "hns-testkit"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 hns-primitives = { path = "../hns-primitives" }

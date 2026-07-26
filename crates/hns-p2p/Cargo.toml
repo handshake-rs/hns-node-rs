@@ -3,6 +3,7 @@ name = "hns-p2p"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 hns-consensus = { path = "../hns-consensus" }

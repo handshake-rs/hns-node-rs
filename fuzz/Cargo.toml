@@ -3,6 +3,7 @@ name = "hsrd-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
+repository = "https://github.com/handshake-rs/hns-node-rs"
 
 [package.metadata]
 cargo-fuzz = true

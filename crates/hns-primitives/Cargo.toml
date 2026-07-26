@@ -3,6 +3,7 @@ name = "hns-primitives"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 blake2 = "0.10"
