@@ -41,6 +41,12 @@ cannot bypass synchronization, durable tip authority, or any consensus
 readiness bit. See [Native mainnet mining canary](docs/mainnet-canary.md) for
 the runnable sync command and its current fail-closed outcome.
 
+Live peers also negotiate the collision-detectable
+[Denuo Experimental V1 profile](docs/experimental-mainnet-profile.md) after
+ordinary Handshake readiness. Its service bit advertises only the extension
+envelope; it neither represents nor changes requester, opaque-relayer, output,
+HNSR, or market-role consent.
+
 The current tree contains hardened authority, storage, transaction, covenant,
 and name-state foundations, a live native P2P/synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication

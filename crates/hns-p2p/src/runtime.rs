@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use hns_consensus::Network;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -14,6 +15,10 @@ use tokio::{
 
 use crate::{
     brontide::{AsyncBrontideFrameReader, AsyncBrontideFrameWriter, BrontideSession},
+    denuo::{
+        extension_packet, is_extension_packet_type, is_registry_hello_packet, DenuoAction,
+        DenuoCoordinator, DenuoPeerDiagnostics, DenuoPeerPhase, DenuoRuntimeMetrics,
+    },
     handshake::{PeerDirection, PeerHandshake, PeerState},
     wire::{AsyncFrameReader, AsyncFrameWriter, Frame, NetworkMagic, Packet, VersionPacket},
     P2pError,
@@ -48,6 +53,7 @@ pub struct PeerSnapshot {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub ping_millis: Option<u64>,
+    pub denuo: DenuoPeerDiagnostics,
 }
 
 impl PeerSnapshot {
@@ -69,6 +75,7 @@ impl PeerSnapshot {
             bytes_sent: 0,
             bytes_received: 0,
             ping_millis: None,
+            denuo: DenuoPeerDiagnostics::default(),
         }
     }
 }
@@ -79,6 +86,7 @@ pub struct PeerRuntimeConfig {
     pub idle_timeout: Duration,
     pub ping_interval: Duration,
     pub pong_timeout: Duration,
+    pub denuo_negotiation_timeout: Duration,
     pub critical_queue: usize,
     pub control_queue: usize,
     pub normal_queue: usize,
@@ -91,6 +99,7 @@ impl Default for PeerRuntimeConfig {
             idle_timeout: Duration::from_secs(180),
             ping_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(90),
+            denuo_negotiation_timeout: Duration::from_secs(10),
             critical_queue: 8,
             control_queue: 64,
             normal_queue: 256,
@@ -104,6 +113,7 @@ impl PeerRuntimeConfig {
             || self.idle_timeout.is_zero()
             || self.ping_interval.is_zero()
             || self.pong_timeout.is_zero()
+            || self.denuo_negotiation_timeout.is_zero()
         {
             return Err(P2pError::Configuration(
                 "peer timeouts and intervals must be non-zero".to_owned(),
@@ -252,10 +262,12 @@ pub(crate) struct PeerRuntimeParameters {
     pub id: PeerId,
     pub address: SocketAddr,
     pub direction: PeerDirection,
+    pub network: Network,
     pub magic: NetworkMagic,
     pub local_version: VersionPacket,
     pub config: PeerRuntimeConfig,
     pub events: mpsc::Sender<PeerEvent>,
+    pub denuo_metrics: DenuoRuntimeMetrics,
 }
 
 pub(crate) fn spawn_peer_runtime<R, W>(
@@ -307,17 +319,34 @@ where
         id,
         address,
         direction,
+        network,
         magic,
         local_version,
         config,
         events,
+        denuo_metrics,
     } = parameters;
     config.validate()?;
+    let denuo = DenuoCoordinator::new(
+        direction,
+        network,
+        local_version.services,
+        denuo_request_id(id, local_version.nonce),
+        config.denuo_negotiation_timeout,
+        denuo_metrics,
+    )
+    .map_err(|error| {
+        P2pError::Configuration(format!(
+            "canonical Denuo registry hello is invalid: {error}"
+        ))
+    })?;
     let (critical_tx, critical_rx) = mpsc::channel(config.critical_queue);
     let (control_tx, control_rx) = mpsc::channel(config.control_queue);
     let (normal_tx, normal_rx) = mpsc::channel(config.normal_queue);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let snapshot = Arc::new(RwLock::new(PeerSnapshot::new(id, address, direction)));
+    let mut initial_snapshot = PeerSnapshot::new(id, address, direction);
+    initial_snapshot.denuo = denuo.diagnostics();
+    let snapshot = Arc::new(RwLock::new(initial_snapshot));
     let handle = PeerHandle {
         id,
         snapshot: Arc::clone(&snapshot),
@@ -333,6 +362,7 @@ where
         direction,
         magic,
         local_version,
+        denuo,
         reader,
         writer,
         config,
@@ -389,6 +419,7 @@ async fn run_peer<R, W>(
     direction: PeerDirection,
     _magic: NetworkMagic,
     local_version: VersionPacket,
+    denuo: DenuoCoordinator,
     reader: PeerFrameReader<R>,
     writer: PeerFrameWriter<W>,
     config: PeerRuntimeConfig,
@@ -435,6 +466,7 @@ where
         id,
         direction,
         local_version,
+        denuo,
         reader,
         config,
         events,
@@ -468,6 +500,7 @@ async fn peer_reader<R>(
     id: PeerId,
     direction: PeerDirection,
     local_version: VersionPacket,
+    mut denuo: DenuoCoordinator,
     mut reader: PeerFrameReader<R>,
     config: PeerRuntimeConfig,
     events: mpsc::Sender<PeerEvent>,
@@ -508,6 +541,11 @@ where
             loop {
                 tokio::select! {
                     frame = &mut frame_read => break frame?,
+                    _ = sleep_until(denuo.pending_deadline().unwrap_or(deadline)), if denuo.pending_deadline().is_some() => {
+                        if denuo.expire(Instant::now()) {
+                            snapshot.write().await.denuo = denuo.diagnostics();
+                        }
+                    }
                     _ = ping.tick(), if handshake.is_ready() => {
                         if let Some((_, sent)) = challenge {
                             if sent.elapsed() >= config.pong_timeout {
@@ -546,6 +584,13 @@ where
                 .bytes_received
                 .saturating_add((crate::constants::FRAME_HEADER_SIZE + frame.payload.len()) as u64);
         }
+        if is_extension_packet_type(frame.packet_type) {
+            denuo.expire(Instant::now());
+            let action = denuo.receive_extension(&frame.payload);
+            admit_denuo_action(&mut denuo, action, &control_tx);
+            snapshot.write().await.denuo = denuo.diagnostics();
+            continue;
+        }
         let packet = frame.decode_packet()?;
         if let Packet::Pong(nonce) = &packet {
             if let Some((expected, sent)) = challenge {
@@ -559,6 +604,9 @@ where
         }
 
         let update = handshake.receive(&packet)?;
+        if let Packet::Version(version) = &packet {
+            denuo.observe_remote_services(version.services);
+        }
         // HSD's inbound side waits for the remote version before sending
         // its own introduction. Queue local VERSION before VERACK so the
         // peer observes the same handshake ordering.
@@ -585,6 +633,7 @@ where
             state.advertised_height = Some(version.height);
             state.agent = Some(version.agent.clone());
             state.no_relay = version.no_relay;
+            state.denuo = denuo.diagnostics();
         }
         if update.became_ready {
             snapshot.write().await.state = PeerState::Ready;
@@ -599,6 +648,9 @@ where
                 .send(PeerEvent::Ready { peer: id, version })
                 .await
                 .map_err(|_| P2pError::EventChannelClosed)?;
+            let action = denuo.on_ready(Instant::now());
+            admit_denuo_action(&mut denuo, action, &control_tx);
+            snapshot.write().await.denuo = denuo.diagnostics();
         }
 
         if handshake.is_ready()
@@ -611,6 +663,33 @@ where
                 .send(PeerEvent::Packet { peer: id, packet })
                 .await
                 .map_err(|_| P2pError::EventChannelClosed)?;
+        }
+    }
+}
+
+fn admit_denuo_action(
+    denuo: &mut DenuoCoordinator,
+    action: DenuoAction,
+    control_tx: &mpsc::Sender<Arc<Packet>>,
+) {
+    match (action.response_payload, action.outbound_message) {
+        (Some(payload), Some(message)) => {
+            if control_tx
+                .try_send(Arc::new(extension_packet(payload)))
+                .is_ok()
+            {
+                denuo.outbound_admitted(message, Instant::now());
+            } else {
+                // Queue pressure or a closed writer is scoped to Denuo. The
+                // ordinary peer reader remains available and never blocks on
+                // experimental response admission.
+                denuo.outbound_rejected();
+            }
+        }
+        (None, None) => {}
+        _ => {
+            debug_assert!(false, "Denuo action payload/message mismatch");
+            denuo.outbound_rejected();
         }
     }
 }
@@ -655,6 +734,20 @@ where
         let Some((packet, completion)) = outgoing else {
             continue;
         };
+        if is_registry_hello_packet(&packet)
+            && snapshot.read().await.denuo.phase != DenuoPeerPhase::HelloAdmitted
+        {
+            // HELLO admission starts the negotiation deadline. If it expires
+            // while the control queue is backlogged, do not put that stale
+            // request on the wire. ACKs are intentionally not matched here:
+            // structurally valid mismatch acknowledgements must still drain.
+            if let Some(completion) = completion {
+                let _ = completion.send(Err(
+                    "stale Denuo registry HELLO was dropped before socket write".to_owned(),
+                ));
+            }
+            continue;
+        }
         let bytes = match writer.write_packet(&packet).await {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -684,6 +777,11 @@ fn handshake_nonce_seed(peer: PeerId) -> [u8; 8] {
     now.rotate_left(17).wrapping_add(peer.0).to_le_bytes()
 }
 
+fn denuo_request_id(peer: PeerId, local_nonce: [u8; 8]) -> u64 {
+    let request_id = u64::from_le_bytes(local_nonce) ^ peer.0.rotate_left(29);
+    request_id.max(1)
+}
+
 pub(crate) fn unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -695,15 +793,23 @@ pub(crate) fn unix_time() -> u64 {
 mod tests {
     use super::*;
     use crate::{
+        denuo::DenuoDisableReason,
         wire::{encode_frame, Frame, NetAddress, PacketType},
         PROTOCOL_VERSION, SERVICE_NETWORK,
+    };
+    use hns_p2p_experimental::{
+        DENUO_EXTENSION_MAX_PACKET_PAYLOAD, DENUO_EXTENSION_PACKET, DENUO_EXTENSION_SERVICE,
     };
     use tokio::io::{duplex, AsyncWriteExt};
 
     fn test_version(nonce: [u8; 8]) -> VersionPacket {
+        test_version_with_services(nonce, SERVICE_NETWORK)
+    }
+
+    fn test_version_with_services(nonce: [u8; 8], services: u64) -> VersionPacket {
         VersionPacket {
             version: PROTOCOL_VERSION,
-            services: SERVICE_NETWORK,
+            services,
             time: 1_700_000_000,
             remote: NetAddress::default(),
             nonce,
@@ -711,6 +817,113 @@ mod tests {
             height: 10,
             no_relay: false,
         }
+    }
+
+    #[test]
+    fn full_control_queue_disables_only_denuo_admission() {
+        let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+        let mut denuo = DenuoCoordinator::new(
+            PeerDirection::Outbound,
+            Network::Regtest,
+            services,
+            7,
+            Duration::from_secs(1),
+            DenuoRuntimeMetrics::default(),
+        )
+        .expect("Denuo coordinator");
+        denuo.observe_remote_services(services);
+        let action = denuo.on_ready(Instant::now());
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        control_tx
+            .try_send(Arc::new(Packet::SendHeaders))
+            .expect("fill ordinary control queue");
+
+        admit_denuo_action(&mut denuo, action, &control_tx);
+
+        assert_eq!(denuo.diagnostics().phase, DenuoPeerPhase::Disabled);
+        assert_eq!(
+            denuo.diagnostics().disable_reason,
+            Some(DenuoDisableReason::LocalSendUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_queued_hello_is_dropped_but_ack_still_drains() {
+        let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+        let now = Instant::now();
+        let mut outbound = DenuoCoordinator::new(
+            PeerDirection::Outbound,
+            Network::Regtest,
+            services,
+            7,
+            Duration::from_millis(1),
+            DenuoRuntimeMetrics::default(),
+        )
+        .expect("outbound coordinator");
+        outbound.observe_remote_services(services);
+        let hello_action = outbound.on_ready(now);
+        let hello_payload = hello_action
+            .response_payload
+            .clone()
+            .expect("registry hello");
+        outbound.outbound_admitted(
+            hello_action.outbound_message.expect("hello message kind"),
+            now,
+        );
+
+        let mut inbound = DenuoCoordinator::new(
+            PeerDirection::Inbound,
+            Network::Regtest,
+            services,
+            8,
+            Duration::from_secs(1),
+            DenuoRuntimeMetrics::default(),
+        )
+        .expect("inbound coordinator");
+        inbound.observe_remote_services(services);
+        inbound.on_ready(now);
+        let ack_payload = inbound
+            .receive_extension(&hello_payload)
+            .response_payload
+            .expect("registry hello ack");
+        let hello = Arc::new(extension_packet(hello_payload));
+        let ack = Arc::new(extension_packet(ack_payload));
+        assert!(is_registry_hello_packet(&hello));
+        assert!(!is_registry_hello_packet(&ack));
+
+        let deadline = outbound.pending_deadline().expect("admitted deadline");
+        assert!(outbound.expire(deadline));
+        let mut initial_snapshot = PeerSnapshot::new(
+            PeerId(4),
+            "127.0.0.1:12041".parse().expect("peer address"),
+            PeerDirection::Outbound,
+        );
+        initial_snapshot.denuo = outbound.diagnostics();
+        let snapshot = Arc::new(RwLock::new(initial_snapshot));
+        let (writer_io, reader_io) = duplex(64 * 1024);
+        let (critical_tx, critical_rx) = mpsc::channel::<CriticalOutbound>(1);
+        let (control_tx, control_rx) = mpsc::channel::<Arc<Packet>>(2);
+        let (normal_tx, normal_rx) = mpsc::channel::<Arc<Packet>>(1);
+        let writer = tokio::spawn(peer_writer(
+            PeerFrameWriter::Plaintext(AsyncFrameWriter::new(writer_io, NetworkMagic::Regtest)),
+            Arc::clone(&snapshot),
+            critical_rx,
+            control_rx,
+            normal_rx,
+        ));
+        control_tx.send(hello).await.expect("queue stale hello");
+        control_tx
+            .send(Arc::clone(&ack))
+            .await
+            .expect("queue mismatch ack");
+        drop(critical_tx);
+        drop(control_tx);
+        drop(normal_tx);
+
+        let mut reader = AsyncFrameReader::new(reader_io, NetworkMagic::Regtest);
+        assert_eq!(reader.read_packet().await.expect("written ack"), *ack);
+        writer.await.expect("writer join").expect("writer result");
+        assert!(snapshot.read().await.bytes_sent > 0);
     }
 
     #[tokio::test]
@@ -778,10 +991,20 @@ mod tests {
             pong_timeout: Duration::from_millis(200),
             ..PeerRuntimeConfig::default()
         };
+        let denuo = DenuoCoordinator::new(
+            PeerDirection::Inbound,
+            Network::Regtest,
+            SERVICE_NETWORK,
+            7,
+            config.denuo_negotiation_timeout,
+            DenuoRuntimeMetrics::default(),
+        )
+        .expect("Denuo coordinator");
         let reader = tokio::spawn(peer_reader(
             peer,
             PeerDirection::Inbound,
             test_version([1; 8]),
+            denuo,
             PeerFrameReader::Plaintext(AsyncFrameReader::new(peer_io, NetworkMagic::Regtest)),
             config,
             events_tx,
@@ -834,6 +1057,213 @@ mod tests {
         assert!((0..4).any(
             |_| matches!(control_rx.try_recv(), Ok(packet) if matches!(&*packet, Packet::Ping(_)))
         ));
+
+        shutdown_tx.send(true).expect("shutdown reader");
+        assert!(matches!(
+            reader.await.expect("reader join"),
+            Err(P2pError::Disconnected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn early_denuo_packet_is_scoped_and_handshake_remains_available() {
+        let (peer_io, mut remote_io) = duplex(64 * 1024);
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let peer = PeerId(2);
+        let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+        let snapshot = Arc::new(RwLock::new(PeerSnapshot::new(
+            peer,
+            "127.0.0.1:12039".parse().expect("peer address"),
+            PeerDirection::Inbound,
+        )));
+        let config = PeerRuntimeConfig {
+            handshake_timeout: Duration::from_secs(1),
+            idle_timeout: Duration::from_secs(1),
+            ping_interval: Duration::from_secs(1),
+            pong_timeout: Duration::from_secs(1),
+            ..PeerRuntimeConfig::default()
+        };
+        let denuo = DenuoCoordinator::new(
+            PeerDirection::Inbound,
+            Network::Regtest,
+            services,
+            9,
+            config.denuo_negotiation_timeout,
+            DenuoRuntimeMetrics::default(),
+        )
+        .expect("Denuo coordinator");
+        let reader = tokio::spawn(peer_reader(
+            peer,
+            PeerDirection::Inbound,
+            test_version_with_services([3; 8], services),
+            denuo,
+            PeerFrameReader::Plaintext(AsyncFrameReader::new(peer_io, NetworkMagic::Regtest)),
+            config,
+            events_tx,
+            Arc::clone(&snapshot),
+            control_tx,
+            shutdown_rx,
+        ));
+
+        for packet in [
+            extension_packet(vec![0xde, 0xad]),
+            Packet::Version(test_version_with_services([4; 8], services)),
+            Packet::Verack,
+        ] {
+            let frame = Frame::from_packet(&packet).expect("frame");
+            remote_io
+                .write_all(&encode_frame(NetworkMagic::Regtest, &frame).expect("frame bytes"))
+                .await
+                .expect("write frame");
+        }
+
+        let ready = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("ready timeout")
+            .expect("ready event");
+        assert!(matches!(ready, PeerEvent::Ready { peer: target, .. } if target == peer));
+        let state = snapshot.read().await.clone();
+        assert_eq!(state.state, PeerState::Ready);
+        assert_eq!(state.denuo.phase, DenuoPeerPhase::Disabled);
+        assert_eq!(
+            state.denuo.disable_reason,
+            Some(DenuoDisableReason::UnexpectedMessage)
+        );
+
+        let ordinary = Packet::GetAddr;
+        let frame = Frame::from_packet(&ordinary).expect("ordinary frame");
+        remote_io
+            .write_all(&encode_frame(NetworkMagic::Regtest, &frame).expect("ordinary bytes"))
+            .await
+            .expect("write ordinary frame");
+        let received = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
+            .await
+            .expect("ordinary packet timeout")
+            .expect("ordinary packet event");
+        assert!(matches!(
+            received,
+            PeerEvent::Packet {
+                peer: target,
+                packet,
+            } if target == peer && packet == ordinary
+        ));
+
+        shutdown_tx.send(true).expect("shutdown reader");
+        assert!(matches!(
+            reader.await.expect("reader join"),
+            Err(P2pError::Disconnected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_oversized_denuo_frames_do_not_close_a_ready_peer() {
+        let (peer_io, mut remote_io) = duplex(128 * 1024);
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let peer = PeerId(3);
+        let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+        let snapshot = Arc::new(RwLock::new(PeerSnapshot::new(
+            peer,
+            "127.0.0.1:12040".parse().expect("peer address"),
+            PeerDirection::Inbound,
+        )));
+        let config = PeerRuntimeConfig {
+            handshake_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(5),
+            ping_interval: Duration::from_secs(5),
+            pong_timeout: Duration::from_secs(5),
+            ..PeerRuntimeConfig::default()
+        };
+        let metrics = DenuoRuntimeMetrics::default();
+        let denuo = DenuoCoordinator::new(
+            PeerDirection::Inbound,
+            Network::Regtest,
+            services,
+            10,
+            config.denuo_negotiation_timeout,
+            metrics.clone(),
+        )
+        .expect("Denuo coordinator");
+        let reader = tokio::spawn(peer_reader(
+            peer,
+            PeerDirection::Inbound,
+            test_version_with_services([5; 8], services),
+            denuo,
+            PeerFrameReader::Plaintext(AsyncFrameReader::new(peer_io, NetworkMagic::Regtest)),
+            config,
+            events_tx,
+            Arc::clone(&snapshot),
+            control_tx,
+            shutdown_rx,
+        ));
+
+        for packet in [
+            Packet::Version(test_version_with_services([6; 8], services)),
+            Packet::Verack,
+        ] {
+            let frame = Frame::from_packet(&packet).expect("handshake frame");
+            remote_io
+                .write_all(&encode_frame(NetworkMagic::Regtest, &frame).expect("handshake bytes"))
+                .await
+                .expect("write handshake");
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+            .await
+            .expect("ready timeout")
+            .expect("ready event");
+        assert!(matches!(ready, PeerEvent::Ready { peer: target, .. } if target == peer));
+
+        let oversized = Frame::new(
+            PacketType::Unknown(DENUO_EXTENSION_PACKET.value()),
+            vec![0; DENUO_EXTENSION_MAX_PACKET_PAYLOAD + 1],
+        )
+        .expect("globally bounded extension frame");
+        let oversized =
+            encode_frame(NetworkMagic::Regtest, &oversized).expect("oversized extension bytes");
+        remote_io
+            .write_all(&oversized)
+            .await
+            .expect("write first oversized extension");
+        remote_io
+            .write_all(&oversized)
+            .await
+            .expect("write repeated oversized extension");
+
+        let ordinary = Packet::GetAddr;
+        let frame = Frame::from_packet(&ordinary).expect("ordinary frame");
+        remote_io
+            .write_all(&encode_frame(NetworkMagic::Regtest, &frame).expect("ordinary bytes"))
+            .await
+            .expect("write ordinary frame");
+        let received = tokio::time::timeout(Duration::from_secs(3), events_rx.recv())
+            .await
+            .expect("ordinary packet timeout")
+            .expect("ordinary packet event");
+        assert!(matches!(
+            received,
+            PeerEvent::Packet {
+                peer: target,
+                packet,
+            } if target == peer && packet == ordinary
+        ));
+
+        let state = snapshot.read().await.clone();
+        assert_eq!(state.state, PeerState::Ready);
+        assert_eq!(state.denuo.phase, DenuoPeerPhase::Disabled);
+        assert_eq!(
+            state.denuo.disable_reason,
+            Some(DenuoDisableReason::PacketTooLarge)
+        );
+        let summary = metrics.summary(services, &[state.denuo]);
+        assert_eq!(summary.process.disabled, 1);
+        assert_eq!(summary.process.rejected, 2);
+        assert_eq!(
+            summary.rejection_reasons[DenuoDisableReason::PacketTooLarge.index()].count,
+            2
+        );
 
         shutdown_tx.send(true).expect("shutdown reader");
         assert!(matches!(

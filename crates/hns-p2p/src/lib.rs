@@ -12,6 +12,7 @@ use hns_primitives::BlockHash;
 
 pub mod brontide;
 pub mod constants;
+pub mod denuo;
 pub mod handshake;
 pub mod manager;
 pub mod runtime;
@@ -22,6 +23,11 @@ pub use brontide::{
     BRONTIDE_ACT_ONE_SIZE, BRONTIDE_ACT_THREE_SIZE, BRONTIDE_ACT_TWO_SIZE, BRONTIDE_HEADER_SIZE,
 };
 pub use constants::*;
+pub use denuo::{
+    DenuoDisableReason, DenuoLiveCounts, DenuoNegotiatedParameters, DenuoNegotiatedProtocol,
+    DenuoPeerDiagnostics, DenuoPeerPhase, DenuoProcessTotals, DenuoReasonCount,
+    DenuoRegistryIdentity, DenuoSummary, DENUO_DEFAULT_MAXIMUM_LIVE_REQUESTS,
+};
 pub use handshake::{HandshakeUpdate, PeerDirection, PeerHandshake, PeerState};
 pub use manager::{
     normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, PeerBan,

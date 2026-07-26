@@ -52,15 +52,17 @@ use hns_mining::{
     HeaderSummary, MiningEventHub, MiningGeneration, MiningSnapshot, MiningSubscriptions,
     SolvedMiningCandidate, TemplateCoordinator,
 };
+use hns_p2p::DenuoSummary;
 use hns_primitives::{
     blake2b_256, hex_encode, Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState,
     Reader, Transaction, Uint256, Writer,
 };
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
-    RpcConsensusReadiness, RpcErrorObject, RpcHeaderEntry, RpcMiningEngineInfo,
-    RpcNameTreeCompactionInfo, RpcNodeStatus, RpcParityInfo, RpcService, RpcSnapshot,
-    RpcTransactionEntry, RpcUndoRetentionInfo,
+    RpcConsensusReadiness, RpcErrorObject, RpcExperimentalRegistryInfo,
+    RpcExperimentalRejectionCount, RpcHeaderEntry, RpcMiningEngineInfo, RpcNameTreeCompactionInfo,
+    RpcNodeStatus, RpcParityInfo, RpcService, RpcSnapshot, RpcTransactionEntry,
+    RpcUndoRetentionInfo,
 };
 #[cfg(test)]
 use hns_state::verify_stored_name_tree_root;
@@ -89,7 +91,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 11;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 12;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -1040,6 +1042,47 @@ fn rpc_mining_engine_info(diagnostics: MiningEngineDiagnostics) -> RpcMiningEngi
     }
 }
 
+pub(crate) fn rpc_experimental_registry_info(
+    summary: &DenuoSummary,
+) -> RpcExperimentalRegistryInfo {
+    RpcExperimentalRegistryInfo {
+        name: summary.identity.name.clone(),
+        registry_id: summary.identity.registry_id.clone(),
+        registry_version: summary.identity.registry_version,
+        registry_protocol_version: summary.identity.registry_protocol_version,
+        fingerprint: summary.identity.fingerprint.clone(),
+        wire_profile: summary.identity.wire_profile.clone(),
+        assignment_status: summary.identity.status.clone(),
+        service_bit: summary.identity.service_bit,
+        local_service_mask: summary.local_service_mask,
+        packet_type: summary.identity.packet_type,
+        advertised: summary.advertised,
+        maximum_packet_payload: summary.identity.maximum_packet_payload,
+        maximum_nested_payload: summary.identity.maximum_nested_payload,
+        maximum_registry_payload: summary.identity.maximum_registry_negotiation_payload,
+        awaiting_version_peers: summary.live.awaiting_version,
+        local_disabled_peers: summary.live.local_disabled,
+        eligible_peers: summary.live.eligible,
+        negotiating_peers: summary.live.pending,
+        negotiated_peers: summary.live.negotiated,
+        not_advertised_peers: summary.live.not_advertised,
+        disabled_peers: summary.live.disabled,
+        outbound_messages_admitted: summary.process.admitted(),
+        inbound_messages_received: summary.process.received(),
+        rejected_messages: summary.process.rejected(),
+        agreements_computed: summary.process.agreements_computed,
+        disabled_sessions: summary.process.disabled,
+        rejection_reasons: summary
+            .rejection_reasons
+            .iter()
+            .map(|reason| RpcExperimentalRejectionCount {
+                reason: reason.reason.as_str().to_owned(),
+                count: reason.count,
+            })
+            .collect(),
+    }
+}
+
 fn parity_info() -> RpcParityInfo {
     RpcParityInfo {
         oracle: "handshake-org/hsd".to_owned(),
@@ -1725,6 +1768,7 @@ impl NodeService {
             tip_validation,
             name_tree_compaction,
             undo_retention,
+            experimental_registry: rpc_experimental_registry_info(&DenuoSummary::default()),
             authority,
             parity,
         };
@@ -7038,6 +7082,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn experimental_registry_rpc_projection_preserves_bounded_totals() {
+        let mut summary = DenuoSummary {
+            local_service_mask: 0x1000_0001,
+            advertised: true,
+            ..DenuoSummary::default()
+        };
+        summary.live.awaiting_version = 1;
+        summary.live.local_disabled = 2;
+        summary.live.eligible = 3;
+        summary.live.pending = 4;
+        summary.live.negotiated = 5;
+        summary.live.not_advertised = 6;
+        summary.live.disabled = 7;
+        summary.process.hello_admitted = 8;
+        summary.process.hello_ack_admitted = 9;
+        summary.process.hello_received = 10;
+        summary.process.hello_ack_received = 11;
+        summary.process.agreements_computed = 12;
+        summary.process.rejected = 13;
+        summary.process.disabled = 14;
+        summary.rejection_reasons[9].count = 15;
+
+        let projected = rpc_experimental_registry_info(&summary);
+
+        assert_eq!(projected.local_service_mask, 0x1000_0001);
+        assert!(projected.advertised);
+        assert_eq!(projected.awaiting_version_peers, 1);
+        assert_eq!(projected.local_disabled_peers, 2);
+        assert_eq!(projected.eligible_peers, 3);
+        assert_eq!(projected.negotiating_peers, 4);
+        assert_eq!(projected.negotiated_peers, 5);
+        assert_eq!(projected.not_advertised_peers, 6);
+        assert_eq!(projected.disabled_peers, 7);
+        assert_eq!(projected.outbound_messages_admitted, 17);
+        assert_eq!(projected.inbound_messages_received, 21);
+        assert_eq!(projected.agreements_computed, 12);
+        assert_eq!(projected.rejected_messages, 13);
+        assert_eq!(projected.disabled_sessions, 14);
+        assert_eq!(projected.rejection_reasons.len(), 18);
+        assert_eq!(projected.rejection_reasons[9].reason, "wrong-fingerprint");
+        assert_eq!(projected.rejection_reasons[9].count, 15);
+    }
+
     fn decode_hex(value: &str) -> Vec<u8> {
         fn nibble(value: u8) -> u8 {
             match value {
@@ -11164,6 +11252,7 @@ mod tests {
         })
         .expect("orphans");
         let diagnostics = Arc::new(tokio::sync::RwLock::new(ShadowSyncDiagnostics {
+            api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
             observation_only: false,
             active_state: true,
@@ -12126,6 +12215,42 @@ mod tests {
         assert!(json["undo_retention"]["pruned_blocks"].is_null());
         assert!(json["active_state_resulting_root"].is_null());
         assert!(json["active_state_resulting_root_height"].is_null());
+        let registry = &json["experimental_registry"];
+        assert_eq!(
+            registry["name"],
+            "Denuo Experimental Handshake P2P Registry"
+        );
+        assert_eq!(registry["registry_id"], registry["fingerprint"]);
+        assert_eq!(
+            registry["fingerprint"],
+            "95774db08c569b36fa7b7e4a071930f563b7251fc30934ba986732379a6e542d"
+        );
+        assert_eq!(registry["registry_version"], 1);
+        assert_eq!(registry["registry_protocol_version"], 1);
+        assert_eq!(registry["wire_profile"], "denuo-v1");
+        assert_eq!(
+            registry["assignment_status"],
+            "Denuo Experimental V1 — Not an official Handshake protocol assignment"
+        );
+        assert_eq!(registry["service_bit"], 0x1000_0000_u64);
+        assert_eq!(registry["local_service_mask"], 0);
+        assert_eq!(registry["packet_type"], 0xf4);
+        assert_eq!(registry["advertised"], false);
+        assert_eq!(registry["maximum_packet_payload"], 1_048_576);
+        assert_eq!(registry["maximum_nested_payload"], 1_048_550);
+        assert_eq!(registry["maximum_registry_payload"], 16_384);
+        assert_eq!(registry["outbound_messages_admitted"], 0);
+        assert_eq!(registry["inbound_messages_received"], 0);
+        assert_eq!(registry["rejected_messages"], 0);
+        assert_eq!(registry["agreements_computed"], 0);
+        assert_eq!(registry["disabled_sessions"], 0);
+        let rejection_reasons = registry["rejection_reasons"]
+            .as_array()
+            .expect("fixed rejection reasons");
+        assert_eq!(rejection_reasons.len(), 18);
+        assert_eq!(rejection_reasons[0]["reason"], "local-service-disabled");
+        assert_eq!(rejection_reasons[17]["reason"], "local-send-unavailable");
+        assert!(rejection_reasons.iter().all(|reason| reason["count"] == 0));
 
         let request = format!(
             "GET /api/v1/mining-engine HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"

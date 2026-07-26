@@ -242,6 +242,43 @@ pub struct RpcUndoRetentionInfo {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcExperimentalRejectionCount {
+    pub reason: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcExperimentalRegistryInfo {
+    pub name: String,
+    pub registry_id: String,
+    pub registry_version: u16,
+    pub registry_protocol_version: u16,
+    pub fingerprint: String,
+    pub wire_profile: String,
+    pub assignment_status: String,
+    pub service_bit: u64,
+    pub local_service_mask: u64,
+    pub packet_type: u8,
+    pub advertised: bool,
+    pub maximum_packet_payload: u32,
+    pub maximum_nested_payload: u32,
+    pub maximum_registry_payload: u32,
+    pub awaiting_version_peers: u64,
+    pub local_disabled_peers: u64,
+    pub eligible_peers: u64,
+    pub negotiating_peers: u64,
+    pub negotiated_peers: u64,
+    pub not_advertised_peers: u64,
+    pub disabled_peers: u64,
+    pub outbound_messages_admitted: u64,
+    pub inbound_messages_received: u64,
+    pub rejected_messages: u64,
+    pub agreements_computed: u64,
+    pub disabled_sessions: u64,
+    pub rejection_reasons: Vec<RpcExperimentalRejectionCount>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcNodeStatus {
     pub api_version: u32,
     pub release_stage: String,
@@ -270,6 +307,7 @@ pub struct RpcNodeStatus {
     pub tip_validation: Option<BlockStatus>,
     pub name_tree_compaction: RpcNameTreeCompactionInfo,
     pub undo_retention: RpcUndoRetentionInfo,
+    pub experimental_registry: RpcExperimentalRegistryInfo,
     pub authority: RpcAuthorityInfo,
     pub parity: RpcParityInfo,
 }

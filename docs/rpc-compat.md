@@ -44,6 +44,12 @@ snapshots only.
   active tip's post-state authenticated root and the height it results from are
   exposed explicitly for an external HSD comparison; this differs from the
   pre-state root committed inside the active tip's own header.
+- API-v12 node status adds the canonical Denuo Experimental V1 registry
+  identity, wire profile, packet/registry payload limits, and bounded live
+  negotiation counts and rejection reasons. Each diagnostics refresh builds
+  one `experimental_registry` object from the same per-peer capture for native
+  sync and node status; the existing cache markers identify when status is
+  serving the last completed capture.
 - Native status, authority, parity, and mining-engine diagnostics bind before
   startup replay and remain available while the state coordinator is occupied
   by a connect slice or name-tree compaction. Each response reports

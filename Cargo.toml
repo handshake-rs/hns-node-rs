@@ -28,6 +28,7 @@ repository = "https://github.com/handshake-rs/hns-node-rs"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
+hns-p2p-experimental = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "5f56e5d381338314e4d7cf1f9e08da7c76d1cf6f" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.9"

@@ -10,6 +10,7 @@ use std::{
 };
 
 use hns_consensus::Network;
+use hns_p2p_experimental::DENUO_EXTENSION_SERVICE;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, Mutex, RwLock},
@@ -19,6 +20,7 @@ use tokio::{
 use crate::{
     brontide::{inbound_handshake, outbound_handshake, BrontideIdentity, BrontideSession},
     constants::{DEFAULT_USER_AGENT, PROTOCOL_VERSION, SERVICE_NETWORK},
+    denuo::{DenuoRuntimeMetrics, DenuoSummary},
     handshake::{PeerDirection, PeerState},
     runtime::{
         spawn_brontide_peer_runtime, spawn_peer_runtime, OutboundPriority, PeerEvent, PeerHandle,
@@ -73,7 +75,7 @@ impl LivePeerConfig {
             ban_score: 100,
             ban_time: Duration::from_secs(24 * 60 * 60),
             protocol_version: PROTOCOL_VERSION,
-            services: SERVICE_NETWORK,
+            services: SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             no_relay: false,
             runtime: PeerRuntimeConfig::default(),
@@ -147,6 +149,7 @@ pub struct LivePeerManager {
     local_height: Arc<AtomicU32>,
     retired_bytes_sent: Arc<AtomicU64>,
     retired_bytes_received: Arc<AtomicU64>,
+    denuo_metrics: DenuoRuntimeMetrics,
     local_nonce: [u8; 8],
     registration_lock: Arc<Mutex<()>>,
     banned: Arc<RwLock<HashMap<IpAddr, u64>>>,
@@ -170,6 +173,7 @@ impl LivePeerManager {
                 local_height: Arc::new(AtomicU32::new(0)),
                 retired_bytes_sent: Arc::new(AtomicU64::new(0)),
                 retired_bytes_received: Arc::new(AtomicU64::new(0)),
+                denuo_metrics: DenuoRuntimeMetrics::default(),
                 // Use one unpredictable process-local nonce across all live
                 // connections. A loopback outbound/inbound pair will therefore
                 // observe its own nonce and fail the VERSION handshake.
@@ -357,6 +361,22 @@ impl LivePeerManager {
         }
         snapshots.sort_by_key(|snapshot| snapshot.id.0);
         snapshots
+    }
+
+    pub async fn denuo_summary(&self) -> DenuoSummary {
+        self.snapshots_with_denuo_summary().await.1
+    }
+
+    pub async fn snapshots_with_denuo_summary(&self) -> (Vec<PeerSnapshot>, DenuoSummary) {
+        let snapshots = self.snapshots().await;
+        let diagnostics = snapshots
+            .iter()
+            .map(|snapshot| snapshot.denuo.clone())
+            .collect::<Vec<_>>();
+        let summary = self
+            .denuo_metrics
+            .summary(self.config.services, &diagnostics);
+        (snapshots, summary)
     }
 
     /// Return process-lifetime traffic counters without losing completed peer
@@ -632,10 +652,12 @@ impl LivePeerManager {
             id,
             address,
             direction,
+            network: self.config.network,
             magic,
             local_version,
             config: self.config.runtime.clone(),
             events: self.events.clone(),
+            denuo_metrics: self.denuo_metrics.clone(),
         };
         let spawned = match brontide {
             Some(session) => spawn_brontide_peer_runtime(parameters, reader, writer, session)?,
@@ -700,7 +722,11 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{handshake::PeerState, wire::Packet};
+    use crate::{denuo::DenuoPeerPhase, handshake::PeerState, wire::Packet};
+    use hns_p2p_experimental::{
+        DENUO_EXTENSION_MAX_NESTED_PAYLOAD, DENUO_EXTENSION_MAX_PACKET_PAYLOAD,
+        REGISTRY_NEGOTIATION_MAX_PAYLOAD,
+    };
 
     #[tokio::test]
     async fn live_manager_connects_two_local_peers_and_completes_handshake() {
@@ -751,6 +777,58 @@ mod tests {
         assert_eq!(server_ready, server_peer);
         assert_eq!(client_manager.snapshots().await[0].state, PeerState::Ready);
         assert_eq!(server_manager.snapshots().await[0].state, PeerState::Ready);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let client_phase = client_manager.snapshots().await[0].denuo.phase;
+                let server_phase = server_manager.snapshots().await[0].denuo.phase;
+                if client_phase == DenuoPeerPhase::Negotiated
+                    && server_phase == DenuoPeerPhase::Negotiated
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Denuo negotiation");
+        let (client_snapshots, client_denuo) = client_manager.snapshots_with_denuo_summary().await;
+        let (_, server_denuo) = server_manager.snapshots_with_denuo_summary().await;
+        assert_eq!(client_snapshots.len(), 1);
+        let negotiated = client_snapshots[0]
+            .denuo
+            .negotiated
+            .as_ref()
+            .expect("negotiated parameters");
+        assert_eq!(negotiated.protocols.len(), 1);
+        assert_eq!(negotiated.protocols[0].protocol_id, 0);
+        assert_eq!(negotiated.protocols[0].protocol_version, 1);
+        assert_eq!(negotiated.maximum_live_requests, 64);
+        assert_eq!(negotiated.feature_flags, 0);
+        assert_eq!(
+            negotiated.maximum_send_size,
+            DENUO_EXTENSION_MAX_PACKET_PAYLOAD as u32
+        );
+        assert!(client_denuo.advertised());
+        assert_eq!(client_denuo.live.negotiated, 1);
+        assert_eq!(client_denuo.process.hello_admitted, 1);
+        assert_eq!(client_denuo.process.hello_ack_received, 1);
+        assert_eq!(client_denuo.process.agreements_computed, 1);
+        assert_eq!(server_denuo.live.negotiated, 1);
+        assert_eq!(server_denuo.process.hello_received, 1);
+        assert_eq!(server_denuo.process.hello_ack_admitted, 1);
+        assert_eq!(server_denuo.process.agreements_computed, 1);
+        assert_eq!(
+            client_denuo.identity.maximum_packet_payload,
+            DENUO_EXTENSION_MAX_PACKET_PAYLOAD as u32
+        );
+        assert_eq!(
+            client_denuo.identity.maximum_nested_payload,
+            DENUO_EXTENSION_MAX_NESTED_PAYLOAD as u32
+        );
+        assert_eq!(
+            client_denuo.identity.maximum_registry_negotiation_payload,
+            REGISTRY_NEGOTIATION_MAX_PAYLOAD as u32
+        );
 
         client_manager
             .try_send(
@@ -822,6 +900,12 @@ mod tests {
             traffic_after_disconnect.bytes_received >= traffic_before_disconnect.bytes_received
         );
         assert_eq!(client_manager.peer_count().await, 0);
+        let retired_denuo = client_manager.denuo_summary().await;
+        assert_eq!(retired_denuo.live.negotiated, 0);
+        assert_eq!(retired_denuo.process.agreements_computed, 1);
+        assert_eq!(retired_denuo.process.admitted(), 1);
+        assert_eq!(retired_denuo.process.received(), 1);
+        assert_eq!(retired_denuo.process.disabled, 0);
         client_manager.disconnect_all().await;
         server_manager.disconnect_all().await;
     }

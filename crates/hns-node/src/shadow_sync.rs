@@ -39,7 +39,9 @@ use hns_p2p::{
 use hns_primitives::{
     blake2b_256, Block, BlockHash, CovenantKind, Header, Height, Reader, Txid, Writer,
 };
-use hns_rpc::{BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcService};
+use hns_rpc::{
+    BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcExperimentalRegistryInfo, RpcService,
+};
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use hns_store::mark_clean_shutdown;
 use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
@@ -62,9 +64,10 @@ use super::{
     completed_deployment_period_with_lookup, current_unix_time, expected_bits_with_lookup,
     json_rpc_error, load_block_index_record, load_header_record, mark_node_store_clean,
     median_time_past_with_lookup, mining_generation_from_snapshot, mining_snapshot_for_hash,
-    require_rpc_authorization, AuthorityMode, ChainActivationFailure, DurableMiningState,
-    FailedBlockMutation, FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport,
-    NodeReorg, NodeService, RpcAuthorizationHeader, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
+    require_rpc_authorization, rpc_experimental_registry_info, AuthorityMode,
+    ChainActivationFailure, DurableMiningState, FailedBlockMutation, FailedBlockStage,
+    HeaderSummary, NativeRuntimeExtension, NodeBlockImport, NodeReorg, NodeService,
+    RpcAuthorizationHeader, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
 };
 use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
@@ -406,6 +409,7 @@ impl ShadowSyncConfig {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ShadowSyncDiagnostics {
+    pub api_version: u32,
     pub enabled: bool,
     pub headers_only: bool,
     pub observation_only: bool,
@@ -463,6 +467,7 @@ pub struct ShadowSyncDiagnostics {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub peers: Vec<PeerSnapshot>,
+    pub experimental_registry: RpcExperimentalRegistryInfo,
     pub sync: SyncSnapshot,
     pub orphans: OrphanSnapshot,
     pub checkpoint_sequence: u64,
@@ -1665,7 +1670,10 @@ impl NodeService {
         let initial_sequence = durable_checkpoint
             .as_ref()
             .map_or(0, |checkpoint| checkpoint.sequence);
+        let initial_experimental_registry =
+            rpc_experimental_registry_info(&peers.denuo_summary().await);
         let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
+            api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
             headers_only: shadow_sync_config.headers_only,
             observation_only: !shadow_sync_config.connect_active_state,
@@ -1691,6 +1699,7 @@ impl NodeService {
             dns_seed_addresses,
             dns_seed_failures,
             started_at: unix_time(),
+            experimental_registry: initial_experimental_registry,
             sync: scheduler.snapshot(),
             orphans: orphan_pool.snapshot(),
             checkpoint_sequence: initial_sequence,
@@ -3140,6 +3149,7 @@ fn compose_shadow_sync_rpc_service(
     };
     snapshot.network_active = diagnostics.enabled;
     snapshot.peer_count = diagnostics.peers.len();
+    snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
     snapshot.node_status.release_stage = if node.config.mainnet_canary {
         "mainnet-canary-gated".to_owned()
     } else if node.config.mining_engine.enabled {
@@ -5332,11 +5342,12 @@ async fn refresh_diagnostics(
     checkpoint_sequence: u64,
 ) {
     let traffic = peers.traffic_totals().await;
-    let snapshots = peers.snapshots().await;
+    let (snapshots, experimental_registry) = peers.snapshots_with_denuo_summary().await;
     let mut state = diagnostics.write().await;
     state.bytes_sent = traffic.bytes_sent;
     state.bytes_received = traffic.bytes_received;
     state.peers = snapshots;
+    state.experimental_registry = rpc_experimental_registry_info(&experimental_registry);
     state.sync = scheduler.snapshot();
     state.orphans = orphans.snapshot();
     state.checkpoint_sequence = checkpoint_sequence;
@@ -7183,9 +7194,11 @@ mod tests {
             .expect("genesis header");
         let node = Arc::new(Mutex::new(service));
         let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
+            api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
             observation_only: true,
             runtime_instance: "test-runtime".to_owned(),
+            experimental_registry: rpc_experimental_registry_info(&hns_p2p::DenuoSummary::default()),
             ..ShadowSyncDiagnostics::default()
         }));
         let diagnostic_rpc = {
@@ -7213,6 +7226,8 @@ mod tests {
             shutdown_rx,
         ));
 
+        let mut native_registry = None;
+        let mut status_registry = None;
         for path in [
             "/api/v1/native-sync",
             "/api/v1/header-deployments",
@@ -7239,20 +7254,28 @@ mod tests {
             let json: serde_json::Value = serde_json::from_str(body).expect("json response");
             assert!(json.is_object(), "{json}");
             if path == "/api/v1/native-sync" {
+                assert_eq!(json["api_version"], HSRD_DIAGNOSTIC_API_VERSION);
                 assert_eq!(json["observation_only"], true);
                 assert_eq!(json["active_state"], false);
                 assert_eq!(json["runtime_instance"], "test-runtime");
                 assert_eq!(json["connected_blocks"], 0);
                 assert_eq!(json["contextual_failed_bodies"], 0);
+                native_registry = Some(json["experimental_registry"].clone());
             } else if path == "/api/v1/header-deployments" {
                 assert_eq!(json["best_header"]["height"], 0);
                 assert_eq!(json["next_height"], 1);
                 assert_eq!(json["script_flags"], 50);
             } else if path == "/api/v1/status" {
+                assert_eq!(json["api_version"], HSRD_DIAGNOSTIC_API_VERSION);
                 assert_eq!(json["diagnostic_snapshot_cached"], false);
                 assert!(json["diagnostic_snapshot_captured_at"].is_u64());
+                status_registry = Some(json["experimental_registry"].clone());
             }
         }
+        assert_eq!(
+            native_registry.expect("native registry diagnostics"),
+            status_registry.expect("status registry diagnostics")
+        );
 
         let node_guard = node.lock().await;
         let cached_request = format!(
