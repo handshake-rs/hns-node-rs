@@ -64,8 +64,31 @@ qualification mechanism, not as independent production endorsement.
 
 ## Storage compatibility
 
-Extraction does not change consensus or persistent-state code. In particular,
-schema version 19, storage profile `hsrd-mining-v15`, append-only authenticated
-name pages, block/undo segment locators, RocksDB snapshot and multi-get paths,
-pruning checkpoints, and one-batch reorganization semantics are unchanged from
-the source-prefix tree.
+The extraction normalization does not change consensus or persistent-state
+behavior. A follow-up qualification cleanup only names existing compound return
+types, groups an internal root/height argument pair, scopes test borrows
+lexically, and writes one boolean equivalence in its minimal form. In
+particular, schema version 19, storage profile `hsrd-mining-v15`, append-only
+authenticated name pages, block/undo segment locators, RocksDB snapshot and
+multi-get paths, pruning checkpoints, and one-batch reorganization semantics
+are unchanged from the source-prefix tree.
+
+## Extraction qualification
+
+The standalone normalization was checked on 2026-07-25 with the repository's
+pinned Rust 1.89.0 toolchain:
+
+- root and fuzz-workspace locked metadata resolve independently;
+- both workspaces pass `cargo fmt --all -- --check`;
+- the root workspace passes strict Clippy across all targets and all features;
+- the complete no-default-features workspace test matrix passes, including its
+  loopback network tests when run with local socket permission; and
+- every fuzz target passes locked offline `cargo check`.
+
+The all-features test command started compiling the Rust workspace but did not
+reach test execution on this ARM host: building and archiving bundled RocksDB
+remained I/O-bound on the external work disk for more than one hour, so the
+attempt was interrupted rather than repeatedly rebuilt. The strict all-features
+Clippy gate did finish that native dependency and pass, but it is not
+represented as a substitute for the incomplete all-features test or
+release-build gates.

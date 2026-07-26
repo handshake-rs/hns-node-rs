@@ -295,7 +295,7 @@ fn apply_airdrop_positions(
         };
         let mask = 1 << (7 - (position & 7));
         let currently_spent = *value & mask != 0;
-        if currently_spent != !spend {
+        if currently_spent == spend {
             bail!(
                 "airdrop position {position} has invalid {} state at height {height}",
                 if spend { "reconnect" } else { "disconnect" }

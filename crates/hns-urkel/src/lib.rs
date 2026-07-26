@@ -45,6 +45,17 @@ const HSD_PROOF_EXISTS: u16 = 3;
 )]
 pub struct TreeRoot([u8; 32]);
 
+/// One authenticated Urkel node and its canonical durable encoding.
+pub type UrkelRecord = (TreeRoot, Vec<u8>);
+
+/// The canonical node records from a selected node to the tree root.
+pub type UrkelRecordPath = Vec<UrkelRecord>;
+
+/// Root, reachable-record count, and an optional path to the selected node.
+pub type UrkelRecordPathSearch = (TreeRoot, usize, Option<UrkelRecordPath>);
+
+type SortedRecordPathSearch = (TreeRoot, Option<UrkelRecordPath>);
+
 impl TreeRoot {
     pub const ZERO: Self = Self(EMPTY_ROOT);
 
@@ -521,7 +532,7 @@ impl MemoryUrkel {
     pub fn record_path_to_root(
         &self,
         target: TreeRoot,
-    ) -> Result<(TreeRoot, usize, Option<Vec<(TreeRoot, Vec<u8>)>>), UrkelError> {
+    ) -> Result<UrkelRecordPathSearch, UrkelError> {
         let entries = self.entries.iter().collect::<Vec<_>>();
         let record_count = entries
             .len()
@@ -2461,7 +2472,7 @@ fn sorted_entries_record_path(
     entries: &[(&NameHash, &Vec<u8>)],
     depth: usize,
     target: TreeRoot,
-) -> Result<(TreeRoot, Option<Vec<(TreeRoot, Vec<u8>)>>), UrkelError> {
+) -> Result<SortedRecordPathSearch, UrkelError> {
     match entries {
         [] => Ok((TreeRoot::ZERO, None)),
         [(key, value)] => {

@@ -3660,11 +3660,14 @@ pub fn materialize_committed_name_tree<T: ReadSnapshot>(
 /// one radix-tree traversal. This is intended for offline diagnosis and repair:
 /// it derives bytes from NameState plus canonical undo rather than trusting the
 /// content-addressed page store under examination.
+pub type ReconstructedNameTreeRecords = BTreeMap<TreeRoot, Vec<u8>>;
+pub type ReconstructedNameTree = (TreeRoot, usize, ReconstructedNameTreeRecords);
+
 pub fn reconstruct_committed_name_tree_records<T: ReadSnapshot>(
     snapshot: &T,
     tree_interval: Height,
     tip_height: Height,
-) -> Result<(TreeRoot, usize, BTreeMap<TreeRoot, Vec<u8>>), StateError> {
+) -> Result<ReconstructedNameTree, StateError> {
     let (stored, tree) = prepare_committed_name_tree(snapshot, tree_interval, tip_height)?;
     let name_count = tree.len();
     let (actual, records) = tree.node_records_with_root()?;
