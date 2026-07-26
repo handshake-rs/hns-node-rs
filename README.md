@@ -47,12 +47,20 @@ ordinary Handshake readiness. Its service bit advertises only the extension
 envelope; it neither represents nor changes requester, opaque-relayer, output,
 HNSR, or market-role consent.
 
+The bounded [HIP-76 session boundary](docs/hip76-session.md) is now wired
+through live peers. Requesting is available by default and can be disabled
+(opt-out); serving DNS output remains disabled until an operator explicitly
+opts in and marks a backend ready. The session validates framing, DNS message
+shape, correlation, policy generations, deadlines, queue admission, and socket
+completion. A received DNS answer remains untrusted input for a separate
+resolver/DNSSEC validation boundary.
+
 The current tree contains hardened authority, storage, transaction, covenant,
 and name-state foundations, a live native P2P/synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication
 foundation. Native synchronization can produce fully validated durable block
 status, but the mining engine cannot authorize jobs or publish solved blocks
-without the private authority capability and complete readiness. API-v9
+without the private authority capability and complete readiness. API-v13
 exposes the exact next-header interval-committed root, and the external comparison
 runner can check it against a pinned live HSD node without feeding oracle data
 back into consensus.

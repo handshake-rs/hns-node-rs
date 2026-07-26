@@ -52,7 +52,7 @@ use hns_mining::{
     HeaderSummary, MiningEventHub, MiningGeneration, MiningSnapshot, MiningSubscriptions,
     SolvedMiningCandidate, TemplateCoordinator,
 };
-use hns_p2p::DenuoSummary;
+use hns_p2p::{DenuoSummary, Hip76Summary, PeerSnapshot};
 use hns_primitives::{
     blake2b_256, hex_encode, Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState,
     Reader, Transaction, Uint256, Writer,
@@ -60,9 +60,9 @@ use hns_primitives::{
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
     RpcConsensusReadiness, RpcErrorObject, RpcExperimentalRegistryInfo,
-    RpcExperimentalRejectionCount, RpcHeaderEntry, RpcMiningEngineInfo, RpcNameTreeCompactionInfo,
-    RpcNodeStatus, RpcParityInfo, RpcService, RpcSnapshot, RpcTransactionEntry,
-    RpcUndoRetentionInfo,
+    RpcExperimentalRejectionCount, RpcHeaderEntry, RpcHip76Info, RpcMiningEngineInfo,
+    RpcNameTreeCompactionInfo, RpcNodeStatus, RpcParityInfo, RpcService, RpcSnapshot,
+    RpcTransactionEntry, RpcUndoRetentionInfo,
 };
 #[cfg(test)]
 use hns_state::verify_stored_name_tree_root;
@@ -91,7 +91,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 12;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 13;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -1083,6 +1083,68 @@ pub(crate) fn rpc_experimental_registry_info(
     }
 }
 
+pub(crate) fn rpc_hip76_info(peers: &[PeerSnapshot]) -> RpcHip76Info {
+    let mut hip76 = Hip76Summary::default();
+    let mut remote_provider_advertised_peers = 0u64;
+    let mut registry_negotiated_peers = 0u64;
+    let mut peer_faulted_peers = 0u64;
+    for peer in peers {
+        let diagnostics = &peer.hip76;
+        hip76.observe(diagnostics);
+        remote_provider_advertised_peers = remote_provider_advertised_peers
+            .saturating_add(u64::from(diagnostics.remote_provider_advertised));
+        registry_negotiated_peers =
+            registry_negotiated_peers.saturating_add(u64::from(diagnostics.registry_negotiated));
+        peer_faulted_peers = peer_faulted_peers.saturating_add(u64::from(diagnostics.peer_faulted));
+    }
+    RpcHip76Info {
+        semantic_version: hip76.identity.semantic_version,
+        service_bit: hip76.identity.service_bit,
+        request_packet_type: hip76.identity.request_packet_type,
+        response_packet_type: hip76.identity.response_packet_type,
+        maximum_query_body_size: hip76.identity.maximum_query_body_size,
+        maximum_request_payload_size: hip76.identity.maximum_request_payload_size,
+        maximum_response_body_size: hip76.identity.maximum_response_body_size,
+        maximum_response_payload_size: hip76.identity.maximum_response_payload_size,
+        registry_fingerprint: hip76.identity.registry_fingerprint,
+        registry_wire_profile: hip76.identity.registry_wire_profile,
+        experimental_status: hip76.identity.experimental_status,
+        requester_default: hip76.identity.requester_default,
+        provider_default_opted_in: hip76.identity.provider_default_opted_in,
+        live_peers: hip76.peers,
+        awaiting_registry_peers: hip76.phases.awaiting_registry,
+        active_peers: hip76.phases.active,
+        revoked_peers: hip76.phases.revoked,
+        faulted_peers: hip76.phases.faulted,
+        disconnected_peers: hip76.phases.disconnected,
+        requester_enabled_peers: hip76.requester_enabled_peers,
+        requester_eligible_peers: hip76.requester_eligible_peers,
+        provider_opted_in_peers: hip76.provider_opted_in_peers,
+        provider_backend_ready_peers: hip76.provider_backend_ready_peers,
+        provider_available_peers: hip76.provider_available_peers,
+        local_provider_advertised_peers: hip76.provider_advertised_peers,
+        remote_provider_advertised_peers,
+        registry_negotiated_peers,
+        peer_faulted_peers,
+        outbound_live_requests: hip76.outbound_live_requests,
+        inbound_live_requests: hip76.inbound_live_requests,
+        outbound_requests_created: hip76.process.outbound_requests_created,
+        outbound_requests_queue_admitted: hip76.process.outbound_requests_queue_admitted,
+        outbound_requests_socket_written: hip76.process.outbound_requests_socket_written,
+        inbound_requests_received: hip76.process.inbound_requests_received,
+        inbound_requests_accepted: hip76.process.inbound_requests_accepted,
+        provider_responses_created: hip76.process.provider_responses_created,
+        provider_responses_queue_admitted: hip76.process.provider_responses_queue_admitted,
+        provider_responses_socket_written: hip76.process.provider_responses_socket_written,
+        requester_responses_received: hip76.process.requester_responses_received,
+        outbound_socket_write_failures: hip76.process.outbound_socket_write_failures,
+        outbound_queue_dropped_stale: hip76.process.outbound_queue_dropped_stale,
+        expired_requests: hip76.process.expired_requests,
+        revoked_requests: hip76.process.revoked_requests,
+        rejected_operations: hip76.process.rejected_operations,
+    }
+}
+
 fn parity_info() -> RpcParityInfo {
     RpcParityInfo {
         oracle: "handshake-org/hsd".to_owned(),
@@ -1769,6 +1831,7 @@ impl NodeService {
             name_tree_compaction,
             undo_retention,
             experimental_registry: rpc_experimental_registry_info(&DenuoSummary::default()),
+            hip76: rpc_hip76_info(&[]),
             authority,
             parity,
         };
@@ -7124,6 +7187,54 @@ mod tests {
         assert_eq!(projected.rejection_reasons.len(), 18);
         assert_eq!(projected.rejection_reasons[9].reason, "wrong-fingerprint");
         assert_eq!(projected.rejection_reasons[9].count, 15);
+    }
+
+    #[test]
+    fn hip76_rpc_projection_is_qname_free_and_distinguishes_write_stages() {
+        let mut peer = hns_p2p::PeerSnapshot::new(
+            hns_p2p::PeerId(7),
+            "127.0.0.1:12038".parse().expect("peer address"),
+            hns_p2p::PeerDirection::Outbound,
+        );
+        peer.hip76.requester_eligible = true;
+        peer.hip76.remote_provider_advertised = true;
+        peer.hip76.registry_negotiated = true;
+        peer.hip76.outbound_live_requests = 1;
+        peer.hip76.process.outbound_requests_created = 3;
+        peer.hip76.process.outbound_requests_queue_admitted = 2;
+        peer.hip76.process.outbound_requests_socket_written = 1;
+        peer.hip76.process.outbound_socket_write_failures = 1;
+        peer.hip76.process.outbound_queue_dropped_stale = 1;
+
+        let projected = rpc_hip76_info(&[peer]);
+
+        assert_eq!(projected.request_packet_type, 0xf0);
+        assert_eq!(projected.response_packet_type, 0xf1);
+        assert_eq!(projected.requester_default, "auto");
+        assert!(!projected.provider_default_opted_in);
+        assert_eq!(projected.live_peers, 1);
+        assert_eq!(projected.awaiting_registry_peers, 1);
+        assert_eq!(projected.requester_eligible_peers, 1);
+        assert_eq!(projected.remote_provider_advertised_peers, 1);
+        assert_eq!(projected.registry_negotiated_peers, 1);
+        assert_eq!(projected.outbound_live_requests, 1);
+        assert_eq!(projected.outbound_requests_created, 3);
+        assert_eq!(projected.outbound_requests_queue_admitted, 2);
+        assert_eq!(projected.outbound_requests_socket_written, 1);
+        assert_eq!(projected.outbound_socket_write_failures, 1);
+        assert_eq!(projected.outbound_queue_dropped_stale, 1);
+
+        let json = serde_json::to_string(&projected).expect("serialize HIP-76 diagnostics");
+        for forbidden_key in [
+            "\"qname\"",
+            "\"request_id\"",
+            "\"query\"",
+            "\"response\"",
+            "\"status\"",
+            "\"deadline\"",
+        ] {
+            assert!(!json.contains(forbidden_key));
+        }
     }
 
     fn decode_hex(value: &str) -> Vec<u8> {

@@ -50,6 +50,11 @@ snapshots only.
   one `experimental_registry` object from the same per-peer capture for native
   sync and node status; the existing cache markers identify when status is
   serving the last completed capture.
+- API-v13 adds a qname-free `hip76` object with the draft wire identity,
+  opt-out requester and opt-in provider defaults, live role/phase counts, and
+  separate packet-created, queue-admitted, socket-written, failed-write, and
+  stale-drop counters. It never exposes request IDs, question names, raw DNS
+  bodies, response statuses, or deadlines.
 - Native status, authority, parity, and mining-engine diagnostics bind before
   startup replay and remain available while the state coordinator is occupied
   by a connect slice or name-tree compaction. Each response reports

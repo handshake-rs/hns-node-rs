@@ -6,6 +6,7 @@
 //! Elligator-Squared encoding, nonce layout, and key rotation are consensus for
 //! transport compatibility.
 
+use hns_dns_relay_protocol::MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE as HIP76_MAX_RESPONSE_PAYLOAD_SIZE;
 use hns_primitives::sha256;
 use std::{fmt, sync::Arc};
 
@@ -14,7 +15,7 @@ use openssl::symm::{decrypt_aead, encrypt_aead, Cipher};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    constants::MAX_FRAME_PAYLOAD_SIZE,
+    constants::{FRAME_HEADER_SIZE, MAX_FRAME_PAYLOAD_SIZE},
     wire::{decode_frame, encode_frame, Frame, NetworkMagic},
     P2pError,
 };
@@ -28,7 +29,9 @@ pub const BRONTIDE_HEADER_SIZE: usize = 4 + TAG_SIZE;
 pub const BRONTIDE_ACT_ONE_SIZE: usize = 64 + TAG_SIZE;
 pub const BRONTIDE_ACT_TWO_SIZE: usize = 64 + TAG_SIZE;
 pub const BRONTIDE_ACT_THREE_SIZE: usize = 33 + TAG_SIZE + TAG_SIZE;
-pub const MAX_BRONTIDE_MESSAGE_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE + 9;
+pub const MAX_BRONTIDE_MESSAGE_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE + FRAME_HEADER_SIZE;
+const MAX_REUSABLE_BRONTIDE_RECORD_SIZE: usize =
+    FRAME_HEADER_SIZE + HIP76_MAX_RESPONSE_PAYLOAD_SIZE + TAG_SIZE + 1024;
 
 #[derive(Debug)]
 struct Secret([u8; 32]);
@@ -631,6 +634,7 @@ pub(crate) struct AsyncBrontideFrameReader<R> {
     io: R,
     cipher: BrontideReceiveCipher,
     magic: NetworkMagic,
+    record: Vec<u8>,
 }
 
 impl<R> AsyncBrontideFrameReader<R>
@@ -638,16 +642,38 @@ where
     R: AsyncRead + Unpin,
 {
     pub(crate) fn new(io: R, cipher: BrontideReceiveCipher, magic: NetworkMagic) -> Self {
-        Self { io, cipher, magic }
+        Self {
+            io,
+            cipher,
+            magic,
+            record: Vec::new(),
+        }
     }
 
     pub(crate) async fn read_frame(&mut self) -> Result<Frame, P2pError> {
         let mut header = [0u8; BRONTIDE_HEADER_SIZE];
         self.io.read_exact(&mut header).await?;
         let size = self.cipher.decrypt_header(&header)?;
-        let mut payload = vec![0u8; size + TAG_SIZE];
-        self.io.read_exact(&mut payload).await?;
-        let plaintext = self.cipher.decrypt_payload(&payload)?;
+        let record_size = size
+            .checked_add(TAG_SIZE)
+            .ok_or_else(|| P2pError::Protocol("Brontide record length overflow".to_owned()))?;
+        // The HSD packet type is inside the authenticated ciphertext, so it
+        // cannot safely select the smaller HIP-76 request/response bound from
+        // the encrypted length alone. The authenticated length is first held
+        // to the ordinary global frame limit. Common and HIP-76-sized records
+        // reuse a narrowly capped buffer, while larger valid ordinary P2P
+        // records use transient storage instead of pinning eight megabytes per
+        // peer. `decode_frame` applies the packet-specific HIP-76 limit
+        // immediately after authentication and before copying its payload.
+        let plaintext = if record_size <= MAX_REUSABLE_BRONTIDE_RECORD_SIZE {
+            self.record.resize(record_size, 0);
+            self.io.read_exact(&mut self.record).await?;
+            self.cipher.decrypt_payload(&self.record)?
+        } else {
+            let mut record = vec![0u8; record_size];
+            self.io.read_exact(&mut record).await?;
+            self.cipher.decrypt_payload(&record)?
+        };
         decode_frame(self.magic, &plaintext)
     }
 }
@@ -768,6 +794,11 @@ fn secp_error(error: SecpError) -> P2pError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{Packet, PacketType};
+    use hns_dns_relay_protocol::{
+        MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE, MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+    };
+    use hns_p2p_experimental::{DNS_RELAY_REQUEST_PACKET, DNS_RELAY_RESPONSE_PACKET};
 
     const ORACLE_FIXTURE: &str = include_str!("../../../fixtures/hsd/p2p/wire-v1.json");
 
@@ -890,6 +921,185 @@ mod tests {
         assert!(responder
             .decrypt_payload(&record[BRONTIDE_HEADER_SIZE..])
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn async_reader_enforces_hip76_bounds_after_authentication_and_stays_aligned() {
+        for (packet_type, limit, context) in [
+            (
+                PacketType::Unknown(DNS_RELAY_REQUEST_PACKET.value()),
+                MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE,
+                "HIP-76 request payload",
+            ),
+            (
+                PacketType::Unknown(DNS_RELAY_RESPONSE_PACKET.value()),
+                MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+                "HIP-76 response payload",
+            ),
+        ] {
+            let (mut sender, receiver) = exchange();
+            let rejected =
+                Frame::new(packet_type, vec![0xa5; limit + 1]).expect("generic frame bound");
+            let ordinary = Frame::from_packet(&Packet::GetAddr).expect("ordinary frame");
+            let mut stream = sender
+                .encrypt_message(
+                    &encode_frame(NetworkMagic::Regtest, &rejected).expect("rejected plaintext"),
+                )
+                .expect("rejected record");
+            stream.extend(
+                sender
+                    .encrypt_message(
+                        &encode_frame(NetworkMagic::Regtest, &ordinary)
+                            .expect("ordinary plaintext"),
+                    )
+                    .expect("ordinary record"),
+            );
+
+            let (_, receive_cipher) = receiver.into_ciphers();
+            let mut reader = AsyncBrontideFrameReader::new(
+                stream.as_slice(),
+                receive_cipher,
+                NetworkMagic::Regtest,
+            );
+            assert!(matches!(
+                reader.read_frame().await.expect_err("packet-specific limit"),
+                P2pError::ScopedPacketLimit {
+                    packet_type: actual_packet_type,
+                    context: actual_context,
+                    limit: actual_limit,
+                    actual
+                } if actual_packet_type == packet_type.as_u8()
+                    && actual_context == context
+                    && actual_limit == limit
+                    && actual == limit + 1
+            ));
+            let maximum_record_capacity = reader.record.capacity();
+            assert_eq!(
+                reader.read_frame().await.expect("stream stays aligned"),
+                ordinary
+            );
+            assert_eq!(
+                reader.record.capacity(),
+                maximum_record_capacity,
+                "authenticated ciphertext storage is reused across records"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn async_reader_never_trusts_an_unauthenticated_packet_type() {
+        let (mut sender, receiver) = exchange();
+        let ordinary = Frame::new(
+            PacketType::Unknown(0xef),
+            vec![0; MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE + 1],
+        )
+        .expect("ordinary experimental frame");
+        let mut record = sender
+            .encrypt_message(
+                &encode_frame(NetworkMagic::Regtest, &ordinary).expect("ordinary plaintext"),
+            )
+            .expect("ordinary record");
+
+        // ChaCha20 encryption preserves XOR differences. This changes the
+        // encrypted packet-type byte from the plaintext 0xef to an apparent
+        // HIP-76 request type (0xf0), but necessarily invalidates the tag.
+        record[BRONTIDE_HEADER_SIZE + 4] ^= 0x1f;
+
+        let (_, receive_cipher) = receiver.into_ciphers();
+        let mut reader =
+            AsyncBrontideFrameReader::new(record.as_slice(), receive_cipher, NetworkMagic::Regtest);
+        assert!(matches!(
+            reader
+                .read_frame()
+                .await
+                .expect_err("authentication must precede classification"),
+            P2pError::Protocol(message)
+                if message.contains("authentication tag mismatch")
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_hip76_and_larger_ordinary_records_use_bounded_storage() {
+        let (mut sender, receiver) = exchange();
+        let exact_hip76 = Frame::new(
+            PacketType::Unknown(DNS_RELAY_RESPONSE_PACKET.value()),
+            vec![0x5a; MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE],
+        )
+        .expect("exact HIP-76 response frame");
+        let large_ordinary = Frame::new(
+            PacketType::Unknown(0xef),
+            vec![0x3c; MAX_REUSABLE_BRONTIDE_RECORD_SIZE],
+        )
+        .expect("large ordinary frame");
+
+        let mut stream = sender
+            .encrypt_message(
+                &encode_frame(NetworkMagic::Regtest, &exact_hip76).expect("HIP-76 plaintext"),
+            )
+            .expect("HIP-76 record");
+        stream.extend(
+            sender
+                .encrypt_message(
+                    &encode_frame(NetworkMagic::Regtest, &large_ordinary)
+                        .expect("ordinary plaintext"),
+                )
+                .expect("ordinary record"),
+        );
+
+        let (_, receive_cipher) = receiver.into_ciphers();
+        let mut reader =
+            AsyncBrontideFrameReader::new(stream.as_slice(), receive_cipher, NetworkMagic::Regtest);
+        assert_eq!(
+            reader.read_frame().await.expect("exact HIP-76 frame"),
+            exact_hip76
+        );
+        let reusable_length = reader.record.len();
+        let reusable_capacity = reader.record.capacity();
+        assert_eq!(
+            reader.read_frame().await.expect("large ordinary frame"),
+            large_ordinary
+        );
+        assert_eq!(
+            reader.record.len(),
+            reusable_length,
+            "large ordinary records must leave the reusable buffer untouched"
+        );
+        assert_eq!(
+            reader.record.capacity(),
+            reusable_capacity,
+            "large ordinary records must not enlarge persistent per-peer storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_global_length_is_rejected_before_record_allocation() {
+        let (mut sender, receiver) = exchange();
+        let declared = u32::try_from(MAX_BRONTIDE_MESSAGE_SIZE + 1)
+            .expect("global test bound fits u32")
+            .to_le_bytes();
+        let (encrypted_length, tag) = sender
+            .send_cipher
+            .encrypt(&declared, &[])
+            .expect("authenticated length");
+        let mut header = Vec::with_capacity(BRONTIDE_HEADER_SIZE);
+        header.extend_from_slice(&encrypted_length);
+        header.extend_from_slice(&tag);
+
+        let (_, receive_cipher) = receiver.into_ciphers();
+        let mut reader =
+            AsyncBrontideFrameReader::new(header.as_slice(), receive_cipher, NetworkMagic::Regtest);
+        assert!(matches!(
+            reader
+                .read_frame()
+                .await
+                .expect_err("authenticated global bound"),
+            P2pError::LimitExceeded {
+                context: "Brontide message",
+                limit: MAX_BRONTIDE_MESSAGE_SIZE,
+                actual
+            } if actual == MAX_BRONTIDE_MESSAGE_SIZE + 1
+        ));
+        assert_eq!(reader.record.capacity(), 0);
     }
 
     #[test]

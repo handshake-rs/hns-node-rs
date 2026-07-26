@@ -452,9 +452,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-dns-relay-protocol"
+version = "0.1.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=dde2da81f29df935f043978a6d517c1d60ceff31#dde2da81f29df935f043978a6d517c1d60ceff31"
+dependencies = [
+ "hns-encoding",
+ "thiserror",
+]
+
+[[package]]
 name = "hns-encoding"
 version = "0.1.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=5f56e5d381338314e4d7cf1f9e08da7c76d1cf6f#5f56e5d381338314e4d7cf1f9e08da7c76d1cf6f"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=dde2da81f29df935f043978a6d517c1d60ceff31#dde2da81f29df935f043978a6d517c1d60ceff31"
 dependencies = [
  "thiserror",
 ]
@@ -523,6 +532,7 @@ name = "hns-p2p"
 version = "0.1.0"
 dependencies = [
  "hns-consensus",
+ "hns-dns-relay-protocol",
  "hns-p2p-experimental",
  "hns-primitives 0.1.0",
  "hns-secp256k1",
@@ -537,11 +547,11 @@ dependencies = [
 [[package]]
 name = "hns-p2p-experimental"
 version = "0.1.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=5f56e5d381338314e4d7cf1f9e08da7c76d1cf6f#5f56e5d381338314e4d7cf1f9e08da7c76d1cf6f"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=dde2da81f29df935f043978a6d517c1d60ceff31#dde2da81f29df935f043978a6d517c1d60ceff31"
 dependencies = [
  "hex",
  "hns-encoding",
- "hns-primitives 0.1.0 (git+https://github.com/handshake-rs/hns-rs.git?rev=5f56e5d381338314e4d7cf1f9e08da7c76d1cf6f)",
+ "hns-primitives 0.1.0 (git+https://github.com/handshake-rs/hns-rs.git?rev=dde2da81f29df935f043978a6d517c1d60ceff31)",
  "serde",
  "sha2",
  "thiserror",
@@ -562,7 +572,7 @@ dependencies = [
 [[package]]
 name = "hns-primitives"
 version = "0.1.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=5f56e5d381338314e4d7cf1f9e08da7c76d1cf6f#5f56e5d381338314e4d7cf1f9e08da7c76d1cf6f"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=dde2da81f29df935f043978a6d517c1d60ceff31#dde2da81f29df935f043978a6d517c1d60ceff31"
 dependencies = [
  "hex",
  "thiserror",

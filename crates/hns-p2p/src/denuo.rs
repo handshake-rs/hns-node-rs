@@ -13,6 +13,7 @@ use std::{
 };
 
 use hns_consensus::Network as ConsensusNetwork;
+use hns_dns_relay_protocol::MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE;
 use hns_p2p_experimental::{
     DenuoExtensionEnvelope, EnvelopeError, KnownMessage, NegotiatedRegistry, NegotiationError,
     Network, ProtocolDisposition, RegistryEnvelopeError, RegistryHello,
@@ -447,7 +448,10 @@ impl DenuoCoordinator {
             experimental_network,
             network.params().genesis_hash.into_inner(),
             Vec::new(),
-            DENUO_EXTENSION_MAX_PACKET_PAYLOAD as u32,
+            u32::try_from(
+                DENUO_EXTENSION_MAX_PACKET_PAYLOAD.max(MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE),
+            )
+            .expect("canonical Denuo packet ceilings fit u32"),
             DENUO_DEFAULT_MAXIMUM_LIVE_REQUESTS,
             0,
         )?;

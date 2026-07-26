@@ -4,6 +4,10 @@ use std::{
 };
 
 use hns_consensus::Network;
+use hns_dns_relay_protocol::{
+    MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE, MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+};
+use hns_p2p_experimental::{DNS_RELAY_REQUEST_PACKET, DNS_RELAY_RESPONSE_PACKET};
 use hns_primitives::{
     blake2b_256_many, AirdropProof, Block, BlockHash, Claim, Header, Reader, Transaction, Txid,
     Writer,
@@ -1456,6 +1460,7 @@ pub fn decode_frame(magic: NetworkMagic, bytes: &[u8]) -> Result<Frame, P2pError
             "payload exceeds {MAX_FRAME_PAYLOAD_SIZE} bytes"
         )));
     }
+    validate_packet_payload_size(packet_type, payload_len)?;
     let payload = primitive(reader.read_vec(payload_len))?;
     finish_reader(reader)?;
     Frame::new(packet_type, payload)
@@ -1478,8 +1483,7 @@ where
         let mut header = [0u8; FRAME_HEADER_SIZE];
         self.io.read_exact(&mut header).await?;
         let (packet_type, payload_len) = decode_frame_header(self.magic, &header)?;
-        let mut payload = vec![0; payload_len];
-        self.io.read_exact(&mut payload).await?;
+        let payload = read_frame_payload(&mut self.io, packet_type, payload_len).await?;
         Frame::new(packet_type, payload)
     }
 
@@ -1536,8 +1540,7 @@ where
         let mut header = [0u8; FRAME_HEADER_SIZE];
         self.io.read_exact(&mut header).await?;
         let (packet_type, payload_len) = decode_frame_header(self.magic, &header)?;
-        let mut payload = vec![0; payload_len];
-        self.io.read_exact(&mut payload).await?;
+        let payload = read_frame_payload(&mut self.io, packet_type, payload_len).await?;
         Frame::new(packet_type, payload)
     }
 
@@ -1569,6 +1572,84 @@ fn decode_frame_header(
     }
     finish_reader(reader)?;
     Ok((packet_type, payload_len))
+}
+
+#[derive(Clone, Copy)]
+struct PacketPayloadLimit {
+    context: &'static str,
+    maximum: usize,
+}
+
+fn packet_payload_limit(packet_type: PacketType) -> Option<PacketPayloadLimit> {
+    let PacketType::Unknown(value) = packet_type else {
+        return None;
+    };
+    if value == DNS_RELAY_REQUEST_PACKET.value() {
+        return Some(PacketPayloadLimit {
+            context: "HIP-76 request payload",
+            maximum: MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE,
+        });
+    }
+    if value == DNS_RELAY_RESPONSE_PACKET.value() {
+        return Some(PacketPayloadLimit {
+            context: "HIP-76 response payload",
+            maximum: MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+        });
+    }
+    None
+}
+
+fn validate_packet_payload_size(
+    packet_type: PacketType,
+    payload_len: usize,
+) -> Result<(), P2pError> {
+    let Some(limit) = packet_payload_limit(packet_type) else {
+        return Ok(());
+    };
+    if payload_len > limit.maximum {
+        return Err(P2pError::ScopedPacketLimit {
+            packet_type: packet_type.as_u8(),
+            context: limit.context,
+            limit: limit.maximum,
+            actual: payload_len,
+        });
+    }
+    Ok(())
+}
+
+async fn read_frame_payload<R>(
+    io: &mut R,
+    packet_type: PacketType,
+    payload_len: usize,
+) -> Result<Vec<u8>, P2pError>
+where
+    R: AsyncRead + Unpin,
+{
+    if let Err(error) = validate_packet_payload_size(packet_type, payload_len) {
+        // Packet type and length are plaintext in the native HSD framing.
+        // Consume a rejected, generically bounded payload through a fixed
+        // scratch buffer so one HIP-76 violation cannot allocate up to the
+        // eight-megabyte ordinary P2P limit or desynchronize the stream.
+        drain_exact(io, payload_len).await?;
+        return Err(error);
+    }
+    let mut payload = vec![0; payload_len];
+    io.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+async fn drain_exact<R>(io: &mut R, mut remaining: usize) -> Result<(), P2pError>
+where
+    R: AsyncRead + Unpin,
+{
+    const DRAIN_BUFFER_SIZE: usize = 8 * 1024;
+    let mut scratch = [0u8; DRAIN_BUFFER_SIZE];
+    while remaining != 0 {
+        let take = remaining.min(scratch.len());
+        io.read_exact(&mut scratch[..take]).await?;
+        remaining -= take;
+    }
+    Ok(())
 }
 
 fn encode_inventory(writer: &mut Writer, items: &[Inventory]) -> Result<(), P2pError> {
@@ -1841,6 +1922,104 @@ mod tests {
             transport.read_frame().await.expect_err("oversized"),
             P2pError::MalformedFrame(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn async_reader_drains_oversized_hip76_frames_without_losing_sync() {
+        for (packet_type, limit, context) in [
+            (
+                PacketType::Unknown(DNS_RELAY_REQUEST_PACKET.value()),
+                MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE,
+                "HIP-76 request payload",
+            ),
+            (
+                PacketType::Unknown(DNS_RELAY_RESPONSE_PACKET.value()),
+                MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+                "HIP-76 response payload",
+            ),
+        ] {
+            let rejected =
+                Frame::new(packet_type, vec![0xa5; limit + 1]).expect("generic frame bound");
+            let ordinary = Frame::from_packet(&Packet::GetAddr).expect("ordinary frame");
+            let mut stream =
+                encode_frame(NetworkMagic::Regtest, &rejected).expect("rejected bytes");
+            stream.extend(
+                encode_frame(NetworkMagic::Regtest, &ordinary).expect("ordinary frame bytes"),
+            );
+
+            let mut reader = AsyncFrameReader::new(stream.as_slice(), NetworkMagic::Regtest);
+            assert!(matches!(
+                reader.read_frame().await.expect_err("packet-specific limit"),
+                P2pError::ScopedPacketLimit {
+                    packet_type: actual_packet_type,
+                    context: actual_context,
+                    limit: actual_limit,
+                    actual
+                } if actual_packet_type == packet_type.as_u8()
+                    && actual_context == context
+                    && actual_limit == limit
+                    && actual == limit + 1
+            ));
+            assert_eq!(
+                reader.read_packet().await.expect("stream stays aligned"),
+                Packet::GetAddr
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hip76_exact_limits_and_large_ordinary_frames_remain_valid() {
+        for (packet_type, limit) in [
+            (
+                PacketType::Unknown(DNS_RELAY_REQUEST_PACKET.value()),
+                MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE,
+            ),
+            (
+                PacketType::Unknown(DNS_RELAY_RESPONSE_PACKET.value()),
+                MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+            ),
+            (
+                PacketType::Unknown(0xef),
+                MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE + 1,
+            ),
+        ] {
+            let frame = Frame::new(packet_type, vec![0x5a; limit]).expect("generic frame bound");
+            let encoded = encode_frame(NetworkMagic::Regtest, &frame).expect("frame bytes");
+            let mut reader = AsyncFrameReader::new(encoded.as_slice(), NetworkMagic::Regtest);
+            assert_eq!(reader.read_frame().await.expect("bounded frame"), frame);
+        }
+    }
+
+    #[test]
+    fn borrowed_decoder_checks_hip76_limit_before_payload_copy() {
+        for (packet_type, limit, context) in [
+            (
+                PacketType::Unknown(DNS_RELAY_REQUEST_PACKET.value()),
+                MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE,
+                "HIP-76 request payload",
+            ),
+            (
+                PacketType::Unknown(DNS_RELAY_RESPONSE_PACKET.value()),
+                MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+                "HIP-76 response payload",
+            ),
+        ] {
+            let frame = Frame::new(packet_type, vec![0; limit + 1]).expect("generic frame bound");
+            let encoded = encode_frame(NetworkMagic::Regtest, &frame).expect("frame bytes");
+            assert!(matches!(
+                decode_frame(NetworkMagic::Regtest, &encoded)
+                    .expect_err("packet-specific limit"),
+                P2pError::ScopedPacketLimit {
+                    packet_type: actual_packet_type,
+                    context: actual_context,
+                    limit: actual_limit,
+                    actual
+                } if actual_packet_type == packet_type.as_u8()
+                    && actual_context == context
+                    && actual_limit == limit
+                    && actual == limit + 1
+            ));
+        }
     }
 
     #[test]

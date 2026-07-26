@@ -22,6 +22,7 @@ use crate::{
     constants::{DEFAULT_USER_AGENT, PROTOCOL_VERSION, SERVICE_NETWORK},
     denuo::{DenuoRuntimeMetrics, DenuoSummary},
     handshake::{PeerDirection, PeerState},
+    hip76::{hip76_advertised_services, Hip76ProviderPolicy, Hip76SessionConfig, Hip76Summary},
     runtime::{
         spawn_brontide_peer_runtime, spawn_peer_runtime, OutboundPriority, PeerEvent, PeerHandle,
         PeerId, PeerRuntimeConfig, PeerRuntimeParameters, PeerSnapshot,
@@ -52,6 +53,7 @@ pub struct LivePeerConfig {
     pub user_agent: String,
     pub no_relay: bool,
     pub runtime: PeerRuntimeConfig,
+    pub hip76: Hip76SessionConfig,
 }
 
 impl LivePeerConfig {
@@ -79,6 +81,7 @@ impl LivePeerConfig {
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             no_relay: false,
             runtime: PeerRuntimeConfig::default(),
+            hip76: Hip76SessionConfig::default(),
         }
     }
 
@@ -113,6 +116,16 @@ impl LivePeerConfig {
                 "user agent must be ASCII and fit in one byte".to_owned(),
             ));
         }
+        if matches!(self.network, Network::Mainnet | Network::Testnet)
+            && !matches!(self.transport, PeerTransport::Brontide(_))
+        {
+            return Err(P2pError::Configuration(
+                "mainnet and testnet peer transport must use authenticated Brontide".to_owned(),
+            ));
+        }
+        self.hip76
+            .validate()
+            .map_err(|error| P2pError::Configuration(error.to_string()))?;
         self.runtime.validate()
     }
 }
@@ -367,6 +380,16 @@ impl LivePeerManager {
         self.snapshots_with_denuo_summary().await.1
     }
 
+    /// Aggregate qname-free HIP-76 state across the currently live peer map.
+    /// Session counters leave this summary when their peer disconnects.
+    pub async fn hip76_summary(&self) -> Hip76Summary {
+        let mut summary = Hip76Summary::default();
+        for snapshot in self.snapshots().await {
+            summary.observe(&snapshot.hip76);
+        }
+        summary
+    }
+
     pub async fn snapshots_with_denuo_summary(&self) -> (Vec<PeerSnapshot>, DenuoSummary) {
         let snapshots = self.snapshots().await;
         let diagnostics = snapshots
@@ -424,6 +447,104 @@ impl LivePeerManager {
             .cloned()
             .ok_or(P2pError::PeerUnavailable(peer))?;
         handle.try_send(packet, priority)
+    }
+
+    pub async fn begin_hip76_request(
+        &self,
+        peer: PeerId,
+        query: Vec<u8>,
+    ) -> Result<crate::Hip76PendingRequest, P2pError> {
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        handle.begin_hip76_request(query).await
+    }
+
+    pub async fn finish_hip76_provider_request(
+        &self,
+        peer: PeerId,
+        work: crate::Hip76ProviderWork,
+        status: crate::DnsRelayStatus,
+        response: Vec<u8>,
+    ) -> Result<(), P2pError> {
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        handle
+            .finish_hip76_provider_request(work, status, response)
+            .await
+    }
+
+    pub async fn subscribe_peer_hip76(
+        &self,
+        peer: PeerId,
+    ) -> Result<tokio::sync::watch::Receiver<crate::Hip76SessionDiagnostics>, P2pError> {
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        Ok(handle.subscribe_hip76())
+    }
+
+    /// Replace a connected peer's HIP-76 policy generation. Provider changes
+    /// that alter VERSION advertisement require a reconnect and are rejected
+    /// here so the service mask can never drift from live admission.
+    pub async fn replace_peer_hip76_policy(
+        &self,
+        peer: PeerId,
+        requester: crate::DnsRelayRequesterPolicy,
+        provider: Hip76ProviderPolicy,
+        generation: u64,
+    ) -> Result<crate::Hip76RevokedWork, P2pError> {
+        let current_services =
+            hip76_advertised_services(self.config.services, self.config.hip76.provider_policy);
+        let next_services = hip76_advertised_services(self.config.services, provider);
+        if current_services != next_services {
+            return Err(P2pError::Configuration(
+                "HIP-76 provider advertisement changes require reconnecting the peer".to_owned(),
+            ));
+        }
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        handle
+            .replace_hip76_policy(requester, provider, generation)
+            .await
+    }
+
+    pub async fn revoke_peer_hip76(
+        &self,
+        peer: PeerId,
+        generation: u64,
+    ) -> Result<crate::Hip76RevokedWork, P2pError> {
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        let revoked = handle.revoke_hip76(generation).await?;
+        if self.config.hip76.provider_policy.is_available() {
+            // VERSION service bits are immutable for a connected peer.
+            handle.disconnect();
+        }
+        Ok(revoked)
     }
 
     pub async fn broadcast(
@@ -636,11 +757,13 @@ impl LivePeerManager {
         self.ensure_capacity(direction, address).await?;
         let id = PeerId(self.next_peer_id.fetch_add(1, Ordering::Relaxed));
         let nonce = self.local_nonce;
+        let services =
+            hip76_advertised_services(self.config.services, self.config.hip76.provider_policy);
         let local_version = VersionPacket {
             version: self.config.protocol_version,
-            services: self.config.services,
+            services,
             time: unix_time(),
-            remote: NetAddress::from_socket_addr(address, unix_time(), self.config.services),
+            remote: NetAddress::from_socket_addr(address, unix_time(), services),
             nonce,
             agent: self.config.user_agent.clone(),
             height: self.local_height.load(Ordering::Acquire),
@@ -658,6 +781,7 @@ impl LivePeerManager {
             config: self.config.runtime.clone(),
             events: self.events.clone(),
             denuo_metrics: self.denuo_metrics.clone(),
+            hip76_config: self.config.hip76.clone(),
         };
         let spawned = match brontide {
             Some(session) => spawn_brontide_peer_runtime(parameters, reader, writer, session)?,
@@ -722,11 +846,126 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{denuo::DenuoPeerPhase, handshake::PeerState, wire::Packet};
+    use crate::{
+        denuo::DenuoPeerPhase,
+        handshake::PeerState,
+        runtime::{Hip76RequestOutcome, PeerTransportKind},
+        wire::Packet,
+        DnsRelayStatus, Hip76ConnectionPhase,
+    };
     use hns_p2p_experimental::{
-        DENUO_EXTENSION_MAX_NESTED_PAYLOAD, DENUO_EXTENSION_MAX_PACKET_PAYLOAD,
+        DENUO_EXTENSION_MAX_NESTED_PAYLOAD, DENUO_EXTENSION_MAX_PACKET_PAYLOAD, DNS_RELAY_SERVICE,
         REGISTRY_NEGOTIATION_MAX_PAYLOAD,
     };
+
+    const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn strict_nonrecursive_dnssec_query(transaction_id: u16) -> Vec<u8> {
+        let mut query = Vec::new();
+        query.extend_from_slice(&transaction_id.to_be_bytes());
+        query.extend_from_slice(&0_u16.to_be_bytes()); // QR=0, RD=0.
+        query.extend_from_slice(&1_u16.to_be_bytes()); // One question.
+        query.extend_from_slice(&0_u16.to_be_bytes());
+        query.extend_from_slice(&0_u16.to_be_bytes());
+        query.extend_from_slice(&1_u16.to_be_bytes()); // One EDNS OPT.
+        for label in ["hip76", "integration"] {
+            query.push(u8::try_from(label.len()).expect("test label length"));
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&48_u16.to_be_bytes()); // DNSKEY.
+        query.extend_from_slice(&1_u16.to_be_bytes()); // IN.
+        query.push(0);
+        query.extend_from_slice(&41_u16.to_be_bytes()); // OPT.
+        query.extend_from_slice(&1232_u16.to_be_bytes());
+        query.extend_from_slice(&0x0000_8000_u32.to_be_bytes()); // EDNS DO.
+        query.extend_from_slice(&0_u16.to_be_bytes()); // No EDNS options, including ECS.
+        query
+    }
+
+    fn correlated_dns_response(query: &[u8]) -> Vec<u8> {
+        let mut question_end = 12;
+        loop {
+            let label_length = usize::from(query[question_end]);
+            question_end += 1;
+            if label_length == 0 {
+                break;
+            }
+            question_end += label_length;
+        }
+        question_end += 4;
+        let mut response = query[..question_end].to_vec();
+        response[2..4].copy_from_slice(&0x8000_u16.to_be_bytes()); // QR=1, RD=0.
+        response[6..12].fill(0);
+        response
+    }
+
+    fn assert_not_generic_hip76(packet: &Packet) {
+        assert!(
+            !crate::is_hip76_packet_type(packet.packet_type()),
+            "HIP-76 f0/f1 packet leaked through PeerEvent::Packet"
+        );
+    }
+
+    async fn await_ready(
+        events: &mut mpsc::Receiver<PeerEvent>,
+        expected_peer: PeerId,
+    ) -> VersionPacket {
+        tokio::time::timeout(LIVE_EVENT_TIMEOUT, async {
+            loop {
+                match events.recv().await.expect("live peer event channel") {
+                    PeerEvent::Ready { peer, version } if peer == expected_peer => break version,
+                    PeerEvent::Packet { packet, .. } => assert_not_generic_hip76(&packet),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("peer readiness event")
+    }
+
+    async fn await_hip76_capability(
+        status: &mut tokio::sync::watch::Receiver<crate::Hip76SessionDiagnostics>,
+        requester_eligible: bool,
+        provider_available: bool,
+    ) -> crate::Hip76SessionDiagnostics {
+        tokio::time::timeout(LIVE_EVENT_TIMEOUT, async {
+            loop {
+                let diagnostics = status.borrow().clone();
+                if diagnostics.phase == Hip76ConnectionPhase::Active
+                    && diagnostics.registry_negotiated
+                    && diagnostics.requester_eligible == requester_eligible
+                    && diagnostics.provider_available == provider_available
+                {
+                    break diagnostics;
+                }
+                status.changed().await.expect("HIP-76 status sender");
+            }
+        })
+        .await
+        .expect("HIP-76 capability")
+    }
+
+    async fn await_ordinary_packet(
+        events: &mut mpsc::Receiver<PeerEvent>,
+        expected_peer: PeerId,
+        expected_packet: Packet,
+    ) {
+        tokio::time::timeout(LIVE_EVENT_TIMEOUT, async {
+            loop {
+                if let PeerEvent::Packet { peer, packet } =
+                    events.recv().await.expect("live peer event channel")
+                {
+                    assert_not_generic_hip76(&packet);
+                    if peer == expected_peer && packet == expected_packet {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("ordinary packet after HIP-76 exchange");
+    }
 
     #[tokio::test]
     async fn live_manager_connects_two_local_peers_and_completes_handshake() {
@@ -908,6 +1147,200 @@ mod tests {
         assert_eq!(retired_denuo.process.disabled, 0);
         client_manager.disconnect_all().await;
         server_manager.disconnect_all().await;
+    }
+
+    #[tokio::test]
+    async fn live_managers_complete_hip76_request_without_leaking_private_packets() {
+        let mut provider_config = LivePeerConfig::for_network(Network::Regtest);
+        provider_config.runtime.ping_interval = Duration::from_secs(60);
+        provider_config.hip76.provider_policy = Hip76ProviderPolicy::opted_in(true);
+        assert!(matches!(
+            provider_config.transport,
+            PeerTransport::Plaintext
+        ));
+        assert!(provider_config.hip76.provider_policy.is_available());
+
+        let mut requester_config = LivePeerConfig::for_network(Network::Regtest);
+        requester_config.runtime.ping_interval = Duration::from_secs(60);
+        assert!(matches!(
+            requester_config.transport,
+            PeerTransport::Plaintext
+        ));
+        assert!(!requester_config.hip76.provider_policy.is_opted_in());
+
+        let (provider_manager, mut provider_events) =
+            LivePeerManager::new(provider_config).expect("provider manager");
+        let (requester_manager, mut requester_events) =
+            LivePeerManager::new(requester_config).expect("requester manager");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let provider_address = listener.local_addr().expect("provider address");
+        let provider_accept = {
+            let manager = provider_manager.clone();
+            tokio::spawn(async move {
+                let (stream, requester_address) = listener.accept().await.expect("accept");
+                manager
+                    .accept_stream(stream, requester_address)
+                    .await
+                    .expect("register provider peer")
+            })
+        };
+        let requester_peer = requester_manager
+            .connect(provider_address)
+            .await
+            .expect("connect requester");
+        let provider_peer = provider_accept.await.expect("provider accept task");
+
+        let mut requester_hip76 = requester_manager
+            .subscribe_peer_hip76(requester_peer)
+            .await
+            .expect("requester HIP-76 subscription");
+        let mut provider_hip76 = provider_manager
+            .subscribe_peer_hip76(provider_peer)
+            .await
+            .expect("provider HIP-76 subscription");
+
+        let requester_remote_version = await_ready(&mut requester_events, requester_peer).await;
+        let provider_remote_version = await_ready(&mut provider_events, provider_peer).await;
+        assert_ne!(
+            requester_remote_version.services & DNS_RELAY_SERVICE.value(),
+            0,
+            "the opted-in provider must advertise the DNS output service"
+        );
+        assert_eq!(
+            provider_remote_version.services & DNS_RELAY_SERVICE.value(),
+            0,
+            "the default requester must not advertise the DNS output service"
+        );
+
+        let requester_diagnostics = await_hip76_capability(&mut requester_hip76, true, false).await;
+        assert!(requester_diagnostics.remote_provider_advertised);
+        assert!(!requester_diagnostics.local_provider_advertised);
+        let provider_diagnostics = await_hip76_capability(&mut provider_hip76, false, true).await;
+        assert!(provider_diagnostics.local_provider_advertised);
+        assert!(!provider_diagnostics.remote_provider_advertised);
+
+        let query = strict_nonrecursive_dnssec_query(0x76);
+        assert_eq!(u16::from_be_bytes([query[2], query[3]]), 0);
+        assert_eq!(
+            u32::from_be_bytes([
+                query[query.len() - 6],
+                query[query.len() - 5],
+                query[query.len() - 4],
+                query[query.len() - 3],
+            ]),
+            0x0000_8000
+        );
+        let pending = requester_manager
+            .begin_hip76_request(requester_peer, query.clone())
+            .await
+            .expect("admit requester request");
+        let request_id = pending.admission.request_id;
+        let generation = pending.admission.generation;
+        assert_ne!(request_id, 0);
+        assert!(pending.admission.deadline > tokio::time::Instant::now());
+
+        let (provider_provenance, provider_request) =
+            tokio::time::timeout(LIVE_EVENT_TIMEOUT, async {
+                loop {
+                    match provider_events
+                        .recv()
+                        .await
+                        .expect("provider event channel")
+                    {
+                        PeerEvent::Hip76ProviderRequest {
+                            provenance,
+                            request,
+                        } => break (provenance, request),
+                        PeerEvent::Packet { packet, .. } => assert_not_generic_hip76(&packet),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("provider f0 admission event");
+        assert_eq!(provider_provenance.peer, provider_peer);
+        assert_eq!(provider_provenance.direction, PeerDirection::Inbound);
+        assert_eq!(provider_provenance.transport, PeerTransportKind::Plaintext);
+        assert_eq!(provider_provenance.authenticated_remote_static, None);
+        assert_eq!(provider_request.request_id, request_id);
+        assert_eq!(provider_request.generation, generation);
+        assert_eq!(provider_request.query(), query);
+        let (provider_work, provider_query) = provider_request.into_parts();
+        assert_eq!(provider_work.request_id(), request_id);
+        assert_eq!(provider_work.generation(), generation);
+        assert_eq!(provider_query, query);
+
+        let response = correlated_dns_response(&query);
+        provider_manager
+            .finish_hip76_provider_request(
+                provider_peer,
+                provider_work,
+                DnsRelayStatus::Ok,
+                response.clone(),
+            )
+            .await
+            .expect("write correlated provider response");
+
+        let outcome = tokio::time::timeout(LIVE_EVENT_TIMEOUT, pending.outcome())
+            .await
+            .expect("requester per-admission outcome")
+            .expect("requester outcome channel");
+        let Hip76RequestOutcome::Response {
+            provenance,
+            response: requester_response,
+        } = outcome
+        else {
+            panic!("expected correlated HIP-76 response, got {outcome:?}");
+        };
+        assert_eq!(provenance.peer, requester_peer);
+        assert_eq!(provenance.address, provider_address);
+        assert_eq!(provenance.direction, PeerDirection::Outbound);
+        assert_eq!(provenance.transport, PeerTransportKind::Plaintext);
+        assert_eq!(provenance.authenticated_remote_static, None);
+        let (response_id, response_generation, status, untrusted_response) =
+            requester_response.into_parts();
+        assert_eq!(response_id, request_id);
+        assert_eq!(response_generation, generation);
+        assert_eq!(status, DnsRelayStatus::Ok);
+        assert_eq!(untrusted_response.as_bytes(), response);
+
+        requester_manager
+            .try_send(
+                requester_peer,
+                Arc::new(Packet::GetAddr),
+                OutboundPriority::Control,
+            )
+            .await
+            .expect("ordinary requester packet");
+        await_ordinary_packet(&mut provider_events, provider_peer, Packet::GetAddr).await;
+        provider_manager
+            .try_send(
+                provider_peer,
+                Arc::new(Packet::GetAddr),
+                OutboundPriority::Control,
+            )
+            .await
+            .expect("ordinary provider packet");
+        await_ordinary_packet(&mut requester_events, requester_peer, Packet::GetAddr).await;
+
+        requester_manager.disconnect_all().await;
+        provider_manager.disconnect_all().await;
+    }
+
+    #[test]
+    fn public_networks_reject_plaintext_peer_transport() {
+        for network in [Network::Mainnet, Network::Testnet] {
+            let mut config = LivePeerConfig::for_network(network);
+            config.transport = PeerTransport::Plaintext;
+            let error = config
+                .validate()
+                .expect_err("public network plaintext must fail closed");
+            assert!(
+                matches!(error, P2pError::Configuration(ref message) if
+                    message == "mainnet and testnet peer transport must use authenticated Brontide"),
+                "unexpected {network:?} plaintext validation error: {error}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@ pub mod brontide;
 pub mod constants;
 pub mod denuo;
 pub mod handshake;
+pub mod hip76;
 pub mod manager;
 pub mod runtime;
 pub mod wire;
@@ -29,12 +30,25 @@ pub use denuo::{
     DenuoRegistryIdentity, DenuoSummary, DENUO_DEFAULT_MAXIMUM_LIVE_REQUESTS,
 };
 pub use handshake::{HandshakeUpdate, PeerDirection, PeerHandshake, PeerState};
+pub use hip76::{
+    hip76_advertised_services, is_hip76_packet_type, DnsRelayOutputPolicy, DnsRelayRequesterPolicy,
+    DnsRelayStatus, Hip76ConfigurationError, Hip76ConnectionPhase, Hip76Error, Hip76Expiration,
+    Hip76FailureReason, Hip76Inbound, Hip76OutboundRequest, Hip76OutboundResponse,
+    Hip76PhaseCounts, Hip76ProcessTotals, Hip76ProtocolIdentity, Hip76ProviderDisposition,
+    Hip76ProviderPolicy, Hip76ProviderRejection, Hip76ProviderRequest, Hip76ProviderWork,
+    Hip76RequesterResponse, Hip76RevokedWork, Hip76Session, Hip76SessionConfig,
+    Hip76SessionDiagnostics, Hip76Summary, Hip76UntrustedDnsResponse, Hip76WriteToken,
+    HIP76_DEFAULT_MAXIMUM_LIVE_REQUESTS, MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE,
+    MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+};
 pub use manager::{
     normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, PeerBan,
     PeerTrafficTotals, PeerTransport,
 };
 pub use runtime::{
-    OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot,
+    AuthenticatedPeerKey, Hip76PeerProvenance, Hip76PendingRequest, Hip76RequestAdmission,
+    Hip76RequestOutcome, OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig,
+    PeerSnapshot, PeerTransportKind,
 };
 pub use wire::{
     decode_frame, encode_frame, peer_address_group, AddressHost, AsyncFrameReader,
@@ -153,6 +167,15 @@ pub enum P2pError {
         limit: usize,
         actual: usize,
     },
+    #[error(
+        "scoped experimental packet {packet_type:#04x} {context} limit exceeded: limit {limit}, actual {actual}"
+    )]
+    ScopedPacketLimit {
+        packet_type: u8,
+        context: &'static str,
+        limit: usize,
+        actual: usize,
+    },
     #[error("malformed frame: {0}")]
     MalformedFrame(String),
     #[error("malformed packet: {0}")]
@@ -175,6 +198,16 @@ pub enum P2pError {
     QueueTimeout {
         peer: PeerId,
         priority: OutboundPriority,
+    },
+    #[error("peer {peer:?} {protocol} command queue is full")]
+    ExperimentalQueueFull {
+        peer: PeerId,
+        protocol: &'static str,
+    },
+    #[error("peer {peer:?} HIP-76 operation rejected: {reason}")]
+    Hip76 {
+        peer: PeerId,
+        reason: Hip76FailureReason,
     },
     #[error("p2p state failed: {0}")]
     State(String),

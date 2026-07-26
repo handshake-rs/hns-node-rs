@@ -278,6 +278,57 @@ pub struct RpcExperimentalRegistryInfo {
     pub rejection_reasons: Vec<RpcExperimentalRejectionCount>,
 }
 
+/// Qname-free HIP-76 diagnostics aggregated across the currently live peer
+/// sessions. These counters intentionally do not claim DNS authenticity and
+/// do not include completed sessions after they leave the live peer map.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcHip76Info {
+    pub semantic_version: u16,
+    pub service_bit: u64,
+    pub request_packet_type: u8,
+    pub response_packet_type: u8,
+    pub maximum_query_body_size: u32,
+    pub maximum_request_payload_size: u32,
+    pub maximum_response_body_size: u32,
+    pub maximum_response_payload_size: u32,
+    pub registry_fingerprint: String,
+    pub registry_wire_profile: String,
+    pub experimental_status: String,
+    pub requester_default: String,
+    pub provider_default_opted_in: bool,
+    pub live_peers: u64,
+    pub awaiting_registry_peers: u64,
+    pub active_peers: u64,
+    pub revoked_peers: u64,
+    pub faulted_peers: u64,
+    pub disconnected_peers: u64,
+    pub requester_enabled_peers: u64,
+    pub requester_eligible_peers: u64,
+    pub provider_opted_in_peers: u64,
+    pub provider_backend_ready_peers: u64,
+    pub provider_available_peers: u64,
+    pub local_provider_advertised_peers: u64,
+    pub remote_provider_advertised_peers: u64,
+    pub registry_negotiated_peers: u64,
+    pub peer_faulted_peers: u64,
+    pub outbound_live_requests: u64,
+    pub inbound_live_requests: u64,
+    pub outbound_requests_created: u64,
+    pub outbound_requests_queue_admitted: u64,
+    pub outbound_requests_socket_written: u64,
+    pub inbound_requests_received: u64,
+    pub inbound_requests_accepted: u64,
+    pub provider_responses_created: u64,
+    pub provider_responses_queue_admitted: u64,
+    pub provider_responses_socket_written: u64,
+    pub requester_responses_received: u64,
+    pub outbound_socket_write_failures: u64,
+    pub outbound_queue_dropped_stale: u64,
+    pub expired_requests: u64,
+    pub revoked_requests: u64,
+    pub rejected_operations: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcNodeStatus {
     pub api_version: u32,
@@ -308,6 +359,8 @@ pub struct RpcNodeStatus {
     pub name_tree_compaction: RpcNameTreeCompactionInfo,
     pub undo_retention: RpcUndoRetentionInfo,
     pub experimental_registry: RpcExperimentalRegistryInfo,
+    #[serde(default)]
+    pub hip76: RpcHip76Info,
     pub authority: RpcAuthorityInfo,
     pub parity: RpcParityInfo,
 }

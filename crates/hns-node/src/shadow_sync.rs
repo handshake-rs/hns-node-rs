@@ -40,7 +40,8 @@ use hns_primitives::{
     blake2b_256, Block, BlockHash, CovenantKind, Header, Height, Reader, Txid, Writer,
 };
 use hns_rpc::{
-    BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcExperimentalRegistryInfo, RpcService,
+    BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcExperimentalRegistryInfo, RpcHip76Info,
+    RpcService,
 };
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use hns_store::mark_clean_shutdown;
@@ -64,7 +65,7 @@ use super::{
     completed_deployment_period_with_lookup, current_unix_time, expected_bits_with_lookup,
     json_rpc_error, load_block_index_record, load_header_record, mark_node_store_clean,
     median_time_past_with_lookup, mining_generation_from_snapshot, mining_snapshot_for_hash,
-    require_rpc_authorization, rpc_experimental_registry_info, AuthorityMode,
+    require_rpc_authorization, rpc_experimental_registry_info, rpc_hip76_info, AuthorityMode,
     ChainActivationFailure, DurableMiningState, FailedBlockMutation, FailedBlockStage,
     HeaderSummary, NativeRuntimeExtension, NodeBlockImport, NodeReorg, NodeService,
     RpcAuthorizationHeader, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
@@ -468,6 +469,8 @@ pub struct ShadowSyncDiagnostics {
     pub bytes_received: u64,
     pub peers: Vec<PeerSnapshot>,
     pub experimental_registry: RpcExperimentalRegistryInfo,
+    #[serde(default)]
+    pub hip76: RpcHip76Info,
     pub sync: SyncSnapshot,
     pub orphans: OrphanSnapshot,
     pub checkpoint_sequence: u64,
@@ -1700,6 +1703,7 @@ impl NodeService {
             dns_seed_failures,
             started_at: unix_time(),
             experimental_registry: initial_experimental_registry,
+            hip76: rpc_hip76_info(&[]),
             sync: scheduler.snapshot(),
             orphans: orphan_pool.snapshot(),
             checkpoint_sequence: initial_sequence,
@@ -3150,6 +3154,7 @@ fn compose_shadow_sync_rpc_service(
     snapshot.network_active = diagnostics.enabled;
     snapshot.peer_count = diagnostics.peers.len();
     snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
+    snapshot.node_status.hip76 = rpc_hip76_info(&diagnostics.peers);
     snapshot.node_status.release_stage = if node.config.mainnet_canary {
         "mainnet-canary-gated".to_owned()
     } else if node.config.mining_engine.enabled {
@@ -3501,6 +3506,15 @@ async fn handle_peer_event(
             })
             .await;
             tracing::debug!(%address, %reason, "inbound HNS peer rejected");
+        }
+        PeerEvent::Hip76CapabilityChanged { .. } => {
+            // Redacted HIP-76 capability is exposed by the manager's
+            // snapshot/watch surface and is intentionally not logged here.
+        }
+        PeerEvent::Hip76ProviderRequest { .. } => {
+            // Provider policy defaults off. A future explicitly configured
+            // resolver backend must consume this typed event without logging
+            // its DNS query.
         }
         PeerEvent::Packet { peer, packet } => match packet {
             Packet::Headers(headers) => {
@@ -5346,6 +5360,7 @@ async fn refresh_diagnostics(
     let mut state = diagnostics.write().await;
     state.bytes_sent = traffic.bytes_sent;
     state.bytes_received = traffic.bytes_received;
+    state.hip76 = rpc_hip76_info(&snapshots);
     state.peers = snapshots;
     state.experimental_registry = rpc_experimental_registry_info(&experimental_registry);
     state.sync = scheduler.snapshot();
