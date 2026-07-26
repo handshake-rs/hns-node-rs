@@ -851,7 +851,7 @@ mod tests {
         handshake::PeerState,
         runtime::{Hip76RequestOutcome, PeerTransportKind},
         wire::Packet,
-        DnsRelayStatus, Hip76ConnectionPhase,
+        DnsRelayRequesterPolicy, DnsRelayStatus, Hip76ConnectionPhase,
     };
     use hns_p2p_experimental::{
         DENUO_EXTENSION_MAX_NESTED_PAYLOAD, DENUO_EXTENSION_MAX_PACKET_PAYLOAD, DNS_RELAY_SERVICE,
@@ -1322,6 +1322,37 @@ mod tests {
             .await
             .expect("ordinary provider packet");
         await_ordinary_packet(&mut requester_events, requester_peer, Packet::GetAddr).await;
+
+        requester_manager
+            .replace_peer_hip76_policy(
+                requester_peer,
+                DnsRelayRequesterPolicy::Disabled,
+                Hip76ProviderPolicy::disabled(),
+                generation + 1,
+            )
+            .await
+            .expect("apply requester opt-out");
+        let opted_out = await_hip76_capability(&mut requester_hip76, false, false).await;
+        assert!(!opted_out.requester_enabled);
+        let error = requester_manager
+            .begin_hip76_request(requester_peer, strict_nonrecursive_dnssec_query(0x77))
+            .await
+            .expect_err("requester opt-out must reject new work");
+        assert!(matches!(
+            error,
+            P2pError::Hip76 { peer, reason }
+                if peer == requester_peer
+                    && reason == crate::Hip76FailureReason::RequesterDisabled
+        ));
+        requester_manager
+            .try_send(
+                requester_peer,
+                Arc::new(Packet::GetAddr),
+                OutboundPriority::Control,
+            )
+            .await
+            .expect("ordinary traffic after requester opt-out");
+        await_ordinary_packet(&mut provider_events, provider_peer, Packet::GetAddr).await;
 
         requester_manager.disconnect_all().await;
         provider_manager.disconnect_all().await;
