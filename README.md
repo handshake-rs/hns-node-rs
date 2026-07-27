@@ -504,6 +504,9 @@ the source commit recorded in
 Compiler gates:
 
 ```bash
+./scripts/check.sh
+
+# Equivalent individual commands:
 cargo metadata --locked --manifest-path Cargo.toml --format-version 1
 cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1
 cargo fmt --manifest-path Cargo.toml --all --check
@@ -518,6 +521,13 @@ cargo test --locked --manifest-path Cargo.toml \
 cargo build --locked --release --manifest-path Cargo.toml \
   --workspace --all-targets --all-features
 ```
+
+The complete gate ends by launching two isolated regtest `hsrd` processes,
+waiting for both standard Handshake peers to remain ready after canonical
+Denuo registry negotiation, and checking their matching fingerprints and
+bidirectional traffic through qname-free local diagnostics. Ports may be
+overridden with `HNS_NODE_RPC_A`, `HNS_NODE_RPC_B`, `HNS_NODE_P2P_A`, and
+`HNS_NODE_P2P_B`.
 
 The offline wrapper attempts the npm advisory audit with a bounded timeout. If
 the advisory service is unavailable, it reports that fact and continues the
