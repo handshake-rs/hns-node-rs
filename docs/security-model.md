@@ -2,9 +2,14 @@
 
 `hsrd` verifies consensus locally. Peers, snapshots, control clients, MeshMine
 inputs, caches, fixtures, synchronization checkpoints, and local databases are
-untrusted until promoted by an explicit validation stage. Until every parity
-gate passes, the pinned `hsd` revision remains the production oracle and
-`hsrd` has no native mainnet authority.
+untrusted until promoted by an explicit validation stage. The source
+consensus-readiness matrix is complete, but authority is still a runtime
+capability: only the explicit synchronized mainnet canary with a coherent
+durable authoritative tip may receive it. The pinned `hsd` revision remains an
+offline comparison oracle, not a runtime or production authority. API-v13's
+base snapshot initializes `release_stage: "pre-authority"`; live native RPC
+replaces it with a configuration-specific diagnostic stage that does not grant
+authority.
 
 ## Current trust boundary
 
@@ -71,12 +76,13 @@ The current foundation verifies or records evidence for:
 The default input verifier rejects non-coinbase spends. Native script
 verification must be selected explicitly. Successful configured script/name
 checks do not imply global mainnet authority; historical and live evidence
-remain separate gates.
+remain separate assurance work.
 
 Shadow-network input is non-authoritative. Downloaded bodies remain non-active
-by default. The explicitly acknowledged active-state mode may connect them to
-UTXO/name state through bounded atomic consensus batches, but neither mode can
-produce a mining authority capability. Candidate-derived contextual failures
+in observe-only mode. Native active-state mode may connect them to UTXO/name
+state through bounded atomic consensus batches and may receive a mining
+authority capability only when every canary, readiness, synchronization, and
+durable-tip gate passes. Candidate-derived contextual failures
 may poison the exact durable branch; local store/tree/backend/chain-view faults
 instead stop synchronization without changing branch validity. The mining
 engine may build diagnostic future templates from a durable active snapshot,
@@ -88,18 +94,20 @@ does not grant authority. Solved-block staging, connection, and
 publication require the same private authority capability as the existing
 authoritative mining boundary.
 
-API-v10 exposes the active tip's next-header interval-committed root for external
-qualification. `compare-hsrd-hsd-shadow.py` reads that material and a pinned
+Current API-v13 retains the next-header interval-committed root introduced in
+API-v10 for external qualification. `compare-hsrd-hsd-shadow.py` reads that
+material and a pinned
 HSD node, but its observations and evidence checkpoint never enter the store,
 fork-choice logic, validation services, mining event hub, or authority permit.
 A match is evidence for an observed boundary, not a consensus input. Remote
 diagnostic reads require an explicit acknowledgement, and HSD/hsrd tip changes
 during a probe are retried rather than classified as divergence.
 
-The following remain untrusted and release-blocking:
+The following remain hardening or assurance work; none is represented as a
+false source-readiness bit:
 
-- full-mainnet replay and independent invalid-corpus qualification of the
-  branch-gated historical route;
+- broader full-history replay beyond the qualified stopped state and retained
+  rollback horizon;
 - independent script fuzz/invalid evidence beyond the complete pinned HSD
   upstream corpus;
 - current/live claim-proof evidence and complete historical claim replay beyond
@@ -108,14 +116,13 @@ The following remain untrusted and release-blocking:
   deterministic all-family transition corpus;
 - deployment-scale compaction performance/priority qualification and RocksDB
   mid-commit process-crash/fault injection;
-- full-mainnet active-state IBD, pruning, and sustained
-  alternate-chain/reorganization qualification;
+- long-duration full-history active-state IBD, pruning, and sustained
+  alternate-chain/reorganization campaigns;
 - long-lived subthreshold peer reputation and sustained adversarial Brontide
   qualification;
 - production template qualification, continuously supervised publication
   retry, and measured publication latency;
-- complete mainnet replay, invalid corpus, sustained native multi-peer
-  qualification, and offline differential audits.
+- sustained native multi-peer qualification and offline differential audits.
 
 ## Authority policy
 
@@ -125,7 +132,8 @@ The following remain untrusted and release-blocking:
   configuration currently fails closed.
 - `native`: the default mainnet synchronization mode; mining remains fail
   closed until every readiness bit and the durable tip's authoritative status
-  pass.
+  pass. Those readiness bits are complete in current source, but the live-tip
+  requirements are evaluated continuously.
 - `native-experimental`: requires the `experimental-authority` Cargo feature,
   explicit incomplete-consensus acknowledgement, and regtest/simnet.
 
@@ -134,9 +142,10 @@ The mining engine cannot manufacture the private authority capability through it
 configuration, template cache, mempool, diagnostics, or durable intent queue.
 
 A private `MiningAuthorityPermit` is required by authoritative mining
-subscriptions and candidate admission. Normal modes do not receive it. Future
-mainnet modes must issue the same capability only after complete readiness and
-an authoritative durable tip.
+subscriptions and candidate admission. `disabled`, `shadow`, observe-only, and
+incomplete native states do not receive it. The explicit native mainnet canary
+issues the same capability only after complete readiness and an authoritative
+durable tip.
 
 ## Network-input policy
 
@@ -172,6 +181,11 @@ an authoritative durable tip.
 - Header-derived deployment diagnostics walk only the validated canonical
   ancestry and bind any historical-script assumption to the exact final
   configured checkpoint; they do not confer body, state, or mining authority.
+- Denuo registry agreement and HIP-76 role/session state are connection-local
+  experimental transport capabilities. Requester operation can be disabled;
+  provider advertisement requires explicit opt-in and a ready backend. Neither
+  DNS relay negotiation nor received DNS bytes grant consensus or mining
+  authority.
 
 ## Mining-engine and publication policy
 
@@ -224,7 +238,8 @@ Fixtures are evidence, not authority.
 - Unsupported consensus data fails closed.
 - Malformed parser input returns bounded errors rather than panicking.
 - Missing signature verification rejects spends.
-- Claim/airdrop issuance rejects until proof validation exists.
+- Claim/airdrop issuance rejects unless its implemented native proof validation,
+  allocation, deployment, and duplicate-prevention checks pass.
 - Missing deployment-derived name flags reject contextual name transitions.
 - A failed staged reorganization commits no durable operation.
 - Root, schema, network, genesis, or profile mismatch requires explicit operator

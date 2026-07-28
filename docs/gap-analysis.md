@@ -78,8 +78,8 @@
   and pinned-root reachable union. Malformed pins and failed commits preserve
   every node.
 - Opt-in height-gated startup scheduling and forced serialized maintenance with
-  an atomic checksummed last-run checkpoint, API-v10 status, and unclean RocksDB
-  reopen evidence.
+  an atomic checksummed last-run checkpoint, compaction status introduced in
+  API-v10 and retained in current API-v13, and unclean RocksDB reopen evidence.
 - Exact HSD `pruneAfterHeight`/`keepBlocks` constants and opt-in atomic undo
   retirement, including startup catch-up, pruning-aware pinned-root compaction,
   deep-reorg rejection, checksummed checkpoints, and unclean RocksDB reopen.
@@ -118,9 +118,13 @@
 
 - Exact bounded HNS framing and sync packet behavior with pinned HSD wire
   fixtures.
-- Live inbound/outbound plaintext peers with handshake, service, self-connect,
-  timeout, ping/pong, priority-queue controls, and cancellation-safe partial
-  frame reads across timer maintenance.
+- Live inbound/outbound Brontide peers on public networks and plaintext peers
+  on regtest/simnet, with handshake, service, self-connect, timeout, ping/pong,
+  priority-queue controls, and cancellation-safe partial frame reads across
+  timer maintenance.
+- Canonical Denuo Experimental V1 registry negotiation after the ordinary
+  Handshake handshake, plus bounded role-safe HIP-76 live sessions with
+  requester opt-out and provider/backend explicit opt-in.
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
 - HSD score-100/24-hour normalized-IP bans with IP-wide live disconnect,
   pre-handshake inbound/outbound rejection, bounded restart persistence,
@@ -160,9 +164,10 @@
   contextual state/reorg pipeline, with restart resumption, exact failed-root
   attribution, local-fault separation, shutdown-responsive eight-block direct
   slices, and full-configured-bound atomic reorganizations.
-- API-v10 next-header committed-root diagnostics and a pinned-source external HSD comparator
-  with coherent-tip retries, provisional/confirmed root labels, and bounded
-  checksummed restart/reorganization evidence.
+- Next-header committed-root diagnostics introduced in API-v10 and retained in
+  current API-v13, plus a pinned-source external HSD comparator with coherent-tip
+  retries, provisional/confirmed root labels, and bounded checksummed
+  restart/reorganization evidence.
 - Non-authoritative diagnostics; network data cannot grant mining authority.
 
 ### Mempool, template, and publication foundation
@@ -217,21 +222,25 @@
 - Staged versus authoritative event channels.
 - Explicit authority modes, capability-gated authoritative paths, readiness
   blockers, parity status, and read-only diagnostics.
-- Nested-workspace CI definition, static fixture/schema/authority checks, and a
-  C-level vendored secp256k1 smoke test.
+- Independent root and fuzz-workspace CI, locked dependency policy, a release
+  build, and a two-node regtest standard-P2P/Denuo negotiation qualifier.
 
-These are substantial foundations, not a production full node.
+These foundations now satisfy the source consensus-readiness matrix. Production
+eligibility still depends on the explicit synchronized canary, deployment
+operations, independent review, and the hardening work below. API-v13's base
+snapshot uses `release_stage: "pre-authority"`; live native RPC replaces it
+with a configuration-specific diagnostic stage.
 
-## Mandatory missing work
+## Remaining hardening and release work
 
 ### Consensus and authenticated state
 
-- Full-mainnet replay and contextual invalid-corpus qualification of the now
-  composed checkpoint fast path. The independently generated corpus now
-  includes 22 non-contextual rejections and 8 state-boundary rejections with
-  exact atomicity checks, but positive/negative coverage is not yet complete
-  for every contextual claim, airdrop, name, deployment, and reorganization
-  rule family.
+- Broader full-history auditing of the composed checkpoint fast path beyond the
+  qualified height-339,654 stopped state and complete 288-block retained
+  rollback horizon. The independent corpus contains 24 noncontextual cases and
+  12 contextual state-boundary cases: 30 invalid mutations, six valid controls,
+  and exact atomicity checks. Broader positive/negative coverage remains useful
+  for contextual claim, airdrop, name, deployment, and reorganization families.
 - Independently generated script fuzz/invalid corpora beyond the complete
   pinned HSD upstream suite.
 - Independently sourced live DNSSEC-proof evidence for historical-policy
@@ -246,10 +255,10 @@ These are substantial foundations, not a production full node.
 - Deployment-scale Urkel compaction performance/priority qualification and
   RocksDB mid-commit process-crash/fault injection.
 
-### Chain and network qualification
+### Chain and network hardening
 
-- Full-mainnet replay, sustained fork, persistent pruning-horizon discovery,
-  and pruning qualification of the bounded restartable active-state connector.
+- Longer-running full-history, sustained-fork, pruning-horizon, and pruning
+  campaigns for the bounded restartable active-state connector.
 - Failed-branch pruning/retention policy, historical reorganizations, and
   RocksDB fault evidence.
 - Long-lived subthreshold reputation, broader peer-diversity controls beyond
@@ -259,16 +268,15 @@ These are substantial foundations, not a production full node.
 - Sustained multipath publication and reconnect/retry supervision under WAN
   partitions and queue saturation.
 
-### Mining authority
+### Mining deployment
 
 - A deployed long-duration run of the implemented authority-only future-template
   stream, durable exact gateway activation, immediate stale-job retirement, and
   current-tip publication fence against physical ASICs.
-- End-to-end candidate validation against a historically qualified active state.
-- Complete historical mainnet replay against the pinned HSD oracle.
 - Positive and negative invalid corpora for every rule family.
-- Byte-for-byte UTXO, name-state, Urkel-root, deployment, undo, and
-  reorganization parity.
+- Additional byte-for-byte UTXO, name-state, Urkel-root, deployment, undo, and
+  reorganization audits beyond the stopped-state and retained-horizon
+  qualifications.
 - Sustained native multi-peer evidence through restarts, partitions, tip races,
   and real reorganizations, plus offline differential audits of retained
   canonical history; no runtime HSD shadow is required.
@@ -276,6 +284,12 @@ These are substantial foundations, not a production full node.
   and first-peer-acceptance latency.
 - Reproducible builds, external review, fuzzing, and published latency/recovery
   evidence.
+
+The conditional mainnet canary permit path, invalid-corpus readiness,
+stopped-state parity, and retained-horizon rollback qualification are
+implemented. The items above are production hardening and assurance work, not
+hidden false readiness bits; no base or live release-stage diagnostic grants
+production authority.
 
 ## Explicitly excluded product work
 

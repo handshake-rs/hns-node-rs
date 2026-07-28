@@ -33,34 +33,35 @@ service unit from this repository. The original remains at
 
 MeshMine's `meshmine-hsrd-bridge`, unified miner, CI job, HSD-oracle
 generators, and source-handoff/comparison scripts were outside `hsrd/` and are
-not included here. MeshMine has deliberately not yet been rewired to consume
-this repository. Committed Rust fixtures, qualification artifacts, vendored
-cryptographic sources, and the independent fuzz workspace were inside the
-prefix and are preserved.
+not included here. MeshMine was subsequently rewired to consume this repository
+and currently pins
+`504d3fed035feb8a637ca09c4e0816b6e1144622`. Committed Rust fixtures,
+qualification artifacts, vendored cryptographic sources, and the independent
+fuzz workspace were inside the prefix and are preserved.
 
 Documentation retains the source-only oracle and comparison procedures because
 they describe how the committed evidence was produced. Run those commands from
 the source MeshMine commit above; run Cargo and installed-binary commands from
 this standalone repository as documented.
 
-## Readiness documentation caveat
+## Post-extraction status
 
-The extracted source contains a known release-status inconsistency that this
-mechanical extraction does not resolve:
+The extraction hashes above are immutable provenance. Later standalone commits
+qualified the workspace, promoted retained mainnet historical replay, and
+added live Denuo registry and role-safe HIP-76 negotiation. At standalone commit
+`42c76a622f2600a833835b4ca737d3350f73af52`, every
+`RpcConsensusReadiness` field is true and the strict mainnet canary can issue
+its private permit only for a synchronized, durably authoritative tip.
+API-v13's base snapshot initializes `release_stage: "pre-authority"`, while
+live native RPC replaces it with a configuration-specific diagnostic stage.
+Functional readiness and a conditional permit therefore do not imply
+independent production endorsement.
 
-- `crates/hns-node/src/lib.rs` reports every `RpcConsensusReadiness` field as
-  true, including historical replay and invalid-corpus readiness.
-- `qualification/mainnet-339654/`,
-  `qualification/mainnet-339660/`, and later sections of
-  `docs/mainnet-canary.md` and `docs/readiness.md` record the stopped-state,
-  retained rollback, and invalid-corpus promotions.
-- Earlier text in `README.md`, `docs/readiness.md`, and
-  `docs/gap-analysis.md` still describes the node as pre-authority or lists
-  some promoted gates as incomplete.
-
-Until those claims receive a dedicated evidence review and one consistent
-documentation update, treat the strict mainnet canary as an implementation and
-qualification mechanism, not as independent production endorsement.
+MeshMine's pinned `504d3fed035feb8a637ca09c4e0816b6e1144622` revision
+already includes the promoted historical-replay and invalid-corpus readiness
+but predates the later standalone Denuo/HIP-76 commits. Consumers must describe
+features against the revision they actually pin rather than against either the
+old embedded snapshot or an unconsumed standalone HEAD.
 
 ## Storage compatibility
 

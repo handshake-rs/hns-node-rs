@@ -9,8 +9,8 @@ a mining capability.
 
 ## Comparison material
 
-API-v10 `/api/v1/status` exposes the active block hash/height and
-`active_state_resulting_root`. The latter is the interval-committed name-tree
+Current API-v13 `/api/v1/status` retains the active block hash/height and
+`active_state_resulting_root` fields introduced in API-v10. The latter is the interval-committed name-tree
 root that the next block must place in its header. HSD applies name changes to
 a working transaction every block but commits that transaction only at the
 network `treeInterval`; comparison at hsrd height `H` therefore uses:

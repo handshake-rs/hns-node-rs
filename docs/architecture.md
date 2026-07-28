@@ -104,15 +104,17 @@ staged disconnect/connect overlay
 
 No intermediate disconnect or connect is visible in durable state. On any
 error, the underlying batch is dropped and the original chain remains intact.
-This solves database atomicity; complete historical reorganization consensus
-parity remains a separate qualification gate.
+Database atomicity, the qualified stopped state, and the complete retained
+rollback horizon satisfy the source readiness gate. Broader historical and
+long-running reorganization campaigns remain assurance work.
 
 ## State and storage
 
 `hns-state` is the only UTXO/name-state writer. It resolves and authorizes all
 transaction inputs before staging spends, verifies contextual covenant linkage,
-then stages value changes and undo data. Claim/airdrop and complete name-state
-work remain fail-closed.
+then stages value changes and undo data. Claims, airdrops, and name-state
+transitions use their implemented native validators and remain fail closed on
+missing proof, deployment, allocation, or authenticated-state context.
 
 Memory-store snapshots are cloned immutable maps. RocksDB snapshots retain a
 sequence-consistent `rocksdb::Snapshot`, so related reads cannot cross a commit
@@ -124,5 +126,10 @@ to the mining lane's reserved storage budget.
 `hns-consensus` is deterministic, synchronous, and independent of networking,
 storage, RPC, MeshMine, and wall clocks. `hsd`, historical mainnet, `hnsd`, and
 Urkel/liburkel are comparison oracles, not runtime architectural dependencies.
-The production authority transition is governed by
+Ordinary VERSION/VERACK precedes the connection-local Denuo Experimental V1
+registry exchange; typed HIP-76 `f0`/`f1` traffic is admitted only after that
+agreement and under separate requester/provider role policy. These extensions
+do not enter consensus or authority.
+
+The authority and production-hardening boundary is governed by
 [`mining-node-scope.md`](mining-node-scope.md).

@@ -15,15 +15,24 @@ exists for diagnostics, operations, and differential testing.
 
 This repository preserves the history of MeshMine's former `hsrd/` subtree.
 See [the extraction provenance](docs/extraction-provenance.md) for the exact
-source and split commits, the standalone boundary, and an important unresolved
-inconsistency between the readiness code/evidence and older release-stage
-prose.
+source and split commits, the standalone boundary, and the post-extraction
+release qualification.
 
 ## Current release stage
 
-`hsrd` remains **pre-authority**. The pinned `hsd` revision is still the
-offline behavioral oracle; it is not a runtime parent or production authority.
-The default mode is `native`.
+The current source has complete functional consensus readiness: every
+`RpcConsensusReadiness` field is true, including historical replay and the
+independent invalid corpus. The retained stopped-state and 288-block rollback
+qualifications are recorded under `qualification/`. This source qualification
+does not by itself make an arbitrary process or deployment authoritative.
+`NodeService` initializes a base snapshot with `release_stage:
+"pre-authority"`; the live native-sync RPC composer replaces that field with
+`native-sync-live-p2p`, `mining-engine-observe`, or
+`mainnet-canary-gated` according to the active configuration. Those are
+diagnostic mode labels, not readiness or authority grants.
+
+The pinned `hsd` revision remains the offline behavioral oracle; it is not a
+runtime parent or production authority. The default mode is `native`.
 `native-experimental` requires an explicit Cargo feature, an explicit runtime
 acknowledgement, and regtest or simnet. No incomplete validation or
 synchronization stage is presented as complete Handshake consensus.
@@ -32,14 +41,15 @@ The Core/operator integration has no runtime HSD dependency. It consumes the
 hsrd-specific atomic `getparentauthority` snapshot, and it will accept that
 snapshot only when the RPC listener is protected with
 `--rpc-authorization-header-file` and every native authority/readiness and
-durable-tip gate passes. Because readiness is currently incomplete, this is a
-fail-closed integration boundary rather than a claim of mainnet mining authority.
+durable-tip gate passes. A current build can issue the private mining permit
+only for that coherent synchronized tip; a stale, staged, unauthenticated, or
+otherwise incomplete snapshot remains fail closed.
 
 Native mainnet operation has a second explicit lock: `--mainnet-canary`. The
 flag is accepted only with the hardened native-sync/mining configuration and it
 cannot bypass synchronization, durable tip authority, or any consensus
 readiness bit. See [Native mainnet mining canary](docs/mainnet-canary.md) for
-the runnable sync command and its current fail-closed outcome.
+the runnable sync command and exact runtime qualification boundary.
 
 Live peers also negotiate the collision-detectable
 [Denuo Experimental V1 profile](docs/experimental-mainnet-profile.md) after
@@ -60,7 +70,8 @@ and name-state foundations, a live native P2P/synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication
 foundation. Native synchronization can produce fully validated durable block
 status, but the mining engine cannot authorize jobs or publish solved blocks
-without the private authority capability and complete readiness. API-v13
+without the private authority capability and a currently authoritative durable
+tip. API-v13
 exposes the exact next-header interval-committed root, and the external comparison
 runner can check it against a pinned live HSD node without feeding oracle data
 back into consensus.
@@ -69,8 +80,9 @@ back into consensus.
 
 Implemented:
 
-- Separate nested-workspace CI for formatting, Clippy, feature matrices, tests,
-  release builds, and RustSec checks.
+- Independent root and fuzz-workspace CI for locked metadata and dependency
+  policy, formatting, Clippy, feature matrices, tests, release builds, and
+  RustSec checks, followed by a two-node regtest P2P/Denuo qualification.
 - Explicit validation-stage bits rather than coarse `tx_valid` or
   `state_connected` labels.
 - `disabled`, legacy `shadow`, fail-closed `native`, reserved `hsd-verified`, and explicitly gated
@@ -163,8 +175,8 @@ Implemented:
   checkpoint assumptions for body sanity, proof cryptography/output binding,
   maturity/value/reward checks, sequence locks, contextual sigops, covenant
   links, scripts, and BID/REDEEM NameState reads. The runtime records the exact
-  route in each state result; full-mainnet replay remains an independent
-  qualification and authority gate.
+  route in each state result. Broader full-history replay remains an independent
+  audit and hardening campaign, not a false consensus-readiness bit.
 - Exact bounded HSD Claim envelope encoding, blob-only Claim hashes, and the
   checksummed ownership TXT payload codec for all four network prefixes.
 - Compression-free DNSKEY/DS/TXT/RRSIG ownership-proof parsing, exact HSD
@@ -190,12 +202,13 @@ Implemented:
   signatures, plus an upstream production-root GooSig allocation through the
   active node's durable duplicate-prevention path.
 
-Still release-blocking:
+Remaining release hardening:
 
 - broader independently generated script fuzz and invalid corpora beyond HSD's
   upstream suite;
-- complete mainnet replay and independent review of the Rust wrapper and script
-  integration.
+- broader historical replay and independent review of the Rust wrapper and
+  script integration beyond the retained qualification used for source
+  readiness.
 
 ## Covenant, name-state, Urkel-root, and best-chain foundations
 
@@ -243,7 +256,8 @@ Implemented:
   commits leave all records unchanged.
 - HSD-shaped opt-in startup scheduling with a nonzero block-height interval
   (10,000 by default), a checksummed last-run checkpoint committed in the same
-  batch as deletions, manual serialized maintenance, and API-v9 status counts.
+  batch as deletions, manual serialized maintenance, and current API-v13 status
+  counts (introduced with the API-v9 compaction diagnostics).
 - Optional HSD-shaped undo retirement preserves heights through
   `pruneAfterHeight` and the newest `keepBlocks`, advances a checksummed
   checkpoint in the same batch as each status/undo deletion, preserves
@@ -263,7 +277,7 @@ Implemented:
 - Durable non-active header/index/body storage and validated atomic activation
   of a strictly greater-work replacement branch.
 
-Still release-blocking:
+Remaining release hardening:
 
 - independently sourced live DNSSEC-proof evidence for historical-policy
   qualification and complete claim replay beyond the pinned initial,
@@ -272,7 +286,8 @@ Still release-blocking:
 - full contextual covenant parity across mainnet history;
 - deployment-scale compaction performance/priority qualification and RocksDB
   mid-commit process-crash/fault injection for the incremental Urkel lifecycle;
-- complete historical root, undo, and reorganization replay.
+- broader historical root, undo, and reorganization campaigns beyond the
+  qualified retained rollback horizon.
 
 ## Live native P2P and restartable synchronization
 
@@ -364,20 +379,23 @@ Implemented:
   provisional-versus-confirmed root labeling, and a checksummed bounded
   restart/reorganization evidence checkpoint.
 
-Still release-blocking:
+Remaining network and operational hardening:
 
 - Long-lived subthreshold peer reputation and broader adversarial network
   qualification;
 - sustained adversarial qualification of the implemented ordinary,
   claim/airdrop, and solved-block relay paths;
-- production qualification of contextual active-state IBD across full mainnet
-  replay and sustained reorganizations;
+- long-duration production-scale contextual active-state IBD and sustained
+  reorganization campaigns beyond the stopped-state and retained-horizon
+  qualifications;
 - pruning-aware synchronization, invalid-branch pruning policy, and production
   Urkel lifecycle qualification;
 - sustained live HSD state/root agreement campaigns using the comparison
   runner across restarts, partitions, and real reorganizations;
-- qualified active-state IBD, live HSD comparison, and native mainnet mining
-  authority.
+- continued live HSD comparison across changing mainnet conditions. The
+  conditional mainnet canary permit path is implemented but remains dependent
+  on the explicit synchronized canary and durable runtime gates; no base or
+  live release-stage diagnostic bypasses those gates.
 
 ## Bounded mempool, templates, and solved-block publication
 
@@ -428,14 +446,17 @@ Implemented:
   reorganizations, and accepted mempool generations.
 - `getminingengineinfo` and `/api/v1/mining-engine` diagnostics.
 
-Still release-blocking:
+Remaining mining-path hardening:
 
-- qualified full-mainnet active-state IBD and the incremental production Urkel
-  lifecycle;
+- long-duration full-history active-state and incremental production Urkel
+  lifecycle campaigns;
 - sustained live HSD comparison evidence across restarts, partitions, and real
   reorganizations;
 - measured template/job and solved-block publication latency;
-- native mainnet authority.
+- physical deployment qualification. The mainnet canary can issue a permit
+  only at a synchronized authoritative tip; its `mainnet-canary-gated` live
+  release-stage label describes that mode rather than proving the tip is
+  currently authorized.
 
 See [`docs/mining-engine.md`](docs/mining-engine.md).
 
@@ -445,11 +466,16 @@ results, and their qualification limits are in
 
 ## Authority gates
 
-Native mainnet authority remains disabled until all readiness fields report
-complete and historical/live evidence is independently reviewed. The live
-network path is available in `disabled`, legacy `shadow`, or `native` authority
-modes. A complete durable block status is necessary but cannot alone produce a
-`MiningAuthorityPermit` while readiness remains incomplete.
+Every functional readiness field currently reports complete. The base snapshot
+uses `release_stage: "pre-authority"` and live native RPC replaces it with a
+configuration-specific stage. A native mainnet permit is nevertheless fail
+closed unless `--mainnet-canary` passes its
+hardened configuration checks and the live best header, active state, chainwork,
+durable status, and pending-chain view form one coherent authoritative tip. The
+live network path is available in `disabled`, legacy `shadow`, or `native`
+authority modes; only the qualified `native` path can receive a
+`MiningAuthorityPermit`. Independent review and longer operational campaigns
+remain release-hardening work rather than hidden readiness overrides.
 
 See:
 

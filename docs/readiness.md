@@ -1,6 +1,12 @@
 # Readiness status
 
-Status labels describe source maturity, not production authority.
+Status labels describe source maturity, not production authority. At the
+current source revision every `RpcConsensusReadiness` field is true, including
+historical replay and invalid-corpus readiness. Runtime authority remains
+conditional on the explicit mainnet canary, exact synchronization, and a
+coherent durable authoritative tip. API-v13 initializes the base
+`release_stage` as `pre-authority`, then the live native RPC composer replaces
+it with a configuration-specific diagnostic stage.
 
 ## Scope and primitives — foundation present
 
@@ -12,9 +18,10 @@ Implemented:
 - Complete canonical HSD genesis-block fixtures for all four networks with
   strict import, durable state restart, and mainnet block-1 continuation.
 
-Remaining: broaden valid/invalid vectors and fuzz every parser family.
+Further hardening: broaden valid/invalid vectors and sustain fuzzing across
+every parser family.
 
-## Consensus kernel — substantial foundation, not complete
+## Consensus kernel — source readiness complete
 
 Implemented:
 
@@ -69,9 +76,9 @@ Implemented:
   Goosig 0.11.0 airdrop verification, including an upstream production-root
   GooSig proof through active block connection and durable duplicate rejection.
 
-Remaining:
+Further hardening (not false readiness bits):
 
-- full-mainnet qualification of the composed historical route and broader
+- broader full-history auditing of the composed historical route and broader
   contextual invalid/fuzz corpora beyond the independently generated
   non-contextual and core UTXO/lock/script state-boundary block corpora;
 - independently sourced live DNSSEC-proof evidence for historical-policy
@@ -82,7 +89,7 @@ Remaining:
   for every remaining claim, airdrop, name, deployment, and reorganization
   rule family.
 
-## State and reorganization engine — hardened foundation
+## State and reorganization engine — qualified foundation
 
 Implemented:
 
@@ -103,7 +110,8 @@ Implemented:
 - Validated mark-and-sweep compaction retaining the current, undo, and pinned
   root union, including idempotence and failed-commit atomicity evidence.
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
-  atomic checksummed last-run checkpoint, API-v10 diagnostics, and unclean
+  atomic checksummed last-run checkpoint, compaction diagnostics introduced in
+  API-v10 and retained in current API-v13, and unclean
   RocksDB reopen evidence.
 - Matching clean checkpoints audit the complete network reorganization/undo
   suffix with keyed reads; unclean or stale checkpoints retain exhaustive
@@ -118,20 +126,24 @@ Implemented:
   strict greater-work fork choice, and restart recovery gates.
 - Schema/network/genesis/profile/epoch/root identity checks.
 
-Remaining:
+Further hardening:
 
 - deployment-scale compaction performance/priority qualification and broader
   RocksDB mid-commit process-crash/fault injection;
-- full-mainnet qualification of historical contextual claim/airdrop behavior;
+- broader full-history auditing of historical contextual claim/airdrop behavior;
 - production-scale pruning and RocksDB crash/fault qualification;
 - sustained live mainnet reorganization/root campaigns.
 
-## Live P2P and synchronization — native foundation implemented
+## Live P2P and synchronization — native path implemented and qualified
 
 Implemented:
 
 - exact bounded HNS frames and sync-relevant packets with HSD oracle fixtures;
 - inbound/outbound plaintext sessions and VERSION/VERACK negotiation;
+- post-VERSION canonical Denuo Experimental V1 registry negotiation with exact
+  fingerprint agreement, plus a live role-safe HIP-76 requester/provider
+  session whose requester can opt out and whose provider remains explicit
+  opt-in with a ready backend;
 - process-local self-connection detection, service checks, timeouts, ping/pong,
   priority outbound lanes, and cancellation-safe partial frame reads across
   timer maintenance;
@@ -174,8 +186,9 @@ Implemented:
   eight-block shutdown-responsive direct slices, full-bound atomic
   reorganizations, exact contextual-invalid ancestry, and fail-closed
   local-fault separation;
-- API-v10 next-header committed-root material plus a pinned-source, race-safe external HSD
-  block/root comparator with checksummed bounded evidence and explicit
+- next-header committed-root material introduced in API-v10 and retained in
+  current API-v13, plus a pinned-source, race-safe external HSD block/root
+  comparator with checksummed bounded evidence and explicit
   restart/reorganization accounting;
 - complete native mainnet active-state replay through height 339,660, a
   passing stopped-state comparison of physical UTXOs, HSD-compatible name
@@ -185,7 +198,7 @@ Implemented:
 - bounded read-only header, inventory, block, and transaction serving;
 - reserved critical-lane parallel fan-out used by the mining publication path.
 
-Remaining:
+Further network hardening:
 
 - long-lived subthreshold reputation, broader peer-diversity controls, and
   adversarial network qualification;
@@ -198,7 +211,7 @@ validated state only after an atomic batch commits; the explicit mainnet canary
 still requires exact synchronization, durable authoritative status, and every
 consensus readiness bit.
 
-## Mining engine — bounded foundation implemented
+## Mining engine — bounded authority path implemented
 
 Implemented:
 
@@ -237,12 +250,13 @@ Implemented:
   pre-airdrop coinbase assembly;
 - mining-engine readiness and queue diagnostics.
 
-Remaining:
+Further mining-path hardening:
 
-- retained-horizon disconnect/reconnect qualification before native mainnet
-  authority promotion;
 - measured tip-to-job and candidate-to-peer latency under WAN and load;
-- native mainnet authority qualification.
+- physical gateway/ASIC campaigns and longer-duration canary operation. The
+  conditional native permit path and retained-horizon disconnect/reconnect
+  qualification are implemented; no release-stage diagnostic is itself an
+  authority grant.
 
 ## MeshMine composition — operator foundation implemented
 

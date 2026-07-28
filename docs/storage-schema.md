@@ -407,8 +407,9 @@ scheduling. In undo-pruned mining mode the same scheduler also runs during
 native replay. A nonzero height interval (10,000 by default) prevents repeated
 work at the same tip. The checksummed height/tip/count completion checkpoint is
 written only after every deletion chunk succeeds; malformed checkpoints fail
-startup. API-v10 status reports the configured policy and last completed
-result. During the serialized pass it serves an explicitly marked, timestamped
+startup. Current API-v13 status retains the configured policy and
+last-completed result fields introduced in API-v10. During the serialized pass
+it serves an explicitly marked, timestamped
 cached diagnostic snapshot, while authority-bearing reads continue waiting for
 live state. Unclean RocksDB reopen tests verify that interrupted deletion
 resumes safely and that a completion checkpoint agrees with the compacted node

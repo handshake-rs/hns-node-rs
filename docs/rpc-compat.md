@@ -55,6 +55,13 @@ snapshots only.
   separate packet-created, queue-admitted, socket-written, failed-write, and
   stale-drop counters. It never exposes request IDs, question names, raw DNS
   bodies, response statuses, or deadlines.
+- API-v13's base `NodeService` snapshot initializes `release_stage:
+  "pre-authority"`. The native-sync composer replaces it in live RPC with
+  `native-sync-live-p2p`, `mining-engine-observe`, or
+  `mainnet-canary-gated`, according to configuration. These diagnostic stages
+  are intentionally separate from the all-true `consensus_readiness` object
+  and from a conditional mainnet-canary permit at a coherent authoritative
+  live tip.
 - Native status, authority, parity, and mining-engine diagnostics bind before
   startup replay and remain available while the state coordinator is occupied
   by a connect slice or name-tree compaction. Each response reports

@@ -47,6 +47,11 @@ transition across the complete 288-block retained horizon through height
 [`../qualification/mainnet-339660/`](../qualification/mainnet-339660/).
 Historical replay readiness is promoted; a synchronized mainnet canary may now
 activate mining jobs without a live HSD or shadow connection.
+The base `NodeService` snapshot initializes `release_stage:
+"pre-authority"`, but the live native RPC composer reports
+`mainnet-canary-gated` for this configuration. That mode label is not a
+readiness bit and does not say whether the private permit is currently
+available.
 
 Create a private file containing one complete Authorization value, such as
 `Bearer <random-secret>`, then check the operational configuration:

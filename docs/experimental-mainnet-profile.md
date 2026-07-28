@@ -28,9 +28,11 @@ not official global Handshake assignments.
 ## Connection behavior
 
 The node advertises the ordinary network service and the Denuo extension
-service. It does not advertise DNS relay, ODoH, HNSR, marketplace, or any
-provider/output role until the corresponding runtime and consent boundary
-exist.
+service. The HIP-76 DNS-output service bit is stripped by default and is
+advertised only when the operator explicitly opts into the provider role and
+declares its backend ready. Requester `Auto` policy does not advertise a
+provider role and can be disabled. ODoH, HNSR, marketplace, and other
+provider/output roles remain unadvertised.
 
 Ordinary VERSION/VERACK completes first. An outbound peer then initiates the
 first `DENUO_EXT` exchange only if the remote VERSION advertised the extension
@@ -53,9 +55,11 @@ experimental traffic for that connection. It does not by itself ban or
 disconnect the peer, and ordinary headers, blocks, transactions, compact-block
 negotiation, address exchange, and ping/pong remain available.
 
-Only packet `0xf4` enters this coordinator. Every other unknown packet remains
-opaque to the ordinary P2P event consumer. Unknown Denuo subprotocols are
-bounded and rejected without being assigned new semantics.
+Only packet `0xf4` enters the registry coordinator. Once registry agreement is
+active, HIP-76 packets `0xf0` and `0xf1` enter their separate typed,
+role-governed session before generic packet delivery. Every other unknown
+packet remains opaque to the ordinary P2P event consumer. Unknown Denuo
+subprotocols are bounded and rejected without being assigned new semantics.
 
 ## Diagnostics
 
@@ -63,7 +67,9 @@ bounded and rejected without being assigned new semantics.
 canonical identity and wire profile, advertised state, peer negotiation
 counts, bounded message totals, and a closed set of rejection reasons.
 Per-peer native diagnostics report the connection's negotiation phase,
-disable reason, and negotiated limits.
+disable reason, negotiated limits, and qname-free HIP-76 phase/role/counter
+state. Current API-v13 is the first status schema with the aggregate `hip76`
+object.
 
 Outbound message totals count bounded queue admission, not socket-write
 completion. Inbound totals count decoded messages received from the wire, and

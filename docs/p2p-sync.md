@@ -31,6 +31,8 @@ explicit outbound peers / optional listener
                     |
      VERSION / VERACK / SENDHEADERS / SENDCMPCT
                     |
+      optional Denuo registry / HIP-76 session
+                    |
                     v
           headers-first synchronization
                     |
@@ -81,6 +83,15 @@ SENDHEADERS, MEMPOOL, SENDCMPCT, CMPCTBLOCK, GETBLOCKTXN, and BLOCKTXN.
 Remaining bounded opaque forms are retained only where safe rejection or ignore
 behavior is intentional.
 
+After ordinary VERSION/VERACK readiness, peers that mutually advertise the
+Denuo extension negotiate the exact canonical registry fingerprint through
+packet `0xf4`. A matching agreement may activate the separate typed HIP-76
+`0xf0`/`0xf1` session. Requesting defaults to `Auto` with operator opt-out;
+provider advertisement defaults off and requires both explicit opt-in and a
+ready backend. The packet-specific limits, role generations, deadlines, queue
+admission, and socket-write completion are connection-local and cannot grant
+consensus or mining authority.
+
 The HSD fixture generator verifies subtle compatibility behavior:
 
 - low service bits and reserved high service words;
@@ -110,6 +121,7 @@ Each live peer has:
 - bounded critical, control, and normal queues;
 - byte counters and ping latency;
 - a local misbehavior score;
+- Denuo registry phase/limits and qname-free HIP-76 role/session counters;
 - handshake, idle, ping, and pong timeouts.
 
 The in-progress frame read is retained when ping, idle, or shutdown maintenance
@@ -157,9 +169,9 @@ Default operational bounds are intentionally lower. Each peer also has
 separate outbound queue capacities, while synchronization limits pending,
 inflight, and per-peer block requests.
 
-The critical lane is reserved for future solved-block publication and supports a
-bounded waiting send. Ordinary body serving uses the normal lane and cannot
-consume critical-lane slots.
+The critical lane is used by solved-block publication and supports a bounded
+waiting send. Ordinary body serving uses the normal lane and cannot consume
+critical-lane slots.
 
 ## Header synchronization
 
@@ -462,10 +474,11 @@ they do not poison `last_error` after healthy synchronization continues.
 Discovery diagnostics additionally expose durable
 address-book availability, loaded/pruned counts, generation, dirty state,
 successful/failed flushes, decode failures, the last flush time, and its last
-storage error. API-v10 node status separately counts valid non-active blocks and
-durably failed blocks and exposes the active tip's resulting authenticated
-root/height. The native endpoint includes an opaque runtime instance so external
-evidence can distinguish observations across restarts.
+storage error. Current API-v13 retains the API-v10 valid non-active and durably
+failed block counts and active-tip resulting authenticated root/height. It also
+exposes the canonical Denuo registry and qname-free HIP-76 phase, role, and
+write-stage counters. The native endpoint includes an opaque runtime instance
+so external evidence can distinguish observations across restarts.
 
 Authenticated status, authority, parity, and mining-engine diagnostics remain
 available during serialized replay and name-tree compaction. They return a
@@ -566,16 +579,20 @@ subthreshold scores are not persisted.
 
 ## Known limitations
 
-The native-sync runtime does not yet provide:
+The native-sync runtime still needs:
 
 - long-lived subthreshold peer reputation;
 - sustained adversarial qualification of its bounded ordinary,
   claim/airdrop, and solved-block relay paths;
-- historical mainnet block-body and active-state replay qualification;
-- persistent pruning-horizon discovery plus full pruning and
-  sustained-reorganization IBD qualification;
-- production mining authority before every readiness gate passes.
+- longer-running full-history and sustained-reorganization campaigns beyond
+  the qualified height-339,654 stopped state and 288-block retained horizon;
+- persistent pruning-horizon discovery plus full pruning qualification;
+- deployment review, WAN/load evidence, and physical mining integration.
 
-Those omissions are reported rather than hidden. The optional comparison runner
-supplies external qualification evidence; it is not in the native sync runtime
-or its consensus authority path.
+The functional readiness matrix and conditional mainnet permit path are
+implemented, but every live permit remains dependent on the explicit canary,
+exact synchronization, and durable authoritative tip. API-v13's base snapshot
+uses `pre-authority`, while live native RPC advertises a separate
+configuration-specific stage. The optional comparison runner supplies external
+qualification evidence; it is not in the native sync runtime or its consensus
+authority path.

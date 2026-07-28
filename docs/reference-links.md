@@ -15,11 +15,11 @@
 - [Handshake whitepaper](https://handshake.org/files/handshake.txt)
 - [Urkel](https://github.com/handshake-org/urkel)
 - [Liburkel](https://github.com/chjj/liburkel)
-- [HSD network constants](https://github.com/handshake-org/hsd/blob/master/lib/protocol/networks.js)
-- [HSD consensus constants](https://github.com/handshake-org/hsd/blob/master/lib/protocol/consensus.js)
-- [HSD primitives](https://github.com/handshake-org/hsd/tree/master/lib/primitives)
-- [HSD covenant rules](https://github.com/handshake-org/hsd/blob/master/lib/covenants/rules.js)
-- [HSD name state](https://github.com/handshake-org/hsd/blob/master/lib/covenants/namestate.js)
+- [Pinned HSD network constants](https://github.com/handshake-org/hsd/blob/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/protocol/networks.js)
+- [Pinned HSD consensus constants](https://github.com/handshake-org/hsd/blob/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/protocol/consensus.js)
+- [Pinned HSD primitives](https://github.com/handshake-org/hsd/tree/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/primitives)
+- [Pinned HSD covenant rules](https://github.com/handshake-org/hsd/blob/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/covenants/rules.js)
+- [Pinned HSD name state](https://github.com/handshake-org/hsd/blob/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/covenants/namestate.js)
 
 ## Runtime, storage, and assurance
 

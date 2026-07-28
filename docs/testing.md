@@ -10,11 +10,29 @@ mainnet replay stopped-state and pinned deployment comparisons passed at height
 [`../qualification/mainnet-339654/`](../qualification/mainnet-339654/) and
 [`../qualification/mainnet-339660/`](../qualification/mainnet-339660/).
 
-The `scripts/` and `hsd-oracle/` commands below are source-only evidence tools
-that were outside the extracted `hsrd/` prefix. Run them from the exact
-MeshMine source commit recorded in
-[`extraction-provenance.md`](extraction-provenance.md). Cargo commands and
-committed fixture tests run directly from this standalone repository.
+The HSD-oracle generators, source-handoff validators, and comparison commands
+below were outside the extracted `hsrd/` prefix. Run those source-only tools
+from the exact MeshMine source commit recorded in
+[`extraction-provenance.md`](extraction-provenance.md). Cargo commands,
+committed fixture tests, `scripts/check.sh`, and
+`scripts/qualify-two-node-regtest.sh` run directly from this standalone
+repository.
+
+## Current standalone gate
+
+```bash
+./scripts/check.sh
+```
+
+With Rust 1.89.0 by default, this verifies locked root and fuzz metadata,
+dependency policy for both lockfiles, formatting, every fuzz target, strict
+all-feature Clippy, all-feature and no-default-feature tests, and the optimized
+all-target release build. It then starts two independent regtest `hsrd`
+processes and requires ordinary P2P readiness, matching canonical Denuo
+registry negotiation, the exact registry fingerprint, and bidirectional
+traffic. The normal test matrix also covers live HIP-76 requester/provider
+admission, requester opt-out, provider opt-in/backend readiness, revocation,
+timeouts, queue/socket completion, and qname-free diagnostics.
 
 ## Fast static gate
 
@@ -173,8 +191,9 @@ Current evidence includes:
 - malformed-pin and failed-compaction-commit cases that leave the complete node
   set unchanged, followed by an idempotent successful retry;
 - startup compaction due/not-due scheduling, nonzero interval validation,
-  forced coordinator maintenance, checksummed checkpoint rejection, API-v10
-  status, and unclean RocksDB reopen with exact checkpoint/node-set agreement;
+  forced coordinator maintenance, checksummed checkpoint rejection, compaction
+  status introduced in API-v10 and retained in current API-v13, and unclean
+  RocksDB reopen with exact checkpoint/node-set agreement;
 - exact HSD undo-retention constants, steady/startup retirement, protected and
   retained windows, atomic interval-pin retirement, scheduled non-empty root
   compaction after undo expiry, checksummed checkpoint rejection, deep-reorg
@@ -225,8 +244,9 @@ Current evidence includes:
   slices, full-bound atomic fork connection, contextual-invalid ancestor
   persistence, and proof that local state faults do not poison stored branches
   or grant shadow mining authority;
-- API-v10 next-header committed-root material, opaque runtime-instance exposure, and the
-  external HSD comparison self-test covering confirmed/provisional roots,
+- next-header committed-root material introduced in API-v10 and retained in
+  current API-v13, opaque runtime-instance exposure, and the external HSD
+  comparison self-test covering confirmed/provisional roots,
   header-derived deployment/script-policy comparison, divergence,
   restart/reorganization counters, hash normalization, and checksummed evidence
   chaining;
