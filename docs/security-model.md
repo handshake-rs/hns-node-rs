@@ -1,8 +1,8 @@
 # Security model
 
-`hsrd` verifies consensus locally. Peers, snapshots, control clients, MeshMine
-inputs, caches, fixtures, synchronization checkpoints, and local databases are
-untrusted until promoted by an explicit validation stage. The source
+`hsrd` verifies consensus locally. Peers, imported snapshots, control clients,
+MeshMine inputs, caches, fixtures, and synchronization checkpoints are
+untrusted until an explicit validation stage accepts their use. The source
 consensus-readiness matrix is complete, but authority is still a runtime
 capability: only the explicit synchronized mainnet canary with a coherent
 durable authoritative tip may receive it. The pinned `hsd` revision remains an
@@ -10,6 +10,33 @@ offline comparison oracle, not a runtime or production authority. API-v13's
 base snapshot initializes `release_stage: "pre-authority"`; live native RPC
 replaces it with a configuration-specific diagnostic stage that does not grant
 authority.
+
+Local durable state has a narrower production trust boundary. The data root and
+its external page/segment files must remain in exclusive custody: only the
+dedicated `hsrd` service identity and trusted, audited offline maintenance may
+write them. OS, root, storage-administrator, backup-restore, and hypervisor
+principals that can modify those bytes are part of the trusted computing base.
+The node decodes and revalidates durable records where described below, but it
+does not authenticate the complete logical database against a hostile local
+writer.
+
+The clean-shutdown marker and `startup-audit/v1` record use unkeyed checksums as
+crash-recovery and cache-coherency evidence. RocksDB checksums, atomic batches,
+synced archive frames, and manifest reconciliation are designed to expose torn,
+partial, or random physical corruption and ambiguous writes. None is a MAC or
+signature from a separately protected authority. In particular, the startup
+audit does not commit to every UTXO key/value pair or every logical database
+record. A writer with offline database access can inject a well-formed UTXO or
+coordinately alter records and preserve or recompute the unkeyed markers; a
+successful startup audit therefore does not prove state provenance.
+
+Arbitrary offline logical database mutation is outside the production threat
+model. Suspected loss of custody requires stopping the node, withholding mining
+authority, preserving the affected store as evidence, and rebuilding consensus
+state through a full trusted replay. A separately protected keyed or otherwise
+trusted commitment covering the complete logical state could provide another
+recovery basis only after that mechanism is implemented and qualified; the
+current implementation has no such commitment.
 
 ## Current trust boundary
 
@@ -147,6 +174,14 @@ incomplete native states do not receive it. The explicit native mainnet canary
 issues the same capability only after complete readiness and an authoritative
 durable tip.
 
+Production authority additionally requires a reviewed custody record for the
+exact deployment. It identifies the numeric owner/group, modes and ACLs of the
+data root and every external page/segment path, the parent-directory and mount
+controls, every privileged principal able to write them, and the exact trusted
+maintenance binaries and window. Shared or unaccounted write access blocks
+release. Any custody breach invalidates evidence derived from that store; a
+clean marker or matching startup checkpoint cannot restore authority.
+
 ## Network-input policy
 
 - Frame magic and payload length are checked before allocation.
@@ -244,6 +279,9 @@ Fixtures are evidence, not authority.
 - A failed staged reorganization commits no durable operation.
 - Root, schema, network, genesis, or profile mismatch requires explicit operator
   action/reindex.
+- Suspected unauthorized local database access revokes production authority and
+  requires a full trusted replay or a qualified separately protected commitment;
+  a clean startup or successful checksum verification is insufficient.
 - Unexpected shadow-network supervisor/channel/task failure leaves the store marked
   unclean.
 - A corrupt or over-capacity publication queue fails diagnostics/recovery rather
@@ -262,6 +300,11 @@ Fixtures are evidence, not authority.
 - Authorization and covenant/name checks finish before spend staging.
 - Reorganization undo and replacement state share one batch.
 - Root metadata and materialized name state are checked before state mutation.
+- Production data-root custody, owners, permissions, ACLs, mounts, privileged
+  writers, and offline-maintenance access are reviewed and retained as release
+  evidence.
+- Startup and RocksDB checksums are treated as crash/corruption evidence, not
+  hostile-writer authentication or proof of complete UTXO provenance.
 - Peer inventories, orphans, queues, templates, publication attempts, and
   control requests have explicit bounds.
 - Shadow-network input cannot issue or bypass a mining authority permit.

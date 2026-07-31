@@ -124,6 +124,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -159,9 +169,9 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hns-chain"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "hns-primitives 0.1.0",
+ "hns-primitives 0.2.0",
  "hns-store",
  "serde",
  "thiserror",
@@ -169,10 +179,10 @@ dependencies = [
 
 [[package]]
 name = "hns-consensus"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hns-goosig",
- "hns-primitives 0.1.0",
+ "hns-primitives 0.2.0",
  "hns-secp256k1",
  "openssl",
  "serde",
@@ -198,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "hns-goosig"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "thiserror",
@@ -206,22 +216,22 @@ dependencies = [
 
 [[package]]
 name = "hns-mempool"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hns-consensus",
- "hns-primitives 0.1.0",
+ "hns-primitives 0.2.0",
  "serde",
  "thiserror",
 ]
 
 [[package]]
 name = "hns-p2p"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hns-consensus",
  "hns-dns-relay-protocol",
  "hns-p2p-experimental",
- "hns-primitives 0.1.0",
+ "hns-primitives 0.2.0",
  "hns-secp256k1",
  "openssl",
  "rand",
@@ -237,21 +247,11 @@ source = "git+https://github.com/handshake-rs/hns-rs.git?rev=dde2da81f29df935f04
 dependencies = [
  "hex",
  "hns-encoding",
- "hns-primitives 0.1.0 (git+https://github.com/handshake-rs/hns-rs.git?rev=dde2da81f29df935f043978a6d517c1d60ceff31)",
+ "hns-primitives 0.1.0",
  "serde",
  "sha2",
  "thiserror",
  "toml",
-]
-
-[[package]]
-name = "hns-primitives"
-version = "0.1.0"
-dependencies = [
- "blake2",
- "serde",
- "sha3",
- "thiserror",
 ]
 
 [[package]]
@@ -264,12 +264,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-primitives"
+version = "0.2.0"
+dependencies = [
+ "blake2",
+ "serde",
+ "sha3",
+ "thiserror",
+]
+
+[[package]]
 name = "hns-rpc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hns-chain",
  "hns-mempool",
- "hns-primitives 0.1.0",
+ "hns-primitives 0.2.0",
  "serde",
  "serde_json",
  "thiserror",
@@ -277,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "hns-secp256k1"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "thiserror",
@@ -285,18 +295,19 @@ dependencies = [
 
 [[package]]
 name = "hns-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "hns-primitives 0.1.0",
+ "fs4",
+ "hns-primitives 0.2.0",
  "serde",
  "thiserror",
 ]
 
 [[package]]
 name = "hns-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "hns-primitives 0.1.0",
+ "hns-primitives 0.2.0",
  "serde",
  "serde_json",
  "thiserror",
@@ -307,7 +318,7 @@ name = "hsrd-fuzz"
 version = "0.0.0"
 dependencies = [
  "hns-p2p",
- "hns-primitives 0.1.0",
+ "hns-primitives 0.2.0",
  "hns-rpc",
  "hns-testkit",
  "libfuzzer-sys",
@@ -364,6 +375,12 @@ dependencies = [
  "arbitrary",
  "cc",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "memchr"
@@ -491,6 +508,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
 ]
 
 [[package]]

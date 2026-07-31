@@ -7,6 +7,11 @@ its clean shutdown.
 
 ## Safety invariants
 
+- The data root, its parent, external name-page and block/undo segment paths,
+  and fallback copies are controlled by documented service/maintenance
+  principals. Only the dedicated `hsrd` identity and trusted, audited offline
+  maintenance may write the live store; shared or unaccounted write access
+  blocks production release.
 - The exact marker `.hsrd-storage-maintenance` with body
   `hsrd-storage-maintenance-v1\n` is required by the maintenance command.
 - The normal node refuses to start while that marker exists.
@@ -20,7 +25,32 @@ its clean shutdown.
 - Migration commits segment bytes and `fsync`s them before atomically replacing
   an inline RocksDB value with a locator. Restart discards every unpublished
   complete or torn tail.
+- A database write error after external bytes are synced is treated as
+  potentially committed. The current process retains both generations and
+  fences every clone of the archived/RocksDB store; new snapshots, all commits
+  (including metadata-only batches), checkpoints, and maintenance reject.
+  Recovery requires closing and reopening RocksDB, not merely constructing a
+  new archive wrapper. Reopen selects old or new files from the atomic
+  manifests before cleanup.
+- If the replacement locator/manifest batch commits successfully but archive
+  installation or predecessor cleanup then fails, the caller reports
+  committed-but-install-incomplete and the archive is likewise reopen-required.
+  A pre-cleanup failure retains both generations; a later cleanup failure may
+  have removed predecessor files, but the committed new generation remains
+  authoritative and reopen completes recovery.
+- Compaction creates no rewrite generation until a read-only plan has passed
+  record, live-frame-byte, atomic-locator-byte, cursor-record, and cursor-byte
+  budgets.
 - No maintenance command deletes the source data root or a fallback backup.
+
+Before production cutover, retain the numeric owner/group, modes, ACLs,
+parent-directory and mount controls, privileged writers, and exact maintenance
+binary identity with the release evidence. The checksummed maintenance marker,
+clean marker, startup audit, RocksDB checksums, and state manifest are unkeyed
+consistency evidence, not authentication against an offline writer. Suspected
+loss of custody invalidates the rollout evidence: preserve the store, withhold
+authority, and rebuild through a full trusted replay (or a future qualified,
+separately protected complete-state commitment).
 
 ## 1. Build and identify the rollout binary
 
@@ -93,7 +123,128 @@ segments, and truncates only bytes beyond the authoritative active tails. The
 JSON separates legacy inline records/bytes from archived records/frame bytes
 and locator bytes and reports the scrubbed segment/record/byte totals.
 
-## 4. Optional inline-payload conversion
+## 4. Plan and run payload-segment compaction
+
+Compaction is optional and useful only after logical pruning leaves enough dead
+frames. Always retain the fallback and run the read-only command first:
+
+```sh
+target/release/hsrd-storage-maintenance \
+  --data-dir "$DATA" \
+  compact --dry-run \
+  --max-live-records 1000000 \
+  --max-live-frame-bytes 68719476736 \
+  --max-atomic-locator-bytes 134217728 \
+  --scan-page-records 1024 \
+  --scan-page-bytes 8388608 \
+  --min-reclaim-bytes 268435456 \
+  > hsrd-compaction-plan.json
+```
+
+Opening the archive first performs normal manifest-driven recovery: it may
+truncate bytes beyond an authoritative active tail or remove a generation that
+no manifest selects. After that recovery, `--dry-run` performs no compaction
+publication and creates no rewrite generation; it does perform the exhaustive
+committed-frame scrub. It must report:
+
+- `mutation_performed: false`;
+- `committed_frames_validated: true`;
+- `reclaim_threshold_met: true` before a production rewrite;
+- live records, live frame bytes, and estimated atomic locator bytes below the
+  supplied host-specific limits; and
+- enough free disk for `plan.live_frame_bytes`, RocksDB WAL/SST amplification,
+  the ordinary operating reserve, and the untouched fallback. The command does
+  not guess a filesystem reserve.
+
+Use the exact reviewed limits from the retained plan for mutation:
+
+```sh
+target/release/hsrd-storage-maintenance \
+  --data-dir "$DATA" \
+  compact \
+  --max-live-records 1000000 \
+  --max-live-frame-bytes 68719476736 \
+  --max-atomic-locator-bytes 134217728 \
+  --scan-page-records 1024 \
+  --scan-page-bytes 8388608 \
+  --min-reclaim-bytes 268435456 \
+  > hsrd-compaction-result.json
+
+target/release/hsrd-storage-maintenance \
+  --data-dir "$DATA" inventory \
+  > hsrd-post-compaction-inventory.json
+```
+
+The mutation repeats the plan after acquiring the database, uses one immutable
+snapshot, and refuses to proceed if the observed live record/frame totals
+change. Iterator working memory is bounded by the cursor page, but all new
+locators and both manifests are deliberately published in one atomic RocksDB
+batch. The final batch therefore remains proportional to live records and is
+bounded by `--max-live-records` plus `--max-atomic-locator-bytes`.
+
+Acceptance requires all of the following:
+
+1. Pre- and post-scrubs report no checksum or frame-boundary error.
+2. `after_frame_bytes <= before_frame_bytes`, and `reclaimed_frame_bytes`
+   equals their difference.
+3. `live_records` equals the sum of post-inventory archived block and undo
+   records; every retained-horizon disconnect/reconnect test still passes.
+4. A clean reopen followed by `inventory` selects only the reported generation
+   and reproduces the exact tip, roots, pruning checkpoints, and state
+   manifest.
+5. On a disposable copy, deterministic before-write and after-write regression
+   tests pass:
+
+   ```sh
+   cargo test --locked -p hns-store \
+     rocks_segment_publication_faults_recover_the_complete_old_or_new_batch
+   cargo test --locked -p hns-store \
+     compaction_post_write_error_reopens_the_new_generation_without_data_loss
+   ```
+
+6. The external fault campaign kills the process at segment-sync,
+   before/within/after RocksDB write, manifest-install, and predecessor-cleanup
+   boundaries. Run at least 100 seeded trials per boundary on the deployment
+   filesystem. Every reopen must select a complete old or new generation, pass
+   the full scrub and state manifest, and preserve all rollback-window blocks.
+   Retained metrics must report `injection_points >= 8`,
+   `iterations_per_point >= 100`, and
+   `iterations >= injection_points * iterations_per_point`.
+7. Production-scale pruning is measured on mainnet-scale state, not a reduced
+   fixture: at least 300,000 block records, 20,000,000 UTXOs, 10,000,000 name
+   records, and the complete 288-block rollback horizon. Retain
+   `duration_seconds > 0`, `peak_rss_bytes > 0`, `peak_disk_bytes > 0`,
+   `resource_limits_respected: true`, and `rocksdb_background_errors: 0`
+   alongside the reviewed host RSS/disk/runtime envelope. Pre/post inventory,
+   restart-tip agreement, fallback restore, and at least one reclaimed byte
+   must also pass.
+8. The same production-scale evidence includes a complete non-pruned hsrd
+   baseline, identified by `baseline_mode: full_non_pruned`. Measure all
+   hsrd-owned live and temporary files on the qualification volume, including
+   RocksDB WAL/SST files, block/undo segments, name pages, and transient
+   rewrite/compaction files. The launch supervisor stops at a sampled
+   150,000,000,000-byte data-root cutoff and independently requires
+   10,000,000,000 free filesystem bytes. The retained exact
+   `peak_disk_bytes` and `final_disk_bytes` must each be at most
+   `150000000000`. An at-or-below `90000000000` observation may be retained as
+   informational telemetry only and must not affect qualification or release.
+   Run the pruned comparison at the same pinned height with the same binary,
+   host, filesystem, and measurement scope; retain
+   `pruned_final_disk_bytes > 0` and
+   `pruned_final_disk_bytes < final_disk_bytes`. The evidence must also record
+   `hsd_blocks_deleted: false`: neither qualification run authorizes removal of
+   the HSD data used for parity and rollback.
+
+The deterministic tests establish control-flow invariants. They do not replace
+external process-kill, filesystem, controller-cache, or power-loss evidence.
+If the command reports an uncertain database outcome or a committed but
+incomplete archive installation, do not retry in the same process. For an
+uncertain database write, do not reuse any clone of that RocksDB handle.
+Preserve every remaining generation and the logs, fully close the database,
+then reopen it with the same binary; recovery will use the database manifests
+before deleting anything.
+
+## 5. Optional inline-payload conversion
 
 Legacy inline values are semantically valid and may remain indefinitely. They
 do not block mining or new append-only writes. Convert them only when the disk
@@ -121,14 +272,15 @@ The final inventory must report zero inline block and undo records. Old payload
 bytes can remain in obsolete RocksDB SST files until normal or explicit
 compaction retires them; their temporary presence is expected. The command may
 be rerun after interruption and will skip every already published locator. It
-performs the exhaustive scrub before its first write; newly appended frames are
-checksummed and synced by the same publication path used during normal block
+walks each hash prefix with record- and byte-bounded exclusive cursor pages,
+performs the exhaustive scrub before its first write, and checksums/syncs newly
+appended frames through the same publication path used during normal block
 commit.
 
 Remove the maintenance marker before restart. A startup with the marker still
 present is intentionally rejected.
 
-## 5. Semantic verification
+## 6. Semantic verification
 
 The backup checkpoint already contains the exact
 `.hsrd-state-audit-copy` marker required by `hsrd-state-manifest`:
@@ -143,7 +295,27 @@ At a pinned block hash, compare this with the HSD manifest as described in
 retain both outputs. A state manifest does not replace the retained-horizon
 disconnect/reconnect campaign.
 
-## 6. Fallback
+HSD block-data retirement is a separate destructive cutover, not part of this
+maintenance procedure or the production-assurance campaign. Keep the HSD data
+unchanged until all of the following are independently complete:
+
+1. hsrd has reproduced the pinned tip, consensus roots, state manifest, and
+   retained-horizon disconnect/reconnect results, then completed the approved
+   sustained multi-peer qualification;
+2. the HSD wallet backup has been restored into an isolated test environment
+   and its expected accounts, names, and spend authority have been verified;
+3. an operator-reviewed rollback and evidence-retention plan identifies what
+   HSD data remains recoverable, where the verified wallet backup is retained,
+   and how hsrd can be rolled back without depending on the candidate deletion;
+   and
+4. the named cutover authority explicitly approves the exact HSD block-data
+   paths and retention date.
+
+Until that approval exists, `hsd_blocks_deleted` remains `false`. No hsrd
+storage command deletes HSD data, and an informational at-or-below-90 GB hsrd
+observation does not imply permission to do so.
+
+## 7. Fallback
 
 Never start a node directly on the only fallback copy. Preserve it as the
 reference artifact.

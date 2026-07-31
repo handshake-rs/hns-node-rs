@@ -7,7 +7,9 @@
 //! callers must install complete verifiers; the default `submit` boundary
 //! remains fail closed.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use hns_consensus::{
     is_coinbase, is_final_transaction, reserved_name, transaction_sigops, transaction_weight,
@@ -603,7 +605,7 @@ impl MempoolSnapshot {
         self.transactions.get(txid)
     }
 
-    pub fn txids(&self) -> impl Iterator<Item = Txid> + '_ {
+    pub fn txids(&self) -> impl ExactSizeIterator<Item = Txid> + '_ {
         self.entries.keys().copied()
     }
 
@@ -742,10 +744,307 @@ struct CovenantMetrics {
     exclusive_names: Vec<[u8; 32]>,
 }
 
+type OrderedTxidKey = (u64, Txid);
+
+/// Immutable, structurally shared transaction-id generation.
+///
+/// The persistent AVL tree gives RPC an O(1) snapshot clone while admissions
+/// and removals path-copy only O(log N) nodes, even when workers retain older
+/// generations. Iteration remains deterministic in `(sequence, txid)` order.
+#[derive(Clone, Debug, Default)]
+pub struct OrderedTxidSnapshot {
+    root: Option<Arc<OrderedTxidNode>>,
+    len: usize,
+}
+
+#[derive(Debug)]
+struct OrderedTxidNode {
+    key: OrderedTxidKey,
+    height: u16,
+    left: Option<Arc<Self>>,
+    right: Option<Arc<Self>>,
+}
+
+pub struct OrderedTxidIter<'a> {
+    stack: Vec<&'a OrderedTxidNode>,
+    remaining: usize,
+}
+
+impl OrderedTxidSnapshot {
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn is_same_generation(&self, other: &Self) -> bool {
+        self.len == other.len
+            && match (&self.root, &other.root) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub fn txids(&self) -> impl Iterator<Item = Txid> + '_ {
+        self.iter().map(|(_, txid)| *txid)
+    }
+
+    fn iter(&self) -> OrderedTxidIter<'_> {
+        let mut iter = OrderedTxidIter {
+            stack: Vec::new(),
+            remaining: self.len,
+        };
+        iter.push_left(self.root.as_deref());
+        iter
+    }
+
+    fn insert(&self, key: OrderedTxidKey) -> (Self, bool) {
+        let (root, inserted) = ordered_txid_insert(&self.root, key);
+        (
+            Self {
+                root,
+                len: if inserted {
+                    self.len
+                        .checked_add(1)
+                        .expect("persistent mempool txid count overflow")
+                } else {
+                    self.len
+                },
+            },
+            inserted,
+        )
+    }
+
+    fn remove(&self, key: &OrderedTxidKey) -> (Self, bool) {
+        let (root, removed) = ordered_txid_remove(&self.root, key);
+        (
+            Self {
+                root,
+                len: if removed {
+                    self.len
+                        .checked_sub(1)
+                        .expect("persistent mempool txid count underflow")
+                } else {
+                    self.len
+                },
+            },
+            removed,
+        )
+    }
+}
+
+impl<'a> OrderedTxidIter<'a> {
+    fn push_left(&mut self, mut node: Option<&'a OrderedTxidNode>) {
+        while let Some(current) = node {
+            self.stack.push(current);
+            node = current.left.as_deref();
+        }
+    }
+}
+
+impl<'a> Iterator for OrderedTxidIter<'a> {
+    type Item = &'a OrderedTxidKey;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.stack.pop()?;
+        self.push_left(node.right.as_deref());
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .expect("persistent mempool iterator length underflow");
+        Some(&node.key)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for OrderedTxidIter<'_> {}
+
+fn ordered_txid_height(node: &Option<Arc<OrderedTxidNode>>) -> u16 {
+    node.as_ref().map_or(0, |node| node.height)
+}
+
+fn ordered_txid_node(
+    key: OrderedTxidKey,
+    left: Option<Arc<OrderedTxidNode>>,
+    right: Option<Arc<OrderedTxidNode>>,
+) -> Arc<OrderedTxidNode> {
+    Arc::new(OrderedTxidNode {
+        key,
+        height: ordered_txid_height(&left)
+            .max(ordered_txid_height(&right))
+            .checked_add(1)
+            .expect("persistent mempool AVL height overflow"),
+        left,
+        right,
+    })
+}
+
+fn ordered_txid_balance_factor(node: &OrderedTxidNode) -> i32 {
+    i32::from(ordered_txid_height(&node.left)) - i32::from(ordered_txid_height(&node.right))
+}
+
+fn ordered_txid_rotate_left(root: &Arc<OrderedTxidNode>) -> Arc<OrderedTxidNode> {
+    let pivot = root
+        .right
+        .as_ref()
+        .expect("left rotation requires a right child");
+    let left = ordered_txid_node(root.key, root.left.clone(), pivot.left.clone());
+    ordered_txid_node(pivot.key, Some(left), pivot.right.clone())
+}
+
+fn ordered_txid_rotate_right(root: &Arc<OrderedTxidNode>) -> Arc<OrderedTxidNode> {
+    let pivot = root
+        .left
+        .as_ref()
+        .expect("right rotation requires a left child");
+    let right = ordered_txid_node(root.key, pivot.right.clone(), root.right.clone());
+    ordered_txid_node(pivot.key, pivot.left.clone(), Some(right))
+}
+
+fn ordered_txid_balance(
+    key: OrderedTxidKey,
+    left: Option<Arc<OrderedTxidNode>>,
+    right: Option<Arc<OrderedTxidNode>>,
+) -> Arc<OrderedTxidNode> {
+    let mut root = ordered_txid_node(key, left, right);
+    if ordered_txid_balance_factor(&root) > 1 {
+        if ordered_txid_balance_factor(
+            root.left
+                .as_ref()
+                .expect("left-heavy node has a left child"),
+        ) < 0
+        {
+            let rotated = ordered_txid_rotate_left(
+                root.left
+                    .as_ref()
+                    .expect("left-heavy node has a left child"),
+            );
+            root = ordered_txid_node(root.key, Some(rotated), root.right.clone());
+        }
+        return ordered_txid_rotate_right(&root);
+    }
+    if ordered_txid_balance_factor(&root) < -1 {
+        if ordered_txid_balance_factor(
+            root.right
+                .as_ref()
+                .expect("right-heavy node has a right child"),
+        ) > 0
+        {
+            let rotated = ordered_txid_rotate_right(
+                root.right
+                    .as_ref()
+                    .expect("right-heavy node has a right child"),
+            );
+            root = ordered_txid_node(root.key, root.left.clone(), Some(rotated));
+        }
+        return ordered_txid_rotate_left(&root);
+    }
+    root
+}
+
+fn ordered_txid_insert(
+    root: &Option<Arc<OrderedTxidNode>>,
+    key: OrderedTxidKey,
+) -> (Option<Arc<OrderedTxidNode>>, bool) {
+    let Some(node) = root else {
+        return (Some(ordered_txid_node(key, None, None)), true);
+    };
+    match key.cmp(&node.key) {
+        Ordering::Less => {
+            let (left, inserted) = ordered_txid_insert(&node.left, key);
+            if !inserted {
+                return (root.clone(), false);
+            }
+            (
+                Some(ordered_txid_balance(node.key, left, node.right.clone())),
+                true,
+            )
+        }
+        Ordering::Greater => {
+            let (right, inserted) = ordered_txid_insert(&node.right, key);
+            if !inserted {
+                return (root.clone(), false);
+            }
+            (
+                Some(ordered_txid_balance(node.key, node.left.clone(), right)),
+                true,
+            )
+        }
+        Ordering::Equal => (root.clone(), false),
+    }
+}
+
+fn ordered_txid_remove_min(
+    root: &Arc<OrderedTxidNode>,
+) -> (Option<Arc<OrderedTxidNode>>, OrderedTxidKey) {
+    let Some(left) = root.left.as_ref() else {
+        return (root.right.clone(), root.key);
+    };
+    let (new_left, minimum) = ordered_txid_remove_min(left);
+    (
+        Some(ordered_txid_balance(root.key, new_left, root.right.clone())),
+        minimum,
+    )
+}
+
+fn ordered_txid_remove(
+    root: &Option<Arc<OrderedTxidNode>>,
+    key: &OrderedTxidKey,
+) -> (Option<Arc<OrderedTxidNode>>, bool) {
+    let Some(node) = root else {
+        return (None, false);
+    };
+    match key.cmp(&node.key) {
+        Ordering::Less => {
+            let (left, removed) = ordered_txid_remove(&node.left, key);
+            if !removed {
+                return (root.clone(), false);
+            }
+            (
+                Some(ordered_txid_balance(node.key, left, node.right.clone())),
+                true,
+            )
+        }
+        Ordering::Greater => {
+            let (right, removed) = ordered_txid_remove(&node.right, key);
+            if !removed {
+                return (root.clone(), false);
+            }
+            (
+                Some(ordered_txid_balance(node.key, node.left.clone(), right)),
+                true,
+            )
+        }
+        Ordering::Equal => match (&node.left, &node.right) {
+            (None, _) => (node.right.clone(), true),
+            (_, None) => (node.left.clone(), true),
+            (Some(left), Some(right)) => {
+                let (right, successor) = ordered_txid_remove_min(right);
+                (
+                    Some(ordered_txid_balance(successor, Some(left.clone()), right)),
+                    true,
+                )
+            }
+        },
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MemoryMempool {
     limits: MempoolLimits,
     entries: HashMap<Txid, MempoolEntry>,
+    ordered_txids: OrderedTxidSnapshot,
+    /// Exact dependency-root membership ordered by original admission time.
+    /// This replaces a full-pool scan and sort with O(log N) root mutations.
+    expiry_roots: BTreeSet<(u64, Txid)>,
+    /// Cached minimum of `expiry_roots`, making the common not-due check O(1).
+    next_expiry_root: Option<(u64, Txid)>,
     transactions: HashMap<Txid, Transaction>,
     orphans: HashMap<Txid, OrphanEntry>,
     spent_outpoints: HashMap<Outpoint, Txid>,
@@ -758,11 +1057,16 @@ pub struct MemoryMempool {
     airdrops: HashMap<[u8; 32], AirdropMempoolEntry>,
     airdrop_positions: HashMap<u32, [u8; 32]>,
     bytes: usize,
+    // Wider than the public `Amount` so add/remove remains reversible even
+    // when the compatibility summary saturates at `u64::MAX`.
+    total_fee: u128,
     orphan_bytes: usize,
     free_count: f64,
     last_free_time: u64,
     generation: u64,
     next_sequence: u64,
+    #[cfg(test)]
+    expiry_root_checks: usize,
 }
 
 impl Default for MemoryMempool {
@@ -781,6 +1085,9 @@ impl MemoryMempool {
         Ok(Self {
             limits,
             entries: HashMap::new(),
+            ordered_txids: OrderedTxidSnapshot::default(),
+            expiry_roots: BTreeSet::new(),
+            next_expiry_root: None,
             transactions: HashMap::new(),
             orphans: HashMap::new(),
             spent_outpoints: HashMap::new(),
@@ -793,11 +1100,14 @@ impl MemoryMempool {
             airdrops: HashMap::new(),
             airdrop_positions: HashMap::new(),
             bytes: 0,
+            total_fee: 0,
             orphan_bytes: 0,
             free_count: 0.0,
             last_free_time: 0,
             generation: 0,
             next_sequence: 1,
+            #[cfg(test)]
+            expiry_root_checks: 0,
         })
     }
 
@@ -807,6 +1117,10 @@ impl MemoryMempool {
 
     pub fn transaction(&self, txid: &Txid) -> Option<&Transaction> {
         self.transactions.get(txid)
+    }
+
+    pub fn ordered_txids_snapshot(&self) -> OrderedTxidSnapshot {
+        self.ordered_txids.clone()
     }
 
     pub fn claim(&self, hash: &[u8; 32]) -> Option<&Claim> {
@@ -938,6 +1252,8 @@ impl MemoryMempool {
             &authenticated.output,
             authenticated.verified.name.len(),
         );
+        let claim_fee = authenticated.verified.fee;
+        let counts_toward_total_fee = authenticated.verified.commit_height == 1;
         let sequence = self.take_sequence();
         self.claim_names.insert(name_hash, hash);
         self.claims.insert(
@@ -963,6 +1279,9 @@ impl MemoryMempool {
             },
         );
         self.bytes = projected_bytes;
+        if counts_toward_total_fee {
+            self.total_fee = self.total_fee.saturating_add(u128::from(claim_fee));
+        }
         self.advance_generation();
         if !self.limit_size_claim(hash, context.current_time) {
             return Ok(rejected_claim("mempool-full"));
@@ -1183,6 +1502,7 @@ impl MemoryMempool {
             .ok_or(MempoolError::WeightOverflow)?;
         let policy_size = raw.len().div_ceil(WITNESS_SCALE_FACTOR);
         let coinbase_weight = airdrop_coinbase_weight(raw.len(), &output);
+        let airdrop_fee = proof.fee;
         let sequence = self.take_sequence();
         self.airdrop_positions.insert(position, hash);
         self.airdrops.insert(
@@ -1201,6 +1521,7 @@ impl MemoryMempool {
             },
         );
         self.bytes = projected_bytes;
+        self.total_fee = self.total_fee.saturating_add(u128::from(airdrop_fee));
         self.advance_generation();
         if !self.limit_size_airdrop(hash, context.current_time) {
             return Ok(rejected_airdrop("mempool-full"));
@@ -1470,6 +1791,16 @@ impl MemoryMempool {
             })
             .saturating_add(rebuilt.airdrops.values().fold(0usize, |total, entry| {
                 total.saturating_add(entry.memory_usage)
+            }));
+        rebuilt.total_fee = rebuilt
+            .claims
+            .values()
+            .filter(|entry| entry.commit_height == 1)
+            .fold(0u128, |total, entry| {
+                total.saturating_add(u128::from(entry.fee))
+            })
+            .saturating_add(rebuilt.airdrops.values().fold(0u128, |total, entry| {
+                total.saturating_add(u128::from(entry.fee))
             }));
         rebuilt.next_sequence = self.next_sequence;
         for (transaction, allow_orphan, admitted_at, charge_free_relay) in candidates {
@@ -1881,8 +2212,15 @@ impl MemoryMempool {
         }
         self.exclusive_names.insert(txid, exclusive_names);
         self.bytes = projected_bytes;
+        self.total_fee = self.total_fee.saturating_add(u128::from(fee));
+        let (ordered_txids, inserted) = self.ordered_txids.insert((sequence, txid));
+        debug_assert!(inserted, "accepted mempool txid index entry is unique");
+        self.ordered_txids = ordered_txids;
         self.entries.insert(txid, entry);
         self.transactions.insert(txid, transaction);
+        if self.parents.get(&txid).is_some_and(BTreeSet::is_empty) {
+            self.insert_expiry_root((admitted_at, txid));
+        }
         self.advance_generation();
         if !self.limit_size(txid, context.current_time) {
             return Ok(rejected("mempool-full"));
@@ -1928,18 +2266,27 @@ impl MemoryMempool {
     }
 
     fn enforce_size_limit(&mut self, now: u64) {
-        let mut expired = self
-            .entries
-            .values()
-            .filter(|entry| {
-                self.parents.get(&entry.txid).is_none_or(BTreeSet::is_empty)
-                    && now >= entry.admitted_at.saturating_add(self.limits.expiry_time)
-            })
-            .map(|entry| (entry.admitted_at, entry.txid))
-            .collect::<Vec<_>>();
-        expired.sort();
-        for (_, txid) in expired {
-            self.remove_transaction_without_generation(txid, true);
+        loop {
+            let Some((admitted_at, txid)) = self.next_expiry_root else {
+                break;
+            };
+            #[cfg(test)]
+            {
+                self.expiry_root_checks = self.expiry_root_checks.saturating_add(1);
+            }
+            if now < admitted_at.saturating_add(self.limits.expiry_time) {
+                break;
+            }
+            let removed = self.remove_transaction_without_generation(txid, true);
+            if removed == 0 {
+                // Fail closed against an internally stale key and guarantee
+                // forward progress even in non-debug builds.
+                self.remove_expiry_root((admitted_at, txid));
+            }
+            debug_assert_ne!(
+                removed, 0,
+                "expiry index referenced a missing transaction root"
+            );
         }
 
         if self.member_count() <= self.limits.maximum_transactions
@@ -2046,6 +2393,22 @@ impl MemoryMempool {
         }
     }
 
+    fn insert_expiry_root(&mut self, key: (u64, Txid)) {
+        let inserted = self.expiry_roots.insert(key);
+        debug_assert!(inserted, "new dependency root has one expiry index entry");
+        if self.next_expiry_root.is_none_or(|current| key < current) {
+            self.next_expiry_root = Some(key);
+        }
+    }
+
+    fn remove_expiry_root(&mut self, key: (u64, Txid)) -> bool {
+        let removed = self.expiry_roots.remove(&key);
+        if removed && self.next_expiry_root == Some(key) {
+            self.next_expiry_root = self.expiry_roots.iter().next().copied();
+        }
+        removed
+    }
+
     fn member_count(&self) -> usize {
         self.entries
             .len()
@@ -2136,6 +2499,9 @@ impl MemoryMempool {
             return 0;
         }
         self.entries.clear();
+        self.ordered_txids = OrderedTxidSnapshot::default();
+        self.expiry_roots.clear();
+        self.next_expiry_root = None;
         self.transactions.clear();
         self.orphans.clear();
         self.spent_outpoints.clear();
@@ -2148,6 +2514,7 @@ impl MemoryMempool {
         self.airdrops.clear();
         self.airdrop_positions.clear();
         self.bytes = 0;
+        self.total_fee = 0;
         self.orphan_bytes = 0;
         self.advance_generation();
         removed
@@ -2169,6 +2536,9 @@ impl MemoryMempool {
             self.claim_names.remove(&entry.name_hash);
         }
         self.bytes = self.bytes.saturating_sub(entry.memory_usage);
+        if entry.commit_height == 1 {
+            self.total_fee = self.total_fee.saturating_sub(u128::from(entry.fee));
+        }
         true
     }
 
@@ -2188,6 +2558,7 @@ impl MemoryMempool {
             self.airdrop_positions.remove(&entry.position);
         }
         self.bytes = self.bytes.saturating_sub(entry.memory_usage);
+        self.total_fee = self.total_fee.saturating_sub(u128::from(entry.fee));
         true
     }
 
@@ -2459,11 +2830,16 @@ impl MemoryMempool {
         let affected_descendants = self
             .collect_descendants(txid)
             .expect("accepted mempool descendants stay within configured bounds");
-        let Some(_entry) = self.entries.remove(&txid) else {
+        let Some(entry) = self.entries.remove(&txid) else {
             self.transactions.insert(txid, transaction);
             return false;
         };
+        self.remove_expiry_root((entry.admitted_at, txid));
         self.bytes = self.bytes.saturating_sub(transaction.encode().len());
+        self.total_fee = self.total_fee.saturating_sub(u128::from(entry.fee));
+        let (ordered_txids, removed) = self.ordered_txids.remove(&(entry.sequence, txid));
+        debug_assert!(removed, "removed mempool txid has an ordered index entry");
+        self.ordered_txids = ordered_txids;
         for input in &transaction.inputs {
             if self.spent_outpoints.get(&input.previous_output) == Some(&txid) {
                 self.spent_outpoints.remove(&input.previous_output);
@@ -2479,7 +2855,16 @@ impl MemoryMempool {
         if let Some(children) = self.children.remove(&txid) {
             for child in children {
                 if let Some(parents) = self.parents.get_mut(&child) {
+                    let was_root = parents.is_empty();
                     parents.remove(&txid);
+                    if !was_root && parents.is_empty() {
+                        let child_admitted_at = self
+                            .entries
+                            .get(&child)
+                            .expect("retained child has a mempool entry")
+                            .admitted_at;
+                        self.insert_expiry_root((child_admitted_at, child));
+                    }
                 }
             }
         }
@@ -2571,21 +2956,7 @@ impl Mempool for MemoryMempool {
             claim_count: self.claims.len(),
             airdrop_count: self.airdrops.len(),
             bytes: self.bytes,
-            total_fee: self
-                .entries
-                .values()
-                .fold(0u64, |total, entry| total.saturating_add(entry.fee))
-                .saturating_add(
-                    self.claims
-                        .values()
-                        .filter(|entry| entry.commit_height == 1)
-                        .fold(0u64, |total, entry| total.saturating_add(entry.fee)),
-                )
-                .saturating_add(
-                    self.airdrops
-                        .values()
-                        .fold(0u64, |total, entry| total.saturating_add(entry.fee)),
-                ),
+            total_fee: Amount::try_from(self.total_fee).unwrap_or(Amount::MAX),
             orphan_count: self.orphans.len(),
             orphan_bytes: self.orphan_bytes,
             generation: self.generation,
@@ -2593,9 +2964,15 @@ impl Mempool for MemoryMempool {
     }
 
     fn entries(&self) -> Vec<MempoolEntry> {
-        let mut entries = self.entries.values().cloned().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| (entry.sequence, entry.txid));
-        entries
+        self.ordered_txids
+            .txids()
+            .map(|txid| {
+                self.entries
+                    .get(&txid)
+                    .expect("ordered mempool index references an accepted entry")
+                    .clone()
+            })
+            .collect()
     }
 
     fn submit(&mut self, _transaction: Transaction) -> Result<Admission, MempoolError> {
@@ -3005,6 +3382,218 @@ mod tests {
         }
     }
 
+    fn assert_cached_info_exact(pool: &MemoryMempool) {
+        let expected_ordered_txids = pool
+            .entries
+            .values()
+            .map(|entry| (entry.sequence, entry.txid))
+            .collect::<BTreeSet<_>>();
+        let expected_expiry_roots = pool
+            .entries
+            .values()
+            .filter(|entry| {
+                pool.parents
+                    .get(&entry.txid)
+                    .is_some_and(BTreeSet::is_empty)
+            })
+            .map(|entry| (entry.admitted_at, entry.txid))
+            .collect::<BTreeSet<_>>();
+        let expected_bytes = pool
+            .transactions
+            .values()
+            .fold(0usize, |total, transaction| {
+                total.saturating_add(transaction.encode().len())
+            })
+            .saturating_add(pool.claims.values().fold(0usize, |total, entry| {
+                total.saturating_add(entry.memory_usage)
+            }))
+            .saturating_add(pool.airdrops.values().fold(0usize, |total, entry| {
+                total.saturating_add(entry.memory_usage)
+            }));
+        let expected_orphan_bytes = pool
+            .orphans
+            .values()
+            .fold(0usize, |total, entry| total.saturating_add(entry.bytes));
+        let expected_total_fee = pool
+            .entries
+            .values()
+            .fold(0u128, |total, entry| {
+                total.saturating_add(u128::from(entry.fee))
+            })
+            .saturating_add(
+                pool.claims
+                    .values()
+                    .filter(|entry| entry.commit_height == 1)
+                    .fold(0u128, |total, entry| {
+                        total.saturating_add(u128::from(entry.fee))
+                    }),
+            )
+            .saturating_add(pool.airdrops.values().fold(0u128, |total, entry| {
+                total.saturating_add(u128::from(entry.fee))
+            }));
+        let info = pool.info();
+        assert_eq!(info.transaction_count, pool.entries.len());
+        assert_eq!(info.claim_count, pool.claims.len());
+        assert_eq!(info.airdrop_count, pool.airdrops.len());
+        assert_eq!(info.orphan_count, pool.orphans.len());
+        assert_eq!(info.bytes, expected_bytes);
+        assert_eq!(info.orphan_bytes, expected_orphan_bytes);
+        assert_eq!(pool.total_fee, expected_total_fee);
+        assert_eq!(
+            pool.ordered_txids.iter().copied().collect::<BTreeSet<_>>(),
+            expected_ordered_txids
+        );
+        assert_eq!(pool.expiry_roots, expected_expiry_roots);
+        assert_eq!(
+            pool.next_expiry_root,
+            expected_expiry_roots.iter().next().copied()
+        );
+        assert_eq!(
+            info.total_fee,
+            Amount::try_from(expected_total_fee).unwrap_or(Amount::MAX)
+        );
+    }
+
+    fn ordered_test_key(sequence: u64) -> OrderedTxidKey {
+        let mut raw = [0u8; 32];
+        raw[..8].copy_from_slice(&sequence.to_be_bytes());
+        (sequence, Txid::new(raw))
+    }
+
+    fn validate_ordered_txid_node(
+        node: Option<&OrderedTxidNode>,
+        minimum: Option<OrderedTxidKey>,
+        maximum: Option<OrderedTxidKey>,
+    ) -> (usize, u16) {
+        let Some(node) = node else {
+            return (0, 0);
+        };
+        assert!(minimum.is_none_or(|minimum| node.key > minimum));
+        assert!(maximum.is_none_or(|maximum| node.key < maximum));
+        let (left_count, left_height) =
+            validate_ordered_txid_node(node.left.as_deref(), minimum, Some(node.key));
+        let (right_count, right_height) =
+            validate_ordered_txid_node(node.right.as_deref(), Some(node.key), maximum);
+        assert_eq!(node.height, left_height.max(right_height).saturating_add(1));
+        assert!(
+            left_height.abs_diff(right_height) <= 1,
+            "persistent AVL balance violated at {:?}: left={left_height}, right={right_height}",
+            node.key
+        );
+        (
+            left_count
+                .checked_add(right_count)
+                .and_then(|count| count.checked_add(1))
+                .expect("test node count"),
+            node.height,
+        )
+    }
+
+    fn validate_ordered_txid_snapshot(snapshot: &OrderedTxidSnapshot) -> u16 {
+        let (count, height) = validate_ordered_txid_node(snapshot.root.as_deref(), None, None);
+        assert_eq!(count, snapshot.len());
+        assert_eq!(snapshot.is_empty(), count == 0);
+        height
+    }
+
+    fn collect_ordered_txid_node_pointers(
+        node: Option<&Arc<OrderedTxidNode>>,
+        pointers: &mut HashSet<usize>,
+    ) {
+        let Some(node) = node else {
+            return;
+        };
+        pointers.insert(Arc::as_ptr(node) as usize);
+        collect_ordered_txid_node_pointers(node.left.as_ref(), pointers);
+        collect_ordered_txid_node_pointers(node.right.as_ref(), pointers);
+    }
+
+    fn count_shared_ordered_txid_nodes(
+        node: Option<&Arc<OrderedTxidNode>>,
+        pointers: &HashSet<usize>,
+    ) -> usize {
+        let Some(node) = node else {
+            return 0;
+        };
+        usize::from(pointers.contains(&(Arc::as_ptr(node) as usize)))
+            .saturating_add(count_shared_ordered_txid_nodes(
+                node.left.as_ref(),
+                pointers,
+            ))
+            .saturating_add(count_shared_ordered_txid_nodes(
+                node.right.as_ref(),
+                pointers,
+            ))
+    }
+
+    #[test]
+    fn persistent_ordered_txids_bound_sorted_mutation_and_share_generations() {
+        const MEMBERS: u64 = 4_096;
+        let mut snapshot = OrderedTxidSnapshot::default();
+        for sequence in 0..MEMBERS {
+            let (next, inserted) = snapshot.insert(ordered_test_key(sequence));
+            assert!(inserted);
+            snapshot = next;
+        }
+        let height = validate_ordered_txid_snapshot(&snapshot);
+        assert!(
+            height <= 2 * u16::try_from(MEMBERS.ilog2() + 1).expect("height bound"),
+            "sorted insertions produced an unexpectedly tall AVL: {height}"
+        );
+
+        let ordered = snapshot.iter().copied().collect::<Vec<_>>();
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(ordered.len(), usize::try_from(MEMBERS).expect("members"));
+        let mut iterator = snapshot.iter();
+        let mut remaining = usize::try_from(MEMBERS).expect("members");
+        while iterator.next().is_some() {
+            remaining -= 1;
+            assert_eq!(iterator.size_hint(), (remaining, Some(remaining)));
+            assert_eq!(iterator.len(), remaining);
+        }
+        assert_eq!(iterator.size_hint(), (0, Some(0)));
+
+        let (duplicate, inserted) = snapshot.insert(ordered_test_key(MEMBERS / 2));
+        assert!(!inserted);
+        assert!(snapshot.is_same_generation(&duplicate));
+        let (missing, removed) = snapshot.remove(&ordered_test_key(MEMBERS + 9));
+        assert!(!removed);
+        assert!(snapshot.is_same_generation(&missing));
+
+        let retained = snapshot.clone();
+        let mut retained_pointers = HashSet::new();
+        collect_ordered_txid_node_pointers(retained.root.as_ref(), &mut retained_pointers);
+        let (extended, inserted) = snapshot.insert(ordered_test_key(MEMBERS));
+        assert!(inserted);
+        assert_eq!(extended.len(), retained.len() + 1);
+        assert_eq!(retained.len(), usize::try_from(MEMBERS).expect("members"));
+        let shared = count_shared_ordered_txid_nodes(extended.root.as_ref(), &retained_pointers);
+        assert!(
+            shared >= retained.len().saturating_sub(64),
+            "path-copy insertion shared only {shared} of {} retained nodes",
+            retained.len()
+        );
+        validate_ordered_txid_snapshot(&extended);
+
+        let mut reduced = extended;
+        for sequence in 0..=MEMBERS {
+            let (next, removed) = reduced.remove(&ordered_test_key(sequence));
+            assert!(removed, "missing sorted removal {sequence}");
+            reduced = next;
+            if sequence % 256 == 0 || sequence == MEMBERS {
+                validate_ordered_txid_snapshot(&reduced);
+            }
+        }
+        assert!(reduced.is_empty());
+        assert_eq!(retained.len(), usize::try_from(MEMBERS).expect("members"));
+        assert_eq!(
+            retained.txids().next(),
+            Some(ordered_test_key(0).1),
+            "old generation changed after persistent removals"
+        );
+        validate_ordered_txid_snapshot(&retained);
+    }
+
     #[test]
     fn claim_admission_indexes_revalidates_and_reconciles_coinbases() {
         let (fixture, block) = fixture_claim_block();
@@ -3021,6 +3610,7 @@ mod tests {
                 .expect("claim admission"),
             ClaimAdmission::Accepted(hash)
         );
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().claim_count, 1);
         assert_eq!(pool.info().bytes, 500 + claim.blob.len());
         assert!(matches!(
@@ -3040,13 +3630,16 @@ mod tests {
                 .expect("bounded claim admission"),
             ClaimAdmission::Rejected { reason } if reason == "mempool-full"
         ));
+        assert_cached_info_exact(&bounded);
         assert_eq!(bounded.info().claim_count, 0);
 
         assert_eq!(pool.remove_confirmed(std::slice::from_ref(&coinbase)), 1);
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().claim_count, 0);
         assert!(pool
             .reconcile_claims_with_context(&[coinbase], &context, &view, &dnssec)
             .expect("claim disconnect reconciliation"));
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().claim_count, 2);
     }
 
@@ -3068,6 +3661,7 @@ mod tests {
             .expect("airdrop admission"),
             AirdropAdmission::Accepted(hash)
         );
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().airdrop_count, 1);
 
         let mut bounded = MemoryMempool::with_limits(MempoolLimits {
@@ -3086,6 +3680,7 @@ mod tests {
                 .expect("bounded admission"),
             AirdropAdmission::Rejected { reason } if reason == "mempool-full"
         ));
+        assert_cached_info_exact(&bounded);
         assert_eq!(bounded.info().airdrop_count, 0);
         assert_eq!(pool.info().bytes, 300 + raw_size);
         assert_eq!(pool.info().total_fee, proof.fee);
@@ -3109,6 +3704,7 @@ mod tests {
                 &UnavailableAirdropSignatureVerifier,
             )
             .expect("spent revalidation"));
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().airdrop_count, 0);
 
         let disabled = AirdropMempoolContext {
@@ -3136,6 +3732,7 @@ mod tests {
             .expect("readmit"),
             AirdropAdmission::Accepted(_)
         ));
+        assert_cached_info_exact(&pool);
         let coinbase = Transaction {
             version: 0,
             inputs: vec![
@@ -3156,6 +3753,7 @@ mod tests {
             locktime: 2,
         };
         assert_eq!(pool.remove_confirmed(std::slice::from_ref(&coinbase)), 1);
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().airdrop_count, 0);
         assert!(pool
             .reconcile_airdrops_with_context(
@@ -3165,6 +3763,7 @@ mod tests {
                 &UnavailableAirdropSignatureVerifier,
             )
             .expect("disconnect reconciliation"));
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().airdrop_count, 1);
     }
 
@@ -3305,6 +3904,73 @@ mod tests {
     }
 
     #[test]
+    fn ordered_txid_snapshot_is_generation_stable_across_mutation() {
+        let first_input = outpoint(0xc1, 0);
+        let second_input = outpoint(0xc2, 0);
+        let mut view = FixedView::with_coin(first_input.clone(), 20);
+        view.coins.insert(
+            second_input.clone(),
+            Coin {
+                outpoint: second_input.clone(),
+                value: 20,
+                height: 1,
+                coinbase: false,
+                address: Address::new(0, vec![3; 20]).expect("address"),
+                covenant: covenant(),
+            },
+        );
+        let first = transaction(first_input, 15);
+        let first_txid = first.txid();
+        let second = transaction(second_input, 14);
+        let second_txid = second.txid();
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, first, &view),
+            Admission::Accepted(_)
+        ));
+        let first_generation = pool.ordered_txids_snapshot();
+        assert_eq!(
+            first_generation
+                .iter()
+                .map(|(_, txid)| *txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid]
+        );
+
+        assert!(matches!(
+            submit(&mut pool, second, &view),
+            Admission::Accepted(_)
+        ));
+        let second_generation = pool.ordered_txids_snapshot();
+        assert_eq!(
+            first_generation
+                .iter()
+                .map(|(_, txid)| *txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid],
+            "a retained RPC view must not observe later admission"
+        );
+        assert_eq!(
+            second_generation
+                .iter()
+                .map(|(_, txid)| *txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid, second_txid]
+        );
+
+        assert_eq!(pool.remove_transaction(first_txid, false), 1);
+        assert_eq!(
+            second_generation
+                .iter()
+                .map(|(_, txid)| *txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid, second_txid],
+            "a retained RPC view must not observe later removal"
+        );
+        assert_cached_info_exact(&pool);
+    }
+
+    #[test]
     fn contextual_verifier_receives_name_transactions_in_admission_order() {
         let first_input = outpoint(0xd1, 0);
         let second_input = outpoint(0xd2, 0);
@@ -3408,6 +4074,7 @@ mod tests {
             submit(&mut pool, retained, &view),
             Admission::Accepted(_)
         ));
+        assert_cached_info_exact(&pool);
         let previous_generation = pool.info().generation;
         let summary = pool
             .reconcile_connected_with_context(
@@ -3425,6 +4092,7 @@ mod tests {
         assert_eq!(summary.generation, previous_generation + 1);
         assert!(pool.transaction(&stale_txid).is_none());
         assert!(pool.transaction(&retained_txid).is_some());
+        assert_cached_info_exact(&pool);
 
         let stable = pool
             .reconcile_connected_with_context(
@@ -3437,6 +4105,7 @@ mod tests {
             .expect("stable revalidation");
         assert!(!stable.changed);
         assert_eq!(stable.generation, summary.generation);
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -3585,6 +4254,7 @@ mod tests {
             pool.snapshot().entry(&child_txid).expect("child").parents,
             vec![parent_txid]
         );
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4079,6 +4749,101 @@ mod tests {
         assert!(pool.transaction(&child_txid).is_none());
         assert!(pool.transaction(&trigger_txid).is_some());
         assert_eq!(pool.info().transaction_count, 1);
+        assert_cached_info_exact(&pool);
+    }
+
+    #[test]
+    fn under_capacity_admissions_probe_only_the_earliest_expiry_root() {
+        const ADMISSIONS: usize = 4_096;
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            maximum_transactions: ADMISSIONS + 1,
+            expiry_time: u64::MAX,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+
+        for sequence in 0..ADMISSIONS {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(
+                &u64::try_from(sequence)
+                    .expect("test sequence fits u64")
+                    .to_be_bytes(),
+            );
+            let input = Outpoint {
+                txid: Txid::new(raw),
+                index: 0,
+            };
+            assert!(matches!(
+                submit_at(
+                    &mut pool,
+                    transaction(input.clone(), 999),
+                    &FixedView::with_coin(input, 1_000),
+                    100,
+                ),
+                Admission::Accepted(_)
+            ));
+        }
+
+        assert_eq!(pool.info().transaction_count, ADMISSIONS);
+        assert_eq!(pool.expiry_roots.len(), ADMISSIONS);
+        assert_eq!(
+            pool.expiry_root_checks, ADMISSIONS,
+            "the common under-capacity path must not scan all dependency roots"
+        );
+        assert_cached_info_exact(&pool);
+    }
+
+    #[test]
+    fn child_becoming_a_root_keeps_its_original_expiry_age() {
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            expiry_time: 10,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+        let parent_input = outpoint(0xd1, 0);
+        let parent = transaction(parent_input.clone(), 999);
+        let parent_txid = parent.txid();
+        assert!(matches!(
+            submit_at(
+                &mut pool,
+                parent.clone(),
+                &FixedView::with_coin(parent_input, 1_000),
+                1,
+            ),
+            Admission::Accepted(_)
+        ));
+        let child = transaction(
+            Outpoint {
+                txid: parent_txid,
+                index: 0,
+            },
+            998,
+        );
+        let child_txid = child.txid();
+        assert!(matches!(
+            submit_at(&mut pool, child, &FixedView::default(), 2),
+            Admission::Accepted(_)
+        ));
+
+        assert_eq!(pool.remove_confirmed(&[parent]), 1);
+        assert_eq!(pool.next_expiry_root, Some((2, child_txid)));
+        assert_cached_info_exact(&pool);
+
+        let trigger_input = outpoint(0xd2, 0);
+        let trigger = transaction(trigger_input.clone(), 999);
+        let trigger_txid = trigger.txid();
+        assert!(matches!(
+            submit_at(
+                &mut pool,
+                trigger,
+                &FixedView::with_coin(trigger_input, 1_000),
+                12,
+            ),
+            Admission::Accepted(_)
+        ));
+        assert!(pool.transaction(&child_txid).is_none());
+        assert!(pool.transaction(&trigger_txid).is_some());
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4112,6 +4877,7 @@ mod tests {
         assert_eq!(revalidation.removed, 1);
         assert_eq!(revalidation.retained_transactions, 0);
         assert_eq!(pool.info().transaction_count, 0);
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4170,6 +4936,7 @@ mod tests {
         assert!(pool.transaction(&standalone_txid).is_none());
         assert!(pool.transaction(&candidate_txid).is_none());
         assert_eq!(pool.info().transaction_count, 2);
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4205,6 +4972,7 @@ mod tests {
         ));
         assert_eq!(pool.info().transaction_count, 1);
         assert!(pool.transaction(&high_fee_txid).is_some());
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4233,6 +5001,7 @@ mod tests {
         assert_eq!(pool.info().transaction_count, 1);
         assert!(pool.transaction(&newest).is_some());
         assert_eq!(pool.entries()[0].admitted_at, 3);
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4304,9 +5073,11 @@ mod tests {
             submit(&mut pool, grandchild, &view),
             Admission::Accepted(_)
         ));
+        assert_cached_info_exact(&pool);
         let generation_before = pool.info().generation;
 
         assert_eq!(pool.remove_confirmed(&[parent]), 1);
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().generation, generation_before + 1);
         assert!(pool.transaction(&parent_txid).is_none());
         assert!(pool.transaction(&child_txid).is_some());
@@ -4359,8 +5130,10 @@ mod tests {
             submit(&mut pool, transaction(missing, 1), &FixedView::default()),
             Admission::Orphan(_)
         ));
+        assert_cached_info_exact(&pool);
         let generation_before = pool.info().generation;
         assert_eq!(pool.clear(), 2);
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().generation, generation_before + 1);
         assert_eq!(pool.clear(), 0);
         assert_eq!(pool.info().generation, generation_before + 1);

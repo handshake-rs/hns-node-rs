@@ -6,6 +6,10 @@ use hns_primitives::{hex_encode, Block, BlockHash, Coin, Height, NameState, Txid
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+fn hsrd_software_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: Option<String>,
@@ -226,6 +230,12 @@ pub struct RpcNameTreeCompactionInfo {
     pub last_nodes_before: Option<usize>,
     pub last_nodes_retained: Option<usize>,
     pub last_nodes_deleted: Option<usize>,
+    #[serde(default)]
+    pub name_page_compaction_overdue: bool,
+    #[serde(default)]
+    pub payload_segment_compaction_overdue: bool,
+    #[serde(default)]
+    pub production_safety_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -507,6 +517,33 @@ impl BasicRpcService {
         &self.snapshot
     }
 
+    /// Build `getrawmempool` from an immutable transaction-id view without
+    /// requiring callers to clone complete mempool entries while holding
+    /// their coordinator lock.
+    pub fn handle_raw_mempool<I>(
+        &self,
+        request: JsonRpcRequest,
+        txids: I,
+    ) -> Result<JsonRpcResponse, RpcError>
+    where
+        I: IntoIterator<Item = Txid>,
+    {
+        let id = request.id;
+        if RpcMethod::from_hsd_name(&request.method) != Some(RpcMethod::GetRawMempool) {
+            return Ok(self.err(id, -32601, "method not found"));
+        }
+        if let Err(error) = rpc_params(&request.params) {
+            return Ok(self.err(id, error.code, error.message));
+        }
+        Ok(self.ok(
+            id,
+            json!(txids
+                .into_iter()
+                .map(|txid| txid.to_hex())
+                .collect::<Vec<_>>()),
+        ))
+    }
+
     fn ok(&self, id: Option<Value>, result: Value) -> JsonRpcResponse {
         JsonRpcResponse {
             jsonrpc: "2.0".to_owned(),
@@ -556,7 +593,9 @@ impl BasicRpcService {
             RpcMethod::GetBlockchainInfo => Ok(json!({
                 "chain": self.snapshot.network,
                 "blocks": tip.map(|tip| tip.height).unwrap_or(0),
-                "headers": tip.map(|tip| tip.height).unwrap_or(0),
+                "headers": self.snapshot.node_status.best_header_height
+                    .or_else(|| tip.map(|tip| tip.height))
+                    .unwrap_or(0),
                 "bestblockhash": tip.map(|tip| tip.hash.to_hex()),
                 "chainwork": tip.map(|tip| format!("{:x}", tip.chainwork)).unwrap_or_else(|| "0".to_owned()),
                 "initialblockdownload": true,
@@ -590,8 +629,8 @@ impl BasicRpcService {
                 "getpeerinfo requires the live peer diagnostics service",
             )),
             RpcMethod::GetNetworkInfo => Ok(json!({
-                "version": 0,
-                "subversion": "/hsrd:0.1.0/",
+                "version": hsrd_software_version(),
+                "subversion": concat!("/hsrd:", env!("CARGO_PKG_VERSION"), "/"),
                 "networkactive": self.snapshot.network_active,
                 "connections": self.snapshot.peer_count,
             })),
@@ -896,6 +935,71 @@ mod tests {
     }
 
     #[test]
+    fn raw_mempool_can_materialize_an_external_immutable_id_view() {
+        let service = BasicRpcService::default();
+        let first = Txid::new([1; 32]);
+        let second = Txid::new([2; 32]);
+        let response = service
+            .handle_raw_mempool(
+                JsonRpcRequest {
+                    jsonrpc: Some("2.0".to_owned()),
+                    method: "getrawmempool".to_owned(),
+                    params: json!([]),
+                    id: Some(json!("cow-view")),
+                },
+                [second, first],
+            )
+            .expect("raw mempool response");
+        assert_eq!(
+            response.result,
+            Some(json!([second.to_hex(), first.to_hex()]))
+        );
+        assert_eq!(response.id, Some(json!("cow-view")));
+    }
+
+    #[test]
+    fn blockchain_info_reports_header_frontier_ahead_of_active_blocks() {
+        let service = BasicRpcService::new(RpcSnapshot {
+            network: "regtest".to_owned(),
+            chain_tip: Some(ChainTip {
+                hash: BlockHash::new([1; 32]),
+                height: 7,
+                chainwork: 9u64.into(),
+            }),
+            node_status: RpcNodeStatus {
+                best_header_height: Some(19),
+                ..RpcNodeStatus::default()
+            },
+            ..RpcSnapshot::default()
+        });
+        let response = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getblockchaininfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!("headers-ahead")),
+            })
+            .expect("blockchain info")
+            .result
+            .expect("blockchain result");
+        assert_eq!(response["blocks"], 7);
+        assert_eq!(response["headers"], 19);
+
+        let empty = BasicRpcService::default()
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getblockchaininfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!("empty")),
+            })
+            .expect("empty blockchain info")
+            .result
+            .expect("empty blockchain result");
+        assert_eq!(empty["blocks"], 0);
+        assert_eq!(empty["headers"], 0);
+    }
+
+    #[test]
     fn network_rpc_reports_snapshot_state_and_rejects_missing_peer_details() {
         let service = BasicRpcService::new(RpcSnapshot {
             network_active: true,
@@ -915,6 +1019,15 @@ mod tests {
             .expect("network result");
         assert_eq!(network["networkactive"], true);
         assert_eq!(network["connections"], 4);
+        assert_eq!(
+            network["version"],
+            Value::String(env!("CARGO_PKG_VERSION").to_owned())
+        );
+        assert!(network["version"].is_string());
+        assert_eq!(
+            network["subversion"],
+            concat!("/hsrd:", env!("CARGO_PKG_VERSION"), "/")
+        );
 
         let peers = service
             .handle(JsonRpcRequest {

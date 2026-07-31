@@ -27,7 +27,10 @@ use hns_state::{
     airdrop_position_spent, decode_coin, encode_outpoint_key, verify_mempool_claim_context,
     verify_mempool_name_context,
 };
-use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
+use hns_store::{
+    ColumnFamily, PrefixScanBudget, ReadSnapshot, Store, StoreHandle, WriteBatch,
+    PREFIX_SCAN_MAX_BYTES, PREFIX_SCAN_MAX_ENTRIES,
+};
 use serde::{Deserialize, Serialize};
 
 use super::{issue_authority_permit, AuthorityMode, NodeService, ShadowSyncConfig};
@@ -933,6 +936,7 @@ impl NodeService {
         &mut self,
         transaction: hns_primitives::Transaction,
     ) -> Result<hns_mempool::Admission> {
+        self.state.ensure_storage_operational()?;
         if !self.config.mining_engine.enabled || !self.config.mining_engine.transaction_relay {
             return Ok(hns_mempool::Admission::Rejected {
                 reason: "mining_engine-transaction-relay-disabled".to_owned(),
@@ -989,6 +993,7 @@ impl NodeService {
     /// snapshot used by block connection, including canonical commit ancestry
     /// and post-deflation replacement rules.
     pub fn mining_engine_accept_peer_claim(&mut self, claim: Claim) -> Result<ClaimAdmission> {
+        self.state.ensure_storage_operational()?;
         if !self.config.mining_engine.enabled || !self.config.mining_engine.transaction_relay {
             return Ok(ClaimAdmission::Rejected {
                 reason: "mining_engine-transaction-relay-disabled".to_owned(),
@@ -1033,6 +1038,7 @@ impl NodeService {
         &mut self,
         proof: AirdropProof,
     ) -> Result<AirdropAdmission> {
+        self.state.ensure_storage_operational()?;
         if !self.config.mining_engine.enabled || !self.config.mining_engine.transaction_relay {
             return Ok(AirdropAdmission::Rejected {
                 reason: "mining_engine-transaction-relay-disabled".to_owned(),
@@ -1105,7 +1111,11 @@ impl NodeService {
         if existing.len() >= self.config.mining_engine.maximum_pending_publications {
             anyhow::bail!("pending solved-block publication capacity is exhausted");
         }
-        write_publication_intent(&self.state.store, &intent)?;
+        let publication = write_publication_intent(&self.state.store, &intent);
+        if publication.is_err() {
+            self.fail_closed_after_ambiguous_commit();
+        }
+        publication?;
         Ok(intent)
     }
 
@@ -1117,7 +1127,12 @@ impl NodeService {
     }
 
     pub fn mining_engine_complete_publication(&self, block_hash: BlockHash) -> Result<()> {
-        delete_publication_intent(&self.state.store, block_hash)
+        self.state.ensure_storage_operational()?;
+        let deletion = delete_publication_intent(&self.state.store, block_hash);
+        if deletion.is_err() {
+            self.fail_closed_after_ambiguous_commit();
+        }
+        deletion
     }
 
     pub async fn mining_engine_retry_pending_publications(
@@ -1282,19 +1297,39 @@ fn load_publication_intents(
     store: &StoreHandle,
     maximum: usize,
 ) -> Result<Vec<SolvedBlockPublicationIntent>> {
+    let scan_entries = maximum
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("publication queue maximum overflows its scan bound"))?;
+    if scan_entries > PREFIX_SCAN_MAX_ENTRIES {
+        anyhow::bail!(
+            "publication queue maximum {maximum} cannot be checked within the storage page limit of {} entries",
+            PREFIX_SCAN_MAX_ENTRIES
+        );
+    }
     let snapshot = store
         .snapshot()
         .context("failed to open publication queue snapshot")?;
-    let entries = snapshot
-        .scan_prefix(ColumnFamily::Snapshots, PUBLICATION_KEY_PREFIX)
-        .context("failed to scan publication queue")?;
-    if entries.len() > maximum {
+    let page = snapshot
+        .scan_prefix_page(
+            ColumnFamily::Snapshots,
+            PUBLICATION_KEY_PREFIX,
+            None,
+            PrefixScanBudget {
+                max_entries: scan_entries,
+                max_bytes: PREFIX_SCAN_MAX_BYTES,
+            },
+        )
+        .context("failed to read bounded publication queue")?;
+    if page.entries.len() > maximum || page.continuation.is_some() {
+        let lower_bound = page.entries.len().saturating_add(usize::from(
+            page.continuation.is_some() && page.entries.len() <= maximum,
+        ));
         anyhow::bail!(
-            "publication queue contains {} entries above configured maximum {maximum}",
-            entries.len()
+            "publication queue contains at least {lower_bound} entries or exceeds the bounded scan byte envelope, above configured maximum {maximum}"
         );
     }
-    let mut intents = entries
+    let mut intents = page
+        .entries
         .into_iter()
         .map(|(key, value)| {
             let intent = SolvedBlockPublicationIntent::decode(&value)
@@ -1344,5 +1379,38 @@ mod tests {
         assert!(load_publication_intents(&store, 1)
             .expect("publication queue")
             .is_empty());
+    }
+
+    #[test]
+    fn publication_queue_rejects_oversize_and_overflow_before_decoding() {
+        let store = StoreHandle::memory();
+        initialize_schema(&store).expect("schema");
+        let mut batch = store.batch();
+        for tag in [0x11, 0x22] {
+            let mut key = PUBLICATION_KEY_PREFIX.to_vec();
+            key.extend_from_slice(&[tag; 32]);
+            batch
+                .put(ColumnFamily::Snapshots, &key, &[tag])
+                .expect("stage deliberately invalid intent");
+        }
+        store.commit(batch).expect("publish oversized queue");
+
+        let error = load_publication_intents(&store, 1).expect_err("oversized queue");
+        assert!(
+            error.to_string().contains("above configured maximum 1"),
+            "{error:#}"
+        );
+        let error =
+            load_publication_intents(&store, usize::MAX).expect_err("overflowing queue maximum");
+        assert!(
+            error.to_string().contains("overflows its scan bound"),
+            "{error:#}"
+        );
+        let error = load_publication_intents(&store, PREFIX_SCAN_MAX_ENTRIES)
+            .expect_err("uncheckable queue maximum");
+        assert!(
+            error.to_string().contains("storage page limit"),
+            "{error:#}"
+        );
     }
 }

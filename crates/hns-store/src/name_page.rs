@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use hns_primitives::blake2b_256;
@@ -190,6 +190,7 @@ pub struct NamePageFileInspection {
 #[derive(Debug)]
 pub struct NamePageAppender {
     file: File,
+    path: PathBuf,
     generation: u64,
     segment: u32,
     next_page: u32,
@@ -316,14 +317,16 @@ impl NamePageAppender {
         segment: u32,
     ) -> Result<Self, NamePageError> {
         NamePageAddress::new(segment, 0, 0)?;
+        let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
             .append(true)
             .create_new(true)
-            .open(path)
+            .open(&path)
             .map_err(name_page_io)?;
         Ok(Self {
             file,
+            path,
             generation,
             segment,
             next_page: 0,
@@ -336,10 +339,11 @@ impl NamePageAppender {
         manifest: SegmentManifest,
     ) -> Result<Self, NamePageError> {
         NamePageAddress::new(manifest.active_segment, 0, 0)?;
+        let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
-            .open(path)
+            .open(&path)
             .map_err(name_page_io)?;
         let actual = file.metadata().map_err(name_page_io)?.len();
         if actual != manifest.durable_bytes || !actual.is_multiple_of(NAME_PAGE_BYTES as u64) {
@@ -361,6 +365,7 @@ impl NamePageAppender {
         }
         Ok(Self {
             file,
+            path,
             generation: manifest.generation,
             segment: manifest.active_segment,
             next_page,
@@ -374,6 +379,18 @@ impl NamePageAppender {
     pub fn append(
         &mut self,
         records: &[NamePageRecord],
+    ) -> Result<Vec<NamePageAddress>, NamePageError> {
+        self.append_with_reserve(records, 0)
+    }
+
+    /// Write one complete immutable page while preserving a caller-selected
+    /// filesystem reserve. Availability is sampled after the page is fully
+    /// encoded and immediately before the physical append, so every page in a
+    /// long-running generation or compaction rechecks the capacity envelope.
+    pub fn append_with_reserve(
+        &mut self,
+        records: &[NamePageRecord],
+        reserve_bytes: u64,
     ) -> Result<Vec<NamePageAddress>, NamePageError> {
         if self.poisoned {
             return Err(NamePageError::AppenderPoisoned);
@@ -395,6 +412,8 @@ impl NamePageAppender {
                 u16::try_from(slot).map_err(|_| NamePageError::TooManyRecords(records.len()))?,
             )?);
         }
+        let available_bytes = self.filesystem_available_bytes()?;
+        ensure_name_page_append_capacity(available_bytes, reserve_bytes)?;
         self.poisoned = true;
         self.file.write_all(&encoded).map_err(name_page_io)?;
         self.next_page = self
@@ -405,6 +424,14 @@ impl NamePageAppender {
             })?;
         self.poisoned = false;
         Ok(addresses)
+    }
+
+    /// Return caller-available bytes on the filesystem containing this
+    /// appender. This is informational; reserve enforcement belongs in
+    /// [`Self::append_with_reserve`] so the check cannot be separated from an
+    /// append by page construction work.
+    pub fn filesystem_available_bytes(&self) -> Result<u64, NamePageError> {
+        fs4::available_space(&self.path).map_err(name_page_io)
     }
 
     pub fn sync_data(&mut self) -> Result<SegmentManifest, NamePageError> {
@@ -700,8 +727,42 @@ pub enum NamePageError {
     PageIndexOverflow { pages: u64 },
     #[error("name page appender is poisoned by an incomplete write")]
     AppenderPoisoned,
+    #[error(
+        "name page append needs {required} available bytes ({page_bytes} page + {reserve_bytes} reserve), but only {available} are available"
+    )]
+    InsufficientCapacity {
+        available: u64,
+        required: u64,
+        page_bytes: u64,
+        reserve_bytes: u64,
+    },
     #[error("name page I/O failed: {0}")]
     Io(String),
+}
+
+fn ensure_name_page_append_capacity(
+    available: u64,
+    reserve_bytes: u64,
+) -> Result<(), NamePageError> {
+    let page_bytes = NAME_PAGE_BYTES as u64;
+    let required =
+        reserve_bytes
+            .checked_add(page_bytes)
+            .ok_or(NamePageError::InsufficientCapacity {
+                available,
+                required: u64::MAX,
+                page_bytes,
+                reserve_bytes,
+            })?;
+    if available < required {
+        return Err(NamePageError::InsufficientCapacity {
+            available,
+            required,
+            page_bytes,
+            reserve_bytes,
+        });
+    }
+    Ok(())
 }
 
 pub fn encode_name_page(records: &[NamePageRecord]) -> Result<Vec<u8>, NamePageError> {
@@ -1837,6 +1898,10 @@ pub fn read_name_page_record_at(
     })
 }
 
+/// Coalesce logical addresses into sorted, duplicate-free 64 KiB physical
+/// reads. For `A` addresses and `U` unique pages, the `BTreeSet` plan takes
+/// `O(A log U)` time and `O(U)` memory; later record selection can use the
+/// authenticated 4 KiB subpage directory without retaining unrelated payloads.
 pub fn plan_name_page_reads<I>(
     generation: u64,
     addresses: I,
@@ -2331,6 +2396,12 @@ mod tests {
     fn page_appender_publishes_only_the_synced_manifest_tail() {
         let path = test_file();
         let mut appender = NamePageAppender::create_new(&path, 23, 6).expect("create");
+        assert!(
+            appender
+                .filesystem_available_bytes()
+                .expect("filesystem availability")
+                >= NAME_PAGE_BYTES as u64
+        );
         let records = vec![leaf(0xa1, 70), leaf(0xa2, 70)];
         let addresses = appender.append(&records).expect("append");
         assert_eq!(
@@ -2351,6 +2422,31 @@ mod tests {
         assert_eq!(reopened.next_page(), 1);
         drop(reopened);
         fs::remove_file(path).expect("remove test pages");
+    }
+
+    #[test]
+    fn page_append_capacity_accepts_exact_and_rejects_one_under() {
+        const RESERVE: u64 = 10_000_000_000;
+        let required = RESERVE + NAME_PAGE_BYTES as u64;
+        ensure_name_page_append_capacity(required, RESERVE).expect("exact capacity");
+        assert_eq!(
+            ensure_name_page_append_capacity(required - 1, RESERVE),
+            Err(NamePageError::InsufficientCapacity {
+                available: required - 1,
+                required,
+                page_bytes: NAME_PAGE_BYTES as u64,
+                reserve_bytes: RESERVE,
+            })
+        );
+        assert_eq!(
+            ensure_name_page_append_capacity(u64::MAX, u64::MAX),
+            Err(NamePageError::InsufficientCapacity {
+                available: u64::MAX,
+                required: u64::MAX,
+                page_bytes: NAME_PAGE_BYTES as u64,
+                reserve_bytes: u64::MAX,
+            })
+        );
     }
 
     #[test]

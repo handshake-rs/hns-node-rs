@@ -126,6 +126,8 @@ documented in [Storage rollout](docs/storage-rollout.md).
 - [Readiness status](docs/readiness.md)
 - [Detailed implementation status](docs/implementation-status.md)
 - [Testing and qualification](docs/testing.md)
+- [Production assurance and external evidence](docs/production-assurance.md)
+- [Storage schema and complexity](docs/storage-schema.md)
 - [Native mainnet mining canary](docs/mainnet-canary.md)
 - [Extraction provenance](docs/extraction-provenance.md)
 

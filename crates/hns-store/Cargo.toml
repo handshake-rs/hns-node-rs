@@ -10,6 +10,7 @@ default = ["rocksdb-backend"]
 rocksdb-backend = ["dep:rocksdb"]
 
 [dependencies]
+fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 hns-primitives = { path = "../hns-primitives" }
 rocksdb = { version = "0.24", optional = true }
 serde.workspace = true

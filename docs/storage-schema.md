@@ -99,6 +99,15 @@ Durable identity binds:
   uses one snapshot-bound multi-get, while atomic staging overlays resolve their
   own replacements/deletions first and batch only missing keys against the base
   snapshot.
+- Prefix consumers that cannot prove a small result use the storage-native
+  cursor API. One page is bounded independently by record count and combined
+  key/value bytes, and returns the last emitted key as an exclusive
+  continuation token. RocksDB seeks directly to that token on the same
+  immutable snapshot; the hard API ceilings are 4,096 records and 64 MiB plus
+  one 4 KiB key/framing envelope per page. A value larger than the selected
+  byte budget fails instead of bypassing the bound. Full `scan_prefix` remains
+  only for callers whose domain is
+  intrinsically bounded or explicit offline analysis.
 - One atomic activation snapshot has a 65,536-entry read-through cache,
   including misses, for immutable metadata, headers, height/block/transaction
   indexes, UTXOs, name state, and snapshot records. A separate 131,072-entry
@@ -119,6 +128,127 @@ Durable identity binds:
 
 `RocksSnapshot` owns an actual RocksDB snapshot at one sequence number. It is
 not a clone of the live database handle.
+
+## Block data management and asymptotic bounds
+
+Let:
+
+- `N` be the records in the selected RocksDB column family;
+- `H` be all durable header records;
+- `B` be all durable block-index records;
+- `C` be the length of the selected best-header ancestry, with `C <= H`;
+- `Q` be the number of active canonical-height entries, with `Q <= B`;
+- `M` be the network median-time-past ancestry span;
+- `W` be the network difficulty ancestry window, including the adjacent
+  suitable-block lookups;
+- `P` be one configured cursor page, bounded by both records and bytes;
+- `A` be a failed header root plus all of its known descendants;
+- `D` be the total disconnect/connect length of one canonical fallback or
+  reorganization;
+- `K` be the headers in one live import batch, with `K <= 2,000`;
+- `R` be the block-index records in one live cache publication, with
+  `R <= 1,024`;
+- `L` be live block plus undo locators;
+- `F` be the live segment-frame bytes copied by generation compaction;
+- `S` be physical segment files;
+- `I` be the transactions' unique input/output collision keys in one block.
+
+The design uses hash-addressed primary records, a canonical-height secondary
+index, compact immutable segment locators, append-only generation files, and a
+bounded rollback window. Consensus identity remains the block hash and
+authenticated state roots; physical addresses are replaceable acceleration
+metadata.
+
+| Operation | Data structure and algorithm | Time | Peak working memory | I/O amplification |
+|---|---|---:|---:|---|
+| Header-index startup/recovery | 4,096-record/4 MiB cursor pages decode `headers` into a hash map. Recovery first proves key/header identity, exactly one root when nonempty, contiguous parent/height, exact proof-derived work, and failure ancestry; then it constructs parent-to-children adjacency, an ordered viable-work set, and the best ancestry's canonical-height map. Production recovery validates every resident branch against the selected network's exact genesis, durable context/checkpoint bits, difficulty, median time, checkpoints, PoW, one common future-time bound, and chainwork. | `O(H log H + H(M + W) + C)`; ancestry lookups during the all-branch consensus pass are expected `O(1)` resident-map reads | final `O(H)` across header, canonical, child-edge, and viable entries plus one bounded page; the `O(C)` final canonical map is reconstructed in place without a second ancestry vector | reads every durable header once; the consensus pass performs no per-ancestor RocksDB reads and the storage API never returns an unbounded page |
+| Block-index startup/status | One bounded cursor pass builds exact alternate/failed counters and a 4,096-record FIFO cache. An independent bounded audit pages every `block_index` record and reverse-binds its header/status/height, then pages `height_index` and proves exact contiguity from zero through `best-block-hash`. | expected `O(B + (B + Q) log N)` startup including point bindings; `O(1)` status reads afterward | `O(P bytes + 4,096 records)` rather than `O(B)` | two sequential `block_index` passes; the binding audit adds header/canonical point reads for each block record and block/header point reads for each active height; status refresh performs no durable scan |
+| Live header/canonical lookup | Resident hash maps keyed by header hash and height | expected `O(1)` | covered by the final `O(H)` header index | no storage I/O |
+| Durable block/body point lookup | Bloom-filtered LSM point read by 32-byte hash; a block/undo locator then selects one checksummed frame | expected `O(log N + frame bytes)` | `O(frame bytes)` | one LSM lookup plus one frame read; absent keys normally stop at Bloom/filter metadata |
+| Active canonical height lookup | `height_index` big-endian key to active block hash, then optional point reads | expected `O(log N)` per lookup | `O(1)` excluding returned values | point reads only; no chain scan |
+| Bounded prefix page | RocksDB seek to an exclusive continuation, then ordered iterator | `O(log N + P)` | `O(P bytes)` | reads only iterator/filter/data blocks covering the returned page |
+| Header batch import | A batch-local hash map validates at most 2,000 parents and identifies the next best header. Direct extension appends canonical entries. For a non-direct higher-work tip, height-aligned parent walks over the resident and staged maps build only a bounded reorganization delta: at most 16,384 disconnects and 16,384 connects. | expected `O(K log H + D)` including viable-set publication; resident/staged parent reads are expected `O(1)` | `O(K + D)` incremental working memory beyond the resident `O(H)` index; no complete ancestry or replacement canonical map is retained | one atomic `O(K)` header/best-binding WAL batch; delta planning performs no RocksDB reads and memory publishes only after commit |
+| Failed-header propagation | Persistent child adjacency discovers `A` under a 16,384-record descendant limit and 30-second traversal deadline; the viable-work set skips affected candidates; bounded parent walks derive a `D`-entry canonical delta. Each affected hash probes its durable block-index record, and at most `R` existing records enter an incremental cache publication. | `O(A + D + R)` in-memory traversal and validation, up to `O((A + R) log B)` block-index lookup cost, plus `O(A log H)` ordered-set removals during in-memory publication | `O(A + D + R)` plan and staged deltas beyond the resident indexes; the fixed 4,096-record block cache remains in place and is not cloned | up to `A` block-index existence point reads plus `R` stale-state validation point reads, then one atomic `O(A + R)` header/block-index batch with the single invalid-root raw body and best-header binding; no intermediate failure state is visible |
+| Block state connect | hash-map deduplication plus snapshot-bound multi-get for `I` UTXO keys, then one atomic batch | expected `O(I)` hashing plus LSM point/write costs | `O(I + staged state)` | one multi-get domain and one WAL/memtable publication; segment payloads are appended once |
+| Reorganization | one immutable snapshot and read-your-writes overlay across `D` disconnect/connect steps | proportional to blocks and state touched across `D` | proportional to staged reorg state | one final atomic WAL batch; no intermediate tips are published |
+| Payload pruning | canonical-height point traversal in at most 1,024 heights per startup transaction, with a larger backlog processed across multiple bounded transactions, or one at-most-360-height authenticated interval during connect | `O(batch heights)` | `O(batch heights)` locator/status mutations | deletes locators/status and advances one checkpoint; historical block payload bytes are not reread |
+| Compaction plan | streaming inventory of `blocks` and `undo`, plus `S` file metadata reads | `O(N + S)` | `O(1)` counters and iterator blocks | reads locator values only; it does not read payload frames |
+| Segment generation compaction | cursor pages over one stable snapshot; copy each of `L` live frames once; publish all replacement locators and both manifests atomically | `O(N + F)` | `O(P bytes + largest frame + L locator batch)` | reads old live frames once, writes `F` new bytes once, rereads the new generation for checksum scrub, and writes one locator WAL/SST batch; old and new generations coexist until publication |
+| Name proof/path update | Patricia traversal with page/subpage coalescing and content-hash verification | `O(tree depth)` per independent path, with shared paths composed once | bounded affected-path frontier and page cache | one 4 KiB authenticated index plus only selected 4 KiB record subpages on version-2 pages |
+
+Header paging bounds each storage result, not final header-index residency.
+Recovery deliberately retains all `H` headers, up to `H - 1` child edges, up to
+`H` viable-work entries, and `C` canonical entries so live fork choice,
+descendant failure, and header RPC lookups do not return to disk scans. Peak
+startup memory is the final `O(H)` structures plus the last decoded page. The
+recovery walk inserts its `C` final canonical entries in place and neither
+retains a separate ancestry vector nor an old and new full header index. A live
+non-direct higher-work import instead retains only its at-most-`K` staged
+headers and a bounded `O(D)` disconnect/connect delta, then mutates the resident
+canonical map in place after the durable commit. Production RSS qualification
+must cover the linear `O(H)` recovery baseline and the bounded `O(K + D)` live
+increment; the independent 4,096-record block cache does not bound header
+memory and its live publications stage at most `R` records rather than cloning
+the cache.
+
+Strict production recovery has no synthetic-root or fixture bypass. For a
+nonempty index, the sole height-zero record and reconstructed canonical height
+zero must equal the configured network genesis. The all-branch consensus pass
+captures the host wall clock once and applies the same
+`now + MAX_FUTURE_BLOCK_TIME` bound to every record, avoiding
+iteration-order-dependent time decisions. A production host therefore requires
+a sane wall clock before startup; headers beyond the common bound fail closed.
+
+The complete header consensus audit and bidirectional block/header/height-index
+audit run before a clean startup checkpoint can shorten deeper validation. A
+matching `startup-audit/v1` checkpoint bounds active raw-body, undo,
+deployment, authenticated-name-root, and interval-pin revalidation to the
+configured reorganization horizon; it never skips the all-header or all-block
+index audits. Non-active raw bodies are not all decoded at startup. A body
+availability query authenticates the exact raw frame and its header/status
+binding, and any later stored-block activation exact-binds the body, block
+index, and header before rerunning the complete strict import policy. Durable
+status bits are cached evidence, not activation authority.
+
+`startup-audit/v1`, the clean marker, RocksDB checksums, frame checksums, and
+manifests are unkeyed crash-consistency and corruption-detection mechanisms.
+The startup record binds selected metadata, roots, pins, and maintenance
+checkpoints; it does not bind the complete UTXO keyspace or every logical
+database record. Neither the matching-checkpoint route nor the deeper unclean
+startup route is a full replay from genesis, and neither authenticates the store
+against a hostile offline writer. Production use therefore requires exclusive
+custody by the dedicated `hsrd` service identity and trusted, audited offline
+maintenance, with no untrusted writer to the data root or external
+page/segment paths. After a custody breach, rebuild through a full trusted
+replay or use a separately protected keyed/trusted complete-state commitment
+once such a mechanism exists; the current schema provides no such commitment.
+
+The final locator publication is intentionally atomic: exposing a mixture of
+manifests and generations would make crash recovery ambiguous. Therefore
+generation compaction cannot have constant memory in `L`; instead, preflight
+places explicit ceilings on live records, live frame bytes, estimated
+key/locator bytes, and each iterator page. The defaults cap the final locator
+key/value payload at 128 MiB and copied live frames at 64 GiB. Exceeding any
+budget fails before a replacement generation is created. Production operators
+must choose lower host-specific limits when RocksDB WriteBatch overhead and
+normal process memory leave less headroom.
+
+The durable `height_index` is the mandatory canonical-order index for connected
+active blocks. Header-only fork choice reconstructs its separate canonical
+height map from the durable best-header ancestry and keeps that map resident.
+`block_index` stores status and ancestry by hash, while raw bodies and undo are
+independently hash-addressed. `tx_index` is optional because it amplifies every
+connect, disconnect, and reorganization and is not required for consensus,
+relay, or template construction. No secondary index is authoritative without
+its matching block/header status and active-tip binding in the same atomic
+transition.
+
+The rollback invariant is independent of physical compaction: no height at or
+below `pruneAfterHeight` is retired, and at least the newest network
+`keepBlocks` plus the pending authenticated-tree interval remain available.
+Pruning advances block and undo frontiers with their canonical hashes in the
+same batch that clears presence bits and interval pins. A reorganization that
+would cross either retired frontier fails before mutation.
 
 ## Metadata keys
 
@@ -162,8 +292,9 @@ cannot promote a block or grant authority.
   epoch, sync checkpoint, and recovery markers.
 - `headers`: `header_hash -> HeaderRecord` including bytes, height, unsigned
   256-bit chainwork, and granular status.
-- `height_index`: `height -> canonical_header_hash` for the active/canonical
-  selected header path.
+- `height_index`: `height -> canonical_block_hash` for the connected active
+  block path. The independently selected header path is reconstructed from
+  `best-header-hash` and resident header ancestry.
 - `block_index`: `block_hash -> BlockIndexRecord` including height, parent,
   chainwork, status, transaction count, and validation timestamp.
 - `blocks`: hash-addressed raw block records with source and integrity metadata.
@@ -203,15 +334,19 @@ cannot promote a block or grant authority.
   plus `undo-pruning/v1` for the atomically advanced undo-retirement boundary.
   `name-page-state/v1`, per-root page locators, block/undo segment manifests,
   and `transaction-index-mode/v1` bind the optimized storage tiers.
-  `startup-audit/v1` is a checksummed commitment to the schema/profile,
-  network/genesis, best header, active tip, chain epoch, mining generation,
-  working and committed name roots, airdrop field, complete interval-pin set,
-  and maintenance checkpoints. It is written atomically with the clean marker.
-  A missing, corrupt, or mismatched commitment selects exhaustive startup
-  validation rather than authorizing a shortcut. A matching commitment bounds
-  synchronous chain validation to the complete network reorganization/undo
-  horizon; full historical validation remains the unclean-start route and a
-  requirement for the offline scrub campaign.
+  `startup-audit/v1` is an unkeyed checksummed consistency record binding the
+  schema/profile, network/genesis, best header, active tip, chain epoch, mining
+  generation, working and committed name roots, airdrop field, complete
+  interval-pin set, and maintenance checkpoints. It is written atomically with
+  the clean marker. A missing, corrupt, or mismatched record selects exhaustive
+  startup validation rather than authorizing a shortcut. The strict all-branch
+  header consensus audit and the complete block/header/canonical-index binding
+  audit run regardless. A matching record bounds deeper active body, undo,
+  deployment, name-root, and pin validation to the complete network
+  reorganization/undo horizon. The unclean-start route and offline scrub
+  perform deeper historical structural, body, and name-state audits, but do not
+  replay all consensus state from genesis or authenticate arbitrary logical
+  database changes by a hostile writer.
 - `peers`: `address-book/v1` stores one bounded, checksummed, versioned, and
   network-bound snapshot of discovered IP peers. Each entry retains services,
   advertised time, connection attempts, last success, last attempt, and stable
@@ -366,8 +501,9 @@ accepts each reviewed source profile and publishes a complete fallback marker
 only after the RocksDB checkpoint and independent external-file copies are
 synced. `inventory` validates every committed archive frame.
 `migrate-inline` converts legacy block/undo values in bounded idempotent
-transactions; mixed inline/locator operation remains supported when disk
-headroom is insufficient.
+transactions. It advances through each hash prefix with the same exclusive
+record/byte-bounded cursor rather than materializing the prefix, and mixed
+inline/locator operation remains supported when disk headroom is insufficient.
 
 ## Persistent Urkel status
 
@@ -440,7 +576,38 @@ publishes every replacement locator and both manifests. Recovery keeps the
 manifest-selected generation and removes either unpublished new files or
 superseded predecessors. The stopped-node
 `hsrd-storage-maintenance compact` command performs the same rewrite with full
-pre/post frame scrubs and a JSON reclamation report.
+pre/post frame scrubs and a JSON reclamation report. It first performs a
+read-only, budget-checked plan. `compact --dry-run` reports the exact live,
+physical, reclaimable, and estimated atomic-locator bytes without creating a
+generation. Mutating compaction refuses to start below its configured reclaim
+threshold or above any record/byte budget.
+
+Segment bytes are synced before RocksDB publication, but a write error does not
+prove that RocksDB rejected the batch. After any such ambiguous error the
+process retains both generations and a shared fence covers every clone of the
+RocksDB backend and archived store. New snapshots, all commits (including
+metadata-only batches), checkpoints, and archive maintenance reject until the
+database is truly closed and reopened; constructing another wrapper around a
+poisoned backend is not recovery. Reopen reads the atomic manifests: old
+manifests discard the unpublished generation, while new manifests retain it and
+retire the predecessor. The same backend fence applies to an ambiguous
+payload-free RocksDB write. Deterministic before-write and after-write fault
+tests prove both outcomes and the fence, including the case where the complete
+RocksDB batch is applied and then an error is returned. External process-kill
+testing remains a rollout evidence requirement.
+
+RocksDB can also report a successful replacement-locator/manifest commit before
+the in-process archive fails to swap its writer, invalidate cached readers,
+remove predecessors, or sync the directory. Every such post-commit
+installation error marks the archive reopen-required and is reported as
+committed-but-install-incomplete; new snapshots, archive payload reads
+(including through existing snapshots), writes, and maintenance cannot continue
+through that archive instance. Reopen trusts the already committed new
+manifests and completes generation recovery. A failure injected before
+predecessor cleanup leaves both complete generations for that decision. A later
+cleanup failure may already have removed part of the old generation, but it
+cannot remove the manifest-selected new generation; it is still reopen-only and
+must not be retried in process.
 
 Append-only name pages use the same publish-then-retire generation discipline.
 At sixteen sealed 360-block segments, pruned startup streams the current tree
@@ -453,5 +620,23 @@ crash before publication removes the future generation and a crash after
 publication removes the superseded one.
 
 Production closure still requires deployment-scale performance and priority
-isolation plus RocksDB mid-commit process-kill/fault injection without weakening
-historical-root reachability or the startup oracle.
+isolation plus repeated external RocksDB process-kill campaigns without
+weakening historical-root reachability or the startup oracle. In-process phase
+faults are deterministic regression coverage, not evidence that a particular
+filesystem, kernel, or storage device honors the expected persistence order.
+A complete non-pruned qualification is also mandatory: on the reviewed
+production-scale dataset, all hsrd-owned live and temporary storage must remain
+within a 150,000,000,000-byte peak and final envelope, while the launch
+supervisor independently preserves at least 10,000,000,000 free filesystem
+bytes. Its retained evidence identifies `baseline_mode: full_non_pruned` and is
+compared at the same pinned height, binary, host, filesystem, and measurement
+scope with the pruned run; the pruned final footprint must be nonzero and
+smaller. An at-or-below 90,000,000,000-byte observation is optional,
+informational, and never a qualification or release criterion.
+
+This storage schema never owns or deletes an HSD data root. Qualification
+records `hsd_blocks_deleted: false`. Any later HSD block-data retirement is a
+separate destructive cutover that requires independently verified hsrd
+tip/root/state and retained-reorg behavior, a tested HSD wallet
+backup-and-restore, an approved rollback/evidence-retention plan, and explicit
+operator approval for the exact paths and retention date.

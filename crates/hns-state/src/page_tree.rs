@@ -5,20 +5,19 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
+    time::Instant,
 };
 #[cfg(unix)]
-use std::{
-    sync::{mpsc, Arc},
-    thread::JoinHandle,
-};
+use std::{sync::mpsc, thread::JoinHandle};
 
 use hns_primitives::{blake2b_256, NameHash, Reader, Writer};
 use hns_store::{
-    decode_name_page, ColumnFamily, NamePageAddress, NamePageAppender, NamePageBuilder,
-    NamePageError, NamePagePush, NamePageRecord, NameTreePathRecord, ReadSnapshot, ScanEntry,
-    SegmentManifest, StoreError, NAME_PAGE_BYTES,
+    decode_name_page, filesystem_available_bytes, ColumnFamily, NamePageAddress, NamePageAppender,
+    NamePageBuilder, NamePageError, NamePagePush, NamePageRecord, NameTreePathRecord,
+    PrefixScanBudget, PrefixScanPage, ReadSnapshot, ScanEntry, SegmentManifest, StoreError,
+    NAME_PAGE_BYTES,
 };
 #[cfg(unix)]
 use hns_store::{
@@ -31,12 +30,15 @@ use hns_urkel::{TreeRoot, UrkelError, UrkelNodeRecord, URKEL_BITS};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_PAGE_CACHE_PAGES: usize = 512;
+const DEFAULT_OPEN_SEGMENT_FILES: usize = 8;
 #[cfg(unix)]
 const NAME_PAGE_READ_AHEAD_PAGES: usize = 64;
 #[cfg(unix)]
 const NAME_PAGE_READ_AHEAD_CACHE_PAGES: usize = 128;
 #[cfg(unix)]
 const NAME_PAGE_READ_AHEAD_WORKERS: usize = 4;
+#[cfg(unix)]
+const NAME_PAGE_READ_AHEAD_FILES_PER_WORKER: usize = 2;
 const NAME_PAGE_STATE_VERSION: u32 = 2;
 const LEGACY_NAME_PAGE_STATE_VERSION: u32 = 1;
 const LEGACY_NAME_PAGE_STATE_BODY_BYTES: usize = 4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4;
@@ -52,6 +54,155 @@ const NAME_PAGE_ROOT_RECORD_BYTES: usize = NAME_PAGE_ROOT_RECORD_BODY_BYTES + 32
 pub const NAME_PAGE_ROOT_PREFIX: &[u8] = b"name-page-root/v1/";
 const NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES: usize = 4_096;
 const NAME_PAGE_BOOTSTRAP_READ_BATCH: usize = 1_024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamePageValidationLimits {
+    pub max_segments: u64,
+    pub max_pages: u64,
+    pub max_records: u64,
+    pub max_bytes: u64,
+    pub max_spill_bytes: u64,
+    pub max_published_roots: u64,
+    pub minimum_filesystem_reserve_bytes: u64,
+    pub deadline: Instant,
+}
+
+/// Absolute resource envelope for one direct name-tree generation stream.
+///
+/// Every limit is checked before the corresponding in-memory insertion or
+/// durable page append. The deadline is monotonic and absolute so callers can
+/// share one execution budget across discovery, streaming, and publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamePageStreamLimits {
+    pub max_records: u64,
+    pub max_pages: u64,
+    pub max_frontier: u64,
+    pub max_known_addresses: u64,
+    /// Bytes that must remain available after every fixed-size page append.
+    /// A zero value is reserved for tests and compatibility callers; online
+    /// production generation uses the node's exact filesystem reserve.
+    pub minimum_filesystem_reserve_bytes: u64,
+    pub deadline: Instant,
+}
+
+/// Absolute resource envelope for discovering the physical address index of
+/// one retained page-tree root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamePageTraversalLimits {
+    pub max_records: u64,
+    pub max_frontier: u64,
+    pub max_known_addresses: u64,
+    pub deadline: Instant,
+}
+
+#[derive(Clone, Debug)]
+enum NamePageSegmentSource {
+    Explicit(Arc<BTreeMap<u32, PathBuf>>),
+    Generation {
+        directory: PathBuf,
+        generation: u64,
+        active_segment: u32,
+    },
+}
+
+impl NamePageSegmentSource {
+    fn contains(&self, segment: u32) -> bool {
+        match self {
+            Self::Explicit(paths) => paths.contains_key(&segment),
+            Self::Generation { active_segment, .. } => segment <= *active_segment,
+        }
+    }
+
+    fn path(&self, segment: u32) -> Option<PathBuf> {
+        match self {
+            Self::Explicit(paths) => paths.get(&segment).cloned(),
+            Self::Generation {
+                directory,
+                generation,
+                active_segment,
+            } if segment <= *active_segment => {
+                Some(directory.join(format!("name-g{generation:016x}-s{segment:08x}.pages")))
+            }
+            Self::Generation { .. } => None,
+        }
+    }
+
+    fn segments(&self) -> Vec<u32> {
+        match self {
+            Self::Explicit(paths) => paths.keys().copied().collect(),
+            Self::Generation { active_segment, .. } => (0..=*active_segment).collect(),
+        }
+    }
+
+    fn segment_count(&self) -> u64 {
+        match self {
+            Self::Explicit(paths) => u64::try_from(paths.len()).unwrap_or(u64::MAX),
+            Self::Generation { active_segment, .. } => u64::from(*active_segment) + 1,
+        }
+    }
+
+    fn audit_directory(&self) -> PathBuf {
+        match self {
+            Self::Explicit(paths) => paths
+                .values()
+                .next()
+                .and_then(|path| path.parent())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            Self::Generation { directory, .. } => directory.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NamePageSegmentFiles {
+    source: NamePageSegmentSource,
+    capacity: usize,
+    files: HashMap<u32, File>,
+    order: VecDeque<u32>,
+    opens: u64,
+}
+
+impl NamePageSegmentFiles {
+    fn new(source: NamePageSegmentSource, capacity: usize) -> Self {
+        Self {
+            source,
+            capacity: capacity.max(1),
+            files: HashMap::new(),
+            order: VecDeque::new(),
+            opens: 0,
+        }
+    }
+
+    fn file_mut(&mut self, segment: u32) -> Result<&mut File, PageTreeError> {
+        if !self.files.contains_key(&segment) {
+            let path = self
+                .source
+                .path(segment)
+                .ok_or(PageTreeError::MissingSegment(segment))?;
+            let file = File::open(&path)
+                .map_err(|error| PageTreeError::Io(format!("{}: {error}", path.display())))?;
+            if self.files.len() == self.capacity {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.files.remove(&evicted);
+                }
+            }
+            self.files.insert(segment, file);
+            self.opens = self.opens.saturating_add(1);
+        }
+        if let Some(position) = self
+            .order
+            .iter()
+            .position(|candidate| *candidate == segment)
+        {
+            self.order.remove(position);
+        }
+        self.order.push_back(segment);
+        self.files
+            .get_mut(&segment)
+            .ok_or(PageTreeError::MissingSegment(segment))
+    }
+}
 
 #[cfg(unix)]
 struct ReadAheadNamePage {
@@ -77,7 +228,7 @@ struct NamePageReadAheadPool {
 
 #[cfg(unix)]
 impl NamePageReadAheadPool {
-    fn new(files: Arc<HashMap<u32, File>>) -> Self {
+    fn new(source: NamePageSegmentSource) -> Self {
         let (job_sender, job_receiver) =
             mpsc::sync_channel::<Option<NamePageReadAheadJob>>(NAME_PAGE_READ_AHEAD_PAGES);
         let (result_sender, result_receiver) = mpsc::sync_channel::<
@@ -86,32 +237,35 @@ impl NamePageReadAheadPool {
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let mut workers = Vec::with_capacity(NAME_PAGE_READ_AHEAD_WORKERS);
         for _ in 0..NAME_PAGE_READ_AHEAD_WORKERS {
-            let files = Arc::clone(&files);
+            let source = source.clone();
             let jobs = Arc::clone(&job_receiver);
             let results = result_sender.clone();
-            workers.push(std::thread::spawn(move || loop {
-                let job = match jobs.lock() {
-                    Ok(receiver) => receiver.recv(),
-                    Err(_) => return,
-                };
-                let Ok(Some((page, slots))) = job else {
-                    return;
-                };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let file = files
-                        .get(&page.0)
-                        .ok_or(PageTreeError::MissingSegment(page.0))?;
-                    let directory = read_name_page_directory_at(file, page.1)?;
-                    let records = prefetch_name_page_records_at(file, page.1, &directory, &slots)?;
-                    Ok((page, ReadAheadNamePage { directory, records }))
-                }))
-                .unwrap_or_else(|_| {
-                    Err(PageTreeError::StateCodec(
-                        "name-page read-ahead worker panicked".to_owned(),
-                    ))
-                });
-                if results.send(result).is_err() {
-                    return;
+            workers.push(std::thread::spawn(move || {
+                let mut files =
+                    NamePageSegmentFiles::new(source, NAME_PAGE_READ_AHEAD_FILES_PER_WORKER);
+                loop {
+                    let job = match jobs.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(Some((page, slots))) = job else {
+                        return;
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let file = files.file_mut(page.0)?;
+                        let directory = read_name_page_directory_at(file, page.1)?;
+                        let records =
+                            prefetch_name_page_records_at(file, page.1, &directory, &slots)?;
+                        Ok((page, ReadAheadNamePage { directory, records }))
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(PageTreeError::StateCodec(
+                            "name-page read-ahead worker panicked".to_owned(),
+                        ))
+                    });
+                    if results.send(result).is_err() {
+                        return;
+                    }
                 }
             }));
         }
@@ -571,14 +725,16 @@ impl BootstrapTask {
         raw: Vec<u8>,
         seen: &mut HashSet<TreeRoot>,
         emitter: &mut StreamingPageEmitter<'_>,
+        limits: NamePageStreamLimits,
     ) -> Result<(), PageTreeError> {
+        ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         let root = self.pending_root;
         let depth = self.pending_depth;
         let record = decode_bootstrap_record(root, &raw)?;
         match record {
             UrkelNodeRecord::Leaf { .. } => {
                 let address = emitter.emit(root, raw, Vec::new())?;
-                self.complete(address, seen, emitter)
+                self.complete(address, seen, emitter, limits)
             }
             UrkelNodeRecord::Internal {
                 prefix,
@@ -586,7 +742,12 @@ impl BootstrapTask {
                 right,
             } => {
                 let child_depth = bootstrap_child_depth(depth, prefix.bit_len())?;
-                insert_bootstrap_root(seen, left)?;
+                insert_bootstrap_root_bounded(seen, left, limits.max_records)?;
+                ensure_page_tree_len_limit(
+                    self.parents.len().saturating_add(1),
+                    limits.max_frontier,
+                    "name-page bootstrap parent frontier",
+                )?;
                 self.parents.push(BootstrapParent {
                     root,
                     raw,
@@ -606,15 +767,17 @@ impl BootstrapTask {
         mut address: NamePageAddress,
         seen: &mut HashSet<TreeRoot>,
         emitter: &mut StreamingPageEmitter<'_>,
+        limits: NamePageStreamLimits,
     ) -> Result<(), PageTreeError> {
         loop {
+            ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
             let Some(parent) = self.parents.last_mut() else {
                 self.result = Some(address);
                 return Ok(());
             };
             if parent.left_address.is_none() {
                 parent.left_address = Some(address);
-                insert_bootstrap_root(seen, parent.right)?;
+                insert_bootstrap_root_bounded(seen, parent.right, limits.max_records)?;
                 self.pending_root = parent.right;
                 self.pending_depth = parent.child_depth;
                 return Ok(());
@@ -633,10 +796,16 @@ struct StreamingPageEmitter<'a> {
     pending_addresses: Vec<NamePageAddress>,
     first_page: u32,
     record_count: u64,
+    page_count: u64,
+    limits: NamePageStreamLimits,
 }
 
 impl<'a> StreamingPageEmitter<'a> {
-    fn new(appender: &'a mut NamePageAppender) -> Result<Self, PageTreeError> {
+    fn new(
+        appender: &'a mut NamePageAppender,
+        limits: NamePageStreamLimits,
+    ) -> Result<Self, PageTreeError> {
+        ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         let first_page = appender.next_page();
         Ok(Self {
             builder: Some(NamePageBuilder::new(appender.segment(), first_page)?),
@@ -644,6 +813,8 @@ impl<'a> StreamingPageEmitter<'a> {
             pending_addresses: Vec::new(),
             first_page,
             record_count: 0,
+            page_count: 0,
+            limits,
         })
     }
 
@@ -653,6 +824,13 @@ impl<'a> StreamingPageEmitter<'a> {
         canonical: Vec<u8>,
         children: Vec<NamePageAddress>,
     ) -> Result<NamePageAddress, PageTreeError> {
+        ensure_page_tree_deadline(self.limits.deadline, "name-page generation streaming")?;
+        let next_record_count = add_page_tree_resource(
+            self.record_count,
+            1,
+            self.limits.max_records,
+            "name-page streamed records",
+        )?;
         let mut record = NamePageRecord {
             key: *root.as_bytes(),
             children,
@@ -667,10 +845,7 @@ impl<'a> StreamingPageEmitter<'a> {
             {
                 NamePagePush::Added(address) => {
                     self.pending_addresses.push(address);
-                    self.record_count = self
-                        .record_count
-                        .checked_add(1)
-                        .ok_or(PageTreeError::OffsetOverflow)?;
+                    self.record_count = next_record_count;
                     return Ok(address);
                 }
                 NamePagePush::Full(returned) => {
@@ -682,14 +857,25 @@ impl<'a> StreamingPageEmitter<'a> {
     }
 
     fn flush_page(&mut self) -> Result<(), PageTreeError> {
+        ensure_page_tree_deadline(self.limits.deadline, "name-page generation streaming")?;
+        let next_page_count = add_page_tree_resource(
+            self.page_count,
+            1,
+            self.limits.max_pages,
+            "name-page streamed pages",
+        )?;
         let builder = self.builder.take().expect("streaming page builder exists");
         if builder.is_empty() {
             return Err(PageTreeError::Page(NamePageError::EmptyPage));
         }
-        let actual = self.appender.append(builder.records())?;
+        let actual = self.appender.append_with_reserve(
+            builder.records(),
+            self.limits.minimum_filesystem_reserve_bytes,
+        )?;
         if actual != self.pending_addresses {
             return Err(PageTreeError::AppenderPosition);
         }
+        self.page_count = next_page_count;
         self.pending_addresses.clear();
         self.builder = Some(NamePageBuilder::new(
             self.appender.segment(),
@@ -699,6 +885,7 @@ impl<'a> StreamingPageEmitter<'a> {
     }
 
     fn finish(mut self) -> Result<(SegmentManifest, u64, u64), PageTreeError> {
+        ensure_page_tree_deadline(self.limits.deadline, "name-page generation streaming")?;
         if self
             .builder
             .as_ref()
@@ -707,8 +894,12 @@ impl<'a> StreamingPageEmitter<'a> {
             self.flush_page()?;
         }
         let manifest = self.appender.sync_data()?;
-        let page_count = u64::from(self.appender.next_page() - self.first_page);
-        Ok((manifest, self.record_count, page_count))
+        ensure_page_tree_deadline(self.limits.deadline, "name-page generation streaming")?;
+        debug_assert_eq!(
+            self.page_count,
+            u64::from(self.appender.next_page() - self.first_page)
+        );
+        Ok((manifest, self.record_count, self.page_count))
     }
 }
 
@@ -717,11 +908,21 @@ pub fn stream_name_page_tree<T: ReadSnapshot>(
     root: TreeRoot,
     appender: &mut NamePageAppender,
 ) -> Result<StreamedNamePages, PageTreeError> {
-    stream_name_page_tree_with_parallelism(
+    stream_name_page_tree_with_limits(snapshot, root, appender, default_name_page_stream_limits())
+}
+
+pub fn stream_name_page_tree_with_limits<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+    limits: NamePageStreamLimits,
+) -> Result<StreamedNamePages, PageTreeError> {
+    stream_name_page_tree_with_parallelism_and_limits(
         snapshot,
         root,
         appender,
         NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES,
+        limits,
     )
 }
 
@@ -740,6 +941,22 @@ pub fn stream_name_page_tree_delta<T: ReadSnapshot>(
     appender: &mut NamePageAppender,
     known_addresses: &mut HashMap<TreeRoot, NamePageAddress>,
 ) -> Result<StreamedNamePages, PageTreeError> {
+    stream_name_page_tree_delta_with_limits(
+        snapshot,
+        root,
+        appender,
+        known_addresses,
+        default_name_page_stream_limits(),
+    )
+}
+
+pub fn stream_name_page_tree_delta_with_limits<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+    known_addresses: &mut HashMap<TreeRoot, NamePageAddress>,
+    limits: NamePageStreamLimits,
+) -> Result<StreamedNamePages, PageTreeError> {
     #[derive(Debug)]
     enum Work {
         Visit {
@@ -754,7 +971,13 @@ pub fn stream_name_page_tree_delta<T: ReadSnapshot>(
         },
     }
 
-    let mut emitter = StreamingPageEmitter::new(appender)?;
+    ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
+    ensure_page_tree_hash_map_limit(
+        known_addresses,
+        limits.max_known_addresses,
+        "name-page known addresses",
+    )?;
+    let mut emitter = StreamingPageEmitter::new(appender, limits)?;
     if root == TreeRoot::ZERO {
         let (manifest, record_count, page_count) = emitter.finish()?;
         return Ok(StreamedNamePages {
@@ -778,13 +1001,24 @@ pub fn stream_name_page_tree_delta<T: ReadSnapshot>(
 
     let mut scheduled = HashSet::new();
     let mut work = vec![Work::Visit { root, depth: 0 }];
+    ensure_page_tree_len_limit(
+        work.len(),
+        limits.max_frontier,
+        "name-page streaming frontier",
+    )?;
     while let Some(next) = work.pop() {
+        ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         match next {
             Work::Visit { root, depth } => {
                 if known_addresses.contains_key(&root) {
                     continue;
                 }
-                if !scheduled.insert(root) {
+                if !insert_page_tree_root_bounded(
+                    &mut scheduled,
+                    root,
+                    limits.max_records,
+                    "name-page scheduled records",
+                )? {
                     return Err(PageTreeError::DuplicateRecord(root));
                 }
                 let raw = snapshot
@@ -793,9 +1027,12 @@ pub fn stream_name_page_tree_delta<T: ReadSnapshot>(
                 match decode_bootstrap_record(root, &raw)? {
                     UrkelNodeRecord::Leaf { .. } => {
                         let address = emitter.emit(root, raw, Vec::new())?;
-                        if known_addresses.insert(root, address).is_some() {
-                            return Err(PageTreeError::DuplicateRecord(root));
-                        }
+                        insert_known_address_bounded(
+                            known_addresses,
+                            root,
+                            address,
+                            limits.max_known_addresses,
+                        )?;
                     }
                     UrkelNodeRecord::Internal {
                         prefix,
@@ -803,6 +1040,11 @@ pub fn stream_name_page_tree_delta<T: ReadSnapshot>(
                         right,
                     } => {
                         let child_depth = bootstrap_child_depth(depth, prefix.bit_len())?;
+                        ensure_page_tree_len_limit(
+                            work.len().saturating_add(3),
+                            limits.max_frontier,
+                            "name-page streaming frontier",
+                        )?;
                         work.push(Work::Emit {
                             root,
                             canonical: raw,
@@ -835,9 +1077,12 @@ pub fn stream_name_page_tree_delta<T: ReadSnapshot>(
                     .copied()
                     .ok_or(PageTreeError::MissingChildAddress(right))?;
                 let address = emitter.emit(root, canonical, vec![left_address, right_address])?;
-                if known_addresses.insert(root, address).is_some() {
-                    return Err(PageTreeError::DuplicateRecord(root));
-                }
+                insert_known_address_bounded(
+                    known_addresses,
+                    root,
+                    address,
+                    limits.max_known_addresses,
+                )?;
             }
         }
     }
@@ -856,14 +1101,32 @@ pub fn stream_name_page_tree_delta<T: ReadSnapshot>(
     })
 }
 
+#[cfg(test)]
 fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
     snapshot: &T,
     root: TreeRoot,
     appender: &mut NamePageAppender,
     target_subtrees: usize,
 ) -> Result<StreamedNamePages, PageTreeError> {
+    stream_name_page_tree_with_parallelism_and_limits(
+        snapshot,
+        root,
+        appender,
+        target_subtrees,
+        default_name_page_stream_limits(),
+    )
+}
+
+fn stream_name_page_tree_with_parallelism_and_limits<T: ReadSnapshot>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+    target_subtrees: usize,
+    limits: NamePageStreamLimits,
+) -> Result<StreamedNamePages, PageTreeError> {
+    ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
     let target_subtrees = target_subtrees.max(1);
-    let mut emitter = StreamingPageEmitter::new(appender)?;
+    let mut emitter = StreamingPageEmitter::new(appender, limits)?;
     if root == TreeRoot::ZERO {
         let (manifest, record_count, page_count) = emitter.finish()?;
         return Ok(StreamedNamePages {
@@ -876,15 +1139,21 @@ fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
     }
 
     let mut seen = HashSet::new();
-    insert_bootstrap_root(&mut seen, root)?;
+    insert_bootstrap_root_bounded(&mut seen, root, limits.max_records)?;
     let mut frontier = vec![BootstrapFrontier {
         root,
         depth: 0,
         raw: None,
     }];
+    ensure_page_tree_len_limit(
+        frontier.len(),
+        limits.max_frontier,
+        "name-page bootstrap frontier",
+    )?;
     let mut skeleton = Vec::new();
 
     while frontier.len() < target_subtrees {
+        ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         let requests = frontier
             .iter()
             .filter(|node| node.raw.is_none())
@@ -901,16 +1170,24 @@ fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
             debug_assert!(loaded.next().is_none());
         }
 
-        let mut next = Vec::with_capacity(frontier.len().saturating_mul(2));
+        let mut next = Vec::with_capacity(frontier.len());
         let mut expanded = false;
         for node in frontier {
+            ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
             let raw = node.raw.expect("frontier record loaded");
             match decode_bootstrap_record(node.root, &raw)? {
-                UrkelNodeRecord::Leaf { .. } => next.push(BootstrapFrontier {
-                    root: node.root,
-                    depth: node.depth,
-                    raw: Some(raw),
-                }),
+                UrkelNodeRecord::Leaf { .. } => {
+                    ensure_page_tree_len_limit(
+                        next.len().saturating_add(1),
+                        limits.max_frontier,
+                        "name-page bootstrap frontier",
+                    )?;
+                    next.push(BootstrapFrontier {
+                        root: node.root,
+                        depth: node.depth,
+                        raw: Some(raw),
+                    });
+                }
                 UrkelNodeRecord::Internal {
                     prefix,
                     left,
@@ -918,14 +1195,24 @@ fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
                 } => {
                     expanded = true;
                     let child_depth = bootstrap_child_depth(node.depth, prefix.bit_len())?;
-                    insert_bootstrap_root(&mut seen, left)?;
-                    insert_bootstrap_root(&mut seen, right)?;
+                    insert_bootstrap_root_bounded(&mut seen, left, limits.max_records)?;
+                    insert_bootstrap_root_bounded(&mut seen, right, limits.max_records)?;
+                    ensure_page_tree_len_limit(
+                        skeleton.len().saturating_add(1),
+                        limits.max_records,
+                        "name-page bootstrap skeleton",
+                    )?;
                     skeleton.push(BootstrapSkeletonNode {
                         root: node.root,
                         raw,
                         left,
                         right,
                     });
+                    ensure_page_tree_len_limit(
+                        next.len().saturating_add(2),
+                        limits.max_frontier,
+                        "name-page bootstrap frontier",
+                    )?;
                     next.push(BootstrapFrontier {
                         root: left,
                         depth: child_depth,
@@ -951,10 +1238,11 @@ fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
         .map(BootstrapTask::new)
         .collect::<Vec<_>>();
     loop {
+        ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         let mut progressed = false;
         for task in &mut tasks {
             if let Some(raw) = task.take_preloaded() {
-                task.accept(raw, &mut seen, &mut emitter)?;
+                task.accept(raw, &mut seen, &mut emitter, limits)?;
                 progressed = true;
             }
         }
@@ -976,24 +1264,29 @@ fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
             continue;
         }
         for chunk in requests.chunks(NAME_PAGE_BOOTSTRAP_READ_BATCH) {
+            ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
             let roots = chunk.iter().map(|(_, root)| *root).collect::<Vec<_>>();
             let loaded = load_bootstrap_records(snapshot, &roots)?;
             for ((task_index, _), raw) in chunk.iter().zip(loaded) {
-                tasks[*task_index].accept(raw, &mut seen, &mut emitter)?;
+                tasks[*task_index].accept(raw, &mut seen, &mut emitter, limits)?;
             }
         }
     }
 
-    let mut addresses = HashMap::with_capacity(tasks.len().saturating_mul(2));
+    let mut addresses = HashMap::with_capacity(tasks.len());
     for task in tasks {
         let address = task.result.ok_or_else(|| {
             PageTreeError::StateCodec("name-page bootstrap task has no result".to_owned())
         })?;
-        if addresses.insert(task.root, address).is_some() {
-            return Err(PageTreeError::DuplicateRecord(task.root));
-        }
+        insert_known_address_bounded(
+            &mut addresses,
+            task.root,
+            address,
+            limits.max_known_addresses,
+        )?;
     }
     for node in skeleton.into_iter().rev() {
+        ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         let left = addresses
             .remove(&node.left)
             .ok_or(PageTreeError::MissingChildAddress(node.left))?;
@@ -1001,9 +1294,12 @@ fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
             .remove(&node.right)
             .ok_or(PageTreeError::MissingChildAddress(node.right))?;
         let address = emitter.emit(node.root, node.raw, vec![left, right])?;
-        if addresses.insert(node.root, address).is_some() {
-            return Err(PageTreeError::DuplicateRecord(node.root));
-        }
+        insert_known_address_bounded(
+            &mut addresses,
+            node.root,
+            address,
+            limits.max_known_addresses,
+        )?;
     }
     let root_address = addresses
         .remove(&root)
@@ -1076,16 +1372,17 @@ fn bootstrap_child_depth(depth: usize, prefix_bits: usize) -> Result<usize, Page
     Ok(child_depth)
 }
 
-fn insert_bootstrap_root(
+fn insert_bootstrap_root_bounded(
     seen: &mut HashSet<TreeRoot>,
     root: TreeRoot,
+    maximum_records: u64,
 ) -> Result<(), PageTreeError> {
     if root == TreeRoot::ZERO {
         return Err(PageTreeError::Urkel(UrkelError::InvalidNode(
             "Urkel record tree contains an empty child".to_owned(),
         )));
     }
-    if !seen.insert(root) {
+    if !insert_page_tree_root_bounded(seen, root, maximum_records, "name-page bootstrap records")? {
         return Err(PageTreeError::DuplicateRecord(root));
     }
     Ok(())
@@ -1115,6 +1412,17 @@ impl PackedNamePages {
         &self,
         appender: &mut NamePageAppender,
     ) -> Result<SegmentManifest, PageTreeError> {
+        self.append_with_reserve(appender, 0)
+    }
+
+    /// Append a prepared pack while preserving `reserve_bytes` before every
+    /// physical page write. Production callers preflight the complete pack and
+    /// use this per-page check to close capacity races during a long append.
+    pub fn append_with_reserve(
+        &self,
+        appender: &mut NamePageAppender,
+        reserve_bytes: u64,
+    ) -> Result<SegmentManifest, PageTreeError> {
         if appender.generation() != self.generation
             || appender.segment() != self.segment
             || appender.next_page() != self.first_page
@@ -1122,7 +1430,7 @@ impl PackedNamePages {
             return Err(PageTreeError::AppenderPosition);
         }
         for records in &self.pages {
-            let actual = appender.append(records)?;
+            let actual = appender.append_with_reserve(records, reserve_bytes)?;
             for (record, address) in records.iter().zip(actual) {
                 let expected = self.addresses.get(&TreeRoot::new(record.key)).ok_or(
                     PageTreeError::MissingPackedAddress(TreeRoot::new(record.key)),
@@ -1194,7 +1502,8 @@ impl PageCache {
 /// hashes and their physical addresses for the next traversal step.
 #[derive(Debug)]
 pub struct NamePageTreeReader {
-    files: Mutex<HashMap<u32, File>>,
+    segments: NamePageSegmentSource,
+    files: Mutex<NamePageSegmentFiles>,
     audit_directory: PathBuf,
     generation: u64,
     root_segment: u32,
@@ -1233,10 +1542,11 @@ struct ValidatedPageSpill {
     file: File,
     cache: Vec<Option<CachedValidatedPage>>,
     record_count: u64,
+    maximum_bytes: u64,
 }
 
 impl ValidatedPageSpill {
-    fn create(directory: &Path) -> Result<Self, PageTreeError> {
+    fn create(directory: &Path, maximum_bytes: u64) -> Result<Self, PageTreeError> {
         let sequence = VALIDATION_SPILL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = directory.join(format!(
             ".hsrd-name-page-audit-{}-{sequence}.tmp",
@@ -1259,6 +1569,7 @@ impl ValidatedPageSpill {
                 .take(VALIDATED_PAGE_CACHE_PAGES)
                 .collect(),
             record_count: 0,
+            maximum_bytes,
         })
     }
 
@@ -1275,6 +1586,16 @@ impl ValidatedPageSpill {
             .record_count
             .checked_add(u64::from(record_count))
             .ok_or(PageTreeError::OffsetOverflow)?;
+        let next_bytes = next_record_count
+            .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
+            .ok_or(PageTreeError::OffsetOverflow)?;
+        if next_bytes > self.maximum_bytes {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page validation spill bytes",
+                limit: self.maximum_bytes,
+                actual: next_bytes,
+            });
+        }
         let offset = first_record
             .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
             .ok_or(PageTreeError::OffsetOverflow)?;
@@ -1368,10 +1689,11 @@ fn validation_cache_index(key: u64) -> usize {
 }
 
 /// Result of one physical-order audit of the immutable authenticated page
-/// store. The exact historical address index is mmap-backed and immediately
-/// unlinked during validation, so unclean startup stays bounded by the page
-/// table rather than anonymous memory or swap. Only explicitly published
-/// durable roots remain in the short legacy-overlay summary.
+/// store. The exact historical address index is backed by an immediately
+/// unlinked seek/read/write file during validation, so unclean startup stays
+/// bounded by the page table rather than anonymous memory or swap. Only
+/// explicitly published durable roots remain in the short legacy-overlay
+/// summary.
 #[derive(Debug)]
 pub struct NamePageValidation {
     pub segments: usize,
@@ -1498,6 +1820,20 @@ impl<S: ReadSnapshot> ReadSnapshot for NamePageSnapshot<'_, S> {
         self.base.scan_prefix(family, prefix)
     }
 
+    fn scan_prefix_page(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        budget: PrefixScanBudget,
+    ) -> Result<PrefixScanPage, StoreError> {
+        if family == ColumnFamily::NameTreeNodes {
+            return Err(StoreError::FeatureDisabled("name-page hash-index scan"));
+        }
+        self.base
+            .scan_prefix_page(family, prefix, start_after, budget)
+    }
+
     fn prefetch_name_tree_paths(
         &self,
         root: [u8; 32],
@@ -1556,30 +1892,81 @@ impl NamePageTreeReader {
         locator: NamePageRootLocator,
         cache_pages: usize,
     ) -> Result<Self, PageTreeError> {
-        let address = locator.page_address();
-        let mut files = HashMap::with_capacity(paths.len());
-        for (segment, path) in paths {
-            files.insert(
-                *segment,
-                File::open(path)
-                    .map_err(|error| PageTreeError::Io(format!("{}: {error}", path.display())))?,
-            );
+        Self::open_source_with_cache(
+            NamePageSegmentSource::Explicit(Arc::new(paths.clone())),
+            root,
+            locator,
+            cache_pages,
+        )
+    }
+
+    /// Open a page generation without enumerating or opening every sealed
+    /// segment. Segment paths are derived deterministically and opened only
+    /// when a traversed locator references them.
+    pub fn open_generation(
+        directory: impl AsRef<Path>,
+        generation: u64,
+        active_segment: u32,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+    ) -> Result<Self, PageTreeError> {
+        Self::open_generation_with_cache(
+            directory,
+            generation,
+            active_segment,
+            root,
+            locator,
+            DEFAULT_PAGE_CACHE_PAGES,
+        )
+    }
+
+    pub fn open_generation_with_cache(
+        directory: impl AsRef<Path>,
+        generation: u64,
+        active_segment: u32,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+        cache_pages: usize,
+    ) -> Result<Self, PageTreeError> {
+        if locator.generation != generation {
+            return Err(PageTreeError::WrongGeneration {
+                expected: generation,
+                actual: locator.generation,
+            });
         }
-        if !files.contains_key(&address.segment()) {
+        Self::open_source_with_cache(
+            NamePageSegmentSource::Generation {
+                directory: directory.as_ref().to_path_buf(),
+                generation,
+                active_segment,
+            },
+            root,
+            locator,
+            cache_pages,
+        )
+    }
+
+    fn open_source_with_cache(
+        segments: NamePageSegmentSource,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+        cache_pages: usize,
+    ) -> Result<Self, PageTreeError> {
+        let address = locator.page_address();
+        if !segments.contains(address.segment()) {
             return Err(PageTreeError::MissingSegment(address.segment()));
         }
-        let audit_directory = paths
-            .values()
-            .next()
-            .and_then(|path| path.parent())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        let audit_directory = segments.audit_directory();
         let mut addresses = HashMap::new();
         if root != TreeRoot::ZERO {
             addresses.insert(root, address);
         }
         Ok(Self {
-            files: Mutex::new(files),
+            files: Mutex::new(NamePageSegmentFiles::new(
+                segments.clone(),
+                DEFAULT_OPEN_SEGMENT_FILES,
+            )),
+            segments,
             audit_directory,
             generation: locator.generation,
             root_segment: address.segment(),
@@ -1602,6 +1989,15 @@ impl NamePageTreeReader {
         root: TreeRoot,
         locator: NamePageRootLocator,
     ) -> Result<(), PageTreeError> {
+        self.insert_root_bounded(root, locator, u64::MAX)
+    }
+
+    pub fn insert_root_bounded(
+        &self,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+        max_known_addresses: u64,
+    ) -> Result<(), PageTreeError> {
         let address = locator.page_address();
         if locator.generation != self.generation {
             return Err(PageTreeError::WrongGeneration {
@@ -1609,30 +2005,35 @@ impl NamePageTreeReader {
                 actual: locator.generation,
             });
         }
-        if !self
-            .files
-            .lock()
-            .map_err(|_| PageTreeError::Poisoned)?
-            .contains_key(&address.segment())
-        {
+        if !self.segments.contains(address.segment()) {
             return Err(PageTreeError::MissingSegment(address.segment()));
         }
-        let mut addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
-        insert_discovered_address(&mut addresses, root, address)
+        self.insert_discovered_bounded(vec![(root, address)], max_known_addresses)
     }
 
     pub fn load(&self, root: TreeRoot) -> Result<Option<Vec<u8>>, PageTreeError> {
+        self.load_bounded(root, u64::MAX)
+    }
+
+    pub fn load_bounded(
+        &self,
+        root: TreeRoot,
+        max_known_addresses: u64,
+    ) -> Result<Option<Vec<u8>>, PageTreeError> {
         if root == TreeRoot::ZERO {
             return Ok(None);
         }
-        let Some(address) = self
-            .addresses
-            .lock()
-            .map_err(|_| PageTreeError::Poisoned)?
-            .get(&root)
-            .copied()
-        else {
-            return Ok(None);
+        let address = {
+            let addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
+            ensure_page_tree_len_limit(
+                addresses.len(),
+                max_known_addresses,
+                "name-page reader known addresses",
+            )?;
+            let Some(address) = addresses.get(&root).copied() else {
+                return Ok(None);
+            };
+            address
         };
         self.ensure_page(address)?;
         let loaded = {
@@ -1645,7 +2046,7 @@ impl NamePageTreeReader {
                 .ok_or(PageTreeError::MissingCachedPage(address))?;
             read_cached_name_page_record(page, root, address)?
         };
-        self.insert_discovered(loaded.discovered)?;
+        self.insert_discovered_bounded(loaded.discovered, max_known_addresses)?;
         Ok(Some(loaded.canonical))
     }
 
@@ -1721,14 +2122,12 @@ impl NamePageTreeReader {
             return Ok(located);
         }
         let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
-        let mut segments = files.keys().copied().collect::<Vec<_>>();
+        let mut segments = self.segments.segments();
         segments.sort_unstable_by(|left, right| right.cmp(left));
         let mut encoded = vec![0u8; NAME_PAGE_BYTES];
 
         for segment in segments {
-            let file = files
-                .get_mut(&segment)
-                .ok_or(PageTreeError::MissingSegment(segment))?;
+            let file = files.file_mut(segment)?;
             let bytes = file.metadata().map_err(PageTreeError::io)?.len();
             if !bytes.is_multiple_of(NAME_PAGE_BYTES as u64) {
                 return Err(PageTreeError::UnalignedSegment { segment, bytes });
@@ -1810,20 +2209,7 @@ impl NamePageTreeReader {
         )?;
         let mut records = BTreeMap::<TreeRoot, Vec<u8>>::new();
         #[cfg(unix)]
-        let path_files = Arc::new(
-            self.files
-                .lock()
-                .map_err(|_| PageTreeError::Poisoned)?
-                .iter()
-                .map(|(segment, file)| {
-                    file.try_clone()
-                        .map(|file| (*segment, file))
-                        .map_err(PageTreeError::io)
-                })
-                .collect::<Result<HashMap<_, _>, _>>()?,
-        );
-        #[cfg(unix)]
-        let read_ahead_pool = NamePageReadAheadPool::new(Arc::clone(&path_files));
+        let read_ahead_pool = NamePageReadAheadPool::new(self.segments.clone());
         #[cfg(unix)]
         let mut page_read_ahead = BTreeMap::<(u32, u32), ReadAheadNamePage>::new();
 
@@ -1835,9 +2221,7 @@ impl NamePageTreeReader {
             #[cfg(not(unix))]
             let directory = {
                 let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
-                let file = files
-                    .get_mut(&page_address.segment())
-                    .ok_or(PageTreeError::MissingSegment(page_address.segment()))?;
+                let file = files.file_mut(page_address.segment())?;
                 read_name_page_directory(file, page_address.page())?
             };
             let (_, mut page_work) = pending.pop_last().expect("pending page exists");
@@ -1845,19 +2229,19 @@ impl NamePageTreeReader {
             #[cfg(not(unix))]
             let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
             #[cfg(not(unix))]
-            let file = files
-                .get_mut(&page_address.segment())
-                .ok_or(PageTreeError::MissingSegment(page_address.segment()))?;
+            let file = files.file_mut(page_address.segment())?;
             #[cfg(unix)]
             let ReadAheadNamePage {
                 directory,
                 records: prefetched_records,
             } = prepared_page;
             #[cfg(unix)]
+            let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
+            #[cfg(unix)]
+            let file = files.file_mut(page_address.segment())?;
+            #[cfg(unix)]
             let mut page_reader = PositionedNamePageReader::with_prefetched(
-                path_files
-                    .get(&page_address.segment())
-                    .ok_or(PageTreeError::MissingSegment(page_address.segment()))?,
+                file,
                 page_address.page(),
                 &directory,
                 prefetched_records,
@@ -1946,18 +2330,54 @@ impl NamePageTreeReader {
     /// available to an incremental generation rewrite. `load` authenticates
     /// each record and discovers its child addresses before they are queued.
     pub fn discover_tree_addresses(&self, root: TreeRoot) -> Result<u64, PageTreeError> {
+        let now = Instant::now();
+        self.discover_tree_addresses_bounded(
+            root,
+            NamePageTraversalLimits {
+                max_records: 100_000_000,
+                max_frontier: 1_000_000,
+                max_known_addresses: 100_000_000,
+                deadline: now
+                    .checked_add(std::time::Duration::from_secs(60 * 60))
+                    .unwrap_or(now),
+            },
+        )
+    }
+
+    pub fn discover_tree_addresses_bounded(
+        &self,
+        root: TreeRoot,
+        limits: NamePageTraversalLimits,
+    ) -> Result<u64, PageTreeError> {
+        ensure_page_tree_deadline(limits.deadline, "name-page address discovery")?;
         if root == TreeRoot::ZERO {
             return Ok(0);
         }
         let mut discovered = 0u64;
+        let mut scheduled = HashSet::new();
+        insert_page_tree_root_bounded(
+            &mut scheduled,
+            root,
+            limits.max_records,
+            "name-page discovery scheduled records",
+        )?;
         let mut work = vec![(root, 0usize)];
+        ensure_page_tree_len_limit(
+            work.len(),
+            limits.max_frontier,
+            "name-page discovery frontier",
+        )?;
         while let Some((root, depth)) = work.pop() {
+            ensure_page_tree_deadline(limits.deadline, "name-page address discovery")?;
             let raw = self
-                .load(root)?
+                .load_bounded(root, limits.max_known_addresses)?
                 .ok_or(PageTreeError::MissingPackedRecord(root))?;
-            discovered = discovered
-                .checked_add(1)
-                .ok_or(PageTreeError::OffsetOverflow)?;
+            discovered = add_page_tree_resource(
+                discovered,
+                1,
+                limits.max_records,
+                "name-page discovered records",
+            )?;
             if let UrkelNodeRecord::Internal {
                 prefix,
                 left,
@@ -1965,6 +2385,21 @@ impl NamePageTreeReader {
             } = decode_bootstrap_record(root, &raw)?
             {
                 let child_depth = bootstrap_child_depth(depth, prefix.bit_len())?;
+                for child in [right, left] {
+                    if !insert_page_tree_root_bounded(
+                        &mut scheduled,
+                        child,
+                        limits.max_records,
+                        "name-page discovery scheduled records",
+                    )? {
+                        return Err(PageTreeError::DuplicateRecord(child));
+                    }
+                }
+                ensure_page_tree_len_limit(
+                    work.len().saturating_add(2),
+                    limits.max_frontier,
+                    "name-page discovery frontier",
+                )?;
                 work.push((right, child_depth));
                 work.push((left, child_depth));
             }
@@ -1977,15 +2412,43 @@ impl NamePageTreeReader {
     /// acyclicity, canonical encoding, and maximum path depth can all be
     /// proven while retaining only a compact address-indexed summary.
     pub fn validate_committed_pages(&self) -> Result<NamePageValidation, PageTreeError> {
+        let now = Instant::now();
+        self.validate_committed_pages_with_limits(NamePageValidationLimits {
+            max_segments: 1_000_000,
+            max_pages: 1_048_576,
+            max_records: 100_000_000,
+            max_bytes: 64 * 1024 * 1024 * 1024,
+            max_spill_bytes: 4 * 1024 * 1024 * 1024,
+            max_published_roots: 1_000_000,
+            minimum_filesystem_reserve_bytes: 0,
+            deadline: now
+                .checked_add(std::time::Duration::from_secs(60 * 60))
+                .unwrap_or(now),
+        })
+    }
+
+    pub fn validate_committed_pages_with_limits(
+        &self,
+        limits: NamePageValidationLimits,
+    ) -> Result<NamePageValidation, PageTreeError> {
+        ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
+        let segment_count = self.segments.segment_count();
+        if segment_count > limits.max_segments {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page validation segments",
+                limit: limits.max_segments,
+                actual: segment_count,
+            });
+        }
         let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
-        let mut segments = files.keys().copied().collect::<Vec<_>>();
+        let mut segments = self.segments.segments();
         segments.sort_unstable();
         let mut layouts = Vec::with_capacity(segments.len());
         let mut byte_count = 0u64;
+        let mut planned_pages = 0u64;
         for segment in segments.iter().copied() {
-            let file = files
-                .get(&segment)
-                .ok_or(PageTreeError::MissingSegment(segment))?;
+            ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
+            let file = files.file_mut(segment)?;
             let bytes = file.metadata().map_err(PageTreeError::io)?.len();
             if !bytes.is_multiple_of(NAME_PAGE_BYTES as u64) {
                 return Err(PageTreeError::UnalignedSegment { segment, bytes });
@@ -1994,27 +2457,55 @@ impl NamePageTreeReader {
             let pages_u32 = u32::try_from(pages)
                 .map_err(|_| PageTreeError::PageCountOverflow { segment, pages })?;
             NamePageAddress::new(segment, pages_u32.saturating_sub(1), 0)?;
-            byte_count = byte_count
-                .checked_add(bytes)
-                .ok_or(PageTreeError::OffsetOverflow)?;
+            planned_pages = add_page_tree_resource(
+                planned_pages,
+                pages,
+                limits.max_pages,
+                "name-page validation pages",
+            )?;
+            byte_count = add_page_tree_resource(
+                byte_count,
+                bytes,
+                limits.max_bytes,
+                "name-page validation bytes",
+            )?;
             layouts.push((segment, pages_u32));
         }
-        let mut spill = ValidatedPageSpill::create(&self.audit_directory)?;
+        ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
+        let minimum_spill_bytes = planned_pages
+            .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
+            .ok_or(PageTreeError::OffsetOverflow)?;
+        if minimum_spill_bytes > limits.max_spill_bytes {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page validation spill bytes",
+                limit: limits.max_spill_bytes,
+                actual: minimum_spill_bytes,
+            });
+        }
+        let available =
+            filesystem_available_bytes(&self.audit_directory).map_err(PageTreeError::Store)?;
+        ensure_validation_spill_capacity(
+            available,
+            byte_count,
+            limits.max_spill_bytes,
+            limits.minimum_filesystem_reserve_bytes,
+        )?;
+        let mut spill = ValidatedPageSpill::create(&self.audit_directory, limits.max_spill_bytes)?;
         let mut indexed = BTreeMap::<u32, Vec<ValidatedPageSpan>>::new();
         let mut page_count = 0u64;
         let mut record_count = 0u64;
         let mut encoded = vec![0u8; NAME_PAGE_BYTES];
 
         for (segment, pages_u32) in layouts {
-            let file = files
-                .get_mut(&segment)
-                .ok_or(PageTreeError::MissingSegment(segment))?;
+            ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
+            let file = files.file_mut(segment)?;
             file.seek(SeekFrom::Start(0)).map_err(PageTreeError::io)?;
             let segment_capacity =
                 usize::try_from(pages_u32).map_err(|_| PageTreeError::OffsetOverflow)?;
             let mut segment_pages = Vec::with_capacity(segment_capacity);
 
             for page_number in 0..pages_u32 {
+                ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
                 file.read_exact(&mut encoded).map_err(PageTreeError::io)?;
                 let page = decode_name_page(&encoded)?;
                 if page.record_count() == 0 {
@@ -2025,6 +2516,13 @@ impl NamePageTreeReader {
                 }
                 let mut current = Vec::with_capacity(usize::from(page.record_count()));
                 for slot in 0..page.record_count() {
+                    ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
+                    record_count = add_page_tree_resource(
+                        record_count,
+                        1,
+                        limits.max_records,
+                        "name-page validation records",
+                    )?;
                     let raw = page.record(slot)?;
                     let root = TreeRoot::new(raw.key);
                     let decoded = UrkelNodeRecord::decode(raw.canonical)?;
@@ -2110,22 +2608,32 @@ impl NamePageTreeReader {
                         root,
                         maximum_path_bits,
                     });
-                    record_count = record_count
-                        .checked_add(1)
-                        .ok_or(PageTreeError::OffsetOverflow)?;
                 }
                 segment_pages.push(spill.push_page(segment, page_number, &current)?);
-                page_count = page_count
-                    .checked_add(1)
-                    .ok_or(PageTreeError::OffsetOverflow)?;
+                page_count = add_page_tree_resource(
+                    page_count,
+                    1,
+                    limits.max_pages,
+                    "name-page validation pages",
+                )?;
             }
             indexed.insert(segment, segment_pages);
         }
+        debug_assert_eq!(page_count, planned_pages);
         drop(files);
 
         let addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
+        let published_root_count = u64::try_from(addresses.len()).unwrap_or(u64::MAX);
+        if published_root_count > limits.max_published_roots {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page validation published roots",
+                limit: limits.max_published_roots,
+                actual: published_root_count,
+            });
+        }
         let mut roots = Vec::with_capacity(addresses.len());
         for (root, address) in addresses.iter() {
+            ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
             let record = indexed_page_record(&mut spill, &indexed, *address)?
                 .ok_or(PageTreeError::MissingEarlierRecord(*address))?;
             if record.root != *root {
@@ -2148,6 +2656,7 @@ impl NamePageTreeReader {
             ));
         }
         roots.dedup_by_key(|record| record.root);
+        ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
 
         Ok(NamePageValidation {
             segments: segments.len(),
@@ -2175,12 +2684,49 @@ impl NamePageTreeReader {
         &self,
         discovered: Vec<(TreeRoot, NamePageAddress)>,
     ) -> Result<(), PageTreeError> {
+        self.insert_discovered_bounded(discovered, u64::MAX)
+    }
+
+    fn insert_discovered_bounded(
+        &self,
+        discovered: Vec<(TreeRoot, NamePageAddress)>,
+        max_known_addresses: u64,
+    ) -> Result<(), PageTreeError> {
         if discovered.is_empty() {
             return Ok(());
         }
         let mut addresses = self.addresses.lock().map_err(|_| PageTreeError::Poisoned)?;
+        ensure_page_tree_len_limit(
+            addresses.len(),
+            max_known_addresses,
+            "name-page reader known addresses",
+        )?;
+        let mut pending = HashMap::with_capacity(discovered.len().min(2));
         for (root, address) in discovered {
-            insert_discovered_address(&mut addresses, root, address)?;
+            if let Some(existing) = addresses.get(&root) {
+                if *existing != address {
+                    return Err(PageTreeError::AddressConflict(root));
+                }
+                continue;
+            }
+            if let Some(existing) = pending.get(&root) {
+                if *existing != address {
+                    return Err(PageTreeError::AddressConflict(root));
+                }
+                continue;
+            }
+            ensure_page_tree_len_limit(
+                addresses
+                    .len()
+                    .saturating_add(pending.len())
+                    .saturating_add(1),
+                max_known_addresses,
+                "name-page reader known addresses",
+            )?;
+            pending.insert(root, address);
+        }
+        for (root, address) in pending {
+            addresses.insert(root, address);
         }
         Ok(())
     }
@@ -2199,9 +2745,7 @@ impl NamePageTreeReader {
         let mut encoded = vec![0u8; NAME_PAGE_BYTES];
         {
             let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
-            let file = files
-                .get_mut(&address.segment())
-                .ok_or(PageTreeError::MissingSegment(address.segment()))?;
+            let file = files.file_mut(address.segment())?;
             file.seek(SeekFrom::Start(offset))
                 .map_err(PageTreeError::io)?;
             file.read_exact(&mut encoded).map_err(PageTreeError::io)?;
@@ -2406,17 +2950,6 @@ fn validate_loaded_name_page_record(
     })
 }
 
-fn insert_discovered_address(
-    addresses: &mut HashMap<TreeRoot, NamePageAddress>,
-    root: TreeRoot,
-    address: NamePageAddress,
-) -> Result<(), PageTreeError> {
-    match addresses.insert(root, address) {
-        Some(existing) if existing != address => Err(PageTreeError::AddressConflict(root)),
-        Some(_) | None => Ok(()),
-    }
-}
-
 pub fn pack_name_page_records(
     generation: u64,
     segment: u32,
@@ -2554,6 +3087,127 @@ fn resolve_child_address(
         .ok_or(PageTreeError::MissingChildAddress(root))
 }
 
+fn ensure_page_tree_deadline(
+    deadline: Instant,
+    context: &'static str,
+) -> Result<(), PageTreeError> {
+    if Instant::now() >= deadline {
+        return Err(PageTreeError::DeadlineExceeded { context });
+    }
+    Ok(())
+}
+
+fn ensure_validation_spill_capacity(
+    available: u64,
+    committed_page_bytes: u64,
+    maximum_spill_bytes: u64,
+    minimum_filesystem_reserve_bytes: u64,
+) -> Result<u64, PageTreeError> {
+    // Every 34-byte spill summary corresponds to an encoded page record that
+    // consumes at least those key/index bytes on disk. The committed page
+    // footprint is therefore a conservative physical upper bound without a
+    // second full page scan. The configured spill ceiling remains a hard
+    // write-time limit; it is not itself charged to a tiny generation.
+    let planned_spill_bytes = committed_page_bytes.min(maximum_spill_bytes);
+    let required = planned_spill_bytes.saturating_add(minimum_filesystem_reserve_bytes);
+    if available < required {
+        return Err(PageTreeError::InsufficientSpace {
+            context: "name-page validation spill",
+            available,
+            required: planned_spill_bytes,
+            reserve: minimum_filesystem_reserve_bytes,
+        });
+    }
+    Ok(planned_spill_bytes)
+}
+
+fn default_name_page_stream_limits() -> NamePageStreamLimits {
+    let now = Instant::now();
+    NamePageStreamLimits {
+        max_records: 100_000_000,
+        max_pages: 150_000_000_000u64 / NAME_PAGE_BYTES as u64,
+        max_frontier: 1_000_000,
+        max_known_addresses: 100_000_000,
+        minimum_filesystem_reserve_bytes: 0,
+        deadline: now
+            .checked_add(std::time::Duration::from_secs(60 * 60))
+            .unwrap_or(now),
+    }
+}
+
+fn ensure_page_tree_len_limit(
+    length: usize,
+    limit: u64,
+    context: &'static str,
+) -> Result<(), PageTreeError> {
+    let actual = u64::try_from(length).unwrap_or(u64::MAX);
+    if actual > limit {
+        return Err(PageTreeError::ResourceLimit {
+            context,
+            limit,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_page_tree_hash_map_limit<K, V>(
+    entries: &HashMap<K, V>,
+    limit: u64,
+    context: &'static str,
+) -> Result<(), PageTreeError> {
+    ensure_page_tree_len_limit(entries.len(), limit, context)
+}
+
+fn insert_page_tree_root_bounded(
+    roots: &mut HashSet<TreeRoot>,
+    root: TreeRoot,
+    limit: u64,
+    context: &'static str,
+) -> Result<bool, PageTreeError> {
+    if roots.contains(&root) {
+        return Ok(false);
+    }
+    ensure_page_tree_len_limit(roots.len().saturating_add(1), limit, context)?;
+    roots.insert(root);
+    Ok(true)
+}
+
+fn insert_known_address_bounded(
+    addresses: &mut HashMap<TreeRoot, NamePageAddress>,
+    root: TreeRoot,
+    address: NamePageAddress,
+    limit: u64,
+) -> Result<(), PageTreeError> {
+    if addresses.contains_key(&root) {
+        return Err(PageTreeError::DuplicateRecord(root));
+    }
+    ensure_page_tree_len_limit(
+        addresses.len().saturating_add(1),
+        limit,
+        "name-page known addresses",
+    )?;
+    addresses.insert(root, address);
+    Ok(())
+}
+
+fn add_page_tree_resource(
+    current: u64,
+    additional: u64,
+    limit: u64,
+    context: &'static str,
+) -> Result<u64, PageTreeError> {
+    let actual = current.saturating_add(additional);
+    if actual > limit {
+        return Err(PageTreeError::ResourceLimit {
+            context,
+            limit,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PageTreeError {
     #[error("name-page codec failed: {0}")]
@@ -2611,6 +3265,23 @@ pub enum PageTreeError {
     MissingPackedAddress(TreeRoot),
     #[error("name-page appender position does not match the prepared pack")]
     AppenderPosition,
+    #[error("{context} reached {actual}, exceeding limit {limit}")]
+    ResourceLimit {
+        context: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+    #[error("{context} exceeded its execution deadline")]
+    DeadlineExceeded { context: &'static str },
+    #[error(
+        "{context} has {available} filesystem bytes available; {required} plus reserve {reserve} are required"
+    )]
+    InsufficientSpace {
+        context: &'static str,
+        available: u64,
+        required: u64,
+        reserve: u64,
+    },
 }
 
 impl PageTreeError {
@@ -2648,7 +3319,7 @@ mod tests {
             root: TreeRoot::new([0xa5; 32]),
             maximum_path_bits: 255,
         };
-        let mut spill = ValidatedPageSpill::create(&directory).expect("create spill");
+        let mut spill = ValidatedPageSpill::create(&directory, u64::MAX).expect("create spill");
         assert_eq!(
             std::fs::read_dir(&directory)
                 .expect("read spill directory")
@@ -2706,6 +3377,97 @@ mod tests {
         assert_eq!(decoded.last_sealed_height, None);
         assert_eq!(decoded.committed_height, state.committed_height);
         assert_eq!(decoded.manifest, state.manifest);
+    }
+
+    #[test]
+    fn generation_reader_opens_segments_lazily_with_a_bounded_fd_cache() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-name-page-lazy-segments-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create generation directory");
+        let generation = 17;
+        let segment_count = DEFAULT_OPEN_SEGMENT_FILES + 4;
+        let mut roots = Vec::with_capacity(segment_count);
+        let mut locators = Vec::with_capacity(segment_count);
+        for index in 0..segment_count {
+            let tag = u8::try_from(index + 1).expect("test segment tag");
+            let tree = MemoryUrkel::from_entries([(
+                NameHash::new([tag; 32]),
+                vec![tag, tag.rotate_left(1)],
+            )])
+            .expect("single-record tree");
+            let root = tree.root();
+            let canonical = tree
+                .node_records()
+                .expect("tree records")
+                .remove(&root)
+                .expect("root record");
+            let segment = u32::try_from(index).expect("test segment");
+            let path = directory.join(format!("name-g{generation:016x}-s{segment:08x}.pages"));
+            let mut appender =
+                NamePageAppender::create_new(&path, generation, segment).expect("create segment");
+            let address = appender
+                .append(&[NamePageRecord {
+                    key: *root.as_bytes(),
+                    children: Vec::new(),
+                    canonical,
+                }])
+                .expect("append segment record")[0];
+            appender.sync_data().expect("sync segment");
+            roots.push(root);
+            locators.push(NamePageRootLocator::new(generation, address));
+        }
+
+        let active_segment = u32::try_from(segment_count - 1).expect("active segment");
+        let reader = NamePageTreeReader::open_generation_with_cache(
+            &directory,
+            generation,
+            active_segment,
+            roots[0],
+            locators[0],
+            1,
+        )
+        .expect("open lazy generation");
+        {
+            let files = reader.files.lock().expect("segment cache");
+            assert_eq!(files.opens, 0, "construction must not open a segment");
+            assert!(files.files.is_empty());
+        }
+        for (root, locator) in roots.iter().copied().zip(locators.iter().copied()).skip(1) {
+            reader.insert_root(root, locator).expect("seed root");
+        }
+        {
+            let files = reader.files.lock().expect("segment cache");
+            assert_eq!(files.opens, 0, "root seeding must remain metadata-only");
+        }
+
+        for root in roots.iter().copied() {
+            assert!(reader.load(root).expect("load segment root").is_some());
+            let files = reader.files.lock().expect("segment cache");
+            assert!(files.files.len() <= DEFAULT_OPEN_SEGMENT_FILES);
+        }
+        {
+            let files = reader.files.lock().expect("segment cache");
+            assert_eq!(files.opens, segment_count as u64);
+            assert_eq!(files.files.len(), DEFAULT_OPEN_SEGMENT_FILES);
+        }
+        assert!(reader
+            .load(roots[0])
+            .expect("reopen evicted root")
+            .is_some());
+        {
+            let files = reader.files.lock().expect("segment cache");
+            assert_eq!(files.opens, segment_count as u64 + 1);
+            assert_eq!(files.files.len(), DEFAULT_OPEN_SEGMENT_FILES);
+        }
+
+        drop(reader);
+        std::fs::remove_dir_all(directory).expect("remove generation directory");
     }
 
     #[test]
@@ -2789,6 +3551,197 @@ mod tests {
         drop(reader);
         drop(appender);
         std::fs::remove_file(path).expect("remove page fixture");
+    }
+
+    #[test]
+    fn bounded_stream_accepts_exact_record_and_rejects_one_over_deadline_and_reserve() {
+        let tree =
+            MemoryUrkel::from_entries([(NameHash::new([0x44; 32]), b"bounded-stream".to_vec())])
+                .expect("one-record tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("tree records");
+        assert_eq!(records.len(), 1);
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        for (record_root, raw) in records {
+            batch
+                .put(ColumnFamily::NameTreeNodes, record_root.as_bytes(), &raw)
+                .expect("stage record");
+        }
+        store.commit(batch).expect("commit record");
+        let snapshot = store.snapshot().expect("snapshot");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = |case: &str| {
+            std::env::temp_dir().join(format!(
+                "hsrd-name-pages-stream-limits-{case}-{}-{nonce}.pages",
+                std::process::id()
+            ))
+        };
+        let now = Instant::now();
+        let exact_limits = NamePageStreamLimits {
+            max_records: 1,
+            max_pages: 1,
+            max_frontier: 1,
+            max_known_addresses: 1,
+            minimum_filesystem_reserve_bytes: 0,
+            deadline: now
+                .checked_add(std::time::Duration::from_secs(30))
+                .unwrap_or(now),
+        };
+
+        let exact_path = path("exact");
+        let mut exact =
+            NamePageAppender::create_new(&exact_path, 1, 0).expect("create exact output");
+        let streamed = stream_name_page_tree_with_limits(&snapshot, root, &mut exact, exact_limits)
+            .expect("exact stream limits");
+        assert_eq!(streamed.record_count, 1);
+        assert_eq!(streamed.page_count, 1);
+        drop(exact);
+        std::fs::remove_file(exact_path).expect("remove exact output");
+
+        let count_path = path("count");
+        let mut count =
+            NamePageAppender::create_new(&count_path, 2, 0).expect("create count output");
+        assert!(matches!(
+            stream_name_page_tree_with_limits(
+                &snapshot,
+                root,
+                &mut count,
+                NamePageStreamLimits {
+                    max_records: 0,
+                    ..exact_limits
+                },
+            ),
+            Err(PageTreeError::ResourceLimit {
+                context: "name-page bootstrap records",
+                limit: 0,
+                actual: 1,
+            })
+        ));
+        assert_eq!(
+            std::fs::metadata(&count_path)
+                .expect("count metadata")
+                .len(),
+            0
+        );
+        drop(count);
+        std::fs::remove_file(count_path).expect("remove count output");
+
+        let frontier_path = path("frontier");
+        let mut frontier =
+            NamePageAppender::create_new(&frontier_path, 5, 0).expect("create frontier output");
+        assert!(matches!(
+            stream_name_page_tree_with_limits(
+                &snapshot,
+                root,
+                &mut frontier,
+                NamePageStreamLimits {
+                    max_frontier: 0,
+                    ..exact_limits
+                },
+            ),
+            Err(PageTreeError::ResourceLimit {
+                context: "name-page bootstrap frontier",
+                limit: 0,
+                actual: 1,
+            })
+        ));
+        assert_eq!(
+            std::fs::metadata(&frontier_path)
+                .expect("frontier metadata")
+                .len(),
+            0
+        );
+        drop(frontier);
+        std::fs::remove_file(frontier_path).expect("remove frontier output");
+
+        let deadline_path = path("deadline");
+        let mut deadline =
+            NamePageAppender::create_new(&deadline_path, 3, 0).expect("create deadline output");
+        assert!(matches!(
+            stream_name_page_tree_with_limits(
+                &snapshot,
+                root,
+                &mut deadline,
+                NamePageStreamLimits {
+                    deadline: Instant::now(),
+                    ..exact_limits
+                },
+            ),
+            Err(PageTreeError::DeadlineExceeded {
+                context: "name-page generation streaming",
+            })
+        ));
+        assert_eq!(
+            std::fs::metadata(&deadline_path)
+                .expect("deadline metadata")
+                .len(),
+            0
+        );
+        drop(deadline);
+        std::fs::remove_file(deadline_path).expect("remove deadline output");
+
+        let reserve_path = path("reserve");
+        let mut reserve =
+            NamePageAppender::create_new(&reserve_path, 4, 0).expect("create reserve output");
+        assert!(matches!(
+            stream_name_page_tree_with_limits(
+                &snapshot,
+                root,
+                &mut reserve,
+                NamePageStreamLimits {
+                    minimum_filesystem_reserve_bytes: u64::MAX,
+                    ..exact_limits
+                },
+            ),
+            Err(PageTreeError::Page(
+                NamePageError::InsufficientCapacity { .. }
+            ))
+        ));
+        assert_eq!(
+            std::fs::metadata(&reserve_path)
+                .expect("reserve metadata")
+                .len(),
+            0
+        );
+        drop(reserve);
+        std::fs::remove_file(reserve_path).expect("remove reserve output");
+    }
+
+    #[test]
+    fn validation_spill_capacity_charges_planned_generation_bytes() {
+        const COMMITTED: u64 = NAME_PAGE_BYTES as u64;
+        const RESERVE: u64 = 10_000;
+        const CONFIGURED_MAXIMUM: u64 = 4 * 1024 * 1024 * 1024;
+        let exact_available = COMMITTED + RESERVE;
+
+        assert_eq!(
+            ensure_validation_spill_capacity(
+                exact_available,
+                COMMITTED,
+                CONFIGURED_MAXIMUM,
+                RESERVE,
+            )
+            .expect("exact planned spill capacity"),
+            COMMITTED
+        );
+        assert!(matches!(
+            ensure_validation_spill_capacity(
+                exact_available - 1,
+                COMMITTED,
+                CONFIGURED_MAXIMUM,
+                RESERVE,
+            ),
+            Err(PageTreeError::InsufficientSpace {
+                context: "name-page validation spill",
+                available,
+                required: COMMITTED,
+                reserve: RESERVE,
+            }) if available == exact_available - 1
+        ));
     }
 
     #[test]

@@ -59,3 +59,40 @@ jobs:
 
       - name: Audit locked fuzz dependencies
         run: cargo +1.89.0 audit --file fuzz/Cargo.lock
+
+  scheduled-assurance:
+    name: Scheduled sustained fuzz and performance evidence
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang libclang-dev
+
+      - name: Install declared Rust toolchain
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup toolchain install nightly-2025-08-07 --profile minimal
+
+      - name: Install pinned cargo-fuzz
+        run: cargo +1.89.0 install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Run scheduled software assurance
+        run: |
+          ./scripts/run-production-assurance.sh scheduled \
+            --evidence-dir "${RUNNER_TEMP}/production-assurance" \
+            --fuzz-duration-seconds 180
+
+      - name: Retain machine-readable assurance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-assurance-${{ github.sha }}
+          path: ${{ runner.temp }}/production-assurance
+          if-no-files-found: error
+          retention-days: 30

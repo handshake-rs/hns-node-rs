@@ -550,6 +550,190 @@ impl MemoryUrkel {
     }
 }
 
+/// Incrementally compute the exact HSD/Urkel root of strictly sorted entries.
+///
+/// Values are size-checked and hashed by [`Self::push`] and are never retained.
+/// The pending branch stack has at most one entry for each of the 256 key bits,
+/// so working memory is bounded by the radix depth rather than the entry count.
+#[derive(Debug)]
+pub struct SortedEntryRootAccumulator {
+    previous_key: Option<NameHash>,
+    current: Option<SortedEntrySubtree>,
+    branches: Vec<PendingSortedEntryBranch>,
+    #[cfg(test)]
+    peak_branches: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SortedEntrySubtree {
+    first_key: NameHash,
+    root: TreeRoot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingSortedEntryBranch {
+    branch_depth: u16,
+    left: SortedEntrySubtree,
+}
+
+impl Default for SortedEntryRootAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SortedEntryRootAccumulator {
+    /// Construct an empty streaming root accumulator.
+    pub fn new() -> Self {
+        Self {
+            previous_key: None,
+            current: None,
+            branches: Vec::with_capacity(URKEL_BITS),
+            #[cfg(test)]
+            peak_branches: 0,
+        }
+    }
+
+    /// Add the next strictly increasing key and its borrowed value.
+    ///
+    /// The value must satisfy the same size limit as [`MemoryUrkel`]. Any error
+    /// leaves the accumulator unchanged, so a caller may correct the input and
+    /// continue the same stream.
+    pub fn push(&mut self, key: NameHash, value: &[u8]) -> Result<(), UrkelError> {
+        if let Some(previous) = self.previous_key {
+            if key == previous {
+                return Err(UrkelError::DuplicateKey(key));
+            }
+            if key < previous {
+                return Err(UrkelError::KeysOutOfOrder {
+                    previous,
+                    next: key,
+                });
+            }
+        }
+        validate_value_size(value.len())?;
+
+        let leaf = SortedEntrySubtree {
+            first_key: key,
+            root: TreeRoot::new(hash_leaf(key.as_bytes(), &blake2b_256(value))),
+        };
+        let Some(previous) = self.previous_key else {
+            self.previous_key = Some(key);
+            self.current = Some(leaf);
+            return Ok(());
+        };
+
+        let branch_depth = common_key_bits(previous.as_bytes(), key.as_bytes(), 0);
+        if branch_depth >= URKEL_BITS {
+            return Err(UrkelError::InvalidNode(
+                "distinct sorted Urkel keys have no divergent bit".to_owned(),
+            ));
+        }
+        let branch_depth_u16 = u16::try_from(branch_depth).map_err(|_| {
+            UrkelError::InvalidNode("streaming Urkel branch depth exceeds u16".to_owned())
+        })?;
+        let mut left = self.current.ok_or_else(|| {
+            UrkelError::InvalidNode("streaming Urkel root lost its current subtree".to_owned())
+        })?;
+
+        let mut retained_branches = self.branches.len();
+        loop {
+            let Some(pending_index) = retained_branches.checked_sub(1) else {
+                break;
+            };
+            let pending = self.branches[pending_index];
+            if usize::from(pending.branch_depth) <= branch_depth {
+                break;
+            }
+            let parent_depth = pending_index
+                .checked_sub(1)
+                .map(|parent_index| usize::from(self.branches[parent_index].branch_depth))
+                .unwrap_or(branch_depth)
+                .max(branch_depth);
+            left = finish_sorted_entry_branch(pending, left, parent_depth + 1)?;
+            retained_branches = pending_index;
+        }
+        if retained_branches
+            .checked_sub(1)
+            .map(|pending_index| self.branches[pending_index])
+            .is_some_and(|pending| usize::from(pending.branch_depth) >= branch_depth)
+        {
+            return Err(UrkelError::InvalidNode(
+                "streaming Urkel branch depths are not strictly increasing".to_owned(),
+            ));
+        }
+
+        self.branches.truncate(retained_branches);
+        self.branches.push(PendingSortedEntryBranch {
+            branch_depth: branch_depth_u16,
+            left,
+        });
+        self.previous_key = Some(key);
+        self.current = Some(leaf);
+        #[cfg(test)]
+        {
+            self.peak_branches = self.peak_branches.max(self.branches.len());
+        }
+        Ok(())
+    }
+
+    /// Finish the stream and return its exact HSD/Urkel root.
+    pub fn finish(mut self) -> Result<TreeRoot, UrkelError> {
+        let Some(mut right) = self.current.take() else {
+            if !self.branches.is_empty() || self.previous_key.is_some() {
+                return Err(UrkelError::InvalidNode(
+                    "empty streaming Urkel root retains pending state".to_owned(),
+                ));
+            }
+            return Ok(TreeRoot::ZERO);
+        };
+
+        while let Some(pending) = self.branches.pop() {
+            let start_depth = self
+                .branches
+                .last()
+                .map(|parent| usize::from(parent.branch_depth) + 1)
+                .unwrap_or(0);
+            right = finish_sorted_entry_branch(pending, right, start_depth)?;
+        }
+        Ok(right.root)
+    }
+}
+
+fn finish_sorted_entry_branch(
+    pending: PendingSortedEntryBranch,
+    right: SortedEntrySubtree,
+    start_depth: usize,
+) -> Result<SortedEntrySubtree, UrkelError> {
+    let branch_depth = usize::from(pending.branch_depth);
+    if branch_depth >= URKEL_BITS || start_depth > branch_depth {
+        return Err(UrkelError::InvalidNode(
+            "streaming Urkel branch has an invalid depth range".to_owned(),
+        ));
+    }
+    if key_bit(pending.left.first_key.as_bytes(), branch_depth) != 0
+        || key_bit(right.first_key.as_bytes(), branch_depth) != 1
+    {
+        return Err(UrkelError::InvalidNode(
+            "streaming Urkel branch children disagree with their branch bit".to_owned(),
+        ));
+    }
+
+    let prefix = BitPrefix::from_key_range(
+        pending.left.first_key.as_bytes(),
+        start_depth,
+        branch_depth - start_depth,
+    );
+    Ok(SortedEntrySubtree {
+        first_key: pending.left.first_key,
+        root: TreeRoot::new(hash_internal(
+            &prefix,
+            pending.left.root.as_bytes(),
+            right.root.as_bytes(),
+        )),
+    })
+}
+
 /// Canonical durable representation of one content-addressed Urkel node.
 /// The record bytes are not HSD's filesystem format; their authenticated hash
 /// is exactly the HSD/Urkel node hash used by roots and proofs.
@@ -2855,6 +3039,10 @@ pub enum UrkelError {
     Unavailable,
     #[error("urkel value size {0} exceeds the configured bound")]
     ValueTooLarge(usize),
+    #[error("duplicate streamed urkel key {0:?}")]
+    DuplicateKey(NameHash),
+    #[error("streamed urkel key {next:?} follows greater key {previous:?}")]
+    KeysOutOfOrder { previous: NameHash, next: NameHash },
     #[error("invalid urkel proof: {0}")]
     InvalidProof(String),
     #[error("invalid urkel node: {0}")]
@@ -2985,6 +3173,142 @@ mod tests {
             )
         }))
         .expect("fixture tree")
+    }
+
+    fn streamed_root(entries: &BTreeMap<NameHash, Vec<u8>>) -> TreeRoot {
+        let mut accumulator = SortedEntryRootAccumulator::new();
+        for (key, value) in entries {
+            accumulator.push(*key, value).expect("sorted entry");
+        }
+        accumulator.finish().expect("streamed root")
+    }
+
+    #[test]
+    fn sorted_entry_root_stream_is_empty() {
+        assert_eq!(
+            SortedEntryRootAccumulator::new()
+                .finish()
+                .expect("empty streamed root"),
+            MemoryUrkel::new().root()
+        );
+    }
+
+    #[test]
+    fn sorted_entry_root_stream_matches_singleton() {
+        let entries = BTreeMap::from([(key(7), b"singleton".to_vec())]);
+        let expected = MemoryUrkel::from_entries(entries.clone())
+            .expect("singleton tree")
+            .root();
+        assert_eq!(streamed_root(&entries), expected);
+    }
+
+    #[test]
+    fn sorted_entry_root_stream_bounds_adversarial_shared_prefixes() {
+        let mut entries = BTreeMap::new();
+        for leading_ones in 0..=URKEL_BITS {
+            let mut bytes = [0u8; 32];
+            for bit in 0..leading_ones {
+                set_key_bit(&mut bytes, bit, 1);
+            }
+            entries.insert(
+                NameHash::new(bytes),
+                format!("leading-ones-{leading_ones}").into_bytes(),
+            );
+        }
+
+        let expected = MemoryUrkel::from_entries(entries.clone())
+            .expect("adversarial tree")
+            .root();
+        let mut accumulator = SortedEntryRootAccumulator::new();
+        for (key, value) in &entries {
+            accumulator.push(*key, value).expect("sorted entry");
+        }
+        assert_eq!(accumulator.peak_branches, URKEL_BITS);
+        assert_eq!(accumulator.finish().expect("streamed root"), expected);
+    }
+
+    #[test]
+    fn sorted_entry_root_stream_matches_deterministic_randomized_tree() {
+        let mut seed = 0xd1b5_4a32_d192_ed03u64;
+        let mut entries = BTreeMap::new();
+        while entries.len() < 4_096 {
+            let mut bytes = [0u8; 32];
+            for chunk in bytes.chunks_exact_mut(8) {
+                seed ^= seed << 7;
+                seed ^= seed >> 9;
+                seed ^= seed << 8;
+                chunk.copy_from_slice(&seed.to_be_bytes());
+            }
+            let value_len = usize::from((seed as u8) % 96) + 1;
+            let value = (0..value_len)
+                .map(|offset| (seed.rotate_left(offset as u32) as u8) ^ offset as u8)
+                .collect::<Vec<_>>();
+            entries.insert(NameHash::new(bytes), value);
+        }
+
+        let expected = MemoryUrkel::from_entries(entries.clone())
+            .expect("randomized tree")
+            .root();
+        assert_eq!(streamed_root(&entries), expected);
+    }
+
+    #[test]
+    fn sorted_entry_root_stream_rejects_order_errors_without_mutation() {
+        let first = key(2);
+        let lower = key(1);
+        let higher = key(3);
+        let mut accumulator = SortedEntryRootAccumulator::new();
+        accumulator.push(first, b"first").expect("first entry");
+        assert!(matches!(
+            accumulator.push(first, b"duplicate"),
+            Err(UrkelError::DuplicateKey(key)) if key == first
+        ));
+        assert!(matches!(
+            accumulator.push(lower, b"lower"),
+            Err(UrkelError::KeysOutOfOrder { previous, next })
+                if previous == first && next == lower
+        ));
+        accumulator
+            .push(higher, b"higher")
+            .expect("later valid entry");
+
+        let expected =
+            MemoryUrkel::from_entries([(first, b"first".to_vec()), (higher, b"higher".to_vec())])
+                .expect("tree after rejected entries")
+                .root();
+        assert_eq!(
+            accumulator.finish().expect("streamed root after errors"),
+            expected
+        );
+    }
+
+    #[test]
+    fn sorted_entry_root_stream_enforces_exact_value_limit() {
+        let exact = vec![0x5a; MAX_TX_SIZE];
+        let mut exact_accumulator = SortedEntryRootAccumulator::new();
+        exact_accumulator
+            .push(key(0), &exact)
+            .expect("exact-limit value");
+        let expected = MemoryUrkel::from_entries([(key(0), exact)])
+            .expect("exact-limit tree")
+            .root();
+        assert_eq!(
+            exact_accumulator.finish().expect("exact-limit root"),
+            expected
+        );
+
+        let too_large = vec![0x5a; MAX_TX_SIZE + 1];
+        let mut oversized_accumulator = SortedEntryRootAccumulator::new();
+        assert!(matches!(
+            oversized_accumulator.push(key(0), &too_large),
+            Err(UrkelError::ValueTooLarge(size)) if size == MAX_TX_SIZE + 1
+        ));
+        assert_eq!(
+            oversized_accumulator
+                .finish()
+                .expect("unchanged oversized accumulator"),
+            TreeRoot::ZERO
+        );
     }
 
     #[test]

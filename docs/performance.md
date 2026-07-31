@@ -40,18 +40,99 @@ Sampler schema 3 records:
 - stored-to-active buffer depth, pending and inflight body work, active stalls,
   ready peers, failures, and unavailable evidence.
 
-Measure the local mining critical path:
+### Fast in-memory smoke
+
+The default scenario is a deterministic, fast local smoke test:
 
 ```bash
-cargo run --locked --release -p hns-node --bin hsrd-performance-gate
+cargo run --locked --release -p hns-node \
+  --bin hsrd-performance-gate -- \
+  --json-output /new/path/deterministic-performance.json
 ```
 
-`hsrd-performance-gate` imports canonical HSD regtest genesis, warms ten blocks,
-then builds and connects 100 native blocks. It reports count, P50, P95, P99,
-maximum, failure count, and unavailable evidence for template assembly, cached
-job preparation, tip-to-job work, solved-candidate validation, and local
-connection. This is a regression gate, not a full-mainnet IBD completion claim
-or an ASIC/WAN qualification.
+This `smoke` scenario uses the in-memory backend, imports canonical HSD regtest
+genesis, connects ten unmeasured warmup blocks, and then builds and connects 100
+measured native blocks. `scripts/check.sh` and the smoke assurance tier use this
+default. It is a quick correctness and latency regression signal; it does not
+exercise RocksDB, synchronous storage durability, or a saturated block-index
+cache.
+
+### Persistent RocksDB/synchronous qualification
+
+Scheduled and release assurance require the explicit persistent scenario:
+
+```bash
+cargo run --locked --release -p hns-node \
+  --bin hsrd-performance-gate -- \
+  --scenario persistent-rocksdb-sync \
+  --json-output /new/path/persistent-performance.json
+```
+
+This scenario observes and requires the RocksDB backend with `Sync` durability.
+After canonical regtest genesis it connects 4,096 unmeasured setup blocks and
+requires the block-index cache capacity and observed occupancy to be exactly
+4,096. It then builds and connects 100 measured blocks and requires final cache
+occupancy to remain exactly 4,096. A backend, durability, workload-count, cache,
+latency, failure, or unavailable-evidence mismatch fails closed.
+
+When `--data-root` is omitted, the gate creates a unique temporary directory,
+writes its own ownership marker, closes the node, verifies that exact marker,
+and removes only that automatically created root. For diagnosis, supply a
+fresh, nonexistent path and the gate will create and retain it:
+
+```bash
+cargo run --locked --release -p hns-node \
+  --bin hsrd-performance-gate -- \
+  --scenario persistent-rocksdb-sync \
+  --data-root /new/nonexistent/path/performance-data \
+  --json-output /new/path/persistent-performance.json
+```
+
+The gate refuses to reuse an existing caller-selected root. Schema-v2 JSON
+records the package version, scenario, requested and observed backend and
+durability, root policy, setup/measured counts, cache capacity and occupancy,
+latency distributions, evidence checks, and explicit pass/fail status.
+
+Both scenarios report count, P50, P95, P99, and maximum for template assembly,
+cached job preparation, tip-to-job work, solved-candidate validation, and local
+connection. The enforced P99 thresholds are exclusive: tip-to-job must be less
+than 25,000 µs, candidate validation less than 5,000 µs, and local connection
+less than 50,000 µs. Equality fails. These are deterministic local regtest
+gates. Even the persistent scenario is not full-mainnet IBD, WAN/load,
+long-duration multi-peer, or physical gateway/ASIC evidence.
+
+The block-index implementation also has a saturated structural regression
+separate from the latency workload. It fills the fixed 4,096-record cache,
+publishes prepared one-record and exact 1,024-record deltas without cloning
+historical cache records, keeps occupancy at 4,096, and rejects a 1,025-record
+update before publication. This proves cache publication scales with the
+bounded change set rather than by cloning the complete resident cache; the
+persistent scenario supplies the corresponding synchronous-storage latency
+measurement.
+
+## WAN, load, hardware, and soak evidence
+
+Three separate production records prevent a fast local regression test from
+being misreported as deployment evidence:
+
+- `wan_load_latency` runs at least one hour across two sites and 1,000 samples.
+  Job-delivery P99 is at most 250 ms, candidate-to-first-peer P99 is at most
+  500 ms, and failed or unavailable samples are forbidden.
+- `physical_gateway_asic` runs a real device for at least four hours and 1,000
+  observed jobs, includes valid share and block-candidate paths plus three
+  fallback/recovery cycles, keeps job-switch P99 at or below 250 ms, and
+  permits no invalid job or unreconciled receipt.
+- `long_duration_multi_peer` runs at least 24 hours with eight peers and three
+  controlled restarts, with no tip divergence, recovery failure, or unexpected
+  authority grant.
+
+Raw timestamp samples, distributions, clock synchronization, network topology,
+load/resource series, device/firmware identities, receipt transcripts, peer
+diversity, and restart checkpoints are retained as hashed artifacts. The
+machine verifier and complete minimum criteria are defined in
+[`production-assurance.md`](production-assurance.md). These gates remain open
+until real evidence exists; scheduled hosted CI does not simulate their
+completion.
 
 ## Chokepoint model
 
@@ -294,4 +375,7 @@ Optimization is accepted only with:
 - sustained phase/backlog measurements on persistent mainnet storage;
 - template-to-job, candidate-validation, local-connect, and first-peer
   publication latency distributions;
-- reproducible builds and a reviewed migration and fallback procedure.
+- reproducible builds and a reviewed migration and fallback procedure;
+- a passing `run-production-assurance.sh release` bundle for the exact commit
+  and Git tree. Harness availability or an unavailable measurement is not a
+  passing record.

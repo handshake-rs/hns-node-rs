@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     middleware,
     routing::{get, post},
     Json, Router,
@@ -28,7 +28,7 @@ use hns_consensus::{
     validate_transaction_start, ConsensusParams, DeploymentState, HeaderConsensus, HeaderParent,
     HeaderValidationContext, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
 };
-use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
+use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission, Mempool};
 use hns_p2p::{
     generate_private_key, normalize_peer_ip, peer_address_group, BrontideIdentity, CompactBlock,
     CompactBlockError, CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse,
@@ -41,7 +41,7 @@ use hns_primitives::{
 };
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcExperimentalRegistryInfo, RpcHip76Info,
-    RpcService,
+    RpcMethod, RpcService, RpcSnapshot,
 };
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use hns_store::mark_clean_shutdown;
@@ -62,13 +62,15 @@ use tokio::{
 
 use super::{
     authority_info, best_block_tip_from_snapshot, best_header_tip_from_snapshot,
-    completed_deployment_period_with_lookup, current_unix_time, expected_bits_with_lookup,
-    json_rpc_error, load_block_index_record, load_header_record, mark_node_store_clean,
-    median_time_past_with_lookup, mining_generation_from_snapshot, mining_snapshot_for_hash,
-    require_rpc_authorization, rpc_experimental_registry_info, rpc_hip76_info, AuthorityMode,
-    ChainActivationFailure, DurableMiningState, FailedBlockMutation, FailedBlockStage,
-    HeaderSummary, NativeRuntimeExtension, NodeBlockImport, NodeReorg, NodeService,
-    RpcAuthorizationHeader, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
+    completed_deployment_period_with_lookup, current_unix_time, enforce_rpc_resource_limits,
+    expected_bits_with_lookup, json_rpc_error, load_block_index_record, load_header_record,
+    mark_node_store_clean, median_time_past_with_lookup, mining_generation_from_snapshot,
+    mining_snapshot_for_hash, preflight_reorg_reconciliation_budget, require_rpc_authorization,
+    rpc_experimental_registry_info, rpc_hip76_info, rpc_immediately_unsupported,
+    rpc_point_read_method, AuthorityMode, ChainActivationFailure, DurableMiningState,
+    FailedBlockMutation, FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport,
+    NodeReorg, NodeReorgLimits, NodeService, RpcAuthorizationHeader, RpcLimits, RpcReadContext,
+    RpcRuntimeLimits, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
 };
 use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
@@ -1480,6 +1482,8 @@ impl NodeService {
         let shadow_sync_config = self.config.shadow_sync.clone();
         let rpc_bind = self.config.rpc_bind;
         let rpc_authorization = self.config.rpc_authorization.clone();
+        let rpc_limits = self.config.rpc_limits;
+        let rpc_read_context = self.rpc_read_context();
         let network = self.config.network;
         let data_dir = self.config.data_dir.clone();
         let ban_list_persistent = self.config.data_dir.is_some();
@@ -1719,11 +1723,16 @@ impl NodeService {
         let rpc_listener = TcpListener::bind(rpc_bind)
             .await
             .with_context(|| format!("failed to bind RPC listener on {rpc_bind}"))?;
+        let rpc_state = ShadowSyncHttpState {
+            node: Arc::clone(&node),
+            diagnostics: Arc::clone(&diagnostics),
+            diagnostic_rpc: Arc::clone(&diagnostic_rpc),
+            read_context: rpc_read_context,
+            limits: rpc_limits,
+        };
         let rpc_task = tokio::spawn(serve_shadow_sync_rpc(
             rpc_listener,
-            Arc::clone(&node),
-            Arc::clone(&diagnostics),
-            Arc::clone(&diagnostic_rpc),
+            rpc_state,
             rpc_authorization,
             shutdown_rx.clone(),
         ));
@@ -2133,6 +2142,18 @@ impl NodeService {
                     .await;
                 }
             }
+            let storage_operational = {
+                let node = node.lock().await;
+                node.fail_closed_after_ambiguous_commit();
+                node.state.ensure_storage_operational()
+            };
+            if let Err(error) = storage_operational {
+                let error =
+                    error.context("native-sync storage requires reopen after a commit failure");
+                record_error(&diagnostics, format!("{error:#}")).await;
+                terminal_error = Some(error);
+                break;
+            }
             maintain_peer_bans(
                 &store,
                 &peers,
@@ -2145,27 +2166,57 @@ impl NodeService {
             .await;
         }
 
-        maintain_peer_bans(
-            &store,
-            &peers,
-            &mut ban_list,
-            &mut address_book,
-            &mut reconnects,
-            &diagnostics,
-            ban_list_persistent,
-        )
-        .await;
-        if address_book_persistent {
-            flush_address_book(&store, &mut address_book, &diagnostics).await;
-        }
-        if ban_list_persistent {
-            flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
-        }
-        checkpoint_sequence = checkpoint_sequence.saturating_add(1);
-        if let Err(error) = persist_checkpoint(&checkpoint_store, &scheduler, checkpoint_sequence) {
-            record_error(&diagnostics, format!("{error:#}")).await;
+        let shutdown_persistence = {
+            let node = node.lock().await;
+            node.fail_closed_after_ambiguous_commit();
+            node.state.ensure_storage_operational()
+        };
+        if let Err(error) = shutdown_persistence {
+            record_warning(format!(
+                "skipped final peer/checkpoint persistence while storage requires reopen: {error:#}"
+            ));
             if terminal_error.is_none() {
-                terminal_error = Some(error);
+                terminal_error =
+                    Some(error.context("native-sync storage was fenced before shutdown"));
+            }
+        } else {
+            maintain_peer_bans(
+                &store,
+                &peers,
+                &mut ban_list,
+                &mut address_book,
+                &mut reconnects,
+                &diagnostics,
+                ban_list_persistent,
+            )
+            .await;
+            if address_book_persistent {
+                flush_address_book(&store, &mut address_book, &diagnostics).await;
+            }
+            if ban_list_persistent {
+                flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
+            }
+            checkpoint_sequence = checkpoint_sequence.saturating_add(1);
+            if let Err(error) =
+                persist_checkpoint(&checkpoint_store, &scheduler, checkpoint_sequence)
+            {
+                record_error(&diagnostics, format!("{error:#}")).await;
+                if terminal_error.is_none() {
+                    terminal_error = Some(error);
+                }
+            }
+            let final_storage_state = {
+                let node = node.lock().await;
+                node.fail_closed_after_ambiguous_commit();
+                node.state.ensure_storage_operational()
+            };
+            if let Err(error) = final_storage_state {
+                let error =
+                    error.context("native-sync storage was fenced during shutdown persistence");
+                record_error(&diagnostics, format!("{error:#}")).await;
+                if terminal_error.is_none() {
+                    terminal_error = Some(error);
+                }
             }
         }
         let _ = shutdown_tx.send(true);
@@ -2199,6 +2250,7 @@ impl NodeService {
     }
 
     pub(super) fn shadow_sync_ensure_genesis_header(&mut self) -> Result<HeaderRecord> {
+        self.state.ensure_storage_operational()?;
         let params = self.config.network.params();
         if let Some(record) = self
             .state
@@ -2224,7 +2276,8 @@ impl NodeService {
                 },
             )
             .map_err(|error| anyhow::anyhow!("genesis header validation failed: {error}"))?;
-        self.state
+        let result = self
+            .state
             .chain
             .import_header(HeaderImport {
                 header,
@@ -2232,10 +2285,15 @@ impl NodeService {
                 verify_pow: false,
                 checkpoint_valid: true,
             })
-            .map_err(|error| anyhow::anyhow!("failed to persist genesis header: {error}"))
+            .map_err(|error| anyhow::anyhow!("failed to persist genesis header: {error}"));
+        if result.is_err() {
+            self.fail_closed_after_ambiguous_commit();
+        }
+        result
     }
 
     fn shadow_sync_import_headers(&mut self, headers: Vec<Header>) -> Result<Vec<HeaderRecord>> {
+        self.state.ensure_storage_operational()?;
         if headers.len() > MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE {
             anyhow::bail!("peer sent too many headers: {}", headers.len());
         }
@@ -2324,10 +2382,11 @@ impl NodeService {
             imported.push(record);
         }
 
-        let committed = self
-            .state
-            .chain
-            .import_headers(requests)
+        let committed = self.state.chain.import_headers(requests);
+        if committed.is_err() {
+            self.fail_closed_after_ambiguous_commit();
+        }
+        let committed = committed
             .map_err(|error| anyhow::anyhow!("failed to persist header batch: {error}"))?;
         if committed != pending_records {
             anyhow::bail!("committed header batch differs from its staged validation view");
@@ -2506,11 +2565,45 @@ impl NodeService {
     }
 
     fn shadow_sync_has_block(&self, hash: &BlockHash) -> Result<bool> {
-        self.state
+        let Some(record) = self
+            .state
             .blocks
             .block(hash)
-            .map(|record| record.is_some_and(|record| record.status.body_present))
-            .map_err(|error| anyhow::anyhow!("failed to read block availability: {error}"))
+            .map_err(|error| anyhow::anyhow!("failed to read block availability: {error}"))?
+        else {
+            return Ok(false);
+        };
+        if !record.status.body_present {
+            return Ok(false);
+        }
+        let Some(block) = self.state.blocks.load_block(hash).map_err(|error| {
+            anyhow::anyhow!("failed to authenticate stored block body: {error}")
+        })?
+        else {
+            return Ok(false);
+        };
+        let Some(header) = self.state.chain.load_record(hash).map_err(|error| {
+            anyhow::anyhow!("failed to authenticate stored block header: {error}")
+        })?
+        else {
+            anyhow::bail!(
+                "stored block body {} has no matching header record",
+                hash.to_hex()
+            );
+        };
+        if block.header != header.header
+            || record.hash != header.hash
+            || record.height != header.height
+            || record.prev_hash != block.header.prev_block
+            || record.chainwork != header.chainwork
+            || record.status != header.status
+        {
+            anyhow::bail!(
+                "stored block availability metadata disagrees for {}",
+                hash.to_hex()
+            );
+        }
+        Ok(true)
     }
 
     fn shadow_sync_header_record(&self, hash: &BlockHash) -> Result<Option<HeaderRecord>> {
@@ -2539,6 +2632,7 @@ impl NodeService {
         &mut self,
         blocks: Vec<(ValidatedBlock, bool)>,
     ) -> Result<Vec<BlockIndexRecord>> {
+        self.state.ensure_storage_operational()?;
         let mut candidates = Vec::with_capacity(blocks.len());
         for (validated, canonical) in blocks {
             let stateless = super::StatelessBodyValidation::for_block(
@@ -2552,14 +2646,19 @@ impl NodeService {
                 .validate_prevalidated_shadow_import(&request, canonical, stateless)?;
             candidates.push((request, import));
         }
-        self.state
+        let result = self
+            .state
             .store_validated_alternates(candidates)
             .map(|mutations| {
                 mutations
                     .into_iter()
                     .map(|mutation| mutation.record)
                     .collect()
-            })
+            });
+        if result.is_err() {
+            self.fail_closed_after_ambiguous_commit();
+        }
+        result
     }
 
     fn shadow_sync_store_failed_block(
@@ -2567,10 +2666,15 @@ impl NodeService {
         block: Block,
         height: Height,
     ) -> Result<super::FailedBlockMutation> {
-        self.state.store_failed_block(
+        self.state.ensure_storage_operational()?;
+        let result = self.state.store_failed_block(
             NodeBlockImport::from_peer(block, height),
             FailedBlockStage::BodySyntax,
-        )
+        );
+        if result.is_err() {
+            self.fail_closed_after_ambiguous_commit();
+        }
+        result
     }
 
     #[cfg(test)]
@@ -2586,6 +2690,7 @@ impl NodeService {
         maximum_connect: usize,
         stored_tip_hint: Option<&ChainTip>,
     ) -> Result<ActiveStateConnectOutcome> {
+        self.state.ensure_storage_operational()?;
         let planning_started = StdInstant::now();
         if maximum_connect == 0 || maximum_connect > MAX_ACTIVE_STATE_CONNECT_BATCH {
             anyhow::bail!(
@@ -2654,28 +2759,13 @@ impl NodeService {
             }
         };
 
-        let Some(mut activation) = self.state.best_chain_activation_plan(candidate_hash)? else {
+        let Some(activation) = self.state.best_chain_activation_plan(
+            candidate_hash,
+            NodeReorgLimits::with_maximum_connect(maximum_connect),
+        )?
+        else {
             return Ok(ActiveStateConnectOutcome::default());
         };
-        if activation.connect.len() > maximum_connect {
-            activation.connect.truncate(maximum_connect);
-            let candidate = activation
-                .connect
-                .last()
-                .ok_or_else(|| anyhow::anyhow!("bounded connector plan has no candidate"))?;
-            let candidate_record = self
-                .state
-                .load_block_record(&candidate.block.hash())?
-                .ok_or_else(|| anyhow::anyhow!("bounded connector candidate index is missing"))?;
-            if active_tip
-                .as_ref()
-                .is_some_and(|active| candidate_record.chainwork <= active.chainwork)
-            {
-                anyhow::bail!(
-                    "active-state reorganization needs more than {maximum_connect} replacement blocks before exceeding the active tip"
-                );
-            }
-        }
 
         for connect in &activation.connect {
             let summary = HeaderSummary::from_block(&connect.block, connect.height);
@@ -2712,6 +2802,13 @@ impl NodeService {
         let planning_micros =
             u64::try_from(planning_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
+        let reconciliation_snapshot = self.state.store.snapshot()?;
+        preflight_reorg_reconciliation_budget(
+            &reconciliation_snapshot,
+            &activation,
+            NodeReorgLimits::with_maximum_connect(maximum_connect),
+        )?;
+        drop(reconciliation_snapshot);
         let disconnected_transactions =
             self.disconnected_mempool_transactions(&activation.disconnect)?;
         let connected_transactions = activation
@@ -2768,7 +2865,11 @@ impl NodeService {
                 );
                 let failed = self
                     .state
-                    .store_failed_block(failure.request, FailedBlockStage::ContextualState)?;
+                    .store_failed_block(failure.request, FailedBlockStage::ContextualState);
+                if failed.is_err() {
+                    self.fail_closed_after_ambiguous_commit();
+                }
+                let failed = failed?;
                 let post_commit_micros =
                     u64::try_from(post_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 Ok(ActiveStateConnectOutcome {
@@ -2781,6 +2882,7 @@ impl NodeService {
                 })
             }
             Err(ChainActivationFailure::Internal(error)) => {
+                self.fail_closed_after_ambiguous_commit();
                 if is_reorg {
                     self.mining_events.reorg_aborted();
                 }
@@ -3080,6 +3182,8 @@ struct ShadowSyncHttpState {
     node: Arc<Mutex<NodeService>>,
     diagnostics: Arc<RwLock<ShadowSyncDiagnostics>>,
     diagnostic_rpc: Arc<RwLock<CachedDiagnosticRpc>>,
+    read_context: RpcReadContext,
+    limits: RpcLimits,
 }
 
 #[derive(Clone)]
@@ -3090,17 +3194,13 @@ struct CachedDiagnosticRpc {
 
 async fn serve_shadow_sync_rpc(
     listener: TcpListener,
-    node: Arc<Mutex<NodeService>>,
-    diagnostics: Arc<RwLock<ShadowSyncDiagnostics>>,
-    diagnostic_rpc: Arc<RwLock<CachedDiagnosticRpc>>,
+    state: ShadowSyncHttpState,
     authorization: Option<RpcAuthorizationHeader>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let state = ShadowSyncHttpState {
-        node,
-        diagnostics,
-        diagnostic_rpc,
-    };
+    let limits = state.limits;
+    limits.validate()?;
+    let runtime_limits = RpcRuntimeLimits::new(limits);
     let app = Router::new()
         .route("/", post(handle_shadow_sync_rpc))
         .route("/rpc", post(handle_shadow_sync_rpc))
@@ -3116,7 +3216,12 @@ async fn serve_shadow_sync_rpc(
             "/api/v1/mining-engine",
             get(handle_mining_engine_diagnostics),
         )
-        .with_state(state);
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(limits.maximum_request_bytes))
+        .layer(middleware::from_fn_with_state(
+            runtime_limits,
+            enforce_rpc_resource_limits,
+        ));
     let app = match authorization {
         Some(expected) => app.layer(middleware::from_fn_with_state(
             expected,
@@ -3132,25 +3237,11 @@ async fn serve_shadow_sync_rpc(
         .context("Native sync RPC server failed")
 }
 
-async fn shadow_sync_rpc_service(
-    state: &ShadowSyncHttpState,
-    include_entries: bool,
-) -> Result<BasicRpcService> {
-    let diagnostics = state.diagnostics.read().await.clone();
-    let node = state.node.lock().await;
-    compose_shadow_sync_rpc_service(&node, &diagnostics, include_entries)
-}
-
 fn compose_shadow_sync_rpc_service(
     node: &NodeService,
     diagnostics: &ShadowSyncDiagnostics,
-    include_entries: bool,
 ) -> Result<BasicRpcService> {
-    let mut snapshot = if include_entries {
-        node.rpc_snapshot()?
-    } else {
-        node.rpc_diagnostic_snapshot()?
-    };
+    let mut snapshot = node.rpc_diagnostic_snapshot()?;
     snapshot.network_active = diagnostics.enabled;
     snapshot.peer_count = diagnostics.peers.len();
     snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
@@ -3176,7 +3267,7 @@ async fn initialize_cached_diagnostic_rpc(
     let diagnostics = diagnostics.read().await.clone();
     let node = node.lock().await;
     Ok(Arc::new(RwLock::new(CachedDiagnosticRpc {
-        service: compose_shadow_sync_rpc_service(&node, &diagnostics, false)?,
+        service: compose_shadow_sync_rpc_service(&node, &diagnostics)?,
         captured_at: unix_time(),
     })))
 }
@@ -3188,31 +3279,45 @@ async fn refresh_cached_diagnostic_rpc(
 ) -> Result<()> {
     let diagnostics = diagnostics.read().await.clone();
     let node = node.lock().await;
-    let service = compose_shadow_sync_rpc_service(&node, &diagnostics, false)?;
-    drop(node);
+    let service = compose_shadow_sync_rpc_service(&node, &diagnostics)?;
     *diagnostic_rpc.write().await = CachedDiagnosticRpc {
         service,
         captured_at: unix_time(),
     };
+    drop(node);
     Ok(())
+}
+
+async fn available_mempool_info_rpc(state: &ShadowSyncHttpState) -> Result<BasicRpcService> {
+    // Aggregate reads are O(1): never clone the transaction collection merely
+    // because its generation changed.
+    let base = state.diagnostic_rpc.read().await.service.clone();
+    let mempool_info = state.node.lock().await.state.mempool.info();
+    let mut snapshot = base.snapshot().clone();
+    snapshot.mempool_info = mempool_info;
+    snapshot.mempool_entries.clear();
+    Ok(BasicRpcService::new(snapshot))
 }
 
 async fn available_diagnostic_rpc(
     state: &ShadowSyncHttpState,
 ) -> Result<(BasicRpcService, bool, u64)> {
-    let diagnostics = state.diagnostics.read().await.clone();
-    if let Ok(node) = state.node.try_lock() {
-        let service = compose_shadow_sync_rpc_service(&node, &diagnostics, false)?;
-        let captured_at = unix_time();
-        drop(node);
-        *state.diagnostic_rpc.write().await = CachedDiagnosticRpc {
-            service: service.clone(),
-            captured_at,
-        };
-        return Ok((service, false, captured_at));
-    }
+    // The storage-derived base remains a sync-loop capture. Overlay only the
+    // already-bounded live diagnostic fields so peer/network RPCs do not stay
+    // frozen at startup and request handling still never takes the node lock
+    // or scans durable state.
     let cached = state.diagnostic_rpc.read().await.clone();
-    Ok((cached.service, true, cached.captured_at))
+    let diagnostics = state.diagnostics.read().await;
+    let mut snapshot: RpcSnapshot = cached.service.snapshot().clone();
+    snapshot.network_active = diagnostics.enabled;
+    snapshot.peer_count = diagnostics.peers.len();
+    snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
+    snapshot.node_status.hip76 = diagnostics.hip76.clone();
+    if let Some(best_header) = diagnostics.sync.best_header.as_ref() {
+        snapshot.node_status.best_header_hash = Some(best_header.hash);
+        snapshot.node_status.best_header_height = Some(best_header.height);
+    }
+    Ok((BasicRpcService::new(snapshot), true, cached.captured_at))
 }
 
 async fn handle_shadow_sync_rpc(
@@ -3230,43 +3335,105 @@ async fn handle_shadow_sync_rpc(
         }
     };
     let id = request.id.clone();
+    let Some(method) = RpcMethod::from_hsd_name(&request.method) else {
+        return Json(json_rpc_error(id, -32601, "method not found".to_owned()));
+    };
+    if rpc_immediately_unsupported(method) {
+        return Json(
+            BasicRpcService::default()
+                .handle(request)
+                .unwrap_or_else(|error| json_rpc_error(id, -32603, error.to_string())),
+        );
+    }
+
     if matches!(
-        request.method.as_str(),
-        "gethsrdstatus" | "getauthorityinfo" | "getparityinfo" | "getminingengineinfo"
+        method,
+        RpcMethod::GetHsrdStatus
+            | RpcMethod::GetAuthorityInfo
+            | RpcMethod::GetParityInfo
+            | RpcMethod::GetMiningEngineInfo
     ) {
         return cached_json_rpc_diagnostic(&state, request).await;
     }
-    if request.method == "getblockhash" {
-        let Some(height) = request
-            .params
-            .as_array()
-            .and_then(|params| params.first())
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|height| Height::try_from(height).ok())
-        else {
+
+    if method == RpcMethod::GetMempoolInfo {
+        let service = match available_mempool_info_rpc(&state).await {
+            Ok(service) => service,
+            Err(error) => {
+                return Json(json_rpc_error(
+                    id,
+                    -32603,
+                    format!("failed to capture live mempool state: {error}"),
+                ));
+            }
+        };
+        return Json(
+            service
+                .handle(request)
+                .unwrap_or_else(|error| json_rpc_error(id, -32603, error.to_string())),
+        );
+    }
+
+    if method == RpcMethod::GetRawMempool {
+        let Some(collection_permit) = state.read_context.try_acquire_collection() else {
             return Json(json_rpc_error(
                 id,
-                -32602,
-                "missing or invalid block height".to_owned(),
+                -32005,
+                "RPC collection-worker concurrency limit exceeded".to_owned(),
             ));
         };
-        let result = state.node.lock().await.state.chain.canonical_hash(height);
-        return match result {
-            Ok(Some(hash)) => Json(JsonRpcResponse {
-                jsonrpc: "2.0".to_owned(),
-                result: Some(serde_json::json!(hash.to_hex())),
-                error: None,
-                id,
-            }),
-            Ok(None) => Json(json_rpc_error(
-                id,
-                -8,
-                "block height out of range".to_owned(),
-            )),
-            Err(error) => Json(json_rpc_error(id, -32603, error.to_string())),
-        };
+        let node = Arc::clone(&state.node);
+        let limits = state.limits;
+        let base = state.diagnostic_rpc.read().await.service.snapshot().clone();
+        let worker_request = request;
+        let worker_id = id.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            let _collection_permit = collection_permit;
+            let mempool = {
+                let node = node.blocking_lock();
+                node.rpc_request_mempool(&worker_request)
+            };
+            if mempool.info.transaction_count > limits.maximum_collection_entries {
+                return json_rpc_error(
+                    worker_id,
+                    -8,
+                    format!(
+                        "mempool collection exceeds the RPC limit of {} entries",
+                        limits.maximum_collection_entries
+                    ),
+                );
+            }
+            let Some(ordered_txids) = mempool.ordered_txids else {
+                return json_rpc_error(
+                    worker_id,
+                    -32603,
+                    "mempool transaction-id view was not captured".to_owned(),
+                );
+            };
+            if ordered_txids.len() != mempool.info.transaction_count {
+                return json_rpc_error(
+                    worker_id,
+                    -32603,
+                    "mempool transaction-id view does not match aggregate count".to_owned(),
+                );
+            }
+            let mut snapshot = base;
+            snapshot.mempool_info = mempool.info;
+            snapshot.mempool_entries.clear();
+            BasicRpcService::new(snapshot)
+                .handle_raw_mempool(worker_request, ordered_txids.txids())
+                .unwrap_or_else(|error| json_rpc_error(worker_id, -32603, error.to_string()))
+        })
+        .await;
+        return Json(match response {
+            Ok(response) => response,
+            Err(error) => {
+                json_rpc_error(id, -32603, format!("RPC collection worker failed: {error}"))
+            }
+        });
     }
-    if request.method == "getparentauthority" {
+
+    if method == RpcMethod::GetParentAuthority {
         let Some(encoded_hash) = request
             .params
             .as_array()
@@ -3279,7 +3446,29 @@ async fn handle_shadow_sync_rpc(
             Ok(hash) => hash,
             Err(error) => return Json(json_rpc_error(id, -32602, error.to_string())),
         };
-        let result = state.node.lock().await.parent_authority_value(hash);
+        let Some(point_read_permit) = state.read_context.try_acquire_point_read() else {
+            return Json(json_rpc_error(
+                id,
+                -32005,
+                "RPC point-read concurrency limit exceeded".to_owned(),
+            ));
+        };
+        let node = Arc::clone(&state.node);
+        let result = match tokio::task::spawn_blocking(move || {
+            let _point_read_permit = point_read_permit;
+            node.blocking_lock().parent_authority_value(hash)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                return Json(json_rpc_error(
+                    id,
+                    -32603,
+                    format!("RPC parent-authority worker failed: {error}"),
+                ));
+            }
+        };
         return match result {
             Ok(result) => Json(JsonRpcResponse {
                 jsonrpc: "2.0".to_owned(),
@@ -3290,8 +3479,61 @@ async fn handle_shadow_sync_rpc(
             Err(error) => Json(json_rpc_error(id, -32603, error.to_string())),
         };
     }
-    match shadow_sync_rpc_service(&state, true).await {
-        Ok(service) => Json(
+
+    if rpc_point_read_method(method) {
+        let Some(point_read_permit) = state.read_context.try_acquire_point_read() else {
+            return Json(json_rpc_error(
+                id,
+                -32005,
+                "RPC point-read concurrency limit exceeded".to_owned(),
+            ));
+        };
+        let mempool_node = if method == RpcMethod::GetRawTransaction {
+            Some(Arc::clone(&state.node))
+        } else {
+            None
+        };
+        let diagnostics = state.diagnostics.read().await;
+        let network_active = diagnostics.enabled;
+        let peer_count = diagnostics.peers.len();
+        drop(diagnostics);
+        let read_context = state.read_context.clone();
+        let read_request = request;
+        let response = match tokio::task::spawn_blocking(move || -> Result<JsonRpcResponse> {
+            let _point_read_permit = point_read_permit;
+            let mempool = mempool_node
+                .map(|node| node.blocking_lock().rpc_request_mempool(&read_request))
+                .unwrap_or_default();
+            let service = read_context.service_for_request(
+                &read_request,
+                mempool,
+                network_active,
+                peer_count,
+                None,
+            )?;
+            service
+                .handle(read_request)
+                .map_err(|error| anyhow::anyhow!("RPC response construction failed: {error}"))
+        })
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Json(json_rpc_error(id, -32603, error.to_string()));
+            }
+            Err(error) => {
+                return Json(json_rpc_error(
+                    id,
+                    -32603,
+                    format!("RPC point-read worker failed: {error}"),
+                ));
+            }
+        };
+        return Json(response);
+    }
+
+    match available_diagnostic_rpc(&state).await {
+        Ok((service, _, _)) => Json(
             service
                 .handle(request)
                 .unwrap_or_else(|error| json_rpc_error(id, -32603, error.to_string())),
@@ -5581,12 +5823,118 @@ fn runtime_instance_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NodeConfig;
+    use crate::{NamePageStorage, NodeConfig, NodeState};
+    use hns_consensus::{ConsensusError, SequenceLockView, TransactionInputVerifier};
+    use hns_mempool::{ContextualTransactionVerifier, MempoolContext, MempoolView};
     use hns_primitives::{
-        Address, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Txid, Uint256,
+        Address, Coin, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Txid, Uint256,
         Witness,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct RpcMempoolView {
+        coins: HashMap<Outpoint, Coin>,
+    }
+
+    impl SequenceLockView for RpcMempoolView {
+        fn coin_height(
+            &self,
+            outpoint: &Outpoint,
+        ) -> std::result::Result<Option<Height>, ConsensusError> {
+            Ok(self.coins.get(outpoint).map(|coin| coin.height))
+        }
+
+        fn median_time_past(&self, height: Height) -> std::result::Result<u64, ConsensusError> {
+            Ok(u64::from(height))
+        }
+    }
+
+    impl MempoolView for RpcMempoolView {
+        fn coin(&self, outpoint: &Outpoint) -> std::result::Result<Option<Coin>, ConsensusError> {
+            Ok(self.coins.get(outpoint).cloned())
+        }
+    }
+
+    struct AllowRpcMempoolInputs;
+
+    impl TransactionInputVerifier for AllowRpcMempoolInputs {
+        fn verify_input(
+            &self,
+            _transaction: &Transaction,
+            _input_index: usize,
+            _coin: &Coin,
+        ) -> std::result::Result<(), ConsensusError> {
+            Ok(())
+        }
+    }
+
+    struct AllowRpcMempoolContext;
+
+    impl ContextualTransactionVerifier for AllowRpcMempoolContext {
+        fn verify(
+            &self,
+            _transaction: &Transaction,
+            _input_coins: &[Coin],
+            _context: &MempoolContext,
+            _accepted_name_transactions: &[&Transaction],
+        ) -> std::result::Result<(), ConsensusError> {
+            Ok(())
+        }
+    }
+
+    fn rpc_mempool_transaction(tag: u8) -> (Transaction, Coin) {
+        let outpoint = Outpoint {
+            txid: Txid::new([tag; 32]),
+            index: 0,
+        };
+        let address = Address::new(0, vec![tag; 20]).expect("test address");
+        let covenant = Covenant {
+            kind: CovenantKind::None,
+            items: Vec::new(),
+        };
+        let coin = Coin {
+            outpoint: outpoint.clone(),
+            value: 20,
+            height: 1,
+            coinbase: false,
+            address: address.clone(),
+            covenant: covenant.clone(),
+        };
+        (
+            Transaction {
+                version: 0,
+                inputs: vec![Input {
+                    previous_output: outpoint,
+                    sequence: u32::MAX,
+                    witness: Witness::default(),
+                }],
+                outputs: vec![Output {
+                    value: 15,
+                    address,
+                    covenant,
+                }],
+                locktime: 0,
+            },
+            coin,
+        )
+    }
+
+    async fn call_shadow_rpc(
+        state: &ShadowSyncHttpState,
+        id: &str,
+        method: &str,
+    ) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": [],
+        });
+        let response =
+            handle_shadow_sync_rpc(State(state.clone()), Bytes::from(request.to_string())).await;
+        serde_json::to_value(response.0).expect("serialize RPC response")
+    }
 
     fn keyed_net_address(address: SocketAddr, time: u64, services: u64) -> hns_p2p::NetAddress {
         let mut wire = hns_p2p::NetAddress::from_socket_addr(address, time, services);
@@ -6700,6 +7048,58 @@ mod tests {
     }
 
     #[test]
+    fn body_present_index_without_raw_payload_is_not_available() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            shadow_sync: ShadowSyncConfig {
+                enabled: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..ShadowSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .shadow_sync_ensure_genesis_header()
+            .expect("genesis");
+        let block = linked_validator_block(1, &genesis.header);
+        let hash = block.hash();
+        service
+            .shadow_sync_import_headers(vec![block.header.clone()])
+            .expect("canonical header");
+        service
+            .shadow_sync_store_validated_blocks(vec![(
+                ValidatedBlock {
+                    sequence: 0,
+                    peer: PeerId(1),
+                    height: 1,
+                    block,
+                },
+                true,
+            )])
+            .expect("stored body");
+        assert!(service
+            .shadow_sync_has_block(&hash)
+            .expect("complete body availability"));
+
+        let mut batch = service.state.store.batch();
+        batch
+            .delete(ColumnFamily::Blocks, hash.as_bytes())
+            .expect("delete raw payload");
+        service
+            .state
+            .store
+            .commit(batch)
+            .expect("commit missing raw payload");
+
+        assert!(
+            !service
+                .shadow_sync_has_block(&hash)
+                .expect("missing raw payload availability"),
+            "body_present metadata alone must never suppress redownload"
+        );
+    }
+
+    #[test]
     fn validated_body_batch_is_all_or_nothing_before_durable_commit() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
@@ -6783,6 +7183,87 @@ mod tests {
         assert!(service
             .shadow_sync_has_block(&second_hash)
             .expect("second stored body"));
+    }
+
+    #[test]
+    fn ambiguous_name_page_fence_blocks_shadow_header_body_and_compaction_writes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-shadow-name-page-fence-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let mut state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        state.name_pages =
+            Some(NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages"));
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("node");
+        node.state
+            .name_pages
+            .as_mut()
+            .expect("page storage")
+            .fence_after_commit_attempt();
+        node.fail_closed_after_ambiguous_commit();
+
+        let params = Network::Regtest.params();
+        let header_error = node
+            .shadow_sync_import_headers(vec![params.genesis_header()])
+            .expect_err("fenced header persistence");
+        assert!(
+            header_error.to_string().contains("restart and reopen"),
+            "{header_error}"
+        );
+        assert!(node
+            .state
+            .chain
+            .load_record(&params.genesis_hash)
+            .expect("genesis header lookup")
+            .is_none());
+
+        let alternate = linked_validator_block(1, &params.genesis_header());
+        let alternate_hash = alternate.hash();
+        let body_error = node
+            .shadow_sync_store_validated_blocks(vec![(
+                ValidatedBlock {
+                    sequence: 0,
+                    peer: PeerId(1),
+                    height: 1,
+                    block: alternate,
+                },
+                true,
+            )])
+            .expect_err("fenced alternate-body persistence");
+        assert!(
+            body_error.to_string().contains("restart and reopen"),
+            "{body_error}"
+        );
+        assert!(node
+            .shadow_sync_block(&alternate_hash)
+            .expect("alternate body lookup")
+            .is_none());
+
+        let compaction_error = node
+            .compact_name_tree_nodes()
+            .expect_err("fenced public compaction");
+        assert!(
+            compaction_error.to_string().contains("restart and reopen"),
+            "{compaction_error}"
+        );
+
+        drop(node);
+        fs::remove_dir_all(directory).expect("remove shadow fence fixture");
     }
 
     #[cfg(feature = "rocksdb-backend")]
@@ -7197,16 +7678,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shadow_mempool_rpc_refreshes_by_generation_and_enforces_live_cap() {
+        let rpc_limits = RpcLimits {
+            maximum_collection_entries: 1,
+            maximum_concurrent_requests: 1,
+            ..RpcLimits::default()
+        };
+        let service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            rpc_limits,
+            ..NodeConfig::default()
+        });
+        let read_context = service.rpc_read_context();
+        let node = Arc::new(Mutex::new(service));
+        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
+        let diagnostic_rpc = initialize_cached_diagnostic_rpc(&node, &diagnostics)
+            .await
+            .expect("initial empty RPC cache");
+        let state = ShadowSyncHttpState {
+            node: Arc::clone(&node),
+            diagnostics,
+            diagnostic_rpc,
+            read_context,
+            limits: rpc_limits,
+        };
+
+        let (first, first_coin) = rpc_mempool_transaction(0x31);
+        let first_txid = first.txid();
+        let (second, second_coin) = rpc_mempool_transaction(0x32);
+        let mut view = RpcMempoolView::default();
+        view.coins.insert(first_coin.outpoint.clone(), first_coin);
+        view.coins.insert(second_coin.outpoint.clone(), second_coin);
+        {
+            let mut node = node.lock().await;
+            assert_eq!(
+                node.state
+                    .mempool
+                    .submit_with_context(
+                        first,
+                        &MempoolContext::testing(2, 2),
+                        &view,
+                        &AllowRpcMempoolInputs,
+                        &AllowRpcMempoolContext,
+                    )
+                    .expect("first mempool admission"),
+                Admission::Accepted(first_txid)
+            );
+        }
+        let captured_generation = {
+            let node = node.lock().await;
+            let direct = node.state.mempool.ordered_txids_snapshot();
+            let captured = node.rpc_request_mempool(&JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getrawmempool".to_owned(),
+                params: serde_json::json!([]),
+                id: Some(serde_json::json!("capture")),
+            });
+            let ordered = captured
+                .ordered_txids
+                .expect("bounded immutable transaction-id view");
+            assert!(
+                direct.is_same_generation(&ordered),
+                "capturing the RPC collection view under NodeService must be O(1)"
+            );
+            ordered
+        };
+
+        let info = call_shadow_rpc(&state, "live-info-one", "getmempoolinfo").await;
+        assert_eq!(info["result"]["size"], 1, "{info}");
+        let collection_guard = state
+            .read_context
+            .try_acquire_collection()
+            .expect("collection guard");
+        let info_while_collection_busy =
+            call_shadow_rpc(&state, "info-while-collection-busy", "getmempoolinfo").await;
+        assert_eq!(
+            info_while_collection_busy["result"]["size"], 1,
+            "{info_while_collection_busy}"
+        );
+        let busy = call_shadow_rpc(&state, "busy-list", "getrawmempool").await;
+        assert_eq!(busy["error"]["code"], -32005, "{busy}");
+        drop(collection_guard);
+        let entries = call_shadow_rpc(&state, "live-list-one", "getrawmempool").await;
+        assert_eq!(
+            entries["result"],
+            serde_json::json!([first_txid.to_hex()]),
+            "{entries}"
+        );
+
+        {
+            let mut node = node.lock().await;
+            assert!(matches!(
+                node.state
+                    .mempool
+                    .submit_with_context(
+                        second,
+                        &MempoolContext::testing(2, 2),
+                        &view,
+                        &AllowRpcMempoolInputs,
+                        &AllowRpcMempoolContext,
+                    )
+                    .expect("second mempool admission"),
+                Admission::Accepted(_)
+            ));
+        }
+        let retained_response = BasicRpcService::default()
+            .handle_raw_mempool(
+                JsonRpcRequest {
+                    jsonrpc: Some("2.0".to_owned()),
+                    method: "getrawmempool".to_owned(),
+                    params: serde_json::json!([]),
+                    id: Some(serde_json::json!("retained-generation")),
+                },
+                captured_generation.txids(),
+            )
+            .expect("retained generation response");
+        assert_eq!(
+            retained_response.result,
+            Some(serde_json::json!([first_txid.to_hex()])),
+            "materialization after releasing NodeService must stay on the captured generation"
+        );
+
+        let capped = call_shadow_rpc(&state, "live-list-capped", "getrawmempool").await;
+        assert_eq!(capped["error"]["code"], -8, "{capped}");
+        assert_eq!(
+            capped["error"]["message"], "mempool collection exceeds the RPC limit of 1 entries",
+            "{capped}"
+        );
+        let info = call_shadow_rpc(&state, "live-info-two", "getmempoolinfo").await;
+        assert_eq!(info["result"]["size"], 2, "{info}");
+    }
+
+    #[tokio::test]
     async fn shadow_sync_serves_capability_named_diagnostic_routes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
+        let rpc_limits = RpcLimits {
+            maximum_concurrent_requests: 1,
+            ..RpcLimits::default()
+        };
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
+            rpc_limits,
             ..NodeConfig::default()
         });
         service
             .shadow_sync_ensure_genesis_header()
             .expect("genesis header");
+        let read_context = service.rpc_read_context();
         let node = Arc::new(Mutex::new(service));
         let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
@@ -7220,23 +7839,35 @@ mod tests {
             let diagnostics_snapshot = diagnostics.read().await.clone();
             let node_snapshot = node.lock().await;
             Arc::new(RwLock::new(CachedDiagnosticRpc {
-                service: compose_shadow_sync_rpc_service(
-                    &node_snapshot,
-                    &diagnostics_snapshot,
-                    false,
-                )
-                .expect("initial diagnostic snapshot"),
+                service: compose_shadow_sync_rpc_service(&node_snapshot, &diagnostics_snapshot)
+                    .expect("initial diagnostic snapshot"),
                 captured_at: unix_time(),
             }))
         };
+        let live_peer = PeerSnapshot::new(
+            PeerId(7),
+            "127.0.0.1:14039".parse().expect("live peer address"),
+            PeerDirection::Outbound,
+        );
+        let live_hip76 = rpc_hip76_info(std::slice::from_ref(&live_peer));
+        {
+            let mut live_diagnostics = diagnostics.write().await;
+            live_diagnostics.peers.push(live_peer);
+            live_diagnostics.hip76 = live_hip76;
+        }
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let authorization =
             RpcAuthorizationHeader::new("Bearer native-sync-test").expect("authorization");
+        let read_context_probe = read_context.clone();
         let server = tokio::spawn(serve_shadow_sync_rpc(
             listener,
-            Arc::clone(&node),
-            diagnostics,
-            diagnostic_rpc,
+            ShadowSyncHttpState {
+                node: Arc::clone(&node),
+                diagnostics,
+                diagnostic_rpc,
+                read_context,
+                limits: rpc_limits,
+            },
             Some(authorization),
             shutdown_rx,
         ));
@@ -7282,7 +7913,7 @@ mod tests {
                 assert_eq!(json["script_flags"], 50);
             } else if path == "/api/v1/status" {
                 assert_eq!(json["api_version"], HSRD_DIAGNOSTIC_API_VERSION);
-                assert_eq!(json["diagnostic_snapshot_cached"], false);
+                assert_eq!(json["diagnostic_snapshot_cached"], true);
                 assert!(json["diagnostic_snapshot_captured_at"].is_u64());
                 status_registry = Some(json["experimental_registry"].clone());
             }
@@ -7325,6 +7956,42 @@ mod tests {
         assert_eq!(cached_json["diagnostic_snapshot_cached"], true);
         assert!(cached_json["diagnostic_snapshot_captured_at"].is_u64());
 
+        let live_network_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "live-network-overlay",
+            "method": "getnetworkinfo",
+            "params": [],
+        })
+        .to_string();
+        let live_network_request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer native-sync-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{live_network_body}",
+            live_network_body.len()
+        );
+        let live_network_response = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect live network overlay");
+            stream
+                .write_all(live_network_request.as_bytes())
+                .await
+                .expect("write live network overlay");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .await
+                .expect("read live network overlay");
+            response
+        })
+        .await
+        .expect("live network overlay must not wait for the node lock");
+        let (_, live_network_body) = live_network_response
+            .split_once("\r\n\r\n")
+            .expect("live network body split");
+        let live_network_json: serde_json::Value =
+            serde_json::from_str(live_network_body).expect("live network response");
+        assert_eq!(live_network_json["result"]["connections"], 1);
+        assert_eq!(live_network_json["result"]["networkactive"], true);
+
         let cached_rpc_body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": "cached-authority",
@@ -7363,6 +8030,59 @@ mod tests {
             true
         );
         assert!(cached_rpc_json["result"]["diagnostic_snapshot_captured_at"].is_u64());
+
+        // Saturate both state-access paths. Unknown and known unsupported
+        // methods must still reject immediately, proving classification occurs
+        // before the node lock, point-read permit, or durable snapshot.
+        let _point_read_guard = read_context_probe
+            .try_acquire_point_read()
+            .expect("point-read guard");
+        for (method, expected_message) in [
+            ("not-a-method", "method not found"),
+            (
+                "sendrawtransaction",
+                "sendrawtransaction requires a mutable mempool service",
+            ),
+            (
+                "getpeerinfo",
+                "getpeerinfo requires the live peer diagnostics service",
+            ),
+        ] {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": method,
+                "method": method,
+                "params": [],
+            })
+            .to_string();
+            let request = format!(
+                "POST /rpc HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer native-sync-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let response = tokio::time::timeout(Duration::from_secs(1), async {
+                let mut stream = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("connect unsupported RPC");
+                stream
+                    .write_all(request.as_bytes())
+                    .await
+                    .expect("write unsupported RPC");
+                let mut response = String::new();
+                stream
+                    .read_to_string(&mut response)
+                    .await
+                    .expect("read unsupported RPC");
+                response
+            })
+            .await
+            .expect("unsupported RPC must not wait for state");
+            let (_, response_body) = response.split_once("\r\n\r\n").expect("body split");
+            let json: serde_json::Value =
+                serde_json::from_str(response_body).expect("unsupported RPC response");
+            assert_eq!(json["error"]["code"], -32601, "{json}");
+            assert_eq!(json["error"]["message"], expected_message, "{json}");
+        }
+        drop(_point_read_guard);
         drop(node_guard);
 
         let genesis_hash = Network::Regtest.params().genesis_hash.to_hex();
@@ -7392,7 +8112,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         let (_, body) = response.split_once("\r\n\r\n").expect("body split");
         let json: serde_json::Value = serde_json::from_str(body).expect("point RPC response");
-        assert_eq!(json["result"], genesis_hash);
+        assert_eq!(json["result"], genesis_hash, "{json}");
 
         shutdown_tx.send(true).expect("shutdown");
         server.await.expect("server join").expect("server result");

@@ -5,8 +5,10 @@ mod page_tree;
 pub use hns_urkel::TreeRoot;
 pub use page_tree::{
     name_page_root_key, pack_name_page_records, stream_name_page_tree, stream_name_page_tree_delta,
-    NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageTreeReader,
-    NamePageValidation, PackedNamePages, PageTreeError, StreamedNamePages, NAME_PAGE_ROOT_PREFIX,
+    stream_name_page_tree_delta_with_limits, stream_name_page_tree_with_limits,
+    NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageStreamLimits,
+    NamePageTraversalLimits, NamePageTreeReader, NamePageValidation, NamePageValidationLimits,
+    PackedNamePages, PageTreeError, StreamedNamePages, NAME_PAGE_ROOT_PREFIX,
     NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
 };
 
@@ -15,6 +17,7 @@ use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use hns_chain::{read_canonical_hash, HeaderRecord};
@@ -32,20 +35,22 @@ use hns_primitives::{
     BlockHash, Coin, Covenant, CovenantKind, DnssecVerifier, Height, NameHash, NameLifecycleState,
     NameState, Outpoint, OwnershipProof, PrimitiveError, Reader, Transaction,
     UnavailableAirdropSignatureVerifier, Writer, AIRDROP_TREE_LEAVES, MAX_ADDRESS_HASH_SIZE,
-    MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_TX_SIZE,
+    MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_SCRIPT_STACK, MAX_TX_SIZE,
+    MIN_ADDRESS_HASH_SIZE,
 };
 use hns_store::{
-    decode_u32, encode_u32, ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch,
-    AIRDROP_FIELD_BYTES, INTERVAL_SCHEMA_VERSION, INTERVAL_STORAGE_PROFILE, LEGACY_SCHEMA_VERSION,
-    LEGACY_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE,
-    SCHEMA_VERSION, STORAGE_PROFILE,
+    decode_u32, encode_u32, ColumnFamily, MetaKey, PrefixScanBudget, PrefixScanPage, ReadSnapshot,
+    Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES, INTERVAL_SCHEMA_VERSION,
+    INTERVAL_STORAGE_PROFILE, LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE,
+    PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION, STORAGE_PROFILE,
 };
 use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
     reachable_record_roots_batched, update_record_tree, update_record_tree_batched,
     update_record_tree_mutation_trie_prefetched, validate_record_root, validate_record_tree,
     validate_record_trees_batched, validate_record_trees_batched_until, MemoryUrkel,
-    NameTreeSnapshot, UrkelError, UrkelProof, UrkelRecordUpdate, URKEL_BITS,
+    NameTreeSnapshot, SortedEntryRootAccumulator, UrkelError, UrkelProof, UrkelRecordUpdate,
+    URKEL_BITS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +66,26 @@ const NAME_TREE_INTERVAL_MIGRATION_COMMIT_ROOT_KEY: &[u8] =
     b"migration/v17/original-committed-root";
 const NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX: &[u8] = b"migration/v17/undo-v6/";
 const NAME_TREE_INTERVAL_MIGRATION_BATCH: usize = 256;
+const NAME_TREE_INTERVAL_MIGRATION_OPERATION_OVERHEAD_BYTES: u64 = 64;
+const NAME_TREE_INTERVAL_MIGRATION_ROCKS_TEMPORARY_MULTIPLIER: u64 = 2;
+const NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES: u64 = 128;
+pub const NAME_TREE_INTERVAL_MIGRATION_SCAN_PAGE_RECORDS: usize = 1_024;
+pub const NAME_TREE_INTERVAL_MIGRATION_SCAN_PAGE_BYTES: usize = 1024 * 1024;
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_HEIGHT_RECORDS: u64 = 10_000_000;
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_HEIGHT_BYTES: u64 = 512 * 1024 * 1024;
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_UNDO_INPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_BACKUP_OUTPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_PUBLICATION_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// The fixed accumulator body/checksum plus its worst-case count varint must
+/// leave 34 encoded bytes per distinct name.
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES: u64 =
+    ((NAME_TREE_ACCUMULATOR_CODEC_MAX - (4 + 32 + 4 + 4 + 9 + 32))
+        / NAME_TREE_ACCUMULATOR_ENTRY_BYTES) as u64;
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAME_BYTES: u64 =
+    NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES
+        * NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES;
+pub const NAME_TREE_INTERVAL_MIGRATION_MAX_ELAPSED: Duration = Duration::from_secs(30 * 60);
 const NAME_TREE_SNAPSHOT_PIN_VERSION: u32 = 1;
 pub const NAME_TREE_SNAPSHOT_PIN_PREFIX: &[u8] = b"name-tree-snapshot/v1/";
 const NAME_TREE_SNAPSHOT_PIN_BODY_SIZE: usize = 4 + 4 + 32 + 32;
@@ -74,6 +99,56 @@ const NAME_STATE_CODEC_MAX: usize =
 const NAME_UNDO_CODEC_MAX: usize = 32 + 1 + NAME_STATE_CODEC_MAX + 9;
 const BLOCK_UNDO_CODEC_MAX: usize = MAX_BLOCK_WEIGHT * 8;
 const NAME_TREE_ACCUMULATOR_CODEC_MAX: usize = MAX_BLOCK_WEIGHT * 2;
+const BLOCK_UNDO_KEY_BYTES: usize = 32;
+const NAME_STATE_KEY_BYTES: usize = 32;
+const BLOCK_UNDO_FIXED_METADATA_BYTES: usize = 4 + 32 + 4 + 32 * 4;
+const OUTPOINT_CODEC_BYTES: usize = 32 + 4;
+const MIN_SPENT_COIN_CODEC_BYTES: usize =
+    OUTPOINT_CODEC_BYTES + 8 + 4 + 1 + 1 + 1 + MIN_ADDRESS_HASH_SIZE + 1 + 1 + 1;
+const MIN_SPENT_COIN_ENTRY_BYTES: usize = 1 + MIN_SPENT_COIN_CODEC_BYTES;
+const MIN_NAME_UNDO_CODEC_BYTES: usize = 32 + 1;
+const MIN_NAME_UNDO_ENTRY_BYTES: usize = 1 + MIN_NAME_UNDO_CODEC_BYTES;
+const NAME_TREE_ACCUMULATOR_ENTRY_BYTES: usize = 32 + 2;
+
+pub const RETAINED_NAME_TREE_ROOT_SCAN_PAGE_RECORDS: usize = 1;
+pub const RETAINED_NAME_TREE_ROOT_SCAN_PAGE_BYTES: usize =
+    BLOCK_UNDO_CODEC_MAX + BLOCK_UNDO_KEY_BYTES;
+pub const RETAINED_NAME_TREE_ROOT_MAX_UNDO_RECORDS: u64 = 2_048;
+pub const RETAINED_NAME_TREE_ROOT_MAX_UNDO_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const RETAINED_NAME_TREE_ROOT_MAX_PIN_RECORDS: u64 = 4_096;
+pub const RETAINED_NAME_TREE_ROOT_MAX_PIN_BYTES: u64 = 1024 * 1024;
+pub const RETAINED_NAME_TREE_ROOT_MAX_ROOTS: u64 = 16_384;
+pub const RETAINED_NAME_TREE_ROOT_MAX_ELAPSED: Duration = Duration::from_secs(30 * 60);
+pub const NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_RECORDS: usize = 1_024;
+pub const NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_BYTES: usize = 1024 * 1024;
+pub const NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_RECORDS: u64 = 1_000_000;
+pub const NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_BYTES: u64 =
+    NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE as u64 * NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_RECORDS;
+pub const NAME_TREE_SNAPSHOT_PIN_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(30 * 60);
+pub const NAME_TREE_MATERIALIZATION_SCAN_PAGE_RECORDS: usize = 1_024;
+pub const NAME_TREE_MATERIALIZATION_SCAN_PAGE_BYTES: usize = 1024 * 1024;
+pub const NAME_TREE_MATERIALIZATION_MAX_RECORDS: u64 = 20_000_000;
+pub const NAME_TREE_MATERIALIZATION_MAX_ENCODED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const NAME_TREE_MATERIALIZATION_MAX_INTERVAL_UNDO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const NAME_TREE_MATERIALIZATION_MAX_WORKING_SET_BYTES: u64 = 1024 * 1024 * 1024;
+pub const NAME_TREE_MATERIALIZATION_MAX_ELAPSED: Duration = Duration::from_secs(4 * 60 * 60);
+const NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES: u64 = 128;
+/// One pending Urkel branch contains a depth plus two 32-byte roots/keys.
+/// Charging a full map-entry-sized frame also covers alignment and the
+/// accumulator's fixed fields without depending on private urkel layout.
+const NAME_TREE_STREAMING_ROOT_ACCUMULATOR_BYTES: u64 =
+    (URKEL_BITS as u64 + 1) * NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES;
+/// `decode_name_state` temporarily owns copies of the variable name/resource
+/// bytes in addition to the fixed `NameState` value. Two entry-sized margins
+/// cover the pair of backing allocations and allocator rounding.
+const NAME_TREE_STREAMING_DECODED_STATE_BYTES: u64 = std::mem::size_of::<NameState>() as u64
+    + MAX_NAME_SIZE as u64
+    + MAX_RESOURCE_SIZE as u64
+    + 2 * NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES;
+/// The returned page, previous cursor, and cloned next cursor can coexist.
+const NAME_TREE_STREAMING_CURSOR_BYTES: u64 = 3
+    * (NAME_STATE_KEY_BYTES as u64 + std::mem::size_of::<Vec<u8>>() as u64)
+    + NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES;
 
 #[derive(Default)]
 struct NameStateChanges {
@@ -158,6 +233,82 @@ pub struct NameTreeIntervalMigrationSummary {
     pub legacy_undos_backed_up: usize,
     pub pending_names: usize,
     pub tip_height: Option<Height>,
+    pub height_index_bytes: u64,
+    pub undo_input_bytes: u64,
+    pub backup_output_bytes: u64,
+    pub rewrite_output_bytes: u64,
+    pub publication_bytes: u64,
+    pub required_temporary_bytes: u64,
+    pub peak_pending_names: u64,
+    pub peak_pending_name_bytes: u64,
+    pub peak_batch_bytes: u64,
+    pub batch_commits: u64,
+}
+
+/// Exact, read-only resource projection for a schema-16 interval migration.
+/// The Rocks temporary estimate covers the complete staged publication plus
+/// one equivalent WAL/flush copy; the caller must add its filesystem reserve.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameTreeIntervalMigrationPlan {
+    pub active_heights: u64,
+    pub height_index_bytes: u64,
+    pub undo_records: u64,
+    pub legacy_undos_to_backup: u64,
+    pub undo_input_bytes: u64,
+    pub backup_output_bytes: u64,
+    pub rewrite_output_bytes: u64,
+    pub publication_bytes: u64,
+    pub required_temporary_bytes: u64,
+    pub peak_pending_names: u64,
+    pub peak_pending_name_bytes: u64,
+    pub maximum_record_publication_bytes: u64,
+}
+
+/// Finite cursor and time envelope for the one-time schema-16 height-index
+/// migration. The deadline is absolute so page reads, point reads, validation,
+/// and durable batch commits all consume the same allowance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NameTreeIntervalMigrationLimits {
+    pub max_height_records: u64,
+    /// Maximum sum of height-index key/value bytes.
+    pub max_height_bytes: u64,
+    /// Maximum sum of resolved active-chain undo value bytes.
+    pub max_undo_input_bytes: u64,
+    /// Maximum newly persistent backup key/value and operation bytes.
+    pub max_backup_output_bytes: u64,
+    /// Maximum backup plus rewritten-undo publication bytes.
+    pub max_publication_bytes: u64,
+    /// Maximum key/value and conservative operation bytes staged in one
+    /// RocksDB batch. One record is never split across batches.
+    pub max_pending_batch_bytes: u64,
+    pub max_pending_names: u64,
+    /// Conservative in-memory estimate for distinct accumulator names.
+    pub max_pending_name_bytes: u64,
+    pub page_budget: PrefixScanBudget,
+    pub deadline: Instant,
+}
+
+impl Default for NameTreeIntervalMigrationLimits {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            max_height_records: NAME_TREE_INTERVAL_MIGRATION_MAX_HEIGHT_RECORDS,
+            max_height_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_HEIGHT_BYTES,
+            max_undo_input_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_UNDO_INPUT_BYTES,
+            max_backup_output_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_BACKUP_OUTPUT_BYTES,
+            max_publication_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_PUBLICATION_BYTES,
+            max_pending_batch_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_BATCH_BYTES,
+            max_pending_names: NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES,
+            max_pending_name_bytes: NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAME_BYTES,
+            page_budget: PrefixScanBudget {
+                max_entries: NAME_TREE_INTERVAL_MIGRATION_SCAN_PAGE_RECORDS,
+                max_bytes: NAME_TREE_INTERVAL_MIGRATION_SCAN_PAGE_BYTES,
+            },
+            deadline: now
+                .checked_add(NAME_TREE_INTERVAL_MIGRATION_MAX_ELAPSED)
+                .unwrap_or(now),
+        }
+    }
 }
 
 impl NameTreeAccumulator {
@@ -229,6 +380,12 @@ impl NameTreeAccumulator {
             ));
         }
         let count = reader.read_varint_usize("name-tree accumulator names")?;
+        validate_borrowed_count(
+            count,
+            reader.remaining(),
+            NAME_TREE_ACCUMULATOR_ENTRY_BYTES,
+            "name-tree accumulator name",
+        )?;
         let mut names = BTreeMap::new();
         for _ in 0..count {
             let name_hash = NameHash::new(reader.read_hash()?);
@@ -275,6 +432,136 @@ pub struct BlockUndo {
     /// accumulator. The separate boundary flag also represents genesis or an
     /// interval-one network, where no prior accumulator exists.
     pub previous_name_tree_accumulator: Option<NameTreeAccumulator>,
+}
+
+/// Finite envelope for startup/offline retained-name-root discovery.
+///
+/// The compatibility wrapper uses [`Self::default`]. An explicit archive or
+/// offline compaction that needs a larger qualified envelope must call
+/// [`retained_name_tree_roots_bounded`] with reviewed limits instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedNameTreeRootLimits {
+    pub max_undo_records: u64,
+    /// Maximum sum of resolved undo value bytes. Key bytes are bounded
+    /// independently by `page_budget`.
+    pub max_undo_bytes: u64,
+    pub max_pin_records: u64,
+    /// Maximum sum of encoded snapshot-pin value bytes.
+    pub max_pin_bytes: u64,
+    pub max_roots: u64,
+    /// Archived undo scans require exactly one resolved record per page so a
+    /// page of small locators cannot expand into several large payloads.
+    pub page_budget: PrefixScanBudget,
+    /// Absolute monotonic deadline shared with the containing compaction.
+    pub deadline: Instant,
+}
+
+impl Default for RetainedNameTreeRootLimits {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            max_undo_records: RETAINED_NAME_TREE_ROOT_MAX_UNDO_RECORDS,
+            max_undo_bytes: RETAINED_NAME_TREE_ROOT_MAX_UNDO_BYTES,
+            max_pin_records: RETAINED_NAME_TREE_ROOT_MAX_PIN_RECORDS,
+            max_pin_bytes: RETAINED_NAME_TREE_ROOT_MAX_PIN_BYTES,
+            max_roots: RETAINED_NAME_TREE_ROOT_MAX_ROOTS,
+            page_budget: PrefixScanBudget {
+                max_entries: RETAINED_NAME_TREE_ROOT_SCAN_PAGE_RECORDS,
+                max_bytes: RETAINED_NAME_TREE_ROOT_SCAN_PAGE_BYTES,
+            },
+            deadline: now
+                .checked_add(RETAINED_NAME_TREE_ROOT_MAX_ELAPSED)
+                .unwrap_or(now),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedNameTreeRootSelection {
+    pub roots: BTreeSet<TreeRoot>,
+    pub undo_records: u64,
+    pub undo_bytes: u64,
+    pub pin_records: u64,
+    pub pin_bytes: u64,
+}
+
+/// Caller-owned envelope for streaming durable interval pins. Archive startup
+/// should derive total limits from its already validated tip/profile instead
+/// of using the collecting compatibility wrapper.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NameTreeSnapshotPinScanLimits {
+    pub max_records: u64,
+    /// Maximum sum of encoded pin value bytes.
+    pub max_bytes: u64,
+    pub page_budget: PrefixScanBudget,
+    pub deadline: Instant,
+}
+
+impl Default for NameTreeSnapshotPinScanLimits {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            max_records: NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_RECORDS,
+            max_bytes: NAME_TREE_SNAPSHOT_PIN_COMPAT_MAX_BYTES,
+            page_budget: PrefixScanBudget {
+                max_entries: NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_RECORDS,
+                max_bytes: NAME_TREE_SNAPSHOT_PIN_SCAN_PAGE_BYTES,
+            },
+            deadline: now
+                .checked_add(NAME_TREE_SNAPSHOT_PIN_SCAN_MAX_ELAPSED)
+                .unwrap_or(now),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NameTreeSnapshotPinScanSummary {
+    pub records: u64,
+    pub bytes: u64,
+}
+
+/// Finite envelope for independent NameState root reconstruction. Production
+/// verification streams the base column through a constant-depth Urkel root
+/// accumulator; offline materialization also charges every retained map entry.
+/// Encoded bytes count keys plus values and the working-set bound includes page
+/// buffers plus all pending-interval audit maps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NameTreeMaterializationLimits {
+    pub max_records: u64,
+    pub max_encoded_bytes: u64,
+    pub max_interval_undo_bytes: u64,
+    pub max_working_set_bytes: u64,
+    pub page_budget: PrefixScanBudget,
+    pub deadline: Instant,
+}
+
+impl Default for NameTreeMaterializationLimits {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            max_records: NAME_TREE_MATERIALIZATION_MAX_RECORDS,
+            max_encoded_bytes: NAME_TREE_MATERIALIZATION_MAX_ENCODED_BYTES,
+            max_interval_undo_bytes: NAME_TREE_MATERIALIZATION_MAX_INTERVAL_UNDO_BYTES,
+            max_working_set_bytes: NAME_TREE_MATERIALIZATION_MAX_WORKING_SET_BYTES,
+            page_budget: PrefixScanBudget {
+                max_entries: NAME_TREE_MATERIALIZATION_SCAN_PAGE_RECORDS,
+                max_bytes: NAME_TREE_MATERIALIZATION_SCAN_PAGE_BYTES,
+            },
+            deadline: now
+                .checked_add(NAME_TREE_MATERIALIZATION_MAX_ELAPSED)
+                .unwrap_or(now),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlockUndoMetadata {
+    block_hash: BlockHash,
+    height: Height,
+    previous_tree_root: TreeRoot,
+    resulting_tree_root: TreeRoot,
+    previous_committed_tree_root: TreeRoot,
+    resulting_committed_tree_root: TreeRoot,
 }
 
 impl BlockUndo {
@@ -342,6 +629,12 @@ impl BlockUndo {
         let previous_committed_tree_root = TreeRoot::new(reader.read_hash()?);
         let resulting_committed_tree_root = TreeRoot::new(reader.read_hash()?);
         let spent_count = reader.read_varint_usize("spent coins")?;
+        validate_borrowed_count(
+            spent_count,
+            reader.remaining(),
+            MIN_SPENT_COIN_ENTRY_BYTES,
+            "spent coin",
+        )?;
         let mut spent_coins = Vec::with_capacity(spent_count);
         for _ in 0..spent_count {
             let bytes = reader.read_varbytes(COIN_CODEC_MAX, "spent coin")?;
@@ -349,18 +642,36 @@ impl BlockUndo {
         }
 
         let created_count = reader.read_varint_usize("created coins")?;
+        validate_borrowed_count(
+            created_count,
+            reader.remaining(),
+            OUTPOINT_CODEC_BYTES,
+            "created coin",
+        )?;
         let mut created_coins = Vec::with_capacity(created_count);
         for _ in 0..created_count {
             created_coins.push(Outpoint::read_from(&mut reader)?);
         }
 
         let airdrop_count = reader.read_varint_usize("airdrop undo positions")?;
+        validate_borrowed_count(
+            airdrop_count,
+            reader.remaining(),
+            std::mem::size_of::<u32>(),
+            "airdrop undo position",
+        )?;
         let mut airdrop_positions = Vec::with_capacity(airdrop_count);
         for _ in 0..airdrop_count {
             airdrop_positions.push(reader.read_u32()?);
         }
 
         let name_count = reader.read_varint_usize("name undo records")?;
+        validate_borrowed_count(
+            name_count,
+            reader.remaining(),
+            MIN_NAME_UNDO_ENTRY_BYTES,
+            "name undo",
+        )?;
         let mut previous_name_states = Vec::with_capacity(name_count);
         for _ in 0..name_count {
             let bytes = reader.read_varbytes(NAME_UNDO_CODEC_MAX, "name undo")?;
@@ -430,6 +741,476 @@ impl BlockUndo {
             previous_name_tree_accumulator,
         })
     }
+}
+
+/// Borrowing codec cursor used by retained-root discovery. Unlike
+/// [`Reader`], variable byte strings remain borrowed, so validating a large
+/// undo never creates aggregate spent/name/airdrop vectors.
+struct BorrowedCodecReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    context: &'static str,
+}
+
+impl<'a> BorrowedCodecReader<'a> {
+    fn new(bytes: &'a [u8], max_len: usize, context: &'static str) -> Result<Self, StateError> {
+        if bytes.len() > max_len {
+            return Err(StateError::Codec(format!(
+                "{context} contains {} bytes; maximum is {max_len}",
+                bytes.len()
+            )));
+        }
+        Ok(Self {
+            bytes,
+            offset: 0,
+            context,
+        })
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], StateError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| StateError::Codec(format!("{} length overflow", self.context)))?;
+        let bytes = self.bytes.get(self.offset..end).ok_or_else(|| {
+            StateError::Codec(format!(
+                "{} is truncated: needed {len} bytes, {} remain",
+                self.context,
+                self.remaining()
+            ))
+        })?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, StateError> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, StateError> {
+        let raw: [u8; 2] = self
+            .read_exact(2)?
+            .try_into()
+            .expect("borrowed reader returned exact u16 bytes");
+        Ok(u16::from_le_bytes(raw))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, StateError> {
+        let raw: [u8; 4] = self
+            .read_exact(4)?
+            .try_into()
+            .expect("borrowed reader returned exact u32 bytes");
+        Ok(u32::from_le_bytes(raw))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, StateError> {
+        let raw: [u8; 8] = self
+            .read_exact(8)?
+            .try_into()
+            .expect("borrowed reader returned exact u64 bytes");
+        Ok(u64::from_le_bytes(raw))
+    }
+
+    fn read_hash(&mut self) -> Result<[u8; 32], StateError> {
+        Ok(self
+            .read_exact(32)?
+            .try_into()
+            .expect("borrowed reader returned exact hash bytes"))
+    }
+
+    fn read_varint(&mut self) -> Result<u64, StateError> {
+        let value = match self.read_u8()? {
+            value @ 0x00..=0xfc => u64::from(value),
+            0xfd => {
+                let value = u64::from(self.read_u16()?);
+                if value < 0xfd {
+                    return Err(StateError::Codec(format!(
+                        "{} contains a non-canonical varint",
+                        self.context
+                    )));
+                }
+                value
+            }
+            0xfe => {
+                let value = u64::from(self.read_u32()?);
+                if value <= 0xffff {
+                    return Err(StateError::Codec(format!(
+                        "{} contains a non-canonical varint",
+                        self.context
+                    )));
+                }
+                value
+            }
+            0xff => {
+                let value = self.read_u64()?;
+                if value <= 0xffff_ffff {
+                    return Err(StateError::Codec(format!(
+                        "{} contains a non-canonical varint",
+                        self.context
+                    )));
+                }
+                value
+            }
+        };
+        Ok(value)
+    }
+
+    fn read_varint_usize(&mut self, item: &'static str) -> Result<usize, StateError> {
+        usize::try_from(self.read_varint()?)
+            .map_err(|_| StateError::Codec(format!("{} {item} count exceeds usize", self.context)))
+    }
+
+    fn read_varbytes(
+        &mut self,
+        max_len: usize,
+        item: &'static str,
+    ) -> Result<&'a [u8], StateError> {
+        let len = self.read_varint_usize(item)?;
+        if len > max_len {
+            return Err(StateError::Codec(format!(
+                "{} {item} contains {len} bytes; maximum is {max_len}",
+                self.context
+            )));
+        }
+        self.read_exact(len)
+    }
+
+    fn ensure_finished(&self) -> Result<(), StateError> {
+        if self.remaining() == 0 {
+            Ok(())
+        } else {
+            Err(StateError::Codec(format!(
+                "{} contains {} trailing bytes",
+                self.context,
+                self.remaining()
+            )))
+        }
+    }
+}
+
+fn ensure_retained_root_deadline(
+    deadline: Instant,
+    context: &'static str,
+) -> Result<(), StateError> {
+    if Instant::now() >= deadline {
+        return Err(StateError::DeadlineExceeded { context });
+    }
+    Ok(())
+}
+
+fn validate_borrowed_count(
+    count: usize,
+    remaining: usize,
+    minimum_item_bytes: usize,
+    context: &'static str,
+) -> Result<(), StateError> {
+    let possible = remaining / minimum_item_bytes;
+    if count > possible {
+        return Err(StateError::Codec(format!(
+            "{context} count {count} exceeds the {possible} minimally encoded records remaining"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_borrowed_covenant(bytes: &[u8], deadline: Instant) -> Result<(), StateError> {
+    let mut reader = BorrowedCodecReader::new(bytes, MAX_TX_SIZE, "coin covenant")?;
+    reader.read_u8()?;
+    let count = reader.read_varint_usize("items")?;
+    if count > MAX_SCRIPT_STACK {
+        return Err(StateError::Codec(format!(
+            "coin covenant item count {count} exceeds {MAX_SCRIPT_STACK}"
+        )));
+    }
+    validate_borrowed_count(count, reader.remaining(), 1, "coin covenant item")?;
+    for _ in 0..count {
+        ensure_retained_root_deadline(deadline, "block undo metadata validation")?;
+        reader.read_varbytes(MAX_TX_SIZE, "item")?;
+    }
+    reader.ensure_finished()
+}
+
+fn validate_borrowed_coin(bytes: &[u8], deadline: Instant) -> Result<(), StateError> {
+    let mut reader = BorrowedCodecReader::new(bytes, COIN_CODEC_MAX, "spent coin")?;
+    reader.read_exact(OUTPOINT_CODEC_BYTES)?;
+    reader.read_u64()?;
+    reader.read_u32()?;
+    match reader.read_u8()? {
+        0 | 1 => {}
+        value => {
+            return Err(StateError::Codec(format!(
+                "spent coin contains invalid coinbase flag {value}"
+            )))
+        }
+    }
+    let version = reader.read_u8()?;
+    let hash_len = usize::from(reader.read_u8()?);
+    reader.read_exact(hash_len)?;
+    if version > 31 {
+        return Err(StateError::Codec(
+            "spent coin address version exceeds 31".to_owned(),
+        ));
+    }
+    if !(MIN_ADDRESS_HASH_SIZE..=MAX_ADDRESS_HASH_SIZE).contains(&hash_len) {
+        return Err(StateError::Codec(
+            "spent coin address hash length is outside 2..=40".to_owned(),
+        ));
+    }
+    if version == 0 && hash_len != 20 && hash_len != 32 {
+        return Err(StateError::Codec(
+            "spent coin version 0 witness program must be 20 or 32 bytes".to_owned(),
+        ));
+    }
+    let covenant = reader.read_varbytes(MAX_TX_SIZE, "covenant")?;
+    validate_borrowed_covenant(covenant, deadline)?;
+    reader.ensure_finished()
+}
+
+fn validate_borrowed_name_state(bytes: &[u8]) -> Result<(), StateError> {
+    let mut reader = BorrowedCodecReader::new(bytes, NAME_STATE_CODEC_MAX, "previous name state")?;
+    let name_len = usize::from(reader.read_u8()?);
+    if name_len > MAX_NAME_SIZE {
+        return Err(StateError::Codec(
+            "encoded previous name exceeds HNS limit".to_owned(),
+        ));
+    }
+    reader.read_exact(name_len)?;
+    let data_len = usize::from(reader.read_u16()?);
+    if data_len > MAX_RESOURCE_SIZE {
+        return Err(StateError::Codec(
+            "encoded previous name resource exceeds HNS limit".to_owned(),
+        ));
+    }
+    reader.read_exact(data_len)?;
+    reader.read_u32()?;
+    reader.read_u32()?;
+    let field = reader.read_u16()?;
+    if field & !NAME_STATE_FIELD_MASK != 0 {
+        return Err(StateError::Codec(format!(
+            "previous name-state field contains unknown bits 0x{:04x}",
+            field & !NAME_STATE_FIELD_MASK
+        )));
+    }
+    if field & (1 << 0) != 0 {
+        reader.read_hash()?;
+        u32::try_from(reader.read_varint()?)
+            .map_err(|_| StateError::Codec("previous name owner index exceeds u32".to_owned()))?;
+    }
+    if field & (1 << 1) != 0 {
+        reader.read_varint()?;
+    }
+    if field & (1 << 2) != 0 {
+        reader.read_varint()?;
+    }
+    for bit in 3..=5 {
+        if field & (1 << bit) != 0 {
+            reader.read_u32()?;
+        }
+    }
+    if field & (1 << 6) != 0 {
+        u32::try_from(reader.read_varint()?)
+            .map_err(|_| StateError::Codec("previous name renewal count exceeds u32".to_owned()))?;
+    }
+    reader.ensure_finished()
+}
+
+fn validate_borrowed_name_undo(bytes: &[u8]) -> Result<(), StateError> {
+    let mut reader = BorrowedCodecReader::new(bytes, NAME_UNDO_CODEC_MAX, "name undo")?;
+    reader.read_hash()?;
+    match reader.read_u8()? {
+        0 => {}
+        1 => {
+            let previous = reader.read_varbytes(NAME_STATE_CODEC_MAX, "previous state")?;
+            validate_borrowed_name_state(previous)?;
+        }
+        value => {
+            return Err(StateError::Codec(format!(
+                "name undo contains invalid previous-name flag {value}"
+            )))
+        }
+    }
+    reader.ensure_finished()
+}
+
+fn validate_borrowed_name_tree_accumulator(
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<(), StateError> {
+    if bytes.len() < 32 {
+        return Err(StateError::Codec(
+            "previous name-tree accumulator is truncated".to_owned(),
+        ));
+    }
+    let (body, checksum) = bytes.split_at(bytes.len() - 32);
+    if checksum != blake2b_256(body) {
+        return Err(StateError::Codec(
+            "previous name-tree accumulator checksum mismatch".to_owned(),
+        ));
+    }
+    let mut reader = BorrowedCodecReader::new(
+        body,
+        NAME_TREE_ACCUMULATOR_CODEC_MAX,
+        "previous name-tree accumulator",
+    )?;
+    let version = reader.read_u32()?;
+    if version != NAME_TREE_ACCUMULATOR_VERSION {
+        return Err(StateError::Codec(format!(
+            "unsupported previous name-tree accumulator version {version}"
+        )));
+    }
+    reader.read_hash()?;
+    let first_height = reader.read_u32()?;
+    let last_height = reader.read_u32()?;
+    if first_height > last_height {
+        return Err(StateError::Codec(
+            "previous name-tree accumulator height range is inverted".to_owned(),
+        ));
+    }
+    let count = reader.read_varint_usize("names")?;
+    validate_borrowed_count(
+        count,
+        reader.remaining(),
+        NAME_TREE_ACCUMULATOR_ENTRY_BYTES,
+        "previous name-tree accumulator name",
+    )?;
+    let mut names = BTreeSet::new();
+    for _ in 0..count {
+        ensure_retained_root_deadline(deadline, "block undo metadata validation")?;
+        let name = reader.read_hash()?;
+        if reader.read_u16()? == 0 {
+            return Err(StateError::Codec(
+                "previous name-tree accumulator contains a zero reference count".to_owned(),
+            ));
+        }
+        if !names.insert(name) {
+            return Err(StateError::Codec(
+                "previous name-tree accumulator contains a duplicate name".to_owned(),
+            ));
+        }
+    }
+    reader.ensure_finished()
+}
+
+fn decode_block_undo_metadata(
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<BlockUndoMetadata, StateError> {
+    ensure_retained_root_deadline(deadline, "block undo metadata validation")?;
+    if bytes.len() < BLOCK_UNDO_FIXED_METADATA_BYTES {
+        return Err(StateError::Codec(format!(
+            "block undo is truncated before fixed metadata: {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut reader = BorrowedCodecReader::new(bytes, BLOCK_UNDO_CODEC_MAX, "block undo")?;
+    let version = reader.read_u32()?;
+    if version != BLOCK_UNDO_VERSION && version != LEGACY_BLOCK_UNDO_VERSION {
+        return Err(StateError::Codec(format!(
+            "unsupported block undo version {version}"
+        )));
+    }
+    let metadata = BlockUndoMetadata {
+        block_hash: BlockHash::new(reader.read_hash()?),
+        height: reader.read_u32()?,
+        previous_tree_root: TreeRoot::new(reader.read_hash()?),
+        resulting_tree_root: TreeRoot::new(reader.read_hash()?),
+        previous_committed_tree_root: TreeRoot::new(reader.read_hash()?),
+        resulting_committed_tree_root: TreeRoot::new(reader.read_hash()?),
+    };
+
+    let spent_count = reader.read_varint_usize("spent coins")?;
+    validate_borrowed_count(
+        spent_count,
+        reader.remaining(),
+        MIN_SPENT_COIN_ENTRY_BYTES,
+        "spent coin",
+    )?;
+    for _ in 0..spent_count {
+        ensure_retained_root_deadline(deadline, "block undo metadata validation")?;
+        let coin = reader.read_varbytes(COIN_CODEC_MAX, "spent coin")?;
+        validate_borrowed_coin(coin, deadline)?;
+    }
+
+    let created_count = reader.read_varint_usize("created coins")?;
+    validate_borrowed_count(
+        created_count,
+        reader.remaining(),
+        OUTPOINT_CODEC_BYTES,
+        "created coin",
+    )?;
+    let created_bytes = created_count
+        .checked_mul(OUTPOINT_CODEC_BYTES)
+        .ok_or_else(|| StateError::Codec("created coin byte count overflow".to_owned()))?;
+    reader.read_exact(created_bytes)?;
+
+    let airdrop_count = reader.read_varint_usize("airdrop undo positions")?;
+    validate_borrowed_count(
+        airdrop_count,
+        reader.remaining(),
+        std::mem::size_of::<u32>(),
+        "airdrop undo position",
+    )?;
+    let airdrop_bytes = airdrop_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| StateError::Codec("airdrop undo byte count overflow".to_owned()))?;
+    reader.read_exact(airdrop_bytes)?;
+
+    let name_count = reader.read_varint_usize("name undo records")?;
+    validate_borrowed_count(
+        name_count,
+        reader.remaining(),
+        MIN_NAME_UNDO_ENTRY_BYTES,
+        "name undo",
+    )?;
+    for _ in 0..name_count {
+        ensure_retained_root_deadline(deadline, "block undo metadata validation")?;
+        let undo = reader.read_varbytes(NAME_UNDO_CODEC_MAX, "name undo")?;
+        validate_borrowed_name_undo(undo)?;
+    }
+
+    if version == BLOCK_UNDO_VERSION {
+        match reader.read_u8()? {
+            0 | 1 => {}
+            value => {
+                return Err(StateError::Codec(format!(
+                    "invalid name-tree interval-boundary flag {value}"
+                )))
+            }
+        }
+        match reader.read_u8()? {
+            0 => {}
+            1 => {
+                reader.read_u32()?;
+            }
+            value => {
+                return Err(StateError::Codec(format!(
+                    "invalid previous name-tree accumulator height flag {value}"
+                )))
+            }
+        }
+        match reader.read_u8()? {
+            0 => {}
+            1 => {
+                let accumulator = reader.read_varbytes(
+                    NAME_TREE_ACCUMULATOR_CODEC_MAX,
+                    "previous name-tree accumulator",
+                )?;
+                validate_borrowed_name_tree_accumulator(accumulator, deadline)?;
+            }
+            value => {
+                return Err(StateError::Codec(format!(
+                    "invalid previous name-tree accumulator flag {value}"
+                )))
+            }
+        }
+    }
+    reader.ensure_finished()?;
+    ensure_retained_root_deadline(deadline, "block undo metadata validation")?;
+    Ok(metadata)
 }
 
 /// Durable interval commitment for one active-chain post-state root. Pins are
@@ -2490,8 +3271,9 @@ pub fn write_name_state_to_batch<B: WriteBatch>(
 
 /// Rebuild the exact authenticated name-tree root from the durable NameState
 /// column family using the pinned HSD/Urkel hashing rules. This intentionally
-/// O(number of names) path is the independent startup and differential-test
-/// oracle; steady-state transitions use path-local content-addressed mutation.
+/// collecting O(number of names) path is an offline/differential-test oracle;
+/// production startup streams and steady-state transitions use path-local
+/// content-addressed mutation.
 pub fn rebuild_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot, StateError> {
     rebuild_name_tree_root_with_overrides(snapshot, &BTreeMap::new())
 }
@@ -2501,6 +3283,24 @@ pub fn rebuild_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<TreeRoot,
 /// and independent from steady-state incremental mutation.
 pub fn materialize_name_tree<T: ReadSnapshot>(snapshot: &T) -> Result<MemoryUrkel, StateError> {
     materialize_name_tree_with_overrides(snapshot, &BTreeMap::new())
+}
+
+/// Cursor-paged but still fully collecting variant of
+/// [`materialize_name_tree`]. This is bounded for offline diagnosis; production
+/// startup uses [`verify_name_tree_interval_state_bounded`] and never retains
+/// the base NameState population.
+pub fn materialize_name_tree_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    limits: NameTreeMaterializationLimits,
+) -> Result<MemoryUrkel, StateError> {
+    materialize_name_tree_with_overrides_bounded(snapshot, &BTreeMap::new(), limits, 0)
+}
+
+pub fn rebuild_name_tree_root_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    limits: NameTreeMaterializationLimits,
+) -> Result<TreeRoot, StateError> {
+    Ok(materialize_name_tree_bounded(snapshot, limits)?.root())
 }
 
 /// Rebuild the authenticated name-tree root from one immutable base snapshot
@@ -2553,6 +3353,199 @@ fn materialize_name_tree_with_overrides<T: ReadSnapshot>(
     }
 
     MemoryUrkel::from_entries(entries).map_err(StateError::NameTree)
+}
+
+fn ensure_name_tree_materialization_working_set(
+    records: u64,
+    encoded_bytes: u64,
+    reserved_working_set_bytes: u64,
+    limits: NameTreeMaterializationLimits,
+) -> Result<(), StateError> {
+    let map_overhead = records.saturating_mul(NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES);
+    let actual = reserved_working_set_bytes
+        .checked_add(encoded_bytes)
+        .and_then(|bytes| bytes.checked_add(map_overhead))
+        .unwrap_or(u64::MAX);
+    if actual > limits.max_working_set_bytes {
+        return Err(StateError::ResourceLimit {
+            context: "name-tree materialization working-set bytes",
+            limit: limits.max_working_set_bytes,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn materialize_name_tree_with_overrides_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    overrides: &BTreeMap<NameHash, Option<NameState>>,
+    limits: NameTreeMaterializationLimits,
+    reserved_working_set_bytes: u64,
+) -> Result<MemoryUrkel, StateError> {
+    limits.page_budget.validate()?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree materialization")?;
+    if reserved_working_set_bytes > limits.max_working_set_bytes {
+        return Err(StateError::ResourceLimit {
+            context: "name-tree materialization working-set bytes",
+            limit: limits.max_working_set_bytes,
+            actual: reserved_working_set_bytes,
+        });
+    }
+    let mut entries = BTreeMap::<NameHash, Vec<u8>>::new();
+    let mut records = 0u64;
+    let mut encoded_bytes = 0u64;
+    let mut continuation = None::<Vec<u8>>;
+    loop {
+        ensure_retained_root_deadline(limits.deadline, "name-tree materialization")?;
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::NameState,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+        )?;
+        ensure_retained_root_deadline(limits.deadline, "name-tree materialization")?;
+        validate_state_scan_page(
+            &page,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+            "name-tree materialization scan",
+        )?;
+        let next = page.continuation.clone();
+        for (key, value) in page.entries {
+            ensure_retained_root_deadline(limits.deadline, "name-tree materialization")?;
+            records = add_bounded_resource(
+                records,
+                1,
+                limits.max_records,
+                "name-tree materialization records",
+            )?;
+            let record_bytes = key
+                .len()
+                .checked_add(value.len())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX);
+            encoded_bytes = add_bounded_resource(
+                encoded_bytes,
+                record_bytes,
+                limits.max_encoded_bytes,
+                "name-tree materialization encoded bytes",
+            )?;
+            ensure_name_tree_materialization_working_set(
+                records,
+                encoded_bytes,
+                reserved_working_set_bytes,
+                limits,
+            )?;
+            let key: [u8; 32] = key.try_into().map_err(|key: Vec<u8>| {
+                StateError::Codec(format!(
+                    "name-state key must contain 32 bytes, got {}",
+                    key.len()
+                ))
+            })?;
+            let name_hash = NameHash::new(key);
+            let state = decode_name_state(&name_hash, &value)?;
+            if state.is_null() {
+                return Err(StateError::Codec(
+                    "null NameState must not be persisted in the authenticated tree".to_owned(),
+                ));
+            }
+            if entries.insert(name_hash, value).is_some() {
+                return Err(StateError::Codec(
+                    "name-state materialization returned a duplicate key".to_owned(),
+                ));
+            }
+        }
+        let Some(next) = next else {
+            break;
+        };
+        continuation = Some(next);
+    }
+
+    for (name_hash, state) in overrides {
+        ensure_retained_root_deadline(limits.deadline, "name-tree materialization")?;
+        match state {
+            Some(state) if !state.is_null() => {
+                if state.name_hash != *name_hash {
+                    return Err(StateError::Codec(
+                        "name-tree override key does not match its state".to_owned(),
+                    ));
+                }
+                let replacement = encode_name_state(state)?;
+                let (next_records, next_encoded_bytes) = match entries.get(name_hash) {
+                    Some(previous) => {
+                        let bytes = encoded_bytes
+                            .checked_sub(u64::try_from(previous.len()).unwrap_or(u64::MAX))
+                            .and_then(|bytes| {
+                                bytes.checked_add(
+                                    u64::try_from(replacement.len()).unwrap_or(u64::MAX),
+                                )
+                            })
+                            .ok_or_else(|| {
+                                StateError::Codec(
+                                    "name-tree override byte accounting overflow".to_owned(),
+                                )
+                            })?;
+                        (records, bytes)
+                    }
+                    None => {
+                        let next_records = records.saturating_add(1);
+                        let additional = NAME_STATE_KEY_BYTES
+                            .checked_add(replacement.len())
+                            .and_then(|bytes| u64::try_from(bytes).ok())
+                            .unwrap_or(u64::MAX);
+                        (next_records, encoded_bytes.saturating_add(additional))
+                    }
+                };
+                if next_records > limits.max_records {
+                    return Err(StateError::ResourceLimit {
+                        context: "name-tree materialization records",
+                        limit: limits.max_records,
+                        actual: next_records,
+                    });
+                }
+                if next_encoded_bytes > limits.max_encoded_bytes {
+                    return Err(StateError::ResourceLimit {
+                        context: "name-tree materialization encoded bytes",
+                        limit: limits.max_encoded_bytes,
+                        actual: next_encoded_bytes,
+                    });
+                }
+                ensure_name_tree_materialization_working_set(
+                    next_records,
+                    next_encoded_bytes,
+                    reserved_working_set_bytes,
+                    limits,
+                )?;
+                entries.insert(*name_hash, replacement);
+                records = next_records;
+                encoded_bytes = next_encoded_bytes;
+            }
+            Some(_) | None => {
+                if let Some(previous) = entries.remove(name_hash) {
+                    records = records.checked_sub(1).ok_or_else(|| {
+                        StateError::Codec(
+                            "name-tree override record accounting underflow".to_owned(),
+                        )
+                    })?;
+                    encoded_bytes = encoded_bytes
+                        .checked_sub(
+                            u64::try_from(NAME_STATE_KEY_BYTES + previous.len())
+                                .unwrap_or(u64::MAX),
+                        )
+                        .ok_or_else(|| {
+                            StateError::Codec(
+                                "name-tree override byte accounting underflow".to_owned(),
+                            )
+                        })?;
+                }
+            }
+        }
+    }
+    ensure_retained_root_deadline(limits.deadline, "name-tree materialization")?;
+    let tree = MemoryUrkel::from_entries(entries).map_err(StateError::NameTree)?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree materialization")?;
+    Ok(tree)
 }
 
 /// Mutate only affected paths from `root` and stage newly constructed
@@ -2846,6 +3839,467 @@ pub fn load_name_tree_accumulator<T: ReadSnapshot>(
         .transpose()
 }
 
+fn name_tree_interval_migration_backup_key(block_hash: BlockHash) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX.len() + BLOCK_UNDO_KEY_BYTES);
+    key.extend_from_slice(NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX);
+    key.extend_from_slice(block_hash.as_bytes());
+    key
+}
+
+fn name_tree_interval_migration_operation_bytes(
+    key_bytes: usize,
+    value_bytes: usize,
+    context: &'static str,
+) -> Result<u64, StateError> {
+    u64::try_from(key_bytes)
+        .ok()
+        .and_then(|key| {
+            u64::try_from(value_bytes)
+                .ok()
+                .and_then(|value| key.checked_add(value))
+        })
+        .and_then(|bytes| bytes.checked_add(NAME_TREE_INTERVAL_MIGRATION_OPERATION_OVERHEAD_BYTES))
+        .ok_or_else(|| StateError::Codec(format!("{context} byte count overflow")))
+}
+
+fn name_tree_interval_migration_record_bytes(
+    raw_undo_bytes: usize,
+    rewritten_undo_bytes: usize,
+    backup_key_bytes: usize,
+    needs_backup: bool,
+) -> Result<(u64, u64, u64), StateError> {
+    let backup = if needs_backup {
+        name_tree_interval_migration_operation_bytes(
+            backup_key_bytes,
+            raw_undo_bytes,
+            "name-tree interval migration backup publication",
+        )?
+    } else {
+        0
+    };
+    let rewrite = name_tree_interval_migration_operation_bytes(
+        BLOCK_UNDO_KEY_BYTES,
+        rewritten_undo_bytes,
+        "name-tree interval migration undo publication",
+    )?;
+    let publication = backup.checked_add(rewrite).ok_or_else(|| {
+        StateError::Codec("name-tree interval migration record publication overflow".to_owned())
+    })?;
+    Ok((backup, rewrite, publication))
+}
+
+fn ensure_name_tree_interval_migration_record_batch_limit(
+    publication_bytes: u64,
+    limit: u64,
+) -> Result<(), StateError> {
+    if publication_bytes > limit {
+        return Err(StateError::ResourceLimit {
+            context: "name-tree interval migration pending batch bytes",
+            limit,
+            actual: publication_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn enforce_name_tree_interval_accumulator_limits(
+    accumulator: Option<&NameTreeAccumulator>,
+    limits: NameTreeIntervalMigrationLimits,
+    peak_names: &mut u64,
+    peak_bytes: &mut u64,
+) -> Result<(), StateError> {
+    let names = accumulator
+        .map(|pending| u64::try_from(pending.names.len()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    enforce_name_tree_interval_accumulator_size(names, limits)?;
+    let bytes = names.saturating_mul(NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES);
+    *peak_names = (*peak_names).max(names);
+    *peak_bytes = (*peak_bytes).max(bytes);
+    Ok(())
+}
+
+fn enforce_name_tree_interval_accumulator_size(
+    names: u64,
+    limits: NameTreeIntervalMigrationLimits,
+) -> Result<(), StateError> {
+    let name_limit = limits
+        .max_pending_names
+        .min(NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES);
+    if names > name_limit {
+        return Err(StateError::ResourceLimit {
+            context: "name-tree interval migration pending names",
+            limit: name_limit,
+            actual: names,
+        });
+    }
+    let bytes = names.saturating_mul(NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES);
+    if bytes > limits.max_pending_name_bytes {
+        return Err(StateError::ResourceLimit {
+            context: "name-tree interval migration pending name bytes",
+            limit: limits.max_pending_name_bytes,
+            actual: bytes,
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_name_tree_interval_migration_undo(
+    raw_undo: &[u8],
+    block_hash: BlockHash,
+    height: Height,
+    tree_interval: Height,
+    previous_undo_height: &mut Option<Height>,
+    accumulator: &mut Option<NameTreeAccumulator>,
+    limits: NameTreeIntervalMigrationLimits,
+    peak_pending_names: &mut u64,
+    peak_pending_name_bytes: &mut u64,
+) -> Result<(u32, Vec<u8>), StateError> {
+    let undo_version = raw_undo
+        .get(..4)
+        .and_then(|raw| raw.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| StateError::Codec("block undo version is truncated".to_owned()))?;
+    let mut undo = BlockUndo::decode(raw_undo)?;
+    if undo.block_hash != block_hash || undo.height != height {
+        return Err(StateError::Codec(format!(
+            "active block undo disagrees with height {height}"
+        )));
+    }
+
+    if previous_undo_height.and_then(|value: Height| value.checked_add(1)) != Some(height) {
+        *accumulator = None;
+    }
+    if accumulator
+        .as_ref()
+        .is_some_and(|pending| pending.base_root != undo.previous_committed_tree_root)
+    {
+        return Err(StateError::Codec(format!(
+            "legacy name-tree interval root continuity breaks at height {height}"
+        )));
+    }
+    enforce_name_tree_interval_accumulator_limits(
+        accumulator.as_ref(),
+        limits,
+        peak_pending_names,
+        peak_pending_name_bytes,
+    )?;
+
+    undo.previous_tree_root = undo.previous_committed_tree_root;
+    undo.resulting_tree_root = undo.resulting_committed_tree_root;
+    undo.name_tree_interval_boundary = height.is_multiple_of(tree_interval);
+    undo.previous_name_tree_accumulator_last_height =
+        accumulator.as_ref().map(|pending| pending.last_height);
+    if undo.name_tree_interval_boundary {
+        // Move, rather than clone, the potentially large map into this one
+        // boundary undo. The encoded record is immediately staged/discarded.
+        undo.previous_name_tree_accumulator = accumulator.take();
+    } else {
+        undo.previous_name_tree_accumulator = None;
+        let pending = accumulator.get_or_insert_with(|| {
+            NameTreeAccumulator::new(undo.previous_committed_tree_root, height)
+        });
+        pending.last_height = height;
+        for name_undo in &undo.previous_name_states {
+            if let Some(count) = pending.names.get_mut(&name_undo.name_hash) {
+                *count = count.checked_add(1).ok_or_else(|| {
+                    StateError::Codec(
+                        "migrated name-tree accumulator reference count overflowed".to_owned(),
+                    )
+                })?;
+            } else {
+                let projected = u64::try_from(pending.names.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                enforce_name_tree_interval_accumulator_size(projected, limits)?;
+                pending.names.insert(name_undo.name_hash, 1);
+            }
+        }
+        enforce_name_tree_interval_accumulator_limits(
+            accumulator.as_ref(),
+            limits,
+            peak_pending_names,
+            peak_pending_name_bytes,
+        )?;
+    }
+
+    let rewritten = undo.encode()?;
+    let rewritten_bytes = u64::try_from(rewritten.len()).unwrap_or(u64::MAX);
+    if rewritten_bytes > BLOCK_UNDO_CODEC_MAX as u64 {
+        return Err(StateError::ResourceLimit {
+            context: "name-tree interval migration rewritten undo bytes",
+            limit: BLOCK_UNDO_CODEC_MAX as u64,
+            actual: rewritten_bytes,
+        });
+    }
+    *previous_undo_height = Some(height);
+    Ok((undo_version, rewritten))
+}
+
+#[derive(Debug)]
+struct NameTreeIntervalMigrationPreflight {
+    plan: NameTreeIntervalMigrationPlan,
+    final_accumulator: Option<NameTreeAccumulator>,
+    tip_height: Option<Height>,
+}
+
+fn preflight_name_tree_interval_migration<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    original_committed_root: TreeRoot,
+    limits: NameTreeIntervalMigrationLimits,
+) -> Result<NameTreeIntervalMigrationPreflight, StateError> {
+    let mut plan = NameTreeIntervalMigrationPlan::default();
+    let mut accumulator = None;
+    let mut previous_undo_height = None;
+    let mut continuation = None::<Vec<u8>>;
+    let mut tip_height = None;
+    loop {
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration preflight")?;
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::HeightIndex,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+        )?;
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration preflight")?;
+        validate_state_scan_page(
+            &page,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+            "name-tree interval migration preflight height scan",
+        )?;
+        let next = page.continuation.clone();
+        for (height_key, hash_bytes) in page.entries {
+            ensure_retained_root_deadline(
+                limits.deadline,
+                "name-tree interval migration preflight",
+            )?;
+            plan.active_heights = add_bounded_resource(
+                plan.active_heights,
+                1,
+                limits.max_height_records,
+                "name-tree interval migration height records",
+            )?;
+            let height_record_bytes = height_key
+                .len()
+                .checked_add(hash_bytes.len())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX);
+            plan.height_index_bytes = add_bounded_resource(
+                plan.height_index_bytes,
+                height_record_bytes,
+                limits.max_height_bytes,
+                "name-tree interval migration height bytes",
+            )?;
+            let raw_height: [u8; 4] = height_key.as_slice().try_into().map_err(|_| {
+                StateError::Codec(format!(
+                    "active height key contains {} bytes; expected 4",
+                    height_key.len()
+                ))
+            })?;
+            let height = u32::from_be_bytes(raw_height);
+            tip_height = Some(height);
+            let raw_hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
+                StateError::Codec(format!(
+                    "active height {height} contains a {}-byte block hash",
+                    hash_bytes.len()
+                ))
+            })?;
+            let block_hash = BlockHash::new(raw_hash);
+
+            let Some(raw_undo) = snapshot.get(ColumnFamily::Undo, block_hash.as_bytes())? else {
+                accumulator = None;
+                previous_undo_height = None;
+                continue;
+            };
+            ensure_retained_root_deadline(
+                limits.deadline,
+                "name-tree interval migration preflight",
+            )?;
+            plan.undo_records = plan.undo_records.checked_add(1).ok_or_else(|| {
+                StateError::Codec("name-tree interval migration undo count overflow".to_owned())
+            })?;
+            plan.undo_input_bytes = add_bounded_resource(
+                plan.undo_input_bytes,
+                u64::try_from(raw_undo.len()).unwrap_or(u64::MAX),
+                limits.max_undo_input_bytes,
+                "name-tree interval migration undo input bytes",
+            )?;
+            let (undo_version, rewritten) = prepare_name_tree_interval_migration_undo(
+                &raw_undo,
+                block_hash,
+                height,
+                tree_interval,
+                &mut previous_undo_height,
+                &mut accumulator,
+                limits,
+                &mut plan.peak_pending_names,
+                &mut plan.peak_pending_name_bytes,
+            )?;
+            let backup_key = name_tree_interval_migration_backup_key(block_hash);
+            let needs_backup = if undo_version == LEGACY_BLOCK_UNDO_VERSION {
+                match snapshot.get(ColumnFamily::Snapshots, &backup_key)? {
+                    Some(existing) if existing != raw_undo => {
+                        return Err(StateError::Codec(format!(
+                            "legacy undo migration backup conflicts at height {height}"
+                        )))
+                    }
+                    Some(_) => false,
+                    None => true,
+                }
+            } else {
+                false
+            };
+            let (backup_bytes, rewrite_bytes, publication_bytes) =
+                name_tree_interval_migration_record_bytes(
+                    raw_undo.len(),
+                    rewritten.len(),
+                    backup_key.len(),
+                    needs_backup,
+                )?;
+            ensure_name_tree_interval_migration_record_batch_limit(
+                publication_bytes,
+                limits.max_pending_batch_bytes,
+            )?;
+            plan.maximum_record_publication_bytes =
+                plan.maximum_record_publication_bytes.max(publication_bytes);
+            if needs_backup {
+                plan.legacy_undos_to_backup =
+                    plan.legacy_undos_to_backup.checked_add(1).ok_or_else(|| {
+                        StateError::Codec(
+                            "name-tree interval migration backup count overflow".to_owned(),
+                        )
+                    })?;
+            }
+            plan.backup_output_bytes = add_bounded_resource(
+                plan.backup_output_bytes,
+                backup_bytes,
+                limits.max_backup_output_bytes,
+                "name-tree interval migration backup output bytes",
+            )?;
+            plan.rewrite_output_bytes = plan
+                .rewrite_output_bytes
+                .checked_add(rewrite_bytes)
+                .ok_or_else(|| {
+                    StateError::Codec(
+                        "name-tree interval migration rewrite output overflow".to_owned(),
+                    )
+                })?;
+            plan.publication_bytes = add_bounded_resource(
+                plan.publication_bytes,
+                publication_bytes,
+                limits.max_publication_bytes,
+                "name-tree interval migration publication bytes",
+            )?;
+        }
+        let Some(next) = next else {
+            break;
+        };
+        continuation = Some(next);
+    }
+
+    if let Some(tip_height) = tip_height {
+        if previous_undo_height != Some(tip_height) {
+            return Err(StateError::Codec(
+                "active tip is missing undo required for interval migration".to_owned(),
+            ));
+        }
+        if tip_height.is_multiple_of(tree_interval) != accumulator.is_none() {
+            return Err(StateError::Codec(
+                "migrated name-tree accumulator disagrees with tip interval timing".to_owned(),
+            ));
+        }
+    }
+    if accumulator
+        .as_ref()
+        .is_some_and(|pending| pending.base_root != original_committed_root)
+    {
+        return Err(StateError::Codec(
+            "migrated accumulator base does not match the durable committed root".to_owned(),
+        ));
+    }
+    plan.required_temporary_bytes = plan
+        .publication_bytes
+        .checked_mul(NAME_TREE_INTERVAL_MIGRATION_ROCKS_TEMPORARY_MULTIPLIER)
+        .ok_or_else(|| {
+            StateError::Codec(
+                "name-tree interval migration temporary byte projection overflow".to_owned(),
+            )
+        })?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration preflight")?;
+    Ok(NameTreeIntervalMigrationPreflight {
+        plan,
+        final_accumulator: accumulator,
+        tip_height,
+    })
+}
+
+/// Read-only exact input/publication projection used by production startup to
+/// qualify filesystem capacity before any migration marker or undo is written.
+/// For `H` active heights and `U` distinct pending names, the ordered cursor
+/// pass is `O(H + name-undo entries * log U)` and retains only one scan page,
+/// one decoded undo, and the codec-bounded `O(U)` interval accumulator.
+pub fn plan_name_tree_interval_accumulator_migration_bounded<S: Store>(
+    store: &S,
+    tree_interval: Height,
+    limits: NameTreeIntervalMigrationLimits,
+) -> Result<Option<NameTreeIntervalMigrationPlan>, StateError> {
+    limits.page_budget.validate()?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration preflight")?;
+    if tree_interval == 0 {
+        return Err(StateError::Codec(
+            "network name-tree snapshot interval is zero".to_owned(),
+        ));
+    }
+    let snapshot = store.snapshot()?;
+    let Some(raw_schema) = snapshot.get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())?
+    else {
+        return Ok(None);
+    };
+    let schema = decode_u32(&raw_schema)?;
+    let profile = snapshot
+        .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())?
+        .ok_or_else(|| {
+            StateError::Codec("schema marker exists without a storage profile".to_owned())
+        })?;
+    if schema == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE {
+        return Ok(None);
+    }
+    if (schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE)
+        || (schema == INTERVAL_SCHEMA_VERSION && profile.as_slice() == INTERVAL_STORAGE_PROFILE)
+    {
+        return Ok(None);
+    }
+    if schema != PRE_INTERVAL_SCHEMA_VERSION || profile.as_slice() != PRE_INTERVAL_STORAGE_PROFILE {
+        return Err(StateError::Codec(format!(
+            "cannot migrate schema/profile {schema}/{} to {SCHEMA_VERSION}/{}",
+            String::from_utf8_lossy(&profile),
+            String::from_utf8_lossy(STORAGE_PROFILE)
+        )));
+    }
+    let original_working_root = load_stored_name_tree_root(&snapshot)?;
+    let original_committed_root = load_stored_name_tree_commit_root(&snapshot)?;
+    validate_persisted_name_tree_root(&snapshot, original_working_root)?;
+    validate_persisted_name_tree_root(&snapshot, original_committed_root)?;
+    let preflight = preflight_name_tree_interval_migration(
+        &snapshot,
+        tree_interval,
+        original_committed_root,
+        limits,
+    )?;
+    if preflight.tip_height.is_none()
+        && (original_working_root != TreeRoot::ZERO || original_committed_root != TreeRoot::ZERO)
+    {
+        return Err(StateError::Codec(
+            "empty legacy chain has a non-empty name-tree root".to_owned(),
+        ));
+    }
+    Ok(Some(preflight.plan))
+}
+
 /// Upgrade the schema-16 per-block working-tree layout to the current interval
 /// accumulator profile. Schemas 17 and 18 already have the consensus
 /// transformation and receive only the fail-closed storage-profile cutover.
@@ -2857,6 +4311,20 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
     store: &S,
     tree_interval: Height,
 ) -> Result<Option<NameTreeIntervalMigrationSummary>, StateError> {
+    migrate_name_tree_interval_accumulator_bounded(
+        store,
+        tree_interval,
+        NameTreeIntervalMigrationLimits::default(),
+    )
+}
+
+pub fn migrate_name_tree_interval_accumulator_bounded<S: Store>(
+    store: &S,
+    tree_interval: Height,
+    limits: NameTreeIntervalMigrationLimits,
+) -> Result<Option<NameTreeIntervalMigrationSummary>, StateError> {
+    limits.page_budget.validate()?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
     if tree_interval == 0 {
         return Err(StateError::Codec(
             "network name-tree snapshot interval is zero".to_owned(),
@@ -2881,6 +4349,7 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
         || (schema == INTERVAL_SCHEMA_VERSION && profile.as_slice() == INTERVAL_STORAGE_PROFILE)
     {
         drop(snapshot);
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
         let mut batch = store.batch();
         batch.put(
             ColumnFamily::Meta,
@@ -2894,6 +4363,7 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
         )?;
         batch.put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[0])?;
         store.commit(batch)?;
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
         return Ok(None);
     }
     if schema != PRE_INTERVAL_SCHEMA_VERSION || profile.as_slice() != PRE_INTERVAL_STORAGE_PROFILE {
@@ -2906,16 +4376,34 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
 
     let original_working_root = load_stored_name_tree_root(&snapshot)?;
     let original_committed_root = load_stored_name_tree_commit_root(&snapshot)?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
     validate_persisted_name_tree_root(&snapshot, original_working_root)?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
     validate_persisted_name_tree_root(&snapshot, original_committed_root)?;
-    let mut heights = snapshot.scan_prefix(ColumnFamily::HeightIndex, b"")?;
-    heights.sort_by(|left, right| left.0.cmp(&right.0));
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
+    // Finish the complete read-only projection before writing even the
+    // migration marker. This makes total-input/output, accumulator, and
+    // one-record batch refusal non-mutating and safe to retry offline.
+    let preflight = preflight_name_tree_interval_migration(
+        &snapshot,
+        tree_interval,
+        original_committed_root,
+        limits,
+    )?;
+    if preflight.tip_height.is_none()
+        && (original_working_root != TreeRoot::ZERO || original_committed_root != TreeRoot::ZERO)
+    {
+        return Err(StateError::Codec(
+            "empty legacy chain has a non-empty name-tree root".to_owned(),
+        ));
+    }
     drop(snapshot);
 
     // These small bindings are written first and never overwritten. They are
     // enough to identify and reverse the metadata cutover; each rewritten
     // legacy undo is backed up alongside them below.
     {
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
         let snapshot = store.snapshot()?;
         let backups = [
             (
@@ -2948,127 +4436,209 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
         batch.put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[0])?;
         drop(snapshot);
         store.commit(batch)?;
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
     }
 
+    let NameTreeIntervalMigrationPreflight {
+        plan,
+        final_accumulator: expected_accumulator,
+        tip_height: expected_tip_height,
+    } = preflight;
+    let height_snapshot = store.snapshot()?;
     let mut summary = NameTreeIntervalMigrationSummary {
-        active_heights: heights.len(),
+        required_temporary_bytes: plan.required_temporary_bytes,
+        peak_pending_names: plan.peak_pending_names,
+        peak_pending_name_bytes: plan.peak_pending_name_bytes,
         ..NameTreeIntervalMigrationSummary::default()
     };
+    let mut height_records = 0u64;
+    let mut height_bytes = 0u64;
+    let mut undo_input_bytes = 0u64;
+    let mut backup_output_bytes = 0u64;
+    let mut rewrite_output_bytes = 0u64;
+    let mut publication_bytes = 0u64;
     let mut accumulator: Option<NameTreeAccumulator> = None;
     let mut previous_undo_height = None;
     let mut pending_batch = store.batch();
     let mut pending_writes = 0usize;
+    let mut pending_batch_bytes = 0u64;
+    let mut peak_pending_names = 0u64;
+    let mut peak_pending_name_bytes = 0u64;
+    let mut continuation = None::<Vec<u8>>;
+    loop {
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
+        let page = height_snapshot.scan_prefix_page(
+            ColumnFamily::HeightIndex,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+        )?;
+        validate_state_scan_page(
+            &page,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+            "name-tree interval migration height scan",
+        )?;
+        let next = page.continuation.clone();
+        for (height_key, hash_bytes) in page.entries {
+            ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
+            height_records = add_bounded_resource(
+                height_records,
+                1,
+                limits.max_height_records,
+                "name-tree interval migration height records",
+            )?;
+            let record_bytes = height_key
+                .len()
+                .checked_add(hash_bytes.len())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX);
+            height_bytes = add_bounded_resource(
+                height_bytes,
+                record_bytes,
+                limits.max_height_bytes,
+                "name-tree interval migration height bytes",
+            )?;
+            summary.active_heights =
+                usize::try_from(height_records).map_err(|_| StateError::ResourceLimit {
+                    context: "name-tree interval migration height records",
+                    limit: usize::MAX as u64,
+                    actual: height_records,
+                })?;
 
-    for (height_key, hash_bytes) in &heights {
-        let raw_height: [u8; 4] = height_key.as_slice().try_into().map_err(|_| {
-            StateError::Codec(format!(
-                "active height key contains {} bytes; expected 4",
-                height_key.len()
-            ))
-        })?;
-        let height = u32::from_be_bytes(raw_height);
-        summary.tip_height = Some(height);
-        let raw_hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
-            StateError::Codec(format!(
-                "active height {height} contains a {}-byte block hash",
-                hash_bytes.len()
-            ))
-        })?;
-        let block_hash = BlockHash::new(raw_hash);
-        let snapshot = store.snapshot()?;
-        let Some(raw_undo) = snapshot.get(ColumnFamily::Undo, block_hash.as_bytes())? else {
-            accumulator = None;
-            previous_undo_height = None;
-            continue;
-        };
-        let undo_version = raw_undo
-            .get(..4)
-            .and_then(|raw| raw.try_into().ok())
-            .map(u32::from_le_bytes)
-            .ok_or_else(|| StateError::Codec("block undo version is truncated".to_owned()))?;
-        let mut undo = BlockUndo::decode(&raw_undo)?;
-        if undo.block_hash != block_hash || undo.height != height {
-            return Err(StateError::Codec(format!(
-                "active block undo disagrees with height {height}"
-            )));
-        }
-
-        if previous_undo_height.and_then(|value: Height| value.checked_add(1)) != Some(height) {
-            accumulator = None;
-        }
-        if accumulator
-            .as_ref()
-            .is_some_and(|pending| pending.base_root != undo.previous_committed_tree_root)
-        {
-            return Err(StateError::Codec(format!(
-                "legacy name-tree interval root continuity breaks at height {height}"
-            )));
-        }
-
-        let previous_accumulator = accumulator.clone();
-        undo.previous_tree_root = undo.previous_committed_tree_root;
-        undo.resulting_tree_root = undo.resulting_committed_tree_root;
-        undo.name_tree_interval_boundary = height.is_multiple_of(tree_interval);
-        undo.previous_name_tree_accumulator_last_height = previous_accumulator
-            .as_ref()
-            .map(|pending| pending.last_height);
-        undo.previous_name_tree_accumulator = undo
-            .name_tree_interval_boundary
-            .then_some(previous_accumulator.clone())
-            .flatten();
-
-        if undo.name_tree_interval_boundary {
-            accumulator = None;
-        } else {
-            let mut pending = previous_accumulator.unwrap_or_else(|| {
-                NameTreeAccumulator::new(undo.previous_committed_tree_root, height)
-            });
-            pending.last_height = height;
-            for name_undo in &undo.previous_name_states {
-                let count = pending.names.entry(name_undo.name_hash).or_default();
-                *count = count.checked_add(1).ok_or_else(|| {
+            let raw_height: [u8; 4] = height_key.as_slice().try_into().map_err(|_| {
+                StateError::Codec(format!(
+                    "active height key contains {} bytes; expected 4",
+                    height_key.len()
+                ))
+            })?;
+            let height = u32::from_be_bytes(raw_height);
+            summary.tip_height = Some(height);
+            let raw_hash: [u8; 32] = hash_bytes.as_slice().try_into().map_err(|_| {
+                StateError::Codec(format!(
+                    "active height {height} contains a {}-byte block hash",
+                    hash_bytes.len()
+                ))
+            })?;
+            let block_hash = BlockHash::new(raw_hash);
+            let Some(raw_undo) = height_snapshot.get(ColumnFamily::Undo, block_hash.as_bytes())?
+            else {
+                accumulator = None;
+                previous_undo_height = None;
+                continue;
+            };
+            ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
+            undo_input_bytes = add_bounded_resource(
+                undo_input_bytes,
+                u64::try_from(raw_undo.len()).unwrap_or(u64::MAX),
+                limits.max_undo_input_bytes,
+                "name-tree interval migration undo input bytes",
+            )?;
+            let (undo_version, rewritten_undo) = prepare_name_tree_interval_migration_undo(
+                &raw_undo,
+                block_hash,
+                height,
+                tree_interval,
+                &mut previous_undo_height,
+                &mut accumulator,
+                limits,
+                &mut peak_pending_names,
+                &mut peak_pending_name_bytes,
+            )?;
+            let backup_key = name_tree_interval_migration_backup_key(block_hash);
+            let needs_backup = if undo_version == LEGACY_BLOCK_UNDO_VERSION {
+                match height_snapshot.get(ColumnFamily::Snapshots, &backup_key)? {
+                    Some(existing) if existing != raw_undo => {
+                        return Err(StateError::Codec(format!(
+                            "legacy undo migration backup conflicts at height {height}"
+                        )))
+                    }
+                    Some(_) => false,
+                    None => true,
+                }
+            } else {
+                false
+            };
+            let (record_backup_bytes, record_rewrite_bytes, record_publication_bytes) =
+                name_tree_interval_migration_record_bytes(
+                    raw_undo.len(),
+                    rewritten_undo.len(),
+                    backup_key.len(),
+                    needs_backup,
+                )?;
+            ensure_name_tree_interval_migration_record_batch_limit(
+                record_publication_bytes,
+                limits.max_pending_batch_bytes,
+            )?;
+            let record_writes = usize::from(needs_backup) + 1;
+            let next_writes = pending_writes.saturating_add(record_writes);
+            let next_batch_bytes = pending_batch_bytes.saturating_add(record_publication_bytes);
+            if pending_writes != 0
+                && (next_writes > NAME_TREE_INTERVAL_MIGRATION_BATCH
+                    || next_batch_bytes > limits.max_pending_batch_bytes)
+            {
+                ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
+                store.commit(pending_batch)?;
+                ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
+                summary.batch_commits = summary.batch_commits.checked_add(1).ok_or_else(|| {
                     StateError::Codec(
-                        "migrated name-tree accumulator reference count overflowed".to_owned(),
+                        "name-tree interval migration batch commit count overflow".to_owned(),
                     )
                 })?;
+                pending_batch = store.batch();
+                pending_writes = 0;
+                pending_batch_bytes = 0;
             }
-            accumulator = Some(pending);
-        }
-
-        if undo_version == LEGACY_BLOCK_UNDO_VERSION {
-            let mut backup_key = Vec::with_capacity(
-                NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX.len() + block_hash.as_bytes().len(),
-            );
-            backup_key.extend_from_slice(NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX);
-            backup_key.extend_from_slice(block_hash.as_bytes());
-            match snapshot.get(ColumnFamily::Snapshots, &backup_key)? {
-                Some(existing) if existing != raw_undo => {
-                    return Err(StateError::Codec(format!(
-                        "legacy undo migration backup conflicts at height {height}"
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    pending_batch.put(ColumnFamily::Snapshots, &backup_key, &raw_undo)?;
-                    pending_writes += 1;
-                    summary.legacy_undos_backed_up += 1;
-                }
+            if needs_backup {
+                pending_batch.put(ColumnFamily::Snapshots, &backup_key, &raw_undo)?;
+                pending_writes += 1;
+                summary.legacy_undos_backed_up += 1;
             }
+            pending_batch.put(ColumnFamily::Undo, block_hash.as_bytes(), &rewritten_undo)?;
+            pending_writes += 1;
+            pending_batch_bytes = pending_batch_bytes
+                .checked_add(record_publication_bytes)
+                .ok_or_else(|| {
+                    StateError::Codec(
+                        "name-tree interval migration pending batch byte count overflow".to_owned(),
+                    )
+                })?;
+            summary.peak_batch_bytes = summary.peak_batch_bytes.max(pending_batch_bytes);
+            backup_output_bytes = add_bounded_resource(
+                backup_output_bytes,
+                record_backup_bytes,
+                limits.max_backup_output_bytes,
+                "name-tree interval migration backup output bytes",
+            )?;
+            rewrite_output_bytes = rewrite_output_bytes
+                .checked_add(record_rewrite_bytes)
+                .ok_or_else(|| {
+                    StateError::Codec(
+                        "name-tree interval migration rewrite output overflow".to_owned(),
+                    )
+                })?;
+            publication_bytes = add_bounded_resource(
+                publication_bytes,
+                record_publication_bytes,
+                limits.max_publication_bytes,
+                "name-tree interval migration publication bytes",
+            )?;
+            summary.undos_rewritten += 1;
         }
-        pending_batch.put(ColumnFamily::Undo, block_hash.as_bytes(), &undo.encode()?)?;
-        pending_writes += 1;
-        summary.undos_rewritten += 1;
-        previous_undo_height = Some(height);
-        drop(snapshot);
-
-        if pending_writes >= NAME_TREE_INTERVAL_MIGRATION_BATCH {
-            store.commit(pending_batch)?;
-            pending_batch = store.batch();
-            pending_writes = 0;
-        }
+        let Some(next) = next else {
+            break;
+        };
+        continuation = Some(next);
     }
+    drop(height_snapshot);
     if pending_writes != 0 {
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
         store.commit(pending_batch)?;
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
+        summary.batch_commits = summary.batch_commits.checked_add(1).ok_or_else(|| {
+            StateError::Codec("name-tree interval migration batch commit count overflow".to_owned())
+        })?;
     }
 
     if let Some(tip_height) = summary.tip_height {
@@ -3082,10 +4652,6 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
                 "migrated name-tree accumulator disagrees with tip interval timing".to_owned(),
             ));
         }
-    } else if original_working_root != TreeRoot::ZERO || original_committed_root != TreeRoot::ZERO {
-        return Err(StateError::Codec(
-            "empty legacy chain has a non-empty name-tree root".to_owned(),
-        ));
     }
     if accumulator
         .as_ref()
@@ -3099,6 +4665,29 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
         .as_ref()
         .map(|pending| pending.names.len())
         .unwrap_or(0);
+    summary.height_index_bytes = height_bytes;
+    summary.undo_input_bytes = undo_input_bytes;
+    summary.backup_output_bytes = backup_output_bytes;
+    summary.rewrite_output_bytes = rewrite_output_bytes;
+    summary.publication_bytes = publication_bytes;
+    if height_records != plan.active_heights
+        || height_bytes != plan.height_index_bytes
+        || summary.undos_rewritten as u64 != plan.undo_records
+        || summary.legacy_undos_backed_up as u64 != plan.legacy_undos_to_backup
+        || undo_input_bytes != plan.undo_input_bytes
+        || backup_output_bytes != plan.backup_output_bytes
+        || rewrite_output_bytes != plan.rewrite_output_bytes
+        || publication_bytes != plan.publication_bytes
+        || peak_pending_names != plan.peak_pending_names
+        || peak_pending_name_bytes != plan.peak_pending_name_bytes
+        || summary.tip_height != expected_tip_height
+        || accumulator != expected_accumulator
+    {
+        return Err(StateError::Codec(
+            "name-tree interval migration execution disagrees with its read-only preflight"
+                .to_owned(),
+        ));
+    }
 
     let mut final_batch = store.batch();
     final_batch.put(
@@ -3125,7 +4714,9 @@ pub fn migrate_name_tree_interval_accumulator<S: Store>(
         STORAGE_PROFILE,
     )?;
     final_batch.put(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes(), &[0])?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
     store.commit(final_batch)?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval migration")?;
     Ok(Some(summary))
 }
 
@@ -3136,21 +4727,160 @@ pub fn name_tree_snapshot_pin_key(height: Height) -> Vec<u8> {
     key
 }
 
+fn validate_state_scan_page(
+    page: &PrefixScanPage,
+    prefix: &[u8],
+    start_after: Option<&[u8]>,
+    budget: PrefixScanBudget,
+    context: &'static str,
+) -> Result<(), StateError> {
+    budget.validate()?;
+    if page.entries.len() > budget.max_entries {
+        return Err(StateError::Codec(format!(
+            "{context} returned {} records; page limit is {}",
+            page.entries.len(),
+            budget.max_entries
+        )));
+    }
+    let mut returned_bytes = 0usize;
+    let mut previous = start_after;
+    for (key, value) in &page.entries {
+        if !key.starts_with(prefix) {
+            return Err(StateError::Codec(format!(
+                "{context} returned a key outside its requested prefix"
+            )));
+        }
+        if previous.is_some_and(|cursor| key.as_slice() <= cursor) {
+            return Err(StateError::Codec(format!(
+                "{context} returned non-increasing keys"
+            )));
+        }
+        returned_bytes = returned_bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .ok_or_else(|| StateError::Codec(format!("{context} byte count overflow")))?;
+        previous = Some(key);
+    }
+    if returned_bytes != page.returned_bytes || returned_bytes > budget.max_bytes {
+        return Err(StateError::Codec(format!(
+            "{context} reported {} bytes for {returned_bytes} returned bytes with page limit {}",
+            page.returned_bytes, budget.max_bytes
+        )));
+    }
+    if let Some(continuation) = &page.continuation {
+        let Some((last_key, _)) = page.entries.last() else {
+            return Err(StateError::Codec(format!(
+                "{context} returned a continuation without progress"
+            )));
+        };
+        if continuation != last_key {
+            return Err(StateError::Codec(format!(
+                "{context} continuation does not equal its last returned key"
+            )));
+        }
+        if start_after.is_some_and(|cursor| continuation.as_slice() <= cursor) {
+            return Err(StateError::Codec(format!(
+                "{context} continuation did not advance"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn add_bounded_resource(
+    current: u64,
+    additional: u64,
+    limit: u64,
+    context: &'static str,
+) -> Result<u64, StateError> {
+    let actual = current.saturating_add(additional);
+    if actual > limit {
+        return Err(StateError::ResourceLimit {
+            context,
+            limit,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
+/// Stream checksummed pins in key/height order without materializing the
+/// complete prefix. The caller owns a chain/profile-derived total envelope.
+pub fn visit_name_tree_snapshot_pins_bounded<T, F>(
+    snapshot: &T,
+    limits: NameTreeSnapshotPinScanLimits,
+    mut visitor: F,
+) -> Result<NameTreeSnapshotPinScanSummary, StateError>
+where
+    T: ReadSnapshot,
+    F: FnMut(&NameTreeSnapshotPin) -> Result<(), StateError>,
+{
+    limits.page_budget.validate()?;
+    let mut summary = NameTreeSnapshotPinScanSummary::default();
+    let mut continuation = None::<Vec<u8>>;
+    loop {
+        ensure_retained_root_deadline(limits.deadline, "name-tree snapshot pin scan")?;
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::Snapshots,
+            NAME_TREE_SNAPSHOT_PIN_PREFIX,
+            continuation.as_deref(),
+            limits.page_budget,
+        )?;
+        validate_state_scan_page(
+            &page,
+            NAME_TREE_SNAPSHOT_PIN_PREFIX,
+            continuation.as_deref(),
+            limits.page_budget,
+            "name-tree snapshot pin scan",
+        )?;
+        let next = page.continuation.clone();
+        for (key, raw) in page.entries {
+            ensure_retained_root_deadline(limits.deadline, "name-tree snapshot pin scan")?;
+            summary.records = add_bounded_resource(
+                summary.records,
+                1,
+                limits.max_records,
+                "name-tree snapshot pin records",
+            )?;
+            summary.bytes = add_bounded_resource(
+                summary.bytes,
+                u64::try_from(raw.len()).unwrap_or(u64::MAX),
+                limits.max_bytes,
+                "name-tree snapshot pin bytes",
+            )?;
+            let pin = NameTreeSnapshotPin::decode(&raw)?;
+            if key != name_tree_snapshot_pin_key(pin.height) {
+                return Err(StateError::NameTreeSnapshotPinInvariant {
+                    height: pin.height,
+                    reason: "snapshot key does not match its encoded height".to_owned(),
+                });
+            }
+            visitor(&pin)?;
+            ensure_retained_root_deadline(limits.deadline, "name-tree snapshot pin scan")?;
+        }
+        let Some(next) = next else {
+            break;
+        };
+        continuation = Some(next);
+    }
+    Ok(summary)
+}
+
+/// Collect pins for bounded compatibility call sites. Production archive
+/// startup should use [`visit_name_tree_snapshot_pins_bounded`] with a
+/// validated tip-derived total limit so memory remains page-bounded.
 pub fn load_name_tree_snapshot_pins<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<Vec<NameTreeSnapshotPin>, StateError> {
-    let entries = snapshot.scan_prefix(ColumnFamily::Snapshots, NAME_TREE_SNAPSHOT_PIN_PREFIX)?;
-    let mut pins = Vec::with_capacity(entries.len());
-    for (key, raw) in entries {
-        let pin = NameTreeSnapshotPin::decode(&raw)?;
-        if key != name_tree_snapshot_pin_key(pin.height) {
-            return Err(StateError::NameTreeSnapshotPinInvariant {
-                height: pin.height,
-                reason: "snapshot key does not match its encoded height".to_owned(),
-            });
-        }
-        pins.push(pin);
-    }
+    let mut pins = Vec::new();
+    visit_name_tree_snapshot_pins_bounded(
+        snapshot,
+        NameTreeSnapshotPinScanLimits::default(),
+        |pin| {
+            pins.push(pin.clone());
+            Ok(())
+        },
+    )?;
     Ok(pins)
 }
 
@@ -3201,62 +4931,169 @@ pub fn stage_remove_name_tree_snapshot_pin<T: ReadSnapshot, B: WriteBatch>(
 pub fn retained_name_tree_roots<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<BTreeSet<TreeRoot>, StateError> {
-    let current_root = load_stored_name_tree_root(snapshot)?;
-    let committed_root = load_stored_name_tree_commit_root(snapshot)?;
-    let mut roots = BTreeSet::from([current_root, committed_root]);
-    let mut undos = BTreeMap::new();
-    for (key, raw) in snapshot.scan_prefix(ColumnFamily::Undo, b"")? {
-        let undo = BlockUndo::decode(&raw)?;
-        if key.as_slice() != undo.block_hash.as_bytes() {
-            return Err(StateError::Codec(
-                "block undo key does not match its encoded block hash".to_owned(),
-            ));
+    retained_name_tree_roots_bounded(snapshot, RetainedNameTreeRootLimits::default())
+        .map(|selection| selection.roots)
+}
+
+fn insert_retained_root(
+    roots: &mut BTreeSet<TreeRoot>,
+    root: TreeRoot,
+    limit: u64,
+) -> Result<(), StateError> {
+    if roots.insert(root) {
+        let actual = u64::try_from(roots.len()).unwrap_or(u64::MAX);
+        if actual > limit {
+            return Err(StateError::ResourceLimit {
+                context: "retained name-tree roots",
+                limit,
+                actual,
+            });
         }
-        roots.insert(undo.previous_tree_root);
-        roots.insert(undo.resulting_tree_root);
-        roots.insert(undo.previous_committed_tree_root);
-        roots.insert(undo.resulting_committed_tree_root);
-        undos.insert(undo.block_hash, undo);
+    }
+    Ok(())
+}
+
+pub fn retained_name_tree_roots_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    limits: RetainedNameTreeRootLimits,
+) -> Result<RetainedNameTreeRootSelection, StateError> {
+    limits.page_budget.validate()?;
+    if limits.page_budget.max_entries != RETAINED_NAME_TREE_ROOT_SCAN_PAGE_RECORDS {
+        return Err(StateError::ResourceLimit {
+            context: "retained name-tree root page records",
+            limit: RETAINED_NAME_TREE_ROOT_SCAN_PAGE_RECORDS as u64,
+            actual: u64::try_from(limits.page_budget.max_entries).unwrap_or(u64::MAX),
+        });
+    }
+    ensure_retained_root_deadline(limits.deadline, "retained name-tree root discovery")?;
+    let current_root = load_stored_name_tree_root(snapshot)?;
+    ensure_retained_root_deadline(limits.deadline, "retained name-tree root discovery")?;
+    let committed_root = load_stored_name_tree_commit_root(snapshot)?;
+    ensure_retained_root_deadline(limits.deadline, "retained name-tree root discovery")?;
+    let mut roots = BTreeSet::new();
+    insert_retained_root(&mut roots, current_root, limits.max_roots)?;
+    insert_retained_root(&mut roots, committed_root, limits.max_roots)?;
+    let mut undos = BTreeMap::<BlockHash, (Height, TreeRoot)>::new();
+    let mut undo_records = 0u64;
+    let mut undo_bytes = 0u64;
+    let mut continuation = None::<Vec<u8>>;
+    loop {
+        ensure_retained_root_deadline(limits.deadline, "retained name-tree root discovery")?;
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::Undo,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+        )?;
+        validate_state_scan_page(
+            &page,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+            "retained block undo scan",
+        )?;
+        let next = page.continuation.clone();
+        for (key, raw) in page.entries {
+            undo_records = add_bounded_resource(
+                undo_records,
+                1,
+                limits.max_undo_records,
+                "retained block undo records",
+            )?;
+            undo_bytes = add_bounded_resource(
+                undo_bytes,
+                u64::try_from(raw.len()).unwrap_or(u64::MAX),
+                limits.max_undo_bytes,
+                "retained block undo bytes",
+            )?;
+            let undo = decode_block_undo_metadata(&raw, limits.deadline)?;
+            if key.as_slice() != undo.block_hash.as_bytes() {
+                return Err(StateError::Codec(
+                    "block undo key does not match its encoded block hash".to_owned(),
+                ));
+            }
+            insert_retained_root(&mut roots, undo.previous_tree_root, limits.max_roots)?;
+            insert_retained_root(&mut roots, undo.resulting_tree_root, limits.max_roots)?;
+            insert_retained_root(
+                &mut roots,
+                undo.previous_committed_tree_root,
+                limits.max_roots,
+            )?;
+            insert_retained_root(
+                &mut roots,
+                undo.resulting_committed_tree_root,
+                limits.max_roots,
+            )?;
+            undos.insert(
+                undo.block_hash,
+                (undo.height, undo.resulting_committed_tree_root),
+            );
+            ensure_retained_root_deadline(limits.deadline, "retained name-tree root discovery")?;
+        }
+        let Some(next) = next else {
+            break;
+        };
+        continuation = Some(next);
     }
 
-    for pin in load_name_tree_snapshot_pins(snapshot)? {
-        if let Some(undo) = undos.get(&pin.block_hash) {
-            if undo.height != pin.height || undo.resulting_committed_tree_root != pin.root {
-                return Err(StateError::NameTreeSnapshotPinInvariant {
-                    height: pin.height,
-                    reason: "pin disagrees with its block undo".to_owned(),
-                });
-            }
-        } else {
-            let active_hash = read_canonical_hash(snapshot, pin.height)?.ok_or_else(|| {
-                StateError::NameTreeSnapshotPinInvariant {
-                    height: pin.height,
-                    reason: "pin has neither block undo nor an active height binding".to_owned(),
+    let pin_summary = visit_name_tree_snapshot_pins_bounded(
+        snapshot,
+        NameTreeSnapshotPinScanLimits {
+            max_records: limits.max_pin_records,
+            max_bytes: limits.max_pin_bytes,
+            page_budget: limits.page_budget,
+            deadline: limits.deadline,
+        },
+        |pin| {
+            ensure_retained_root_deadline(limits.deadline, "retained name-tree pin validation")?;
+            if let Some((height, root)) = undos.get(&pin.block_hash) {
+                if *height != pin.height || *root != pin.root {
+                    return Err(StateError::NameTreeSnapshotPinInvariant {
+                        height: pin.height,
+                        reason: "pin disagrees with its block undo".to_owned(),
+                    });
                 }
-            })?;
-            if active_hash != pin.block_hash {
-                return Err(StateError::NameTreeSnapshotPinInvariant {
-                    height: pin.height,
-                    reason: "pin block hash disagrees with the active height binding".to_owned(),
-                });
-            }
-            let expected_root = match pin.height.checked_add(1) {
-                Some(next_height) => match load_canonical_header(snapshot, next_height)? {
-                    Some(next) => TreeRoot::new(next.header.tree_root),
+            } else {
+                let active_hash = read_canonical_hash(snapshot, pin.height)?.ok_or_else(|| {
+                    StateError::NameTreeSnapshotPinInvariant {
+                        height: pin.height,
+                        reason: "pin has neither block undo nor an active height binding"
+                            .to_owned(),
+                    }
+                })?;
+                if active_hash != pin.block_hash {
+                    return Err(StateError::NameTreeSnapshotPinInvariant {
+                        height: pin.height,
+                        reason: "pin block hash disagrees with the active height binding"
+                            .to_owned(),
+                    });
+                }
+                let expected_root = match pin.height.checked_add(1) {
+                    Some(next_height) => match load_canonical_header(snapshot, next_height)? {
+                        Some(next) => TreeRoot::new(next.header.tree_root),
+                        None => committed_root,
+                    },
                     None => committed_root,
-                },
-                None => committed_root,
-            };
-            if pin.root != expected_root {
-                return Err(StateError::NameTreeSnapshotPinInvariant {
-                    height: pin.height,
-                    reason: "pin root disagrees with active-chain root timing".to_owned(),
-                });
+                };
+                if pin.root != expected_root {
+                    return Err(StateError::NameTreeSnapshotPinInvariant {
+                        height: pin.height,
+                        reason: "pin root disagrees with active-chain root timing".to_owned(),
+                    });
+                }
             }
-        }
-        roots.insert(pin.root);
-    }
-    Ok(roots)
+            insert_retained_root(&mut roots, pin.root, limits.max_roots)?;
+            ensure_retained_root_deadline(limits.deadline, "retained name-tree pin validation")
+        },
+    )?;
+    ensure_retained_root_deadline(limits.deadline, "retained name-tree root discovery")?;
+    Ok(RetainedNameTreeRootSelection {
+        roots,
+        undo_records,
+        undo_bytes,
+        pin_records: pin_summary.records,
+        pin_bytes: pin_summary.bytes,
+    })
 }
 
 fn load_canonical_header<T: ReadSnapshot>(
@@ -3509,11 +5346,12 @@ pub fn verify_stored_name_tree_root<T: ReadSnapshot>(snapshot: &T) -> Result<Tre
     Ok(stored)
 }
 
-/// Verify the materialized/interval root binding without traversing its
-/// content-addressed records. Node startup chooses a storage-native exhaustive
-/// audit immediately afterward; callers that need the legacy combined check
-/// continue to use `verify_stored_name_tree_root`.
-pub fn verify_stored_name_tree_root_binding<T: ReadSnapshot>(
+/// Verify only the durable root metadata and pending-interval base binding.
+///
+/// This function performs no NameState or content-addressed-node scan. A
+/// production startup path should follow it with its independently bounded
+/// storage audit and [`verify_name_tree_interval_state_bounded`].
+pub fn verify_stored_name_tree_root_metadata_binding<T: ReadSnapshot>(
     snapshot: &T,
 ) -> Result<TreeRoot, StateError> {
     let stored = load_stored_name_tree_root(snapshot)?;
@@ -3524,12 +5362,24 @@ pub fn verify_stored_name_tree_root_binding<T: ReadSnapshot>(
             actual: committed,
         });
     }
+    if load_name_tree_accumulator(snapshot)?
+        .is_some_and(|accumulator| accumulator.base_root != stored)
+    {
+        return Err(StateError::Codec(
+            "name-tree accumulator base root does not match the durable root".to_owned(),
+        ));
+    }
+    Ok(stored)
+}
+
+/// Legacy combined metadata/NameState binding. When no accumulator exists this
+/// materializes the complete NameState column and is therefore an offline or
+/// compatibility diagnostic, not a production startup primitive.
+pub fn verify_stored_name_tree_root_binding<T: ReadSnapshot>(
+    snapshot: &T,
+) -> Result<TreeRoot, StateError> {
+    let stored = verify_stored_name_tree_root_metadata_binding(snapshot)?;
     match load_name_tree_accumulator(snapshot)? {
-        Some(accumulator) if accumulator.base_root != stored => {
-            return Err(StateError::Codec(
-                "name-tree accumulator base root does not match the durable root".to_owned(),
-            ));
-        }
         Some(_) => {}
         None => {
             let actual = rebuild_name_tree_root(snapshot)?;
@@ -3541,9 +5391,10 @@ pub fn verify_stored_name_tree_root_binding<T: ReadSnapshot>(
     Ok(stored)
 }
 
-/// Exhaustively bind the current materialized NameState view, the pending
-/// interval accumulator, canonical undo, and the latest committed root.
-/// Startup calls this once; steady-state block admission remains path-local.
+/// Exhaustively materialize and bind the current NameState view, pending
+/// interval accumulator, canonical undo, and latest committed root. This
+/// collecting implementation is retained for offline diagnosis and small
+/// compatibility tests; production startup uses the bounded streaming variant.
 fn prepare_committed_name_tree<T: ReadSnapshot>(
     snapshot: &T,
     tree_interval: Height,
@@ -3643,12 +5494,201 @@ fn prepare_committed_name_tree<T: ReadSnapshot>(
     ))
 }
 
+fn add_name_tree_materialization_audit_working_set(
+    current: u64,
+    additional: u64,
+    limits: NameTreeMaterializationLimits,
+) -> Result<u64, StateError> {
+    add_bounded_resource(
+        current,
+        additional,
+        limits.max_working_set_bytes,
+        "name-tree materialization working-set bytes",
+    )
+}
+
+fn prepare_committed_name_tree_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+    limits: NameTreeMaterializationLimits,
+) -> Result<(TreeRoot, MemoryUrkel), StateError> {
+    limits.page_budget.validate()?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree interval startup audit")?;
+    if tree_interval == 0 {
+        return Err(StateError::Codec(
+            "network name-tree snapshot interval is zero".to_owned(),
+        ));
+    }
+    let stored = load_stored_name_tree_root(snapshot)?;
+    let committed = load_stored_name_tree_commit_root(snapshot)?;
+    if stored != committed {
+        return Err(StateError::StoredTreeRootMismatch {
+            stored,
+            actual: committed,
+        });
+    }
+
+    let Some(accumulator) = load_name_tree_accumulator(snapshot)? else {
+        if !tip_height.is_multiple_of(tree_interval) {
+            return Err(StateError::Codec(format!(
+                "active tip height {tip_height} is between tree intervals but has no accumulator"
+            )));
+        }
+        return Ok((stored, materialize_name_tree_bounded(snapshot, limits)?));
+    };
+
+    if tip_height.is_multiple_of(tree_interval) {
+        return Err(StateError::Codec(format!(
+            "tree-interval tip height {tip_height} unexpectedly has an accumulator"
+        )));
+    }
+    let expected_first = tip_height
+        .checked_sub(tip_height % tree_interval)
+        .and_then(|height| height.checked_add(1))
+        .ok_or_else(|| StateError::Codec("name-tree interval start overflowed".to_owned()))?;
+    if accumulator.base_root != stored
+        || accumulator.first_height != expected_first
+        || accumulator.last_height != tip_height
+    {
+        return Err(StateError::Codec(
+            "name-tree accumulator does not match the active tip interval".to_owned(),
+        ));
+    }
+
+    let mut expected_counts = BTreeMap::<NameHash, u16>::new();
+    let mut boundary_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
+    let mut interval_undo_bytes = 0u64;
+    let mut audit_working_set_bytes = 0u64;
+    for height in expected_first..=tip_height {
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval startup audit")?;
+        let hash = read_canonical_hash(snapshot, height)?.ok_or_else(|| {
+            StateError::Codec(format!(
+                "name-tree accumulator audit is missing canonical height {height}"
+            ))
+        })?;
+        let raw = snapshot
+            .get(ColumnFamily::Undo, hash.as_bytes())?
+            .ok_or(StateError::MissingUndo(hash))?;
+        interval_undo_bytes = add_bounded_resource(
+            interval_undo_bytes,
+            u64::try_from(raw.len()).unwrap_or(u64::MAX),
+            limits.max_interval_undo_bytes,
+            "name-tree interval startup undo bytes",
+        )?;
+        let transient = u64::try_from(raw.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2);
+        let instantaneous = audit_working_set_bytes.saturating_add(transient);
+        if instantaneous > limits.max_working_set_bytes {
+            return Err(StateError::ResourceLimit {
+                context: "name-tree materialization working-set bytes",
+                limit: limits.max_working_set_bytes,
+                actual: instantaneous,
+            });
+        }
+        let undo = BlockUndo::decode(&raw)?;
+        ensure_retained_root_deadline(limits.deadline, "name-tree interval startup audit")?;
+        if undo.block_hash != hash
+            || undo.height != height
+            || undo.name_tree_interval_boundary
+            || undo.previous_name_tree_accumulator.is_some()
+            || (height == expected_first
+                && undo.previous_name_tree_accumulator_last_height.is_some())
+            || (height > expected_first
+                && undo.previous_name_tree_accumulator_last_height != height.checked_sub(1))
+            || undo.previous_tree_root != stored
+            || undo.resulting_tree_root != stored
+            || undo.previous_committed_tree_root != stored
+            || undo.resulting_committed_tree_root != stored
+        {
+            return Err(StateError::Codec(format!(
+                "block undo at height {height} violates pending interval continuity"
+            )));
+        }
+        for name_undo in &undo.previous_name_states {
+            ensure_retained_root_deadline(limits.deadline, "name-tree interval startup audit")?;
+            if let Some(count) = expected_counts.get_mut(&name_undo.name_hash) {
+                *count = count.checked_add(1).ok_or_else(|| {
+                    StateError::Codec(
+                        "name-tree accumulator audit reference count overflowed".to_owned(),
+                    )
+                })?;
+                continue;
+            }
+            let projected_records = u64::try_from(expected_counts.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            if projected_records > limits.max_records {
+                return Err(StateError::ResourceLimit {
+                    context: "name-tree materialization records",
+                    limit: limits.max_records,
+                    actual: projected_records,
+                });
+            }
+            let previous_bytes = match &name_undo.previous {
+                Some(previous) => {
+                    if previous.name_hash != name_undo.name_hash {
+                        return Err(StateError::Codec(
+                            "name-tree interval undo key does not match its previous state"
+                                .to_owned(),
+                        ));
+                    }
+                    u64::try_from(encode_name_state(previous)?.len()).unwrap_or(u64::MAX)
+                }
+                None => 0,
+            };
+            let additional = NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(previous_bytes))
+                .unwrap_or(u64::MAX);
+            audit_working_set_bytes = add_name_tree_materialization_audit_working_set(
+                audit_working_set_bytes,
+                additional,
+                limits,
+            )?;
+            expected_counts.insert(name_undo.name_hash, 1);
+            boundary_overrides.insert(name_undo.name_hash, name_undo.previous.clone());
+        }
+    }
+    if accumulator.names != expected_counts {
+        return Err(StateError::Codec(
+            "name-tree accumulator names disagree with canonical undo".to_owned(),
+        ));
+    }
+
+    Ok((
+        stored,
+        materialize_name_tree_with_overrides_bounded(
+            snapshot,
+            &boundary_overrides,
+            limits,
+            audit_working_set_bytes,
+        )?,
+    ))
+}
+
 pub fn materialize_committed_name_tree<T: ReadSnapshot>(
     snapshot: &T,
     tree_interval: Height,
     tip_height: Height,
 ) -> Result<MemoryUrkel, StateError> {
     let (stored, tree) = prepare_committed_name_tree(snapshot, tree_interval, tip_height)?;
+    let actual = tree.root();
+    if stored != actual {
+        return Err(StateError::StoredTreeRootMismatch { stored, actual });
+    }
+    Ok(tree)
+}
+
+pub fn materialize_committed_name_tree_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+    limits: NameTreeMaterializationLimits,
+) -> Result<MemoryUrkel, StateError> {
+    let (stored, tree) =
+        prepare_committed_name_tree_bounded(snapshot, tree_interval, tip_height, limits)?;
     let actual = tree.root();
     if stored != actual {
         return Err(StateError::StoredTreeRootMismatch { stored, actual });
@@ -3697,9 +5737,8 @@ pub fn diagnose_committed_name_tree_node<T: ReadSnapshot>(
     Ok((actual, name_count, record_count, path))
 }
 
-/// Exhaustively bind the current materialized NameState view, the pending
-/// interval accumulator, canonical undo, and the latest committed root.
-/// Startup calls this once; steady-state block admission remains path-local.
+/// Legacy collecting root oracle for offline diagnosis and differential tests.
+/// Production startup uses [`verify_name_tree_interval_state_bounded`].
 pub fn verify_name_tree_interval_state<T: ReadSnapshot>(
     snapshot: &T,
     tree_interval: Height,
@@ -3711,6 +5750,696 @@ pub fn verify_name_tree_interval_state<T: ReadSnapshot>(
         return Err(StateError::StoredTreeRootMismatch { stored, actual });
     }
     Ok(actual)
+}
+
+#[derive(Debug)]
+struct NameTreeStreamingPreparation {
+    stored: TreeRoot,
+    overrides: BTreeMap<NameHash, Option<Vec<u8>>>,
+    override_working_set_bytes: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NameTreeStreamingAudit {
+    root: TreeRoot,
+    scanned_records: u64,
+    scanned_encoded_bytes: u64,
+    emitted_records: u64,
+    emitted_encoded_bytes: u64,
+    maximum_page_records: u64,
+    maximum_page_bytes: u64,
+}
+
+fn ensure_name_tree_streaming_working_set(
+    retained_bytes: u64,
+    transient_bytes: u64,
+    limits: NameTreeMaterializationLimits,
+) -> Result<(), StateError> {
+    let actual = retained_bytes.saturating_add(transient_bytes);
+    if actual > limits.max_working_set_bytes {
+        return Err(StateError::ResourceLimit {
+            context: "name-tree streaming working-set bytes",
+            limit: limits.max_working_set_bytes,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn preflight_name_tree_accumulator_entries(raw: &[u8]) -> Result<usize, StateError> {
+    if raw.len() < 32 {
+        return Err(StateError::Codec(
+            "name-tree accumulator is truncated".to_owned(),
+        ));
+    }
+    let (body, checksum) = raw.split_at(raw.len() - 32);
+    if checksum != blake2b_256(body) {
+        return Err(StateError::Codec(
+            "name-tree accumulator checksum mismatch".to_owned(),
+        ));
+    }
+    let mut reader = BorrowedCodecReader::new(
+        body,
+        NAME_TREE_ACCUMULATOR_CODEC_MAX,
+        "name-tree accumulator",
+    )?;
+    let version = reader.read_u32()?;
+    if version != NAME_TREE_ACCUMULATOR_VERSION {
+        return Err(StateError::Codec(format!(
+            "unsupported name-tree accumulator version {version}"
+        )));
+    }
+    reader.read_hash()?;
+    let first_height = reader.read_u32()?;
+    let last_height = reader.read_u32()?;
+    if first_height > last_height {
+        return Err(StateError::Codec(
+            "name-tree accumulator height range is inverted".to_owned(),
+        ));
+    }
+    let count = reader.read_varint_usize("names")?;
+    validate_borrowed_count(
+        count,
+        reader.remaining(),
+        NAME_TREE_ACCUMULATOR_ENTRY_BYTES,
+        "name-tree accumulator name",
+    )?;
+    Ok(count)
+}
+
+/// Preflight the raw value and its decoded map before `BTreeMap` allocation.
+/// The returned working-set charge remains live while the accumulator is held;
+/// the raw point-read buffer is charged only during decoding.
+fn load_name_tree_accumulator_streaming_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    limits: NameTreeMaterializationLimits,
+) -> Result<Option<(NameTreeAccumulator, u64)>, StateError> {
+    let Some(raw) = snapshot.get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)? else {
+        return Ok(None);
+    };
+    let raw_bytes = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+    ensure_name_tree_streaming_working_set(0, raw_bytes, limits)?;
+    let count = preflight_name_tree_accumulator_entries(&raw)?;
+    let decoded_bytes = u64::try_from(std::mem::size_of::<NameTreeAccumulator>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(
+            u64::try_from(count)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES),
+        );
+    ensure_name_tree_streaming_working_set(decoded_bytes, raw_bytes, limits)?;
+    let accumulator = NameTreeAccumulator::decode(&raw)?;
+    debug_assert_eq!(accumulator.names.len(), count);
+    Ok(Some((accumulator, decoded_bytes)))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingIntervalUndoView {
+    metadata: BlockUndoMetadata,
+    name_tree_interval_boundary: bool,
+    previous_name_tree_accumulator_last_height: Option<Height>,
+    has_previous_name_tree_accumulator: bool,
+}
+
+/// Validate one pending-interval undo with borrowed cursors and visit only its
+/// name records. Spent coins, created outpoints, and airdrop positions are
+/// never materialized, so transient memory is the raw point-read value plus at
+/// most one decoded NameState in the caller.
+fn visit_pending_interval_undo_names<F>(
+    bytes: &[u8],
+    deadline: Instant,
+    mut visitor: F,
+) -> Result<PendingIntervalUndoView, StateError>
+where
+    F: FnMut(NameHash, Option<&[u8]>) -> Result<(), StateError>,
+{
+    ensure_retained_root_deadline(deadline, "name-tree streaming verification")?;
+    let mut reader = BorrowedCodecReader::new(bytes, BLOCK_UNDO_CODEC_MAX, "block undo")?;
+    let version = reader.read_u32()?;
+    if version != BLOCK_UNDO_VERSION && version != LEGACY_BLOCK_UNDO_VERSION {
+        return Err(StateError::Codec(format!(
+            "unsupported block undo version {version}"
+        )));
+    }
+    let metadata = BlockUndoMetadata {
+        block_hash: BlockHash::new(reader.read_hash()?),
+        height: reader.read_u32()?,
+        previous_tree_root: TreeRoot::new(reader.read_hash()?),
+        resulting_tree_root: TreeRoot::new(reader.read_hash()?),
+        previous_committed_tree_root: TreeRoot::new(reader.read_hash()?),
+        resulting_committed_tree_root: TreeRoot::new(reader.read_hash()?),
+    };
+
+    let spent_count = reader.read_varint_usize("spent coins")?;
+    validate_borrowed_count(
+        spent_count,
+        reader.remaining(),
+        MIN_SPENT_COIN_ENTRY_BYTES,
+        "spent coin",
+    )?;
+    for _ in 0..spent_count {
+        ensure_retained_root_deadline(deadline, "name-tree streaming verification")?;
+        let coin = reader.read_varbytes(COIN_CODEC_MAX, "spent coin")?;
+        validate_borrowed_coin(coin, deadline)?;
+    }
+
+    let created_count = reader.read_varint_usize("created coins")?;
+    validate_borrowed_count(
+        created_count,
+        reader.remaining(),
+        OUTPOINT_CODEC_BYTES,
+        "created coin",
+    )?;
+    let created_bytes = created_count
+        .checked_mul(OUTPOINT_CODEC_BYTES)
+        .ok_or_else(|| StateError::Codec("created coin byte count overflow".to_owned()))?;
+    reader.read_exact(created_bytes)?;
+
+    let airdrop_count = reader.read_varint_usize("airdrop undo positions")?;
+    validate_borrowed_count(
+        airdrop_count,
+        reader.remaining(),
+        std::mem::size_of::<u32>(),
+        "airdrop undo position",
+    )?;
+    let airdrop_bytes = airdrop_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| StateError::Codec("airdrop undo byte count overflow".to_owned()))?;
+    reader.read_exact(airdrop_bytes)?;
+
+    let name_count = reader.read_varint_usize("name undo records")?;
+    validate_borrowed_count(
+        name_count,
+        reader.remaining(),
+        MIN_NAME_UNDO_ENTRY_BYTES,
+        "name undo",
+    )?;
+    for _ in 0..name_count {
+        ensure_retained_root_deadline(deadline, "name-tree streaming verification")?;
+        let undo = reader.read_varbytes(NAME_UNDO_CODEC_MAX, "name undo")?;
+        let mut undo_reader = BorrowedCodecReader::new(undo, NAME_UNDO_CODEC_MAX, "name undo")?;
+        let name_hash = NameHash::new(undo_reader.read_hash()?);
+        let previous = match undo_reader.read_u8()? {
+            0 => None,
+            1 => {
+                let previous = undo_reader.read_varbytes(NAME_STATE_CODEC_MAX, "previous state")?;
+                validate_borrowed_name_state(previous)?;
+                Some(previous)
+            }
+            value => {
+                return Err(StateError::Codec(format!(
+                    "name undo contains invalid previous-name flag {value}"
+                )))
+            }
+        };
+        undo_reader.ensure_finished()?;
+        visitor(name_hash, previous)?;
+    }
+
+    let (
+        name_tree_interval_boundary,
+        previous_name_tree_accumulator_last_height,
+        has_previous_name_tree_accumulator,
+    ) = if version == BLOCK_UNDO_VERSION {
+        let boundary = match reader.read_u8()? {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(StateError::Codec(format!(
+                    "invalid name-tree interval-boundary flag {value}"
+                )))
+            }
+        };
+        let previous_height = match reader.read_u8()? {
+            0 => None,
+            1 => Some(reader.read_u32()?),
+            value => {
+                return Err(StateError::Codec(format!(
+                    "invalid previous name-tree accumulator height flag {value}"
+                )))
+            }
+        };
+        let has_previous = match reader.read_u8()? {
+            0 => false,
+            1 => {
+                reader.read_varbytes(
+                    NAME_TREE_ACCUMULATOR_CODEC_MAX,
+                    "previous name-tree accumulator",
+                )?;
+                true
+            }
+            value => {
+                return Err(StateError::Codec(format!(
+                    "invalid previous name-tree accumulator flag {value}"
+                )))
+            }
+        };
+        (boundary, previous_height, has_previous)
+    } else {
+        (false, None, false)
+    };
+    reader.ensure_finished()?;
+    Ok(PendingIntervalUndoView {
+        metadata,
+        name_tree_interval_boundary,
+        previous_name_tree_accumulator_last_height,
+        has_previous_name_tree_accumulator,
+    })
+}
+
+fn prepare_name_tree_streaming_overrides<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+    limits: NameTreeMaterializationLimits,
+) -> Result<NameTreeStreamingPreparation, StateError> {
+    limits.page_budget.validate()?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+    if tree_interval == 0 {
+        return Err(StateError::Codec(
+            "network name-tree snapshot interval is zero".to_owned(),
+        ));
+    }
+    let stored = load_stored_name_tree_root(snapshot)?;
+    let committed = load_stored_name_tree_commit_root(snapshot)?;
+    if stored != committed {
+        return Err(StateError::StoredTreeRootMismatch {
+            stored,
+            actual: committed,
+        });
+    }
+
+    let Some((accumulator, accumulator_working_set_bytes)) =
+        load_name_tree_accumulator_streaming_bounded(snapshot, limits)?
+    else {
+        if !tip_height.is_multiple_of(tree_interval) {
+            return Err(StateError::Codec(format!(
+                "active tip height {tip_height} is between tree intervals but has no accumulator"
+            )));
+        }
+        return Ok(NameTreeStreamingPreparation {
+            stored,
+            overrides: BTreeMap::new(),
+            override_working_set_bytes: 0,
+        });
+    };
+
+    if tip_height.is_multiple_of(tree_interval) {
+        return Err(StateError::Codec(format!(
+            "tree-interval tip height {tip_height} unexpectedly has an accumulator"
+        )));
+    }
+    let expected_first = tip_height
+        .checked_sub(tip_height % tree_interval)
+        .and_then(|height| height.checked_add(1))
+        .ok_or_else(|| StateError::Codec("name-tree interval start overflowed".to_owned()))?;
+    if accumulator.base_root != stored
+        || accumulator.first_height != expected_first
+        || accumulator.last_height != tip_height
+    {
+        return Err(StateError::Codec(
+            "name-tree accumulator does not match the active tip interval".to_owned(),
+        ));
+    }
+
+    let distinct_override_limit = limits
+        .max_records
+        .min(NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES);
+    let accumulator_names = u64::try_from(accumulator.names.len()).unwrap_or(u64::MAX);
+    if accumulator_names > distinct_override_limit {
+        return Err(StateError::ResourceLimit {
+            context: "name-tree interval startup distinct overrides",
+            limit: distinct_override_limit,
+            actual: accumulator_names,
+        });
+    }
+    let mut audit_working_set_bytes = accumulator_working_set_bytes
+        .checked_add(
+            u64::try_from(std::mem::size_of::<BTreeMap<NameHash, u16>>()).unwrap_or(u64::MAX),
+        )
+        .and_then(|bytes| {
+            bytes.checked_add(
+                u64::try_from(std::mem::size_of::<BTreeMap<NameHash, Option<Vec<u8>>>>())
+                    .unwrap_or(u64::MAX),
+            )
+        })
+        .unwrap_or(u64::MAX);
+    ensure_name_tree_streaming_working_set(audit_working_set_bytes, 0, limits)?;
+
+    let mut expected_counts = BTreeMap::<NameHash, u16>::new();
+    let mut boundary_overrides = BTreeMap::<NameHash, Option<Vec<u8>>>::new();
+    let mut override_working_set_bytes = 0u64;
+    let mut interval_undo_bytes = 0u64;
+    for height in expected_first..=tip_height {
+        ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+        let hash = read_canonical_hash(snapshot, height)?.ok_or_else(|| {
+            StateError::Codec(format!(
+                "name-tree accumulator audit is missing canonical height {height}"
+            ))
+        })?;
+        let raw = snapshot
+            .get(ColumnFamily::Undo, hash.as_bytes())?
+            .ok_or(StateError::MissingUndo(hash))?;
+        interval_undo_bytes = add_bounded_resource(
+            interval_undo_bytes,
+            u64::try_from(raw.len()).unwrap_or(u64::MAX),
+            limits.max_interval_undo_bytes,
+            "name-tree interval startup undo bytes",
+        )?;
+        let undo_transient_bytes = u64::try_from(raw.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(NAME_TREE_STREAMING_DECODED_STATE_BYTES);
+        ensure_name_tree_streaming_working_set(
+            audit_working_set_bytes,
+            undo_transient_bytes,
+            limits,
+        )?;
+        let undo =
+            visit_pending_interval_undo_names(&raw, limits.deadline, |name_hash, previous_raw| {
+                match expected_counts.entry(name_hash) {
+                    Entry::Occupied(mut entry) => {
+                        let count = entry.get().checked_add(1).ok_or_else(|| {
+                            StateError::Codec(
+                                "name-tree accumulator audit reference count overflowed".to_owned(),
+                            )
+                        })?;
+                        entry.insert(count);
+                    }
+                    Entry::Vacant(entry) => {
+                        let projected = u64::try_from(boundary_overrides.len())
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(1);
+                        if projected > distinct_override_limit {
+                            return Err(StateError::ResourceLimit {
+                                context: "name-tree interval startup distinct overrides",
+                                limit: distinct_override_limit,
+                                actual: projected,
+                            });
+                        }
+                        let previous = match previous_raw {
+                            Some(previous_raw) => {
+                                let previous = decode_name_state(&name_hash, previous_raw)?;
+                                if previous.is_null() {
+                                    None
+                                } else {
+                                    Some(encode_name_state(&previous)?)
+                                }
+                            }
+                            None => None,
+                        };
+                        let previous_bytes = previous
+                            .as_ref()
+                            .map(|value| u64::try_from(value.len()).unwrap_or(u64::MAX))
+                            .unwrap_or(0);
+                        let audit_additional = NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES
+                            .checked_mul(2)
+                            .and_then(|bytes| bytes.checked_add(previous_bytes))
+                            .unwrap_or(u64::MAX);
+                        let projected_working_set = add_bounded_resource(
+                            audit_working_set_bytes,
+                            audit_additional,
+                            limits.max_working_set_bytes,
+                            "name-tree streaming working-set bytes",
+                        )?;
+                        ensure_name_tree_streaming_working_set(
+                            projected_working_set,
+                            undo_transient_bytes,
+                            limits,
+                        )?;
+                        audit_working_set_bytes = projected_working_set;
+                        override_working_set_bytes = override_working_set_bytes
+                            .checked_add(NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES)
+                            .and_then(|bytes| bytes.checked_add(previous_bytes))
+                            .unwrap_or(u64::MAX);
+                        entry.insert(1);
+                        boundary_overrides.insert(name_hash, previous);
+                    }
+                }
+                Ok(())
+            })?;
+        ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+        if undo.metadata.block_hash != hash
+            || undo.metadata.height != height
+            || undo.name_tree_interval_boundary
+            || undo.has_previous_name_tree_accumulator
+            || (height == expected_first
+                && undo.previous_name_tree_accumulator_last_height.is_some())
+            || (height > expected_first
+                && undo.previous_name_tree_accumulator_last_height != height.checked_sub(1))
+            || undo.metadata.previous_tree_root != stored
+            || undo.metadata.resulting_tree_root != stored
+            || undo.metadata.previous_committed_tree_root != stored
+            || undo.metadata.resulting_committed_tree_root != stored
+        {
+            return Err(StateError::Codec(format!(
+                "block undo at height {height} violates pending interval continuity"
+            )));
+        }
+    }
+    if accumulator.names != expected_counts {
+        return Err(StateError::Codec(
+            "name-tree accumulator names disagree with canonical undo".to_owned(),
+        ));
+    }
+    ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+
+    Ok(NameTreeStreamingPreparation {
+        stored,
+        overrides: boundary_overrides,
+        override_working_set_bytes,
+    })
+}
+
+fn push_name_tree_stream_entry(
+    accumulator: &mut SortedEntryRootAccumulator,
+    key: NameHash,
+    value: &[u8],
+    emitted_records: &mut u64,
+    emitted_encoded_bytes: &mut u64,
+    limits: NameTreeMaterializationLimits,
+) -> Result<(), StateError> {
+    ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+    *emitted_records = add_bounded_resource(
+        *emitted_records,
+        1,
+        limits.max_records,
+        "name-tree streaming emitted records",
+    )?;
+    let encoded_bytes = NAME_STATE_KEY_BYTES
+        .checked_add(value.len())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(u64::MAX);
+    *emitted_encoded_bytes = add_bounded_resource(
+        *emitted_encoded_bytes,
+        encoded_bytes,
+        limits.max_encoded_bytes,
+        "name-tree streaming emitted encoded bytes",
+    )?;
+    accumulator.push(key, value)?;
+    Ok(())
+}
+
+fn stream_name_state_root_with_overrides_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    overrides: &BTreeMap<NameHash, Option<Vec<u8>>>,
+    override_working_set_bytes: u64,
+    limits: NameTreeMaterializationLimits,
+) -> Result<NameTreeStreamingAudit, StateError> {
+    limits.page_budget.validate()?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+    let page_entry_overhead = u64::try_from(limits.page_budget.max_entries)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES);
+    let maximum_page_working_set = u64::try_from(limits.page_budget.max_bytes)
+        .unwrap_or(u64::MAX)
+        .checked_add(page_entry_overhead)
+        .and_then(|bytes| bytes.checked_add(NAME_TREE_STREAMING_DECODED_STATE_BYTES))
+        .and_then(|bytes| bytes.checked_add(NAME_TREE_STREAMING_CURSOR_BYTES))
+        .unwrap_or(u64::MAX);
+    let retained_streaming_bytes = override_working_set_bytes
+        .checked_add(NAME_TREE_STREAMING_ROOT_ACCUMULATOR_BYTES)
+        .and_then(|bytes| {
+            bytes.checked_add(
+                u64::try_from(std::mem::size_of::<BTreeMap<NameHash, Option<Vec<u8>>>>())
+                    .unwrap_or(u64::MAX),
+            )
+        })
+        .unwrap_or(u64::MAX);
+    ensure_name_tree_streaming_working_set(
+        retained_streaming_bytes,
+        maximum_page_working_set,
+        limits,
+    )?;
+
+    let mut root_accumulator = SortedEntryRootAccumulator::new();
+    let mut override_entries = overrides.iter().peekable();
+    let mut scanned_records = 0u64;
+    let mut scanned_encoded_bytes = 0u64;
+    let mut emitted_records = 0u64;
+    let mut emitted_encoded_bytes = 0u64;
+    let mut maximum_page_records = 0u64;
+    let mut maximum_page_bytes = 0u64;
+    let mut continuation = None::<Vec<u8>>;
+    loop {
+        ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::NameState,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+        )?;
+        ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+        validate_state_scan_page(
+            &page,
+            b"",
+            continuation.as_deref(),
+            limits.page_budget,
+            "name-tree streaming NameState scan",
+        )?;
+        maximum_page_records =
+            maximum_page_records.max(u64::try_from(page.entries.len()).unwrap_or(u64::MAX));
+        maximum_page_bytes =
+            maximum_page_bytes.max(u64::try_from(page.returned_bytes).unwrap_or(u64::MAX));
+        let next = page.continuation.clone();
+        for (key, value) in page.entries {
+            ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+            scanned_records = add_bounded_resource(
+                scanned_records,
+                1,
+                limits.max_records,
+                "name-tree streaming scanned records",
+            )?;
+            let scanned_record_bytes = key
+                .len()
+                .checked_add(value.len())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX);
+            scanned_encoded_bytes = add_bounded_resource(
+                scanned_encoded_bytes,
+                scanned_record_bytes,
+                limits.max_encoded_bytes,
+                "name-tree streaming scanned encoded bytes",
+            )?;
+            let key: [u8; 32] = key.try_into().map_err(|key: Vec<u8>| {
+                StateError::Codec(format!(
+                    "name-state key must contain 32 bytes, got {}",
+                    key.len()
+                ))
+            })?;
+            let name_hash = NameHash::new(key);
+            let state = decode_name_state(&name_hash, &value)?;
+            if state.is_null() {
+                return Err(StateError::Codec(
+                    "null NameState must not be persisted in the authenticated tree".to_owned(),
+                ));
+            }
+
+            while override_entries
+                .peek()
+                .is_some_and(|(override_key, _)| **override_key < name_hash)
+            {
+                let (override_key, override_value) = override_entries
+                    .next()
+                    .expect("peeked name-tree override exists");
+                if let Some(override_value) = override_value {
+                    push_name_tree_stream_entry(
+                        &mut root_accumulator,
+                        *override_key,
+                        override_value,
+                        &mut emitted_records,
+                        &mut emitted_encoded_bytes,
+                        limits,
+                    )?;
+                }
+            }
+            if override_entries
+                .peek()
+                .is_some_and(|(override_key, _)| **override_key == name_hash)
+            {
+                let (_, override_value) = override_entries
+                    .next()
+                    .expect("equal name-tree override exists");
+                if let Some(override_value) = override_value {
+                    push_name_tree_stream_entry(
+                        &mut root_accumulator,
+                        name_hash,
+                        override_value,
+                        &mut emitted_records,
+                        &mut emitted_encoded_bytes,
+                        limits,
+                    )?;
+                }
+            } else {
+                push_name_tree_stream_entry(
+                    &mut root_accumulator,
+                    name_hash,
+                    &value,
+                    &mut emitted_records,
+                    &mut emitted_encoded_bytes,
+                    limits,
+                )?;
+            }
+        }
+        let Some(next) = next else {
+            break;
+        };
+        continuation = Some(next);
+    }
+    for (override_key, override_value) in override_entries {
+        if let Some(override_value) = override_value {
+            push_name_tree_stream_entry(
+                &mut root_accumulator,
+                *override_key,
+                override_value,
+                &mut emitted_records,
+                &mut emitted_encoded_bytes,
+                limits,
+            )?;
+        }
+    }
+    ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+    let root = root_accumulator.finish()?;
+    ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
+    Ok(NameTreeStreamingAudit {
+        root,
+        scanned_records,
+        scanned_encoded_bytes,
+        emitted_records,
+        emitted_encoded_bytes,
+        maximum_page_records,
+        maximum_page_bytes,
+    })
+}
+
+/// Production startup variant with strict cursor paging, separately bounded
+/// scanned and emitted totals, an at-most-one-interval override set, and one
+/// absolute monotonic deadline shared across canonical undo and NameState.
+/// Base NameState values are validated, hashed, and discarded page by page.
+/// For `N` base states and `U` interval overrides, time is
+/// `O((N + U) * URKEL_BITS)` and retained memory is
+/// `O(page_budget + U + URKEL_BITS)`, never `O(N)`.
+pub fn verify_name_tree_interval_state_bounded<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+    limits: NameTreeMaterializationLimits,
+) -> Result<TreeRoot, StateError> {
+    let preparation =
+        prepare_name_tree_streaming_overrides(snapshot, tree_interval, tip_height, limits)?;
+    let audit = stream_name_state_root_with_overrides_bounded(
+        snapshot,
+        &preparation.overrides,
+        preparation.override_working_set_bytes,
+        limits,
+    )?;
+    if preparation.stored != audit.root {
+        return Err(StateError::StoredTreeRootMismatch {
+            stored: preparation.stored,
+            actual: audit.root,
+        });
+    }
+    Ok(audit.root)
 }
 
 pub fn encode_coin(coin: &Coin) -> Vec<u8> {
@@ -3969,6 +6698,14 @@ pub enum StateError {
     Codec(String),
     #[error("state store failed: {0}")]
     Store(#[from] StoreError),
+    #[error("{context} exceeded its resource limit: limit {limit}, actual {actual}")]
+    ResourceLimit {
+        context: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+    #[error("{context} exceeded its monotonic deadline")]
+    DeadlineExceeded { context: &'static str },
     #[error("authenticated name-tree calculation failed: {0}")]
     NameTree(#[from] UrkelError),
     #[error("durable name-tree-root metadata is missing")]
@@ -4179,6 +6916,966 @@ mod tests {
             !StateError::InputAuthorizationBackend("backend unavailable".to_owned())
                 .is_consensus_invalid()
         );
+    }
+
+    #[test]
+    fn block_undo_huge_counts_fail_before_vector_allocation() {
+        for (field, preceding_counts) in [
+            ("spent coin", 0usize),
+            ("created coin", 1),
+            ("airdrop undo position", 2),
+            ("name undo", 3),
+        ] {
+            let mut writer = Writer::new();
+            writer.write_u32(BLOCK_UNDO_VERSION);
+            writer.write_bytes(&[0; 32]);
+            writer.write_u32(0);
+            for _ in 0..4 {
+                writer.write_bytes(&[0; 32]);
+            }
+            for _ in 0..preceding_counts {
+                writer.write_varint(0);
+            }
+            writer.write_varint(u64::MAX);
+            let error = BlockUndo::decode(&writer.finish())
+                .expect_err("impossible count must fail before allocation");
+            assert!(
+                matches!(&error, StateError::Codec(message)
+                    if message.contains(field) && message.contains("count")),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_tree_accumulator_huge_count_fails_before_map_allocation() {
+        let mut writer = Writer::new();
+        writer.write_u32(NAME_TREE_ACCUMULATOR_VERSION);
+        writer.write_bytes(TreeRoot::ZERO.as_bytes());
+        writer.write_u32(1);
+        writer.write_u32(1);
+        writer.write_varint(u64::MAX);
+        let mut raw = writer.finish();
+        raw.extend_from_slice(&blake2b_256(&raw));
+        assert!(matches!(
+            NameTreeAccumulator::decode(&raw),
+            Err(StateError::Codec(message))
+                if message.contains("accumulator name count")
+                    && message.contains("minimally encoded")
+        ));
+    }
+
+    #[test]
+    fn name_tree_accumulator_decode_preflights_raw_plus_map_working_set() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let name_hash = ordered_test_name_hash(1);
+        let accumulator = NameTreeAccumulator {
+            base_root: TreeRoot::new([1; 32]),
+            first_height: 1,
+            last_height: 1,
+            names: BTreeMap::from([(name_hash, 1)]),
+        };
+        let raw = accumulator.encode().expect("encode accumulator");
+        let exact = u64::try_from(raw.len())
+            .expect("raw bytes")
+            .checked_add(
+                u64::try_from(std::mem::size_of::<NameTreeAccumulator>())
+                    .expect("fixed accumulator bytes"),
+            )
+            .and_then(|bytes| bytes.checked_add(NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES))
+            .expect("exact accumulator working set");
+        let mut batch = store.batch();
+        batch
+            .put(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY, &raw)
+            .expect("write accumulator");
+        store.commit(batch).expect("commit accumulator");
+        let snapshot = store.snapshot().expect("snapshot");
+        let limits = NameTreeMaterializationLimits {
+            max_records: 1,
+            max_encoded_bytes: 1,
+            max_interval_undo_bytes: 0,
+            max_working_set_bytes: exact,
+            page_budget: PrefixScanBudget {
+                max_entries: 1,
+                max_bytes: 1,
+            },
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let (decoded, retained) = load_name_tree_accumulator_streaming_bounded(&snapshot, limits)
+            .expect("exact accumulator working set")
+            .expect("stored accumulator");
+        assert_eq!(decoded, accumulator);
+        assert_eq!(
+            retained,
+            exact - u64::try_from(raw.len()).expect("raw bytes")
+        );
+        assert!(matches!(
+            load_name_tree_accumulator_streaming_bounded(
+                &snapshot,
+                NameTreeMaterializationLimits {
+                    max_working_set_bytes: exact - 1,
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree streaming working-set bytes",
+                limit,
+                actual,
+            }) if limit == exact - 1 && actual == exact
+        ));
+    }
+
+    struct PagedOnlySnapshot<S> {
+        inner: S,
+        page_calls: Cell<usize>,
+        maximum_page_records: Cell<usize>,
+        maximum_page_bytes: Cell<usize>,
+    }
+
+    impl<S> PagedOnlySnapshot<S> {
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                page_calls: Cell::new(0),
+                maximum_page_records: Cell::new(0),
+                maximum_page_bytes: Cell::new(0),
+            }
+        }
+    }
+
+    impl<S: ReadSnapshot> ReadSnapshot for PagedOnlySnapshot<S> {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            self.inner.get(family, key)
+        }
+
+        fn get_many(
+            &self,
+            family: ColumnFamily,
+            keys: &[&[u8]],
+        ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+            self.inner.get_many(family, keys)
+        }
+
+        fn scan_prefix(
+            &self,
+            _family: ColumnFamily,
+            _prefix: &[u8],
+        ) -> Result<Vec<hns_store::ScanEntry>, StoreError> {
+            Err(StoreError::Io(
+                "bounded state path attempted a full prefix materialization".to_owned(),
+            ))
+        }
+
+        fn scan_prefix_page(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+            start_after: Option<&[u8]>,
+            budget: PrefixScanBudget,
+        ) -> Result<PrefixScanPage, StoreError> {
+            self.page_calls.set(self.page_calls.get() + 1);
+            self.maximum_page_records
+                .set(self.maximum_page_records.get().max(budget.max_entries));
+            self.maximum_page_bytes
+                .set(self.maximum_page_bytes.get().max(budget.max_bytes));
+            self.inner
+                .scan_prefix_page(family, prefix, start_after, budget)
+        }
+    }
+
+    fn streaming_name_state_fixture(
+        records: u64,
+    ) -> (MemoryStore, TreeRoot, u64, Vec<(NameHash, Vec<u8>)>) {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let mut batch = store.batch();
+        let mut accumulator = SortedEntryRootAccumulator::new();
+        let mut encoded_bytes = 0u64;
+        let mut entries = Vec::with_capacity(records as usize);
+        for index in 0..records {
+            let mut raw_key = [0u8; 32];
+            raw_key[24..].copy_from_slice(&index.to_be_bytes());
+            let name_hash = NameHash::new(raw_key);
+            let mut state = NameState::null(name_hash);
+            state.initialize(format!("stream-{index:08}").into_bytes(), 100);
+            let encoded = encode_name_state(&state).expect("encode streaming state");
+            encoded_bytes += NAME_STATE_KEY_BYTES as u64 + encoded.len() as u64;
+            accumulator
+                .push(name_hash, &encoded)
+                .expect("accumulate streaming state");
+            batch
+                .put(ColumnFamily::NameState, name_hash.as_bytes(), &encoded)
+                .expect("write streaming state");
+            entries.push((name_hash, encoded));
+        }
+        let root = accumulator.finish().expect("streaming fixture root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                root.as_bytes(),
+            )
+            .expect("write streaming root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                root.as_bytes(),
+            )
+            .expect("write streaming committed root");
+        store.commit(batch).expect("commit streaming fixture");
+        (store, root, encoded_bytes, entries)
+    }
+
+    #[test]
+    fn name_tree_startup_stream_retains_at_most_one_bounded_page() {
+        const RECORDS: u64 = 32_769;
+        const PAGE_RECORDS: usize = 1_024;
+        const PAGE_BYTES: usize = 1024 * 1024;
+        let (store, expected, encoded_bytes, _) = streaming_name_state_fixture(RECORDS);
+        let snapshot = PagedOnlySnapshot::new(store.snapshot().expect("streaming snapshot"));
+        let limits = NameTreeMaterializationLimits {
+            max_records: RECORDS,
+            max_encoded_bytes: encoded_bytes,
+            max_interval_undo_bytes: 0,
+            max_working_set_bytes: 2 * 1024 * 1024,
+            page_budget: PrefixScanBudget {
+                max_entries: PAGE_RECORDS,
+                max_bytes: PAGE_BYTES,
+            },
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        let audit =
+            stream_name_state_root_with_overrides_bounded(&snapshot, &BTreeMap::new(), 0, limits)
+                .expect("stream scale-shaped NameState");
+        assert_eq!(audit.root, expected);
+        assert_eq!(audit.scanned_records, RECORDS);
+        assert_eq!(audit.scanned_encoded_bytes, encoded_bytes);
+        assert_eq!(audit.emitted_records, RECORDS);
+        assert_eq!(audit.emitted_encoded_bytes, encoded_bytes);
+        assert_eq!(audit.maximum_page_records, PAGE_RECORDS as u64);
+        assert!(audit.maximum_page_bytes <= PAGE_BYTES as u64);
+        assert!(snapshot.page_calls.get() > 32);
+        assert_eq!(snapshot.maximum_page_records.get(), PAGE_RECORDS);
+        assert_eq!(snapshot.maximum_page_bytes.get(), PAGE_BYTES);
+        assert_eq!(
+            verify_stored_name_tree_root_metadata_binding(&snapshot)
+                .expect("metadata-only binding"),
+            expected
+        );
+        assert_eq!(
+            verify_name_tree_interval_state_bounded(
+                &snapshot,
+                2,
+                0,
+                NameTreeMaterializationLimits {
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    ..limits
+                },
+            )
+            .expect("verify exact streaming root"),
+            expected
+        );
+
+        assert!(matches!(
+            stream_name_state_root_with_overrides_bounded(
+                &snapshot,
+                &BTreeMap::new(),
+                0,
+                NameTreeMaterializationLimits {
+                    max_records: RECORDS - 1,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree streaming scanned records",
+                limit,
+                actual,
+            }) if limit == RECORDS - 1 && actual == RECORDS
+        ));
+        assert!(matches!(
+            stream_name_state_root_with_overrides_bounded(
+                &snapshot,
+                &BTreeMap::new(),
+                0,
+                NameTreeMaterializationLimits {
+                    max_encoded_bytes: encoded_bytes - 1,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree streaming scanned encoded bytes",
+                limit,
+                actual,
+            }) if limit == encoded_bytes - 1 && actual == encoded_bytes
+        ));
+        assert!(matches!(
+            stream_name_state_root_with_overrides_bounded(
+                &snapshot,
+                &BTreeMap::new(),
+                0,
+                NameTreeMaterializationLimits {
+                    deadline: Instant::now(),
+                    ..limits
+                },
+            ),
+            Err(StateError::DeadlineExceeded {
+                context: "name-tree streaming verification"
+            })
+        ));
+    }
+
+    #[test]
+    fn name_tree_startup_stream_bounds_emitted_override_totals_exactly() {
+        let (store, _, scanned_bytes, entries) = streaming_name_state_fixture(2);
+        let snapshot = PagedOnlySnapshot::new(store.snapshot().expect("streaming snapshot"));
+        let mut raw_key = [0xff; 32];
+        raw_key[31] = 0xfe;
+        let override_key = NameHash::new(raw_key);
+        assert!(entries.last().is_some_and(|(key, _)| *key < override_key));
+        let mut state = NameState::null(override_key);
+        state.initialize(b"stream-override".to_vec(), 101);
+        let override_value = encode_name_state(&state).expect("encode override");
+        let override_working_set_bytes =
+            NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES + override_value.len() as u64;
+        let emitted_bytes =
+            scanned_bytes + NAME_STATE_KEY_BYTES as u64 + override_value.len() as u64;
+        let overrides = BTreeMap::from([(override_key, Some(override_value))]);
+        let limits = NameTreeMaterializationLimits {
+            max_records: 3,
+            max_encoded_bytes: emitted_bytes,
+            max_interval_undo_bytes: 0,
+            max_working_set_bytes: 2 * 1024 * 1024,
+            page_budget: PrefixScanBudget {
+                max_entries: 1,
+                max_bytes: 1024,
+            },
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let audit = stream_name_state_root_with_overrides_bounded(
+            &snapshot,
+            &overrides,
+            override_working_set_bytes,
+            limits,
+        )
+        .expect("exact emitted limits");
+        assert_eq!(audit.scanned_records, 2);
+        assert_eq!(audit.scanned_encoded_bytes, scanned_bytes);
+        assert_eq!(audit.emitted_records, 3);
+        assert_eq!(audit.emitted_encoded_bytes, emitted_bytes);
+
+        assert!(matches!(
+            stream_name_state_root_with_overrides_bounded(
+                &snapshot,
+                &overrides,
+                override_working_set_bytes,
+                NameTreeMaterializationLimits {
+                    max_records: 2,
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree streaming emitted records",
+                limit: 2,
+                actual: 3,
+            })
+        ));
+        assert!(matches!(
+            stream_name_state_root_with_overrides_bounded(
+                &snapshot,
+                &overrides,
+                override_working_set_bytes,
+                NameTreeMaterializationLimits {
+                    max_encoded_bytes: emitted_bytes - 1,
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree streaming emitted encoded bytes",
+                limit,
+                actual,
+            }) if limit == emitted_bytes - 1 && actual == emitted_bytes
+        ));
+    }
+
+    fn ordered_test_name_hash(index: u64) -> NameHash {
+        let mut raw = [0u8; 32];
+        raw[24..].copy_from_slice(&index.to_be_bytes());
+        NameHash::new(raw)
+    }
+
+    fn initialized_test_name_state(index: u64, label: &[u8]) -> NameState {
+        let mut state = NameState::null(ordered_test_name_hash(index));
+        state.initialize(label.to_vec(), 100 + index as u32);
+        state
+    }
+
+    #[test]
+    fn name_tree_startup_stream_merge_matches_collecting_oracle_at_every_ordering_case() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let mut batch = store.batch();
+        let mut scanned_bytes = 0u64;
+        for (index, label) in [
+            (10, b"base-10".as_slice()),
+            (20, b"base-20".as_slice()),
+            (30, b"base-30".as_slice()),
+            (50, b"base-50".as_slice()),
+        ] {
+            let state = initialized_test_name_state(index, label);
+            let encoded = encode_name_state(&state).expect("encode base state");
+            scanned_bytes += NAME_STATE_KEY_BYTES as u64 + encoded.len() as u64;
+            batch
+                .put(
+                    ColumnFamily::NameState,
+                    state.name_hash.as_bytes(),
+                    &encoded,
+                )
+                .expect("write base state");
+        }
+        store.commit(batch).expect("commit base states");
+
+        let state_overrides = BTreeMap::from([
+            (
+                ordered_test_name_hash(5),
+                Some(initialized_test_name_state(5, b"before-first")),
+            ),
+            (
+                ordered_test_name_hash(10),
+                Some(initialized_test_name_state(10, b"equal-replacement")),
+            ),
+            (ordered_test_name_hash(20), None),
+            (
+                ordered_test_name_hash(40),
+                Some(initialized_test_name_state(40, b"between-pages")),
+            ),
+            (
+                ordered_test_name_hash(60),
+                Some(initialized_test_name_state(60, b"after-last")),
+            ),
+        ]);
+        let encoded_overrides = state_overrides
+            .iter()
+            .map(|(name_hash, state)| {
+                state
+                    .as_ref()
+                    .map(|state| encode_name_state(state).map(Some))
+                    .unwrap_or(Ok(None))
+                    .map(|encoded| (*name_hash, encoded))
+            })
+            .collect::<Result<BTreeMap<_, _>, StateError>>()
+            .expect("encode streaming overrides");
+        let override_working_set_bytes = u64::try_from(encoded_overrides.len())
+            .unwrap_or(u64::MAX)
+            .checked_mul(NAME_TREE_MATERIALIZATION_ENTRY_OVERHEAD_BYTES)
+            .and_then(|bytes| {
+                encoded_overrides
+                    .values()
+                    .flatten()
+                    .try_fold(bytes, |total, value| {
+                        total.checked_add(u64::try_from(value.len()).ok()?)
+                    })
+            })
+            .expect("override working-set bytes");
+
+        let collecting_snapshot = store.snapshot().expect("collecting snapshot");
+        let collecting =
+            materialize_name_tree_with_overrides(&collecting_snapshot, &state_overrides)
+                .expect("collecting oracle");
+        let expected_root = collecting.root();
+        let expected_records =
+            u64::try_from(collecting.entries().count()).expect("expected record count");
+        let expected_bytes = collecting
+            .entries()
+            .try_fold(0u64, |total, (_, value)| {
+                total.checked_add(NAME_STATE_KEY_BYTES as u64 + value.len() as u64)
+            })
+            .expect("expected encoded bytes");
+        assert_eq!(expected_records, 6);
+
+        let snapshot = PagedOnlySnapshot::new(store.snapshot().expect("streaming snapshot"));
+        let audit = stream_name_state_root_with_overrides_bounded(
+            &snapshot,
+            &encoded_overrides,
+            override_working_set_bytes,
+            NameTreeMaterializationLimits {
+                max_records: expected_records,
+                max_encoded_bytes: scanned_bytes.max(expected_bytes),
+                max_interval_undo_bytes: 0,
+                max_working_set_bytes: 2 * 1024 * 1024,
+                page_budget: PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: 1024,
+                },
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+        )
+        .expect("stream every ordering case");
+        assert_eq!(audit.root, expected_root);
+        assert_eq!(audit.scanned_records, 4);
+        assert_eq!(audit.scanned_encoded_bytes, scanned_bytes);
+        assert_eq!(audit.emitted_records, expected_records);
+        assert_eq!(audit.emitted_encoded_bytes, expected_bytes);
+        assert_eq!(audit.maximum_page_records, 1);
+        assert!(snapshot.page_calls.get() >= 4);
+    }
+
+    fn empty_block_undo(block_hash: BlockHash, height: Height) -> BlockUndo {
+        BlockUndo {
+            block_hash,
+            height,
+            previous_tree_root: TreeRoot::ZERO,
+            resulting_tree_root: TreeRoot::ZERO,
+            previous_committed_tree_root: TreeRoot::ZERO,
+            resulting_committed_tree_root: TreeRoot::ZERO,
+            spent_coins: Vec::new(),
+            created_coins: Vec::new(),
+            airdrop_positions: Vec::new(),
+            previous_name_states: Vec::new(),
+            name_tree_interval_boundary: false,
+            previous_name_tree_accumulator_last_height: None,
+            previous_name_tree_accumulator: None,
+        }
+    }
+
+    #[test]
+    fn borrowing_block_undo_metadata_parser_matches_authoritative_codec() {
+        let block_hash = BlockHash::new([0x31; 32]);
+        let name_hash = hash_name("metadata-parity").expect("name hash");
+        let mut previous_name = NameState::null(name_hash);
+        previous_name.initialize(b"metadata-parity".to_vec(), 42);
+        let undo = BlockUndo {
+            block_hash,
+            height: 77,
+            previous_tree_root: TreeRoot::new([1; 32]),
+            resulting_tree_root: TreeRoot::new([2; 32]),
+            previous_committed_tree_root: TreeRoot::new([3; 32]),
+            resulting_committed_tree_root: TreeRoot::new([4; 32]),
+            spent_coins: vec![Coin {
+                outpoint: Outpoint {
+                    txid: Txid::new([5; 32]),
+                    index: 6,
+                },
+                value: 7,
+                height: 8,
+                coinbase: false,
+                address: address(),
+                covenant: covenant(),
+            }],
+            created_coins: vec![Outpoint {
+                txid: Txid::new([9; 32]),
+                index: 10,
+            }],
+            airdrop_positions: vec![11],
+            previous_name_states: vec![NameUndo {
+                name_hash,
+                previous: Some(previous_name),
+            }],
+            name_tree_interval_boundary: true,
+            previous_name_tree_accumulator_last_height: Some(76),
+            previous_name_tree_accumulator: Some(NameTreeAccumulator {
+                base_root: TreeRoot::new([12; 32]),
+                first_height: 70,
+                last_height: 76,
+                names: BTreeMap::from([(name_hash, 1)]),
+            }),
+        };
+        let raw = undo.encode().expect("encode undo");
+        assert_eq!(BlockUndo::decode(&raw).expect("authoritative decode"), undo);
+        let metadata = decode_block_undo_metadata(&raw, Instant::now() + Duration::from_secs(10))
+            .expect("borrowing metadata decode");
+        assert_eq!(metadata.block_hash, undo.block_hash);
+        assert_eq!(metadata.height, undo.height);
+        assert_eq!(metadata.previous_tree_root, undo.previous_tree_root);
+        assert_eq!(metadata.resulting_tree_root, undo.resulting_tree_root);
+        assert_eq!(
+            metadata.previous_committed_tree_root,
+            undo.previous_committed_tree_root
+        );
+        assert_eq!(
+            metadata.resulting_committed_tree_root,
+            undo.resulting_committed_tree_root
+        );
+        let mut visited_names = Vec::new();
+        let view = visit_pending_interval_undo_names(
+            &raw,
+            Instant::now() + Duration::from_secs(10),
+            |visited_hash, previous| {
+                visited_names.push((
+                    visited_hash,
+                    previous
+                        .map(|previous| decode_name_state(&visited_hash, previous))
+                        .transpose()?,
+                ));
+                Ok(())
+            },
+        )
+        .expect("borrowing pending-interval decode");
+        assert_eq!(view.metadata, metadata);
+        assert!(view.name_tree_interval_boundary);
+        assert_eq!(
+            view.previous_name_tree_accumulator_last_height,
+            undo.previous_name_tree_accumulator_last_height
+        );
+        assert!(view.has_previous_name_tree_accumulator);
+        assert_eq!(
+            visited_names,
+            vec![(name_hash, undo.previous_name_states[0].previous.clone())]
+        );
+
+        let mut trailing = raw;
+        trailing.push(0);
+        assert!(BlockUndo::decode(&trailing).is_err());
+        assert!(
+            decode_block_undo_metadata(&trailing, Instant::now() + Duration::from_secs(10),)
+                .is_err()
+        );
+        assert!(visit_pending_interval_undo_names(
+            &trailing,
+            Instant::now() + Duration::from_secs(10),
+            |_, _| Ok(()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn retained_root_discovery_pages_and_enforces_exact_total_budgets() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let mut batch = store.batch();
+        let mut undo_bytes = 0u64;
+        let mut pin_bytes = 0u64;
+        for (index, height) in [100u32, 101].into_iter().enumerate() {
+            let mut raw_hash = [0u8; 32];
+            raw_hash[31] = (index + 1) as u8;
+            let block_hash = BlockHash::new(raw_hash);
+            let raw_undo = empty_block_undo(block_hash, height)
+                .encode()
+                .expect("encode undo");
+            undo_bytes += raw_undo.len() as u64;
+            batch
+                .put(ColumnFamily::Undo, block_hash.as_bytes(), &raw_undo)
+                .expect("put undo");
+            let raw_pin = NameTreeSnapshotPin {
+                height,
+                block_hash,
+                root: TreeRoot::ZERO,
+            }
+            .encode();
+            pin_bytes += raw_pin.len() as u64;
+            batch
+                .put(
+                    ColumnFamily::Snapshots,
+                    &name_tree_snapshot_pin_key(height),
+                    &raw_pin,
+                )
+                .expect("put pin");
+        }
+        store.commit(batch).expect("commit retained-root fixture");
+        let snapshot = PagedOnlySnapshot::new(store.snapshot().expect("retained-root snapshot"));
+        let limits = RetainedNameTreeRootLimits {
+            max_undo_records: 2,
+            max_undo_bytes: undo_bytes,
+            max_pin_records: 2,
+            max_pin_bytes: pin_bytes,
+            max_roots: 1,
+            page_budget: PrefixScanBudget {
+                max_entries: 1,
+                max_bytes: RETAINED_NAME_TREE_ROOT_SCAN_PAGE_BYTES,
+            },
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let selection =
+            retained_name_tree_roots_bounded(&snapshot, limits).expect("exact retained budgets");
+        assert_eq!(selection.roots, BTreeSet::from([TreeRoot::ZERO]));
+        assert_eq!(selection.undo_records, 2);
+        assert_eq!(selection.undo_bytes, undo_bytes);
+        assert_eq!(selection.pin_records, 2);
+        assert_eq!(selection.pin_bytes, pin_bytes);
+        assert!(snapshot.page_calls.get() >= 4);
+        assert_eq!(snapshot.maximum_page_records.get(), 1);
+
+        assert!(matches!(
+            retained_name_tree_roots_bounded(
+                &snapshot,
+                RetainedNameTreeRootLimits {
+                    max_undo_records: 1,
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "retained block undo records",
+                limit: 1,
+                actual: 2,
+            })
+        ));
+        assert!(matches!(
+            retained_name_tree_roots_bounded(
+                &snapshot,
+                RetainedNameTreeRootLimits {
+                    max_undo_bytes: undo_bytes - 1,
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "retained block undo bytes",
+                limit,
+                actual,
+            }) if limit == undo_bytes - 1 && actual == undo_bytes
+        ));
+        assert!(matches!(
+            retained_name_tree_roots_bounded(
+                &snapshot,
+                RetainedNameTreeRootLimits {
+                    max_pin_records: 1,
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree snapshot pin records",
+                limit: 1,
+                actual: 2,
+            })
+        ));
+        assert!(matches!(
+            retained_name_tree_roots_bounded(
+                &snapshot,
+                RetainedNameTreeRootLimits {
+                    max_pin_bytes: pin_bytes - 1,
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree snapshot pin bytes",
+                limit,
+                actual,
+            }) if limit == pin_bytes - 1 && actual == pin_bytes
+        ));
+        assert!(matches!(
+            retained_name_tree_roots_bounded(
+                &snapshot,
+                RetainedNameTreeRootLimits {
+                    deadline: Instant::now(),
+                    ..limits
+                },
+            ),
+            Err(StateError::DeadlineExceeded {
+                context: "retained name-tree root discovery"
+            })
+        ));
+    }
+
+    #[test]
+    fn retained_root_discovery_rejects_malformed_key_and_trailing_undo_bytes() {
+        for corruption in ["key", "trailing"] {
+            let store = MemoryStore::new();
+            hns_store::initialize_schema(&store).expect("schema");
+            let block_hash = BlockHash::new([0x21; 32]);
+            let mut raw = empty_block_undo(block_hash, 55)
+                .encode()
+                .expect("encode undo");
+            let key = if corruption == "key" {
+                [0x22; 32]
+            } else {
+                raw.push(0);
+                *block_hash.as_bytes()
+            };
+            let mut batch = store.batch();
+            batch
+                .put(ColumnFamily::Undo, &key, &raw)
+                .expect("put corrupt undo");
+            store.commit(batch).expect("commit corrupt undo");
+            let snapshot = store.snapshot().expect("snapshot");
+            let error = retained_name_tree_roots_bounded(
+                &snapshot,
+                RetainedNameTreeRootLimits {
+                    max_undo_records: 1,
+                    max_undo_bytes: raw.len() as u64,
+                    max_pin_records: 1,
+                    max_pin_bytes: NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE as u64,
+                    max_roots: 8,
+                    page_budget: PrefixScanBudget {
+                        max_entries: 1,
+                        max_bytes: RETAINED_NAME_TREE_ROOT_SCAN_PAGE_BYTES,
+                    },
+                    deadline: Instant::now() + Duration::from_secs(10),
+                },
+            )
+            .expect_err("corrupt retained undo");
+            assert!(
+                matches!(&error, StateError::Codec(message)
+                    if message.contains(if corruption == "key" { "key" } else { "trailing" })),
+                "{corruption}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_pin_visitor_streams_more_than_retained_compaction_cap() {
+        const PIN_COUNT: u64 = 5_000;
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let mut batch = store.batch();
+        for height in 0..PIN_COUNT as u32 {
+            let mut raw_hash = [0u8; 32];
+            raw_hash[..4].copy_from_slice(&height.to_be_bytes());
+            let pin = NameTreeSnapshotPin {
+                height,
+                block_hash: BlockHash::new(raw_hash),
+                root: TreeRoot::new(raw_hash),
+            };
+            batch
+                .put(
+                    ColumnFamily::Snapshots,
+                    &name_tree_snapshot_pin_key(height),
+                    &pin.encode(),
+                )
+                .expect("put pin");
+        }
+        store.commit(batch).expect("commit pins");
+        let snapshot = PagedOnlySnapshot::new(store.snapshot().expect("pin snapshot"));
+        let exact_bytes = PIN_COUNT * NAME_TREE_SNAPSHOT_PIN_CODEC_SIZE as u64;
+        let limits = NameTreeSnapshotPinScanLimits {
+            max_records: PIN_COUNT,
+            max_bytes: exact_bytes,
+            page_budget: PrefixScanBudget {
+                max_entries: 37,
+                max_bytes: 8 * 1024,
+            },
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let mut visited = 0u64;
+        let summary = visit_name_tree_snapshot_pins_bounded(&snapshot, limits, |pin| {
+            assert_eq!(pin.height, visited as u32);
+            visited += 1;
+            Ok(())
+        })
+        .expect("stream all pins");
+        assert_eq!(visited, PIN_COUNT);
+        assert_eq!(
+            summary,
+            NameTreeSnapshotPinScanSummary {
+                records: PIN_COUNT,
+                bytes: exact_bytes,
+            }
+        );
+        assert!(snapshot.page_calls.get() > 1);
+        assert_eq!(snapshot.maximum_page_records.get(), 37);
+        assert_eq!(snapshot.maximum_page_bytes.get(), 8 * 1024);
+
+        assert!(matches!(
+            visit_name_tree_snapshot_pins_bounded(
+                &snapshot,
+                NameTreeSnapshotPinScanLimits {
+                    max_records: PIN_COUNT - 1,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    ..limits
+                },
+                |_| Ok(()),
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree snapshot pin records",
+                limit,
+                actual,
+            }) if limit == PIN_COUNT - 1 && actual == PIN_COUNT
+        ));
+        assert!(matches!(
+            visit_name_tree_snapshot_pins_bounded(
+                &snapshot,
+                NameTreeSnapshotPinScanLimits {
+                    max_bytes: exact_bytes - 1,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                    ..limits
+                },
+                |_| Ok(()),
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree snapshot pin bytes",
+                limit,
+                actual,
+            }) if limit == exact_bytes - 1 && actual == exact_bytes
+        ));
+        assert!(matches!(
+            visit_name_tree_snapshot_pins_bounded(
+                &snapshot,
+                NameTreeSnapshotPinScanLimits {
+                    deadline: Instant::now(),
+                    ..limits
+                },
+                |_| Ok(()),
+            ),
+            Err(StateError::DeadlineExceeded {
+                context: "name-tree snapshot pin scan"
+            })
+        ));
+    }
+
+    #[test]
+    fn retained_root_metadata_parser_accepts_near_codec_max_without_aggregate_vectors() {
+        let airdrop_bytes = (BLOCK_UNDO_CODEC_MAX - 256) / 4 * 4;
+        let airdrop_count = airdrop_bytes / 4;
+        let block_hash = BlockHash::new([0x6a; 32]);
+        let mut writer = Writer::with_capacity(BLOCK_UNDO_CODEC_MAX);
+        writer.write_u32(BLOCK_UNDO_VERSION);
+        writer.write_bytes(block_hash.as_bytes());
+        writer.write_u32(123);
+        for _ in 0..4 {
+            writer.write_bytes(TreeRoot::ZERO.as_bytes());
+        }
+        writer.write_varint(0);
+        writer.write_varint(0);
+        writer.write_varint(airdrop_count as u64);
+        writer.write_bytes(&vec![0; airdrop_bytes]);
+        writer.write_varint(0);
+        writer.write_u8(0);
+        writer.write_u8(0);
+        writer.write_u8(0);
+        let raw = writer.finish();
+        assert!(raw.len() <= BLOCK_UNDO_CODEC_MAX);
+        assert!(raw.len() > BLOCK_UNDO_CODEC_MAX - 1_024);
+
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let mut batch = store.batch();
+        batch
+            .put(ColumnFamily::Undo, block_hash.as_bytes(), &raw)
+            .expect("put near-max undo");
+        store.commit(batch).expect("commit near-max undo");
+        let snapshot = PagedOnlySnapshot::new(store.snapshot().expect("snapshot"));
+        let limits = RetainedNameTreeRootLimits {
+            max_undo_records: 1,
+            max_undo_bytes: raw.len() as u64,
+            max_pin_records: 0,
+            max_pin_bytes: 0,
+            max_roots: 1,
+            page_budget: PrefixScanBudget {
+                max_entries: 1,
+                max_bytes: RETAINED_NAME_TREE_ROOT_SCAN_PAGE_BYTES,
+            },
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let selection =
+            retained_name_tree_roots_bounded(&snapshot, limits).expect("near-max metadata");
+        assert_eq!(selection.undo_records, 1);
+        assert_eq!(selection.undo_bytes, raw.len() as u64);
+        assert_eq!(selection.roots, BTreeSet::from([TreeRoot::ZERO]));
+        assert!(matches!(
+            retained_name_tree_roots_bounded(
+                &snapshot,
+                RetainedNameTreeRootLimits {
+                    max_undo_bytes: raw.len() as u64 - 1,
+                    ..limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "retained block undo bytes",
+                limit,
+                actual,
+            }) if limit == raw.len() as u64 - 1 && actual == raw.len() as u64
+        ));
     }
 
     struct NoNameStateScanSnapshot<S> {
@@ -4445,6 +8142,36 @@ mod tests {
     }
 
     #[test]
+    fn interval_migration_batch_accounts_for_one_near_max_undo_atomically() {
+        let backup_key_bytes =
+            NAME_TREE_INTERVAL_MIGRATION_UNDO_PREFIX.len() + BLOCK_UNDO_KEY_BYTES;
+        let (backup, rewrite, publication) = name_tree_interval_migration_record_bytes(
+            BLOCK_UNDO_CODEC_MAX,
+            BLOCK_UNDO_CODEC_MAX,
+            backup_key_bytes,
+            true,
+        )
+        .expect("near-max record accounting");
+        assert_eq!(publication, backup + rewrite);
+        assert!(publication <= NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_BATCH_BYTES);
+        ensure_name_tree_interval_migration_record_batch_limit(publication, publication)
+            .expect("exact one-record batch limit");
+        assert!(matches!(
+            ensure_name_tree_interval_migration_record_batch_limit(publication, publication - 1),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration pending batch bytes",
+                limit,
+                actual,
+            }) if limit == publication - 1 && actual == publication
+        ));
+        assert_eq!(
+            NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAME_BYTES,
+            NAME_TREE_INTERVAL_MIGRATION_MAX_PENDING_NAMES
+                * NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES
+        );
+    }
+
+    #[test]
     fn schema_16_working_tree_migrates_to_reversible_interval_accumulator() {
         let store = MemoryStore::new();
         let mut state = engine(store.clone());
@@ -4558,9 +8285,187 @@ mod tests {
         drop(snapshot);
         store.commit(legacy_batch).expect("commit legacy fixture");
 
-        let migration = migrate_name_tree_interval_accumulator(
+        let migration_limits = NameTreeIntervalMigrationLimits {
+            max_height_records: 2,
+            max_height_bytes: 2 * (4 + 32),
+            page_budget: PrefixScanBudget {
+                max_entries: 1,
+                max_bytes: 4 + 32,
+            },
+            deadline: Instant::now() + Duration::from_secs(60),
+            ..NameTreeIntervalMigrationLimits::default()
+        };
+        let plan = plan_name_tree_interval_accumulator_migration_bounded(
             &store,
             Network::Regtest.params().names.tree_interval,
+            migration_limits,
+        )
+        .expect("migration plan")
+        .expect("schema-16 migration required");
+        assert_eq!(plan.active_heights, 2);
+        assert_eq!(plan.height_index_bytes, 2 * (4 + 32));
+        assert_eq!(plan.undo_records, 2);
+        assert_eq!(plan.legacy_undos_to_backup, 2);
+        assert_eq!(plan.peak_pending_names, 1);
+        assert_eq!(
+            plan.peak_pending_name_bytes,
+            NAME_TREE_INTERVAL_MIGRATION_NAME_ENTRY_ESTIMATED_BYTES
+        );
+        assert_eq!(
+            plan.required_temporary_bytes,
+            plan.publication_bytes * NAME_TREE_INTERVAL_MIGRATION_ROCKS_TEMPORARY_MULTIPLIER
+        );
+        let migration_limits = NameTreeIntervalMigrationLimits {
+            max_undo_input_bytes: plan.undo_input_bytes,
+            max_backup_output_bytes: plan.backup_output_bytes,
+            max_publication_bytes: plan.publication_bytes,
+            max_pending_batch_bytes: plan.maximum_record_publication_bytes,
+            max_pending_names: plan.peak_pending_names,
+            max_pending_name_bytes: plan.peak_pending_name_bytes,
+            ..migration_limits
+        };
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    deadline: Instant::now(),
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::DeadlineExceeded {
+                context: "name-tree interval migration"
+            })
+        ));
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    max_height_records: 1,
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration height records",
+                limit: 1,
+                actual: 2,
+            })
+        ));
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    max_height_bytes: 2 * (4 + 32) - 1,
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration height bytes",
+                limit,
+                actual,
+            }) if limit == (2 * (4 + 32) - 1) as u64
+                && actual == (2 * (4 + 32)) as u64
+        ));
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    max_undo_input_bytes: plan.undo_input_bytes - 1,
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration undo input bytes",
+                limit,
+                actual,
+            }) if limit == plan.undo_input_bytes - 1 && actual == plan.undo_input_bytes
+        ));
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    max_backup_output_bytes: plan.backup_output_bytes - 1,
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration backup output bytes",
+                limit,
+                actual,
+            }) if limit == plan.backup_output_bytes - 1
+                && actual == plan.backup_output_bytes
+        ));
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    max_publication_bytes: plan.publication_bytes - 1,
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration publication bytes",
+                limit,
+                actual,
+            }) if limit == plan.publication_bytes - 1 && actual == plan.publication_bytes
+        ));
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    max_pending_batch_bytes: plan.maximum_record_publication_bytes - 1,
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration pending batch bytes",
+                limit,
+                actual,
+            }) if limit == plan.maximum_record_publication_bytes - 1
+                && actual == plan.maximum_record_publication_bytes
+        ));
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    max_pending_names: plan.peak_pending_names - 1,
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration pending names",
+                limit,
+                actual,
+            }) if limit == plan.peak_pending_names - 1
+                && actual == plan.peak_pending_names
+        ));
+        assert!(matches!(
+            migrate_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                NameTreeIntervalMigrationLimits {
+                    max_pending_name_bytes: plan.peak_pending_name_bytes - 1,
+                    ..migration_limits
+                },
+            ),
+            Err(StateError::ResourceLimit {
+                context: "name-tree interval migration pending name bytes",
+                limit,
+                actual,
+            }) if limit == plan.peak_pending_name_bytes - 1
+                && actual == plan.peak_pending_name_bytes
+        ));
+        let migration = migrate_name_tree_interval_accumulator_bounded(
+            &store,
+            Network::Regtest.params().names.tree_interval,
+            migration_limits,
         )
         .expect("migrate legacy state")
         .expect("migration performed");
@@ -4569,6 +8474,22 @@ mod tests {
         assert_eq!(migration.legacy_undos_backed_up, 2);
         assert_eq!(migration.pending_names, 1);
         assert_eq!(migration.tip_height, Some(101));
+        assert_eq!(migration.height_index_bytes, plan.height_index_bytes);
+        assert_eq!(migration.undo_input_bytes, plan.undo_input_bytes);
+        assert_eq!(migration.backup_output_bytes, plan.backup_output_bytes);
+        assert_eq!(migration.rewrite_output_bytes, plan.rewrite_output_bytes);
+        assert_eq!(migration.publication_bytes, plan.publication_bytes);
+        assert_eq!(
+            migration.required_temporary_bytes,
+            plan.required_temporary_bytes
+        );
+        assert_eq!(migration.peak_pending_names, plan.peak_pending_names);
+        assert_eq!(
+            migration.peak_pending_name_bytes,
+            plan.peak_pending_name_bytes
+        );
+        assert!(migration.peak_batch_bytes <= migration_limits.max_pending_batch_bytes);
+        assert_eq!(migration.batch_commits, 2);
 
         let snapshot = store.snapshot().expect("migrated snapshot");
         assert_eq!(
