@@ -45,7 +45,7 @@ use hns_rpc::{
 };
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use hns_store::mark_clean_shutdown;
-use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreHandle, WriteBatch};
+use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreError, StoreHandle, WriteBatch};
 use hns_sync::{
     spawn_validation_pipeline, BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult,
     OrphanLimits, OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction,
@@ -69,8 +69,8 @@ use super::{
     rpc_experimental_registry_info, rpc_hip76_info, rpc_immediately_unsupported,
     rpc_point_read_method, AuthorityMode, ChainActivationFailure, DurableMiningState,
     FailedBlockMutation, FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport,
-    NodeReorg, NodeReorgLimits, NodeService, RpcAuthorizationHeader, RpcLimits, RpcReadContext,
-    RpcRuntimeLimits, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
+    NodeReorg, NodeReorgLimits, NodeService, ReorgStagedEffectMeter, RpcAuthorizationHeader,
+    RpcLimits, RpcReadContext, RpcRuntimeLimits, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
 };
 use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
@@ -562,6 +562,70 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) state_commit_micros: u64,
     pub(super) post_commit_micros: u64,
     pub(super) workload: ActiveStateWorkload,
+}
+
+struct DirectStagedEffectLimit {
+    retry_connect: usize,
+    limit: u64,
+    actual: u64,
+}
+
+type ActiveStateConnectAttempt =
+    std::ops::ControlFlow<DirectStagedEffectLimit, ActiveStateConnectOutcome>;
+
+fn reorg_staged_effect_limit(error: &anyhow::Error) -> Option<(u64, u64)> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<StoreError>() {
+            Some(StoreError::LimitExceeded {
+                context,
+                limit,
+                actual,
+            }) if *context == ReorgStagedEffectMeter::CONTEXT => Some((*limit, *actual)),
+            _ => None,
+        })
+}
+
+fn direct_staged_effect_retry(
+    error: &anyhow::Error,
+    is_reorg: bool,
+    attempted_connect: usize,
+) -> Option<(usize, u64, u64)> {
+    if is_reorg || attempted_connect <= 1 {
+        return None;
+    }
+    let (limit, actual) = reorg_staged_effect_limit(error)?;
+    Some((attempted_connect.div_ceil(2), limit, actual))
+}
+
+fn drive_active_state_connect_retries<T>(
+    initial_limit: usize,
+    mut attempt: impl FnMut(usize) -> Result<std::ops::ControlFlow<DirectStagedEffectLimit, T>>,
+) -> Result<T> {
+    let mut attempt_limit = initial_limit;
+    loop {
+        match attempt(attempt_limit)? {
+            std::ops::ControlFlow::Continue(outcome) => return Ok(outcome),
+            std::ops::ControlFlow::Break(DirectStagedEffectLimit {
+                retry_connect,
+                limit,
+                actual,
+            }) => {
+                if retry_connect == 0 || retry_connect >= attempt_limit {
+                    anyhow::bail!(
+                        "direct active-state retry limit {retry_connect} does not reduce attempted limit {attempt_limit}"
+                    );
+                }
+                tracing::warn!(
+                    retry_connect,
+                    limit,
+                    actual,
+                    "direct active-state slice exceeded its atomic effect budget; retrying a smaller rollback-safe slice"
+                );
+                attempt_limit = retry_connect;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2690,6 +2754,16 @@ impl NodeService {
         maximum_connect: usize,
         stored_tip_hint: Option<&ChainTip>,
     ) -> Result<ActiveStateConnectOutcome> {
+        drive_active_state_connect_retries(maximum_connect, |attempt_limit| {
+            self.shadow_sync_connect_stored_state_once_with_hint(attempt_limit, stored_tip_hint)
+        })
+    }
+
+    fn shadow_sync_connect_stored_state_once_with_hint(
+        &mut self,
+        maximum_connect: usize,
+        stored_tip_hint: Option<&ChainTip>,
+    ) -> Result<ActiveStateConnectAttempt> {
         self.state.ensure_storage_operational()?;
         let planning_started = StdInstant::now();
         if maximum_connect == 0 || maximum_connect > MAX_ACTIVE_STATE_CONNECT_BATCH {
@@ -2699,11 +2773,15 @@ impl NodeService {
         }
 
         let Some(stored_tip) = self.shadow_sync_contiguous_body_tip(stored_tip_hint)? else {
-            return Ok(ActiveStateConnectOutcome::default());
+            return Ok(std::ops::ControlFlow::Continue(
+                ActiveStateConnectOutcome::default(),
+            ));
         };
         let active_tip = self.shadow_sync_active_tip()?;
         if active_tip.as_ref() == Some(&stored_tip) {
-            return Ok(ActiveStateConnectOutcome::default());
+            return Ok(std::ops::ControlFlow::Continue(
+                ActiveStateConnectOutcome::default(),
+            ));
         }
         // Direct IBD progress amortizes the ordered name-page durability
         // barrier across one HSD mainnet rollback horizon. The connector still
@@ -2736,7 +2814,9 @@ impl NodeService {
                         })?;
                 if canonical_active == Some(active.hash) {
                     if stored_tip.height <= active.height {
-                        return Ok(ActiveStateConnectOutcome::default());
+                        return Ok(std::ops::ControlFlow::Continue(
+                            ActiveStateConnectOutcome::default(),
+                        ));
                     }
                     let advance =
                         direct_connect_limit.min((stored_tip.height - active.height) as usize);
@@ -2764,8 +2844,12 @@ impl NodeService {
             NodeReorgLimits::with_maximum_connect(maximum_connect),
         )?
         else {
-            return Ok(ActiveStateConnectOutcome::default());
+            return Ok(std::ops::ControlFlow::Continue(
+                ActiveStateConnectOutcome::default(),
+            ));
         };
+
+        let attempted_connect = activation.connect.len();
 
         for connect in &activation.connect {
             let summary = HeaderSummary::from_block(&connect.block, connect.height);
@@ -2843,7 +2927,7 @@ impl NodeService {
                 )?;
                 let post_commit_micros =
                     u64::try_from(post_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                Ok(ActiveStateConnectOutcome {
+                Ok(std::ops::ControlFlow::Continue(ActiveStateConnectOutcome {
                     connected: reorg.summary.connected.len(),
                     disconnected: reorg.summary.disconnected.len(),
                     contextual_failure: None,
@@ -2851,7 +2935,7 @@ impl NodeService {
                     state_commit_micros,
                     post_commit_micros,
                     workload,
-                })
+                }))
             }
             Err(ChainActivationFailure::ContextualInvalid(failure)) => {
                 if is_reorg {
@@ -2872,21 +2956,32 @@ impl NodeService {
                 let failed = failed?;
                 let post_commit_micros =
                     u64::try_from(post_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                Ok(ActiveStateConnectOutcome {
+                Ok(std::ops::ControlFlow::Continue(ActiveStateConnectOutcome {
                     contextual_failure: Some(failed),
                     planning_micros,
                     state_commit_micros,
                     post_commit_micros,
                     workload,
                     ..ActiveStateConnectOutcome::default()
-                })
+                }))
             }
             Err(ChainActivationFailure::Internal(error)) => {
                 self.fail_closed_after_ambiguous_commit();
                 if is_reorg {
                     self.mining_events.reorg_aborted();
                 }
-                Err(error.context("active-state connector failed without block-invalid evidence"))
+                let error =
+                    error.context("active-state connector failed without block-invalid evidence");
+                if let Some((retry_connect, limit, actual)) =
+                    direct_staged_effect_retry(&error, is_reorg, attempted_connect)
+                {
+                    return Ok(std::ops::ControlFlow::Break(DirectStagedEffectLimit {
+                        retry_connect,
+                        limit,
+                        actual,
+                    }));
+                }
+                Err(error)
             }
         }
     }
@@ -5960,6 +6055,86 @@ mod tests {
                 u8::from_str_radix(encoded, 16).expect("fixture hex byte")
             })
             .collect()
+    }
+
+    fn staged_effect_test_error(context: &'static str) -> anyhow::Error {
+        anyhow::Error::new(StoreError::LimitExceeded {
+            context,
+            limit: super::super::MAX_REORG_STAGED_EFFECT_BYTES,
+            actual: super::super::MAX_REORG_STAGED_EFFECT_BYTES.saturating_add(1),
+        })
+        .context("active-state connector failed without block-invalid evidence")
+    }
+
+    fn staged_effect_retry_break(attempted_connect: usize) -> DirectStagedEffectLimit {
+        let error = staged_effect_test_error(ReorgStagedEffectMeter::CONTEXT);
+        let (retry_connect, limit, actual) =
+            direct_staged_effect_retry(&error, false, attempted_connect)
+                .expect("multi-block direct limit is retryable");
+        DirectStagedEffectLimit {
+            retry_connect,
+            limit,
+            actual,
+        }
+    }
+
+    #[test]
+    fn direct_staged_effect_limit_driver_retries_288_as_144_then_succeeds() {
+        let mut attempts = Vec::new();
+        let connected = drive_active_state_connect_retries(288, |attempted_connect| {
+            attempts.push(attempted_connect);
+            Ok::<_, anyhow::Error>(if attempted_connect == 288 {
+                std::ops::ControlFlow::Break(staged_effect_retry_break(attempted_connect))
+            } else {
+                std::ops::ControlFlow::Continue(attempted_connect)
+            })
+        })
+        .expect("smaller direct slice succeeds");
+        assert_eq!(attempts, vec![288, 144]);
+        assert_eq!(connected, 144);
+    }
+
+    #[test]
+    fn direct_staged_effect_limit_driver_repeats_odd_ceil_halving() {
+        let mut attempts = Vec::new();
+        let connected = drive_active_state_connect_retries(5, |attempted_connect| {
+            attempts.push(attempted_connect);
+            Ok::<_, anyhow::Error>(if attempted_connect > 2 {
+                std::ops::ControlFlow::Break(staged_effect_retry_break(attempted_connect))
+            } else {
+                std::ops::ControlFlow::Continue(attempted_connect)
+            })
+        })
+        .expect("bounded repeated retry succeeds");
+        assert_eq!(attempts, vec![5, 3, 2]);
+        assert_eq!(connected, 2);
+    }
+
+    #[test]
+    fn single_block_staged_effect_limit_driver_propagates_terminal_error() {
+        let mut attempts = Vec::new();
+        let error = drive_active_state_connect_retries::<()>(1, |attempted_connect| {
+            attempts.push(attempted_connect);
+            Err(staged_effect_test_error(ReorgStagedEffectMeter::CONTEXT))
+        })
+        .expect_err("one block cannot be bisected");
+        assert_eq!(attempts, vec![1]);
+        assert_eq!(
+            reorg_staged_effect_limit(&error),
+            Some((
+                super::super::MAX_REORG_STAGED_EFFECT_BYTES,
+                super::super::MAX_REORG_STAGED_EFFECT_BYTES.saturating_add(1),
+            ))
+        );
+    }
+
+    #[test]
+    fn staged_effect_retry_classifier_rejects_reorg_and_unrelated_context() {
+        let error = staged_effect_test_error(ReorgStagedEffectMeter::CONTEXT);
+        assert_eq!(direct_staged_effect_retry(&error, true, 288), None);
+
+        let unrelated = staged_effect_test_error("unrelated atomic write bytes");
+        assert_eq!(direct_staged_effect_retry(&unrelated, false, 288), None);
     }
 
     #[test]

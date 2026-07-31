@@ -3001,6 +3001,8 @@ fn push_reorg_hash(
 pub enum ChainError {
     #[error("chain store failed: {0}")]
     Store(String),
+    #[error("chain store failed: {0}")]
+    StoreSource(#[source] StoreError),
     #[error("chain codec failed: {0}")]
     Codec(String),
     #[error("missing parent header {0:?}")]
@@ -3059,7 +3061,7 @@ impl ChainError {
 
 impl From<StoreError> for ChainError {
     fn from(value: StoreError) -> Self {
-        Self::Store(value.to_string())
+        Self::StoreSource(value)
     }
 }
 
@@ -3180,6 +3182,52 @@ mod tests {
     use hns_store::{
         MemoryBatch, MemorySnapshot, MemoryStore, PrefixScanPage, ReadSnapshot, Store,
     };
+
+    #[test]
+    fn store_error_conversion_preserves_typed_limit_source_and_diagnostic() {
+        const CONTEXT: &str = "reorganization staged effect bytes";
+        const LIMIT: u64 = 268_435_456;
+        const ACTUAL: u64 = 274_597_194;
+
+        assert_eq!(
+            ChainError::Store("header index page cursor did not advance".to_owned()).to_string(),
+            "chain store failed: header index page cursor did not advance"
+        );
+
+        let error = ChainError::from(StoreError::LimitExceeded {
+            context: CONTEXT,
+            limit: LIMIT,
+            actual: ACTUAL,
+        });
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "chain store failed: {CONTEXT} exceeded its resource limit: limit {LIMIT}, actual {ACTUAL}"
+            )
+        );
+        assert!(matches!(
+            &error,
+            ChainError::StoreSource(StoreError::LimitExceeded {
+                context: CONTEXT,
+                limit: LIMIT,
+                actual: ACTUAL,
+            })
+        ));
+
+        let source = std::error::Error::source(&error).expect("typed store source");
+        let store_error = source
+            .downcast_ref::<StoreError>()
+            .expect("source remains a StoreError");
+        assert!(matches!(
+            store_error,
+            StoreError::LimitExceeded {
+                context: CONTEXT,
+                limit: LIMIT,
+                actual: ACTUAL,
+            }
+        ));
+    }
 
     #[derive(Debug, Default)]
     struct PagingMetrics {

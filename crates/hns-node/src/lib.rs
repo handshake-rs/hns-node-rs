@@ -8710,20 +8710,25 @@ impl NodeState {
         };
 
         write_record_to_batch(batch, &header_record)
-            .map_err(|error| anyhow::anyhow!("failed to stage header index: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage header index")?;
         write_block_index_to_batch(batch, &record)
-            .map_err(|error| anyhow::anyhow!("failed to stage block index: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage block index")?;
         if persist_raw_body {
             let raw_record = RawBlockRecord::from_block(&request.block, request.source);
             write_raw_block_to_batch(batch, &raw_record)
-                .map_err(|error| anyhow::anyhow!("failed to stage raw block: {error}"))?;
+                .map_err(anyhow::Error::new)
+                .context("failed to stage raw block")?;
         }
         if self.transaction_index {
             write_tx_index_for_block_to_batch(batch, &request.block, request.height)
-                .map_err(|error| anyhow::anyhow!("failed to stage tx index: {error}"))?;
+                .map_err(anyhow::Error::new)
+                .context("failed to stage tx index")?;
         }
         write_canonical_height_to_batch(batch, request.height, block_hash)
-            .map_err(|error| anyhow::anyhow!("failed to stage canonical height: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage canonical height")?;
         batch.put(
             ColumnFamily::Meta,
             MetaKey::BestBlockHash.as_bytes(),
@@ -9005,17 +9010,22 @@ impl NodeState {
             },
             &undo,
         )
-        .map_err(|error| anyhow::anyhow!("failed to stage state disconnect: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("failed to stage state disconnect")?;
         if self.transaction_index {
             delete_tx_index_for_block_from_batch(batch, &block)
-                .map_err(|error| anyhow::anyhow!("failed to stage tx-index deletion: {error}"))?;
+                .map_err(anyhow::Error::new)
+                .context("failed to stage tx-index deletion")?;
         }
         write_block_index_to_batch(batch, &record)
-            .map_err(|error| anyhow::anyhow!("failed to stage block index update: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage block index update")?;
         write_record_to_batch(batch, &header_record)
-            .map_err(|error| anyhow::anyhow!("failed to stage header index update: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage header index update")?;
         delete_canonical_height_from_batch(batch, request.height)
-            .map_err(|error| anyhow::anyhow!("failed to stage canonical height delete: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage canonical height delete")?;
 
         if request.height == 0 {
             batch.delete(ColumnFamily::Meta, MetaKey::BestBlockHash.as_bytes())?;
@@ -10215,12 +10225,14 @@ fn stage_prune_payload_height<T: ReadSnapshot, B: WriteBatch>(
                 hash.to_hex()
             );
         }
-        stage_remove_name_tree_snapshot_pin(snapshot, batch, &undo).map_err(|error| {
-            anyhow::anyhow!(
-                "undo-pruning target {} could not retire its name-tree pin: {error}",
-                hash.to_hex()
-            )
-        })?;
+        stage_remove_name_tree_snapshot_pin(snapshot, batch, &undo)
+            .map_err(anyhow::Error::new)
+            .with_context(|| {
+                format!(
+                    "undo-pruning target {} could not retire its name-tree pin",
+                    hash.to_hex()
+                )
+            })?;
         block.status.undo_present = false;
         header.status.undo_present = false;
         batch.delete(ColumnFamily::Undo, hash.as_bytes())?;
@@ -11322,6 +11334,120 @@ mod tests {
             .collect::<Vec<_>>();
         image.sort_by(|left, right| left.0.cmp(&right.0));
         image
+    }
+
+    #[test]
+    fn reorg_index_staging_limit_preserves_typed_store_source() {
+        let store = StoreHandle::memory();
+        let record = regtest_genesis_record();
+        let actual = ReorgStagedEffectMeter::operation_charge(
+            record.hash.as_bytes().len(),
+            record.encode().len(),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        let limit = actual.checked_sub(1).expect("positive header write charge");
+        let overlay = StagingOverlay::new();
+        let staged_batch = overlay.batch(store.batch());
+        let mut batch = ReorgMeteredBatch::new(
+            staged_batch,
+            ReorgStagedEffectMeter::new(limit),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+
+        let error = write_record_to_batch(&mut batch, &record)
+            .map_err(anyhow::Error::new)
+            .context("failed to stage header index")
+            .expect_err("header index write must exceed the staged-effect budget");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<ChainError>().is_some()),
+            "chain staging error must remain in the source chain: {error:#}"
+        );
+        let store_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreError>())
+            .expect("typed store limit must remain in the source chain");
+        match store_error {
+            StoreError::LimitExceeded {
+                context,
+                limit: error_limit,
+                actual: error_actual,
+            } => {
+                assert_eq!(*context, ReorgStagedEffectMeter::CONTEXT);
+                assert_eq!(*error_limit, limit);
+                assert_eq!(*error_actual, actual);
+            }
+            other => panic!("unexpected typed store error: {other}"),
+        }
+        assert_eq!(batch.meter.consumed, 0);
+        assert!(overlay.staged_family(ColumnFamily::Headers).is_empty());
+    }
+
+    #[test]
+    fn undo_pruning_pin_limit_preserves_typed_store_source() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let block = block_with_commitments(vec![coinbase_transaction()]);
+        let hash = block.hash();
+        node.connect_block(NodeBlockImport::fixture(block, 0, 1))
+            .expect("connect pruning fixture");
+        let store = node.state.store.clone();
+        let snapshot = store.snapshot().expect("pruning snapshot");
+        let pin_key = name_tree_snapshot_pin_key(0);
+        assert!(snapshot
+            .get(ColumnFamily::Snapshots, &pin_key)
+            .expect("read pruning pin")
+            .is_some());
+
+        let body_delete_charge = ReorgStagedEffectMeter::operation_charge(
+            hash.as_bytes().len(),
+            0,
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        let pin_delete_charge = ReorgStagedEffectMeter::operation_charge(
+            pin_key.len(),
+            0,
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        let mut batch = ReorgMeteredBatch::new(
+            store.batch(),
+            ReorgStagedEffectMeter::new(body_delete_charge),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+
+        let error = stage_prune_payload_height(&snapshot, &mut batch, 0)
+            .expect_err("name-tree pin deletion must exceed the staged-effect budget");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<StateError>().is_some()),
+            "state staging error must remain in the source chain: {error:#}"
+        );
+        let store_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreError>())
+            .expect("typed pin-deletion limit must remain in the source chain");
+        match store_error {
+            StoreError::LimitExceeded {
+                context,
+                limit,
+                actual,
+            } => {
+                assert_eq!(*context, ReorgStagedEffectMeter::CONTEXT);
+                assert_eq!(*limit, body_delete_charge);
+                assert_eq!(
+                    *actual,
+                    body_delete_charge.saturating_add(pin_delete_charge)
+                );
+            }
+            other => panic!("unexpected typed store error: {other}"),
+        }
+        assert_eq!(batch.meter.consumed, body_delete_charge);
     }
 
     #[test]

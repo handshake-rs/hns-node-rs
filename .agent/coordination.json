@@ -34,12 +34,17 @@
         "The scheduled persistent RocksDB performance gate then failed closed before fuzzing because the synthetic height-144 template used version 0 while HSD deployment logic required 268435456; preserved the fail record outside the repository.",
         "Supervised a sole-file fix that replaced the hard-coded synthetic version with a scenario-bounded full-history HSD oracle while retaining an independent fail-closed comparison against the production incremental deployment cache.",
         "Received a final independent NO BLOCKER verdict for the exact frozen performance-gate SHA-256 60c55bd10d44d0fdb2a641e53fe5fa04fb9c29a2367e8cc50156cea29320ae26 after focused tests, strict Clippy in both feature modes, Rustfmt, and diff checks passed.",
-        "Committed the reviewed fix and coordination record as 2c6156e31f022b5968476f6d8c776cabd11773d7 and pushed agent/production-hardening-0.2.0, then verified the remote branch resolved to that exact commit."
+        "Committed the reviewed fix and coordination record as 2c6156e31f022b5968476f6d8c776cabd11773d7 and pushed agent/production-hardening-0.2.0, then verified the remote branch resolved to that exact commit.",
+        "Launched the promoted 0.2.0 candidate in a fresh full non-pruned mainnet campaign on NVMe; the first attempt safely rejected at active height 13,731 when a 288-block direct-connect slice required 274,597,194 staged-effect bytes against the 268,435,456-byte production ceiling.",
+        "Preserved the failed campaign, confirmed the rejection was pre-publication and rollback-safe, and refused an unchanged deterministic resume.",
+        "Supervised three sole-file owners implementing exact typed StoreError preservation across chain and node staging plus bounded direct-sync ceil-halving while retaining the 256 MiB ceiling.",
+        "Accepted and resolved an adversarial review blocker for the pruned snapshot-pin retirement path, then received two independent NO BLOCKER re-audits over every metered reorganization, pruning, page-publication, and archive-commit route.",
+        "Focused integrated validation passed the production retry driver, typed early-index and pruning paths, existing atomic rollback, strict no-default Clippy, Rustfmt, and diff checks without any RocksDB or C++ compilation."
       ],
-      "present": "Publish this coordination checkpoint and verify the remote branch exactly before repeating release-profile qualification from a fresh commit-specific target.",
+      "present": "Commit and push the exact independently reviewed coordination and three-source-file fix before one cached release relink.",
       "pending": [
-        "Repeat post-push qualification from a fresh new commit-specific release target and preserve truthful external-gate status.",
-        "Promote and fingerprint the qualified binary before starting the authorized fresh non-pruned mainnet sync."
+        "Promote and fingerprint the post-push candidate without rebuilding RocksDB.",
+        "Restart the full non-pruned mainnet qualification from an empty NVMe data root and confirm it passes the height-13,731 production blocker."
       ]
     },
     "prepush-production-audit-9b4f21": {
@@ -142,19 +147,23 @@
     },
     "rpc-shadow-sync-a12c7e": {
       "file": "crates/hns-node/src/shadow_sync.rs",
-      "agent": "/root/rpc_hardening",
+      "agent": "/root/reorg_limit_fix_design",
       "status": "completed",
       "past": [
         "Read the ledger, confirmed ownership, and mapped both RPC server paths and storage/RPC abstractions.",
         "Selected public RpcMethod classification, immediate unknown/unsupported rejection, keyed snapshots, capped mempool output, and a preserved atomic parent-authority path.",
-        "Moved synchronous RocksDB/decode work toward spawn_blocking so wall-clock timeouts remain operational, and defined an explicit bounded-result error for oversized getrawmempool responses."
+        "Moved synchronous RocksDB/decode work toward spawn_blocking so wall-clock timeouts remain operational, and defined an explicit bounded-result error for oversized getrawmempool responses.",
+        "Ownership transferred after the first production full-sync attempt exposed a deterministic direct-connect staged-effect budget rejection at active height 13,731.",
+        "Implemented exact-context direct-only adaptive slicing through the production retry driver: 288 to 144 and repeated ceil-halving, with strict progress and one-block termination.",
+        "Preserved fail-closed divergent-reorganization and unrelated-limit behavior and retained the 268,435,456-byte staged-effect ceiling.",
+        "Passed five integrated staged-effect/atomicity tests and strict no-default Clippy using an existing target; Rustfmt and diff checks passed with no RocksDB or C++ compilation."
       ],
-      "present": "Frozen at 317,747 bytes and SHA-256 5bd591d0d430ff425abd2dccb28947c3d5ac674890f00e3f06561e9de02761c0 after method-first, request/concurrency/timeout, point-read, and collection-limit validation.",
+      "present": "Frozen at 324,412 bytes and SHA-256 aa8d60c14bb7dd48dc6b4f168f4b686697a582e5be2c57ebcce18fdba5e75993.",
       "pending": []
     },
     "rpc-node-lib-66b0a1": {
       "file": "crates/hns-node/src/lib.rs",
-      "agent": "/root/reorg_page_meter",
+      "agent": "/root/node_reorg_error_source",
       "status": "completed",
       "past": [
         "Mapped standalone RPC snapshot construction and storage entry materialization.",
@@ -183,9 +192,13 @@
         "Distinguished the archive preflight LimitExceeded result from ambiguous commit errors so an already-appended but uncommitted page tail is safely rolled back; any rollback failure fences storage and revokes operational authority.",
         "Added real archived RocksDB/Sync late-rejection coverage with a two-block read-your-writes replacement, a generated 64 KiB-plus undo from 2,048 outputs, an actual replacement NameState write, transaction indexing, a physical page append, and a nonempty mempool.",
         "The late regression proves the database, segment files/manifests, page tail/state, block and transaction indexes, mining state, mempool entry, and reopen fence remain unchanged.",
-        "Passed 155/155 all-feature node tests and 147/147 no-default tests on a filesystem satisfying the unchanged 10 GB reserve, four focused meter tests, segment rollback and rollback-fence tests, strict all-target Clippy in both modes, Rustfmt, and whitespace validation."
+        "Passed 155/155 all-feature node tests and 147/147 no-default tests on a filesystem satisfying the unchanged 10 GB reserve, four focused meter tests, segment rollback and rollback-fence tests, strict all-target Clippy in both modes, Rustfmt, and whitespace validation.",
+        "Ownership transferred after adversarial review found reorganization helper call sites formatted typed store-limit errors into strings before the adaptive direct-sync retry boundary.",
+        "Preserved typed ChainError and StateError sources through every reorganization connect/disconnect staging context instead of formatting them into strings.",
+        "Resolved the follow-up pruning blocker by preserving the StateError source while retiring name-tree snapshot pins in the metered pruning batch.",
+        "Added exact early index-staging and production pruning-pin source-chain regressions and passed both plus the existing atomic rollback regression without RocksDB or C++ compilation."
       ],
-      "present": "Frozen at 760,560 bytes and SHA-256 66fd54f8489dbd0226bc984d5ebd75d101f513d5b4d065a0edf0916038dedb09.",
+      "present": "Frozen at SHA-256 2c1a6a8b3eb9b55bb144fe9ca837178bdb0a6366ef78c244c67c6738a82b8196 after Rustfmt and diff validation.",
       "pending": []
     },
     "rpc-page-tree-reader-83d51c": {
@@ -213,16 +226,19 @@
     },
     "rpc-chain-counters-7bd946": {
       "file": "crates/hns-chain/src/lib.rs",
-      "agent": "/root/rpc_hardening",
+      "agent": "/root/chain_store_error_source",
       "status": "completed",
       "past": [
         "Assigned after independent integration review found diagnostic status_counts performed an O(N) block-index scan under the global NodeService lock.",
         "Transition-safe O(1) alternate/failed counters and replacement tests were implemented.",
         "A later independent block-management review found peer-triggerable unbounded header-path work: non-direct heavier import_headers rebuilds a full canonical HashMap, prepare_cache_update materializes unbounded reorganization vectors, and failed_branch_plan breadth-first materializes all descendants plus a full canonical delta and atomic failure batch.",
         "The same review found StoredBlockIndex::prepare_cache_update clones the complete bounded 4,096-record block cache on each update; the current 110-block in-memory performance gate observes at most 110 records and cannot qualify this production cost.",
-        "A subsequent ordinary-path probe found MemoryHeaderIndex::prepare_cache_update and StoredHeaderIndex::import_headers count genesis roots by scanning the complete resident header map, making block-status updates O(H) and header sync potentially quadratic."
+        "A subsequent ordinary-path probe found MemoryHeaderIndex::prepare_cache_update and StoredHeaderIndex::import_headers count genesis roots by scanning the complete resident header map, making block-status updates O(H) and header sync potentially quadratic.",
+        "Ownership transferred after production full-sync review proved From<StoreError> stringified the exact staged-effect LimitExceeded source needed for safe adaptive slicing.",
+        "Added a typed StoreSource variant while retaining the existing Store(String) invariant variant and byte-compatible diagnostics.",
+        "Changed From<StoreError> to retain the typed source and passed exact LimitExceeded conversion, matching, display, and downcast coverage without RocksDB or C++ compilation."
       ],
-      "present": "Frozen at 163,143 bytes and SHA-256 c0433d24968f8e71bae7f92586afe8f165059648e4d634fa38e5f8e0bc46adc5 after bounded branch work, O(changes) block-cache updates, O(1) counters, saturated-history probes, and exact/one-over tests.",
+      "present": "Frozen at SHA-256 76a9ccb192c7fdedd2c5f834bdf356e03fdc41ad72efae176bb806bcb3ae7ce8 after Rustfmt and diff validation.",
       "pending": []
     },
     "rpc-chain-manifest-42d6f9": {
