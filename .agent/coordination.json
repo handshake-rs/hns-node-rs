@@ -28,11 +28,16 @@
         "Received the independent follow-up hygiene verdict with NO BLOCKER for staging, commit, and push: all 46 paths mapped uniquely, all 44 declared hashes matched, and no remaining privacy, secret, artifact, mode, conflict, or whitespace finding remained.",
         "Committed the exact reviewed 46-file tree as 0daae1ca3e5201abcc497e1261a9b6731a47e4f8 with title Harden production node for v0.2.0.",
         "Pushed agent/production-hardening-0.2.0 and independently verified the remote branch resolved to the exact local commit.",
-        "Opened draft pull request https://github.com/handshake-rs/hns-node-rs/pull/1 after the GitHub app lacked write permission and the authenticated GitHub CLI fallback succeeded."
+        "Opened draft pull request https://github.com/handshake-rs/hns-node-rs/pull/1 after the GitHub app lacked write permission and the authenticated GitHub CLI fallback succeeded.",
+        "Committed and pushed the publication checkpoint as 9e01ffd0712776d971569155fad5eed16c4a9835 before beginning release-profile qualification.",
+        "Passed the complete post-push check.sh release workflow on a fresh commit-specific target, including both test matrices, optimized all-target build, performance smoke, and two-node negotiation.",
+        "The scheduled persistent RocksDB performance gate then failed closed before fuzzing because the synthetic height-144 template used version 0 while HSD deployment logic required 268435456; preserved the fail record outside the repository.",
+        "Supervised a sole-file fix that replaced the hard-coded synthetic version with a scenario-bounded full-history HSD oracle while retaining an independent fail-closed comparison against the production incremental deployment cache.",
+        "Received a final independent NO BLOCKER verdict for the exact frozen performance-gate SHA-256 60c55bd10d44d0fdb2a641e53fe5fa04fb9c29a2367e8cc50156cea29320ae26 after focused tests, strict Clippy in both feature modes, Rustfmt, and diff checks passed."
       ],
-      "present": "Commit and push this root-owned publication checkpoint before any release-profile command, then begin post-push qualification from a fresh commit-specific target.",
+      "present": "Commit and push the independently cleared performance-gate fix and this coordination record, then verify the remote branch exactly before any further release-profile command.",
       "pending": [
-        "Run post-push qualification from a fresh commit-specific release target and preserve truthful external-gate status.",
+        "Repeat post-push qualification from a fresh new commit-specific release target and preserve truthful external-gate status.",
         "Promote and fingerprint the qualified binary before starting the authorized fresh non-pruned mainnet sync."
       ]
     },
@@ -459,9 +464,15 @@
         "The production-assurance owner extended deterministic latency/load gates with structured output and passed pinned-toolchain Rust formatting, freezing SHA-256 61dc35efb99e860f46b58862b5137a37e318b3e5f025329e8425b73e75040fad.",
         "Independent scale review found the in-memory Regtest workload measures only 11 through 110 cached block records, versus the production 4,096-record cache, and cannot expose WAL, sync-durability, or LSM latency.",
         "Added a persistent RocksDB/synchronous workload with 4,096 setup connects, exact saturated-cache observations, 100 measured connects, backend/durability evidence, package version, and schema-v2 pass/fail JSON while preserving the fast smoke default.",
-        "Focused default-feature and no-default-feature tests each passed 7/7; pinned rustfmt and owned-file diff checks passed. A debug smoke produced complete evidence and correctly missed release-tuned latency thresholds; no release-profile command was run."
+        "Focused default-feature and no-default-feature tests each passed 7/7; pinned rustfmt and owned-file diff checks passed. A debug smoke produced complete evidence and correctly missed release-tuned latency thresholds; no release-profile command was run.",
+        "Post-push scheduled assurance at source 9e01ffd0712776d971569155fad5eed16c4a9835 failed closed before fuzzing: persistent-rocksdb-sync reached height 144 with mining template version 0 while HSD deployment policy required 268435456.",
+        "Replaced the hard-coded request version with a scenario-bounded HSD full-history oracle capped at 111 smoke or 4,197 persistent entries, seeded from canonical genesis and advanced only from accepted canonical headers plus durable median time past.",
+        "Preserved independent production validation through the incremental deployment-state cache, with any oracle disagreement failing closed and all oracle/history work outside the existing latency timers.",
+        "The first focused compile found two BlockHash Display errors in new diagnostics before tests ran; changed only those diagnostics to explicit hexadecimal rendering and invalidated the superseded source review.",
+        "Passed three version-focused tests in both default and no-default modes, including the full 4,197-entry progression and actual production template/native-job transitions at heights 143/144, 287/288, and 431/432.",
+        "Passed strict warning-denied Clippy in default and no-default modes, pinned Rustfmt, scoped diff checks, and an independent exact-hash production review with NO BLOCKER; no release-profile command was run."
       ],
-      "present": "Frozen at 36,073 bytes and SHA-256 1fce8f7944cfdac8c2fd4285e625702cb407d534905a8706989b94f32fa3659e.",
+      "present": "Frozen at SHA-256 60c55bd10d44d0fdb2a641e53fe5fa04fb9c29a2367e8cc50156cea29320ae26, mode 0664, 48,767 bytes, and 1,322 lines.",
       "pending": []
     },
     "assurance-node-manifest-ca32bc": {

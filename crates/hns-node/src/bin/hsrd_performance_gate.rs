@@ -7,7 +7,8 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use hns_consensus::Network;
+use hns_chain::HeaderIndex;
+use hns_consensus::{compute_block_version, DeploymentHistoryEntry, Network};
 use hns_mining::{TemplateCacheKey, TemplatePolicy};
 use hns_node::{
     MiningEngineConfig, MiningTemplateRequest, NodeBlockImport, NodeConfig, NodeService, NodeState,
@@ -99,6 +100,154 @@ impl ScenarioPlan {
                 requested_cache_occupancy: Some(PERSISTENT_CACHE_OCCUPANCY),
             },
         }
+    }
+
+    fn history_entry_limit(self) -> Result<usize, Box<dyn Error>> {
+        1usize
+            .checked_add(self.warmup_blocks)
+            .and_then(|count| count.checked_add(self.setup_blocks))
+            .and_then(|count| count.checked_add(self.measured_blocks))
+            .ok_or_else(|| "performance deployment-history limit overflowed".into())
+    }
+}
+
+/// Bounded independent oracle for the synthetic chain's next header version.
+/// Production template construction still derives and checks its cached HSD
+/// deployment state independently; an oracle disagreement therefore fails the
+/// gate rather than selecting a retry or fallback version.
+#[derive(Debug)]
+struct HsdVersionOracle {
+    network: Network,
+    maximum_entries: usize,
+    history: Vec<DeploymentHistoryEntry>,
+    next_version: u32,
+}
+
+impl HsdVersionOracle {
+    fn from_genesis(
+        network: Network,
+        maximum_entries: usize,
+        genesis_height: u32,
+        genesis: DeploymentHistoryEntry,
+    ) -> Result<Self, Box<dyn Error>> {
+        if maximum_entries == 0 {
+            return Err("performance deployment-history limit is zero".into());
+        }
+        if genesis_height != 0 {
+            return Err(format!(
+                "performance deployment history starts at height {genesis_height}, not genesis"
+            )
+            .into());
+        }
+        let mut history = Vec::with_capacity(maximum_entries);
+        history.push(genesis);
+        let next_version = Self::compute_version(network, &history)?;
+        Ok(Self {
+            network,
+            maximum_entries,
+            history,
+            next_version,
+        })
+    }
+
+    fn version_for_tip(
+        &self,
+        tip_height: u32,
+        tip_median_time_past: u64,
+    ) -> Result<u32, Box<dyn Error>> {
+        if self.history.len() >= self.maximum_entries {
+            return Err(format!(
+                "performance deployment history exhausted its {}-entry scenario limit",
+                self.maximum_entries
+            )
+            .into());
+        }
+        let expected_height = u32::try_from(self.history.len().saturating_sub(1))?;
+        if tip_height != expected_height {
+            return Err(format!(
+                "performance deployment-history tip height {tip_height} is not contiguous with {expected_height}"
+            )
+            .into());
+        }
+        let recorded_median_time = self
+            .history
+            .last()
+            .ok_or("performance deployment history is empty")?
+            .median_time_past;
+        if tip_median_time_past != recorded_median_time {
+            return Err(format!(
+                "performance deployment-history MTP {recorded_median_time} disagrees with durable tip MTP {tip_median_time_past} at height {tip_height}"
+            )
+            .into());
+        }
+        Ok(self.next_version)
+    }
+
+    fn record_connected(
+        &mut self,
+        height: u32,
+        entry: DeploymentHistoryEntry,
+        requested_version: u32,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.history.len() >= self.maximum_entries {
+            return Err(format!(
+                "performance deployment history exceeded its {}-entry scenario limit",
+                self.maximum_entries
+            )
+            .into());
+        }
+        let expected_height = u32::try_from(self.history.len())?;
+        if height != expected_height {
+            return Err(format!(
+                "connected performance height {height} is not contiguous with deployment-history height {expected_height}"
+            )
+            .into());
+        }
+        if entry.version != requested_version {
+            return Err(format!(
+                "accepted performance header version {} disagrees with requested HSD oracle version {requested_version} at height {height}",
+                entry.version
+            )
+            .into());
+        }
+        self.history.push(entry);
+
+        let next_height = height
+            .checked_add(1)
+            .ok_or("performance deployment-history height exhausted")?;
+        if self.history.len() < self.maximum_entries
+            && Self::is_deployment_boundary(self.network, next_height)?
+        {
+            self.next_version = Self::compute_version(self.network, &self.history)?;
+        }
+        Ok(())
+    }
+
+    fn is_deployment_boundary(network: Network, next_height: u32) -> Result<bool, Box<dyn Error>> {
+        let default_window = network.params().miner_window;
+        for deployment in network.deployments() {
+            let window = deployment.effective_window(default_window);
+            if window == 0 {
+                return Err(format!("deployment {} has a zero window", deployment.name()).into());
+            }
+            if next_height.is_multiple_of(window) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn compute_version(
+        network: Network,
+        history: &[DeploymentHistoryEntry],
+    ) -> Result<u32, Box<dyn Error>> {
+        let params = network.params();
+        Ok(compute_block_version(
+            params.activation_threshold,
+            params.miner_window,
+            network.deployments(),
+            history,
+        )?)
     }
 }
 
@@ -317,21 +466,30 @@ fn execute_workload(
     };
     let mut node = NodeService::try_with_state(config, state)?;
     node.connect_block(NodeBlockImport::from_peer(canonical_regtest_genesis()?, 0))?;
-    let genesis_height = observed_tip_height(&node)?;
+    let genesis_snapshot = node
+        .observed_mining_snapshot()?
+        .ok_or("durable genesis mining snapshot is unavailable")?;
+    let genesis_height = usize::try_from(genesis_snapshot.tip.height)?;
     if genesis_height != 0 {
         return Err(
             format!("regtest genesis connected at unexpected height {genesis_height}").into(),
         );
     }
+    let mut version_oracle = HsdVersionOracle::from_genesis(
+        Network::Regtest,
+        plan.history_entry_limit()?,
+        genesis_snapshot.tip.height,
+        deployment_history_entry_for_tip(&node, &genesis_snapshot)?,
+    )?;
 
     for _ in 0..plan.warmup_blocks {
-        mine_and_connect(&mut node)?;
+        mine_and_connect(&mut node, &mut version_oracle)?;
     }
     let after_warmup_height = observed_tip_height(&node)?;
     let observed_warmup_blocks = after_warmup_height.checked_sub(genesis_height);
 
     for completed in 1..=plan.setup_blocks {
-        mine_and_connect(&mut node)?;
+        mine_and_connect(&mut node, &mut version_oracle)?;
         if completed.is_multiple_of(256) || completed == plan.setup_blocks {
             eprintln!("persistent_setup_blocks_completed={completed}");
         }
@@ -343,7 +501,7 @@ fn execute_workload(
 
     let mut latencies = LatencySamples::with_capacity(plan.measured_blocks);
     for _ in 0..plan.measured_blocks {
-        latencies.push(mine_and_connect(&mut node)?);
+        latencies.push(mine_and_connect(&mut node, &mut version_oracle)?);
     }
     let after_measurement_height = observed_tip_height(&node)?;
     let observed_measured_blocks = after_measurement_height.checked_sub(after_setup_height);
@@ -372,17 +530,22 @@ fn execute_workload(
     })
 }
 
-fn mine_and_connect(node: &mut NodeService) -> Result<BlockTiming, Box<dyn Error>> {
+fn mine_and_connect(
+    node: &mut NodeService,
+    version_oracle: &mut HsdVersionOracle,
+) -> Result<BlockTiming, Box<dyn Error>> {
     let snapshot = node
         .observed_mining_snapshot()?
         .ok_or("durable mining snapshot is unavailable")?;
+    let version =
+        version_oracle.version_for_tip(snapshot.tip.height, snapshot.parent_median_time)?;
     let mask = [0x42; 32];
     let mask_hash = blake2b_256_many([snapshot.tip.hash.as_bytes().as_slice(), mask.as_slice()]);
     let request = MiningTemplateRequest {
         variant: 0,
         payout_address: Address::new(0, vec![0x51; 20])?,
         coinbase_flags: b"hsrd-performance-gate".to_vec(),
-        version: 0,
+        version,
         bits: Network::Regtest.params().pow.bits,
         minimum_time: snapshot.parent_median_time.saturating_add(1),
         reserved_root: [0; 32],
@@ -429,6 +592,11 @@ fn mine_and_connect(node: &mut NodeService) -> Result<BlockTiming, Box<dyn Error
     let connect_started = Instant::now();
     node.connect_block(NodeBlockImport::from_mining_candidate(candidate)?)?;
     let connect_micros = connect_started.elapsed().as_micros();
+    let connected_snapshot = node
+        .observed_mining_snapshot()?
+        .ok_or("connected durable mining snapshot is unavailable")?;
+    let connected_entry = deployment_history_entry_for_tip(node, &connected_snapshot)?;
+    version_oracle.record_connected(connected_snapshot.tip.height, connected_entry, version)?;
 
     Ok(BlockTiming {
         template_micros,
@@ -436,6 +604,58 @@ fn mine_and_connect(node: &mut NodeService) -> Result<BlockTiming, Box<dyn Error
         tip_to_job_micros,
         candidate_micros,
         connect_micros,
+    })
+}
+
+fn deployment_history_entry_for_tip(
+    node: &NodeService,
+    snapshot: &hns_mining::MiningSnapshot,
+) -> Result<DeploymentHistoryEntry, Box<dyn Error>> {
+    let canonical = node
+        .state()
+        .chain
+        .canonical_hash(snapshot.tip.height)?
+        .ok_or_else(|| {
+            format!(
+                "durable mining tip height {} has no canonical header",
+                snapshot.tip.height
+            )
+        })?;
+    if canonical != snapshot.tip.hash {
+        return Err(format!(
+            "durable mining tip {} disagrees with canonical header {} at height {}",
+            snapshot.tip.hash.to_hex(),
+            canonical.to_hex(),
+            snapshot.tip.height
+        )
+        .into());
+    }
+    let record = node
+        .state()
+        .chain
+        .header(&snapshot.tip.hash)?
+        .ok_or_else(|| {
+            format!(
+                "durable mining tip {} has no accepted header record",
+                snapshot.tip.hash.to_hex()
+            )
+        })?;
+    if record.hash != snapshot.tip.hash
+        || record.height != snapshot.tip.height
+        || record.header.prev_block != snapshot.tip.parent_hash
+        || record.header.tree_root != snapshot.tip.tree_root
+        || record.header.time != snapshot.tip.time
+        || record.header.bits != snapshot.tip.bits
+    {
+        return Err(format!(
+            "accepted header record disagrees with durable mining snapshot at height {}",
+            snapshot.tip.height
+        )
+        .into());
+    }
+    Ok(DeploymentHistoryEntry {
+        version: record.header.version,
+        median_time_past: snapshot.parent_median_time,
     })
 }
 
@@ -962,6 +1182,135 @@ mod tests {
             .expect_err("existing caller root must be rejected");
         assert_eq!(reuse.kind(), io::ErrorKind::AlreadyExists);
         fs::remove_dir(&caller_path).expect("remove exact test-owned caller root");
+    }
+
+    #[test]
+    fn bounded_hsd_version_oracle_covers_persistent_setup_and_measurement() {
+        let plan = ScenarioPlan::for_scenario(Scenario::PersistentRocksdbSync);
+        let maximum_entries = plan.history_entry_limit().expect("history limit");
+        assert_eq!(
+            maximum_entries,
+            1 + PERSISTENT_SETUP_BLOCKS + MEASURED_BLOCKS
+        );
+
+        let genesis = canonical_regtest_genesis().expect("regtest genesis");
+        let median_time_past = genesis.header.time;
+        let mut oracle = HsdVersionOracle::from_genesis(
+            Network::Regtest,
+            maximum_entries,
+            0,
+            DeploymentHistoryEntry {
+                version: genesis.header.version,
+                median_time_past,
+            },
+        )
+        .expect("genesis deployment history");
+
+        for height in 1..u32::try_from(maximum_entries).expect("bounded height") {
+            let version = oracle
+                .version_for_tip(height - 1, median_time_past)
+                .expect("next HSD version");
+            let expected = if (144..432).contains(&height) {
+                1 << 28
+            } else {
+                0
+            };
+            assert_eq!(version, expected, "candidate height {height}");
+            oracle
+                .record_connected(
+                    height,
+                    DeploymentHistoryEntry {
+                        version,
+                        median_time_past,
+                    },
+                    version,
+                )
+                .expect("record connected synthetic header");
+        }
+        assert_eq!(oracle.history.len(), maximum_entries);
+        assert!(oracle
+            .version_for_tip(
+                u32::try_from(maximum_entries - 1).expect("final height"),
+                median_time_past,
+            )
+            .expect_err("scenario history cap must be final")
+            .to_string()
+            .contains("exhausted"));
+    }
+
+    #[test]
+    fn production_template_and_native_job_cross_regtest_version_boundaries() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            mining_engine: MiningEngineConfig {
+                enabled: true,
+                ..MiningEngineConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        node.connect_block(NodeBlockImport::from_peer(
+            canonical_regtest_genesis().expect("regtest genesis"),
+            0,
+        ))
+        .expect("connect canonical genesis");
+        let genesis_snapshot = node
+            .observed_mining_snapshot()
+            .expect("read genesis snapshot")
+            .expect("genesis snapshot");
+        let mut oracle = HsdVersionOracle::from_genesis(
+            Network::Regtest,
+            433,
+            genesis_snapshot.tip.height,
+            deployment_history_entry_for_tip(&node, &genesis_snapshot)
+                .expect("accepted genesis deployment entry"),
+        )
+        .expect("initialize deployment oracle");
+
+        for expected_height in 1..=143 {
+            mine_and_connect(&mut node, &mut oracle).unwrap_or_else(|error| {
+                panic!("candidate height {expected_height} failed: {error}")
+            });
+        }
+        assert_eq!(oracle.history[143].version, 0);
+        assert_eq!(
+            oracle
+                .version_for_tip(143, oracle.history[143].median_time_past)
+                .expect("height-144 version"),
+            1 << 28
+        );
+
+        let native = node
+            .mining_engine_build_native_job(hns_node::NativeMiningJobRequest {
+                variant: 0,
+                payout_address: Address::new(0, vec![0x52; 20]).expect("native payout address"),
+                coinbase_flags: b"hsrd-performance-boundary".to_vec(),
+                reserved_root: [0; 32],
+                mask: [0x43; 32],
+                policy: TemplatePolicy::default(),
+            })
+            .expect("native height-144 job");
+        assert_eq!(native.snapshot.tip.height, 143);
+        assert_eq!(native.prepared.header().version, 1 << 28);
+
+        for expected_height in 144..=432 {
+            mine_and_connect(&mut node, &mut oracle).unwrap_or_else(|error| {
+                panic!("candidate height {expected_height} failed: {error}")
+            });
+        }
+        for (height, expected_version) in [
+            (143, 0),
+            (144, 1 << 28),
+            (287, 1 << 28),
+            (288, 1 << 28),
+            (431, 1 << 28),
+            (432, 0),
+        ] {
+            assert_eq!(
+                oracle.history[height].version, expected_version,
+                "accepted header height {height}"
+            );
+        }
+        assert_eq!(observed_tip_height(&node).expect("final height"), 432);
     }
 
     #[test]
