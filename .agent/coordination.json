@@ -33,9 +33,10 @@
         "Passed the complete post-push check.sh release workflow on a fresh commit-specific target, including both test matrices, optimized all-target build, performance smoke, and two-node negotiation.",
         "The scheduled persistent RocksDB performance gate then failed closed before fuzzing because the synthetic height-144 template used version 0 while HSD deployment logic required 268435456; preserved the fail record outside the repository.",
         "Supervised a sole-file fix that replaced the hard-coded synthetic version with a scenario-bounded full-history HSD oracle while retaining an independent fail-closed comparison against the production incremental deployment cache.",
-        "Received a final independent NO BLOCKER verdict for the exact frozen performance-gate SHA-256 60c55bd10d44d0fdb2a641e53fe5fa04fb9c29a2367e8cc50156cea29320ae26 after focused tests, strict Clippy in both feature modes, Rustfmt, and diff checks passed."
+        "Received a final independent NO BLOCKER verdict for the exact frozen performance-gate SHA-256 60c55bd10d44d0fdb2a641e53fe5fa04fb9c29a2367e8cc50156cea29320ae26 after focused tests, strict Clippy in both feature modes, Rustfmt, and diff checks passed.",
+        "Committed the reviewed fix and coordination record as 2c6156e31f022b5968476f6d8c776cabd11773d7 and pushed agent/production-hardening-0.2.0, then verified the remote branch resolved to that exact commit."
       ],
-      "present": "Commit and push the independently cleared performance-gate fix and this coordination record, then verify the remote branch exactly before any further release-profile command.",
+      "present": "Publish this coordination checkpoint and verify the remote branch exactly before repeating release-profile qualification from a fresh commit-specific target.",
       "pending": [
         "Repeat post-push qualification from a fresh new commit-specific release target and preserve truthful external-gate status.",
         "Promote and fingerprint the qualified binary before starting the authorized fresh non-pruned mainnet sync."
