@@ -25,11 +25,13 @@
         "Received an independent version and publication audit clearing commit, push, and draft PR while confirming that crate, tag, and GitHub Release publication remain unauthorized.",
         "Received an independent changed-set hygiene audit with no credential, build-artifact, path-escape, symlink, binary, or large-file findings.",
         "Directed the four original report owners to remove two formatting defects and sanitize host-specific paths and one transient PID; all four reports were refrozen without changing their findings.",
-        "Received the independent follow-up hygiene verdict with NO BLOCKER for staging, commit, and push: all 46 paths mapped uniquely, all 44 declared hashes matched, and no remaining privacy, secret, artifact, mode, conflict, or whitespace finding remained."
+        "Received the independent follow-up hygiene verdict with NO BLOCKER for staging, commit, and push: all 46 paths mapped uniquely, all 44 declared hashes matched, and no remaining privacy, secret, artifact, mode, conflict, or whitespace finding remained.",
+        "Committed the exact reviewed 46-file tree as 0daae1ca3e5201abcc497e1261a9b6731a47e4f8 with title Harden production node for v0.2.0.",
+        "Pushed agent/production-hardening-0.2.0 and independently verified the remote branch resolved to the exact local commit.",
+        "Opened draft pull request https://github.com/handshake-rs/hns-node-rs/pull/1 after the GitHub app lacked write permission and the authenticated GitHub CLI fallback succeeded."
       ],
-      "present": "Stage the exact reviewed 0.2.0 tree, verify the cached diff and identity, commit, push, verify the remote commit, and open a draft PR before any release-profile command.",
+      "present": "Commit and push this root-owned publication checkpoint before any release-profile command, then begin post-push qualification from a fresh commit-specific target.",
       "pending": [
-        "Commit and push the exact reviewed 0.2.0 tree, then open its draft PR.",
         "Run post-push qualification from a fresh commit-specific release target and preserve truthful external-gate status.",
         "Promote and fingerprint the qualified binary before starting the authorized fresh non-pruned mainnet sync."
       ]
