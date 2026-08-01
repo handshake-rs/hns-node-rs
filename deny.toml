@@ -20,8 +20,9 @@ allow = [
 ]
 
 [licenses.private]
-# The extracted workspace is publish=false and does not yet declare a project
-# license. This gate audits every third-party dependency without inventing one.
+# The workspace remains publish=false. Project-authored source is ISC-licensed;
+# private-package exceptions with bundled native terms are documented separately.
+# This gate audits the registry and Git dependency graph.
 ignore = true
 
 [bans]

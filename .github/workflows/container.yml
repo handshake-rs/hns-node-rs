@@ -9,9 +9,13 @@ on:
       - Cargo.lock
       - Cargo.toml
       - Dockerfile
+      - LICENSE-ISC
+      - LICENSES/**
+      - THIRD_PARTY_NOTICES.md
       - compose.yaml
       - crates/**
       - docker/**
+      - docs/docker.md
       - fixtures/**
       - rust-toolchain.toml
       - vendor/**
@@ -22,9 +26,13 @@ on:
       - Cargo.lock
       - Cargo.toml
       - Dockerfile
+      - LICENSE-ISC
+      - LICENSES/**
+      - THIRD_PARTY_NOTICES.md
       - compose.yaml
       - crates/**
       - docker/**
+      - docs/docker.md
       - fixtures/**
       - rust-toolchain.toml
       - vendor/**
@@ -95,9 +103,243 @@ jobs:
             --check-config
           test "$(docker run --rm --entrypoint /usr/bin/id "$VERIFY_IMAGE" -u)" = 10001
 
+  release-preflight:
+    name: Release preflight
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+    outputs:
+      commit: ${{ steps.validate.outputs.commit }}
+      version: ${{ steps.validate.outputs.version }}
+      release-tag: ${{ steps.validate.outputs.release-tag }}
+      binary-asset-sha256: ${{ steps.validate.outputs.binary-asset-sha256 }}
+      binary-asset-url: ${{ steps.validate.outputs.binary-asset-url }}
+      source-asset-sha256: ${{ steps.validate.outputs.source-asset-sha256 }}
+      source-asset-url: ${{ steps.validate.outputs.source-asset-url }}
+      provenance-sha256: ${{ steps.validate.outputs.provenance-sha256 }}
+      provenance-url: ${{ steps.validate.outputs.provenance-url }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Validate source, checks, and release assets
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_EVENT_SHA: ${{ github.sha }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must be v-prefixed semantic versioning: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          workspace_version=$(awk '
+            /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+            in_workspace_package && /^\[/ { exit }
+            in_workspace_package && /^version = "[^"]+"$/ {
+              sub(/^version = "/, "")
+              sub(/"$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+          if [[ -z "$workspace_version" || "$RELEASE_TAG" != "v${workspace_version}" ]]; then
+            echo "release tag $RELEASE_TAG does not exactly match workspace version ${workspace_version:-<missing>}" >&2
+            exit 1
+          fi
+
+          tag_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          head_commit=$(git rev-parse --verify HEAD)
+          if [[ ! "$tag_commit" =~ ^[0-9a-f]{40}$ || ! "$RELEASE_EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'release commit identifiers are not full lowercase SHA-1 values' >&2
+            exit 1
+          fi
+          if [[ "$head_commit" != "$tag_commit" || "$RELEASE_EVENT_SHA" != "$tag_commit" ]]; then
+            echo "checked-out HEAD, release-event SHA, and peeled tag commit do not match" >&2
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+            echo "origin/main was not fetched by the release checkout" >&2
+            exit 1
+          fi
+          main_commit=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
+          if [[ "$tag_commit" != "$main_commit" ]]; then
+            echo "release commit $tag_commit is not the exact origin/main tip $main_commit" >&2
+            exit 1
+          fi
+
+          checks_file="$RUNNER_TEMP/release-check-runs.json"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${GITHUB_REPOSITORY}/commits/${tag_commit}/check-runs?per_page=100" \
+            > "$checks_file"
+          if ! jq -e '.total_count == (.check_runs | length)' "$checks_file" >/dev/null; then
+            echo "more than 100 check runs exist; refusing an incomplete preflight view" >&2
+            exit 1
+          fi
+          required_checks=(
+            'Node and fuzz qualification'
+            'RustSec'
+            'Verify linux/amd64 image'
+            'Verify linux/arm64 image'
+          )
+          for check_name in "${required_checks[@]}"; do
+            check_result=$(jq --raw-output --arg name "$check_name" '
+              [.check_runs[]
+                | select(.name == $name and .app.slug == "github-actions")]
+              | sort_by(.id)
+              | last
+              | if . == null then "missing" else "\(.status)/\(.conclusion)" end
+            ' "$checks_file")
+            if [[ "$check_result" != 'completed/success' ]]; then
+              echo "required check $check_name is not green at $tag_commit: $check_result" >&2
+              exit 1
+            fi
+          done
+
+          binary_name="hsrd-v${workspace_version}-aarch64-unknown-linux-gnu.tar.gz"
+          source_name="hsrd-v${workspace_version}-lgpl-relink-source.tar.gz"
+          checksum_name='SHA256SUMS'
+          provenance_name='BUILD-PROVENANCE.json'
+          required_assets=(
+            "$binary_name"
+            "$source_name"
+            "$checksum_name"
+            "$provenance_name"
+          )
+          assets_file="$RUNNER_TEMP/release-assets.json"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            > "$assets_file"
+          if ! jq -e --argjson expected "${#required_assets[@]}" \
+            'type == "array" and length == $expected' "$assets_file" >/dev/null; then
+            echo "release must contain exactly ${#required_assets[@]} uploaded assets" >&2
+            exit 1
+          fi
+
+          asset_dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$asset_dir"
+          declare -A asset_urls=()
+          for asset_name in "${required_assets[@]}"; do
+            asset_count=$(jq --arg name "$asset_name" '[.[] | select(.name == $name)] | length' "$assets_file")
+            if [[ "$asset_count" != 1 ]]; then
+              echo "release must contain exactly one $asset_name asset; found $asset_count" >&2
+              exit 1
+            fi
+            asset_id=$(jq --raw-output --arg name "$asset_name" '.[] | select(.name == $name) | .id' "$assets_file")
+            asset_state=$(jq --raw-output --arg name "$asset_name" '.[] | select(.name == $name) | .state' "$assets_file")
+            asset_size=$(jq --raw-output --arg name "$asset_name" '.[] | select(.name == $name) | .size' "$assets_file")
+            asset_url=$(jq --raw-output --arg name "$asset_name" '.[] | select(.name == $name) | .browser_download_url' "$assets_file")
+            if [[ "$asset_state" != uploaded || ! "$asset_size" =~ ^[1-9][0-9]*$ ]]; then
+              echo "release asset $asset_name is not a nonempty uploaded asset" >&2
+              exit 1
+            fi
+            expected_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${asset_name}"
+            if [[ "$asset_url" != "$expected_url" ]]; then
+              echo "release asset $asset_name has an unexpected download URL" >&2
+              exit 1
+            fi
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "$asset_dir/$asset_name"
+            asset_urls["$asset_name"]="$asset_url"
+          done
+
+          declare -A expected_sha256=()
+          checksum_entries=0
+          while read -r checksum filename extra; do
+            if [[ -z "${checksum:-}" ]]; then
+              continue
+            fi
+            filename=${filename#\*}
+            if [[ -n "${extra:-}" || ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo 'SHA256SUMS contains a malformed entry' >&2
+              exit 1
+            fi
+            case "$filename" in
+              "$binary_name"|"$source_name"|"$provenance_name") ;;
+              *)
+                echo "SHA256SUMS contains an unexpected entry: $filename" >&2
+                exit 1
+                ;;
+            esac
+            if [[ -n "${expected_sha256[$filename]+present}" ]]; then
+              echo "SHA256SUMS contains a duplicate entry: $filename" >&2
+              exit 1
+            fi
+            expected_sha256["$filename"]="$checksum"
+            checksum_entries=$((checksum_entries + 1))
+          done < "$asset_dir/$checksum_name"
+          if [[ "$checksum_entries" != 3 ]]; then
+            echo "SHA256SUMS must contain exactly the two archives and $provenance_name" >&2
+            exit 1
+          fi
+          for asset_name in "$binary_name" "$source_name" "$provenance_name"; do
+            actual_sha256=$(sha256sum "$asset_dir/$asset_name" | cut -d ' ' -f 1)
+            if [[ "${expected_sha256[$asset_name]:-missing}" != "$actual_sha256" ]]; then
+              echo "checksum mismatch for $asset_name" >&2
+              exit 1
+            fi
+          done
+          repository_url="https://github.com/${GITHUB_REPOSITORY}"
+          jq -e \
+            --arg binary_name "$binary_name" \
+            --arg binary_sha256 "${expected_sha256[$binary_name]}" \
+            --arg commit "$tag_commit" \
+            --arg repository "$repository_url" \
+            --arg source_name "$source_name" \
+            --arg source_sha256 "${expected_sha256[$source_name]}" \
+            --arg tag "$RELEASE_TAG" \
+            --arg version "$workspace_version" '
+              type == "object"
+              and .schema_version == 1
+              and .project == "hns-node-rs"
+              and .program == "hsrd"
+              and .version == $version
+              and .source.repository == $repository
+              and .source.commit == $commit
+              and .source.tag == $tag
+              and .binary.target == "aarch64-unknown-linux-gnu"
+              and (.binary.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+              and .artifacts.binary_archive.name == $binary_name
+              and .artifacts.binary_archive.sha256 == $binary_sha256
+              and .artifacts.source_archive.name == $source_name
+              and .artifacts.source_archive.sha256 == $source_sha256
+            ' "$asset_dir/$provenance_name" >/dev/null
+
+          {
+            echo "commit=$tag_commit"
+            echo "version=$workspace_version"
+            echo "release-tag=$RELEASE_TAG"
+            echo "binary-asset-sha256=${expected_sha256[$binary_name]}"
+            echo "binary-asset-url=${asset_urls[$binary_name]}"
+            echo "source-asset-sha256=${expected_sha256[$source_name]}"
+            echo "source-asset-url=${asset_urls[$source_name]}"
+            echo "provenance-sha256=${expected_sha256[$provenance_name]}"
+            echo "provenance-url=${asset_urls[$provenance_name]}"
+          } >> "$GITHUB_OUTPUT"
+
   release-platforms:
     name: Release ${{ matrix.platform }} image
     if: github.event_name == 'release'
+    needs: release-preflight
     permissions:
       contents: read
       packages: write
@@ -119,24 +361,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.release.tag_name }}
-
-      - name: Validate release source and version
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: |
-          if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "release tag is not semantic versioning: $RELEASE_TAG" >&2
-            exit 1
-          fi
-          workspace_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          test -n "$workspace_version"
-          if [[ "${RELEASE_TAG#v}" != "$workspace_version" ]]; then
-            echo "release tag $RELEASE_TAG does not match workspace version $workspace_version" >&2
-            exit 1
-          fi
-          release_commit=$(git rev-parse "${RELEASE_TAG}^{commit}")
-          git merge-base --is-ancestor "$release_commit" origin/main
+          ref: ${{ needs.release-preflight.outputs.commit }}
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -161,8 +386,8 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           build-args: |
-            VCS_REF=${{ github.sha }}
-            VERSION=${{ github.event.release.tag_name }}
+            VCS_REF=${{ needs.release-preflight.outputs.commit }}
+            VERSION=${{ needs.release-preflight.outputs.version }}
           cache-from: type=gha,scope=hsrd-${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=hsrd-${{ matrix.suffix }}
           context: .
@@ -205,7 +430,7 @@ jobs:
   release-manifest:
     name: Publish multi-platform release manifest
     if: github.event_name == 'release'
-    needs: release-platforms
+    needs: [release-preflight, release-platforms]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -237,48 +462,210 @@ jobs:
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=semver,pattern={{version}},value=${{ github.event.release.tag_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ github.event.release.tag_name }}
+            type=raw,value=canary-v${{ needs.release-preflight.outputs.version }},enable=${{ github.event.release.prerelease }}
+            type=semver,pattern={{version}},value=${{ needs.release-preflight.outputs.release-tag }},enable=${{ !github.event.release.prerelease }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-preflight.outputs.release-tag }},enable=${{ !github.event.release.prerelease }}
             type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
 
-      - name: Create release manifest
+      - name: Create commit-bound candidate manifest
         id: manifest
         env:
+          RELEASE_COMMIT: ${{ needs.release-preflight.outputs.commit }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
           RELEASE_TAGS_JSON: ${{ steps.meta.outputs.json }}
+          RELEASE_VERSION: ${{ needs.release-preflight.outputs.version }}
         working-directory: /tmp/hsrd-digests
         run: |
-          mapfile -t tags < <(jq --raw-output '.tags[] | "--tag\n" + .' <<< "$RELEASE_TAGS_JSON")
-          digests=()
-          for digest in *; do
-            digests+=("${REGISTRY_IMAGE}@sha256:${digest}")
+          set -euo pipefail
+
+          shopt -s nullglob
+          digest_files=(*)
+          if [[ "${#digest_files[@]}" != 2 ]]; then
+            echo "expected exactly two platform digest artifacts; found ${#digest_files[@]}" >&2
+            exit 1
+          fi
+          declare -A seen_digests=()
+          digest_refs=()
+          for digest_file in "${digest_files[@]}"; do
+            if [[ ! -f "$digest_file" || ! "$digest_file" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "invalid platform digest artifact: $digest_file" >&2
+              exit 1
+            fi
+            if [[ -n "${seen_digests[$digest_file]+present}" ]]; then
+              echo "duplicate platform digest artifact: $digest_file" >&2
+              exit 1
+            fi
+            seen_digests["$digest_file"]=1
+            digest_refs+=("${REGISTRY_IMAGE}@sha256:${digest_file}")
           done
-          test "${#digests[@]}" = 2
-          docker buildx imagetools create "${tags[@]}" "${digests[@]}"
-          primary_tag=$(jq --raw-output '.tags[0]' <<< "$RELEASE_TAGS_JSON")
-          manifest_digest=$(docker buildx imagetools inspect "$primary_tag" --format '{{json .Manifest}}' | jq --raw-output '.digest')
-          test -n "$manifest_digest"
-          echo "primary-tag=$primary_tag" >> "$GITHUB_OUTPUT"
-          echo "digest=$manifest_digest" >> "$GITHUB_OUTPUT"
 
-      - name: Inspect published manifest
-        run: docker buildx imagetools inspect "${{ steps.manifest.outputs.primary-tag }}"
+          public_tags_file="$RUNNER_TEMP/release-public-tags"
+          jq -er '
+            .tags
+            | if type == "array" and length > 0 and all(.[]; type == "string" and length > 0)
+              then .[]
+              else error("invalid release tags")
+              end
+          ' <<< "$RELEASE_TAGS_JSON" > "$public_tags_file"
+          mapfile -t public_tags < "$public_tags_file"
 
-      - name: Attest release manifest
+          if [[ "$RELEASE_PRERELEASE" == true ]]; then
+            exact_public_tag="${REGISTRY_IMAGE}:canary-v${RELEASE_VERSION}"
+            if [[ "${#public_tags[@]}" != 1 || "${public_tags[0]}" != "$exact_public_tag" ]]; then
+              echo "prerelease must publish only $exact_public_tag" >&2
+              exit 1
+            fi
+          elif [[ "$RELEASE_PRERELEASE" == false ]]; then
+            if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "stable container release requires a stable x.y.z version" >&2
+              exit 1
+            fi
+            minor_version=${RELEASE_VERSION%.*}
+            exact_public_tag="${REGISTRY_IMAGE}:${RELEASE_VERSION}"
+            expected_stable_tags=$(printf '%s\n' \
+              "$exact_public_tag" \
+              "${REGISTRY_IMAGE}:${minor_version}" \
+              "${REGISTRY_IMAGE}:latest" | sort)
+            actual_stable_tags=$(printf '%s\n' "${public_tags[@]}" | sort)
+            if [[ "${#public_tags[@]}" != 3 || "$actual_stable_tags" != "$expected_stable_tags" ]]; then
+              echo 'stable release tags do not exactly equal version, minor, and latest' >&2
+              exit 1
+            fi
+          else
+            echo "invalid prerelease flag: $RELEASE_PRERELEASE" >&2
+            exit 1
+          fi
+
+          candidate_tag="${REGISTRY_IMAGE}:candidate-${RELEASE_COMMIT}"
+          candidate_raw_file="$RUNNER_TEMP/candidate-manifest.json"
+          candidate_error="$RUNNER_TEMP/candidate-manifest.err"
+          if ! docker buildx imagetools inspect "$candidate_tag" --raw \
+            > "$candidate_raw_file" 2> "$candidate_error"; then
+            if ! grep -Eiq 'manifest unknown|name unknown|not found' "$candidate_error"; then
+              echo "could not inspect commit candidate: $candidate_tag" >&2
+              cat "$candidate_error" >&2
+              exit 1
+            fi
+            docker buildx imagetools create --tag "$candidate_tag" "${digest_refs[@]}"
+            docker buildx imagetools inspect "$candidate_tag" --raw > "$candidate_raw_file"
+          fi
+          candidate_raw=$(<"$candidate_raw_file")
+          if [[ -z "$candidate_raw" ]]; then
+            echo 'candidate manifest is empty' >&2
+            exit 1
+          fi
+          expected_platform_digests=$(printf 'sha256:%s\n' "${digest_files[@]}" | sort)
+          actual_platform_digests=$(jq -er '
+            if type == "object"
+              and (.manifests | type == "array")
+              and (.manifests | length == 2)
+              and all(.manifests[]; .digest | type == "string")
+            then [.manifests[].digest] | sort | .[]
+            else error("candidate is not an exact two-entry image index")
+            end
+          ' <<< "$candidate_raw")
+          if [[ "$actual_platform_digests" != "$expected_platform_digests" ]]; then
+            echo 'commit candidate does not contain the exact platform digests' >&2
+            exit 1
+          fi
+          manifest_digest="sha256:$(printf '%s' "$candidate_raw" | sha256sum | cut -d ' ' -f 1)"
+          if [[ ! "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid candidate manifest digest: $manifest_digest" >&2
+            exit 1
+          fi
+
+          digest_raw=$(docker buildx imagetools inspect "${REGISTRY_IMAGE}@${manifest_digest}" --raw)
+          digest_address_sha256="sha256:$(printf '%s' "$digest_raw" | sha256sum | cut -d ' ' -f 1)"
+          if [[ "$digest_address_sha256" != "$manifest_digest" || "$digest_raw" != "$candidate_raw" ]]; then
+            echo 'digest-addressed candidate inspection did not reproduce the candidate manifest' >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect "${REGISTRY_IMAGE}@${manifest_digest}"
+
+          exact_public_raw="$RUNNER_TEMP/exact-public-manifest.json"
+          exact_public_error="$RUNNER_TEMP/exact-public-manifest.err"
+          if docker buildx imagetools inspect "$exact_public_tag" --raw \
+            > "$exact_public_raw" 2> "$exact_public_error"; then
+            existing_public_digest="sha256:$(sha256sum "$exact_public_raw" | cut -d ' ' -f 1)"
+            if [[ "$existing_public_digest" != "$manifest_digest" ]]; then
+              echo "exact public tag already exists at another digest: $exact_public_tag" >&2
+              exit 1
+            fi
+          elif ! grep -Eiq 'manifest unknown|name unknown|not found' "$exact_public_error"; then
+            echo "could not inspect exact public tag: $exact_public_tag" >&2
+            cat "$exact_public_error" >&2
+            exit 1
+          fi
+
+          public_tags_json=$(jq -c '.tags' <<< "$RELEASE_TAGS_JSON")
+          {
+            echo "candidate-tag=$candidate_tag"
+            echo "digest=$manifest_digest"
+            echo "exact-public-tag=$exact_public_tag"
+            echo "public-tags-json=$public_tags_json"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest candidate manifest
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-name: ${{ env.REGISTRY_IMAGE }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
+      - name: Apply and verify public release tags
+        env:
+          MANIFEST_DIGEST: ${{ steps.manifest.outputs.digest }}
+          PUBLIC_TAGS_JSON: ${{ steps.manifest.outputs.public-tags-json }}
+        run: |
+          set -euo pipefail
+
+          public_tags_file="$RUNNER_TEMP/release-public-tags-final"
+          jq -er '
+            if type == "array" and length > 0 and all(.[]; type == "string" and length > 0)
+            then .[]
+            else error("invalid public tags")
+            end
+          ' <<< "$PUBLIC_TAGS_JSON" > "$public_tags_file"
+          mapfile -t public_tags < "$public_tags_file"
+          tag_args=()
+          for public_tag in "${public_tags[@]}"; do
+            tag_args+=(--tag "$public_tag")
+          done
+          docker buildx imagetools create \
+            "${tag_args[@]}" \
+            "${REGISTRY_IMAGE}@${MANIFEST_DIGEST}"
+
+          for public_tag in "${public_tags[@]}"; do
+            public_raw=$(docker buildx imagetools inspect "$public_tag" --raw)
+            public_digest="sha256:$(printf '%s' "$public_raw" | sha256sum | cut -d ' ' -f 1)"
+            if [[ ! "$public_digest" =~ ^sha256:[0-9a-f]{64}$ || "$public_digest" != "$MANIFEST_DIGEST" ]]; then
+              echo "published tag does not resolve to the attested manifest: $public_tag" >&2
+              exit 1
+            fi
+            docker buildx imagetools inspect "$public_tag"
+          done
+
+          digest_raw=$(docker buildx imagetools inspect "${REGISTRY_IMAGE}@${MANIFEST_DIGEST}" --raw)
+          digest_address_sha256="sha256:$(printf '%s' "$digest_raw" | sha256sum | cut -d ' ' -f 1)"
+          if [[ "$digest_address_sha256" != "$MANIFEST_DIGEST" ]]; then
+            echo 'published manifest failed final digest-address inspection' >&2
+            exit 1
+          fi
+
       - name: Write release summary
         env:
           PUBLISHED_DIGEST: ${{ steps.manifest.outputs.digest }}
-          PUBLISHED_TAG: ${{ steps.manifest.outputs.primary-tag }}
+          PUBLISHED_TAGS_JSON: ${{ steps.manifest.outputs.public-tags-json }}
+          RELEASE_COMMIT: ${{ needs.release-preflight.outputs.commit }}
+          SOURCE_ASSET_SHA256: ${{ needs.release-preflight.outputs.source-asset-sha256 }}
+          SOURCE_ASSET_URL: ${{ needs.release-preflight.outputs.source-asset-url }}
         run: |
           {
             echo '### Published hsrd container'
             echo
-            echo "- Tag: \`$PUBLISHED_TAG\`"
+            echo "- Commit: \`$RELEASE_COMMIT\`"
             echo "- Digest: \`$PUBLISHED_DIGEST\`"
+            echo "- Tags: \`$(jq -r 'join(", ")' <<< "$PUBLISHED_TAGS_JSON")\`"
             echo "- Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- Relinking/source archive: [$SOURCE_ASSET_SHA256]($SOURCE_ASSET_URL)"
           } >> "$GITHUB_STEP_SUMMARY"

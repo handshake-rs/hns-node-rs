@@ -4,12 +4,13 @@ The release image is published as a multi-platform OCI image for
 `linux/amd64` (x86_64) and `linux/arm64` (AArch64):
 
 ```sh
-docker pull ghcr.io/handshake-rs/hns-node-rs:0.3.1
+docker pull ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.2
 ```
 
-Docker selects the matching platform automatically. Release automation also
-publishes minor and stable tags. Production deployments should pin the
-manifest digest recorded by the release workflow:
+Docker selects the matching platform automatically. The v0.3.2 prerelease
+publishes only the exact `canary-v0.3.2` tag. Stable releases publish the exact
+version, minor-version, and `latest` tags. Production deployments should pin
+the manifest digest recorded by the release workflow:
 
 ```yaml
 image: ghcr.io/handshake-rs/hns-node-rs@sha256:MANIFEST_DIGEST
@@ -27,6 +28,10 @@ Start the default node with durable named-volume storage:
 docker compose up --detach
 docker compose logs --follow hsrd
 ```
+
+The checked-in Compose configuration defaults to
+`ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.2` for this prerelease. Override
+`HSRD_IMAGE` with an immutable manifest digest for a pinned deployment.
 
 The Compose service runs as UID/GID 10001, drops every Linux capability, uses
 a read-only root filesystem, and gives RocksDB two minutes to checkpoint after
@@ -103,17 +108,20 @@ toolchain.
 
 Pull requests and `main` changes build and execute the image independently on
 native amd64 and arm64 GitHub-hosted runners. Publishing occurs only for a
-published GitHub Release whose tag is valid semantic versioning. Each native
+published GitHub Release whose tag is valid semantic versioning. Before the
+GHCR release event proceeds, it verifies the uploaded binary archive, separate
+relinking/source archive, `SHA256SUMS`, and `BUILD-PROVENANCE.json`. Each native
 runner pushes an untagged platform image by digest; the final job creates one
-multi-platform GHCR manifest and applies the release tags only after both
-platform checks pass.
+multi-platform GHCR manifest and applies only the prerelease canary tag, or the
+stable version, minor-version, and `latest` tags, after both platform checks
+pass.
 
 The release workflow publishes BuildKit SBOM/provenance attestations and a
 GitHub artifact attestation for the final manifest. Verify the latter with:
 
 ```sh
 gh attestation verify \
-  oci://ghcr.io/handshake-rs/hns-node-rs:0.3.1 \
+  oci://ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.2 \
   --repo handshake-rs/hns-node-rs
 ```
 

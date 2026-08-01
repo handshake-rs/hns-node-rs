@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 repository.workspace = true
 build = "build.rs"
-license = "MIT"
+license = "ISC AND MIT"
 description = "Small safe verification-only wrapper around the pinned libsecp256k1 used by hsd"
 
 [build-dependencies]

@@ -140,3 +140,9 @@ The full development and release qualification gate is:
 
 It requires the additional tools described in
 [Testing and qualification](docs/testing.md).
+
+## License
+
+Project-authored source is available under the
+[ISC License](LICENSE-ISC). Separately licensed bundled and third-party material
+remains under its original terms; see [Third-party notices](THIRD_PARTY_NOTICES.md).
