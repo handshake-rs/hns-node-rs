@@ -28,8 +28,8 @@ use hns_chain::{
 use hns_consensus::{
     advance_threshold_state, block_merkle_root, block_witness_root,
     compute_block_version_from_state, is_hsd_historical_block, validate_coinbase_height,
-    validate_transaction_start, ConsensusParams, DeploymentState, HeaderConsensus, HeaderParent,
-    HeaderValidationContext, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
+    validate_transaction_start, ConsensusError, ConsensusParams, DeploymentState, HeaderConsensus,
+    HeaderParent, HeaderValidationContext, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
 };
 use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
 use hns_p2p::{
@@ -53,9 +53,9 @@ use hns_sync::{
     spawn_validation_pipeline,
     validation::{spawn_ordered_work_pipeline, OrderedWorkError},
     BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult, OrphanLimits, OrphanSnapshot,
-    StatelessBlockValidator, StoredSyncCheckpoint, SyncAction, SyncCheckpoint, SyncLimits,
-    SyncScheduler, SyncSnapshot, ValidatedBlock, ValidationFailure, ValidationFailureKind,
-    ValidationRejection, ValidationRequest, ValidationSubmitter,
+    StatelessBlockValidator, StoredSyncCheckpoint, SyncAction, SyncCheckpoint, SyncError,
+    SyncLimits, SyncScheduler, SyncSnapshot, ValidatedBlock, ValidationFailure,
+    ValidationFailureKind, ValidationRejection, ValidationRequest, ValidationSubmitter,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -118,6 +118,24 @@ impl fmt::Display for MissingHeaderParent {
 }
 
 impl Error for MissingHeaderParent {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PeerHeaderBatchLimit {
+    limit: usize,
+    actual: usize,
+}
+
+impl fmt::Display for PeerHeaderBatchLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "peer sent {} headers above the {}-header limit",
+            self.actual, self.limit
+        )
+    }
+}
+
+impl Error for PeerHeaderBatchLimit {}
 const ADDRESS_BOOK_FLUSH_INTERVAL: Duration = Duration::from_secs(120);
 const HSD_ADDRESS_HORIZON_SECONDS: u64 = 30 * 24 * 60 * 60;
 const HSD_ADDRESS_MIN_FAIL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -140,6 +158,7 @@ const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
 pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 288;
 const MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
 const MIN_NATIVE_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_NATIVE_SYNC_CONTENTION_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const NATIVE_RUNTIME_EXTENSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const NATIVE_RUNTIME_EXTENSION_ABORT_GRACE: Duration = Duration::from_secs(1);
 // Native IBD deliberately fails over stalled body reservations sooner than
@@ -148,6 +167,531 @@ const NATIVE_RUNTIME_EXTENSION_ABORT_GRACE: Duration = Duration::from_secs(1);
 const NATIVE_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const NATIVE_MAX_INFLIGHT_PER_PEER: usize = 32;
 const BRONTIDE_IDENTITY_FILE: &str = "p2p-identity-v1.key";
+
+#[derive(Clone, Debug)]
+struct OwnedOrphan {
+    block: Block,
+    height: Height,
+}
+
+#[derive(Debug)]
+struct OwnedOrphanInvariant(String);
+
+impl fmt::Display for OwnedOrphanInvariant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for OwnedOrphanInvariant {}
+
+fn owned_orphan_invariant(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<OwnedOrphanInvariant>())
+}
+
+#[derive(Debug, Default)]
+struct OwnedOrphanInsertOutcome {
+    evicted: Vec<OwnedOrphan>,
+}
+
+#[derive(Debug, Default)]
+struct OwnedOrphanChildrenOutcome {
+    children: Vec<OwnedOrphan>,
+    children_remain: bool,
+}
+
+/// Retains the scheduler height with every in-memory orphan body.
+///
+/// The underlying bounded pool deliberately owns only wire blocks. Keeping the
+/// height sidecar here lets eviction and release reconcile scheduler ownership
+/// synchronously, without a stable canonical read that can race the writer.
+#[derive(Debug)]
+struct OwnedOrphanPool {
+    inner: BoundedOrphanPool,
+    heights: HashMap<BlockHash, Height>,
+    child_counts: HashMap<BlockHash, usize>,
+    indexed_children: usize,
+}
+
+impl OwnedOrphanPool {
+    fn new(limits: OrphanLimits) -> std::result::Result<Self, SyncError> {
+        Ok(Self {
+            inner: BoundedOrphanPool::new(limits)?,
+            heights: HashMap::new(),
+            child_counts: HashMap::new(),
+            indexed_children: 0,
+        })
+    }
+
+    fn contains(&self, hash: &BlockHash) -> bool {
+        self.inner.contains(hash)
+    }
+
+    fn ensure_sidecar_exact(&self) -> Result<()> {
+        let blocks = self.inner.snapshot().blocks;
+        if blocks != self.heights.len() || blocks != self.indexed_children {
+            return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                "owned orphan sidecars have {} heights and {} child indexes for {blocks} retained blocks",
+                self.heights.len(),
+                self.indexed_children,
+            ))));
+        }
+        Ok(())
+    }
+
+    fn has_children(&self, parent: BlockHash) -> bool {
+        self.child_counts.contains_key(&parent)
+    }
+
+    fn index_child(&mut self, parent: BlockHash) -> Result<()> {
+        let parent_children = self
+            .child_counts
+            .get(&parent)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| {
+                anyhow::Error::new(OwnedOrphanInvariant(format!(
+                    "orphan parent {} child count overflowed",
+                    parent.to_hex()
+                )))
+            })?;
+        let indexed_children = self.indexed_children.checked_add(1).ok_or_else(|| {
+            anyhow::Error::new(OwnedOrphanInvariant(
+                "owned orphan child index overflowed".to_owned(),
+            ))
+        })?;
+        self.child_counts.insert(parent, parent_children);
+        self.indexed_children = indexed_children;
+        Ok(())
+    }
+
+    fn unindex_child(&mut self, parent: BlockHash) -> Result<()> {
+        let remove_parent = {
+            let count = self.child_counts.get_mut(&parent).ok_or_else(|| {
+                anyhow::Error::new(OwnedOrphanInvariant(format!(
+                    "orphan parent {} has no child-count entry",
+                    parent.to_hex()
+                )))
+            })?;
+            *count = count.checked_sub(1).ok_or_else(|| {
+                anyhow::Error::new(OwnedOrphanInvariant(format!(
+                    "orphan parent {} child count underflowed",
+                    parent.to_hex()
+                )))
+            })?;
+            *count == 0
+        };
+        if remove_parent {
+            self.child_counts.remove(&parent);
+        }
+        self.indexed_children = self.indexed_children.checked_sub(1).ok_or_else(|| {
+            anyhow::Error::new(OwnedOrphanInvariant(
+                "owned orphan child index underflowed".to_owned(),
+            ))
+        })?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn insert(&mut self, orphan: OwnedOrphan) -> Result<()> {
+        let outcome = self.insert_with_evictions(orphan)?;
+        if !outcome.evicted.is_empty() {
+            anyhow::bail!(
+                "owned orphan insertion unexpectedly evicted {} blocks",
+                outcome.evicted.len()
+            );
+        }
+        Ok(())
+    }
+
+    fn insert_with_evictions(&mut self, orphan: OwnedOrphan) -> Result<OwnedOrphanInsertOutcome> {
+        self.ensure_sidecar_exact()?;
+        let hash = orphan.block.hash();
+        if self.inner.contains(&hash) {
+            if self.heights.get(&hash) != Some(&orphan.height) {
+                return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                    "owned orphan {} changed height while retained",
+                    hash.to_hex()
+                ))));
+            }
+            return Ok(OwnedOrphanInsertOutcome::default());
+        }
+        let parent = orphan.block.header.prev_block;
+        let outcome = self
+            .inner
+            .insert_with_evictions(orphan.block)
+            .context("failed to insert bounded owned orphan")?;
+        let mut evicted = Vec::with_capacity(outcome.evicted.len());
+        for block in outcome.evicted {
+            let evicted_hash = block.hash();
+            let height = self.heights.remove(&evicted_hash).ok_or_else(|| {
+                anyhow::Error::new(OwnedOrphanInvariant(format!(
+                    "evicted orphan {} has no owned height",
+                    evicted_hash.to_hex()
+                )))
+            })?;
+            self.unindex_child(block.header.prev_block)?;
+            evicted.push(OwnedOrphan { block, height });
+        }
+        if outcome.inserted && self.heights.insert(hash, orphan.height).is_some() {
+            return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                "new orphan {} replaced an owned height",
+                hash.to_hex()
+            ))));
+        }
+        if outcome.inserted {
+            self.index_child(parent)?;
+        }
+        self.ensure_sidecar_exact()?;
+        Ok(OwnedOrphanInsertOutcome { evicted })
+    }
+
+    #[cfg(test)]
+    fn take_children(&mut self, parent: BlockHash) -> Result<Vec<OwnedOrphan>> {
+        let outcome = self.take_children_bounded(parent, usize::MAX)?;
+        if outcome.children_remain {
+            return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                "unbounded orphan release left children for parent {}",
+                parent.to_hex()
+            ))));
+        }
+        Ok(outcome.children)
+    }
+
+    fn take_children_bounded(
+        &mut self,
+        parent: BlockHash,
+        maximum_children: usize,
+    ) -> Result<OwnedOrphanChildrenOutcome> {
+        self.ensure_sidecar_exact()?;
+        let outcome = self
+            .inner
+            .take_children_bounded(parent, maximum_children)
+            .context("failed to take bounded orphan children")?;
+        let mut children = Vec::with_capacity(outcome.children.len());
+        for block in outcome.children {
+            let hash = block.hash();
+            let height = self.heights.remove(&hash).ok_or_else(|| {
+                anyhow::Error::new(OwnedOrphanInvariant(format!(
+                    "released orphan {} has no owned height",
+                    hash.to_hex()
+                )))
+            })?;
+            self.unindex_child(block.header.prev_block)?;
+            children.push(OwnedOrphan { block, height });
+        }
+        if outcome.children_remain != self.has_children(parent) {
+            return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                "orphan parent {} bounded-release remainder disagrees with its owned child index",
+                parent.to_hex()
+            ))));
+        }
+        self.ensure_sidecar_exact()?;
+        Ok(OwnedOrphanChildrenOutcome {
+            children,
+            children_remain: outcome.children_remain,
+        })
+    }
+
+    fn snapshot(&self) -> OrphanSnapshot {
+        self.inner.snapshot()
+    }
+}
+
+trait ActiveStateOrphanPool {
+    fn active_state_snapshot(&self) -> OrphanSnapshot;
+    #[cfg(test)]
+    fn take_child_hashes(&mut self, parent: BlockHash) -> Result<Vec<BlockHash>>;
+}
+
+impl ActiveStateOrphanPool for OwnedOrphanPool {
+    fn active_state_snapshot(&self) -> OrphanSnapshot {
+        self.snapshot()
+    }
+
+    #[cfg(test)]
+    fn take_child_hashes(&mut self, parent: BlockHash) -> Result<Vec<BlockHash>> {
+        Ok(self
+            .take_children(parent)?
+            .into_iter()
+            .map(|orphan| orphan.block.hash())
+            .collect())
+    }
+}
+
+#[cfg(test)]
+impl ActiveStateOrphanPool for BoundedOrphanPool {
+    fn active_state_snapshot(&self) -> OrphanSnapshot {
+        self.snapshot()
+    }
+
+    fn take_child_hashes(&mut self, parent: BlockHash) -> Result<Vec<BlockHash>> {
+        Ok(self
+            .take_children(parent)
+            .into_iter()
+            .map(|block| block.hash())
+            .collect())
+    }
+}
+
+#[derive(Debug)]
+struct ReadyOrphanParents {
+    queue: BTreeMap<u64, BlockHash>,
+    queued: HashMap<BlockHash, u64>,
+    next_id: u64,
+    maximum: usize,
+}
+
+impl ReadyOrphanParents {
+    fn new(maximum: usize) -> Self {
+        Self {
+            queue: BTreeMap::new(),
+            queued: HashMap::new(),
+            next_id: 0,
+            maximum,
+        }
+    }
+
+    fn enqueue(&mut self, parent: BlockHash) -> Result<()> {
+        if self.queued.contains_key(&parent) {
+            return Ok(());
+        }
+        let id = self.next_id;
+        let next_id = id.checked_add(1).ok_or_else(|| {
+            anyhow::Error::new(OwnedOrphanInvariant(
+                "ready orphan-parent sequence overflowed".to_owned(),
+            ))
+        })?;
+        if self.queued.len() >= self.maximum {
+            anyhow::bail!(
+                "ready orphan-parent queue exceeds its {}-parent bound",
+                self.maximum
+            );
+        }
+        let previous_parent = self.queued.insert(parent, id);
+        let previous_id = self.queue.insert(id, parent);
+        debug_assert_eq!(previous_parent, None);
+        debug_assert_eq!(previous_id, None);
+        self.next_id = next_id;
+        Ok(())
+    }
+
+    fn preflight_enqueue(&self, parent: BlockHash) -> Result<()> {
+        if !self.queued.contains_key(&parent) && self.next_id.checked_add(1).is_none() {
+            return Err(anyhow::Error::new(OwnedOrphanInvariant(
+                "ready orphan-parent sequence overflowed".to_owned(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, parent: BlockHash) -> bool {
+        let Some(id) = self.queued.remove(&parent) else {
+            return false;
+        };
+        let removed = self.queue.remove(&id);
+        debug_assert_eq!(removed, Some(parent));
+        true
+    }
+
+    fn retain_live(&mut self, orphans: &OwnedOrphanPool, discards: &DeferredOrphanDiscards) {
+        self.queued
+            .retain(|parent, _| orphans.has_children(*parent) && !discards.contains(*parent));
+        self.queue
+            .retain(|id, parent| self.queued.get(parent).is_some_and(|queued| queued == id));
+    }
+
+    fn pop_front(&mut self) -> Option<BlockHash> {
+        let (id, parent) = self.queue.pop_first()?;
+        let removed = self.queued.remove(&parent);
+        debug_assert_eq!(removed, Some(id));
+        Some(parent)
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+#[derive(Debug)]
+struct DeferredOrphanDiscards {
+    queue: BTreeMap<u64, BlockHash>,
+    queued: HashMap<BlockHash, u64>,
+    next_id: u64,
+    maximum: usize,
+}
+
+impl DeferredOrphanDiscards {
+    fn new(maximum: usize) -> Self {
+        Self {
+            queue: BTreeMap::new(),
+            queued: HashMap::new(),
+            next_id: 0,
+            maximum,
+        }
+    }
+
+    fn enqueue(&mut self, parent: BlockHash, orphans: &OwnedOrphanPool) -> Result<()> {
+        if !orphans.has_children(parent) || self.queued.contains_key(&parent) {
+            return Ok(());
+        }
+        self.preflight_enqueue(parent, orphans)?;
+        let id = self.next_id;
+        let next_id = id.checked_add(1).ok_or_else(|| {
+            anyhow::Error::new(OwnedOrphanInvariant(
+                "deferred orphan-discard sequence overflowed".to_owned(),
+            ))
+        })?;
+        if self.queued.len() >= self.maximum {
+            self.retain_live(orphans);
+        }
+        if self.queued.len() >= self.maximum {
+            return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                "deferred orphan-discard queue exceeds its {}-parent bound",
+                self.maximum
+            ))));
+        }
+        let previous_parent = self.queued.insert(parent, id);
+        let previous_id = self.queue.insert(id, parent);
+        debug_assert_eq!(previous_parent, None);
+        debug_assert_eq!(previous_id, None);
+        self.next_id = next_id;
+        Ok(())
+    }
+
+    fn preflight_enqueue(&self, parent: BlockHash, orphans: &OwnedOrphanPool) -> Result<()> {
+        if orphans.has_children(parent)
+            && !self.queued.contains_key(&parent)
+            && self.next_id.checked_add(1).is_none()
+        {
+            return Err(anyhow::Error::new(OwnedOrphanInvariant(
+                "deferred orphan-discard sequence overflowed".to_owned(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, parent: BlockHash) -> bool {
+        let Some(id) = self.queued.remove(&parent) else {
+            return false;
+        };
+        let removed = self.queue.remove(&id);
+        debug_assert_eq!(removed, Some(parent));
+        true
+    }
+
+    fn retain_live(&mut self, orphans: &OwnedOrphanPool) {
+        self.queued
+            .retain(|parent, _| orphans.has_children(*parent));
+        self.queue
+            .retain(|id, parent| self.queued.get(parent).is_some_and(|queued| queued == id));
+    }
+
+    fn contains(&self, parent: BlockHash) -> bool {
+        self.queued.contains_key(&parent)
+    }
+
+    fn pop_front(&mut self) -> Option<BlockHash> {
+        let (id, parent) = self.queue.pop_first()?;
+        let removed = self.queued.remove(&parent);
+        debug_assert_eq!(removed, Some(id));
+        Some(parent)
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrphanWorkLane {
+    Release,
+    Discard,
+}
+
+impl OrphanWorkLane {
+    fn alternate(self) -> Self {
+        match self {
+            Self::Release => Self::Discard,
+            Self::Discard => Self::Release,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OrphanWorkSchedule {
+    next: OrphanWorkLane,
+}
+
+impl Default for OrphanWorkSchedule {
+    fn default() -> Self {
+        Self {
+            next: OrphanWorkLane::Discard,
+        }
+    }
+}
+
+fn ensure_orphan_work_queues_exact(
+    ready: &ReadyOrphanParents,
+    discards: &DeferredOrphanDiscards,
+) -> Result<()> {
+    if ready.queue.len() != ready.queued.len() || discards.queue.len() != discards.queued.len() {
+        return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+            "orphan work queue indexes disagree: ready {}/{}, discard {}/{}",
+            ready.queue.len(),
+            ready.queued.len(),
+            discards.queue.len(),
+            discards.queued.len()
+        ))));
+    }
+    let indexed_parents = ready.len().checked_add(discards.len()).ok_or_else(|| {
+        anyhow::Error::new(OwnedOrphanInvariant(
+            "combined orphan-parent work queues overflowed".to_owned(),
+        ))
+    })?;
+    if ready.maximum != discards.maximum
+        || ready.len() > ready.maximum
+        || discards.len() > discards.maximum
+        || indexed_parents > ready.maximum
+    {
+        return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+            "orphan-parent work queues exceed their exact bounds: ready {}/{}, discard {}/{}, combined {indexed_parents}",
+            ready.len(),
+            ready.maximum,
+            discards.len(),
+            discards.maximum,
+        ))));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn assert_orphan_work_membership_exact(
+    orphans: &OwnedOrphanPool,
+    ready: &ReadyOrphanParents,
+    discards: &DeferredOrphanDiscards,
+) {
+    for (id, parent) in &ready.queue {
+        assert_eq!(ready.queued.get(parent), Some(id));
+        assert!(orphans.has_children(*parent));
+        assert!(!discards.contains(*parent));
+    }
+    for (parent, id) in &ready.queued {
+        assert_eq!(ready.queue.get(id), Some(parent));
+    }
+    for (id, parent) in &discards.queue {
+        assert_eq!(discards.queued.get(parent), Some(id));
+        assert!(orphans.has_children(*parent));
+        assert!(!ready.queued.contains_key(parent));
+    }
+    for (parent, id) in &discards.queued {
+        assert_eq!(discards.queue.get(id), Some(parent));
+    }
+    assert!(ready.len().saturating_add(discards.len()) <= orphans.snapshot().blocks);
+}
 
 fn charge_header_deployment_read(
     reads: &mut usize,
@@ -694,6 +1238,105 @@ fn canonical_writer_stale(error: &anyhow::Error) -> bool {
             )
         )
     })
+}
+
+fn canonical_writer_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CanonicalWriterError>(),
+            Some(CanonicalWriterError::Busy)
+        )
+    })
+}
+
+fn canonical_writer_contention(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CanonicalWriterError>(),
+            Some(
+                CanonicalWriterError::Busy
+                    | CanonicalWriterError::StaleEpoch { .. }
+                    | CanonicalWriterError::StaleChainEpoch { .. }
+                    | CanonicalWriterError::QueueFull { .. }
+            )
+        )
+    })
+}
+
+fn peer_header_import_penalty(error: &anyhow::Error) -> Option<u32> {
+    error
+        .chain()
+        .any(|cause| {
+            cause.is::<PeerHeaderBatchLimit>()
+                || matches!(
+                    cause.downcast_ref::<ConsensusError>(),
+                    Some(ConsensusError::InvalidHeader(_))
+                )
+        })
+        .then_some(100)
+}
+
+fn peer_block_header_import_penalty(error: &anyhow::Error) -> Option<u32> {
+    error
+        .chain()
+        .any(|cause| {
+            cause.is::<PeerHeaderBatchLimit>()
+                || matches!(
+                    cause.downcast_ref::<ConsensusError>(),
+                    Some(ConsensusError::InvalidHeader(_))
+                )
+        })
+        .then_some(50)
+}
+
+fn canonical_writer_shutting_down(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CanonicalWriterError>(),
+            Some(CanonicalWriterError::ShuttingDown)
+        )
+    })
+}
+
+fn native_sync_contention_retry_interval(base: Duration, consecutive: usize) -> Duration {
+    let maximum = MAX_NATIVE_SYNC_CONTENTION_RETRY_INTERVAL.max(base);
+    let doublings = consecutive
+        .saturating_sub(1)
+        .min(MAX_CANONICAL_STALE_RETRIES.saturating_sub(1));
+    let mut delay = base;
+    for _ in 0..doublings {
+        delay = delay.saturating_mul(2).min(maximum);
+    }
+    delay
+}
+
+fn active_state_contention_retry_interval(consecutive: usize) -> Duration {
+    native_sync_contention_retry_interval(MIN_NATIVE_SYNC_POLL_INTERVAL, consecutive)
+}
+
+fn trace_native_sync_contention_retry(
+    operation: &'static str,
+    consecutive: usize,
+    retry_after: Duration,
+    error: &anyhow::Error,
+) {
+    if consecutive.is_power_of_two() {
+        tracing::warn!(
+            operation,
+            consecutive,
+            retry_millis = retry_after.as_millis(),
+            error = %error,
+            "native-sync canonical contention; rescheduling"
+        );
+    } else {
+        tracing::debug!(
+            operation,
+            consecutive,
+            retry_millis = retry_after.as_millis(),
+            error = %error,
+            "native-sync canonical contention; rescheduling"
+        );
+    }
 }
 
 fn direct_staged_effect_retry(
@@ -1896,11 +2539,15 @@ impl NodeService {
 
         node.native_sync_queue_missing_canonical_bodies(&mut scheduler)?;
 
-        let mut orphan_pool = BoundedOrphanPool::new(OrphanLimits {
+        let mut orphan_pool = OwnedOrphanPool::new(OrphanLimits {
             maximum_blocks: native_sync_config.orphan_blocks,
             maximum_bytes: native_sync_config.orphan_bytes,
         })
         .map_err(|error| anyhow::anyhow!("failed to initialize orphan pool: {error}"))?;
+        let mut ready_orphan_parents = ReadyOrphanParents::new(native_sync_config.orphan_blocks);
+        let mut deferred_orphan_discards =
+            DeferredOrphanDiscards::new(native_sync_config.orphan_blocks);
+        let mut orphan_work_schedule = OrphanWorkSchedule::default();
         let (validation, mut validated) = spawn_validation_pipeline(
             Arc::new(HnsBodyValidator::new(network)),
             native_sync_config.validation_workers,
@@ -2065,18 +2712,28 @@ impl NodeService {
                 diagnostics: &diagnostics,
                 diagnostic_rpc: &diagnostic_rpc,
             };
-            if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
+            let startup_affected = connect_stored_active_state_with_diagnostic_rpc(
                 &context,
                 &mut scheduler,
                 &mut orphan_pool,
                 native_sync_config.active_state_connect_batch,
             )
             .await
-            {
-                let _ = shutdown_tx.send(true);
-                let _ = rpc_task.await;
-                return Err(error.context("failed to resume active-state synchronization"));
-            }
+            .map_err(|error| error.context("failed to resume active-state synchronization"));
+            let startup_affected = match startup_affected {
+                Ok(affected) => affected,
+                Err(error) => {
+                    let _ = shutdown_tx.send(true);
+                    let _ = rpc_task.await;
+                    return Err(error);
+                }
+            };
+            enqueue_affected_orphan_discards(
+                &startup_affected,
+                &orphan_pool,
+                &mut ready_orphan_parents,
+                &mut deferred_orphan_discards,
+            )?;
         }
 
         let listener_task = if let Some(address) = native_sync_config.listen {
@@ -2126,6 +2783,9 @@ impl NodeService {
         let mut shutdown_wait = Box::pin(shutdown.wait());
         let mut terminal_error: Option<anyhow::Error> = None;
         let mut active_state_task: Option<JoinHandle<Result<NativeActiveStateSliceResult>>> = None;
+        let mut active_state_completion: Option<NativeActiveStateSliceResult> = None;
+        let mut consecutive_active_state_contention = 0usize;
+        let mut consecutive_maintenance_busy = 0usize;
         let mut next_supervisor_lane = NativeSupervisorLane::Maintenance;
 
         loop {
@@ -2155,21 +2815,119 @@ impl NodeService {
                 _ = active_state_poll.tick(),
                     if native_sync_config.connect_active_state
                         && active_state_task.is_none()
-                        && active_state_work_ready(&scheduler) =>
+                        && (active_state_completion.is_some()
+                            || active_state_work_ready(&scheduler)) =>
                 {
-                    // Preparation is pure, bounded CPU work and remains
-                    // independent of the network supervisor. Exactly one job
-                    // may be in flight; its ordered completion branch below is
-                    // the only place scheduler state is advanced.
-                    active_state_task = Some(tokio::spawn(execute_native_active_state_slice(
-                        node.clone(),
-                        writer.clone(),
-                        native_sync_config.active_state_connect_batch,
-                        scheduler.stored_tip().cloned(),
-                        native_sync_config.validation_workers,
-                        native_sync_config.validation_queue,
-                    )));
-                    active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
+                    if active_state_completion.is_some() {
+                        let context = ActiveStateConnectionContext {
+                            node: &node,
+                            writer: &writer,
+                            peers: &peers,
+                            diagnostics: &diagnostics,
+                            diagnostic_rpc: &diagnostic_rpc,
+                        };
+                        let completion_result = {
+                            let completed = active_state_completion
+                                .as_ref()
+                                .expect("active-state completion remains retained");
+                            complete_stored_active_state_slice(
+                                completed,
+                                &context,
+                                &mut scheduler,
+                                &mut orphan_pool,
+                            )
+                            .await
+                        };
+                        match completion_result {
+                            Ok(()) => {
+                                // Canonical completion and its scheduler/
+                                // diagnostic publication are irreversible.
+                                // Relinquish the retained completion before
+                                // fallible deferred-orphan bookkeeping so a
+                                // terminal shutdown cannot publish it twice.
+                                let completed = active_state_completion
+                                    .take()
+                                    .expect("published active-state completion remains retained");
+                                let orphan_result = (|| -> Result<()> {
+                                    if let Some(failed) = &completed.outcome.contextual_failure {
+                                        enqueue_affected_orphan_discards(
+                                            &failed.affected,
+                                            &orphan_pool,
+                                            &mut ready_orphan_parents,
+                                            &mut deferred_orphan_discards,
+                                        )?;
+                                    }
+                                    drain_orphan_work(
+                                        MAX_VALIDATED_BODY_COMMIT_BATCH,
+                                        &validation,
+                                        &mut scheduler,
+                                        &mut orphan_pool,
+                                        &mut ready_orphan_parents,
+                                        &mut deferred_orphan_discards,
+                                        &mut orphan_work_schedule,
+                                    )?;
+                                    Ok(())
+                                })();
+                                if let Err(error) = orphan_result {
+                                    let error = error.context(
+                                        "failed to schedule contextual orphan cleanup",
+                                    );
+                                    record_error(&diagnostics, format!("{error:#}")).await;
+                                    terminal_error = Some(error);
+                                    break;
+                                }
+                                consecutive_active_state_contention = 0;
+                                active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
+                                refresh_diagnostics(
+                                    &diagnostics,
+                                    &peers,
+                                    &scheduler,
+                                    &orphan_pool,
+                                    &reconnects,
+                                    &address_book,
+                                    &ban_list,
+                                    &compact_peers,
+                                    &pending_compact_blocks,
+                                    checkpoint_sequence,
+                                )
+                                .await;
+                            }
+                            Err(error) if canonical_writer_contention(&error) => {
+                                consecutive_active_state_contention =
+                                    consecutive_active_state_contention.saturating_add(1);
+                                let retry_after = active_state_contention_retry_interval(
+                                    consecutive_active_state_contention,
+                                );
+                                trace_native_sync_contention_retry(
+                                    "active-state completion",
+                                    consecutive_active_state_contention,
+                                    retry_after,
+                                    &error,
+                                );
+                                active_state_poll.reset_after(retry_after);
+                            }
+                            Err(error) => {
+                                let error = error.context("active-state completion failed");
+                                record_error(&diagnostics, format!("{error:#}")).await;
+                                terminal_error = Some(error);
+                                break;
+                            }
+                        }
+                    } else {
+                        // Preparation is pure, bounded CPU work and remains
+                        // independent of the network supervisor. Exactly one
+                        // job may be in flight, and a completed job remains
+                        // owned here until all scheduler effects are published.
+                        active_state_task = Some(tokio::spawn(execute_native_active_state_slice(
+                            node.clone(),
+                            writer.clone(),
+                            native_sync_config.active_state_connect_batch,
+                            scheduler.stored_tip().cloned(),
+                            native_sync_config.validation_workers,
+                            native_sync_config.validation_queue,
+                        )));
+                        active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
+                    }
                 }
                 result = async {
                     active_state_task
@@ -2180,8 +2938,25 @@ impl NodeService {
                     let _finished = active_state_task
                         .take()
                         .expect("completed active-state task remains present");
-                    let completed = match result {
-                        Ok(Ok(completed)) => completed,
+                    match result {
+                        Ok(Ok(completed)) => {
+                            active_state_completion = Some(completed);
+                            active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
+                        }
+                        Ok(Err(error)) if canonical_writer_contention(&error) => {
+                            consecutive_active_state_contention =
+                                consecutive_active_state_contention.saturating_add(1);
+                            let retry_after = active_state_contention_retry_interval(
+                                consecutive_active_state_contention,
+                            );
+                            trace_native_sync_contention_retry(
+                                "active-state preparation/commit",
+                                consecutive_active_state_contention,
+                                retry_after,
+                                &error,
+                            );
+                            active_state_poll.reset_after(retry_after);
+                        }
                         Ok(Err(error)) => {
                             let error = error.context("active-state synchronization failed");
                             record_error(&diagnostics, format!("{error:#}")).await;
@@ -2195,39 +2970,7 @@ impl NodeService {
                             terminal_error = Some(error);
                             break;
                         }
-                    };
-                    let context = ActiveStateConnectionContext {
-                        node: &node,
-                        writer: &writer,
-                        peers: &peers,
-                        diagnostics: &diagnostics,
-                        diagnostic_rpc: &diagnostic_rpc,
-                    };
-                    if let Err(error) = complete_stored_active_state_slice(
-                        completed,
-                        &context,
-                        &mut scheduler,
-                        &mut orphan_pool,
-                    ).await {
-                        let error = error.context("active-state completion failed");
-                        record_error(&diagnostics, format!("{error:#}")).await;
-                        terminal_error = Some(error);
-                        break;
                     }
-                    active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
-                    refresh_diagnostics(
-                        &diagnostics,
-                        &peers,
-                        &scheduler,
-                        &orphan_pool,
-                        &reconnects,
-                        &address_book,
-                        &ban_list,
-                        &compact_peers,
-                        &pending_compact_blocks,
-                        checkpoint_sequence,
-                    )
-                    .await;
                 }
                 event = next_native_supervisor_event(
                     &mut next_supervisor_lane,
@@ -2314,19 +3057,69 @@ impl NodeService {
                         .await;
                     }
 
-                    let queue_result =
-                        node.native_sync_queue_missing_canonical_bodies(&mut scheduler);
-                    if let Err(error) = queue_result {
-                        let error = error.context(
-                            "failed to refresh canonical block-body work queue",
-                        );
+                    if let Err(error) = drain_orphan_work(
+                        MAX_VALIDATED_BODY_COMMIT_BATCH,
+                        &validation,
+                        &mut scheduler,
+                        &mut orphan_pool,
+                        &mut ready_orphan_parents,
+                        &mut deferred_orphan_discards,
+                        &mut orphan_work_schedule,
+                    ) {
+                        let error = error.context("failed to drain bounded orphan work");
                         record_error(&diagnostics, format!("{error:#}")).await;
                         terminal_error = Some(error);
                         break;
                     }
+
+                    let queue_result =
+                        node.native_sync_queue_missing_canonical_bodies(&mut scheduler);
+                    match queue_result {
+                        Ok(_) => {}
+                        Err(error) if canonical_writer_busy(&error) => {
+                            consecutive_maintenance_busy =
+                                consecutive_maintenance_busy.saturating_add(1);
+                            let retry_after = native_sync_contention_retry_interval(
+                                native_sync_config.poll_interval,
+                                consecutive_maintenance_busy,
+                            );
+                            trace_native_sync_contention_retry(
+                                "canonical body-queue refresh",
+                                consecutive_maintenance_busy,
+                                retry_after,
+                                &error,
+                            );
+                            reset_native_supervisor_poll(&mut poll, retry_after);
+                            continue;
+                        }
+                        Err(error) => {
+                            let error = error.context(
+                                "failed to refresh canonical block-body work queue",
+                            );
+                            record_error(&diagnostics, format!("{error:#}")).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    }
                     let locator_result = node.native_sync_block_locator(MAX_LOCATOR_ENTRIES);
                     let locator = match locator_result {
                         Ok(locator) => locator,
+                        Err(error) if canonical_writer_busy(&error) => {
+                            consecutive_maintenance_busy =
+                                consecutive_maintenance_busy.saturating_add(1);
+                            let retry_after = native_sync_contention_retry_interval(
+                                native_sync_config.poll_interval,
+                                consecutive_maintenance_busy,
+                            );
+                            trace_native_sync_contention_retry(
+                                "synchronization locator read",
+                                consecutive_maintenance_busy,
+                                retry_after,
+                                &error,
+                            );
+                            reset_native_supervisor_poll(&mut poll, retry_after);
+                            continue;
+                        }
                         Err(error) => {
                             let error = error.context("failed to build synchronization locator");
                             record_error(&diagnostics, format!("{error:#}")).await;
@@ -2334,6 +3127,7 @@ impl NodeService {
                             break;
                         }
                     };
+                    consecutive_maintenance_busy = 0;
                     let dispatches = match batch_sync_actions(
                         scheduler.poll(StdInstant::now(), &locator),
                     ) {
@@ -2482,7 +3276,6 @@ impl NodeService {
                         node: &node,
                         writer: &writer,
                         peers: &peers,
-                        validation: &validation,
                         diagnostics: &diagnostics,
                     };
                     let validation_result = handle_validation_results(
@@ -2490,15 +3283,30 @@ impl NodeService {
                         &context,
                         &mut scheduler,
                         &mut orphan_pool,
+                        &mut ready_orphan_parents,
+                        &mut deferred_orphan_discards,
                     )
                     .await;
                     if let Err(error) = validation_result {
-                        if unreconciled_validation_batch(&error) {
+                        if terminal_validation_error(&error) {
                             record_error(&diagnostics, format!("{error:#}")).await;
                             terminal_error = Some(error);
                             break;
                         }
                         record_warning(format!("{error:#}"));
+                    }
+                    if let Err(error) = drain_orphan_work(
+                        MAX_VALIDATED_BODY_COMMIT_BATCH,
+                        &validation,
+                        &mut scheduler,
+                        &mut orphan_pool,
+                        &mut ready_orphan_parents,
+                        &mut deferred_orphan_discards,
+                        &mut orphan_work_schedule,
+                    ) {
+                        record_error(&diagnostics, format!("{error:#}")).await;
+                        terminal_error = Some(error);
+                        break;
                     }
                     refresh_diagnostics(
                         &diagnostics,
@@ -2555,15 +3363,23 @@ impl NodeService {
         // charges every materialized body against `NodeReorgLimits`' bounded
         // production body-byte envelope before a worker is admitted.
         if let Some(task) = active_state_task.take() {
-            let completed = match task.await {
-                Ok(Ok(completed)) => Some(completed),
+            match task.await {
+                Ok(Ok(completed)) => active_state_completion = Some(completed),
+                Ok(Err(error))
+                    if canonical_writer_contention(&error)
+                        || canonical_writer_shutting_down(&error) =>
+                {
+                    tracing::debug!(
+                        error = %error,
+                        "discarding uncommitted active-state work during shutdown"
+                    );
+                }
                 Ok(Err(error)) => {
                     let error = error.context("active-state shutdown drain failed");
                     record_error(&diagnostics, format!("{error:#}")).await;
                     if terminal_error.is_none() {
                         terminal_error = Some(error);
                     }
-                    None
                 }
                 Err(error) => {
                     let error = anyhow::Error::new(error)
@@ -2572,29 +3388,81 @@ impl NodeService {
                     if terminal_error.is_none() {
                         terminal_error = Some(error);
                     }
-                    None
                 }
+            }
+        }
+        if let Some(completed) = active_state_completion.take() {
+            let context = ActiveStateConnectionContext {
+                node: &node,
+                writer: &writer,
+                peers: &peers,
+                diagnostics: &diagnostics,
+                diagnostic_rpc: &diagnostic_rpc,
             };
-            if let Some(completed) = completed {
-                let context = ActiveStateConnectionContext {
-                    node: &node,
-                    writer: &writer,
-                    peers: &peers,
-                    diagnostics: &diagnostics,
-                    diagnostic_rpc: &diagnostic_rpc,
-                };
-                if let Err(error) = complete_stored_active_state_slice(
-                    completed,
+            for attempt in 0..MAX_CANONICAL_STALE_RETRIES {
+                match complete_stored_active_state_slice(
+                    &completed,
                     &context,
                     &mut scheduler,
                     &mut orphan_pool,
                 )
                 .await
                 {
-                    let error = error.context("active-state shutdown completion failed");
-                    record_error(&diagnostics, format!("{error:#}")).await;
-                    if terminal_error.is_none() {
-                        terminal_error = Some(error);
+                    Ok(()) => {
+                        let orphan_result = (|| -> Result<()> {
+                            if let Some(failed) = &completed.outcome.contextual_failure {
+                                enqueue_affected_orphan_discards(
+                                    &failed.affected,
+                                    &orphan_pool,
+                                    &mut ready_orphan_parents,
+                                    &mut deferred_orphan_discards,
+                                )?;
+                            }
+                            drain_orphan_work(
+                                MAX_VALIDATED_BODY_COMMIT_BATCH,
+                                &validation,
+                                &mut scheduler,
+                                &mut orphan_pool,
+                                &mut ready_orphan_parents,
+                                &mut deferred_orphan_discards,
+                                &mut orphan_work_schedule,
+                            )?;
+                            Ok(())
+                        })();
+                        if let Err(error) = orphan_result {
+                            let error = error
+                                .context("failed to schedule shutdown contextual orphan cleanup");
+                            record_error(&diagnostics, format!("{error:#}")).await;
+                            if terminal_error.is_none() {
+                                terminal_error = Some(error);
+                            }
+                        }
+                        break;
+                    }
+                    Err(error)
+                        if canonical_writer_contention(&error)
+                            && attempt + 1 < MAX_CANONICAL_STALE_RETRIES =>
+                    {
+                        tokio::time::sleep(active_state_contention_retry_interval(attempt + 1))
+                            .await;
+                    }
+                    Err(error)
+                        if canonical_writer_contention(&error)
+                            || canonical_writer_shutting_down(&error) =>
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "deferred active-state scheduler publication during shutdown; durable state will be recovered on restart"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        let error = error.context("active-state shutdown completion failed");
+                        record_error(&diagnostics, format!("{error:#}")).await;
+                        if terminal_error.is_none() {
+                            terminal_error = Some(error);
+                        }
+                        break;
                     }
                 }
             }
@@ -2729,7 +3597,10 @@ impl NodeService {
     fn native_sync_import_headers(&mut self, headers: Vec<Header>) -> Result<Vec<HeaderRecord>> {
         self.state.ensure_storage_operational()?;
         if headers.len() > MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE {
-            anyhow::bail!("peer sent too many headers: {}", headers.len());
+            return Err(anyhow::Error::new(PeerHeaderBatchLimit {
+                limit: MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE,
+                actual: headers.len(),
+            }));
         }
 
         let maximum_time = current_unix_time()?.saturating_add(MAX_FUTURE_BLOCK_TIME);
@@ -2800,7 +3671,8 @@ impl NodeService {
                         require_pow: !is_canonical_genesis,
                     },
                 )
-                .map_err(|error| anyhow::anyhow!("header validation failed: {error}"))?;
+                .map_err(anyhow::Error::new)
+                .context("header validation failed")?;
 
             let request = HeaderImport {
                 header,
@@ -4600,24 +5472,43 @@ async fn handle_peer_event(
                         );
                         return Ok(());
                     }
+                    Err(error) if canonical_writer_contention(&error) => {
+                        // The peer supplied a complete response; only local
+                        // writer admission prevented its atomic import. Clear
+                        // the request so the next maintenance poll can issue
+                        // a fresh locator without attributing local pressure
+                        // to the remote peer.
+                        scheduler.note_headers_response(peer, header_count);
+                        tracing::debug!(
+                            ?peer,
+                            %error,
+                            "deferred peer header batch after local canonical contention"
+                        );
+                        return Ok(());
+                    }
                     Err(error) => {
                         // A connecting response consumes the outstanding
                         // request even if its consensus validation fails.
                         // Otherwise a malicious peer can pin the request slot
                         // until the timeout fires.
                         scheduler.note_headers_response(peer, header_count);
-                        // Header packets commit atomically. Refresh from the
-                        // unchanged durable index before disconnecting the
-                        // sender so the scheduler retries from the last
-                        // complete protocol batch.
-                        scheduler.set_best_header(node.native_sync_best_header_tip()?);
-                        node.native_sync_queue_missing_canonical_bodies(scheduler)?;
-                        penalize_peer(peers, peer, 100, "peer header batch rejected").await?;
-                        update_diagnostics(diagnostics, |state| {
-                            state.rejected_messages = state.rejected_messages.saturating_add(1);
-                        })
-                        .await;
-                        return Err(error.context("peer header batch rejected"));
+                        if let Some(penalty) = peer_header_import_penalty(&error) {
+                            // Proven-invalid header packets commit atomically.
+                            // Refresh from the unchanged durable index before
+                            // scoring the sender so retries start from the
+                            // last complete protocol batch.
+                            scheduler.set_best_header(node.native_sync_best_header_tip()?);
+                            node.native_sync_queue_missing_canonical_bodies(scheduler)?;
+                            penalize_peer(peers, peer, penalty, "peer header batch rejected")
+                                .await?;
+                            update_diagnostics(diagnostics, |state| {
+                                state.rejected_messages = state.rejected_messages.saturating_add(1);
+                            })
+                            .await;
+                            return Err(error.context("peer header batch rejected"));
+                        }
+                        return Err(error
+                            .context("local dependency failed while importing peer header batch"));
                     }
                 };
                 scheduler.note_headers_response(peer, header_count);
@@ -5189,7 +6080,10 @@ async fn import_header_packet(
     headers: Vec<Header>,
 ) -> Result<Vec<HeaderRecord>> {
     if headers.len() > MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE {
-        anyhow::bail!("peer sent too many headers: {}", headers.len());
+        return Err(anyhow::Error::new(PeerHeaderBatchLimit {
+            limit: MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE,
+            actual: headers.len(),
+        }));
     }
 
     writer
@@ -5483,9 +6377,29 @@ async fn accept_peer_block(
             .await;
         record = match imported {
             Ok(imported) => imported.into_iter().next(),
+            Err(error) if canonical_writer_contention(&error) => {
+                // Height is not authoritative until the header import
+                // succeeds, so leave the existing bounded body reservation
+                // in flight for scheduler timeout/reassignment. The body can
+                // be requested again without scoring the delivering peer.
+                tracing::debug!(
+                    ?peer,
+                    block = %hash.to_hex(),
+                    %error,
+                    "deferred delivered block header after local canonical contention"
+                );
+                return Err(
+                    error.context("local canonical contention deferred delivered block header")
+                );
+            }
             Err(error) => {
-                penalize_peer(peers, peer, 50, "peer block header rejected").await?;
-                return Err(error.context("peer block header rejected"));
+                if let Some(penalty) = peer_block_header_import_penalty(&error) {
+                    penalize_peer(peers, peer, penalty, "peer block header rejected").await?;
+                    return Err(error.context("peer block header rejected"));
+                }
+                return Err(
+                    error.context("local dependency failed while importing delivered block header")
+                );
             }
         };
         scheduler.set_best_header(node.native_sync_best_header_tip()?);
@@ -5552,70 +6466,74 @@ async fn request_headers_from_peer(
     Ok(())
 }
 
-async fn submit_released_orphans(
+fn validation_queue_full(error: &SyncError) -> bool {
+    matches!(
+        error,
+        SyncError::LimitExceeded {
+            context: "validation input queue",
+            ..
+        }
+    )
+}
+
+/// Try every child released by one newly durable parent exactly once.
+///
+/// A full validation queue restores the exact `(block, height)` into capacity
+/// freed by `take_children` and asks the bounded ready-parent queue to retry on
+/// a later supervisor opportunity. A closed pipeline is not retryable during
+/// normal runtime, but all not-submitted children are still restored first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OrphanReleaseOutcome {
+    attempted: usize,
+    retry_parent: bool,
+}
+
+fn release_parent_orphans(
     parent: BlockHash,
-    node: &NodeReadHandle,
-    writer: &CanonicalStateWriter,
+    maximum_children: usize,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
-) -> Result<()> {
-    let mut first_error = None;
+    orphans: &mut OwnedOrphanPool,
+) -> Result<OrphanReleaseOutcome> {
+    let mut terminal_error = None;
     let mut terminal_recovery_failure = None;
-    for block in orphans.take_children(parent) {
-        let hash = block.hash();
-        let record = match async {
-            match node.native_sync_header_record(&hash)? {
-                Some(record) => Ok(record),
-                None => {
-                    let header = block.header.clone();
-                    writer
-                        .execute(
-                            None,
-                            "import released native-sync orphan header",
-                            move |node| node.native_sync_import_headers(vec![header]),
-                        )
-                        .await?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("released orphan header import returned no record")
-                        })
-                }
-            }
+    let outcome = match orphans.take_children_bounded(parent, maximum_children) {
+        Ok(outcome) => outcome,
+        Err(error) if owned_orphan_invariant(&error) => {
+            return Err(anyhow::Error::new(UnreconciledValidationBatch {
+                handling_error: error.context("failed to release owned orphan children"),
+                reconciliation_error: anyhow::anyhow!(
+                    "owned orphan sidecar invariant prevents exact child recovery"
+                ),
+            }));
         }
-        .await
-        {
-            Ok(record) => record,
-            Err(error) => {
-                let handling_error = error.context("failed to prepare released orphan validation");
-                if let Err(reconciliation_error) =
-                    restore_released_orphan(block, scheduler, orphans)
-                {
-                    terminal_recovery_failure.get_or_insert((handling_error, reconciliation_error));
-                } else {
-                    first_error.get_or_insert(handling_error);
-                }
-                continue;
-            }
-        };
+        Err(error) => return Err(error),
+    };
+    let attempted = outcome.children.len();
+    let mut retry_parent = outcome.children_remain;
+    for orphan in outcome.children {
+        let hash = orphan.block.hash();
         scheduler.begin_local_validation(hash);
-        let retry = block.clone();
+        let retry = orphan.clone();
         if let Err(error) = validation.try_submit(ValidationRequest {
             peer: LOCAL_ORPHAN_PEER,
-            height: record.height,
+            height: orphan.height,
             attempt: 0,
-            block,
+            block: orphan.block,
         }) {
-            let handling_error = anyhow::anyhow!("failed to submit released orphan: {error}");
+            let queue_full = validation_queue_full(&error);
+            let handling_error =
+                anyhow::Error::new(error).context("failed to submit released native-sync orphan");
             if let Err(reconciliation_error) = restore_released_orphan(retry, scheduler, orphans) {
                 terminal_recovery_failure.get_or_insert((handling_error, reconciliation_error));
+            } else if queue_full {
+                retry_parent = true;
             } else {
-                first_error.get_or_insert(handling_error);
+                terminal_error.get_or_insert(handling_error);
             }
         }
     }
-    match (terminal_recovery_failure, first_error) {
+    match (terminal_recovery_failure, terminal_error) {
         (Some((handling_error, reconciliation_error)), _) => {
             Err(anyhow::Error::new(UnreconciledValidationBatch {
                 handling_error,
@@ -5623,17 +6541,20 @@ async fn submit_released_orphans(
             }))
         }
         (None, Some(error)) => Err(error),
-        (None, None) => Ok(()),
+        (None, None) => Ok(OrphanReleaseOutcome {
+            attempted,
+            retry_parent,
+        }),
     }
 }
 
 fn restore_released_orphan(
-    block: Block,
+    orphan: OwnedOrphan,
     scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
+    orphans: &mut OwnedOrphanPool,
 ) -> Result<()> {
     let outcome = orphans
-        .insert_with_evictions(block)
+        .insert_with_evictions(orphan)
         .context("failed to restore released orphan ownership")?;
     if !outcome.evicted.is_empty() {
         anyhow::bail!(
@@ -5645,11 +6566,142 @@ fn restore_released_orphan(
     Ok(())
 }
 
+fn enqueue_ready_orphan_parent(
+    parent: BlockHash,
+    orphans: &OwnedOrphanPool,
+    discards: &DeferredOrphanDiscards,
+    ready: &mut ReadyOrphanParents,
+) -> Result<()> {
+    if !orphans.has_children(parent) || discards.contains(parent) {
+        ready.remove(parent);
+        return Ok(());
+    }
+    ready.preflight_enqueue(parent)?;
+    // Exact eager cleanup keeps this path O(log N). The full bounded prune is
+    // a capacity backstop for future removal paths, not an O(N) tax on every
+    // durable parent in a maximum-size result batch.
+    if ready.len() >= ready.maximum {
+        ready.retain_live(orphans, discards);
+    }
+    ready.enqueue(parent).map_err(|reconciliation_error| {
+        anyhow::Error::new(UnreconciledValidationBatch {
+            handling_error: anyhow::anyhow!(
+                "released children of durable parent {} require a validation retry",
+                parent.to_hex()
+            ),
+            reconciliation_error,
+        })
+    })
+}
+
+fn enqueue_deferred_orphan_discard(
+    parent: BlockHash,
+    orphans: &OwnedOrphanPool,
+    ready: &mut ReadyOrphanParents,
+    discards: &mut DeferredOrphanDiscards,
+) -> Result<()> {
+    discards.preflight_enqueue(parent, orphans)?;
+    ready.remove(parent);
+    discards.enqueue(parent, orphans)
+}
+
+fn drain_orphan_work(
+    maximum_units: usize,
+    validation: &ValidationSubmitter,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut OwnedOrphanPool,
+    ready: &mut ReadyOrphanParents,
+    discards: &mut DeferredOrphanDiscards,
+    schedule: &mut OrphanWorkSchedule,
+) -> Result<usize> {
+    if maximum_units == 0 {
+        return Ok(0);
+    }
+    ensure_orphan_work_queues_exact(ready, discards)?;
+
+    let mut spent = 0usize;
+    while spent < maximum_units {
+        let lane = match schedule.next {
+            OrphanWorkLane::Release if ready.len() != 0 => Some(OrphanWorkLane::Release),
+            OrphanWorkLane::Discard if discards.len() != 0 => Some(OrphanWorkLane::Discard),
+            OrphanWorkLane::Release if discards.len() != 0 => Some(OrphanWorkLane::Discard),
+            OrphanWorkLane::Discard if ready.len() != 0 => Some(OrphanWorkLane::Release),
+            _ => None,
+        };
+        let Some(lane) = lane else {
+            break;
+        };
+        schedule.next = lane.alternate();
+        spent = spent.saturating_add(1);
+
+        match lane {
+            OrphanWorkLane::Release => {
+                let parent = ready
+                    .pop_front()
+                    .expect("ready orphan-parent queue remains non-empty");
+                if discards.contains(parent) {
+                    return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                        "discard-fenced parent {} entered ready release",
+                        parent.to_hex()
+                    ))));
+                }
+                if !orphans.has_children(parent) {
+                    continue;
+                }
+                let outcome = release_parent_orphans(parent, 1, validation, scheduler, orphans)?;
+                if outcome.attempted != 1 {
+                    return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                        "live ready parent {} released {} children for one work unit",
+                        parent.to_hex(),
+                        outcome.attempted
+                    ))));
+                }
+                if outcome.retry_parent {
+                    enqueue_ready_orphan_parent(parent, orphans, discards, ready)?;
+                }
+            }
+            OrphanWorkLane::Discard => {
+                let parent = discards
+                    .pop_front()
+                    .expect("deferred orphan-discard queue remains non-empty");
+                ready.remove(parent);
+                if !orphans.has_children(parent) {
+                    continue;
+                }
+                let outcome = orphans
+                    .take_children_bounded(parent, 1)
+                    .context("failed to discard one bounded orphan child")?;
+                if outcome.children.len() != 1 {
+                    return Err(anyhow::Error::new(OwnedOrphanInvariant(format!(
+                        "live discard parent {} removed {} children for one work unit",
+                        parent.to_hex(),
+                        outcome.children.len()
+                    ))));
+                }
+                if outcome.children_remain {
+                    enqueue_deferred_orphan_discard(parent, orphans, ready, discards)?;
+                }
+                let child = outcome
+                    .children
+                    .into_iter()
+                    .next()
+                    .expect("one bounded discarded orphan child remains exact");
+                let child_hash = child.block.hash();
+                if scheduler.is_tracked_block(&child_hash) {
+                    scheduler.reject_block(None, child_hash, false, StdInstant::now());
+                }
+                enqueue_deferred_orphan_discard(child_hash, orphans, ready, discards)?;
+            }
+        }
+    }
+    ensure_orphan_work_queues_exact(ready, discards)?;
+    Ok(spent)
+}
+
 struct ValidationResultContext<'a> {
     node: &'a NodeReadHandle,
     writer: &'a CanonicalStateWriter,
     peers: &'a LivePeerManager,
-    validation: &'a ValidationSubmitter,
     diagnostics: &'a Arc<RwLock<NativeSyncDiagnostics>>,
 }
 
@@ -5677,33 +6729,61 @@ fn unreconciled_validation_batch(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<UnreconciledValidationBatch>())
 }
 
+fn validation_pipeline_closed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<SyncError>(),
+            Some(SyncError::ValidationPipelineClosed)
+        )
+    })
+}
+
+fn terminal_validation_error(error: &anyhow::Error) -> bool {
+    unreconciled_validation_batch(error)
+        || validation_pipeline_closed(error)
+        || owned_orphan_invariant(error)
+}
+
 async fn handle_validation_results(
     results: Vec<OrderedValidationResult>,
     context: &ValidationResultContext<'_>,
     scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
+    orphans: &mut OwnedOrphanPool,
+    ready_orphan_parents: &mut ReadyOrphanParents,
+    deferred_orphan_discards: &mut DeferredOrphanDiscards,
 ) -> Result<()> {
     let mut validated = Vec::new();
     let mut first_warning = None;
     let mut terminal_failure = None;
 
     for result in results {
+        let hash = match &result {
+            Ok(validated) => validated.block.hash(),
+            Err(failure) => failure.block.hash(),
+        };
+        // Invalid-branch persistence rejects every affected scheduler hash
+        // before bounded body cleanup begins. Results already queued by a
+        // worker are therefore stale ownership notifications, not new work:
+        // dropping both Ok and Err variants prevents them from recreating or
+        // retrying a branch behind the deferred-discard cursor.
+        if !scheduler.is_tracked_block(&hash) {
+            continue;
+        }
         match result {
             Ok(block) => validated.push(block),
             Err(failure) => {
                 if !validated.is_empty() {
                     if let Err(error) = handle_validated_blocks(
                         std::mem::take(&mut validated),
-                        context.node,
-                        context.writer,
-                        context.validation,
+                        context,
                         scheduler,
                         orphans,
-                        context.diagnostics,
+                        ready_orphan_parents,
+                        deferred_orphan_discards,
                     )
                     .await
                     {
-                        if unreconciled_validation_batch(&error) {
+                        if terminal_validation_error(&error) {
                             terminal_failure.get_or_insert(error);
                         } else {
                             first_warning.get_or_insert(error);
@@ -5712,15 +6792,19 @@ async fn handle_validation_results(
                 }
                 if let Err(error) = handle_validation_failure(
                     failure,
-                    context.writer,
-                    context.peers,
+                    context,
                     scheduler,
                     orphans,
-                    context.diagnostics,
+                    ready_orphan_parents,
+                    deferred_orphan_discards,
                 )
                 .await
                 {
-                    first_warning.get_or_insert(error);
+                    if terminal_validation_error(&error) {
+                        terminal_failure.get_or_insert(error);
+                    } else {
+                        first_warning.get_or_insert(error);
+                    }
                 }
             }
         }
@@ -5729,16 +6813,15 @@ async fn handle_validation_results(
     if !validated.is_empty() {
         if let Err(error) = handle_validated_blocks(
             validated,
-            context.node,
-            context.writer,
-            context.validation,
+            context,
             scheduler,
             orphans,
-            context.diagnostics,
+            ready_orphan_parents,
+            deferred_orphan_discards,
         )
         .await
         {
-            if unreconciled_validation_batch(&error) {
+            if terminal_validation_error(&error) {
                 terminal_failure.get_or_insert(error);
             } else {
                 first_warning.get_or_insert(error);
@@ -5754,12 +6837,11 @@ async fn handle_validation_results(
 
 async fn handle_validated_blocks(
     validated: Vec<ValidatedBlock>,
-    node: &NodeReadHandle,
-    writer: &CanonicalStateWriter,
-    validation: &ValidationSubmitter,
+    context: &ValidationResultContext<'_>,
     scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
-    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+    orphans: &mut OwnedOrphanPool,
+    ready_orphan_parents: &mut ReadyOrphanParents,
+    deferred_orphan_discards: &mut DeferredOrphanDiscards,
 ) -> Result<()> {
     let reservations = validated
         .iter()
@@ -5767,12 +6849,11 @@ async fn handle_validated_blocks(
         .collect::<Vec<_>>();
     let result = handle_validated_blocks_inner(
         validated,
-        node,
-        writer,
-        validation,
+        context,
         scheduler,
         orphans,
-        diagnostics,
+        ready_orphan_parents,
+        deferred_orphan_discards,
     )
     .await;
     let Err(handling_error) = result else {
@@ -5793,7 +6874,7 @@ async fn handle_validated_blocks(
 fn reconcile_validated_reservations(
     reservations: &[(BlockHash, Height)],
     scheduler: &mut SyncScheduler,
-    orphans: &BoundedOrphanPool,
+    orphans: &OwnedOrphanPool,
 ) -> Result<()> {
     for (hash, height) in reservations {
         if !scheduler.is_tracked_block(hash) || orphans.contains(hash) {
@@ -5811,18 +6892,93 @@ fn reconcile_validated_reservations(
     Ok(())
 }
 
+fn retain_validated_orphan(
+    block: Block,
+    height: Height,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut OwnedOrphanPool,
+    ready_orphan_parents: &mut ReadyOrphanParents,
+    deferred_orphan_discards: &mut DeferredOrphanDiscards,
+) -> Result<()> {
+    let hash = block.hash();
+    let outcome = match orphans.insert_with_evictions(OwnedOrphan { block, height }) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let invariant = owned_orphan_invariant(&error);
+            if let Err(reconciliation_error) = scheduler
+                .requeue_tracked_block(hash, height)
+                .context("failed to requeue unretained validated orphan")
+            {
+                return Err(anyhow::Error::new(UnreconciledValidationBatch {
+                    handling_error: error.context("failed to retain validated orphan"),
+                    reconciliation_error,
+                }));
+            }
+            if invariant {
+                return Err(anyhow::Error::new(UnreconciledValidationBatch {
+                    handling_error: error.context("owned orphan sidecar invariant failed"),
+                    reconciliation_error: anyhow::anyhow!(
+                        "retained orphan ownership cannot be audited after a sidecar invariant failure"
+                    ),
+                }));
+            }
+            return Err(error.context("failed to retain validated orphan"));
+        }
+    };
+    let mut eviction_reconciliation_failure = None;
+    for evicted in outcome.evicted {
+        let evicted_hash = evicted.block.hash();
+        let evicted_parent = evicted.block.header.prev_block;
+        // Invalid-branch descendants are rejected before their bodies are
+        // removed by the bounded discard cursor. If normal capacity eviction
+        // reaches one first, its absent scheduler reservation is intentional
+        // and must not be resurrected or treated as lost valid ownership.
+        if scheduler.is_tracked_block(&evicted_hash) {
+            if let Err(error) = scheduler
+                .requeue_tracked_block(evicted_hash, evicted.height)
+                .context("failed to requeue evicted owned orphan body")
+            {
+                eviction_reconciliation_failure.get_or_insert(error);
+            }
+        }
+        if !orphans.has_children(evicted_parent) {
+            ready_orphan_parents.remove(evicted_parent);
+            deferred_orphan_discards.remove(evicted_parent);
+        }
+    }
+    if let Some(reconciliation_error) = eviction_reconciliation_failure {
+        return Err(anyhow::Error::new(UnreconciledValidationBatch {
+            handling_error: anyhow::anyhow!(
+                "bounded orphan insertion evicted scheduler-owned body work"
+            ),
+            reconciliation_error,
+        }));
+    }
+    scheduler.complete_orphan_validation();
+    Ok(())
+}
+
 async fn handle_validated_blocks_inner(
     validated: Vec<ValidatedBlock>,
-    node: &NodeReadHandle,
-    writer: &CanonicalStateWriter,
-    validation: &ValidationSubmitter,
+    context: &ValidationResultContext<'_>,
     scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
-    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+    orphans: &mut OwnedOrphanPool,
+    ready_orphan_parents: &mut ReadyOrphanParents,
+    deferred_orphan_discards: &mut DeferredOrphanDiscards,
 ) -> Result<()> {
+    let node = context.node;
     let mut eligible = Vec::with_capacity(validated.len());
     for validated in validated {
         let hash = validated.block.hash();
+        if !scheduler.is_tracked_block(&hash) {
+            continue;
+        }
+        if deferred_orphan_discards.contains(hash)
+            || deferred_orphan_discards.contains(validated.block.header.prev_block)
+        {
+            scheduler.reject_block(None, hash, false, StdInstant::now());
+            continue;
+        }
         let parent_available = validated.block.header == node.network().params().genesis_header()
             || node.native_sync_has_block(&validated.block.header.prev_block)?;
         let canonical = node.native_sync_is_canonical_header(hash, validated.height)?;
@@ -5831,28 +6987,14 @@ async fn handle_validated_blocks_inner(
             continue;
         }
 
-        let outcome = match orphans.insert_with_evictions(validated.block) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                scheduler
-                    .requeue_tracked_block(hash, validated.height)
-                    .context("failed to requeue unretained validated orphan")?;
-                return Err(anyhow::anyhow!(
-                    "failed to retain validated orphan: {error}"
-                ));
-            }
-        };
-        for evicted in outcome.evicted {
-            let evicted_hash = evicted.hash();
-            if let Some(record) = node.native_sync_header_record(&evicted_hash)? {
-                if !node.native_sync_has_block(&evicted_hash)? {
-                    scheduler
-                        .requeue_tracked_block(evicted_hash, record.height)
-                        .context("failed to requeue evicted orphan body")?;
-                }
-            }
-        }
-        scheduler.complete_orphan_validation();
+        retain_validated_orphan(
+            validated.block,
+            validated.height,
+            scheduler,
+            orphans,
+            ready_orphan_parents,
+            deferred_orphan_discards,
+        )?;
     }
 
     if eligible.is_empty() {
@@ -5877,7 +7019,8 @@ async fn handle_validated_blocks_inner(
         }
         let epoch = node.canonical_epoch();
         let batch = eligible.clone();
-        match writer
+        match context
+            .writer
             .execute_at_chain(
                 epoch.chain(),
                 "store validated native-sync body batch",
@@ -5890,9 +7033,10 @@ async fn handle_validated_blocks_inner(
                 break;
             }
             Err(error)
-                if canonical_writer_stale(&error) && attempt + 1 < MAX_CANONICAL_STALE_RETRIES =>
+                if canonical_writer_contention(&error)
+                    && attempt + 1 < MAX_CANONICAL_STALE_RETRIES =>
             {
-                continue;
+                tokio::time::sleep(active_state_contention_retry_interval(attempt + 1)).await;
             }
             Err(error) => return Err(error),
         }
@@ -5911,31 +7055,42 @@ async fn handle_validated_blocks_inner(
     for hash in &expected {
         scheduler.complete_block(*hash);
     }
+    let stored_count = u64::try_from(stored.len()).unwrap_or(u64::MAX);
+    update_diagnostics(context.diagnostics, |state| {
+        state.stored_bodies = state.stored_bodies.saturating_add(stored_count);
+    })
+    .await;
+    // Make retained children ready before the stable tip scan; the event-level
+    // orphan drain below shares one bounded budget across the entire result
+    // batch. Queue saturation preserves deduplicated future supervisor work.
+    for record in &stored {
+        enqueue_ready_orphan_parent(
+            record.hash,
+            orphans,
+            deferred_orphan_discards,
+            ready_orphan_parents,
+        )?;
+    }
     let stored_tip = node.native_sync_contiguous_body_tip(scheduler.stored_tip())?;
     if scheduler.stored_tip() != stored_tip.as_ref() {
         scheduler.set_stored_tip(stored_tip);
     }
     node.native_sync_queue_missing_canonical_bodies(scheduler)?;
-    let stored_count = u64::try_from(stored.len()).unwrap_or(u64::MAX);
-    update_diagnostics(diagnostics, |state| {
-        state.stored_bodies = state.stored_bodies.saturating_add(stored_count);
-    })
-    .await;
-    for record in stored {
-        submit_released_orphans(record.hash, node, writer, validation, scheduler, orphans).await?;
-    }
     Ok(())
 }
 
 async fn handle_validation_failure(
     failure: ValidationFailure,
-    writer: &CanonicalStateWriter,
-    peers: &LivePeerManager,
+    context: &ValidationResultContext<'_>,
     scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
-    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+    orphans: &mut OwnedOrphanPool,
+    ready_orphan_parents: &mut ReadyOrphanParents,
+    deferred_orphan_discards: &mut DeferredOrphanDiscards,
 ) -> Result<()> {
     let hash = failure.block.hash();
+    if !scheduler.is_tracked_block(&hash) {
+        return Ok(());
+    }
     match failure.kind {
         ValidationFailureKind::WorkerFailure => {
             scheduler.retry_validation_failure(
@@ -5961,14 +7116,14 @@ async fn handle_validation_failure(
             );
             if failure.peer != LOCAL_ORPHAN_PEER {
                 penalize_peer(
-                    peers,
+                    context.peers,
                     failure.peer,
                     100,
                     "block body did not match its header",
                 )
                 .await?;
             }
-            update_diagnostics(diagnostics, |state| {
+            update_diagnostics(context.diagnostics, |state| {
                 state.rejected_messages = state.rejected_messages.saturating_add(1);
             })
             .await;
@@ -5983,7 +7138,8 @@ async fn handle_validation_failure(
 
     let failed_height = failure.height;
     let failed_block = failure.block;
-    let stored = writer
+    let stored = context
+        .writer
         .execute(None, "store failed native-sync block", move |node| {
             node.native_sync_store_failed_block(failed_block, failed_height)
         })
@@ -5995,31 +7151,38 @@ async fn handle_validation_failure(
                 hash,
                 failure.height,
                 failure.attempt,
-                (failure.peer != LOCAL_ORPHAN_PEER).then_some(failure.peer),
+                None,
                 StdInstant::now(),
             );
             return Err(error.context("failed to persist invalid block branch"));
         }
     };
     for affected in &stored.affected {
-        scheduler.reject_block(
-            (*affected == hash).then_some(failure.peer),
-            *affected,
-            false,
-            StdInstant::now(),
-        );
+        if scheduler.is_tracked_block(affected) {
+            scheduler.reject_block(
+                (*affected == hash).then_some(failure.peer),
+                *affected,
+                false,
+                StdInstant::now(),
+            );
+        }
     }
-    discard_orphan_descendants(hash, orphans);
+    enqueue_affected_orphan_discards(
+        &stored.affected,
+        orphans,
+        ready_orphan_parents,
+        deferred_orphan_discards,
+    )?;
     if failure.peer != LOCAL_ORPHAN_PEER {
         penalize_peer(
-            peers,
+            context.peers,
             failure.peer,
             100,
             "stateless block validation failed",
         )
         .await?;
     }
-    update_diagnostics(diagnostics, |state| {
+    update_diagnostics(context.diagnostics, |state| {
         state.rejected_messages = state.rejected_messages.saturating_add(1);
         state.stored_failed_bodies = state.stored_failed_bodies.saturating_add(1);
     })
@@ -6259,11 +7422,11 @@ async fn execute_native_active_state_slice_with_validator(
         {
             Ok(plan) => plan,
             Err(error)
-                if canonical_writer_stale(&error)
+                if canonical_writer_contention(&error)
                     && stale_retries + 1 < MAX_CANONICAL_STALE_RETRIES =>
             {
                 stale_retries = stale_retries.saturating_add(1);
-                tokio::task::yield_now().await;
+                tokio::time::sleep(active_state_contention_retry_interval(stale_retries)).await;
                 continue;
             }
             Err(error) => return Err(error),
@@ -6326,11 +7489,11 @@ async fn execute_native_active_state_slice_with_validator(
                 attempt_limit = retry_connect;
             }
             Err(error)
-                if canonical_writer_stale(&error)
+                if canonical_writer_contention(&error)
                     && stale_retries + 1 < MAX_CANONICAL_STALE_RETRIES =>
             {
                 stale_retries = stale_retries.saturating_add(1);
-                tokio::task::yield_now().await;
+                tokio::time::sleep(active_state_contention_retry_interval(stale_retries)).await;
             }
             Err(error) => return Err(error),
         }
@@ -6363,16 +7526,25 @@ pub(super) async fn connect_stored_active_state(
         diagnostics,
         diagnostic_rpc: &diagnostic_rpc,
     };
-    connect_stored_active_state_with_diagnostic_rpc(&context, scheduler, orphans, maximum_connect)
-        .await
+    let affected = connect_stored_active_state_with_diagnostic_rpc(
+        &context,
+        scheduler,
+        orphans,
+        maximum_connect,
+    )
+    .await?;
+    for root in affected {
+        discard_orphan_descendants(root, orphans)?;
+    }
+    Ok(())
 }
 
-async fn connect_stored_active_state_with_diagnostic_rpc(
+async fn connect_stored_active_state_with_diagnostic_rpc<P: ActiveStateOrphanPool>(
     context: &ActiveStateConnectionContext<'_>,
     scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
+    orphans: &mut P,
     maximum_connect: usize,
-) -> Result<()> {
+) -> Result<Vec<BlockHash>> {
     let config = context.node.config();
     let completed = execute_native_active_state_slice(
         context.node.clone(),
@@ -6383,21 +7555,68 @@ async fn connect_stored_active_state_with_diagnostic_rpc(
         config.native_sync.validation_queue,
     )
     .await?;
-    complete_stored_active_state_slice(completed, context, scheduler, orphans).await
+    complete_stored_active_state_slice(&completed, context, scheduler, orphans).await?;
+    Ok(completed
+        .outcome
+        .contextual_failure
+        .as_ref()
+        .map_or_else(Vec::new, |failed| failed.affected.clone()))
 }
 
-async fn complete_stored_active_state_slice(
-    completed: NativeActiveStateSliceResult,
+async fn complete_stored_active_state_slice<P: ActiveStateOrphanPool>(
+    completed: &NativeActiveStateSliceResult,
     context: &ActiveStateConnectionContext<'_>,
     scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
+    orphans: &mut P,
 ) -> Result<()> {
-    let NativeActiveStateSliceResult {
-        outcome,
-        preparation,
-        wall_millis: slice_millis,
-    } = completed;
+    let outcome = &completed.outcome;
+    let preparation = &completed.preparation;
+    let slice_millis = completed.wall_millis;
     let slice_blocks = outcome.connected.saturating_add(outcome.disconnected);
+    // Publish the newly committed tip before a due compaction enters the
+    // canonical writer for its long, stable-snapshot deletion pass. RPC keeps
+    // serving immutable published state throughout that command.
+    refresh_cached_diagnostic_rpc(context.node, context.diagnostics, context.diagnostic_rpc)
+        .await?;
+    let compaction = context
+        .writer
+        .execute(None, "compact pruned native-sync name tree", |node| {
+            node.compact_pruned_name_tree_nodes_if_due()
+        })
+        .await?;
+    if let Some(checkpoint) = compaction {
+        tracing::info!(
+            height = checkpoint.height,
+            tip = %checkpoint.tip.to_hex(),
+            nodes_before = checkpoint.summary.nodes_before,
+            nodes_retained = checkpoint.summary.nodes_retained,
+            nodes_deleted = checkpoint.summary.nodes_deleted,
+            "compacted pruned durable name tree during native sync"
+        );
+        refresh_cached_diagnostic_rpc(context.node, context.diagnostics, context.diagnostic_rpc)
+            .await?;
+    }
+
+    let best_header = context.node.native_sync_best_header_tip()?;
+    let active_tip = context.node.native_sync_active_tip()?;
+    context
+        .node
+        .native_sync_queue_missing_canonical_bodies(scheduler)?;
+    scheduler.set_best_header(best_header);
+    scheduler.set_active_tip(active_tip.clone());
+    if let Some(failed) = &outcome.contextual_failure {
+        for hash in &failed.affected {
+            if scheduler.is_tracked_block(hash) {
+                scheduler.reject_block(None, *hash, false, StdInstant::now());
+            }
+        }
+    }
+    context
+        .peers
+        .set_local_height(active_tip.as_ref().map_or(0, |tip| tip.height));
+
+    // Publish diagnostic counters only after every fallible completion step.
+    // This keeps the retained completion idempotent across contention retries.
     if slice_blocks != 0 || outcome.contextual_failure.is_some() || preparation.blocks != 0 {
         update_diagnostics(context.diagnostics, |state| {
             state.active_state_slices = state.active_state_slices.saturating_add(1);
@@ -6424,55 +7643,10 @@ async fn complete_stored_active_state_slice(
         })
         .await;
     }
-    // Publish the newly committed tip before a due compaction enters the
-    // canonical writer for its long, stable-snapshot deletion pass. RPC keeps
-    // serving immutable published state throughout that command.
-    refresh_cached_diagnostic_rpc(context.node, context.diagnostics, context.diagnostic_rpc)
-        .await?;
-    let compaction = context
-        .writer
-        .execute(None, "compact pruned native-sync name tree", |node| {
-            node.compact_pruned_name_tree_nodes_if_due()
-        })
-        .await?;
-    if let Some(checkpoint) = compaction {
-        tracing::info!(
-            height = checkpoint.height,
-            tip = %checkpoint.tip.to_hex(),
-            nodes_before = checkpoint.summary.nodes_before,
-            nodes_retained = checkpoint.summary.nodes_retained,
-            nodes_deleted = checkpoint.summary.nodes_deleted,
-            "compacted pruned durable name tree during native sync"
-        );
-        refresh_cached_diagnostic_rpc(context.node, context.diagnostics, context.diagnostic_rpc)
-            .await?;
-    }
-
-    if let Some(failed) = &outcome.contextual_failure {
-        for hash in &failed.affected {
-            scheduler.reject_block(None, *hash, false, StdInstant::now());
-        }
-        discard_orphan_descendants(failed.record.hash, orphans);
-    }
-
-    let best_header = context.node.native_sync_best_header_tip()?;
-    let active_tip = context.node.native_sync_active_tip()?;
-    let stored_tip = context
-        .node
-        .native_sync_contiguous_body_tip(scheduler.stored_tip())?;
-    scheduler.set_best_header(best_header);
-    scheduler.set_active_tip(active_tip.clone());
-    scheduler.set_stored_tip(stored_tip);
-    context
-        .node
-        .native_sync_queue_missing_canonical_bodies(scheduler)?;
-    context
-        .peers
-        .set_local_height(active_tip.as_ref().map_or(0, |tip| tip.height));
 
     if outcome.connected != 0 || outcome.disconnected != 0 || outcome.contextual_failure.is_some() {
         let sync_snapshot = scheduler.snapshot();
-        let orphan_snapshot = orphans.snapshot();
+        let orphan_snapshot = orphans.active_state_snapshot();
         update_diagnostics(context.diagnostics, |state| {
             state.sync = sync_snapshot;
             state.orphans = orphan_snapshot;
@@ -6501,13 +7675,35 @@ fn active_state_work_ready(scheduler: &SyncScheduler) -> bool {
     }
 }
 
-fn discard_orphan_descendants(root: BlockHash, orphans: &mut BoundedOrphanPool) {
+#[cfg(test)]
+fn discard_orphan_descendants<P: ActiveStateOrphanPool>(
+    root: BlockHash,
+    orphans: &mut P,
+) -> Result<()> {
     let mut pending = vec![root];
     while let Some(parent) = pending.pop() {
-        for child in orphans.take_children(parent) {
-            pending.push(child.hash());
+        pending.extend(orphans.take_child_hashes(parent)?);
+    }
+    Ok(())
+}
+
+fn enqueue_affected_orphan_discards(
+    affected: &[BlockHash],
+    orphans: &OwnedOrphanPool,
+    ready_orphan_parents: &mut ReadyOrphanParents,
+    deferred_orphan_discards: &mut DeferredOrphanDiscards,
+) -> Result<()> {
+    for hash in affected {
+        if orphans.has_children(*hash) {
+            enqueue_deferred_orphan_discard(
+                *hash,
+                orphans,
+                ready_orphan_parents,
+                deferred_orphan_discards,
+            )?;
         }
     }
+    ensure_orphan_work_queues_exact(ready_orphan_parents, deferred_orphan_discards)
 }
 
 async fn penalize_peer(
@@ -6889,7 +8085,7 @@ async fn refresh_diagnostics(
     diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
     peers: &LivePeerManager,
     scheduler: &SyncScheduler,
-    orphans: &BoundedOrphanPool,
+    orphans: &OwnedOrphanPool,
     reconnects: &HashMap<SocketAddr, ReconnectState>,
     addresses: &BoundedAddressBook,
     bans: &PeerBanBook,
@@ -7220,6 +8416,18 @@ mod tests {
         }
     }
 
+    struct AcceptAllBlocks;
+
+    impl StatelessBlockValidator for AcceptAllBlocks {
+        fn validate(
+            &self,
+            _block: &Block,
+            _height: Height,
+        ) -> std::result::Result<(), ValidationRejection> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn native_runtime_extension_boundary_is_object_safe() {
         let extension: Box<dyn NativeRuntimeExtension> = Box::new(RuntimeExtensionBoundaryProbe);
@@ -7313,12 +8521,17 @@ mod tests {
             scheduler.queue_block(hash, height).expect("body work");
             scheduler.begin_local_validation(hash);
         }
-        let mut orphans = BoundedOrphanPool::new(OrphanLimits {
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
             maximum_blocks: 2,
             maximum_bytes: 1_000_000,
         })
         .expect("orphan pool");
-        orphans.insert(orphan).expect("retained orphan");
+        orphans
+            .insert(OwnedOrphan {
+                block: orphan,
+                height: 3,
+            })
+            .expect("retained orphan");
 
         reconcile_validated_reservations(
             &[(first, 1), (second, 2), (orphan_hash, 3)],
@@ -7332,6 +8545,799 @@ mod tests {
         assert_eq!(snapshot.inflight_blocks, 0);
         assert_eq!(snapshot.tracked_blocks, 3);
         assert!(orphans.contains(&orphan_hash));
+    }
+
+    #[test]
+    fn owned_orphan_eviction_requeues_without_a_canonical_read() {
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        let old_parent = BlockHash::new([0x41; 32]);
+        let new_parent = BlockHash::new([0x42; 32]);
+        let mut old = validator_coinbase_block(1, 1);
+        old.header.prev_block = old_parent;
+        let mut new = validator_coinbase_block(2, 1);
+        new.header.prev_block = new_parent;
+        let old_hash = old.hash();
+        let new_hash = new.hash();
+        for (hash, height) in [(old_hash, 1), (new_hash, 2)] {
+            scheduler.queue_block(hash, height).expect("body work");
+            scheduler.begin_local_validation(hash);
+        }
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 1,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        let mut ready = ReadyOrphanParents::new(1);
+        let mut discards = DeferredOrphanDiscards::new(1);
+
+        retain_validated_orphan(
+            old,
+            1,
+            &mut scheduler,
+            &mut orphans,
+            &mut ready,
+            &mut discards,
+        )
+        .expect("retain first orphan");
+        enqueue_ready_orphan_parent(old_parent, &orphans, &discards, &mut ready)
+            .expect("queue first parent");
+        assert_eq!(ready.len(), 1);
+        retain_validated_orphan(
+            new,
+            2,
+            &mut scheduler,
+            &mut orphans,
+            &mut ready,
+            &mut discards,
+        )
+        .expect("evict and synchronously requeue first orphan");
+
+        assert!(!orphans.contains(&old_hash));
+        assert!(orphans.contains(&new_hash));
+        assert_eq!(ready.len(), 0, "eviction removes the last-child tombstone");
+        enqueue_ready_orphan_parent(new_parent, &orphans, &discards, &mut ready)
+            .expect("replacement parent fits the exact one-parent bound");
+        assert_eq!(ready.len(), 1);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.tracked_blocks, 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_branch_discard_prunes_ready_parent_at_capacity() {
+        struct AcceptValidator;
+
+        impl StatelessBlockValidator for AcceptValidator {
+            fn validate(
+                &self,
+                _block: &Block,
+                _height: Height,
+            ) -> std::result::Result<(), ValidationRejection> {
+                Ok(())
+            }
+        }
+
+        let (validation, _results) = spawn_validation_pipeline(Arc::new(AcceptValidator), 1, 2)
+            .expect("validation pipeline");
+        let failed_parent = BlockHash::new([0x43; 32]);
+        let replacement_parent = BlockHash::new([0x44; 32]);
+        let mut child = validator_coinbase_block(1, 1);
+        child.header.prev_block = failed_parent;
+        let mut replacement = validator_coinbase_block(2, 1);
+        replacement.header.prev_block = replacement_parent;
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 2,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        orphans
+            .insert(OwnedOrphan {
+                block: child,
+                height: 1,
+            })
+            .expect("failed branch child");
+        let mut ready = ReadyOrphanParents::new(1);
+        let mut discards = DeferredOrphanDiscards::new(1);
+        let mut schedule = OrphanWorkSchedule::default();
+        enqueue_ready_orphan_parent(failed_parent, &orphans, &discards, &mut ready)
+            .expect("queue failed parent");
+
+        enqueue_affected_orphan_discards(&[failed_parent], &orphans, &mut ready, &mut discards)
+            .expect("schedule failed branch");
+        assert_eq!(ready.len(), 0);
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        assert_eq!(
+            drain_orphan_work(
+                1,
+                &validation,
+                &mut scheduler,
+                &mut orphans,
+                &mut ready,
+                &mut discards,
+                &mut schedule,
+            )
+            .expect("discard one child"),
+            1
+        );
+        assert_eq!(discards.len(), 0);
+        orphans
+            .insert(OwnedOrphan {
+                block: replacement,
+                height: 2,
+            })
+            .expect("replacement child");
+        enqueue_ready_orphan_parent(replacement_parent, &orphans, &discards, &mut ready)
+            .expect("replacement parent fits after eager cleanup");
+        assert_eq!(ready.len(), 1);
+    }
+
+    #[test]
+    fn ready_enqueue_prunes_contextual_discard_tombstone_at_capacity() {
+        let failed_parent = BlockHash::new([0x45; 32]);
+        let replacement_parent = BlockHash::new([0x46; 32]);
+        let mut child = validator_coinbase_block(1, 1);
+        child.header.prev_block = failed_parent;
+        let mut replacement = validator_coinbase_block(2, 1);
+        replacement.header.prev_block = replacement_parent;
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 2,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        orphans
+            .insert(OwnedOrphan {
+                block: child,
+                height: 1,
+            })
+            .expect("contextual branch child");
+        let mut ready = ReadyOrphanParents::new(1);
+        let discards = DeferredOrphanDiscards::new(1);
+        enqueue_ready_orphan_parent(failed_parent, &orphans, &discards, &mut ready)
+            .expect("queue contextual parent");
+
+        // Active-state completion owns only the generic orphan-pool trait.
+        // The universal enqueue boundary must therefore remove its tombstone.
+        discard_orphan_descendants(failed_parent, &mut orphans).expect("discard contextual branch");
+        assert_eq!(ready.len(), 1, "fixture retains a stale ready key");
+        orphans
+            .insert(OwnedOrphan {
+                block: replacement,
+                height: 2,
+            })
+            .expect("replacement child");
+        enqueue_ready_orphan_parent(replacement_parent, &orphans, &discards, &mut ready)
+            .expect("replacement parent fits after universal cleanup");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready.queue.values().next(), Some(&replacement_parent));
+    }
+
+    #[tokio::test]
+    async fn ready_parent_drain_bounds_children_and_rotates_busy_parents() {
+        struct AcceptValidator;
+
+        impl StatelessBlockValidator for AcceptValidator {
+            fn validate(
+                &self,
+                _block: &Block,
+                _height: Height,
+            ) -> std::result::Result<(), ValidationRejection> {
+                Ok(())
+            }
+        }
+
+        let (validation, _results) = spawn_validation_pipeline(Arc::new(AcceptValidator), 1, 8)
+            .expect("validation pipeline");
+        let first_parent = BlockHash::new([0x47; 32]);
+        let second_parent = BlockHash::new([0x48; 32]);
+        let mut retained = Vec::new();
+        for (height, parent) in [(1, first_parent), (2, first_parent), (3, second_parent)] {
+            let mut child = validator_coinbase_block(height, 1);
+            child.header.prev_block = parent;
+            retained.push((child, height));
+        }
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 3,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        for (block, height) in retained {
+            let hash = block.hash();
+            scheduler
+                .queue_block(hash, height)
+                .expect("child body work");
+            scheduler.begin_local_validation(hash);
+            orphans
+                .insert(OwnedOrphan { block, height })
+                .expect("retained child");
+            scheduler.complete_orphan_validation();
+        }
+        let mut ready = ReadyOrphanParents::new(3);
+        let mut discards = DeferredOrphanDiscards::new(3);
+        let mut schedule = OrphanWorkSchedule::default();
+        enqueue_ready_orphan_parent(first_parent, &orphans, &discards, &mut ready)
+            .expect("queue first parent");
+        enqueue_ready_orphan_parent(second_parent, &orphans, &discards, &mut ready)
+            .expect("queue second parent");
+
+        assert_eq!(
+            drain_orphan_work(
+                1,
+                &validation,
+                &mut scheduler,
+                &mut orphans,
+                &mut ready,
+                &mut discards,
+                &mut schedule,
+            )
+            .expect("first bounded drain"),
+            1
+        );
+        assert_eq!(orphans.snapshot().blocks, 2);
+        assert_eq!(
+            ready.queue.values().copied().collect::<Vec<_>>(),
+            [second_parent, first_parent]
+        );
+
+        assert_eq!(
+            drain_orphan_work(
+                1,
+                &validation,
+                &mut scheduler,
+                &mut orphans,
+                &mut ready,
+                &mut discards,
+                &mut schedule,
+            )
+            .expect("second bounded drain"),
+            1
+        );
+        assert_eq!(orphans.snapshot().blocks, 1);
+        assert_eq!(
+            ready.queue.values().copied().collect::<Vec<_>>(),
+            [first_parent]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_work_alternates_release_and_discard_lanes() {
+        let (validation, _results) = spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 4)
+            .expect("validation pipeline");
+        let release_parent = BlockHash::new([0x49; 32]);
+        let discard_parent = BlockHash::new([0x4a; 32]);
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 4,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        for (height, parent) in [
+            (1, release_parent),
+            (2, release_parent),
+            (3, discard_parent),
+            (4, discard_parent),
+        ] {
+            let mut block = validator_coinbase_block(height, 1);
+            block.header.prev_block = parent;
+            retain_test_owned_orphan(block, height, &mut scheduler, &mut orphans);
+        }
+        let mut ready = ReadyOrphanParents::new(4);
+        let mut discards = DeferredOrphanDiscards::new(4);
+        enqueue_ready_orphan_parent(release_parent, &orphans, &discards, &mut ready)
+            .expect("queue release parent");
+        enqueue_affected_orphan_discards(&[discard_parent], &orphans, &mut ready, &mut discards)
+            .expect("queue discard parent");
+        let mut schedule = OrphanWorkSchedule::default();
+
+        for (expected_next, expected_ready, expected_discards) in [
+            (OrphanWorkLane::Release, 1, 1),
+            (OrphanWorkLane::Discard, 1, 1),
+            (OrphanWorkLane::Release, 1, 0),
+            (OrphanWorkLane::Discard, 0, 0),
+        ] {
+            assert_eq!(
+                drain_orphan_work(
+                    1,
+                    &validation,
+                    &mut scheduler,
+                    &mut orphans,
+                    &mut ready,
+                    &mut discards,
+                    &mut schedule,
+                )
+                .expect("one alternating orphan unit"),
+                1
+            );
+            assert_eq!(schedule.next, expected_next);
+            assert_eq!(ready.len(), expected_ready);
+            assert_eq!(discards.len(), expected_discards);
+            assert_orphan_work_membership_exact(&orphans, &ready, &discards);
+        }
+        assert_eq!(orphans.snapshot().blocks, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_orphan_parent_probe_consumes_the_shared_unit() {
+        let (validation, _results) = spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 2)
+            .expect("validation pipeline");
+        let stale_parent = BlockHash::new([0x4b; 32]);
+        let live_parent = BlockHash::new([0x4c; 32]);
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 2,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        let mut stale_child = validator_coinbase_block(1, 1);
+        stale_child.header.prev_block = stale_parent;
+        retain_test_owned_orphan(stale_child, 1, &mut scheduler, &mut orphans);
+        let mut ready = ReadyOrphanParents::new(2);
+        let mut discards = DeferredOrphanDiscards::new(2);
+        enqueue_ready_orphan_parent(stale_parent, &orphans, &discards, &mut ready)
+            .expect("queue stale fixture parent");
+        let removed = orphans
+            .take_children_bounded(stale_parent, 1)
+            .expect("remove child behind ready queue");
+        assert_eq!(removed.children.len(), 1);
+
+        let mut live_child = validator_coinbase_block(2, 1);
+        live_child.header.prev_block = live_parent;
+        retain_test_owned_orphan(live_child, 2, &mut scheduler, &mut orphans);
+        enqueue_ready_orphan_parent(live_parent, &orphans, &discards, &mut ready)
+            .expect("queue live fixture parent");
+        let mut schedule = OrphanWorkSchedule {
+            next: OrphanWorkLane::Release,
+        };
+
+        assert_eq!(
+            drain_orphan_work(
+                1,
+                &validation,
+                &mut scheduler,
+                &mut orphans,
+                &mut ready,
+                &mut discards,
+                &mut schedule,
+            )
+            .expect("bounded stale probe"),
+            1
+        );
+        assert_eq!(orphans.snapshot().blocks, 1);
+        assert_eq!(ready.len(), 1, "live parent waits for another opportunity");
+        assert_eq!(
+            drain_orphan_work(
+                1,
+                &validation,
+                &mut scheduler,
+                &mut orphans,
+                &mut ready,
+                &mut discards,
+                &mut schedule,
+            )
+            .expect("release live parent"),
+            1
+        );
+        assert_eq!(orphans.snapshot().blocks, 0);
+    }
+
+    #[test]
+    fn orphan_lane_sequence_overflow_fails_before_capacity_cleanup() {
+        let stale_parent = BlockHash::new([0x5a; 32]);
+        let new_parent = BlockHash::new([0x5b; 32]);
+        let mut stale_child = validator_coinbase_block(1, 1);
+        stale_child.header.prev_block = stale_parent;
+        let mut new_child = validator_coinbase_block(2, 1);
+        new_child.header.prev_block = new_parent;
+
+        let mut ready_orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 1,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("ready orphan pool");
+        ready_orphans
+            .insert(OwnedOrphan {
+                block: stale_child.clone(),
+                height: 1,
+            })
+            .expect("ready stale child");
+        let empty_discards = DeferredOrphanDiscards::new(1);
+        let mut ready = ReadyOrphanParents::new(1);
+        enqueue_ready_orphan_parent(stale_parent, &ready_orphans, &empty_discards, &mut ready)
+            .expect("ready stale parent");
+        ready_orphans
+            .take_children_bounded(stale_parent, 1)
+            .expect("remove ready stale child");
+        ready_orphans
+            .insert(OwnedOrphan {
+                block: new_child.clone(),
+                height: 2,
+            })
+            .expect("ready replacement child");
+        ready.next_id = u64::MAX;
+        let ready_before = ready.queue.clone();
+        let error =
+            enqueue_ready_orphan_parent(new_parent, &ready_orphans, &empty_discards, &mut ready)
+                .expect_err("ready sequence overflow");
+        assert!(owned_orphan_invariant(&error));
+        assert_eq!(ready.queue, ready_before);
+
+        let mut discard_orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 1,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("discard orphan pool");
+        discard_orphans
+            .insert(OwnedOrphan {
+                block: stale_child,
+                height: 1,
+            })
+            .expect("discard stale child");
+        let mut discards = DeferredOrphanDiscards::new(1);
+        discards
+            .enqueue(stale_parent, &discard_orphans)
+            .expect("discard stale parent");
+        discard_orphans
+            .take_children_bounded(stale_parent, 1)
+            .expect("remove discard stale child");
+        discard_orphans
+            .insert(OwnedOrphan {
+                block: new_child,
+                height: 2,
+            })
+            .expect("discard replacement child");
+        discards.next_id = u64::MAX;
+        let discards_before = discards.queue.clone();
+        let mut discard_ready = ReadyOrphanParents::new(1);
+        enqueue_ready_orphan_parent(new_parent, &discard_orphans, &discards, &mut discard_ready)
+            .expect("ready parent before discard transfer");
+        let ready_before = discard_ready.queue.clone();
+        let error = enqueue_deferred_orphan_discard(
+            new_parent,
+            &discard_orphans,
+            &mut discard_ready,
+            &mut discards,
+        )
+        .expect_err("discard sequence overflow");
+        assert!(owned_orphan_invariant(&error));
+        assert_eq!(discards.queue, discards_before);
+        assert_eq!(discard_ready.queue, ready_before);
+    }
+
+    #[tokio::test]
+    async fn deferred_discard_bounds_deep_and_wide_tree_per_opportunity() {
+        const WIDE: Height = 32;
+        const DEEP: Height = 64;
+        let (validation, _results) = spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 2)
+            .expect("validation pipeline");
+        let root = BlockHash::new([0x4d; 32]);
+        let total = usize::try_from(WIDE + DEEP).expect("fixture size");
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: total,
+            maximum_bytes: 4_000_000,
+        })
+        .expect("orphan pool");
+        let mut deep_parent = None;
+        for height in 1..=WIDE {
+            let mut block = validator_coinbase_block(height, 1);
+            block.header.prev_block = root;
+            if height == 1 {
+                deep_parent = Some(block.hash());
+            }
+            retain_test_owned_orphan(block, height, &mut scheduler, &mut orphans);
+        }
+        let mut parent = deep_parent.expect("wide branch root");
+        for offset in 1..=DEEP {
+            let height = WIDE.saturating_add(offset);
+            let mut block = validator_coinbase_block(height, 1);
+            block.header.prev_block = parent;
+            parent = block.hash();
+            retain_test_owned_orphan(block, height, &mut scheduler, &mut orphans);
+        }
+        let mut ready = ReadyOrphanParents::new(total);
+        let mut discards = DeferredOrphanDiscards::new(total);
+        enqueue_ready_orphan_parent(root, &orphans, &discards, &mut ready)
+            .expect("queue tree root");
+        enqueue_affected_orphan_discards(&[root], &orphans, &mut ready, &mut discards)
+            .expect("fence tree root");
+        let mut schedule = OrphanWorkSchedule::default();
+        let mut opportunities = 0usize;
+        while orphans.snapshot().blocks != 0 {
+            let before = orphans.snapshot().blocks;
+            let spent = drain_orphan_work(
+                MAX_VALIDATED_BODY_COMMIT_BATCH,
+                &validation,
+                &mut scheduler,
+                &mut orphans,
+                &mut ready,
+                &mut discards,
+                &mut schedule,
+            )
+            .expect("bounded tree discard");
+            opportunities = opportunities.saturating_add(1);
+            assert!((1..=MAX_VALIDATED_BODY_COMMIT_BATCH).contains(&spent));
+            assert_eq!(before.saturating_sub(orphans.snapshot().blocks), spent);
+            assert_orphan_work_membership_exact(&orphans, &ready, &discards);
+            assert!(opportunities <= total);
+        }
+        assert_eq!(
+            opportunities,
+            total.div_ceil(MAX_VALIDATED_BODY_COMMIT_BATCH)
+        );
+        assert_eq!(scheduler.snapshot().tracked_blocks, 0);
+        assert_eq!(ready.len(), 0);
+        assert_eq!(discards.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn affected_seed_reaches_grandchild_across_evicted_body_bridge() {
+        let (validation, _results) = spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 2)
+            .expect("validation pipeline");
+        let root = BlockHash::new([0x4e; 32]);
+        let filler_parent = BlockHash::new([0x4f; 32]);
+        let mut bridge = validator_coinbase_block(1, 1);
+        bridge.header.prev_block = root;
+        let bridge_hash = bridge.hash();
+        let mut grandchild = validator_coinbase_block(2, 1);
+        grandchild.header.prev_block = bridge_hash;
+        let grandchild_hash = grandchild.hash();
+        let mut filler = validator_coinbase_block(3, 1);
+        filler.header.prev_block = filler_parent;
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 2,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        orphans
+            .insert(OwnedOrphan {
+                block: bridge,
+                height: 1,
+            })
+            .expect("bridge body");
+        orphans
+            .insert(OwnedOrphan {
+                block: grandchild,
+                height: 2,
+            })
+            .expect("grandchild body");
+        let outcome = orphans
+            .insert_with_evictions(OwnedOrphan {
+                block: filler,
+                height: 3,
+            })
+            .expect("evict bridge body");
+        assert_eq!(outcome.evicted.len(), 1);
+        assert_eq!(outcome.evicted[0].block.hash(), bridge_hash);
+        assert!(orphans.contains(&grandchild_hash));
+        assert!(!orphans.has_children(root));
+        assert!(orphans.has_children(bridge_hash));
+
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        scheduler
+            .queue_block(grandchild_hash, 2)
+            .expect("grandchild ownership");
+        scheduler.begin_local_validation(grandchild_hash);
+        scheduler.complete_orphan_validation();
+        let mut ready = ReadyOrphanParents::new(2);
+        let mut discards = DeferredOrphanDiscards::new(2);
+        enqueue_ready_orphan_parent(bridge_hash, &orphans, &discards, &mut ready)
+            .expect("queue durable bridge parent");
+        enqueue_affected_orphan_discards(&[root, bridge_hash], &orphans, &mut ready, &mut discards)
+            .expect("seed every affected hash");
+        assert_eq!(ready.len(), 0);
+        assert!(discards.contains(bridge_hash));
+        let mut schedule = OrphanWorkSchedule::default();
+        assert_eq!(
+            drain_orphan_work(
+                1,
+                &validation,
+                &mut scheduler,
+                &mut orphans,
+                &mut ready,
+                &mut discards,
+                &mut schedule,
+            )
+            .expect("discard bridged grandchild"),
+            1
+        );
+        assert!(!orphans.contains(&grandchild_hash));
+        assert_eq!(scheduler.snapshot().tracked_blocks, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_validation_queue_restores_child_and_retries_ready_parent() {
+        struct GateValidator {
+            started: Arc<AtomicUsize>,
+            release: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl StatelessBlockValidator for GateValidator {
+            fn validate(
+                &self,
+                _block: &Block,
+                _height: Height,
+            ) -> std::result::Result<(), ValidationRejection> {
+                let ordinal = self.started.fetch_add(1, Ordering::AcqRel);
+                if ordinal == 0 {
+                    while !self.release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (validation, mut results) = spawn_validation_pipeline(
+            Arc::new(GateValidator {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+            1,
+            1,
+        )
+        .expect("validation pipeline");
+        validation
+            .try_submit(ValidationRequest {
+                peer: PeerId(1),
+                height: 1,
+                attempt: 0,
+                block: validator_coinbase_block(1, 1),
+            })
+            .expect("running validation");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while started.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first validation did not start");
+        validation
+            .try_submit(ValidationRequest {
+                peer: PeerId(1),
+                height: 2,
+                attempt: 0,
+                block: validator_coinbase_block(2, 1),
+            })
+            .expect("fill validation input queue");
+
+        let parent = BlockHash::new([0x55; 32]);
+        let mut child = validator_coinbase_block(3, 1);
+        child.header.prev_block = parent;
+        let child_hash = child.hash();
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        scheduler
+            .queue_block(child_hash, 3)
+            .expect("child body work");
+        scheduler.begin_local_validation(child_hash);
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 1,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        orphans
+            .insert(OwnedOrphan {
+                block: child,
+                height: 3,
+            })
+            .expect("retained child");
+        scheduler.complete_orphan_validation();
+        let mut ready = ReadyOrphanParents::new(1);
+        let mut discards = DeferredOrphanDiscards::new(1);
+        let mut schedule = OrphanWorkSchedule::default();
+
+        enqueue_ready_orphan_parent(parent, &orphans, &discards, &mut ready)
+            .expect("queue releasable parent");
+        drain_orphan_work(
+            1,
+            &validation,
+            &mut scheduler,
+            &mut orphans,
+            &mut ready,
+            &mut discards,
+            &mut schedule,
+        )
+        .expect("queue-full release remains owned");
+        assert!(orphans.contains(&child_hash));
+        assert_eq!(ready.len(), 1);
+
+        release.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), results.recv())
+            .await
+            .expect("first validation result timeout")
+            .expect("first validation result channel");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ready.len() != 0 {
+                drain_orphan_work(
+                    1,
+                    &validation,
+                    &mut scheduler,
+                    &mut orphans,
+                    &mut ready,
+                    &mut discards,
+                    &mut schedule,
+                )
+                .expect("retry ready parent");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ready parent did not submit after capacity freed");
+        assert!(!orphans.contains(&child_hash));
+        assert_eq!(ready.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_validation_pipeline_restores_exact_orphan_before_terminal_error() {
+        let (validation, results) = spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 1)
+            .expect("validation pipeline");
+        drop(results);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let probe = validation.try_submit(ValidationRequest {
+                    peer: PeerId(1),
+                    height: 1,
+                    attempt: 0,
+                    block: validator_coinbase_block(1, 1),
+                });
+                if matches!(probe, Err(SyncError::ValidationPipelineClosed)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("validation pipeline did not close");
+
+        let parent = BlockHash::new([0x56; 32]);
+        let height = 77;
+        let mut child = validator_coinbase_block(height, 1);
+        child.header.prev_block = parent;
+        let child_hash = child.hash();
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 1,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        retain_test_owned_orphan(child, height, &mut scheduler, &mut orphans);
+        let mut ready = ReadyOrphanParents::new(1);
+        let mut discards = DeferredOrphanDiscards::new(1);
+        enqueue_ready_orphan_parent(parent, &orphans, &discards, &mut ready)
+            .expect("queue orphan parent");
+        let mut schedule = OrphanWorkSchedule {
+            next: OrphanWorkLane::Release,
+        };
+
+        let error = drain_orphan_work(
+            1,
+            &validation,
+            &mut scheduler,
+            &mut orphans,
+            &mut ready,
+            &mut discards,
+            &mut schedule,
+        )
+        .expect_err("closed validation pipeline is terminal");
+        assert!(validation_pipeline_closed(&error), "{error:#}");
+        assert!(orphans.contains(&child_hash));
+        assert_eq!(scheduler.snapshot().tracked_blocks, 1);
+        let restored = orphans
+            .take_children_bounded(parent, 1)
+            .expect("inspect restored child");
+        assert_eq!(restored.children.len(), 1);
+        assert_eq!(restored.children[0].block.hash(), child_hash);
+        assert_eq!(restored.children[0].height, height);
     }
 
     #[tokio::test]
@@ -7356,19 +9362,30 @@ mod tests {
         let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
         let node = runtime.read();
         let writer = runtime.writer();
-        let (validation, _validation_results) =
+        let (_validation, _validation_results) =
             spawn_validation_pipeline(Arc::new(HnsBodyValidator::new(Network::Regtest)), 1, 2)
                 .expect("validation pipeline");
         let mut scheduler =
             SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
         scheduler.queue_block(hash, 1).expect("body reservation");
         scheduler.begin_local_validation(hash);
-        let mut orphans = BoundedOrphanPool::new(OrphanLimits {
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
             maximum_blocks: 2,
             maximum_bytes: 1_000_000,
         })
         .expect("orphan pool");
+        let mut ready_orphan_parents = ReadyOrphanParents::new(2);
+        let mut deferred_orphan_discards = DeferredOrphanDiscards::new(2);
         let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+                .expect("peer manager");
+        let context = ValidationResultContext {
+            node: &node,
+            writer: &writer,
+            peers: &peers,
+            diagnostics: &diagnostics,
+        };
 
         let previous = node
             .state
@@ -7382,12 +9399,11 @@ mod tests {
                 height: 1,
                 block,
             }],
-            &node,
-            &writer,
-            &validation,
+            &context,
             &mut scheduler,
             &mut orphans,
-            &diagnostics,
+            &mut ready_orphan_parents,
+            &mut deferred_orphan_discards,
         )
         .await;
         node.state
@@ -7402,6 +9418,87 @@ mod tests {
         assert_eq!(snapshot.tracked_blocks, 1);
         assert_eq!(snapshot.validated_blocks, 0);
         assert!(!node.native_sync_has_block(&hash).expect("body lookup"));
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn rejected_branch_late_ok_and_err_results_are_dropped_exactly() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            }),
+            4,
+        )
+        .expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+                .expect("peer manager");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
+        let context = ValidationResultContext {
+            node: &node,
+            writer: &writer,
+            peers: &peers,
+            diagnostics: &diagnostics,
+        };
+        let ok_block = validator_coinbase_block(40, 1);
+        let err_block = validator_coinbase_block(41, 1);
+        let ok_hash = ok_block.hash();
+        let err_hash = err_block.hash();
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        for (hash, height) in [(ok_hash, 40), (err_hash, 41)] {
+            scheduler.queue_block(hash, height).expect("late body work");
+            scheduler.begin_local_validation(hash);
+            scheduler.reject_block(None, hash, false, StdInstant::now());
+        }
+        let before = scheduler.snapshot();
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 2,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        let mut ready = ReadyOrphanParents::new(2);
+        let mut discards = DeferredOrphanDiscards::new(2);
+
+        handle_validation_results(
+            vec![
+                Ok(ValidatedBlock {
+                    sequence: 0,
+                    peer: PeerId(7),
+                    height: 40,
+                    block: ok_block,
+                }),
+                Err(ValidationFailure {
+                    sequence: 1,
+                    peer: PeerId(7),
+                    height: 41,
+                    attempt: 1,
+                    block: err_block,
+                    kind: ValidationFailureKind::InvalidBlock,
+                    reason: "late invalid result".to_owned(),
+                }),
+            ],
+            &context,
+            &mut scheduler,
+            &mut orphans,
+            &mut ready,
+            &mut discards,
+        )
+        .await
+        .expect("stale results are ignored");
+
+        let after = scheduler.snapshot();
+        assert_eq!(after.pending_blocks, before.pending_blocks);
+        assert_eq!(after.inflight_blocks, before.inflight_blocks);
+        assert_eq!(after.tracked_blocks, before.tracked_blocks);
+        assert_eq!(after.failed_blocks, before.failed_blocks);
+        assert_eq!(orphans.snapshot().blocks, 0);
+        assert_eq!(ready.len(), 0);
+        assert_eq!(discards.len(), 0);
+        assert_eq!(diagnostics.read().await.rejected_messages, 0);
         runtime.shutdown().await.expect("node runtime shutdown");
     }
 
@@ -7858,6 +9955,23 @@ mod tests {
         block.header.merkle_root = block_merkle_root(&block);
         block.header.witness_root = block_witness_root(&block);
         block
+    }
+
+    fn retain_test_owned_orphan(
+        block: Block,
+        height: Height,
+        scheduler: &mut SyncScheduler,
+        orphans: &mut OwnedOrphanPool,
+    ) {
+        let hash = block.hash();
+        scheduler
+            .queue_block(hash, height)
+            .expect("queue retained orphan body");
+        scheduler.begin_local_validation(hash);
+        orphans
+            .insert(OwnedOrphan { block, height })
+            .expect("retain owned orphan body");
+        scheduler.complete_orphan_validation();
     }
 
     fn linked_validator_block(height: Height, parent: &Header) -> Block {
@@ -8327,6 +10441,85 @@ mod tests {
         assert_eq!(reconnect_delay(1), Duration::from_secs(1));
         assert_eq!(reconnect_delay(2), Duration::from_secs(2));
         assert_eq!(reconnect_delay(20), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn native_sync_contention_retry_is_typed_exponential_and_bounded() {
+        let busy = anyhow::Error::new(CanonicalWriterError::Busy)
+            .context("active-state synchronization failed");
+        assert!(canonical_writer_busy(&busy));
+        assert!(canonical_writer_contention(&busy));
+        assert_eq!(
+            active_state_contention_retry_interval(1),
+            MIN_NATIVE_SYNC_POLL_INTERVAL
+        );
+        assert_eq!(
+            active_state_contention_retry_interval(2),
+            MIN_NATIVE_SYNC_POLL_INTERVAL.saturating_mul(2)
+        );
+        assert_eq!(
+            active_state_contention_retry_interval(3),
+            MIN_NATIVE_SYNC_POLL_INTERVAL.saturating_mul(4)
+        );
+        assert_eq!(
+            active_state_contention_retry_interval(usize::MAX),
+            MAX_NATIVE_SYNC_CONTENTION_RETRY_INTERVAL
+        );
+
+        let stale = anyhow::Error::new(CanonicalWriterError::StaleChainEpoch {
+            operation: "test active-state commit",
+            expected: CanonicalChainEpoch::default(),
+            actual: CanonicalChainEpoch::default(),
+        });
+        assert!(canonical_writer_contention(&stale));
+        let queue_full = anyhow::Error::new(CanonicalWriterError::QueueFull { capacity: 8 });
+        assert!(canonical_writer_contention(&queue_full));
+
+        let stopped = anyhow::Error::new(CanonicalWriterError::Stopped)
+            .context("active-state synchronization failed");
+        assert!(
+            !canonical_writer_contention(&stopped),
+            "non-transient writer failures must retain the terminal path"
+        );
+        let shutting_down = anyhow::Error::new(CanonicalWriterError::ShuttingDown);
+        assert!(!canonical_writer_contention(&shutting_down));
+        assert!(canonical_writer_shutting_down(&shutting_down));
+        assert!(!canonical_writer_busy(&anyhow::anyhow!(
+            "simulated storage failure"
+        )));
+    }
+
+    #[test]
+    fn only_typed_peer_header_faults_enter_peer_scoring() {
+        let queue_full = anyhow::Error::new(CanonicalWriterError::QueueFull { capacity: 8 })
+            .context("simulated native-sync writer saturation");
+        assert_eq!(peer_header_import_penalty(&queue_full), None);
+        assert_eq!(peer_block_header_import_penalty(&queue_full), None);
+
+        let invalid_header = anyhow::Error::new(ConsensusError::InvalidHeader("invalid proof"))
+            .context("header validation failed");
+        assert_eq!(peer_header_import_penalty(&invalid_header), Some(100));
+        assert_eq!(peer_block_header_import_penalty(&invalid_header), Some(50));
+        let oversized = anyhow::Error::new(PeerHeaderBatchLimit {
+            limit: MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE,
+            actual: MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE + 1,
+        });
+        assert_eq!(peer_header_import_penalty(&oversized), Some(100));
+
+        for local in [
+            anyhow::Error::new(StoreError::Backend("fault injection".to_owned()))
+                .context("failed to persist header batch"),
+            anyhow::Error::new(ConsensusError::View("header lookup failed".to_owned()))
+                .context("header validation failed"),
+            anyhow::anyhow!("committed header batch differs from staged view"),
+        ] {
+            assert_eq!(peer_header_import_penalty(&local), None, "{local:#}");
+            assert_eq!(peer_block_header_import_penalty(&local), None, "{local:#}");
+        }
+        let detached = anyhow::Error::new(MissingHeaderParent {
+            parent: BlockHash::new([0x44; 32]),
+        });
+        assert_eq!(peer_header_import_penalty(&detached), None);
     }
 
     #[test]
@@ -9168,7 +11361,7 @@ mod tests {
         let (peers, _peer_events) =
             LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
                 .expect("peer manager");
-        let (validation, _validation_results) =
+        let (_validation, _validation_results) =
             spawn_validation_pipeline(Arc::new(HnsBodyValidator::new(Network::Regtest)), 1, 8)
                 .expect("validation pipeline");
         let mut scheduler =
@@ -9177,18 +11370,19 @@ mod tests {
             .queue_block(second_hash, 2)
             .expect("second body reservation");
         scheduler.begin_local_validation(second_hash);
-        let mut orphans = BoundedOrphanPool::new(OrphanLimits {
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
             maximum_blocks: 8,
             maximum_bytes: 1_024 * 1_024,
         })
         .expect("orphan pool");
+        let mut ready_orphan_parents = ReadyOrphanParents::new(8);
+        let mut deferred_orphan_discards = DeferredOrphanDiscards::new(8);
         let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
 
         let context = ValidationResultContext {
             node: &node,
             writer: &writer,
             peers: &peers,
-            validation: &validation,
             diagnostics: &diagnostics,
         };
         handle_validation_results(
@@ -9201,6 +11395,8 @@ mod tests {
             &context,
             &mut scheduler,
             &mut orphans,
+            &mut ready_orphan_parents,
+            &mut deferred_orphan_discards,
         )
         .await
         .expect("store out-of-order canonical body");
@@ -9219,6 +11415,132 @@ mod tests {
         assert!(!scheduler.is_tracked_block(&second_hash));
         assert_eq!(orphans.snapshot().blocks, 0);
         assert_eq!(diagnostics.read().await.stored_bodies, 1);
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn split_validation_runs_share_one_32_unit_orphan_budget() {
+        const CHILDREN_PER_PARENT: Height = 20;
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            native_sync: NativeSyncConfig {
+                enabled: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..NativeSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .native_sync_ensure_genesis_header()
+            .expect("genesis");
+        let first = linked_validator_block(1, &genesis.header);
+        let second = linked_validator_block(2, &first.header);
+        service
+            .native_sync_import_headers(vec![first.header.clone(), second.header.clone()])
+            .expect("canonical headers");
+        let first_hash = first.hash();
+        let second_hash = second.hash();
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+                .expect("peer manager");
+        let (validation, _validation_results) =
+            spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 64)
+                .expect("validation pipeline");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
+        let context = ValidationResultContext {
+            node: &node,
+            writer: &writer,
+            peers: &peers,
+            diagnostics: &diagnostics,
+        };
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        for (hash, height) in [(first_hash, 1), (second_hash, 2)] {
+            scheduler
+                .queue_block(hash, height)
+                .expect("parent body work");
+            scheduler.begin_local_validation(hash);
+        }
+        let failure_block = validator_coinbase_block(500, 2);
+        let failure_hash = failure_block.hash();
+        scheduler
+            .queue_block(failure_hash, 500)
+            .expect("worker-failure body work");
+        scheduler.begin_local_validation(failure_hash);
+
+        let orphan_count =
+            usize::try_from(CHILDREN_PER_PARENT.saturating_mul(2)).expect("orphan fixture count");
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: orphan_count,
+            maximum_bytes: 4_000_000,
+        })
+        .expect("orphan pool");
+        for (ordinal, parent) in [first_hash, second_hash]
+            .into_iter()
+            .flat_map(|parent| (0..CHILDREN_PER_PARENT).map(move |ordinal| (ordinal, parent)))
+        {
+            let height = 100u32
+                .saturating_add(ordinal)
+                .saturating_add(if parent == second_hash { 100 } else { 0 });
+            let mut child = validator_coinbase_block(height, 1);
+            child.header.prev_block = parent;
+            retain_test_owned_orphan(child, height, &mut scheduler, &mut orphans);
+        }
+        let mut ready = ReadyOrphanParents::new(orphan_count);
+        let mut discards = DeferredOrphanDiscards::new(orphan_count);
+        let result = handle_validation_results(
+            vec![
+                Ok(ValidatedBlock {
+                    sequence: 0,
+                    peer: PeerId(1),
+                    height: 1,
+                    block: first,
+                }),
+                Err(ValidationFailure {
+                    sequence: 1,
+                    peer: PeerId(1),
+                    height: 500,
+                    attempt: 1,
+                    block: failure_block,
+                    kind: ValidationFailureKind::WorkerFailure,
+                    reason: "split valid runs".to_owned(),
+                }),
+                Ok(ValidatedBlock {
+                    sequence: 2,
+                    peer: PeerId(1),
+                    height: 2,
+                    block: second,
+                }),
+            ],
+            &context,
+            &mut scheduler,
+            &mut orphans,
+            &mut ready,
+            &mut discards,
+        )
+        .await;
+        let error = result.expect_err("worker failure remains a warning result");
+        assert!(!terminal_validation_error(&error));
+        assert_eq!(ready.len(), 2);
+
+        let mut schedule = OrphanWorkSchedule::default();
+        let spent = drain_orphan_work(
+            MAX_VALIDATED_BODY_COMMIT_BATCH,
+            &validation,
+            &mut scheduler,
+            &mut orphans,
+            &mut ready,
+            &mut discards,
+            &mut schedule,
+        )
+        .expect("one supervisor orphan budget");
+        assert_eq!(spent, MAX_VALIDATED_BODY_COMMIT_BATCH);
+        assert_eq!(orphans.snapshot().blocks, orphan_count - spent);
+        assert_eq!(ready.len(), 2);
+        assert_orphan_work_membership_exact(&orphans, &ready, &discards);
         runtime.shutdown().await.expect("node runtime shutdown");
     }
 
