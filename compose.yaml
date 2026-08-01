@@ -1,0 +1,41 @@
+name: hns-node-rs
+
+services:
+  hsrd:
+    image: ${HSRD_IMAGE:-ghcr.io/handshake-rs/hns-node-rs:0.3.1}
+    restart: unless-stopped
+    stop_grace_period: 2m
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - hsrd-mainnet:/var/lib/hsrd
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - --silent
+        - --show-error
+        - http://127.0.0.1:12037/api/v1/status
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 20m
+
+volumes:
+  hsrd-mainnet:

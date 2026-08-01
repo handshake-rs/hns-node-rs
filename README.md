@@ -128,6 +128,7 @@ documented in [Storage rollout](docs/storage-rollout.md).
 - [Testing and qualification](docs/testing.md)
 - [Production assurance and external evidence](docs/production-assurance.md)
 - [Storage schema and complexity](docs/storage-schema.md)
+- [Docker and GHCR](docs/docker.md)
 - [Native mainnet mining canary](docs/mainnet-canary.md)
 - [Extraction provenance](docs/extraction-provenance.md)
 
