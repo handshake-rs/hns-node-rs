@@ -7,9 +7,11 @@ pub use publication::{
     SolvedBlockPublicationIntent, PUBLICATION_INTENT_VERSION, PUBLICATION_KEY_PREFIX,
 };
 pub use template::{
-    FutureTemplateCache, MiningTemplate, TemplateAssembler, TemplateBuildRequest, TemplateCacheKey,
-    TemplateCoordinator, TemplateId, TemplateMetrics, TemplatePolicy, TemplateVariant,
-    DEFAULT_RESERVED_TEMPLATE_SIGOPS, DEFAULT_RESERVED_TEMPLATE_WEIGHT, MAX_TEMPLATE_VARIANTS,
+    estimate_template_selection_workspace_bytes, FutureTemplateCache, MiningTemplate,
+    TemplateAssembler, TemplateBuildRequest, TemplateCacheKey, TemplateCoordinator, TemplateId,
+    TemplateMetrics, TemplatePolicy, TemplateVariant, DEFAULT_RESERVED_TEMPLATE_SIGOPS,
+    DEFAULT_RESERVED_TEMPLATE_WEIGHT, MAX_TEMPLATE_SELECTION_AGGREGATE_WORKSPACE_BYTES,
+    MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES, MAX_TEMPLATE_VARIANTS,
 };
 
 use std::{
@@ -77,9 +79,9 @@ pub enum ChainEvent {
         committed_generation: MiningGeneration,
         block: HeaderSummary,
     },
-    /// The local pre-authority state engine committed this generation, but it
-    /// has not passed every release-gated Handshake consensus check and is not
-    /// available through the authoritative mining snapshot channel.
+    /// The local state engine committed this generation, but it has not passed
+    /// every mining-authority readiness gate and is not available through the
+    /// authoritative mining snapshot channel.
     TipStaged {
         previous_generation: MiningGeneration,
         snapshot: Option<Arc<MiningSnapshot>>,
@@ -192,7 +194,7 @@ impl MiningEventHub {
     }
 
     /// Advance the durable generation without authorizing mining. This is the
-    /// normal shadow/pre-authority path until the parity gates pass.
+    /// normal non-authoritative path until every mining-readiness gate passes.
     pub fn tip_staged(
         &self,
         snapshot: Option<Arc<MiningSnapshot>>,

@@ -1,4 +1,8 @@
-use std::{cmp::Ordering, collections::HashSet, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet},
+    sync::Arc,
+};
 
 use hns_consensus::{
     block_merkle_root, block_subsidy, block_witness_root, validate_block_body, Network,
@@ -20,6 +24,49 @@ pub const DEFAULT_RESERVED_TEMPLATE_WEIGHT: usize = 4_000;
 pub const DEFAULT_RESERVED_TEMPLATE_SIGOPS: u32 = 400;
 pub const MAX_TEMPLATE_VARIANTS: usize = MAX_PREPARED_JOBS;
 pub type TemplateId = [u8; 32];
+
+/// Hard live workspace ceiling for one dependency-frontier template build.
+/// The selector checks this before reverse-index allocation and every heap
+/// insertion, retaining a separate transient-package reserve throughout.
+pub const MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES: u64 = 512 * 1024 * 1024;
+/// Hard aggregate configuration ceiling for concurrently executing template
+/// builds. Queued immutable-generation captures have a separate node envelope.
+pub const MAX_TEMPLATE_SELECTION_AGGREGATE_WORKSPACE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const TEMPLATE_SELECTION_CANDIDATE_CHARGE_BYTES: u64 = 768;
+const TEMPLATE_SELECTION_CANDIDATE_BASE_BYTES: u64 = 512;
+const TEMPLATE_SELECTION_HEAP_ENTRY_BYTES: u64 =
+    TEMPLATE_SELECTION_CANDIDATE_CHARGE_BYTES - TEMPLATE_SELECTION_CANDIDATE_BASE_BYTES;
+const TEMPLATE_SELECTION_EDGE_OR_MEMBER_CHARGE_BYTES: u64 = 128;
+const TEMPLATE_SELECTION_VECTOR_ELEMENT_BYTES: u64 = 32;
+const TEMPLATE_SELECTION_TRANSIENT_PACKAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Conservatively estimates dependency-frontier workspace from configured
+/// mempool cardinality, maximum ancestor count, and active build count.
+///
+/// The estimate charges one self member in addition to the ancestor ceiling,
+/// one reverse edge and one retained package member at four times the 32-byte
+/// txid payload size (covering minimum `Vec` growth and allocator slack), fixed
+/// adversarial-map/heap overhead per candidate, and one transient package
+/// reserve per build. Runtime accounting additionally charges exact retained
+/// exclusive-name vector and binary-heap capacities.
+pub fn estimate_template_selection_workspace_bytes(
+    maximum_candidates: usize,
+    maximum_ancestors: usize,
+    active_builds: usize,
+) -> Option<u64> {
+    let candidates = u64::try_from(maximum_candidates).ok()?;
+    let package_members = u64::try_from(maximum_ancestors).ok()?.checked_add(1)?;
+    let builds = u64::try_from(active_builds).ok()?;
+    let candidate_bytes = candidates.checked_mul(TEMPLATE_SELECTION_CANDIDATE_CHARGE_BYTES)?;
+    let dependency_members = candidates.checked_mul(package_members)?;
+    let dependency_and_package_bytes = dependency_members
+        .checked_mul(TEMPLATE_SELECTION_EDGE_OR_MEMBER_CHARGE_BYTES)?
+        .checked_mul(2)?;
+    candidate_bytes
+        .checked_add(dependency_and_package_bytes)?
+        .checked_add(TEMPLATE_SELECTION_TRANSIENT_PACKAGE_BYTES)?
+        .checked_mul(builds)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TemplatePolicy {
@@ -156,6 +203,19 @@ impl TemplateAssembler {
         &self,
         request: TemplateBuildRequest<'_>,
     ) -> Result<MiningTemplate, MiningError> {
+        self.assemble_with_selection(
+            request,
+            SelectionAlgorithm::DependencyFrontier,
+            &mut TemplateSelectionWork::default(),
+        )
+    }
+
+    fn assemble_with_selection(
+        &self,
+        request: TemplateBuildRequest<'_>,
+        selection: SelectionAlgorithm,
+        work: &mut TemplateSelectionWork,
+    ) -> Result<MiningTemplate, MiningError> {
         request.policy.validate()?;
         let next_height = request
             .snapshot
@@ -172,18 +232,19 @@ impl TemplateAssembler {
             return Err(MiningError::InvalidTemplateContext);
         }
 
-        let mut selected = HashSet::new();
-        let mut selected_transactions = Vec::new();
         let mut selected_names = HashSet::new();
-        let mut selected_claims = Vec::new();
-        let mut selected_airdrops = Vec::new();
+        let mut selected_claims: Vec<&ClaimMempoolEntry> = Vec::new();
+        let mut selected_airdrops: Vec<&AirdropMempoolEntry> = Vec::new();
         let mut metrics = TemplateMetrics {
             weight: request.policy.reserved_weight,
             sigops: request.policy.reserved_sigops,
             ..TemplateMetrics::default()
         };
 
-        let mut claims = request.mempool.claims().cloned().collect::<Vec<_>>();
+        // Sorting borrowed entries keeps large proof payloads structurally
+        // shared with the immutable mempool snapshot. Only the at-most-ten
+        // selected payloads are materialized while constructing the coinbase.
+        let mut claims = request.mempool.claims().collect::<Vec<_>>();
         claims.sort_by(|left, right| {
             compare_fee_rates(right.fee, right.policy_size, left.fee, left.policy_size)
                 .then_with(|| left.hash.cmp(&right.hash))
@@ -212,9 +273,11 @@ impl TemplateAssembler {
                 .ok_or(MiningError::TemplateArithmetic)?;
             metrics.updates = metrics.updates.saturating_add(1);
             selected_claims.push(entry);
+            work.special_payload_materializations =
+                work.special_payload_materializations.saturating_add(1);
         }
 
-        let mut airdrops = request.mempool.airdrops().cloned().collect::<Vec<_>>();
+        let mut airdrops = request.mempool.airdrops().collect::<Vec<_>>();
         airdrops.sort_by(|left, right| {
             compare_fee_rates(right.fee, right.policy_size, left.fee, left.policy_size)
                 .then_with(|| left.hash.cmp(&right.hash))
@@ -241,66 +304,52 @@ impl TemplateAssembler {
                 .ok_or(MiningError::TemplateArithmetic)?;
             metrics.updates = metrics.updates.saturating_add(1);
             selected_airdrops.push(entry);
+            work.special_payload_materializations =
+                work.special_payload_materializations.saturating_add(1);
         }
 
-        loop {
-            let mut best: Option<MempoolPackage> = None;
-            for txid in request.mempool.txids() {
-                if selected.contains(&txid) {
-                    continue;
-                }
-                let package = request
-                    .mempool
-                    .package_for(txid, &selected)
-                    .map_err(|error| MiningError::Mempool(error.to_string()))?;
-                if package.is_empty()
-                    || !package_meets_fee_rate(&package, request.policy.minimum_package_fee_rate)
-                    || !package_fits(
-                        &package,
-                        &metrics,
-                        selected_transactions.len(),
-                        &selected_names,
-                        &request.policy,
-                    )
-                {
-                    continue;
-                }
-                if best
-                    .as_ref()
-                    .is_none_or(|current| compare_packages(&package, current) == Ordering::Greater)
-                {
-                    best = Some(package);
-                }
-            }
-
-            let Some(package) = best else {
-                break;
-            };
-            for txid in &package.txids {
-                if selected.insert(*txid) {
-                    let transaction = request
+        let candidates = request.mempool.txids().collect::<Vec<_>>();
+        let reverse_dependencies = reverse_dependencies(request.mempool, &candidates)?;
+        let selected_txids = match selection {
+            SelectionAlgorithm::DependencyFrontier => select_packages_with_frontier(
+                &candidates,
+                &reverse_dependencies,
+                |txid, selected| {
+                    request
                         .mempool
-                        .transaction(txid)
-                        .ok_or(MiningError::MempoolTransactionMissing(*txid))?
-                        .clone();
-                    selected_transactions.push(transaction);
-                }
-            }
-            selected_names.extend(package.exclusive_names.iter().copied());
-            metrics.selected_packages = metrics.selected_packages.saturating_add(1);
-            metrics.fees = metrics
-                .fees
-                .checked_add(package.fee)
-                .ok_or(MiningError::TemplateArithmetic)?;
-            metrics.weight = metrics
-                .weight
-                .checked_add(package.weight)
-                .ok_or(MiningError::TemplateArithmetic)?;
-            metrics.sigops = metrics.sigops.saturating_add(package.sigops);
-            metrics.opens = metrics.opens.saturating_add(package.opens);
-            metrics.updates = metrics.updates.saturating_add(package.updates);
-            metrics.renewals = metrics.renewals.saturating_add(package.renewals);
-        }
+                        .package_for(txid, selected)
+                        .map_err(|error| MiningError::Mempool(error.to_string()))
+                },
+                &request.policy,
+                &mut metrics,
+                &mut selected_names,
+                work,
+            )?,
+            #[cfg(test)]
+            SelectionAlgorithm::ReferenceFullScan => select_packages_reference(
+                &candidates,
+                |txid, selected| {
+                    request
+                        .mempool
+                        .package_for(txid, selected)
+                        .map_err(|error| MiningError::Mempool(error.to_string()))
+                },
+                &request.policy,
+                &mut metrics,
+                &mut selected_names,
+                work,
+            )?,
+        };
+        let selected_transactions = selected_txids
+            .iter()
+            .map(|txid| {
+                request
+                    .mempool
+                    .transaction(txid)
+                    .ok_or(MiningError::MempoolTransactionMissing(*txid))
+                    .cloned()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let reward = block_subsidy(next_height, network.params().halving_interval)
             .checked_add(metrics.fees)
@@ -367,6 +416,587 @@ impl TemplateAssembler {
             metrics,
         })
     }
+
+    #[cfg(test)]
+    fn assemble_reference(
+        &self,
+        request: TemplateBuildRequest<'_>,
+        work: &mut TemplateSelectionWork,
+    ) -> Result<MiningTemplate, MiningError> {
+        self.assemble_with_selection(request, SelectionAlgorithm::ReferenceFullScan, work)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionAlgorithm {
+    DependencyFrontier,
+    #[cfg(test)]
+    ReferenceFullScan,
+}
+
+/// Exact operation counts for deterministic complexity regressions. This is
+/// deliberately local to one build and has no synchronization or global hook.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TemplateSelectionWork {
+    initial_package_builds: usize,
+    affected_package_rebuilds: usize,
+    dependency_edges: usize,
+    affected_candidates: usize,
+    affected_dependency_edges: usize,
+    heap_pushes: usize,
+    heap_pops: usize,
+    stale_heap_pops: usize,
+    heap_compactions: usize,
+    #[cfg(test)]
+    full_scan_candidates: usize,
+    special_payload_materializations: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PackageFrontierEntry {
+    candidate: hns_primitives::Txid,
+    version: u64,
+    package: MempoolPackage,
+}
+
+#[derive(Clone, Debug)]
+struct TemplateSelectionWorkspace {
+    base_bytes: u64,
+    retained_package_bytes: u64,
+    charged_heap_capacity: usize,
+}
+
+impl TemplateSelectionWorkspace {
+    fn new(
+        candidate_count: usize,
+        reverse_dependencies: &BTreeMap<hns_primitives::Txid, Vec<hns_primitives::Txid>>,
+        heap_capacity: usize,
+    ) -> Result<Self, MiningError> {
+        let candidates =
+            u64::try_from(candidate_count).map_err(|_| MiningError::TemplateCapacity)?;
+        let candidate_bytes = candidates
+            .checked_mul(TEMPLATE_SELECTION_CANDIDATE_BASE_BYTES)
+            .ok_or(MiningError::TemplateCapacity)?;
+        let heap_bytes = u64::try_from(heap_capacity)
+            .map_err(|_| MiningError::TemplateCapacity)?
+            .checked_mul(TEMPLATE_SELECTION_HEAP_ENTRY_BYTES)
+            .ok_or(MiningError::TemplateCapacity)?;
+        let mut dependency_capacity = 0u64;
+        for children in reverse_dependencies.values() {
+            dependency_capacity = dependency_capacity
+                .checked_add(
+                    u64::try_from(children.capacity())
+                        .map_err(|_| MiningError::TemplateCapacity)?,
+                )
+                .ok_or(MiningError::TemplateCapacity)?;
+        }
+        let dependency_bytes = dependency_capacity
+            .checked_mul(TEMPLATE_SELECTION_VECTOR_ELEMENT_BYTES)
+            .ok_or(MiningError::TemplateCapacity)?;
+        let base_bytes = candidate_bytes
+            .checked_add(heap_bytes)
+            .ok_or(MiningError::TemplateCapacity)?
+            .checked_add(dependency_bytes)
+            .ok_or(MiningError::TemplateCapacity)?;
+        let workspace = Self {
+            base_bytes,
+            retained_package_bytes: 0,
+            charged_heap_capacity: heap_capacity,
+        };
+        workspace.ensure_transient_capacity()?;
+        Ok(workspace)
+    }
+
+    fn package_bytes(package: &MempoolPackage) -> Result<u64, MiningError> {
+        let vector_capacity = package
+            .txids
+            .capacity()
+            .checked_add(package.exclusive_names.capacity())
+            .ok_or(MiningError::TemplateCapacity)?;
+        u64::try_from(vector_capacity)
+            .map_err(|_| MiningError::TemplateCapacity)?
+            .checked_mul(TEMPLATE_SELECTION_VECTOR_ELEMENT_BYTES)
+            .ok_or(MiningError::TemplateCapacity)
+    }
+
+    fn ensure_transient_capacity(&self) -> Result<(), MiningError> {
+        let projected = self
+            .base_bytes
+            .checked_add(self.retained_package_bytes)
+            .and_then(|bytes| bytes.checked_add(TEMPLATE_SELECTION_TRANSIENT_PACKAGE_BYTES))
+            .ok_or(MiningError::TemplateCapacity)?;
+        if projected > MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES {
+            return Err(MiningError::TemplateCapacity);
+        }
+        Ok(())
+    }
+
+    fn can_retain(&self, package: &MempoolPackage) -> Result<bool, MiningError> {
+        let package_bytes = Self::package_bytes(package)?;
+        if package_bytes > TEMPLATE_SELECTION_TRANSIENT_PACKAGE_BYTES {
+            return Ok(false);
+        }
+        let projected = self
+            .base_bytes
+            .checked_add(self.retained_package_bytes)
+            .and_then(|bytes| bytes.checked_add(package_bytes))
+            .and_then(|bytes| bytes.checked_add(TEMPLATE_SELECTION_TRANSIENT_PACKAGE_BYTES))
+            .ok_or(MiningError::TemplateCapacity)?;
+        Ok(projected <= MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES)
+    }
+
+    fn retain(&mut self, package: &MempoolPackage) -> Result<(), MiningError> {
+        if !self.can_retain(package)? {
+            return Err(MiningError::TemplateCapacity);
+        }
+        self.retained_package_bytes = self
+            .retained_package_bytes
+            .checked_add(Self::package_bytes(package)?)
+            .ok_or(MiningError::TemplateCapacity)?;
+        Ok(())
+    }
+
+    fn release(&mut self, package: &MempoolPackage) -> Result<(), MiningError> {
+        self.retained_package_bytes = self
+            .retained_package_bytes
+            .checked_sub(Self::package_bytes(package)?)
+            .ok_or(MiningError::TemplateArithmetic)?;
+        Ok(())
+    }
+
+    fn reset_retained(
+        &mut self,
+        frontier: &BinaryHeap<PackageFrontierEntry>,
+    ) -> Result<(), MiningError> {
+        self.validate_heap_capacity(frontier)?;
+        self.retained_package_bytes = frontier.iter().try_fold(0u64, |total, entry| {
+            total
+                .checked_add(Self::package_bytes(&entry.package)?)
+                .ok_or(MiningError::TemplateCapacity)
+        })?;
+        self.ensure_transient_capacity()
+    }
+
+    fn validate_heap_capacity(
+        &self,
+        frontier: &BinaryHeap<PackageFrontierEntry>,
+    ) -> Result<(), MiningError> {
+        if frontier.capacity() != self.charged_heap_capacity {
+            return Err(MiningError::TemplateCapacity);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_base_bytes(base_bytes: u64, charged_heap_capacity: usize) -> Self {
+        Self {
+            base_bytes,
+            retained_package_bytes: 0,
+            charged_heap_capacity,
+        }
+    }
+
+    #[cfg(test)]
+    fn total_with_transient(&self) -> Result<u64, MiningError> {
+        self.base_bytes
+            .checked_add(self.retained_package_bytes)
+            .and_then(|bytes| bytes.checked_add(TEMPLATE_SELECTION_TRANSIENT_PACKAGE_BYTES))
+            .ok_or(MiningError::TemplateCapacity)
+    }
+}
+
+impl PartialEq for PackageFrontierEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for PackageFrontierEntry {}
+
+impl PartialOrd for PackageFrontierEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PackageFrontierEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_packages(&self.package, &other.package)
+            // The reference scan retains the first candidate on an exact
+            // package tie. Candidate iteration is ascending txid order, so a
+            // smaller candidate must be the greater heap entry.
+            .then_with(|| other.candidate.cmp(&self.candidate))
+            .then_with(|| self.version.cmp(&other.version))
+    }
+}
+
+fn reverse_dependencies(
+    mempool: &MempoolSnapshot,
+    candidates: &[hns_primitives::Txid],
+) -> Result<BTreeMap<hns_primitives::Txid, Vec<hns_primitives::Txid>>, MiningError> {
+    let dependency_edges = candidates.iter().try_fold(0u64, |total, candidate| {
+        let mut parents = 0u64;
+        for parent in mempool.parents(candidate) {
+            if candidates.binary_search(&parent).is_err() {
+                return Err(MiningError::MempoolTransactionMissing(parent));
+            }
+            parents = parents
+                .checked_add(1)
+                .ok_or(MiningError::TemplateCapacity)?;
+        }
+        total
+            .checked_add(parents)
+            .ok_or(MiningError::TemplateCapacity)
+    })?;
+    let candidate_bytes = u64::try_from(candidates.len())
+        .map_err(|_| MiningError::TemplateCapacity)?
+        .checked_mul(TEMPLATE_SELECTION_CANDIDATE_CHARGE_BYTES)
+        .ok_or(MiningError::TemplateCapacity)?;
+    let dependency_bytes = dependency_edges
+        .checked_mul(TEMPLATE_SELECTION_EDGE_OR_MEMBER_CHARGE_BYTES)
+        .ok_or(MiningError::TemplateCapacity)?;
+    let preflight = candidate_bytes
+        .checked_add(dependency_bytes)
+        .and_then(|bytes| bytes.checked_add(TEMPLATE_SELECTION_TRANSIENT_PACKAGE_BYTES))
+        .ok_or(MiningError::TemplateCapacity)?;
+    if preflight > MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES {
+        return Err(MiningError::TemplateCapacity);
+    }
+
+    let mut reverse = candidates
+        .iter()
+        .copied()
+        .map(|txid| (txid, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    for candidate in candidates {
+        for parent in mempool.parents(candidate) {
+            reverse.entry(parent).or_default().push(*candidate);
+        }
+    }
+    Ok(reverse)
+}
+
+fn package_is_eligible(
+    package: &MempoolPackage,
+    metrics: &TemplateMetrics,
+    selected_count: usize,
+    selected_names: &HashSet<[u8; 32]>,
+    policy: &TemplatePolicy,
+) -> bool {
+    !package.is_empty()
+        && package_meets_fee_rate(package, policy.minimum_package_fee_rate)
+        && package_fits(package, metrics, selected_count, selected_names, policy)
+}
+
+fn commit_package(
+    package: &MempoolPackage,
+    selected: &mut HashSet<hns_primitives::Txid>,
+    selected_txids: &mut Vec<hns_primitives::Txid>,
+    selected_names: &mut HashSet<[u8; 32]>,
+    metrics: &mut TemplateMetrics,
+) -> Result<Vec<hns_primitives::Txid>, MiningError> {
+    let mut newly_selected = Vec::with_capacity(package.txids.len());
+    for txid in &package.txids {
+        if selected.insert(*txid) {
+            selected_txids.push(*txid);
+            newly_selected.push(*txid);
+        }
+    }
+    selected_names.extend(package.exclusive_names.iter().copied());
+    metrics.selected_packages = metrics.selected_packages.saturating_add(1);
+    metrics.fees = metrics
+        .fees
+        .checked_add(package.fee)
+        .ok_or(MiningError::TemplateArithmetic)?;
+    metrics.weight = metrics
+        .weight
+        .checked_add(package.weight)
+        .ok_or(MiningError::TemplateArithmetic)?;
+    metrics.sigops = metrics.sigops.saturating_add(package.sigops);
+    metrics.opens = metrics.opens.saturating_add(package.opens);
+    metrics.updates = metrics.updates.saturating_add(package.updates);
+    metrics.renewals = metrics.renewals.saturating_add(package.renewals);
+    Ok(newly_selected)
+}
+
+fn collect_affected_candidates(
+    newly_selected: &[hns_primitives::Txid],
+    reverse_dependencies: &BTreeMap<hns_primitives::Txid, Vec<hns_primitives::Txid>>,
+) -> Result<(BTreeSet<hns_primitives::Txid>, usize), MiningError> {
+    let mut affected = BTreeSet::new();
+    let mut pending = Vec::with_capacity(newly_selected.len());
+    for txid in newly_selected {
+        if affected.insert(*txid) {
+            pending.push(*txid);
+        }
+    }
+    let mut dependency_edge_visits = 0usize;
+    while let Some(parent) = pending.pop() {
+        if let Some(children) = reverse_dependencies.get(&parent) {
+            for child in children {
+                dependency_edge_visits = dependency_edge_visits
+                    .checked_add(1)
+                    .ok_or(MiningError::TemplateArithmetic)?;
+                if affected.insert(*child) {
+                    pending.push(*child);
+                }
+            }
+        }
+    }
+    Ok((affected, dependency_edge_visits))
+}
+
+fn compact_frontier(
+    frontier: &mut BinaryHeap<PackageFrontierEntry>,
+    versions: &BTreeMap<hns_primitives::Txid, u64>,
+    selected: &HashSet<hns_primitives::Txid>,
+    workspace: &mut TemplateSelectionWorkspace,
+) -> Result<(), MiningError> {
+    frontier.retain(|entry| {
+        !selected.contains(&entry.candidate)
+            && versions.get(&entry.candidate) == Some(&entry.version)
+    });
+    workspace.reset_retained(frontier)
+}
+
+fn push_frontier_bounded(
+    frontier: &mut BinaryHeap<PackageFrontierEntry>,
+    versions: &BTreeMap<hns_primitives::Txid, u64>,
+    selected: &HashSet<hns_primitives::Txid>,
+    workspace: &mut TemplateSelectionWorkspace,
+    entry: PackageFrontierEntry,
+    work: &mut TemplateSelectionWork,
+) -> Result<(), MiningError> {
+    workspace.validate_heap_capacity(frontier)?;
+    if frontier.len() >= versions.len() || !workspace.can_retain(&entry.package)? {
+        compact_frontier(frontier, versions, selected, workspace)?;
+        work.heap_compactions = work.heap_compactions.saturating_add(1);
+    }
+    if frontier.len() >= versions.len() {
+        return Err(MiningError::TemplateCapacity);
+    }
+    workspace.retain(&entry.package)?;
+    frontier.push(entry);
+    workspace.validate_heap_capacity(frontier)?;
+    work.heap_pushes = work.heap_pushes.saturating_add(1);
+    Ok(())
+}
+
+/// Dependency-aware exact selector. `MempoolSnapshot::package_for` uses
+/// separate recursion-stack and emitted sets, so each construction is linear
+/// in its bounded ancestor closure and dependency edges. Initial construction
+/// covers N candidates; direct reverse storage is O(N + E); and a candidate is
+/// recomputed only when one of its bounded ancestors was selected. Versioned
+/// lazy heap entries avoid full rescans, while checked workspace accounting and
+/// periodic stale compaction hard-bound retained package vectors.
+#[allow(clippy::too_many_arguments)]
+fn select_packages_with_frontier<F>(
+    candidates: &[hns_primitives::Txid],
+    reverse_dependencies: &BTreeMap<hns_primitives::Txid, Vec<hns_primitives::Txid>>,
+    mut package_for: F,
+    policy: &TemplatePolicy,
+    metrics: &mut TemplateMetrics,
+    selected_names: &mut HashSet<[u8; 32]>,
+    work: &mut TemplateSelectionWork,
+) -> Result<Vec<hns_primitives::Txid>, MiningError>
+where
+    F: FnMut(
+        hns_primitives::Txid,
+        &HashSet<hns_primitives::Txid>,
+    ) -> Result<MempoolPackage, MiningError>,
+{
+    let mut selected = HashSet::with_capacity(candidates.len());
+    let mut selected_txids = Vec::with_capacity(candidates.len());
+    let mut versions = candidates
+        .iter()
+        .copied()
+        .map(|txid| (txid, 0u64))
+        .collect::<BTreeMap<_, _>>();
+    let mut frontier = BinaryHeap::with_capacity(candidates.len());
+    let mut workspace = TemplateSelectionWorkspace::new(
+        candidates.len(),
+        reverse_dependencies,
+        frontier.capacity(),
+    )?;
+    work.dependency_edges = reverse_dependencies
+        .values()
+        .try_fold(0usize, |total, children| total.checked_add(children.len()))
+        .ok_or(MiningError::TemplateArithmetic)?;
+
+    for candidate in candidates {
+        workspace.ensure_transient_capacity()?;
+        let package = package_for(*candidate, &selected)?;
+        work.initial_package_builds = work.initial_package_builds.saturating_add(1);
+        if package_is_eligible(
+            &package,
+            metrics,
+            selected_txids.len(),
+            selected_names,
+            policy,
+        ) {
+            push_frontier_bounded(
+                &mut frontier,
+                &versions,
+                &selected,
+                &mut workspace,
+                PackageFrontierEntry {
+                    candidate: *candidate,
+                    version: 0,
+                    package,
+                },
+                work,
+            )?;
+        }
+    }
+
+    while let Some(entry) = frontier.pop() {
+        workspace.release(&entry.package)?;
+        work.heap_pops = work.heap_pops.saturating_add(1);
+        if selected.contains(&entry.candidate)
+            || versions.get(&entry.candidate) != Some(&entry.version)
+        {
+            work.stale_heap_pops = work.stale_heap_pops.saturating_add(1);
+            continue;
+        }
+        if !package_is_eligible(
+            &entry.package,
+            metrics,
+            selected_txids.len(),
+            selected_names,
+            policy,
+        ) {
+            // An ancestor-bearing package can become eligible after that
+            // ancestor is selected elsewhere and the package shrinks. It is
+            // deliberately deferred, not permanently rejected; the reverse
+            // dependency walk below will recompute and reinsert it.
+            continue;
+        }
+
+        let selected_package = entry.package;
+        let newly_selected = commit_package(
+            &selected_package,
+            &mut selected,
+            &mut selected_txids,
+            selected_names,
+            metrics,
+        )?;
+        drop(selected_package);
+        let (affected, affected_dependency_edges) =
+            collect_affected_candidates(&newly_selected, reverse_dependencies)?;
+        if affected.len() > candidates.len() || affected_dependency_edges > work.dependency_edges {
+            return Err(MiningError::TemplateArithmetic);
+        }
+        work.affected_candidates = work.affected_candidates.saturating_add(affected.len());
+        work.affected_dependency_edges = work
+            .affected_dependency_edges
+            .saturating_add(affected_dependency_edges);
+        for candidate in &affected {
+            let version = versions
+                .get_mut(candidate)
+                .ok_or(MiningError::MempoolTransactionMissing(*candidate))?;
+            *version = version
+                .checked_add(1)
+                .ok_or(MiningError::TemplateArithmetic)?;
+        }
+
+        // Stale packages retain ancestor vectors. Compact in place before the
+        // pending replacements could exhaust the one-entry-per-candidate heap
+        // allocation; the backing `Vec` capacity never grows after preflight.
+        if frontier.len().saturating_add(affected.len()) > candidates.len() {
+            compact_frontier(&mut frontier, &versions, &selected, &mut workspace)?;
+            work.heap_compactions = work.heap_compactions.saturating_add(1);
+        }
+
+        for candidate in affected {
+            if selected.contains(&candidate) {
+                continue;
+            }
+            workspace.ensure_transient_capacity()?;
+            let package = package_for(candidate, &selected)?;
+            work.affected_package_rebuilds = work.affected_package_rebuilds.saturating_add(1);
+            if package_is_eligible(
+                &package,
+                metrics,
+                selected_txids.len(),
+                selected_names,
+                policy,
+            ) {
+                let version = *versions
+                    .get(&candidate)
+                    .ok_or(MiningError::MempoolTransactionMissing(candidate))?;
+                push_frontier_bounded(
+                    &mut frontier,
+                    &versions,
+                    &selected,
+                    &mut workspace,
+                    PackageFrontierEntry {
+                        candidate,
+                        version,
+                        package,
+                    },
+                    work,
+                )?;
+            }
+        }
+    }
+
+    Ok(selected_txids)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn select_packages_reference<F>(
+    candidates: &[hns_primitives::Txid],
+    mut package_for: F,
+    policy: &TemplatePolicy,
+    metrics: &mut TemplateMetrics,
+    selected_names: &mut HashSet<[u8; 32]>,
+    work: &mut TemplateSelectionWork,
+) -> Result<Vec<hns_primitives::Txid>, MiningError>
+where
+    F: FnMut(
+        hns_primitives::Txid,
+        &HashSet<hns_primitives::Txid>,
+    ) -> Result<MempoolPackage, MiningError>,
+{
+    let mut selected = HashSet::with_capacity(candidates.len());
+    let mut selected_txids = Vec::with_capacity(candidates.len());
+    loop {
+        let mut best: Option<MempoolPackage> = None;
+        for candidate in candidates {
+            if selected.contains(candidate) {
+                continue;
+            }
+            work.full_scan_candidates = work.full_scan_candidates.saturating_add(1);
+            let package = package_for(*candidate, &selected)?;
+            if !package_is_eligible(
+                &package,
+                metrics,
+                selected_txids.len(),
+                selected_names,
+                policy,
+            ) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|current| compare_packages(&package, current) == Ordering::Greater)
+            {
+                best = Some(package);
+            }
+        }
+        let Some(package) = best else {
+            break;
+        };
+        commit_package(
+            &package,
+            &mut selected,
+            &mut selected_txids,
+            selected_names,
+            metrics,
+        )?;
+    }
+    Ok(selected_txids)
 }
 
 fn create_coinbase(
@@ -375,8 +1005,8 @@ fn create_coinbase(
     reward: u64,
     payout_address: Address,
     coinbase_flags: Vec<u8>,
-    claims: &[ClaimMempoolEntry],
-    airdrops: &[AirdropMempoolEntry],
+    claims: &[&ClaimMempoolEntry],
+    airdrops: &[&AirdropMempoolEntry],
 ) -> Result<Transaction, MiningError> {
     if coinbase_flags.len() > hns_consensus::MAX_COINBASE_WITNESS_SIZE {
         return Err(MiningError::InvalidTemplateContext);
@@ -700,6 +1330,45 @@ impl TemplateCoordinator {
         Ok(built)
     }
 
+    /// Atomically installs templates assembled outside the canonical writer.
+    ///
+    /// Variant identity is supplied explicitly and the complete replacement
+    /// is authenticated off to the side. Any duplicate, stale generation,
+    /// context mismatch, malformed body, or identity mismatch leaves the
+    /// currently active cache byte-for-byte intact.
+    pub fn install_prebuilt<I>(
+        &mut self,
+        snapshot: &MiningSnapshot,
+        expected_mempool_generation: u64,
+        templates: I,
+    ) -> Result<Vec<Arc<MiningTemplate>>, MiningError>
+    where
+        I: IntoIterator<Item = (u32, MiningTemplate)>,
+    {
+        let mut templates = templates.into_iter().collect::<Vec<_>>();
+        if templates.is_empty() || templates.len() > self.maximum_variants {
+            return Err(MiningError::TemplateCapacity);
+        }
+        templates.sort_by_key(|(variant, _)| *variant);
+        if templates.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(MiningError::TemplateConflict);
+        }
+
+        let mut replacement = FutureTemplateCache::default();
+        let mut installed = Vec::with_capacity(templates.len());
+        for (variant, template) in templates {
+            validate_prebuilt_template(snapshot, expected_mempool_generation, &template)?;
+            let key = TemplateCacheKey {
+                snapshot_generation: snapshot.generation,
+                mempool_generation: expected_mempool_generation,
+                variant,
+            };
+            installed.push(replacement.insert(key, template)?);
+        }
+        self.cache = replacement;
+        Ok(installed)
+    }
+
     pub fn activate(
         &mut self,
         key: &TemplateCacheKey,
@@ -723,6 +1392,64 @@ impl TemplateCoordinator {
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
+}
+
+fn validate_prebuilt_template(
+    snapshot: &MiningSnapshot,
+    expected_mempool_generation: u64,
+    template: &MiningTemplate,
+) -> Result<(), MiningError> {
+    if template.snapshot_generation != snapshot.generation
+        || template.mempool_generation != expected_mempool_generation
+        || template.header.parent_hash != snapshot.tip.hash
+        || template.header.tree_root != snapshot.next_tree_root
+    {
+        return Err(MiningError::StaleTemplate);
+    }
+
+    let block = Block {
+        header: Header {
+            time: template.header.minimum_time,
+            prev_block: template.header.parent_hash,
+            tree_root: template.header.tree_root,
+            reserved_root: template.header.reserved_root,
+            witness_root: template.header.witness_root,
+            merkle_root: template.header.merkle_root,
+            version: template.header.version,
+            bits: template.header.bits,
+            ..Header::default()
+        },
+        transactions: template.transactions.to_vec(),
+    };
+    if block_merkle_root(&block) != template.header.merkle_root
+        || block_witness_root(&block) != template.header.witness_root
+    {
+        return Err(MiningError::InvalidTemplateBody);
+    }
+    let body = validate_block_body(&block).map_err(|_| MiningError::InvalidTemplateBody)?;
+    if template.metrics.transaction_count != template.transactions.len()
+        || template.metrics.weight != body.weight
+    {
+        return Err(MiningError::InvalidTemplateBody);
+    }
+    if template.template_id
+        != template_id(
+            snapshot.network_id,
+            snapshot.generation,
+            expected_mempool_generation,
+            &template.header,
+            &template.transactions,
+        )
+    {
+        return Err(MiningError::InvalidTemplateContext);
+    }
+
+    let prepared = template
+        .prepare_job(snapshot)
+        .map_err(|_| MiningError::InvalidTemplateBody)?;
+    prepared
+        .validate_for_snapshot(snapshot)
+        .map_err(|_| MiningError::InvalidTemplateBody)
 }
 
 impl Default for TemplateCoordinator {
@@ -867,6 +1594,171 @@ mod tests {
             locktime: 0,
         };
         (transaction, coin)
+    }
+
+    fn indexed_txid(index: u64) -> Txid {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&index.to_be_bytes());
+        bytes[31] = 1;
+        Txid::new(bytes)
+    }
+
+    fn output(value: u64, marker: u8) -> Output {
+        Output {
+            value,
+            address: address(marker),
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        }
+    }
+
+    fn admit_graph_transaction(
+        pool: &mut MemoryMempool,
+        view: &View,
+        inputs: Vec<Outpoint>,
+        outputs: Vec<u64>,
+        marker: u32,
+    ) -> Transaction {
+        let transaction = Transaction {
+            version: 1,
+            inputs: inputs
+                .into_iter()
+                .map(|previous_output| Input {
+                    previous_output,
+                    sequence: u32::MAX,
+                    witness: Witness::default(),
+                })
+                .collect(),
+            outputs: outputs.into_iter().map(|value| output(value, 3)).collect(),
+            locktime: marker % 10,
+        };
+        assert!(matches!(
+            pool.submit_with_context(
+                transaction.clone(),
+                &MempoolContext::testing(11, 100),
+                view,
+                &Allow,
+                &Allow,
+            )
+            .expect("admit graph transaction"),
+            Admission::Accepted(_)
+        ));
+        transaction
+    }
+
+    fn admit_graph_root(
+        pool: &mut MemoryMempool,
+        view: &mut View,
+        external_index: u64,
+        outputs: Vec<u64>,
+        fee: u64,
+        marker: u32,
+    ) -> Transaction {
+        let previous = Outpoint {
+            txid: indexed_txid(external_index),
+            index: 0,
+        };
+        let value = outputs
+            .iter()
+            .try_fold(fee, |total, value| total.checked_add(*value))
+            .expect("test root value");
+        view.coins.insert(
+            previous.clone(),
+            Coin {
+                outpoint: previous.clone(),
+                value,
+                height: 1,
+                coinbase: false,
+                address: address(2),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            },
+        );
+        admit_graph_transaction(pool, view, vec![previous], outputs, marker)
+    }
+
+    fn template_request<'a>(
+        mining_snapshot: &'a MiningSnapshot,
+        mempool: &'a MempoolSnapshot,
+        policy: TemplatePolicy,
+        marker: u8,
+    ) -> TemplateBuildRequest<'a> {
+        TemplateBuildRequest {
+            snapshot: mining_snapshot,
+            mempool,
+            payout_address: address(9),
+            coinbase_flags: vec![marker],
+            version: 1,
+            bits: 0x207f_ffff,
+            minimum_time: 101,
+            reserved_root: [marker; 32],
+            mask_hash: [marker.max(1); 32],
+            policy,
+        }
+    }
+
+    fn assert_frontier_matches_reference(pool: &MemoryMempool, policy: TemplatePolicy, marker: u8) {
+        let mining_snapshot = snapshot();
+        let mempool = pool.snapshot();
+        let request = template_request(&mining_snapshot, &mempool, policy, marker);
+        let mut frontier_work = TemplateSelectionWork::default();
+        let frontier = TemplateAssembler
+            .assemble_with_selection(
+                request.clone(),
+                SelectionAlgorithm::DependencyFrontier,
+                &mut frontier_work,
+            )
+            .expect("frontier template");
+        let mut reference_work = TemplateSelectionWork::default();
+        let reference = TemplateAssembler
+            .assemble_reference(request, &mut reference_work)
+            .expect("reference template");
+        assert_eq!(frontier, reference);
+        assert_eq!(frontier.template_id(), reference.template_id());
+        assert_eq!(
+            frontier
+                .transactions()
+                .iter()
+                .map(Transaction::txid)
+                .collect::<Vec<_>>(),
+            reference
+                .transactions()
+                .iter()
+                .map(Transaction::txid)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(frontier_work.initial_package_builds, mempool.len());
+        assert_eq!(frontier_work.full_scan_candidates, 0);
+        assert!(reference_work.full_scan_candidates >= mempool.len());
+    }
+
+    fn empty_template(
+        mining_snapshot: &MiningSnapshot,
+        mempool: &MempoolSnapshot,
+        marker: u8,
+    ) -> MiningTemplate {
+        TemplateAssembler
+            .assemble(template_request(
+                mining_snapshot,
+                mempool,
+                TemplatePolicy::default(),
+                marker,
+            ))
+            .expect("empty-pool template")
+    }
+
+    fn assert_cache_preserved(
+        coordinator: &TemplateCoordinator,
+        key: &TemplateCacheKey,
+        expected: &Arc<MiningTemplate>,
+    ) {
+        assert_eq!(coordinator.len(), 1);
+        let actual = coordinator.get(key).expect("preserved cache entry");
+        assert!(Arc::ptr_eq(&actual, expected));
     }
 
     fn snapshot() -> MiningSnapshot {
@@ -1158,20 +2050,26 @@ mod tests {
         claim_mining_snapshot.tip.height = claim_height - 1;
         claim_mining_snapshot.tip.time = parent_time;
         let claim_mempool_snapshot = claim_pool.snapshot();
+        let mut claim_work = TemplateSelectionWork::default();
         let claim_template = TemplateAssembler
-            .assemble(TemplateBuildRequest {
-                snapshot: &claim_mining_snapshot,
-                mempool: &claim_mempool_snapshot,
-                payout_address: address(9),
-                coinbase_flags: b"hsrd".to_vec(),
-                version: 1,
-                bits: 0x207f_ffff,
-                minimum_time: parent_time + 1,
-                reserved_root: [0; 32],
-                mask_hash: [8; 32],
-                policy: TemplatePolicy::default(),
-            })
+            .assemble_with_selection(
+                TemplateBuildRequest {
+                    snapshot: &claim_mining_snapshot,
+                    mempool: &claim_mempool_snapshot,
+                    payout_address: address(9),
+                    coinbase_flags: b"hsrd".to_vec(),
+                    version: 1,
+                    bits: 0x207f_ffff,
+                    minimum_time: parent_time + 1,
+                    reserved_root: [0; 32],
+                    mask_hash: [8; 32],
+                    policy: TemplatePolicy::default(),
+                },
+                SelectionAlgorithm::DependencyFrontier,
+                &mut claim_work,
+            )
             .expect("claim template");
+        assert_eq!(claim_work.special_payload_materializations, 1);
         let expected_claim_coinbase = &special_claim["deterministicCoinbase"];
         let claim_coinbase = &claim_template.transactions()[0];
         assert_eq!(
@@ -1232,20 +2130,26 @@ mod tests {
         assert_eq!(entry.coinbase_weight as u64, proof_vector["coinbaseWeight"]);
         let mining_snapshot = snapshot();
         let mempool_snapshot = pool.snapshot();
+        let mut airdrop_work = TemplateSelectionWork::default();
         let template = TemplateAssembler
-            .assemble(TemplateBuildRequest {
-                snapshot: &mining_snapshot,
-                mempool: &mempool_snapshot,
-                payout_address: address(9),
-                coinbase_flags: b"hsrd".to_vec(),
-                version: 1,
-                bits: 0x207f_ffff,
-                minimum_time: 101,
-                reserved_root: [0; 32],
-                mask_hash: [8; 32],
-                policy: TemplatePolicy::default(),
-            })
+            .assemble_with_selection(
+                TemplateBuildRequest {
+                    snapshot: &mining_snapshot,
+                    mempool: &mempool_snapshot,
+                    payout_address: address(9),
+                    coinbase_flags: b"hsrd".to_vec(),
+                    version: 1,
+                    bits: 0x207f_ffff,
+                    minimum_time: 101,
+                    reserved_root: [0; 32],
+                    mask_hash: [8; 32],
+                    policy: TemplatePolicy::default(),
+                },
+                SelectionAlgorithm::DependencyFrontier,
+                &mut airdrop_work,
+            )
             .expect("airdrop template");
+        assert_eq!(airdrop_work.special_payload_materializations, 1);
         let expected = &special["deterministicCoinbase"];
         let coinbase = &template.transactions()[0];
         assert_eq!(
@@ -1385,6 +2289,425 @@ mod tests {
     }
 
     #[test]
+    fn dependency_frontier_matches_reference_for_chain_star_and_random_dags() {
+        let mut chain_pool = MemoryMempool::new();
+        let mut chain_view = View::default();
+        let root = admit_graph_root(
+            &mut chain_pool,
+            &mut chain_view,
+            10_000,
+            vec![1_000_000],
+            17,
+            1,
+        );
+        let mut previous = Outpoint {
+            txid: root.txid(),
+            index: 0,
+        };
+        let mut previous_value = 1_000_000u64;
+        for index in 0..18u32 {
+            let fee = 5 + u64::from((index * 37) % 113);
+            let next_value = previous_value.checked_sub(fee).expect("chain value");
+            let child = admit_graph_transaction(
+                &mut chain_pool,
+                &chain_view,
+                vec![previous],
+                vec![next_value],
+                index + 2,
+            );
+            previous = Outpoint {
+                txid: child.txid(),
+                index: 0,
+            };
+            previous_value = next_value;
+        }
+        assert_frontier_matches_reference(&chain_pool, TemplatePolicy::default(), 11);
+
+        let mut star_pool = MemoryMempool::new();
+        let mut star_view = View::default();
+        let root_outputs = (0..20).map(|_| 20_000u64).collect::<Vec<_>>();
+        let root = admit_graph_root(
+            &mut star_pool,
+            &mut star_view,
+            20_000,
+            root_outputs.clone(),
+            3,
+            1,
+        );
+        for (index, value) in root_outputs.into_iter().enumerate() {
+            let fee = 1 + u64::try_from((index * 53) % 97).expect("star fee");
+            admit_graph_transaction(
+                &mut star_pool,
+                &star_view,
+                vec![Outpoint {
+                    txid: root.txid(),
+                    index: u32::try_from(index).expect("star output index"),
+                }],
+                vec![value.checked_sub(fee).expect("star value")],
+                u32::try_from(index + 2).expect("star marker"),
+            );
+        }
+        let constrained = TemplatePolicy {
+            maximum_transactions: 14,
+            minimum_package_fee_rate: 25,
+            ..TemplatePolicy::default()
+        };
+        assert_frontier_matches_reference(&star_pool, constrained, 12);
+
+        for case in 0..8u64 {
+            let mut pool = MemoryMempool::new();
+            let mut view = View::default();
+            let mut available = Vec::new();
+            for root_index in 0..4u64 {
+                let outputs = vec![2_000_000u64; 8];
+                let root = admit_graph_root(
+                    &mut pool,
+                    &mut view,
+                    30_000 + case * 10 + root_index,
+                    outputs.clone(),
+                    11 + root_index,
+                    u32::try_from(root_index + 1).expect("root marker"),
+                );
+                available.extend(outputs.into_iter().enumerate().map(|(index, value)| {
+                    (
+                        Outpoint {
+                            txid: root.txid(),
+                            index: u32::try_from(index).expect("root output index"),
+                        },
+                        value,
+                    )
+                }));
+            }
+
+            let mut random = 0x9e37_79b9_7f4a_7c15u64 ^ case;
+            for step in 0..24u32 {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let input_count = if available.len() > 1 && random & 1 == 0 {
+                    2
+                } else {
+                    1
+                };
+                let mut inputs = Vec::with_capacity(input_count);
+                let mut input_value = 0u64;
+                for _ in 0..input_count {
+                    let available_len =
+                        u64::try_from(available.len()).expect("available length fits u64");
+                    let index = usize::try_from(random % available_len)
+                        .expect("bounded available index fits usize");
+                    let (outpoint, value) = available.swap_remove(index);
+                    inputs.push(outpoint);
+                    input_value = input_value.checked_add(value).expect("DAG input value");
+                    random = random.rotate_left(17).wrapping_add(u64::from(step) + 1);
+                }
+                let fee = 1 + random % 500;
+                let output_count = 1 + usize::try_from((random >> 8) % 3).expect("output count");
+                let spendable = input_value.checked_sub(fee).expect("DAG spendable value");
+                let base = spendable / u64::try_from(output_count).expect("output divisor");
+                let mut outputs = vec![base; output_count];
+                outputs[0] = outputs[0]
+                    .checked_add(
+                        spendable % u64::try_from(output_count).expect("output remainder divisor"),
+                    )
+                    .expect("DAG output remainder");
+                let child =
+                    admit_graph_transaction(&mut pool, &view, inputs, outputs.clone(), step + 5);
+                available.extend(outputs.into_iter().enumerate().map(|(index, value)| {
+                    (
+                        Outpoint {
+                            txid: child.txid(),
+                            index: u32::try_from(index).expect("DAG output index"),
+                        },
+                        value,
+                    )
+                }));
+            }
+            let policy = TemplatePolicy {
+                maximum_transactions: 12 + usize::try_from(case % 9).expect("policy count"),
+                minimum_package_fee_rate: 25 + case * 5,
+                ..TemplatePolicy::default()
+            };
+            assert_frontier_matches_reference(
+                &pool,
+                policy,
+                u8::try_from(case + 20).expect("case marker"),
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_frontier_work_is_nonquadratic_at_policy_scale() {
+        const TRANSACTIONS: usize = 49_999;
+        let candidates = (0..TRANSACTIONS)
+            .map(|index| indexed_txid(u64::try_from(index + 1).expect("policy index")))
+            .collect::<Vec<_>>();
+        let reverse = candidates
+            .iter()
+            .copied()
+            .map(|txid| (txid, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        let mut metrics = TemplateMetrics {
+            weight: DEFAULT_RESERVED_TEMPLATE_WEIGHT,
+            sigops: DEFAULT_RESERVED_TEMPLATE_SIGOPS,
+            ..TemplateMetrics::default()
+        };
+        let mut names = HashSet::new();
+        let mut work = TemplateSelectionWork::default();
+        let selected = select_packages_with_frontier(
+            &candidates,
+            &reverse,
+            |candidate, _| {
+                Ok(MempoolPackage {
+                    txids: vec![candidate],
+                    fee: 1,
+                    weight: 1,
+                    policy_size: 1,
+                    sigops: 0,
+                    opens: 0,
+                    updates: 0,
+                    renewals: 0,
+                    exclusive_names: Vec::new(),
+                    oldest_sequence: 0,
+                })
+            },
+            &TemplatePolicy::default(),
+            &mut metrics,
+            &mut names,
+            &mut work,
+        )
+        .expect("policy-scale frontier");
+        assert_eq!(selected.len(), TRANSACTIONS);
+        assert_eq!(work.initial_package_builds, TRANSACTIONS);
+        assert_eq!(work.affected_package_rebuilds, 0);
+        assert_eq!(work.dependency_edges, 0);
+        assert_eq!(work.affected_dependency_edges, 0);
+        assert_eq!(work.heap_pushes, TRANSACTIONS);
+        assert_eq!(work.heap_pops, TRANSACTIONS);
+        assert_eq!(work.stale_heap_pops, 0);
+        assert_eq!(work.full_scan_candidates, 0);
+        assert!(
+            work.initial_package_builds + work.affected_package_rebuilds
+                <= TRANSACTIONS.saturating_mul(2)
+        );
+
+        const STAR: usize = 1_000;
+        let star_candidates = (0..STAR)
+            .map(|index| indexed_txid(100_000 + u64::try_from(index).expect("star index")))
+            .collect::<Vec<_>>();
+        let root = star_candidates[0];
+        let mut star_reverse = star_candidates
+            .iter()
+            .copied()
+            .map(|txid| (txid, Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        star_reverse
+            .get_mut(&root)
+            .expect("star root")
+            .extend(star_candidates.iter().copied().skip(1));
+        let (deduplicated_affected, duplicate_edge_visits) =
+            collect_affected_candidates(&[root, root], &star_reverse)
+                .expect("deduplicated affected traversal");
+        assert_eq!(deduplicated_affected.len(), STAR);
+        assert_eq!(duplicate_edge_visits, STAR - 1);
+        let mut star_metrics = TemplateMetrics::default();
+        let mut star_names = HashSet::new();
+        let mut star_work = TemplateSelectionWork::default();
+        let star_selected = select_packages_with_frontier(
+            &star_candidates,
+            &star_reverse,
+            |candidate, selected| {
+                let root_pending = candidate != root && !selected.contains(&root);
+                Ok(MempoolPackage {
+                    txids: if root_pending {
+                        vec![root, candidate]
+                    } else {
+                        vec![candidate]
+                    },
+                    fee: if candidate == root {
+                        1_000_000
+                    } else if root_pending {
+                        1_000_001
+                    } else {
+                        1
+                    },
+                    weight: usize::from(root_pending) + 1,
+                    policy_size: usize::from(root_pending) + 1,
+                    sigops: 0,
+                    opens: 0,
+                    updates: 0,
+                    renewals: 0,
+                    exclusive_names: Vec::new(),
+                    oldest_sequence: 0,
+                })
+            },
+            &TemplatePolicy::default(),
+            &mut star_metrics,
+            &mut star_names,
+            &mut star_work,
+        )
+        .expect("star frontier");
+        assert_eq!(star_selected.len(), STAR);
+        assert_eq!(star_work.dependency_edges, STAR - 1);
+        assert_eq!(star_work.affected_dependency_edges, STAR - 1);
+        assert_eq!(star_work.initial_package_builds, STAR);
+        assert_eq!(star_work.affected_package_rebuilds, STAR - 1);
+        assert!(
+            star_work.initial_package_builds + star_work.affected_package_rebuilds
+                <= STAR.saturating_mul(2)
+        );
+    }
+
+    #[test]
+    fn dependency_frontier_workspace_is_bounded_at_exact_limit() {
+        fn package_with_capacity(candidate: Txid, capacity: usize) -> MempoolPackage {
+            let mut txids = Vec::with_capacity(capacity);
+            txids.push(candidate);
+            MempoolPackage {
+                txids,
+                fee: 1,
+                weight: 1,
+                policy_size: 1,
+                sigops: 0,
+                opens: 0,
+                updates: 0,
+                renewals: 0,
+                exclusive_names: Vec::new(),
+                oldest_sequence: 0,
+            }
+        }
+
+        let candidate = indexed_txid(900_000);
+        let exact_package_bytes = TEMPLATE_SELECTION_VECTOR_ELEMENT_BYTES;
+        let exact_base = MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES
+            .checked_sub(TEMPLATE_SELECTION_TRANSIENT_PACKAGE_BYTES)
+            .and_then(|bytes| bytes.checked_sub(exact_package_bytes))
+            .expect("exact workspace base");
+        let mut exact_frontier = BinaryHeap::with_capacity(1);
+        let mut exact_workspace =
+            TemplateSelectionWorkspace::with_base_bytes(exact_base, exact_frontier.capacity());
+        let versions = BTreeMap::from([(candidate, 0u64)]);
+        let selected = HashSet::new();
+        let mut exact_work = TemplateSelectionWork::default();
+        push_frontier_bounded(
+            &mut exact_frontier,
+            &versions,
+            &selected,
+            &mut exact_workspace,
+            PackageFrontierEntry {
+                candidate,
+                version: 0,
+                package: package_with_capacity(candidate, 1),
+            },
+            &mut exact_work,
+        )
+        .expect("exact workspace insertion");
+        assert_eq!(exact_frontier.len(), 1);
+        assert_eq!(
+            exact_workspace
+                .total_with_transient()
+                .expect("exact workspace total"),
+            MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES
+        );
+
+        let stale_package = package_with_capacity(candidate, 1);
+        let mut compacting_frontier = BinaryHeap::with_capacity(1);
+        let mut compacting_workspace =
+            TemplateSelectionWorkspace::with_base_bytes(exact_base, compacting_frontier.capacity());
+        compacting_workspace
+            .retain(&stale_package)
+            .expect("retain stale package");
+        compacting_frontier.push(PackageFrontierEntry {
+            candidate,
+            version: 0,
+            package: stale_package,
+        });
+        let current_versions = BTreeMap::from([(candidate, 1u64)]);
+        let mut compacting_work = TemplateSelectionWork::default();
+        push_frontier_bounded(
+            &mut compacting_frontier,
+            &current_versions,
+            &selected,
+            &mut compacting_workspace,
+            PackageFrontierEntry {
+                candidate,
+                version: 1,
+                package: package_with_capacity(candidate, 1),
+            },
+            &mut compacting_work,
+        )
+        .expect("stale compaction makes exact room");
+        assert_eq!(compacting_frontier.len(), 1);
+        assert_eq!(
+            compacting_frontier.peek().expect("current entry").version,
+            1
+        );
+        assert_eq!(compacting_work.heap_compactions, 1);
+        assert_eq!(
+            compacting_workspace
+                .total_with_transient()
+                .expect("compacted workspace total"),
+            MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES
+        );
+
+        let mut one_over_frontier = BinaryHeap::with_capacity(1);
+        let mut one_over_workspace =
+            TemplateSelectionWorkspace::with_base_bytes(exact_base, one_over_frontier.capacity());
+        let mut one_over_work = TemplateSelectionWork::default();
+        assert!(matches!(
+            push_frontier_bounded(
+                &mut one_over_frontier,
+                &versions,
+                &selected,
+                &mut one_over_workspace,
+                PackageFrontierEntry {
+                    candidate,
+                    version: 0,
+                    package: package_with_capacity(candidate, 2),
+                },
+                &mut one_over_work,
+            ),
+            Err(MiningError::TemplateCapacity)
+        ));
+        assert!(one_over_frontier.is_empty());
+        assert_eq!(one_over_workspace.retained_package_bytes, 0);
+        assert_eq!(one_over_work.heap_pushes, 0);
+    }
+
+    #[test]
+    fn workspace_estimator_accepts_defaults_and_rejects_adversarial_dags() {
+        assert!(
+            u64::try_from(std::mem::size_of::<PackageFrontierEntry>())
+                .expect("heap entry size fits u64")
+                <= TEMPLATE_SELECTION_HEAP_ENTRY_BYTES
+        );
+        let default_one = estimate_template_selection_workspace_bytes(50_000, 25, 1)
+            .expect("default single-build estimate");
+        assert_eq!(default_one, 438_308_864);
+        assert!(default_one <= MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES);
+        let four_active = estimate_template_selection_workspace_bytes(50_000, 25, 4)
+            .expect("four-worker aggregate estimate");
+        assert_eq!(four_active, 1_753_235_456);
+        assert!(four_active <= MAX_TEMPLATE_SELECTION_AGGREGATE_WORKSPACE_BYTES);
+        let maximum_variants_active =
+            estimate_template_selection_workspace_bytes(50_000, 25, MAX_TEMPLATE_VARIANTS)
+                .expect("maximum-variant aggregate estimate");
+        assert_eq!(maximum_variants_active, 7_012_941_824);
+        assert!(maximum_variants_active > MAX_TEMPLATE_SELECTION_AGGREGATE_WORKSPACE_BYTES);
+
+        let maximum_chain = estimate_template_selection_workspace_bytes(1_000, 999, 1)
+            .expect("maximum-chain estimate");
+        assert!(maximum_chain <= MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES);
+        let adversarial_dag = estimate_template_selection_workspace_bytes(250_000, 1_000, 1)
+            .expect("adversarial-DAG estimate");
+        assert!(adversarial_dag > MAX_TEMPLATE_SELECTION_WORKSPACE_BYTES);
+        assert!(
+            estimate_template_selection_workspace_bytes(usize::MAX, usize::MAX, usize::MAX)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn template_cache_rejects_stale_generation() {
         let snapshot = snapshot();
         let pool = MemoryMempool::new();
@@ -1466,6 +2789,247 @@ mod tests {
             Err(MiningError::TemplateConflict)
         ));
         assert_eq!(coordinator.len(), 2);
+    }
+
+    #[test]
+    fn prebuilt_install_authenticates_every_field_and_is_atomic() {
+        let mining_snapshot = snapshot();
+        let pool = MemoryMempool::new();
+        let mempool = pool.snapshot();
+        let generation = mempool.generation();
+        let mut coordinator = TemplateCoordinator::new(2).expect("coordinator");
+        let baseline = empty_template(&mining_snapshot, &mempool, 1);
+        let baseline_key = TemplateCacheKey {
+            snapshot_generation: mining_snapshot.generation,
+            mempool_generation: generation,
+            variant: 1,
+        };
+        let baseline = coordinator
+            .install_prebuilt(&mining_snapshot, generation, [(1, baseline)])
+            .expect("baseline install")
+            .pop()
+            .expect("baseline template");
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        assert!(matches!(
+            coordinator.install_prebuilt(
+                &mining_snapshot,
+                generation,
+                std::iter::empty::<(u32, MiningTemplate)>()
+            ),
+            Err(MiningError::TemplateCapacity)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let valid = empty_template(&mining_snapshot, &mempool, 2);
+        assert!(matches!(
+            coordinator.install_prebuilt(
+                &mining_snapshot,
+                generation,
+                [(1, valid.clone()), (2, valid.clone()), (3, valid.clone())]
+            ),
+            Err(MiningError::TemplateCapacity)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        assert!(matches!(
+            coordinator.install_prebuilt(
+                &mining_snapshot,
+                generation,
+                [(7, valid.clone()), (7, valid.clone())]
+            ),
+            Err(MiningError::TemplateConflict)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation + 1, [(2, valid.clone())]),
+            Err(MiningError::StaleTemplate)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut stale_snapshot = mining_snapshot.clone();
+        stale_snapshot.generation += 1;
+        assert!(matches!(
+            coordinator.install_prebuilt(&stale_snapshot, generation, [(2, valid.clone())]),
+            Err(MiningError::StaleTemplate)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut stale_template = valid.clone();
+        stale_template.snapshot_generation += 1;
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, stale_template)]),
+            Err(MiningError::StaleTemplate)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut stale_mempool = valid.clone();
+        stale_mempool.mempool_generation += 1;
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, stale_mempool)]),
+            Err(MiningError::StaleTemplate)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut stale_parent = valid.clone();
+        stale_parent.header.parent_hash = hns_primitives::BlockHash::new([91; 32]);
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, stale_parent)]),
+            Err(MiningError::StaleTemplate)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut stale_tree = valid.clone();
+        stale_tree.header.tree_root = [92; 32];
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, stale_tree)]),
+            Err(MiningError::StaleTemplate)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut tampered_identity = valid.clone();
+        tampered_identity.template_id[0] ^= 1;
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, tampered_identity)]),
+            Err(MiningError::InvalidTemplateContext)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut tampered_body = valid.clone();
+        let mut transactions = tampered_body.transactions.to_vec();
+        transactions[0].outputs[0].value = transactions[0].outputs[0].value.saturating_add(1);
+        tampered_body.transactions = Arc::from(transactions);
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, tampered_body)]),
+            Err(MiningError::InvalidTemplateBody)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut invalid_body_with_matching_identity = valid.clone();
+        invalid_body_with_matching_identity.transactions = Arc::from(Vec::<Transaction>::new());
+        let mut empty_block = Block {
+            header: Header {
+                time: invalid_body_with_matching_identity.header.minimum_time,
+                prev_block: invalid_body_with_matching_identity.header.parent_hash,
+                tree_root: invalid_body_with_matching_identity.header.tree_root,
+                reserved_root: invalid_body_with_matching_identity.header.reserved_root,
+                version: invalid_body_with_matching_identity.header.version,
+                bits: invalid_body_with_matching_identity.header.bits,
+                ..Header::default()
+            },
+            transactions: Vec::new(),
+        };
+        empty_block.header.merkle_root = block_merkle_root(&empty_block);
+        empty_block.header.witness_root = block_witness_root(&empty_block);
+        invalid_body_with_matching_identity.header.merkle_root = empty_block.header.merkle_root;
+        invalid_body_with_matching_identity.header.witness_root = empty_block.header.witness_root;
+        invalid_body_with_matching_identity
+            .metrics
+            .transaction_count = 0;
+        invalid_body_with_matching_identity.template_id = template_id(
+            mining_snapshot.network_id,
+            mining_snapshot.generation,
+            generation,
+            &invalid_body_with_matching_identity.header,
+            &invalid_body_with_matching_identity.transactions,
+        );
+        assert!(matches!(
+            coordinator.install_prebuilt(
+                &mining_snapshot,
+                generation,
+                [(2, invalid_body_with_matching_identity)]
+            ),
+            Err(MiningError::InvalidTemplateBody)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut tampered_body_root = valid.clone();
+        tampered_body_root.header.merkle_root[0] ^= 1;
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, tampered_body_root)]),
+            Err(MiningError::InvalidTemplateBody)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut tampered_witness_root = valid.clone();
+        tampered_witness_root.header.witness_root[0] ^= 1;
+        assert!(matches!(
+            coordinator.install_prebuilt(
+                &mining_snapshot,
+                generation,
+                [(2, tampered_witness_root)]
+            ),
+            Err(MiningError::InvalidTemplateBody)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut tampered_header = valid.clone();
+        tampered_header.header.bits ^= 1;
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, tampered_header)]),
+            Err(MiningError::InvalidTemplateContext)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+
+        let mut tampered_metrics = valid.clone();
+        tampered_metrics.metrics.transaction_count =
+            tampered_metrics.metrics.transaction_count.saturating_add(1);
+        assert!(matches!(
+            coordinator.install_prebuilt(&mining_snapshot, generation, [(2, tampered_metrics)]),
+            Err(MiningError::InvalidTemplateBody)
+        ));
+        assert_cache_preserved(&coordinator, &baseline_key, &baseline);
+    }
+
+    #[test]
+    fn prebuilt_install_returns_variant_order_and_activates_exact_templates() {
+        let mining_snapshot = snapshot();
+        let pool = MemoryMempool::new();
+        let mempool = pool.snapshot();
+        let generation = mempool.generation();
+        let low_variant = empty_template(&mining_snapshot, &mempool, 3);
+        let high_variant = empty_template(&mining_snapshot, &mempool, 9);
+        let low_id = low_variant.template_id();
+        let high_id = high_variant.template_id();
+        let mut coordinator = TemplateCoordinator::new(2).expect("coordinator");
+        let installed = coordinator
+            .install_prebuilt(
+                &mining_snapshot,
+                generation,
+                [(9, high_variant), (3, low_variant)],
+            )
+            .expect("prebuilt install");
+        assert_eq!(
+            installed
+                .iter()
+                .map(|template| template.template_id())
+                .collect::<Vec<_>>(),
+            vec![low_id, high_id]
+        );
+        assert_eq!(coordinator.len(), 2);
+
+        for (variant, expected) in [(3, low_id), (9, high_id)] {
+            let key = TemplateCacheKey {
+                snapshot_generation: mining_snapshot.generation,
+                mempool_generation: generation,
+                variant,
+            };
+            assert_eq!(
+                coordinator
+                    .get(&key)
+                    .expect("installed template")
+                    .template_id(),
+                expected
+            );
+            assert_eq!(
+                coordinator
+                    .activate(&key, &mining_snapshot)
+                    .expect("activate prebuilt template")
+                    .template_id(),
+                expected
+            );
+        }
     }
 
     #[test]

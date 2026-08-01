@@ -63,8 +63,8 @@ database into a process-wide RPC snapshot.
 - Capability-named REST diagnostics under `/api/v1/status`,
   `/api/v1/authority`, `/api/v1/parity`, and `/api/v1/mining-engine`; the live
   native runtime also exposes `/api/v1/peers`, `/api/v1/sync`, and
-  `/api/v1/native-sync`. `/api/v1/shadow-sync` is a read-only compatibility
-  alias.
+  `/api/v1/native-sync`. The former `/api/v1/shadow-sync` compatibility alias
+  was removed in v0.3.0 and is not routed.
 - API-v11 node status reports whether startup name-tree compaction is enabled,
   its height interval, and the last checkpoint's height, tip, retained roots,
   and before/retained/deleted node counts. It also reports whether undo

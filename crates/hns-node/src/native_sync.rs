@@ -6,7 +6,10 @@ use std::{
     io::{ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,8 +22,8 @@ use axum::{
     Json, Router,
 };
 use hns_chain::{
-    prepare_header_record, read_canonical_hash, BlockIndex, BlockIndexRecord, ChainTip,
-    HeaderImport, HeaderIndex, HeaderRecord,
+    prepare_header_record, read_canonical_hash, BlockIndexRecord, ChainTip, HeaderImport,
+    HeaderIndex, HeaderRecord,
 };
 use hns_consensus::{
     advance_threshold_state, block_merkle_root, block_witness_root,
@@ -28,7 +31,7 @@ use hns_consensus::{
     validate_transaction_start, ConsensusParams, DeploymentState, HeaderConsensus, HeaderParent,
     HeaderValidationContext, Network, ThresholdState, MAX_FUTURE_BLOCK_TIME,
 };
-use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission, Mempool};
+use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
 use hns_p2p::{
     generate_private_key, normalize_peer_ip, peer_address_group, BrontideIdentity, CompactBlock,
     CompactBlockError, CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse,
@@ -47,30 +50,35 @@ use hns_rpc::{
 use hns_store::mark_clean_shutdown;
 use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreError, StoreHandle, WriteBatch};
 use hns_sync::{
-    spawn_validation_pipeline, BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult,
-    OrphanLimits, OrphanSnapshot, StatelessBlockValidator, StoredSyncCheckpoint, SyncAction,
-    SyncCheckpoint, SyncLimits, SyncScheduler, SyncSnapshot, ValidatedBlock, ValidationFailure,
-    ValidationFailureKind, ValidationRejection, ValidationRequest, ValidationSubmitter,
+    spawn_validation_pipeline,
+    validation::{spawn_ordered_work_pipeline, OrderedWorkError},
+    BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult, OrphanLimits, OrphanSnapshot,
+    StatelessBlockValidator, StoredSyncCheckpoint, SyncAction, SyncCheckpoint, SyncLimits,
+    SyncScheduler, SyncSnapshot, ValidatedBlock, ValidationFailure, ValidationFailureKind,
+    ValidationRejection, ValidationRequest, ValidationSubmitter,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, watch, Mutex, RwLock},
+    sync::{mpsc, watch, RwLock},
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
 
 use super::{
-    authority_info, best_block_tip_from_snapshot, best_header_tip_from_snapshot,
-    completed_deployment_period_with_lookup, current_unix_time, enforce_rpc_resource_limits,
-    expected_bits_with_lookup, json_rpc_error, load_block_index_record, load_header_record,
-    mark_node_store_clean, median_time_past_with_lookup, mining_generation_from_snapshot,
-    mining_snapshot_for_hash, preflight_reorg_reconciliation_budget, require_rpc_authorization,
+    authority_info, best_block_tip_from_snapshot, completed_deployment_period_with_lookup,
+    current_unix_time, enforce_rpc_resource_limits, expected_bits_with_lookup, json_rpc_error,
+    load_block as load_block_from_snapshot, load_block_index_record, load_header_record,
+    median_time_past_with_lookup, mining_generation_from_snapshot, mining_snapshot_for_hash,
+    preflight_reorg_reconciliation_budget, require_rpc_authorization,
     rpc_experimental_registry_info, rpc_hip76_info, rpc_immediately_unsupported,
-    rpc_point_read_method, AuthorityMode, ChainActivationFailure, DurableMiningState,
-    FailedBlockMutation, FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport,
-    NodeReorg, NodeReorgLimits, NodeService, ReorgStagedEffectMeter, RpcAuthorizationHeader,
-    RpcLimits, RpcReadContext, RpcRuntimeLimits, ShutdownSignal, HSRD_DIAGNOSTIC_API_VERSION,
+    rpc_point_read_method, AuthorityMode, CanonicalChainEpoch, CanonicalStateWriter,
+    CanonicalWriterError, ChainActivationFailure, DurableMiningState, FailedBlockMutation,
+    FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport, NodeReadHandle,
+    NodeReorg, NodeReorgLimits, NodeRuntime, NodeService, PreparedNativeActivation,
+    ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits, RpcReadContext, RpcRuntimeLimits,
+    ShutdownSignal, StatelessBodyValidation, HSRD_DIAGNOSTIC_API_VERSION,
+    MAX_CANONICAL_WRITER_QUEUE_CAPACITY,
 };
 use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
@@ -119,16 +127,20 @@ const HSD_ADDRESS_TIMESTAMP_REFRESH_SECONDS: u64 = 20 * 60;
 const MAX_ADDR_FUTURE_SECONDS: u64 = 10 * 60;
 const FALLBACK_ADDR_AGE_SECONDS: u64 = 5 * 24 * 60 * 60;
 const MIN_ADDR_TIMESTAMP: u64 = 100_000_000;
-const MAX_SHADOW_SYNC_PEERS: usize = 256;
-const MAX_SHADOW_SYNC_VALIDATION_WORKERS: usize = 128;
-const MAX_SHADOW_SYNC_VALIDATION_QUEUE: usize = 8_192;
+const MAX_NATIVE_SYNC_PEERS: usize = 256;
+const MAX_NATIVE_SYNC_VALIDATION_WORKERS: usize = 128;
+const MAX_NATIVE_SYNC_VALIDATION_QUEUE: usize = 8_192;
 const MAX_VALIDATED_BODY_COMMIT_BATCH: usize = 32;
-const MAX_SHADOW_SYNC_ORPHAN_BLOCKS: usize = 8_192;
-const MAX_SHADOW_SYNC_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_CANONICAL_STALE_RETRIES: usize = 8;
+const MAX_HEADER_DEPLOYMENT_READS: usize = 2_000_000;
+const MAX_NATIVE_SYNC_ORPHAN_BLOCKS: usize = 8_192;
+const MAX_NATIVE_SYNC_ORPHAN_BYTES: usize = 1024 * 1024 * 1024;
 const MAX_ACTIVE_STATE_CONNECT_BATCH: usize = 1_024;
 pub(super) const MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE: usize = 288;
-const MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
-const MIN_SHADOW_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE: usize = hns_p2p::MAX_HEADERS;
+const MIN_NATIVE_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const NATIVE_RUNTIME_EXTENSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const NATIVE_RUNTIME_EXTENSION_ABORT_GRACE: Duration = Duration::from_secs(1);
 // Native IBD deliberately fails over stalled body reservations sooner than
 // HSD's conservative two-minute connection timeout. The request remains
 // single-flight, bounded, and independently validated after reassignment.
@@ -136,8 +148,23 @@ const NATIVE_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const NATIVE_MAX_INFLIGHT_PER_PEER: usize = 32;
 const BRONTIDE_IDENTITY_FILE: &str = "p2p-identity-v1.key";
 
+fn charge_header_deployment_read(
+    reads: &mut usize,
+    maximum_reads: usize,
+    deadline: StdInstant,
+) -> Result<()> {
+    if StdInstant::now() >= deadline {
+        anyhow::bail!("header deployment read exceeded its execution deadline");
+    }
+    *reads = reads.saturating_add(1);
+    if *reads > maximum_reads {
+        anyhow::bail!("header deployment read exceeded its {maximum_reads}-record budget");
+    }
+    Ok(())
+}
+
 // Key-bearing fixed seeds from the pinned HSD `lib/net/seeds` tables. HSD's
-// DNS seed answers expose legacy plaintext endpoints without static keys, so a
+// DNS seed answers expose unauthenticated plaintext endpoints without static keys, so a
 // native Brontide bootstrap must begin from these authenticated records and
 // then learn more key-bearing peers through ADDR.
 const HSD_MAINNET_BRONTIDE_SEEDS: &[(&str, &str)] = &[
@@ -211,7 +238,7 @@ const fn hsd_brontide_seeds(network: Network) -> &'static [(&'static str, &'stat
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShadowSyncConfig {
+pub struct NativeSyncConfig {
     pub enabled: bool,
     /// Acquire and validate canonical headers without scheduling block bodies.
     pub headers_only: bool,
@@ -234,12 +261,14 @@ pub struct ShadowSyncConfig {
     pub poll_interval: Duration,
 }
 
-/// Native name for the synchronization configuration. The older alias remains
-/// available so persisted API integrations can migrate without a flag day.
-pub type NativeSyncConfig = ShadowSyncConfig;
-
-impl Default for ShadowSyncConfig {
+impl Default for NativeSyncConfig {
     fn default() -> Self {
+        let validation_workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_NATIVE_SYNC_VALIDATION_WORKERS);
+        let validation_queue = validation_workers
+            .saturating_mul(32)
+            .clamp(128, MAX_NATIVE_SYNC_VALIDATION_QUEUE);
         Self {
             enabled: false,
             headers_only: false,
@@ -252,8 +281,8 @@ impl Default for ShadowSyncConfig {
             maximum_known_addresses: DEFAULT_KNOWN_PEER_ADDRESSES,
             maximum_inbound: 32,
             maximum_outbound: 8,
-            validation_workers: 4,
-            validation_queue: 128,
+            validation_workers,
+            validation_queue,
             orphan_blocks: 1_024,
             orphan_bytes: 64 * 1024 * 1024,
             poll_interval: Duration::from_millis(250),
@@ -261,7 +290,7 @@ impl Default for ShadowSyncConfig {
     }
 }
 
-impl ShadowSyncConfig {
+impl NativeSyncConfig {
     pub fn validate(&self, authority_mode: AuthorityMode, network: Network) -> Result<()> {
         if self.connect_active_state && !self.enabled {
             anyhow::bail!("active-state synchronization requires native sync to be enabled");
@@ -277,11 +306,9 @@ impl ShadowSyncConfig {
         }
         if !matches!(
             authority_mode,
-            AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::Native
+            AuthorityMode::Disabled | AuthorityMode::Native
         ) {
-            anyhow::bail!(
-                "native sync live P2P requires disabled, shadow, or native authority mode"
-            );
+            anyhow::bail!("native sync live P2P requires disabled or native authority mode");
         }
         if self.active_state_connect_batch == 0
             || self.active_state_connect_batch > MAX_ACTIVE_STATE_CONNECT_BATCH
@@ -350,50 +377,50 @@ impl ShadowSyncConfig {
         if self.validation_workers == 0 || self.validation_queue == 0 {
             anyhow::bail!("Native sync validation workers and queue must be non-zero");
         }
-        if self.validation_workers > MAX_SHADOW_SYNC_VALIDATION_WORKERS {
+        if self.validation_workers > MAX_NATIVE_SYNC_VALIDATION_WORKERS {
             anyhow::bail!(
                 "Native sync validation workers {} exceed the hard limit {}",
                 self.validation_workers,
-                MAX_SHADOW_SYNC_VALIDATION_WORKERS
+                MAX_NATIVE_SYNC_VALIDATION_WORKERS
             );
         }
-        if self.validation_queue > MAX_SHADOW_SYNC_VALIDATION_QUEUE {
+        if self.validation_queue > MAX_NATIVE_SYNC_VALIDATION_QUEUE {
             anyhow::bail!(
                 "Native sync validation queue {} exceeds the hard limit {}",
                 self.validation_queue,
-                MAX_SHADOW_SYNC_VALIDATION_QUEUE
+                MAX_NATIVE_SYNC_VALIDATION_QUEUE
             );
         }
         if self.orphan_blocks == 0 || self.orphan_bytes == 0 {
             anyhow::bail!("Native sync orphan bounds must be non-zero");
         }
-        if self.orphan_blocks > MAX_SHADOW_SYNC_ORPHAN_BLOCKS {
+        if self.orphan_blocks > MAX_NATIVE_SYNC_ORPHAN_BLOCKS {
             anyhow::bail!(
                 "Native sync orphan block limit {} exceeds the hard limit {}",
                 self.orphan_blocks,
-                MAX_SHADOW_SYNC_ORPHAN_BLOCKS
+                MAX_NATIVE_SYNC_ORPHAN_BLOCKS
             );
         }
-        if self.orphan_bytes > MAX_SHADOW_SYNC_ORPHAN_BYTES {
+        if self.orphan_bytes > MAX_NATIVE_SYNC_ORPHAN_BYTES {
             anyhow::bail!(
                 "Native sync orphan byte limit {} exceeds the hard limit {}",
                 self.orphan_bytes,
-                MAX_SHADOW_SYNC_ORPHAN_BYTES
+                MAX_NATIVE_SYNC_ORPHAN_BYTES
             );
         }
-        if self.poll_interval < MIN_SHADOW_SYNC_POLL_INTERVAL {
+        if self.poll_interval < MIN_NATIVE_SYNC_POLL_INTERVAL {
             anyhow::bail!(
                 "Native sync poll interval must be at least {} ms",
-                MIN_SHADOW_SYNC_POLL_INTERVAL.as_millis()
+                MIN_NATIVE_SYNC_POLL_INTERVAL.as_millis()
             );
         }
         let maximum_peers = self
             .maximum_inbound
             .checked_add(self.maximum_outbound)
             .ok_or_else(|| anyhow::anyhow!("Native sync peer limits overflow usize"))?;
-        if maximum_peers > MAX_SHADOW_SYNC_PEERS {
+        if maximum_peers > MAX_NATIVE_SYNC_PEERS {
             anyhow::bail!(
-                "Native sync total peer limit {maximum_peers} exceeds the hard limit {MAX_SHADOW_SYNC_PEERS}"
+                "Native sync total peer limit {maximum_peers} exceeds the hard limit {MAX_NATIVE_SYNC_PEERS}"
             );
         }
 
@@ -403,7 +430,7 @@ impl ShadowSyncConfig {
                 anyhow::bail!("duplicate native-sync outbound peer {address}");
             }
             if self.listen == Some(*address) {
-                anyhow::bail!("Shadow-sync outbound peer {address} is the configured listener");
+                anyhow::bail!("Native-sync outbound peer {address} is the configured listener");
             }
         }
         Ok(())
@@ -411,7 +438,7 @@ impl ShadowSyncConfig {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ShadowSyncDiagnostics {
+pub struct NativeSyncDiagnostics {
     pub api_version: u32,
     pub enabled: bool,
     pub headers_only: bool,
@@ -490,6 +517,11 @@ pub struct ShadowSyncDiagnostics {
     pub active_state_last_planning_micros: u64,
     pub active_state_last_commit_micros: u64,
     pub active_state_last_post_commit_micros: u64,
+    pub active_state_last_prepared_blocks: usize,
+    pub active_state_last_preparation_micros: u64,
+    pub active_state_last_worker_micros: u64,
+    pub active_state_max_preparation_in_flight: usize,
+    pub active_state_stale_retries: u64,
     pub active_state_last_transactions: usize,
     pub active_state_last_non_coinbase_inputs: usize,
     pub active_state_last_outputs: usize,
@@ -511,8 +543,6 @@ pub struct ShadowSyncDiagnostics {
     pub rejected_messages: u64,
     pub last_error: Option<String>,
 }
-
-pub type NativeSyncDiagnostics = ShadowSyncDiagnostics;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HeaderDeploymentEntry {
@@ -564,6 +594,72 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) workload: ActiveStateWorkload,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ActiveStatePreparationMetrics {
+    blocks: usize,
+    wall_micros: u64,
+    aggregate_worker_micros: u64,
+    maximum_in_flight: usize,
+    stale_retries: usize,
+}
+
+#[derive(Debug)]
+struct NativeActiveStatePlan {
+    epoch: CanonicalChainEpoch,
+    activation: NodeReorg,
+    maximum_connect: usize,
+    planning_micros: u64,
+}
+
+#[derive(Debug)]
+struct NativeActiveStatePreparationInput {
+    ordinal: usize,
+    import: NodeBlockImport,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeActiveStatePreparationOutput {
+    proof: StatelessBodyValidation,
+    worker_micros: u64,
+    workload: ActiveStateWorkload,
+}
+
+#[derive(Debug)]
+struct PreparedActiveStatePlan {
+    epoch: CanonicalChainEpoch,
+    activation: NodeReorg,
+    prepared: PreparedNativeActivation,
+    maximum_connect: usize,
+    planning_micros: u64,
+    preparation: ActiveStatePreparationMetrics,
+    workload: ActiveStateWorkload,
+}
+
+#[derive(Debug, Default)]
+struct NativeActiveStateSliceResult {
+    outcome: ActiveStateConnectOutcome,
+    preparation: ActiveStatePreparationMetrics,
+    wall_millis: u64,
+}
+
+struct ActiveStateWorkerPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl ActiveStateWorkerPermit {
+    fn acquire(in_flight: Arc<AtomicUsize>, maximum: &AtomicUsize) -> Self {
+        let active = in_flight.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        maximum.fetch_max(active, Ordering::AcqRel);
+        Self { in_flight }
+    }
+}
+
+impl Drop for ActiveStateWorkerPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct DirectStagedEffectLimit {
     retry_connect: usize,
     limit: u64,
@@ -586,6 +682,19 @@ fn reorg_staged_effect_limit(error: &anyhow::Error) -> Option<(u64, u64)> {
         })
 }
 
+fn canonical_writer_stale(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<CanonicalWriterError>(),
+            Some(
+                CanonicalWriterError::StaleEpoch { .. }
+                    | CanonicalWriterError::StaleChainEpoch { .. }
+                    | CanonicalWriterError::Busy
+            )
+        )
+    })
+}
+
 fn direct_staged_effect_retry(
     error: &anyhow::Error,
     is_reorg: bool,
@@ -598,6 +707,7 @@ fn direct_staged_effect_retry(
     Some((attempted_connect.div_ceil(2), limit, actual))
 }
 
+#[cfg(test)]
 fn drive_active_state_connect_retries<T>(
     initial_limit: usize,
     mut attempt: impl FnMut(usize) -> Result<std::ops::ControlFlow<DirectStagedEffectLimit, T>>,
@@ -634,6 +744,42 @@ pub(super) struct ActiveStateWorkload {
     non_coinbase_inputs: usize,
     outputs: usize,
     name_actions: usize,
+}
+
+impl ActiveStateWorkload {
+    fn for_block(block: &Block) -> Self {
+        let mut workload = Self {
+            transactions: block.transactions.len(),
+            ..Self::default()
+        };
+        for (transaction_index, transaction) in block.transactions.iter().enumerate() {
+            if transaction_index != 0 {
+                workload.non_coinbase_inputs = workload
+                    .non_coinbase_inputs
+                    .saturating_add(transaction.inputs.len());
+            }
+            workload.outputs = workload.outputs.saturating_add(transaction.outputs.len());
+            workload.name_actions = workload.name_actions.saturating_add(
+                transaction
+                    .outputs
+                    .iter()
+                    .filter(|output| output.covenant.kind != CovenantKind::None)
+                    .count(),
+            );
+        }
+        workload
+    }
+
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            transactions: self.transactions.saturating_add(other.transactions),
+            non_coinbase_inputs: self
+                .non_coinbase_inputs
+                .saturating_add(other.non_coinbase_inputs),
+            outputs: self.outputs.saturating_add(other.outputs),
+            name_actions: self.name_actions.saturating_add(other.name_actions),
+        }
+    }
 }
 
 impl HnsBodyValidator {
@@ -1526,39 +1672,46 @@ fn load_or_create_brontide_identity(data_dir: Option<&Path>) -> Result<BrontideI
 }
 
 impl NodeService {
-    pub async fn run_shadow_sync_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
-        self.run_shadow_sync_until_shutdown_with_extension(shutdown, None)
+    pub async fn run_native_sync_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
+        self.run_native_sync_until_shutdown_with_extension(shutdown, None)
             .await
     }
 
-    pub(crate) async fn run_shadow_sync_until_shutdown_with_extension(
+    pub(crate) async fn run_native_sync_until_shutdown_with_extension(
         self,
         shutdown: ShutdownSignal,
         extension: Option<Box<dyn NativeRuntimeExtension>>,
     ) -> Result<()> {
         self.config
-            .shadow_sync
+            .native_sync
             .validate(self.config.authority_mode, self.config.network)?;
-        if !self.config.shadow_sync.enabled {
+        if !self.config.native_sync.enabled {
             return self.run_rpc_until_shutdown(shutdown).await;
         }
 
-        let shadow_sync_config = self.config.shadow_sync.clone();
+        let native_sync_config = self.config.native_sync.clone();
         let rpc_bind = self.config.rpc_bind;
         let rpc_authorization = self.config.rpc_authorization.clone();
         let rpc_limits = self.config.rpc_limits;
-        let rpc_read_context = self.rpc_read_context();
         let network = self.config.network;
         let data_dir = self.config.data_dir.clone();
         let ban_list_persistent = self.config.data_dir.is_some();
-        let address_book_persistent = shadow_sync_config.discovery && ban_list_persistent;
+        let address_book_persistent = native_sync_config.discovery && ban_list_persistent;
         let store = self.state.store.clone();
-        let node = Arc::new(Mutex::new(self));
-
-        {
-            let mut node = node.lock().await;
-            node.shadow_sync_ensure_genesis_header()?;
-        }
+        let runtime = NodeRuntime::spawn(
+            self,
+            native_sync_config
+                .validation_queue
+                .min(MAX_CANONICAL_WRITER_QUEUE_CAPACITY),
+        )?;
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let rpc_read_context = node.rpc_read_context()?;
+        writer
+            .execute(None, "ensure native-sync genesis header", |node| {
+                node.native_sync_ensure_genesis_header()
+            })
+            .await?;
 
         let checkpoint_store = StoredSyncCheckpoint::new(store.clone())
             .map_err(|error| anyhow::anyhow!("failed to initialize sync checkpoint: {error}"))?;
@@ -1566,9 +1719,9 @@ impl NodeService {
             .load()
             .map_err(|error| anyhow::anyhow!("failed to load sync checkpoint: {error}"))?;
         let scheduler_now = StdInstant::now();
-        let maximum_peers = shadow_sync_config
+        let maximum_peers = native_sync_config
             .maximum_inbound
-            .checked_add(shadow_sync_config.maximum_outbound)
+            .checked_add(native_sync_config.maximum_outbound)
             .ok_or_else(|| anyhow::anyhow!("Native sync peer limits overflow usize"))?;
         let sync_limits = SyncLimits {
             maximum_peers,
@@ -1581,19 +1734,15 @@ impl NodeService {
             None => SyncScheduler::new(sync_limits, scheduler_now),
         }
         .map_err(|error| anyhow::anyhow!("failed to initialize sync scheduler: {error}"))?;
-        scheduler.set_headers_only(shadow_sync_config.headers_only);
+        scheduler.set_headers_only(native_sync_config.headers_only);
 
-        let (best_header, active_tip, stored_tip) = {
-            let node = node.lock().await;
-            let best_header = node.shadow_sync_best_header_tip()?;
-            let active_tip = node.shadow_sync_active_tip()?;
-            let stored_tip = node.shadow_sync_contiguous_body_tip(
-                durable_checkpoint
-                    .as_ref()
-                    .and_then(|checkpoint| checkpoint.stored_tip.as_ref()),
-            )?;
-            (best_header, active_tip, stored_tip)
-        };
+        let best_header = node.native_sync_best_header_tip()?;
+        let active_tip = node.native_sync_active_tip()?;
+        let stored_tip = node.native_sync_contiguous_body_tip(
+            durable_checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.stored_tip.as_ref()),
+        )?;
         scheduler.set_best_header(best_header);
         scheduler.set_active_tip(active_tip.clone());
         scheduler.set_stored_tip(stored_tip);
@@ -1603,8 +1752,8 @@ impl NodeService {
             peer_config.transport =
                 PeerTransport::Brontide(load_or_create_brontide_identity(data_dir.as_deref())?);
         }
-        peer_config.maximum_inbound = shadow_sync_config.maximum_inbound;
-        peer_config.maximum_outbound = shadow_sync_config.maximum_outbound;
+        peer_config.maximum_inbound = native_sync_config.maximum_inbound;
+        peer_config.maximum_outbound = native_sync_config.maximum_outbound;
         peer_config.ban_score = HSD_BAN_SCORE;
         peer_config.ban_time = Duration::from_secs(HSD_BAN_TIME_SECONDS);
         let (peers, mut peer_events) = LivePeerManager::new(peer_config)
@@ -1635,20 +1784,17 @@ impl NodeService {
             .replace_bans(ban_list.active_bans(ban_timestamp))
             .await;
 
-        {
-            let node = node.lock().await;
-            node.shadow_sync_queue_missing_canonical_bodies(&mut scheduler)?;
-        }
+        node.native_sync_queue_missing_canonical_bodies(&mut scheduler)?;
 
         let mut orphan_pool = BoundedOrphanPool::new(OrphanLimits {
-            maximum_blocks: shadow_sync_config.orphan_blocks,
-            maximum_bytes: shadow_sync_config.orphan_bytes,
+            maximum_blocks: native_sync_config.orphan_blocks,
+            maximum_bytes: native_sync_config.orphan_bytes,
         })
         .map_err(|error| anyhow::anyhow!("failed to initialize orphan pool: {error}"))?;
         let (validation, mut validated) = spawn_validation_pipeline(
             Arc::new(HnsBodyValidator::new(network)),
-            shadow_sync_config.validation_workers,
-            shadow_sync_config.validation_queue,
+            native_sync_config.validation_workers,
+            native_sync_config.validation_queue,
         )
         .map_err(|error| anyhow::anyhow!("failed to initialize validation pipeline: {error}"))?;
 
@@ -1656,12 +1802,12 @@ impl NodeService {
         let address_timestamp = unix_time();
         let mut address_book = BoundedAddressBook::new(
             network,
-            shadow_sync_config.listen,
-            shadow_sync_config.maximum_known_addresses,
+            native_sync_config.listen,
+            native_sync_config.maximum_known_addresses,
         )?;
-        for address in &shadow_sync_config.connect {
+        for address in &native_sync_config.connect {
             address_book.insert_configured(*address, address_now, address_timestamp)?;
-            if let Some(key) = shadow_sync_config.connect_keys.get(address) {
+            if let Some(key) = native_sync_config.connect_keys.get(address) {
                 address_book
                     .entries
                     .get_mut(address)
@@ -1700,7 +1846,7 @@ impl NodeService {
                 }
             }
         }
-        if shadow_sync_config.discovery {
+        if native_sync_config.discovery {
             let resolution = resolve_hsd_dns_seeds(network).await;
             dns_seed_failures = resolution.errors.len() as u64;
             for error in resolution.errors {
@@ -1715,15 +1861,15 @@ impl NodeService {
                     dns_seed_addresses = dns_seed_addresses.saturating_add(1);
                 }
             }
-            if shadow_sync_config.connect.is_empty()
-                && shadow_sync_config.listen.is_none()
+            if native_sync_config.connect.is_empty()
+                && native_sync_config.listen.is_none()
                 && address_book.len() == 0
             {
                 anyhow::bail!("HNS DNS discovery resolved no admissible peer addresses");
             }
         }
 
-        let mut reconnects = shadow_sync_config
+        let mut reconnects = native_sync_config
             .connect
             .iter()
             .copied()
@@ -1733,7 +1879,7 @@ impl NodeService {
             &address_book,
             &mut reconnects,
             &ban_list,
-            shadow_sync_config.maximum_outbound,
+            native_sync_config.maximum_outbound,
             address_now,
             address_timestamp,
         );
@@ -1743,16 +1889,16 @@ impl NodeService {
             .map_or(0, |checkpoint| checkpoint.sequence);
         let initial_experimental_registry =
             rpc_experimental_registry_info(&peers.denuo_summary().await);
-        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
-            headers_only: shadow_sync_config.headers_only,
-            observation_only: !shadow_sync_config.connect_active_state,
-            active_state: shadow_sync_config.connect_active_state,
+            headers_only: native_sync_config.headers_only,
+            observation_only: !native_sync_config.connect_active_state,
+            active_state: native_sync_config.connect_active_state,
             runtime_instance: runtime_instance_id(),
-            listen: shadow_sync_config.listen,
-            configured_outbound: shadow_sync_config.connect.clone(),
-            discovery_enabled: shadow_sync_config.discovery,
+            listen: native_sync_config.listen,
+            configured_outbound: native_sync_config.connect.clone(),
+            discovery_enabled: native_sync_config.discovery,
             address_book_persistent,
             known_addresses: address_book.len(),
             loaded_addresses,
@@ -1775,41 +1921,45 @@ impl NodeService {
             sync: scheduler.snapshot(),
             orphans: orphan_pool.snapshot(),
             checkpoint_sequence: initial_sequence,
-            ..ShadowSyncDiagnostics::default()
+            ..NativeSyncDiagnostics::default()
         }));
         let diagnostic_rpc = initialize_cached_diagnostic_rpc(&node, &diagnostics).await?;
 
         // Bind diagnostics before startup replay/compaction. The cached,
         // explicitly timestamped snapshot remains readable while the
-        // state-coordination lock is held; authoritative parent reads still
-        // wait for the live node.
+        // canonical writer is busy; authoritative parent reads use stable
+        // generations from the live node.
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let rpc_listener = TcpListener::bind(rpc_bind)
             .await
             .with_context(|| format!("failed to bind RPC listener on {rpc_bind}"))?;
-        let rpc_state = ShadowSyncHttpState {
-            node: Arc::clone(&node),
+        let rpc_state = NativeSyncHttpState {
+            node: node.clone(),
             diagnostics: Arc::clone(&diagnostics),
             diagnostic_rpc: Arc::clone(&diagnostic_rpc),
             read_context: rpc_read_context,
             limits: rpc_limits,
         };
-        let rpc_task = tokio::spawn(serve_shadow_sync_rpc(
+        let rpc_task = tokio::spawn(serve_native_sync_rpc(
             rpc_listener,
             rpc_state,
             rpc_authorization,
             shutdown_rx.clone(),
         ));
 
-        if shadow_sync_config.connect_active_state {
+        if native_sync_config.connect_active_state {
+            let context = ActiveStateConnectionContext {
+                node: &node,
+                writer: &writer,
+                peers: &peers,
+                diagnostics: &diagnostics,
+                diagnostic_rpc: &diagnostic_rpc,
+            };
             if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
-                &node,
-                &peers,
+                &context,
                 &mut scheduler,
                 &mut orphan_pool,
-                &diagnostics,
-                &diagnostic_rpc,
-                shadow_sync_config.active_state_connect_batch,
+                native_sync_config.active_state_connect_batch,
             )
             .await
             {
@@ -1819,7 +1969,7 @@ impl NodeService {
             }
         }
 
-        let listener_task = if let Some(address) = shadow_sync_config.listen {
+        let listener_task = if let Some(address) = native_sync_config.listen {
             let listener = TcpListener::bind(address)
                 .await
                 .with_context(|| format!("failed to bind HNS P2P listener on {address}"))?;
@@ -1835,27 +1985,26 @@ impl NodeService {
         } else {
             None
         };
-        let mut extension_task = extension.map(|extension| {
-            extension.spawn(Arc::clone(&node), peers.clone(), shutdown_rx.clone())
-        });
+        let mut extension_task = extension
+            .map(|extension| extension.spawn(runtime.clone(), peers.clone(), shutdown_rx.clone()));
 
         let (connect_results_tx, mut connect_results_rx) =
-            mpsc::channel::<ConnectAttemptResult>(shadow_sync_config.maximum_outbound.max(1));
+            mpsc::channel::<ConnectAttemptResult>(native_sync_config.maximum_outbound.max(1));
 
         tracing::info!(
             rpc = %rpc_bind,
-            p2p = ?shadow_sync_config.listen,
+            p2p = ?native_sync_config.listen,
             outbound = reconnects.len(),
-            discovery = shadow_sync_config.discovery,
+            discovery = native_sync_config.discovery,
             known_addresses = address_book.len(),
             "hsrd native-sync runtime started"
         );
 
         let mut checkpoint_sequence = initial_sequence;
-        let mut poll = tokio::time::interval(shadow_sync_config.poll_interval);
+        let mut poll = tokio::time::interval(native_sync_config.poll_interval);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         poll.tick().await;
-        let mut active_state_poll = tokio::time::interval(MIN_SHADOW_SYNC_POLL_INTERVAL);
+        let mut active_state_poll = tokio::time::interval(MIN_NATIVE_SYNC_POLL_INTERVAL);
         active_state_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         active_state_poll.tick().await;
         let mut peer_state_flush = tokio::time::interval(ADDRESS_BOOK_FLUSH_INTERVAL);
@@ -1866,10 +2015,26 @@ impl NodeService {
         let mut pending_compact_blocks = HashMap::new();
         let mut shutdown_wait = Box::pin(shutdown.wait());
         let mut terminal_error: Option<anyhow::Error> = None;
+        let mut active_state_task: Option<JoinHandle<Result<NativeActiveStateSliceResult>>> = None;
 
         loop {
             tokio::select! {
+                biased;
                 _ = &mut shutdown_wait => break,
+                result = async {
+                    extension_task
+                        .as_mut()
+                        .expect("native extension task select guard")
+                        .await
+                }, if extension_task.is_some() => {
+                    let _finished = extension_task
+                        .take()
+                        .expect("completed native extension task remains present");
+                    let error = unexpected_extension_exit(result);
+                    record_error(&diagnostics, format!("{error:#}")).await;
+                    terminal_error = Some(error);
+                    break;
+                }
                 _ = peer_state_flush.tick(), if ban_list_persistent => {
                     if address_book_persistent {
                         flush_address_book(&store, &mut address_book, &diagnostics).await;
@@ -1877,30 +2042,68 @@ impl NodeService {
                     flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
                 }
                 _ = active_state_poll.tick(),
-                    if shadow_sync_config.connect_active_state
+                    if native_sync_config.connect_active_state
+                        && active_state_task.is_none()
                         && active_state_work_ready(&scheduler) =>
                 {
-                    // One atomic slice per scheduler turn. The independent
-                    // short cadence removes the general poll-rate ceiling,
-                    // while Delay semantics force an inter-slice opportunity
-                    // for peer events, validation results, and shutdown.
-                    if let Err(error) = connect_stored_active_state_with_diagnostic_rpc(
-                        &node,
-                        &peers,
+                    // Preparation is pure, bounded CPU work and remains
+                    // independent of the network supervisor. Exactly one job
+                    // may be in flight; its ordered completion branch below is
+                    // the only place scheduler state is advanced.
+                    active_state_task = Some(tokio::spawn(execute_native_active_state_slice(
+                        node.clone(),
+                        writer.clone(),
+                        native_sync_config.active_state_connect_batch,
+                        scheduler.stored_tip().cloned(),
+                        native_sync_config.validation_workers,
+                        native_sync_config.validation_queue,
+                    )));
+                    active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
+                }
+                result = async {
+                    active_state_task
+                        .as_mut()
+                        .expect("active-state task select guard")
+                        .await
+                }, if active_state_task.is_some() => {
+                    let _finished = active_state_task
+                        .take()
+                        .expect("completed active-state task remains present");
+                    let completed = match result {
+                        Ok(Ok(completed)) => completed,
+                        Ok(Err(error)) => {
+                            let error = error.context("active-state synchronization failed");
+                            record_error(&diagnostics, format!("{error:#}")).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
+                        Err(error) => {
+                            let error = anyhow::Error::new(error)
+                                .context("active-state synchronization task failed");
+                            record_error(&diagnostics, format!("{error:#}")).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    };
+                    let context = ActiveStateConnectionContext {
+                        node: &node,
+                        writer: &writer,
+                        peers: &peers,
+                        diagnostics: &diagnostics,
+                        diagnostic_rpc: &diagnostic_rpc,
+                    };
+                    if let Err(error) = complete_stored_active_state_slice(
+                        completed,
+                        &context,
                         &mut scheduler,
                         &mut orphan_pool,
-                        &diagnostics,
-                        &diagnostic_rpc,
-                        shadow_sync_config.active_state_connect_batch,
-                    )
-                    .await
-                    {
-                        let error = error.context("active-state synchronization failed");
+                    ).await {
+                        let error = error.context("active-state completion failed");
                         record_error(&diagnostics, format!("{error:#}")).await;
                         terminal_error = Some(error);
                         break;
                     }
-                    active_state_poll.reset_after(MIN_SHADOW_SYNC_POLL_INTERVAL);
+                    active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
                     update_diagnostics(&diagnostics, |state| {
                         state.peer_event_backlog = peer_events.len();
                         state.validation_result_backlog = validated.len();
@@ -1929,23 +2132,6 @@ impl NodeService {
                     }
                     if listener_task.as_ref().is_some_and(|task| task.is_finished()) {
                         let message = "Native sync P2P listener terminated unexpectedly".to_owned();
-                        record_error(&diagnostics, message.clone()).await;
-                        terminal_error = Some(anyhow::anyhow!(message));
-                        break;
-                    }
-                    if extension_task.as_ref().is_some_and(|task| task.is_finished()) {
-                        let task = extension_task.take().expect("finished extension task");
-                        let message = match task.await {
-                            Ok(Ok(())) => {
-                                "native runtime extension terminated unexpectedly".to_owned()
-                            }
-                            Ok(Err(error)) => {
-                                format!("native runtime extension failed: {error:#}")
-                            }
-                            Err(error) => {
-                                format!("native runtime extension task failed: {error}")
-                            }
-                        };
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
@@ -1987,12 +2173,12 @@ impl NodeService {
                     // active-state and canonical-body scans. Historical replay
                     // must not starve peer bootstrap or reconnect scheduling.
                     let connection_now = Instant::now();
-                    if shadow_sync_config.discovery {
+                    if native_sync_config.discovery {
                         fill_discovery_slots(
                             &address_book,
                             &mut reconnects,
                             &ban_list,
-                            shadow_sync_config.maximum_outbound,
+                            native_sync_config.maximum_outbound,
                             connection_now,
                             unix_time(),
                         );
@@ -2004,7 +2190,7 @@ impl NodeService {
                         &peers,
                         &connect_results_tx,
                         connection_now,
-                        shadow_sync_config.maximum_outbound,
+                        native_sync_config.maximum_outbound,
                     );
                     if attempts > 0 {
                         update_diagnostics(&diagnostics, |state| {
@@ -2015,10 +2201,8 @@ impl NodeService {
                         .await;
                     }
 
-                    let queue_result = {
-                        let node = node.lock().await;
-                        node.shadow_sync_queue_missing_canonical_bodies(&mut scheduler)
-                    };
+                    let queue_result =
+                        node.native_sync_queue_missing_canonical_bodies(&mut scheduler);
                     if let Err(error) = queue_result {
                         let error = error.context(
                             "failed to refresh canonical block-body work queue",
@@ -2027,10 +2211,7 @@ impl NodeService {
                         terminal_error = Some(error);
                         break;
                     }
-                    let locator_result = {
-                        let node = node.lock().await;
-                        node.shadow_sync_block_locator(MAX_LOCATOR_ENTRIES)
-                    };
+                    let locator_result = node.native_sync_block_locator(MAX_LOCATOR_ENTRIES);
                     let locator = match locator_result {
                         Ok(locator) => locator,
                         Err(error) => {
@@ -2093,12 +2274,12 @@ impl NodeService {
                         &diagnostics,
                     )
                     .await;
-                    if shadow_sync_config.discovery {
+                    if native_sync_config.discovery {
                         fill_discovery_slots(
                             &address_book,
                             &mut reconnects,
                             &ban_list,
-                            shadow_sync_config.maximum_outbound,
+                            native_sync_config.maximum_outbound,
                             Instant::now(),
                             unix_time(),
                         );
@@ -2119,6 +2300,7 @@ impl NodeService {
                         result = handle_peer_event(
                             event,
                             &node,
+                            &writer,
                             &peers,
                             &validation,
                             &mut scheduler,
@@ -2128,8 +2310,8 @@ impl NodeService {
                             &mut served_getaddr,
                             &mut compact_peers,
                             &mut pending_compact_blocks,
-                            shadow_sync_config.discovery,
-                            shadow_sync_config.headers_only,
+                            native_sync_config.discovery,
+                            native_sync_config.headers_only,
                             &diagnostics,
                         ) => Some(result),
                     };
@@ -2139,12 +2321,12 @@ impl NodeService {
                     if let Err(error) = handled {
                         record_warning(format!("{error:#}"));
                     }
-                    if shadow_sync_config.discovery {
+                    if native_sync_config.discovery {
                         fill_discovery_slots(
                             &address_book,
                             &mut reconnects,
                             &ban_list,
-                            shadow_sync_config.maximum_outbound,
+                            native_sync_config.maximum_outbound,
                             Instant::now(),
                             unix_time(),
                         );
@@ -2178,14 +2360,18 @@ impl NodeService {
                             Err(_) => break,
                         }
                     }
+                    let context = ValidationResultContext {
+                        node: &node,
+                        writer: &writer,
+                        peers: &peers,
+                        validation: &validation,
+                        diagnostics: &diagnostics,
+                    };
                     let validation_result = handle_validation_results(
                         results,
-                        &node,
-                        &peers,
-                        &validation,
+                        &context,
                         &mut scheduler,
                         &mut orphan_pool,
-                        &diagnostics,
                     )
                     .await;
                     if let Err(error) = &validation_result {
@@ -2206,11 +2392,7 @@ impl NodeService {
                     .await;
                 }
             }
-            let storage_operational = {
-                let node = node.lock().await;
-                node.fail_closed_after_ambiguous_commit();
-                node.state.ensure_storage_operational()
-            };
+            let storage_operational = node.ensure_storage_operational();
             if let Err(error) = storage_operational {
                 let error =
                     error.context("native-sync storage requires reopen after a commit failure");
@@ -2229,12 +2411,81 @@ impl NodeService {
             )
             .await;
         }
+        // Tell every subordinate runtime, including external extensions, to
+        // stop before draining accepted writer work. This prevents new work
+        // from racing the final checkpoint while preserving the invariant
+        // that an admitted canonical command runs to completion.
+        let _ = shutdown_tx.send(true);
 
-        let shutdown_persistence = {
-            let node = node.lock().await;
-            node.fail_closed_after_ambiguous_commit();
-            node.state.ensure_storage_operational()
+        // A writer command is non-cancellable once admitted. Finish any
+        // accepted preparation/commit job and publish its scheduler effects
+        // before the final checkpoint and canonical-runtime shutdown. This
+        // drain is work-bounded: at most one task exists, its connect count is
+        // capped by the validated `active_state_connect_batch`, and planning
+        // charges every materialized body against `NodeReorgLimits`' bounded
+        // production body-byte envelope before a worker is admitted.
+        if let Some(task) = active_state_task.take() {
+            let completed = match task.await {
+                Ok(Ok(completed)) => Some(completed),
+                Ok(Err(error)) => {
+                    let error = error.context("active-state shutdown drain failed");
+                    record_error(&diagnostics, format!("{error:#}")).await;
+                    if terminal_error.is_none() {
+                        terminal_error = Some(error);
+                    }
+                    None
+                }
+                Err(error) => {
+                    let error = anyhow::Error::new(error)
+                        .context("active-state shutdown-drain task failed");
+                    record_error(&diagnostics, format!("{error:#}")).await;
+                    if terminal_error.is_none() {
+                        terminal_error = Some(error);
+                    }
+                    None
+                }
+            };
+            if let Some(completed) = completed {
+                let context = ActiveStateConnectionContext {
+                    node: &node,
+                    writer: &writer,
+                    peers: &peers,
+                    diagnostics: &diagnostics,
+                    diagnostic_rpc: &diagnostic_rpc,
+                };
+                if let Err(error) = complete_stored_active_state_slice(
+                    completed,
+                    &context,
+                    &mut scheduler,
+                    &mut orphan_pool,
+                )
+                .await
+                {
+                    let error = error.context("active-state shutdown completion failed");
+                    record_error(&diagnostics, format!("{error:#}")).await;
+                    if terminal_error.is_none() {
+                        terminal_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        // Quiesce the extension before final persistence. A cooperative task
+        // is joined; an unresponsive task is asked to abort and its
+        // cancellation is itself joined for a bounded interval.
+        let extension_result = match extension_task {
+            Some(task) => {
+                await_extension_shutdown(
+                    task,
+                    NATIVE_RUNTIME_EXTENSION_SHUTDOWN_GRACE,
+                    NATIVE_RUNTIME_EXTENSION_ABORT_GRACE,
+                )
+                .await
+            }
+            None => Ok(()),
         };
+
+        let shutdown_persistence = node.ensure_storage_operational();
         if let Err(error) = shutdown_persistence {
             record_warning(format!(
                 "skipped final peer/checkpoint persistence while storage requires reopen: {error:#}"
@@ -2269,11 +2520,7 @@ impl NodeService {
                     terminal_error = Some(error);
                 }
             }
-            let final_storage_state = {
-                let node = node.lock().await;
-                node.fail_closed_after_ambiguous_commit();
-                node.state.ensure_storage_operational()
-            };
+            let final_storage_state = node.ensure_storage_operational();
             if let Err(error) = final_storage_state {
                 let error =
                     error.context("native-sync storage was fenced during shutdown persistence");
@@ -2283,11 +2530,6 @@ impl NodeService {
                 }
             }
         }
-        let _ = shutdown_tx.send(true);
-        let extension_result = match extension_task {
-            Some(task) => await_task("native runtime extension", task).await,
-            None => Ok(()),
-        };
         peers.disconnect_all().await;
 
         let rpc_result = await_task("RPC", rpc_task).await;
@@ -2295,25 +2537,23 @@ impl NodeService {
             Some(task) => await_p2p_task("P2P listener", task).await,
             None => Ok(()),
         };
-
-        if terminal_error.is_none()
+        let clean_shutdown_eligible = terminal_error.is_none()
             && rpc_result.is_ok()
             && listener_result.is_ok()
-            && extension_result.is_ok()
-        {
-            mark_node_store_clean(&store, network)?;
-        }
+            && extension_result.is_ok();
+        let writer_result = shutdown_native_runtime(runtime, clean_shutdown_eligible).await;
         if let Some(error) = terminal_error {
             return Err(error);
         }
         rpc_result?;
         listener_result?;
         extension_result?;
+        writer_result?;
         tracing::info!("hsrd native-sync runtime stopped");
         Ok(())
     }
 
-    pub(super) fn shadow_sync_ensure_genesis_header(&mut self) -> Result<HeaderRecord> {
+    pub(super) fn native_sync_ensure_genesis_header(&mut self) -> Result<HeaderRecord> {
         self.state.ensure_storage_operational()?;
         let params = self.config.network.params();
         if let Some(record) = self
@@ -2356,9 +2596,9 @@ impl NodeService {
         result
     }
 
-    fn shadow_sync_import_headers(&mut self, headers: Vec<Header>) -> Result<Vec<HeaderRecord>> {
+    fn native_sync_import_headers(&mut self, headers: Vec<Header>) -> Result<Vec<HeaderRecord>> {
         self.state.ensure_storage_operational()?;
-        if headers.len() > MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE {
+        if headers.len() > MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE {
             anyhow::bail!("peer sent too many headers: {}", headers.len());
         }
 
@@ -2457,198 +2697,219 @@ impl NodeService {
         }
         Ok(imported)
     }
+}
 
-    fn shadow_sync_best_header_tip(&self) -> Result<Option<ChainTip>> {
-        self.state
-            .chain
-            .best_tip()
-            .map_err(|error| anyhow::anyhow!("failed to read best header: {error}"))
-    }
-
-    fn shadow_sync_header_deployments(&self) -> Result<HeaderDeploymentDiagnostics> {
-        let best_header = self
-            .shadow_sync_best_header_tip()?
-            .ok_or_else(|| anyhow::anyhow!("best header is unavailable"))?;
-        let next_height = best_header
-            .height
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("best-header height exhausted"))?;
-        let params = self.config.network.params();
-        let mut state = DeploymentState::from_states([ThresholdState::Defined; 4]);
-
-        for deployment in self.config.network.deployments() {
-            let window = deployment.effective_window(params.miner_window);
-            if window == 0 {
-                anyhow::bail!("deployment {} has a zero window", deployment.name());
-            }
-            let mut threshold = ThresholdState::Defined;
-            let mut boundary = window;
-            while boundary <= next_height {
-                let parent_height = boundary
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow::anyhow!("deployment boundary underflow"))?;
-                let parent_hash = self
-                    .state
-                    .chain
-                    .canonical_hash(parent_height)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to read canonical deployment parent at {parent_height}: {error}"
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "canonical deployment parent at height {parent_height} is missing"
-                        )
-                    })?;
-                let parent = self
-                    .state
-                    .chain
-                    .header(&parent_hash)
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to read deployment parent header: {error}")
-                    })?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "canonical deployment parent {} is missing",
-                            parent_hash.to_hex()
-                        )
-                    })?;
-                if parent.height != parent_height || parent.status.failed {
-                    anyhow::bail!(
-                        "canonical deployment parent {} is invalid at height {parent_height}",
-                        parent_hash.to_hex()
-                    );
-                }
-                let mut lookup = |hash: &BlockHash| {
-                    self.state.chain.header(hash).map_err(|error| {
-                        anyhow::anyhow!("failed to read deployment ancestry: {error}")
-                    })
-                };
-                let period = completed_deployment_period_with_lookup(
-                    &parent,
-                    *deployment,
-                    window,
-                    &mut lookup,
-                )?;
-                threshold = advance_threshold_state(
-                    params.activation_threshold,
-                    params.miner_window,
-                    *deployment,
-                    boundary,
-                    threshold,
-                    Some(period),
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to derive deployment {} at height {boundary}",
-                        deployment.name()
-                    )
-                })?;
-                boundary = match boundary.checked_add(window) {
-                    Some(boundary) => boundary,
-                    None => break,
-                };
-            }
-            state = state.with_state(deployment.id, threshold);
-        }
-
-        let deployments = self
-            .config
-            .network
-            .deployments()
-            .iter()
-            .map(|deployment| HeaderDeploymentEntry {
-                name: deployment.name().to_owned(),
-                state: state.state(deployment.id),
-                bit: deployment.bit,
-                start_time: deployment.start_time,
-                timeout: deployment.timeout,
-            })
-            .collect::<Vec<_>>();
-        let final_checkpoint = self
-            .config
-            .network
-            .checkpoints()
-            .last()
-            .map(|checkpoint| {
-                let anchored = if best_header.height < checkpoint.height {
-                    false
-                } else {
-                    let canonical =
-                        self.state
-                            .chain
-                            .canonical_hash(checkpoint.height)
-                            .map_err(|error| {
-                                anyhow::anyhow!("failed to read final checkpoint ancestry: {error}")
-                            })?;
-                    let record = self.state.chain.header(&checkpoint.hash).map_err(|error| {
-                        anyhow::anyhow!("failed to read final checkpoint header: {error}")
-                    })?;
-                    canonical == Some(checkpoint.hash)
-                        && record.is_some_and(|record| {
-                            record.height == checkpoint.height
-                                && record.hash == checkpoint.hash
-                                && record.status.header_context_valid
-                                && record.status.checkpoint_valid
-                                && !record.status.failed
-                        })
-                };
-                Ok::<_, anyhow::Error>(HeaderCheckpointEvidence {
-                    height: checkpoint.height,
-                    hash: checkpoint.hash,
-                    anchored,
-                })
-            })
-            .transpose()?;
-        let historical_script_assumption_through = final_checkpoint
-            .as_ref()
-            .filter(|checkpoint| checkpoint.anchored)
-            .map(|checkpoint| checkpoint.height);
-
-        Ok(HeaderDeploymentDiagnostics {
-            best_header,
-            next_height,
-            deployments,
-            script_flags: state.script_flags.bits(),
-            lock_flags: state.lock_flags,
-            name_flags: state.name_flags.bits(),
-            has_airstop: state.has_airstop,
-            next_block_version: compute_block_version_from_state(
-                self.config.network.deployments(),
-                state,
-            )
-            .context("failed to derive next-block deployment version")?,
-            final_checkpoint,
-            historical_script_assumption_through,
+impl NodeReadHandle {
+    fn native_sync_best_header_tip(&self) -> Result<Option<ChainTip>> {
+        self.with_stable_read(|_store, headers| {
+            headers
+                .best_tip()
+                .map_err(|error| anyhow::anyhow!("failed to read best native-sync header: {error}"))
         })
     }
 
-    fn shadow_sync_active_tip(&self) -> Result<Option<ChainTip>> {
-        self.state.best_block_tip()
+    fn native_sync_header_deployments(
+        &self,
+        deadline: StdInstant,
+        maximum_reads: usize,
+    ) -> Result<HeaderDeploymentDiagnostics> {
+        if maximum_reads == 0 || maximum_reads > MAX_HEADER_DEPLOYMENT_READS {
+            anyhow::bail!(
+                "header deployment read budget must be within 1..={MAX_HEADER_DEPLOYMENT_READS}"
+            );
+        }
+        let config = self.config();
+        self.with_stable_read(|store, headers| {
+            let snapshot = store.snapshot()?;
+            let mut reads = 0usize;
+            charge_header_deployment_read(&mut reads, maximum_reads, deadline)?;
+            let best_header = headers
+                .best_tip()
+                .map_err(|error| anyhow::anyhow!("failed to read best deployment header: {error}"))?
+                .ok_or_else(|| anyhow::anyhow!("best header is unavailable"))?;
+            let next_height = best_header
+                .height
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("best-header height exhausted"))?;
+            let params = config.network.params();
+            let mut state = DeploymentState::from_states([ThresholdState::Defined; 4]);
+
+            for deployment in config.network.deployments() {
+                let window = deployment.effective_window(params.miner_window);
+                if window == 0 {
+                    anyhow::bail!("deployment {} has a zero window", deployment.name());
+                }
+                let mut threshold = ThresholdState::Defined;
+                let mut boundary = window;
+                while boundary <= next_height {
+                    let parent_height = boundary
+                        .checked_sub(1)
+                        .ok_or_else(|| anyhow::anyhow!("deployment boundary underflow"))?;
+                    charge_header_deployment_read(&mut reads, maximum_reads, deadline)?;
+                    let parent_hash = headers
+                        .canonical_hash(parent_height)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                            "failed to read canonical deployment parent at {parent_height}: {error}"
+                        )
+                        })?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "canonical deployment parent at height {parent_height} is missing"
+                            )
+                        })?;
+                    charge_header_deployment_read(&mut reads, maximum_reads, deadline)?;
+                    let parent = load_header_record(&snapshot, &parent_hash)
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to read deployment parent header: {error}")
+                        })?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "canonical deployment parent {} is missing",
+                                parent_hash.to_hex()
+                            )
+                        })?;
+                    if parent.height != parent_height || parent.status.failed {
+                        anyhow::bail!(
+                            "canonical deployment parent {} is invalid at height {parent_height}",
+                            parent_hash.to_hex()
+                        );
+                    }
+                    let mut lookup = |hash: &BlockHash| {
+                        charge_header_deployment_read(&mut reads, maximum_reads, deadline)?;
+                        load_header_record(&snapshot, hash)
+                    };
+                    let period = completed_deployment_period_with_lookup(
+                        &parent,
+                        *deployment,
+                        window,
+                        &mut lookup,
+                    )?;
+                    threshold = advance_threshold_state(
+                        params.activation_threshold,
+                        params.miner_window,
+                        *deployment,
+                        boundary,
+                        threshold,
+                        Some(period),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to derive deployment {} at height {boundary}",
+                            deployment.name()
+                        )
+                    })?;
+                    boundary = match boundary.checked_add(window) {
+                        Some(boundary) => boundary,
+                        None => break,
+                    };
+                }
+                state = state.with_state(deployment.id, threshold);
+            }
+
+            let deployments = config
+                .network
+                .deployments()
+                .iter()
+                .map(|deployment| HeaderDeploymentEntry {
+                    name: deployment.name().to_owned(),
+                    state: state.state(deployment.id),
+                    bit: deployment.bit,
+                    start_time: deployment.start_time,
+                    timeout: deployment.timeout,
+                })
+                .collect::<Vec<_>>();
+            let final_checkpoint = config
+                .network
+                .checkpoints()
+                .last()
+                .map(|checkpoint| {
+                    let anchored = if best_header.height < checkpoint.height {
+                        false
+                    } else {
+                        charge_header_deployment_read(&mut reads, maximum_reads, deadline)?;
+                        let canonical =
+                            headers.canonical_hash(checkpoint.height).map_err(|error| {
+                                anyhow::anyhow!("failed to read final checkpoint ancestry: {error}")
+                            })?;
+                        charge_header_deployment_read(&mut reads, maximum_reads, deadline)?;
+                        let record =
+                            load_header_record(&snapshot, &checkpoint.hash).map_err(|error| {
+                                anyhow::anyhow!("failed to read final checkpoint header: {error}")
+                            })?;
+                        canonical == Some(checkpoint.hash)
+                            && record.is_some_and(|record| {
+                                record.height == checkpoint.height
+                                    && record.hash == checkpoint.hash
+                                    && record.status.header_context_valid
+                                    && record.status.checkpoint_valid
+                                    && !record.status.failed
+                            })
+                    };
+                    Ok::<_, anyhow::Error>(HeaderCheckpointEvidence {
+                        height: checkpoint.height,
+                        hash: checkpoint.hash,
+                        anchored,
+                    })
+                })
+                .transpose()?;
+            let historical_script_assumption_through = final_checkpoint
+                .as_ref()
+                .filter(|checkpoint| checkpoint.anchored)
+                .map(|checkpoint| checkpoint.height);
+
+            Ok(HeaderDeploymentDiagnostics {
+                best_header,
+                next_height,
+                deployments,
+                script_flags: state.script_flags.bits(),
+                lock_flags: state.lock_flags,
+                name_flags: state.name_flags.bits(),
+                has_airstop: state.has_airstop,
+                next_block_version: compute_block_version_from_state(
+                    config.network.deployments(),
+                    state,
+                )
+                .context("failed to derive next-block deployment version")?,
+                final_checkpoint,
+                historical_script_assumption_through,
+            })
+        })
     }
 
-    fn shadow_sync_has_block(&self, hash: &BlockHash) -> Result<bool> {
-        let Some(record) = self
-            .state
-            .blocks
-            .block(hash)
-            .map_err(|error| anyhow::anyhow!("failed to read block availability: {error}"))?
+    fn native_sync_active_tip(&self) -> Result<Option<ChainTip>> {
+        self.with_stable_read(|store, _headers| {
+            let snapshot = store.snapshot()?;
+            best_block_tip_from_snapshot(&snapshot).context("failed to read active native-sync tip")
+        })
+    }
+
+    fn native_sync_has_block(&self, hash: &BlockHash) -> Result<bool> {
+        self.with_stable_read(|store, _headers| {
+            let snapshot = store.snapshot()?;
+            Self::native_sync_has_block_from_snapshot(&snapshot, hash)
+        })
+    }
+
+    fn native_sync_has_block_from_snapshot(
+        snapshot: &impl ReadSnapshot,
+        hash: &BlockHash,
+    ) -> Result<bool> {
+        let Some(record) =
+            load_block_index_record(snapshot, hash).context("failed to read block availability")?
         else {
             return Ok(false);
         };
         if !record.status.body_present {
             return Ok(false);
         }
-        let Some(block) = self.state.blocks.load_block(hash).map_err(|error| {
-            anyhow::anyhow!("failed to authenticate stored block body: {error}")
-        })?
+        let Some(block) = load_block_from_snapshot(snapshot, hash)
+            .context("failed to authenticate stored block body")?
         else {
             return Ok(false);
         };
-        let Some(header) = self.state.chain.load_record(hash).map_err(|error| {
-            anyhow::anyhow!("failed to authenticate stored block header: {error}")
-        })?
+        let Some(header) = load_header_record(snapshot, hash)
+            .context("failed to authenticate stored block header")?
         else {
             anyhow::bail!(
                 "stored block body {} has no matching header record",
@@ -2670,29 +2931,65 @@ impl NodeService {
         Ok(true)
     }
 
-    fn shadow_sync_header_record(&self, hash: &BlockHash) -> Result<Option<HeaderRecord>> {
+    fn native_sync_header_record(&self, hash: &BlockHash) -> Result<Option<HeaderRecord>> {
+        self.with_stable_read(|store, _headers| {
+            let snapshot = store.snapshot()?;
+            Self::native_sync_header_record_from_snapshot(&snapshot, hash)
+        })
+    }
+
+    fn native_sync_header_record_from_snapshot(
+        snapshot: &impl ReadSnapshot,
+        hash: &BlockHash,
+    ) -> Result<Option<HeaderRecord>> {
+        load_header_record(snapshot, hash).context("failed to load native-sync header")
+    }
+
+    fn native_sync_is_canonical_header(&self, hash: BlockHash, height: Height) -> Result<bool> {
+        self.with_stable_read(|_store, headers| {
+            headers
+                .canonical_hash(height)
+                .map(|canonical| canonical == Some(hash))
+                .context("failed to read canonical native-sync header")
+        })
+    }
+
+    fn native_sync_block(&self, hash: &BlockHash) -> Result<Option<Block>> {
+        self.with_stable_read(|store, _headers| {
+            let snapshot = store.snapshot()?;
+            load_block_from_snapshot(&snapshot, hash).context("failed to load native-sync block")
+        })
+    }
+}
+
+impl NodeService {
+    #[cfg(test)]
+    fn native_sync_best_header_tip(&self) -> Result<Option<ChainTip>> {
         self.state
             .chain
-            .load_record(hash)
-            .map_err(|error| anyhow::anyhow!("failed to load header: {error}"))
+            .best_tip()
+            .map_err(|error| anyhow::anyhow!("failed to read best test header: {error}"))
     }
 
-    fn shadow_sync_is_canonical_header(&self, hash: BlockHash, height: Height) -> Result<bool> {
-        self.state
-            .chain
-            .canonical_hash(height)
-            .map(|canonical| canonical == Some(hash))
-            .map_err(|error| anyhow::anyhow!("failed to read canonical header: {error}"))
+    #[cfg(test)]
+    fn native_sync_has_block(&self, hash: &BlockHash) -> Result<bool> {
+        let snapshot = self.state.store.snapshot()?;
+        NodeReadHandle::native_sync_has_block_from_snapshot(&snapshot, hash)
     }
 
-    fn shadow_sync_block(&self, hash: &BlockHash) -> Result<Option<Block>> {
-        self.state
-            .blocks
-            .load_block(hash)
-            .map_err(|error| anyhow::anyhow!("failed to load block: {error}"))
+    #[cfg(test)]
+    fn native_sync_header_record(&self, hash: &BlockHash) -> Result<Option<HeaderRecord>> {
+        let snapshot = self.state.store.snapshot()?;
+        NodeReadHandle::native_sync_header_record_from_snapshot(&snapshot, hash)
     }
 
-    fn shadow_sync_store_validated_blocks(
+    #[cfg(test)]
+    fn native_sync_block(&self, hash: &BlockHash) -> Result<Option<Block>> {
+        let snapshot = self.state.store.snapshot()?;
+        load_block_from_snapshot(&snapshot, hash).context("failed to load test block")
+    }
+
+    fn native_sync_store_validated_blocks(
         &mut self,
         blocks: Vec<(ValidatedBlock, bool)>,
     ) -> Result<Vec<BlockIndexRecord>> {
@@ -2707,7 +3004,7 @@ impl NodeService {
             let request = NodeBlockImport::from_peer(validated.block, validated.height);
             let import = self
                 .state
-                .validate_prevalidated_shadow_import(&request, canonical, stateless)?;
+                .validate_prevalidated_native_import(&request, canonical, stateless)?;
             candidates.push((request, import));
         }
         let result = self
@@ -2725,7 +3022,7 @@ impl NodeService {
         result
     }
 
-    fn shadow_sync_store_failed_block(
+    fn native_sync_store_failed_block(
         &mut self,
         block: Block,
         height: Height,
@@ -2742,28 +3039,85 @@ impl NodeService {
     }
 
     #[cfg(test)]
-    pub(super) fn shadow_sync_connect_stored_state(
+    pub(super) fn native_sync_connect_stored_state(
         &mut self,
         maximum_connect: usize,
     ) -> Result<ActiveStateConnectOutcome> {
-        self.shadow_sync_connect_stored_state_with_hint(maximum_connect, None)
+        self.native_sync_connect_stored_state_with_hint(maximum_connect, None)
     }
 
-    fn shadow_sync_connect_stored_state_with_hint(
+    #[cfg(test)]
+    fn native_sync_connect_stored_state_with_hint(
         &mut self,
         maximum_connect: usize,
         stored_tip_hint: Option<&ChainTip>,
     ) -> Result<ActiveStateConnectOutcome> {
         drive_active_state_connect_retries(maximum_connect, |attempt_limit| {
-            self.shadow_sync_connect_stored_state_once_with_hint(attempt_limit, stored_tip_hint)
+            self.native_sync_connect_stored_state_once_with_hint(attempt_limit, stored_tip_hint)
         })
     }
 
-    fn shadow_sync_connect_stored_state_once_with_hint(
+    #[cfg(test)]
+    fn native_sync_connect_stored_state_once_with_hint(
         &mut self,
         maximum_connect: usize,
         stored_tip_hint: Option<&ChainTip>,
     ) -> Result<ActiveStateConnectAttempt> {
+        let Some(plan) =
+            self.native_sync_plan_stored_state_once_with_hint(maximum_connect, stored_tip_hint)?
+        else {
+            return Ok(std::ops::ControlFlow::Continue(
+                ActiveStateConnectOutcome::default(),
+            ));
+        };
+        let validator = HnsBodyValidator::new(self.config.network);
+        let proofs = plan
+            .activation
+            .connect
+            .iter()
+            .map(|connect| {
+                validator
+                    .validate(connect.block(), connect.height())
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "stored block {} at height {} failed stateless replay validation: {}",
+                            connect.block().hash().to_hex(),
+                            connect.height(),
+                            error.reason
+                        )
+                    })?;
+                Ok(StatelessBodyValidation::for_block(
+                    connect.block(),
+                    connect.height(),
+                    self.config.network,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let workload = plan
+            .activation
+            .connect
+            .iter()
+            .fold(ActiveStateWorkload::default(), |total, connect| {
+                total.saturating_add(ActiveStateWorkload::for_block(connect.block()))
+            });
+        let prepared = PreparedNativeActivation::new(proofs)?;
+        self.native_sync_apply_prepared_active_state(PreparedActiveStatePlan {
+            epoch: plan.epoch,
+            activation: plan.activation,
+            prepared,
+            maximum_connect: plan.maximum_connect,
+            planning_micros: plan.planning_micros,
+            preparation: ActiveStatePreparationMetrics::default(),
+            workload,
+        })
+    }
+
+    #[cfg(test)]
+    fn native_sync_plan_stored_state_once_with_hint(
+        &self,
+        maximum_connect: usize,
+        stored_tip_hint: Option<&ChainTip>,
+    ) -> Result<Option<NativeActiveStatePlan>> {
         self.state.ensure_storage_operational()?;
         let planning_started = StdInstant::now();
         if maximum_connect == 0 || maximum_connect > MAX_ACTIVE_STATE_CONNECT_BATCH {
@@ -2772,16 +3126,20 @@ impl NodeService {
             );
         }
 
-        let Some(stored_tip) = self.shadow_sync_contiguous_body_tip(stored_tip_hint)? else {
-            return Ok(std::ops::ControlFlow::Continue(
-                ActiveStateConnectOutcome::default(),
-            ));
+        let stored_tip = {
+            let snapshot = self.state.store.snapshot()?;
+            NodeReadHandle::native_sync_contiguous_body_tip_from_snapshot(
+                &snapshot,
+                &self.state.chain,
+                stored_tip_hint,
+            )?
         };
-        let active_tip = self.shadow_sync_active_tip()?;
+        let Some(stored_tip) = stored_tip else {
+            return Ok(None);
+        };
+        let active_tip = self.state.best_block_tip()?;
         if active_tip.as_ref() == Some(&stored_tip) {
-            return Ok(std::ops::ControlFlow::Continue(
-                ActiveStateConnectOutcome::default(),
-            ));
+            return Ok(None);
         }
         // Direct IBD progress amortizes the ordered name-page durability
         // barrier across one HSD mainnet rollback horizon. The connector still
@@ -2814,9 +3172,7 @@ impl NodeService {
                         })?;
                 if canonical_active == Some(active.hash) {
                     if stored_tip.height <= active.height {
-                        return Ok(std::ops::ControlFlow::Continue(
-                            ActiveStateConnectOutcome::default(),
-                        ));
+                        return Ok(None);
                     }
                     let advance =
                         direct_connect_limit.min((stored_tip.height - active.height) as usize);
@@ -2844,47 +3200,43 @@ impl NodeService {
             NodeReorgLimits::with_maximum_connect(maximum_connect),
         )?
         else {
-            return Ok(std::ops::ControlFlow::Continue(
-                ActiveStateConnectOutcome::default(),
-            ));
+            return Ok(None);
         };
+        let planning_micros =
+            u64::try_from(planning_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
+        // The immutable inspector which calls this method runs in canonical
+        // writer order, so this chain epoch identifies the exact state used to
+        // materialize the activation. Mempool-only publications intentionally
+        // do not invalidate stateless block preparation.
+        let epoch = super::canonical_epoch_for_node(self, 0)?.chain();
+        Ok(Some(NativeActiveStatePlan {
+            epoch,
+            activation,
+            maximum_connect,
+            planning_micros,
+        }))
+    }
+
+    fn native_sync_apply_prepared_active_state(
+        &mut self,
+        plan: PreparedActiveStatePlan,
+    ) -> Result<ActiveStateConnectAttempt> {
+        let PreparedActiveStatePlan {
+            activation,
+            prepared,
+            maximum_connect,
+            planning_micros,
+            workload,
+            ..
+        } = plan;
         let attempted_connect = activation.connect.len();
 
         for connect in &activation.connect {
-            let summary = HeaderSummary::from_block(&connect.block, connect.height);
+            let summary = HeaderSummary::from_block(connect.block(), connect.height());
             self.mining_events.candidate_tip_seen(summary.clone());
             self.mining_events.block_syntax_validated(summary);
         }
-        let workload =
-            activation
-                .connect
-                .iter()
-                .fold(ActiveStateWorkload::default(), |mut total, connect| {
-                    total.transactions = total
-                        .transactions
-                        .saturating_add(connect.block.transactions.len());
-                    for (transaction_index, transaction) in
-                        connect.block.transactions.iter().enumerate()
-                    {
-                        if transaction_index != 0 {
-                            total.non_coinbase_inputs = total
-                                .non_coinbase_inputs
-                                .saturating_add(transaction.inputs.len());
-                        }
-                        total.outputs = total.outputs.saturating_add(transaction.outputs.len());
-                        total.name_actions = total.name_actions.saturating_add(
-                            transaction
-                                .outputs
-                                .iter()
-                                .filter(|output| output.covenant.kind != CovenantKind::None)
-                                .count(),
-                        );
-                    }
-                    total
-                });
-        let planning_micros =
-            u64::try_from(planning_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         let reconciliation_snapshot = self.state.store.snapshot()?;
         preflight_reorg_reconciliation_budget(
@@ -2906,10 +3258,7 @@ impl NodeService {
                 .reorg_started(activation.disconnect.len(), activation.connect.len());
         }
         let state_commit_started = StdInstant::now();
-        let mutation = self.state.apply_reorg_classified(NodeReorg {
-            disconnect: activation.disconnect,
-            connect: activation.connect,
-        });
+        let mutation = self.apply_reorg_classified_prepared(activation, prepared);
         let state_commit_micros =
             u64::try_from(state_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let post_commit_started = StdInstant::now();
@@ -2945,7 +3294,7 @@ impl NodeService {
                     block = %failure.request.block.hash().to_hex(),
                     height = failure.request.height,
                     reason = %failure.error,
-                    "durably rejecting contextual-invalid shadow branch"
+                    "durably rejecting contextual-invalid native branch"
                 );
                 let failed = self
                     .state
@@ -2985,9 +3334,192 @@ impl NodeService {
             }
         }
     }
+}
 
-    fn shadow_sync_contiguous_body_tip(&self, hint: Option<&ChainTip>) -> Result<Option<ChainTip>> {
-        let Some(best) = self.shadow_sync_best_header_tip()? else {
+impl NodeReadHandle {
+    fn native_sync_plan_stored_state_with_hint(
+        &self,
+        maximum_connect: usize,
+        stored_tip_hint: Option<&ChainTip>,
+    ) -> Result<Option<NativeActiveStatePlan>> {
+        let planning_started = StdInstant::now();
+        if maximum_connect == 0 || maximum_connect > MAX_ACTIVE_STATE_CONNECT_BATCH {
+            anyhow::bail!(
+                "active-state connector batch {maximum_connect} is outside 1..={MAX_ACTIVE_STATE_CONNECT_BATCH}"
+            );
+        }
+        let (epoch, activation) = self.with_stable_epoch_read(|store, headers| {
+            let snapshot = store.snapshot()?;
+            let stored_tip = Self::native_sync_contiguous_body_tip_from_snapshot(
+                &snapshot,
+                headers,
+                stored_tip_hint,
+            )?;
+            let Some(stored_tip) = stored_tip else {
+                return Ok(None);
+            };
+            let active_tip = best_block_tip_from_snapshot(&snapshot)?;
+            if active_tip.as_ref() == Some(&stored_tip) {
+                return Ok(None);
+            }
+
+            let direct_connect_limit = maximum_connect.min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+            let candidate_hash = match active_tip.as_ref() {
+                None => {
+                    let connect_count = direct_connect_limit.min(stored_tip.height as usize + 1);
+                    let height = Height::try_from(connect_count.saturating_sub(1))?;
+                    headers
+                        .canonical_hash(height)
+                        .context("failed to read initial connector target")?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("initial connector target height {height} is missing")
+                        })?
+                }
+                Some(active) => {
+                    let canonical_active = headers
+                        .canonical_hash(active.height)
+                        .context("failed to compare active and header chains")?;
+                    if canonical_active == Some(active.hash) {
+                        if stored_tip.height <= active.height {
+                            return Ok(None);
+                        }
+                        let advance =
+                            direct_connect_limit.min((stored_tip.height - active.height) as usize);
+                        let height = active
+                            .height
+                            .checked_add(Height::try_from(advance)?)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("active-state connector height overflow")
+                            })?;
+                        headers
+                            .canonical_hash(height)
+                            .context("failed to read connector target")?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("connector target height {height} is missing")
+                            })?
+                    } else {
+                        stored_tip.hash
+                    }
+                }
+            };
+
+            Self::native_sync_best_chain_activation_plan_from_snapshot(
+                &snapshot,
+                headers,
+                candidate_hash,
+                NodeReorgLimits::with_maximum_connect(maximum_connect),
+            )
+        })?;
+        Ok(activation.map(|activation| NativeActiveStatePlan {
+            epoch: epoch.chain(),
+            activation,
+            maximum_connect,
+            planning_micros: u64::try_from(planning_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX),
+        }))
+    }
+
+    fn native_sync_best_chain_activation_plan_from_snapshot(
+        base: &impl ReadSnapshot,
+        headers: &impl HeaderIndex,
+        candidate: BlockHash,
+        limits: NodeReorgLimits,
+    ) -> Result<Option<NodeReorg>> {
+        let reads = super::StagingOverlay::new();
+        let snapshot = reads.snapshot(base);
+        let candidate_record = load_block_index_record(&snapshot, &candidate)?
+            .ok_or_else(|| anyhow::anyhow!("candidate block index is missing"))?;
+        super::validate_block_header_binding(&snapshot, &candidate_record)?;
+        if candidate_record.status.failed || candidate_record.status.active_chain {
+            return Ok(None);
+        }
+        if !candidate_record.status.header_context_valid
+            || !candidate_record.status.body_present
+            || !candidate_record.status.body_syntax_valid
+            || !candidate_record.status.absolute_finality_valid
+        {
+            anyhow::bail!("candidate block is not eligible for best-chain activation");
+        }
+
+        let active = best_block_tip_from_snapshot(&snapshot)?;
+        if active
+            .as_ref()
+            .is_some_and(|tip| candidate_record.chainwork <= tip.chainwork)
+        {
+            return Ok(None);
+        }
+        let plan = match active.as_ref() {
+            Some(tip) => headers
+                .plan_reorg_between_bounded(
+                    &tip.hash,
+                    &candidate,
+                    NodeReorgLimits::PRODUCTION.header_limits(),
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to plan bounded best-chain reorg: {error}")
+                })?,
+            None => hns_chain::ReorgPlan {
+                disconnect: Vec::new(),
+                connect: super::stored_path_from_genesis_bounded(
+                    &snapshot,
+                    candidate,
+                    limits.maximum_connect,
+                )?,
+            },
+        };
+        super::validate_reorg_plan(&snapshot, active.as_ref(), candidate, &plan)?;
+        if plan.connect.len() > limits.maximum_connect {
+            anyhow::bail!(
+                "active-state reorganization needs more than {} replacement blocks before exceeding the active tip",
+                limits.maximum_connect
+            );
+        }
+
+        let disconnect = plan
+            .disconnect
+            .iter()
+            .map(|hash| {
+                let record = load_block_index_record(&snapshot, hash)?.ok_or_else(|| {
+                    anyhow::anyhow!("disconnect block index {} is missing", hash.to_hex())
+                })?;
+                Ok(super::NodeBlockDisconnect {
+                    block_hash: *hash,
+                    height: record.height,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut body_bytes = 0u64;
+        let mut connect = Vec::with_capacity(plan.connect.len());
+        for hash in &plan.connect {
+            connect.push(super::node_import_from_stored_bounded(
+                &snapshot,
+                hash,
+                &mut body_bytes,
+                limits.maximum_body_bytes,
+            )?);
+        }
+        Ok(Some(NodeReorg {
+            disconnect,
+            connect,
+        }))
+    }
+
+    fn native_sync_contiguous_body_tip(&self, hint: Option<&ChainTip>) -> Result<Option<ChainTip>> {
+        self.with_stable_read(|store, headers| {
+            let snapshot = store.snapshot()?;
+            Self::native_sync_contiguous_body_tip_from_snapshot(&snapshot, headers, hint)
+        })
+    }
+
+    fn native_sync_contiguous_body_tip_from_snapshot(
+        snapshot: &impl ReadSnapshot,
+        headers: &impl HeaderIndex,
+        hint: Option<&ChainTip>,
+    ) -> Result<Option<ChainTip>> {
+        let Some(best) = headers.best_tip().map_err(|error| {
+            anyhow::anyhow!("failed to read contiguous-body header tip: {error}")
+        })?
+        else {
             return Ok(None);
         };
 
@@ -2995,15 +3527,11 @@ impl NodeService {
         let mut start_height = 0;
         if let Some(hint) = hint {
             if hint.height <= best.height
-                && self
-                    .state
-                    .chain
+                && headers
                     .canonical_hash(hint.height)
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to validate stored-tip hint: {error}")
-                    })?
+                    .context("failed to validate stored-tip hint")?
                     == Some(hint.hash)
-                && self.shadow_sync_has_block(&hint.hash)?
+                && Self::native_sync_has_block_from_snapshot(snapshot, &hint.hash)?
             {
                 current = Some(hint.clone());
                 start_height = hint.height.saturating_add(1);
@@ -3011,17 +3539,16 @@ impl NodeService {
         }
 
         for height in start_height..=best.height {
-            let Some(hash) = self.state.chain.canonical_hash(height).map_err(|error| {
-                anyhow::anyhow!("failed to inspect canonical body chain: {error}")
-            })?
+            let Some(hash) = headers
+                .canonical_hash(height)
+                .context("failed to inspect canonical body chain")?
             else {
                 break;
             };
-            if !self.shadow_sync_has_block(&hash)? {
+            if !Self::native_sync_has_block_from_snapshot(snapshot, &hash)? {
                 break;
             }
-            let record = self
-                .shadow_sync_header_record(&hash)?
+            let record = Self::native_sync_header_record_from_snapshot(snapshot, &hash)?
                 .ok_or_else(|| anyhow::anyhow!("canonical header {} is missing", hash.to_hex()))?;
             current = Some(ChainTip {
                 hash,
@@ -3032,53 +3559,69 @@ impl NodeService {
         Ok(current)
     }
 
-    fn shadow_sync_queue_missing_canonical_bodies(
+    fn native_sync_queue_missing_canonical_bodies(
         &self,
         scheduler: &mut SyncScheduler,
     ) -> Result<usize> {
-        if self.config.shadow_sync.headers_only {
+        let config = self.config();
+        if config.native_sync.headers_only {
             return Ok(0);
         }
-        let contiguous = self.shadow_sync_contiguous_body_tip(scheduler.stored_tip())?;
-        if scheduler.stored_tip() != contiguous.as_ref() {
-            scheduler.set_stored_tip(contiguous.clone());
-        }
-
-        let Some(best) = self.shadow_sync_best_header_tip()? else {
-            return Ok(0);
-        };
-        let start_height = contiguous
-            .as_ref()
-            .map_or(0, |tip| tip.height.saturating_add(1));
-        let body_window = Height::try_from(self.config.shadow_sync.orphan_blocks)
+        let hint = scheduler.stored_tip().cloned();
+        let body_window = Height::try_from(config.native_sync.orphan_blocks)
             .context("orphan block horizon exceeds the canonical height range")?;
         if body_window == 0 {
             anyhow::bail!("orphan block horizon is zero");
         }
-        // Canonical validated bodies are durable even when a lower parent body
-        // has not arrived, but the downloader must not create an unbounded
-        // future-body range on disk. Advancing the contiguous stored tip slides
-        // this focused window forward.
-        let last_height = start_height
-            .saturating_add(body_window.saturating_sub(1))
-            .min(best.height);
+        let (contiguous, candidates) = self.with_stable_read(|store, headers| {
+            let snapshot = store.snapshot()?;
+            let contiguous = Self::native_sync_contiguous_body_tip_from_snapshot(
+                &snapshot,
+                headers,
+                hint.as_ref(),
+            )?;
+            let Some(best) = headers.best_tip().map_err(|error| {
+                anyhow::anyhow!("failed to read body-queue header tip: {error}")
+            })?
+            else {
+                return Ok((contiguous, Vec::new()));
+            };
+            let start_height = contiguous
+                .as_ref()
+                .map_or(0, |tip| tip.height.saturating_add(1));
+            // Canonical validated bodies are durable even when a lower parent
+            // body has not arrived, but this bounded horizon prevents an
+            // unbounded future-body range on disk.
+            let last_height = start_height
+                .saturating_add(body_window.saturating_sub(1))
+                .min(best.height);
+            let mut candidates = Vec::new();
+            for height in start_height..=last_height {
+                let Some(hash) = headers
+                    .canonical_hash(height)
+                    .context("failed to read canonical body target")?
+                else {
+                    break;
+                };
+                if !Self::native_sync_has_block_from_snapshot(&snapshot, &hash)? {
+                    candidates.push((hash, height));
+                }
+            }
+            Ok((contiguous, candidates))
+        })?;
+        if scheduler.stored_tip() != contiguous.as_ref() {
+            scheduler.set_stored_tip(contiguous.clone());
+        }
         let mut queued = 0usize;
         let mut available = scheduler.available_pending_slots();
         if available == 0 {
             return Ok(0);
         }
-
-        for height in start_height..=last_height {
+        for (hash, height) in candidates {
             if available == 0 {
                 break;
             }
-            let Some(hash) = self.state.chain.canonical_hash(height).map_err(|error| {
-                anyhow::anyhow!("failed to read canonical body target: {error}")
-            })?
-            else {
-                break;
-            };
-            if self.shadow_sync_has_block(&hash)? || scheduler.is_tracked_block(&hash) {
+            if scheduler.is_tracked_block(&hash) {
                 continue;
             }
             if scheduler
@@ -3092,170 +3635,196 @@ impl NodeService {
         Ok(queued)
     }
 
-    fn shadow_sync_block_locator(&self, maximum: usize) -> Result<Vec<BlockHash>> {
+    fn native_sync_block_locator(&self, maximum: usize) -> Result<Vec<BlockHash>> {
         if maximum == 0 {
             return Ok(Vec::new());
         }
-        let Some(tip) = self.shadow_sync_best_header_tip()? else {
-            return Ok(vec![self.config.network.params().genesis_hash]);
-        };
+        let config = self.config();
+        self.with_stable_read(|_store, headers| {
+            let Some(tip) = headers
+                .best_tip()
+                .map_err(|error| anyhow::anyhow!("failed to read locator header tip: {error}"))?
+            else {
+                return Ok(vec![config.network.params().genesis_hash]);
+            };
 
-        let mut locator = Vec::with_capacity(maximum.min(MAX_LOCATOR_ENTRIES));
-        let mut height = tip.height;
-        let mut step = 1u32;
-        while locator.len() < maximum {
-            if let Some(hash) = self
-                .state
-                .chain
-                .canonical_hash(height)
-                .map_err(|error| anyhow::anyhow!("failed to read locator header: {error}"))?
-            {
-                locator.push(hash);
+            let mut locator = Vec::with_capacity(maximum.min(MAX_LOCATOR_ENTRIES));
+            let mut height = tip.height;
+            let mut step = 1u32;
+            while locator.len() < maximum {
+                if let Some(hash) = headers
+                    .canonical_hash(height)
+                    .context("failed to read locator header")?
+                {
+                    locator.push(hash);
+                }
+                if height == 0 {
+                    break;
+                }
+                if locator.len() >= 10 {
+                    step = step.saturating_mul(2);
+                }
+                height = height.saturating_sub(step);
             }
-            if height == 0 {
-                break;
+            if !locator.contains(&config.network.params().genesis_hash) {
+                locator.push(config.network.params().genesis_hash);
             }
-            if locator.len() >= 10 {
-                step = step.saturating_mul(2);
-            }
-            height = height.saturating_sub(step);
-        }
-        if !locator.contains(&self.config.network.params().genesis_hash) {
-            locator.push(self.config.network.params().genesis_hash);
-        }
-        locator.truncate(maximum);
-        Ok(locator)
+            locator.truncate(maximum);
+            Ok(locator)
+        })
     }
 
-    fn shadow_sync_headers_after_locator(
+    fn native_sync_headers_after_locator(
         &self,
         locator: &[BlockHash],
         stop: BlockHash,
         maximum: usize,
     ) -> Result<Vec<Header>> {
         let maximum = maximum.min(MAX_SERVED_HEADERS);
-        let Some(best) = self.shadow_sync_best_header_tip()? else {
-            return Ok(Vec::new());
-        };
+        self.with_stable_read(|store, headers| {
+            let snapshot = store.snapshot()?;
+            let Some(best) = headers
+                .best_tip()
+                .map_err(|error| anyhow::anyhow!("failed to read served-header tip: {error}"))?
+            else {
+                return Ok(Vec::new());
+            };
 
-        let mut start_height = 0;
-        'locator: for hash in locator {
-            if let Some(record) = self.shadow_sync_header_record(hash)? {
-                if self
-                    .state
-                    .chain
-                    .canonical_hash(record.height)
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to inspect canonical header: {error}")
-                    })?
-                    == Some(*hash)
+            let mut start_height = 0;
+            'locator: for hash in locator {
+                if let Some(record) =
+                    Self::native_sync_header_record_from_snapshot(&snapshot, hash)?
                 {
-                    start_height = record.height.saturating_add(1);
-                    break 'locator;
+                    if headers
+                        .canonical_hash(record.height)
+                        .context("failed to inspect canonical header")?
+                        == Some(*hash)
+                    {
+                        start_height = record.height.saturating_add(1);
+                        break 'locator;
+                    }
                 }
             }
-        }
 
-        let mut headers = Vec::with_capacity(maximum);
-        for height in start_height..=best.height {
-            if headers.len() >= maximum {
-                break;
+            let mut served = Vec::with_capacity(maximum);
+            for height in start_height..=best.height {
+                if served.len() >= maximum {
+                    break;
+                }
+                let Some(hash) = headers
+                    .canonical_hash(height)
+                    .context("failed to read canonical header")?
+                else {
+                    break;
+                };
+                let record = Self::native_sync_header_record_from_snapshot(&snapshot, &hash)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("canonical header {} is missing", hash.to_hex())
+                    })?;
+                served.push(record.header);
+                if stop != BlockHash::ZERO && hash == stop {
+                    break;
+                }
             }
-            let Some(hash) = self
-                .state
-                .chain
-                .canonical_hash(height)
-                .map_err(|error| anyhow::anyhow!("failed to read canonical header: {error}"))?
-            else {
-                break;
-            };
-            let record = self
-                .shadow_sync_header_record(&hash)?
-                .ok_or_else(|| anyhow::anyhow!("canonical header {} is missing", hash.to_hex()))?;
-            headers.push(record.header);
-            if stop != BlockHash::ZERO && hash == stop {
-                break;
-            }
-        }
-        Ok(headers)
+            Ok(served)
+        })
     }
 
-    /// Build Core's parent-authority response with O(1) keyed reads while the
-    /// native-sync coordinator lock excludes a concurrent chain transition.
-    /// The general diagnostic snapshot intentionally remains richer and may
-    /// scan state; parent requalification must not put that work in the mining
-    /// critical path.
+    /// Build Core's parent-authority response with O(1) keyed reads from one
+    /// immutable store snapshot and its matching published generation.
     fn parent_authority_value(&self, hash: BlockHash) -> Result<serde_json::Value> {
-        let snapshot = self.state.store.snapshot()?;
-        let active_tip = best_block_tip_from_snapshot(&snapshot)?;
-        let best_header = best_header_tip_from_snapshot(&snapshot)?;
-        let header = load_header_record(&snapshot, &hash)?
-            .ok_or_else(|| anyhow::anyhow!("block header not found"))?;
-        if read_canonical_hash(&snapshot, header.height)? != Some(hash) {
-            anyhow::bail!("block header is not canonical");
-        }
+        let config = self.config();
+        for _ in 0..8 {
+            let result = self.with_stable_read(|store, headers| {
+                let published = self.published();
+                let snapshot = store.snapshot()?;
+                let active_tip = best_block_tip_from_snapshot(&snapshot)?;
+                let best_header = headers.best_tip().map_err(|error| {
+                    anyhow::anyhow!("failed to read parent-authority header tip: {error}")
+                })?;
+                let generation = mining_generation_from_snapshot(&snapshot)?;
+                if published.canonical_epoch().tip != active_tip
+                    || published.mining_generation() != generation
+                {
+                    anyhow::bail!(
+                        "published parent-authority generation disagrees with durable state"
+                    );
+                }
 
-        let generation = mining_generation_from_snapshot(&snapshot)?;
-        let (mining_snapshot, authoritative) = match active_tip.as_ref() {
-            Some(tip) => {
-                let (mining_snapshot, authoritative) = mining_snapshot_for_hash(
-                    &snapshot,
-                    self.config.network.canonical_id(),
-                    tip.hash,
+                let header = load_header_record(&snapshot, &hash)?
+                    .ok_or_else(|| anyhow::anyhow!("block header not found"))?;
+                if read_canonical_hash(&snapshot, header.height)? != Some(hash) {
+                    anyhow::bail!("block header is not canonical");
+                }
+                let (mining_snapshot, authoritative) = match active_tip.as_ref() {
+                    Some(tip) => {
+                        let (mining_snapshot, authoritative) = mining_snapshot_for_hash(
+                            &snapshot,
+                            config.network.canonical_id(),
+                            tip.hash,
+                            generation,
+                        )?;
+                        (Some(mining_snapshot), authoritative)
+                    }
+                    None => (None, false),
+                };
+                let durable = DurableMiningState {
                     generation,
-                )?;
-                (Some(mining_snapshot), authoritative)
-            }
-            None => (None, false),
-        };
-        let durable = DurableMiningState {
-            generation,
-            snapshot: mining_snapshot,
-            authoritative,
-            synchronized: match (&best_header, &active_tip) {
-                (Some(best), Some(active)) => best == active,
-                _ => false,
-            },
-        };
-        let authority = authority_info(&self.config, &durable);
-        let tip_validation = match active_tip.as_ref() {
-            Some(tip) => load_block_index_record(&snapshot, &tip.hash)?.map(|record| record.status),
-            None => None,
-        };
-        let confirmations = active_tip
-            .as_ref()
-            .and_then(|tip| tip.height.checked_sub(header.height))
-            .map_or(0, |depth| depth.saturating_add(1));
-        let pending_best_chain_activation = match (&best_header, &active_tip) {
-            (Some(best), Some(active)) => {
-                best.hash != active.hash && best.chainwork > active.chainwork
-            }
-            (Some(_), None) => true,
-            _ => false,
-        };
+                    snapshot: mining_snapshot,
+                    authoritative,
+                    synchronized: match (&best_header, &active_tip) {
+                        (Some(best), Some(active)) => best == active,
+                        _ => false,
+                    },
+                };
+                let authority = authority_info(&config, &durable);
+                let tip_validation = match active_tip.as_ref() {
+                    Some(tip) => {
+                        load_block_index_record(&snapshot, &tip.hash)?.map(|record| record.status)
+                    }
+                    None => None,
+                };
+                let confirmations = active_tip
+                    .as_ref()
+                    .and_then(|tip| tip.height.checked_sub(header.height))
+                    .map_or(0, |depth| depth.saturating_add(1));
+                let pending_best_chain_activation = match (&best_header, &active_tip) {
+                    (Some(best), Some(active)) => {
+                        best.hash != active.hash && best.chainwork > active.chainwork
+                    }
+                    (Some(_), None) => true,
+                    _ => false,
+                };
 
-        Ok(serde_json::json!({
-            "api_version": HSRD_DIAGNOSTIC_API_VERSION,
-            "network": self.config.network.to_string(),
-            "rpc_authentication_required": self.config.rpc_authorization.is_some(),
-            "chain": {
-                "blocks": active_tip.as_ref().map_or(0, |tip| tip.height),
-                "headers": best_header.as_ref().map_or(0, |tip| tip.height),
-                "bestblockhash": active_tip.as_ref().map(|tip| tip.hash.to_hex()),
-                "chainwork": active_tip.as_ref().map(|tip| format!("{:x}", tip.chainwork)).unwrap_or_else(|| "0".to_owned()),
-            },
-            "header": {
-                "hash": header.hash.to_hex(),
-                "confirmations": confirmations,
-                "height": header.height,
-                "time": header.header.time,
-                "chainwork": format!("{:x}", header.chainwork),
-            },
-            "authority": authority,
-            "authoritative_mining_tip": self.mining_events.snapshot().is_some(),
-            "pending_best_chain_activation": pending_best_chain_activation,
-            "tip_validation": tip_validation,
-        }))
+                Ok(serde_json::json!({
+                "api_version": HSRD_DIAGNOSTIC_API_VERSION,
+                "network": config.network.to_string(),
+                "rpc_authentication_required": config.rpc_authorization.is_some(),
+                "chain": {
+                    "blocks": active_tip.as_ref().map_or(0, |tip| tip.height),
+                    "headers": best_header.as_ref().map_or(0, |tip| tip.height),
+                    "bestblockhash": active_tip.as_ref().map(|tip| tip.hash.to_hex()),
+                    "chainwork": active_tip.as_ref().map(|tip| format!("{:x}", tip.chainwork)).unwrap_or_else(|| "0".to_owned()),
+                },
+                "header": {
+                    "hash": header.hash.to_hex(),
+                    "confirmations": confirmations,
+                    "height": header.height,
+                    "time": header.header.time,
+                    "chainwork": format!("{:x}", header.chainwork),
+                },
+                "authority": authority,
+                "authoritative_mining_tip": published.authoritative_mining_snapshot().is_some(),
+                "pending_best_chain_activation": pending_best_chain_activation,
+                "tip_validation": tip_validation,
+                }))
+            });
+            match result {
+                Err(error) if canonical_writer_stale(&error) => continue,
+                result => return result,
+            }
+        }
+        anyhow::bail!("canonical state changed repeatedly during parent-authority read")
     }
 }
 
@@ -3273,9 +3842,9 @@ fn decode_rpc_block_hash(value: &str) -> Result<BlockHash> {
 }
 
 #[derive(Clone)]
-struct ShadowSyncHttpState {
-    node: Arc<Mutex<NodeService>>,
-    diagnostics: Arc<RwLock<ShadowSyncDiagnostics>>,
+struct NativeSyncHttpState {
+    node: NodeReadHandle,
+    diagnostics: Arc<RwLock<NativeSyncDiagnostics>>,
     diagnostic_rpc: Arc<RwLock<CachedDiagnosticRpc>>,
     read_context: RpcReadContext,
     limits: RpcLimits,
@@ -3287,9 +3856,9 @@ struct CachedDiagnosticRpc {
     captured_at: u64,
 }
 
-async fn serve_shadow_sync_rpc(
+async fn serve_native_sync_rpc(
     listener: TcpListener,
-    state: ShadowSyncHttpState,
+    state: NativeSyncHttpState,
     authorization: Option<RpcAuthorizationHeader>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -3297,15 +3866,14 @@ async fn serve_shadow_sync_rpc(
     limits.validate()?;
     let runtime_limits = RpcRuntimeLimits::new(limits);
     let app = Router::new()
-        .route("/", post(handle_shadow_sync_rpc))
-        .route("/rpc", post(handle_shadow_sync_rpc))
-        .route("/api/v1/status", get(handle_shadow_sync_status))
-        .route("/api/v1/authority", get(handle_shadow_sync_authority))
-        .route("/api/v1/parity", get(handle_shadow_sync_parity))
-        .route("/api/v1/peers", get(handle_shadow_sync_peers))
-        .route("/api/v1/sync", get(handle_shadow_sync_sync))
-        .route("/api/v1/native-sync", get(handle_shadow_sync_diagnostics))
-        .route("/api/v1/shadow-sync", get(handle_shadow_sync_diagnostics))
+        .route("/", post(handle_native_sync_rpc))
+        .route("/rpc", post(handle_native_sync_rpc))
+        .route("/api/v1/status", get(handle_native_sync_status))
+        .route("/api/v1/authority", get(handle_native_sync_authority))
+        .route("/api/v1/parity", get(handle_native_sync_parity))
+        .route("/api/v1/peers", get(handle_native_sync_peers))
+        .route("/api/v1/sync", get(handle_native_sync_sync))
+        .route("/api/v1/native-sync", get(handle_native_sync_diagnostics))
         .route("/api/v1/header-deployments", get(handle_header_deployments))
         .route(
             "/api/v1/mining-engine",
@@ -3332,62 +3900,57 @@ async fn serve_shadow_sync_rpc(
         .context("Native sync RPC server failed")
 }
 
-fn compose_shadow_sync_rpc_service(
-    node: &NodeService,
-    diagnostics: &ShadowSyncDiagnostics,
+async fn compose_native_sync_rpc_service(
+    node: &NodeReadHandle,
+    diagnostics: &NativeSyncDiagnostics,
 ) -> Result<BasicRpcService> {
-    let mut snapshot = node.rpc_diagnostic_snapshot()?;
+    let config = node.config();
+    let diagnostic = node.rpc_diagnostic_service().await?;
+    let mut snapshot = diagnostic.snapshot().clone();
     snapshot.network_active = diagnostics.enabled;
     snapshot.peer_count = diagnostics.peers.len();
     snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
     snapshot.node_status.hip76 = rpc_hip76_info(&diagnostics.peers);
-    snapshot.node_status.release_stage = if node.config.mainnet_canary {
+    snapshot.node_status.release_stage = if config.mainnet_canary {
         "mainnet-canary-gated".to_owned()
-    } else if node.config.mining_engine.enabled {
+    } else if config.mining_engine.enabled {
         "mining-engine-observe".to_owned()
     } else {
         "native-sync-live-p2p".to_owned()
     };
-    snapshot.node_status.parity.configured = false;
-    snapshot.node_status.parity.live_shadow_active = false;
-    snapshot.node_status.parity.state =
-        "historical-replay-qualified-native-no-live-oracle".to_owned();
     Ok(BasicRpcService::new(snapshot))
 }
 
 async fn initialize_cached_diagnostic_rpc(
-    node: &Arc<Mutex<NodeService>>,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    node: &NodeReadHandle,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<Arc<RwLock<CachedDiagnosticRpc>>> {
     let diagnostics = diagnostics.read().await.clone();
-    let node = node.lock().await;
     Ok(Arc::new(RwLock::new(CachedDiagnosticRpc {
-        service: compose_shadow_sync_rpc_service(&node, &diagnostics)?,
+        service: compose_native_sync_rpc_service(node, &diagnostics).await?,
         captured_at: unix_time(),
     })))
 }
 
 async fn refresh_cached_diagnostic_rpc(
-    node: &Arc<Mutex<NodeService>>,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    node: &NodeReadHandle,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
     diagnostic_rpc: &Arc<RwLock<CachedDiagnosticRpc>>,
 ) -> Result<()> {
     let diagnostics = diagnostics.read().await.clone();
-    let node = node.lock().await;
-    let service = compose_shadow_sync_rpc_service(&node, &diagnostics)?;
+    let service = compose_native_sync_rpc_service(node, &diagnostics).await?;
     *diagnostic_rpc.write().await = CachedDiagnosticRpc {
         service,
         captured_at: unix_time(),
     };
-    drop(node);
     Ok(())
 }
 
-async fn available_mempool_info_rpc(state: &ShadowSyncHttpState) -> Result<BasicRpcService> {
+async fn available_mempool_info_rpc(state: &NativeSyncHttpState) -> Result<BasicRpcService> {
     // Aggregate reads are O(1): never clone the transaction collection merely
     // because its generation changed.
     let base = state.diagnostic_rpc.read().await.service.clone();
-    let mempool_info = state.node.lock().await.state.mempool.info();
+    let mempool_info = state.node.published_mempool()?.info;
     let mut snapshot = base.snapshot().clone();
     snapshot.mempool_info = mempool_info;
     snapshot.mempool_entries.clear();
@@ -3395,12 +3958,12 @@ async fn available_mempool_info_rpc(state: &ShadowSyncHttpState) -> Result<Basic
 }
 
 async fn available_diagnostic_rpc(
-    state: &ShadowSyncHttpState,
+    state: &NativeSyncHttpState,
 ) -> Result<(BasicRpcService, bool, u64)> {
     // The storage-derived base remains a sync-loop capture. Overlay only the
     // already-bounded live diagnostic fields so peer/network RPCs do not stay
-    // frozen at startup and request handling still never takes the node lock
-    // or scans durable state.
+    // frozen at startup and request handling does not enqueue a writer command
+    // or scan durable state.
     let cached = state.diagnostic_rpc.read().await.clone();
     let diagnostics = state.diagnostics.read().await;
     let mut snapshot: RpcSnapshot = cached.service.snapshot().clone();
@@ -3415,8 +3978,8 @@ async fn available_diagnostic_rpc(
     Ok((BasicRpcService::new(snapshot), true, cached.captured_at))
 }
 
-async fn handle_shadow_sync_rpc(
-    State(state): State<ShadowSyncHttpState>,
+async fn handle_native_sync_rpc(
+    State(state): State<NativeSyncHttpState>,
     body: Bytes,
 ) -> Json<JsonRpcResponse> {
     let request = match serde_json::from_slice::<JsonRpcRequest>(&body) {
@@ -3477,17 +4040,22 @@ async fn handle_shadow_sync_rpc(
                 "RPC collection-worker concurrency limit exceeded".to_owned(),
             ));
         };
-        let node = Arc::clone(&state.node);
         let limits = state.limits;
         let base = state.diagnostic_rpc.read().await.service.snapshot().clone();
+        let mempool = match state.node.rpc_request_mempool(&request).await {
+            Ok(mempool) => mempool,
+            Err(error) => {
+                return Json(json_rpc_error(
+                    id,
+                    -32603,
+                    format!("failed to inspect mempool: {error}"),
+                ));
+            }
+        };
         let worker_request = request;
         let worker_id = id.clone();
         let response = tokio::task::spawn_blocking(move || {
             let _collection_permit = collection_permit;
-            let mempool = {
-                let node = node.blocking_lock();
-                node.rpc_request_mempool(&worker_request)
-            };
             if mempool.info.transaction_count > limits.maximum_collection_entries {
                 return json_rpc_error(
                     worker_id,
@@ -3548,10 +4116,10 @@ async fn handle_shadow_sync_rpc(
                 "RPC point-read concurrency limit exceeded".to_owned(),
             ));
         };
-        let node = Arc::clone(&state.node);
+        let node = state.node.clone();
         let result = match tokio::task::spawn_blocking(move || {
             let _point_read_permit = point_read_permit;
-            node.blocking_lock().parent_authority_value(hash)
+            node.parent_authority_value(hash)
         })
         .await
         {
@@ -3583,10 +4151,19 @@ async fn handle_shadow_sync_rpc(
                 "RPC point-read concurrency limit exceeded".to_owned(),
             ));
         };
-        let mempool_node = if method == RpcMethod::GetRawTransaction {
-            Some(Arc::clone(&state.node))
+        let mempool = if method == RpcMethod::GetRawTransaction {
+            match state.node.rpc_request_mempool(&request).await {
+                Ok(mempool) => mempool,
+                Err(error) => {
+                    return Json(json_rpc_error(
+                        id,
+                        -32603,
+                        format!("failed to inspect mempool: {error}"),
+                    ));
+                }
+            }
         } else {
-            None
+            Default::default()
         };
         let diagnostics = state.diagnostics.read().await;
         let network_active = diagnostics.enabled;
@@ -3596,9 +4173,6 @@ async fn handle_shadow_sync_rpc(
         let read_request = request;
         let response = match tokio::task::spawn_blocking(move || -> Result<JsonRpcResponse> {
             let _point_read_permit = point_read_permit;
-            let mempool = mempool_node
-                .map(|node| node.blocking_lock().rpc_request_mempool(&read_request))
-                .unwrap_or_default();
             let service = read_context.service_for_request(
                 &read_request,
                 mempool,
@@ -3637,7 +4211,7 @@ async fn handle_shadow_sync_rpc(
     }
 }
 
-async fn diagnostic_method(state: &ShadowSyncHttpState, method: &str) -> serde_json::Value {
+async fn diagnostic_method(state: &NativeSyncHttpState, method: &str) -> serde_json::Value {
     match available_diagnostic_rpc(state).await {
         Ok((service, cached, captured_at)) => {
             let response = service.handle(JsonRpcRequest {
@@ -3676,7 +4250,7 @@ async fn diagnostic_method(state: &ShadowSyncHttpState, method: &str) -> serde_j
 }
 
 async fn cached_json_rpc_diagnostic(
-    state: &ShadowSyncHttpState,
+    state: &NativeSyncHttpState,
     request: JsonRpcRequest,
 ) -> Json<JsonRpcResponse> {
     let id = request.id.clone();
@@ -3701,53 +4275,70 @@ async fn cached_json_rpc_diagnostic(
     }
 }
 
-async fn handle_shadow_sync_status(
-    State(state): State<ShadowSyncHttpState>,
+async fn handle_native_sync_status(
+    State(state): State<NativeSyncHttpState>,
 ) -> Json<serde_json::Value> {
     Json(diagnostic_method(&state, "gethsrdstatus").await)
 }
 
-async fn handle_shadow_sync_authority(
-    State(state): State<ShadowSyncHttpState>,
+async fn handle_native_sync_authority(
+    State(state): State<NativeSyncHttpState>,
 ) -> Json<serde_json::Value> {
     Json(diagnostic_method(&state, "getauthorityinfo").await)
 }
 
-async fn handle_shadow_sync_parity(
-    State(state): State<ShadowSyncHttpState>,
+async fn handle_native_sync_parity(
+    State(state): State<NativeSyncHttpState>,
 ) -> Json<serde_json::Value> {
     Json(diagnostic_method(&state, "getparityinfo").await)
 }
 
-async fn handle_shadow_sync_peers(
-    State(state): State<ShadowSyncHttpState>,
+async fn handle_native_sync_peers(
+    State(state): State<NativeSyncHttpState>,
 ) -> Json<Vec<PeerSnapshot>> {
     Json(state.diagnostics.read().await.peers.clone())
 }
 
-async fn handle_shadow_sync_sync(State(state): State<ShadowSyncHttpState>) -> Json<SyncSnapshot> {
+async fn handle_native_sync_sync(State(state): State<NativeSyncHttpState>) -> Json<SyncSnapshot> {
     Json(state.diagnostics.read().await.sync.clone())
 }
 
-async fn handle_shadow_sync_diagnostics(
-    State(state): State<ShadowSyncHttpState>,
-) -> Json<ShadowSyncDiagnostics> {
+async fn handle_native_sync_diagnostics(
+    State(state): State<NativeSyncHttpState>,
+) -> Json<NativeSyncDiagnostics> {
     Json(state.diagnostics.read().await.clone())
 }
 
 async fn handle_header_deployments(
-    State(state): State<ShadowSyncHttpState>,
+    State(state): State<NativeSyncHttpState>,
 ) -> Json<serde_json::Value> {
-    let node = state.node.lock().await;
-    Json(match node.shadow_sync_header_deployments() {
-        Ok(diagnostics) => serde_json::to_value(diagnostics)
+    let Some(point_read_permit) = state.read_context.try_acquire_point_read() else {
+        return Json(serde_json::json!({
+            "error": "RPC point-read concurrency limit exceeded"
+        }));
+    };
+    let node = state.node.clone();
+    let now = StdInstant::now();
+    let deadline = now
+        .checked_add(state.limits.execution_timeout)
+        .unwrap_or(now);
+    let result = tokio::task::spawn_blocking(move || {
+        let _point_read_permit = point_read_permit;
+        node.native_sync_header_deployments(deadline, MAX_HEADER_DEPLOYMENT_READS)
+    })
+    .await;
+    Json(match result {
+        Ok(Ok(diagnostics)) => serde_json::to_value(diagnostics)
             .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() })),
-        Err(error) => serde_json::json!({ "error": error.to_string() }),
+        Ok(Err(error)) => serde_json::json!({ "error": error.to_string() }),
+        Err(error) => {
+            serde_json::json!({ "error": format!("header deployment worker failed: {error}") })
+        }
     })
 }
 
 async fn handle_mining_engine_diagnostics(
-    State(state): State<ShadowSyncHttpState>,
+    State(state): State<NativeSyncHttpState>,
 ) -> Json<serde_json::Value> {
     Json(diagnostic_method(&state, "getminingengineinfo").await)
 }
@@ -3755,7 +4346,8 @@ async fn handle_mining_engine_diagnostics(
 #[allow(clippy::too_many_arguments)]
 async fn handle_peer_event(
     event: PeerEvent,
-    node: &Arc<Mutex<NodeService>>,
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
@@ -3767,7 +4359,7 @@ async fn handle_peer_event(
     pending_compact_blocks: &mut HashMap<BlockHash, PendingCompactBlock>,
     discovery: bool,
     headers_only: bool,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     match event {
         PeerEvent::Connected {
@@ -3856,7 +4448,7 @@ async fn handle_peer_event(
         PeerEvent::Packet { peer, packet } => match packet {
             Packet::Headers(headers) => {
                 let header_count = headers.len();
-                let imported = import_header_packet(node, headers).await;
+                let imported = import_header_packet(writer, headers).await;
                 let imported = match imported {
                     Ok(imported) => imported,
                     Err(error) if error.downcast_ref::<MissingHeaderParent>().is_some() => {
@@ -3883,11 +4475,8 @@ async fn handle_peer_event(
                         // unchanged durable index before disconnecting the
                         // sender so the scheduler retries from the last
                         // complete protocol batch.
-                        {
-                            let node = node.lock().await;
-                            scheduler.set_best_header(node.shadow_sync_best_header_tip()?);
-                            node.shadow_sync_queue_missing_canonical_bodies(scheduler)?;
-                        }
+                        scheduler.set_best_header(node.native_sync_best_header_tip()?);
+                        node.native_sync_queue_missing_canonical_bodies(scheduler)?;
                         penalize_peer(peers, peer, 100, "peer header batch rejected").await?;
                         update_diagnostics(diagnostics, |state| {
                             state.rejected_messages = state.rejected_messages.saturating_add(1);
@@ -3897,11 +4486,8 @@ async fn handle_peer_event(
                     }
                 };
                 scheduler.note_headers_response(peer, header_count);
-                {
-                    let node = node.lock().await;
-                    scheduler.set_best_header(node.shadow_sync_best_header_tip()?);
-                    node.shadow_sync_queue_missing_canonical_bodies(scheduler)?;
-                }
+                scheduler.set_best_header(node.native_sync_best_header_tip()?);
+                node.native_sync_queue_missing_canonical_bodies(scheduler)?;
                 update_diagnostics(diagnostics, |state| {
                     state.received_headers =
                         state.received_headers.saturating_add(imported.len() as u64);
@@ -3921,25 +4507,24 @@ async fn handle_peer_event(
                         {
                             continue;
                         }
-                        let missing = {
-                            let node = node.lock().await;
-                            if !node.config.mining_engine.enabled
-                                || !node.config.mining_engine.transaction_relay
-                            {
-                                false
-                            } else {
-                                match item.kind {
-                                    InventoryKind::Transaction => node
-                                        .mining_engine_mempool_transaction(&Txid::new(item.hash))
-                                        .is_none(),
-                                    InventoryKind::Claim => {
-                                        node.mining_engine_mempool_claim(&item.hash).is_none()
-                                    }
-                                    InventoryKind::Airdrop => {
-                                        node.mining_engine_mempool_airdrop(&item.hash).is_none()
-                                    }
-                                    _ => false,
+                        let config = node.config();
+                        let missing = if !config.mining_engine.enabled
+                            || !config.mining_engine.transaction_relay
+                        {
+                            false
+                        } else {
+                            match item.kind {
+                                InventoryKind::Transaction => node
+                                    .mempool_transaction(Txid::new(item.hash))
+                                    .await?
+                                    .is_none(),
+                                InventoryKind::Claim => {
+                                    node.mempool_claim(item.hash).await?.is_none()
                                 }
+                                InventoryKind::Airdrop => {
+                                    node.mempool_airdrop(item.hash).await?.is_none()
+                                }
+                                _ => false,
                             }
                         };
                         if missing {
@@ -3956,16 +4541,10 @@ async fn handle_peer_event(
                         continue;
                     }
                     let hash = BlockHash::new(item.hash);
-                    let record = {
-                        let node = node.lock().await;
-                        node.shadow_sync_header_record(&hash)?
-                    };
+                    let record = node.native_sync_header_record(&hash)?;
                     match record {
                         Some(record) if !headers_only => {
-                            let has_body = {
-                                let node = node.lock().await;
-                                node.shadow_sync_has_block(&hash)?
-                            };
+                            let has_body = node.native_sync_has_block(&hash)?;
                             if !has_body {
                                 scheduler
                                     .announce_block(peer, hash, record.height)
@@ -4010,18 +4589,16 @@ async fn handle_peer_event(
                 })
                 .await;
                 if !headers_only {
-                    accept_peer_block(peer, block, node, peers, validation, scheduler).await?;
+                    accept_peer_block(peer, block, node, writer, peers, validation, scheduler)
+                        .await?;
                 }
             }
             Packet::GetHeaders(locator) => {
-                let headers = {
-                    let node = node.lock().await;
-                    node.shadow_sync_headers_after_locator(
-                        &locator.locator,
-                        locator.stop,
-                        MAX_SERVED_HEADERS,
-                    )?
-                };
+                let headers = node.native_sync_headers_after_locator(
+                    &locator.locator,
+                    locator.stop,
+                    MAX_SERVED_HEADERS,
+                )?;
                 update_diagnostics(diagnostics, |state| {
                     state.served_headers =
                         state.served_headers.saturating_add(headers.len() as u64);
@@ -4037,14 +4614,11 @@ async fn handle_peer_event(
                     .map_err(|error| anyhow::anyhow!("failed to serve headers: {error}"))?;
             }
             Packet::GetBlocks(locator) => {
-                let headers = {
-                    let node = node.lock().await;
-                    node.shadow_sync_headers_after_locator(
-                        &locator.locator,
-                        locator.stop,
-                        MAX_GETDATA_ITEMS,
-                    )?
-                };
+                let headers = node.native_sync_headers_after_locator(
+                    &locator.locator,
+                    locator.stop,
+                    MAX_GETDATA_ITEMS,
+                )?;
                 let inventory = headers
                     .into_iter()
                     .map(|header| Inventory::block(header.hash()))
@@ -4068,15 +4642,13 @@ async fn handle_peer_event(
                 for item in items {
                     match item.kind {
                         InventoryKind::Transaction => {
-                            let transaction = {
-                                let node = node.lock().await;
-                                if node.config.mining_engine.enabled
-                                    && node.config.mining_engine.transaction_relay
-                                {
-                                    node.mining_engine_mempool_transaction(&Txid::new(item.hash))
-                                } else {
-                                    None
-                                }
+                            let config = node.config();
+                            let transaction = if config.mining_engine.enabled
+                                && config.mining_engine.transaction_relay
+                            {
+                                node.mempool_transaction(Txid::new(item.hash)).await?
+                            } else {
+                                None
                             };
                             match transaction {
                                 Some(transaction) => {
@@ -4100,15 +4672,13 @@ async fn handle_peer_event(
                             }
                         }
                         InventoryKind::Claim => {
-                            let claim = {
-                                let node = node.lock().await;
-                                if node.config.mining_engine.enabled
-                                    && node.config.mining_engine.transaction_relay
-                                {
-                                    node.mining_engine_mempool_claim(&item.hash)
-                                } else {
-                                    None
-                                }
+                            let config = node.config();
+                            let claim = if config.mining_engine.enabled
+                                && config.mining_engine.transaction_relay
+                            {
+                                node.mempool_claim(item.hash).await?
+                            } else {
+                                None
                             };
                             match claim {
                                 Some(claim) => {
@@ -4131,15 +4701,13 @@ async fn handle_peer_event(
                             }
                         }
                         InventoryKind::Airdrop => {
-                            let proof = {
-                                let node = node.lock().await;
-                                if node.config.mining_engine.enabled
-                                    && node.config.mining_engine.transaction_relay
-                                {
-                                    node.mining_engine_mempool_airdrop(&item.hash)
-                                } else {
-                                    None
-                                }
+                            let config = node.config();
+                            let proof = if config.mining_engine.enabled
+                                && config.mining_engine.transaction_relay
+                            {
+                                node.mempool_airdrop(item.hash).await?
+                            } else {
+                                None
                             };
                             match proof {
                                 Some(proof) => {
@@ -4164,10 +4732,7 @@ async fn handle_peer_event(
                         }
                         InventoryKind::Block | InventoryKind::FilteredBlock => {
                             let hash = BlockHash::new(item.hash);
-                            let block = {
-                                let node = node.lock().await;
-                                node.shadow_sync_block(&hash)?
-                            };
+                            let block = node.native_sync_block(&hash)?;
                             match block {
                                 Some(block) => {
                                     peers
@@ -4190,10 +4755,7 @@ async fn handle_peer_event(
                         }
                         InventoryKind::CompactBlock => {
                             let hash = BlockHash::new(item.hash);
-                            let block = {
-                                let node = node.lock().await;
-                                node.shadow_sync_block(&hash)?
-                            };
+                            let block = node.native_sync_block(&hash)?;
                             match block {
                                 Some(block) if compact_peers.contains(&peer) => {
                                     peers
@@ -4275,16 +4837,13 @@ async fn handle_peer_event(
                 .await;
             }
             Packet::Mempool => {
-                let inventory = {
-                    let node = node.lock().await;
-                    if node.config.mining_engine.enabled
-                        && node.config.mining_engine.transaction_relay
-                    {
-                        node.mining_engine_mempool_inventory(MAX_GETDATA_ITEMS)
+                let config = node.config();
+                let inventory =
+                    if config.mining_engine.enabled && config.mining_engine.transaction_relay {
+                        node.mempool_inventory(MAX_GETDATA_ITEMS).await?
                     } else {
                         Vec::new()
-                    }
-                };
+                    };
                 peers
                     .try_send(
                         peer,
@@ -4304,10 +4863,9 @@ async fn handle_peer_event(
                     state.received_transactions = state.received_transactions.saturating_add(1);
                 })
                 .await;
-                let admission = {
-                    let mut node = node.lock().await;
-                    node.mining_engine_accept_peer_transaction(transaction)?
-                };
+                let admission = writer
+                    .mining_engine_accept_peer_transaction(transaction)
+                    .await?;
                 match admission {
                     Admission::Accepted(txid) => {
                         let report = peers
@@ -4341,10 +4899,7 @@ async fn handle_peer_event(
                     state.received_claims = state.received_claims.saturating_add(1);
                 })
                 .await;
-                let admission = {
-                    let mut node = node.lock().await;
-                    node.mining_engine_accept_peer_claim(claim)?
-                };
+                let admission = writer.mining_engine_accept_peer_claim(claim).await?;
                 match admission {
                     ClaimAdmission::Accepted(hash) => {
                         let report = peers
@@ -4371,10 +4926,7 @@ async fn handle_peer_event(
                     state.received_airdrops = state.received_airdrops.saturating_add(1);
                 })
                 .await;
-                let admission = {
-                    let mut node = node.lock().await;
-                    node.mining_engine_accept_peer_airdrop(proof)?
-                };
+                let admission = writer.mining_engine_accept_peer_airdrop(proof).await?;
                 match admission {
                     AirdropAdmission::Accepted(hash) => {
                         let report = peers
@@ -4406,6 +4958,7 @@ async fn handle_peer_event(
                     peer,
                     compact,
                     node,
+                    writer,
                     peers,
                     validation,
                     scheduler,
@@ -4424,6 +4977,7 @@ async fn handle_peer_event(
                     peer,
                     response,
                     node,
+                    writer,
                     peers,
                     validation,
                     scheduler,
@@ -4496,29 +5050,33 @@ async fn handle_peer_event(
 }
 
 async fn import_header_packet(
-    node: &Arc<Mutex<NodeService>>,
+    writer: &CanonicalStateWriter,
     headers: Vec<Header>,
 ) -> Result<Vec<HeaderRecord>> {
-    if headers.len() > MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE {
+    if headers.len() > MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE {
         anyhow::bail!("peer sent too many headers: {}", headers.len());
     }
 
-    let mut node = node.lock().await;
-    node.shadow_sync_import_headers(headers)
+    writer
+        .execute(None, "import native-sync header packet", move |node| {
+            node.native_sync_import_headers(headers)
+        })
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_compact_block(
     peer: PeerId,
     compact: CompactBlock,
-    node: &Arc<Mutex<NodeService>>,
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     compact_peers: &HashSet<PeerId>,
     pending: &mut HashMap<BlockHash, PendingCompactBlock>,
     headers_only: bool,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let hash = compact.hash();
     update_diagnostics(diagnostics, |state| {
@@ -4555,10 +5113,9 @@ async fn handle_compact_block(
         anyhow::bail!("peer {peer:?} exceeded the pending compact-block bound");
     }
 
-    let mempool = {
-        let node = node.lock().await;
-        node.mining_engine_mempool_transactions(hns_p2p::MAX_COMPACT_BLOCK_TRANSACTIONS)
-    };
+    let mempool = node
+        .mempool_transactions(hns_p2p::MAX_COMPACT_BLOCK_TRANSACTIONS)
+        .await?;
     let reconstruction = match compact.reconstruct(&mempool) {
         Ok(reconstruction) => reconstruction,
         Err(CompactBlockError::ShortIdCollision(short_id)) => {
@@ -4583,7 +5140,7 @@ async fn handle_compact_block(
             state.received_blocks = state.received_blocks.saturating_add(1);
         })
         .await;
-        return accept_peer_block(peer, block, node, peers, validation, scheduler).await;
+        return accept_peer_block(peer, block, node, writer, peers, validation, scheduler).await;
     }
 
     let request = reconstruction.missing_request();
@@ -4614,12 +5171,13 @@ async fn handle_compact_block(
 async fn handle_block_transactions(
     peer: PeerId,
     response: CompactBlockResponse,
-    node: &Arc<Mutex<NodeService>>,
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     pending: &mut HashMap<BlockHash, PendingCompactBlock>,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let hash = response.block_hash;
     let Some(expected_peer) = pending.get(&hash).map(|pending| pending.peer) else {
@@ -4647,14 +5205,14 @@ async fn handle_block_transactions(
         state.received_blocks = state.received_blocks.saturating_add(1);
     })
     .await;
-    accept_peer_block(peer, block, node, peers, validation, scheduler).await
+    accept_peer_block(peer, block, node, writer, peers, validation, scheduler).await
 }
 
 async fn request_full_block_fallback(
     peer: PeerId,
     hash: BlockHash,
     peers: &LivePeerManager,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     peers
         .try_send(
@@ -4674,24 +5232,33 @@ async fn request_full_block_fallback(
 async fn serve_block_transactions(
     peer: PeerId,
     request: CompactBlockRequest,
-    node: &Arc<Mutex<NodeService>>,
+    node: &NodeReadHandle,
     peers: &LivePeerManager,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let block_hash = request.block_hash;
-    let block = {
-        let node = node.lock().await;
-        let Some(record) = node.shadow_sync_header_record(&block_hash)? else {
-            drop(node);
-            penalize_peer(peers, peer, 100, "getblocktxn requested an unknown block").await?;
-            anyhow::bail!("peer {peer:?} requested transactions for unknown block");
+    let (known, too_old, block) = node.with_stable_read(|store, _headers| {
+        let snapshot = store.snapshot()?;
+        let Some(record) = load_header_record(&snapshot, &block_hash)? else {
+            return Ok((false, false, None));
         };
-        let active_height = node.shadow_sync_active_tip()?.map_or(0, |tip| tip.height);
+        let active_height = best_block_tip_from_snapshot(&snapshot)?.map_or(0, |tip| tip.height);
         if record.height.saturating_add(15) < active_height {
-            return Ok(());
+            return Ok((true, true, None));
         }
-        node.shadow_sync_block(&block_hash)?
-    };
+        Ok((
+            true,
+            false,
+            load_block_from_snapshot(&snapshot, &block_hash)?,
+        ))
+    })?;
+    if !known {
+        penalize_peer(peers, peer, 100, "getblocktxn requested an unknown block").await?;
+        anyhow::bail!("peer {peer:?} requested transactions for unknown block");
+    }
+    if too_old {
+        return Ok(());
+    }
     let Some(block) = block else {
         penalize_peer(
             peers,
@@ -4724,34 +5291,35 @@ async fn serve_block_transactions(
 async fn accept_peer_block(
     peer: PeerId,
     block: Block,
-    node: &Arc<Mutex<NodeService>>,
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
 ) -> Result<()> {
     let hash = block.hash();
-    let mut record = {
-        let node = node.lock().await;
-        let record = node.shadow_sync_header_record(&hash)?;
-        if record.as_ref().is_some_and(|record| record.status.failed) {
-            drop(node);
-            scheduler.reject_block(Some(peer), hash, false, StdInstant::now());
-            penalize_peer(peers, peer, 100, "known invalid block branch").await?;
-            anyhow::bail!("peer {:?} sent known invalid block {}", peer, hash.to_hex());
-        }
-        if node.shadow_sync_has_block(&hash)? {
-            scheduler.complete_block(hash);
-            return Ok(());
-        }
-        record
-    };
+    let (mut record, has_body) = node.with_stable_read(|store, _headers| {
+        let snapshot = store.snapshot()?;
+        let record = NodeReadHandle::native_sync_header_record_from_snapshot(&snapshot, &hash)?;
+        let has_body = NodeReadHandle::native_sync_has_block_from_snapshot(&snapshot, &hash)?;
+        Ok((record, has_body))
+    })?;
+    if record.as_ref().is_some_and(|record| record.status.failed) {
+        scheduler.reject_block(Some(peer), hash, false, StdInstant::now());
+        penalize_peer(peers, peer, 100, "known invalid block branch").await?;
+        anyhow::bail!("peer {:?} sent known invalid block {}", peer, hash.to_hex());
+    }
+    if has_body {
+        scheduler.complete_block(hash);
+        return Ok(());
+    }
     if record.is_none() {
         let parent_known = {
-            let node = node.lock().await;
-            if block.header == node.config.network.params().genesis_header() {
+            let config = node.config();
+            if block.header == config.network.params().genesis_header() {
                 true
             } else {
-                node.shadow_sync_header_record(&block.header.prev_block)?
+                node.native_sync_header_record(&block.header.prev_block)?
                     .is_some()
             }
         };
@@ -4770,10 +5338,14 @@ async fn accept_peer_block(
             );
         }
 
-        let imported = {
-            let mut node = node.lock().await;
-            node.shadow_sync_import_headers(vec![block.header.clone()])
-        };
+        let header = block.header.clone();
+        let imported = writer
+            .execute(
+                None,
+                "import delivered native-sync block header",
+                move |node| node.native_sync_import_headers(vec![header]),
+            )
+            .await;
         record = match imported {
             Ok(imported) => imported.into_iter().next(),
             Err(error) => {
@@ -4781,11 +5353,8 @@ async fn accept_peer_block(
                 return Err(error.context("peer block header rejected"));
             }
         };
-        {
-            let node = node.lock().await;
-            scheduler.set_best_header(node.shadow_sync_best_header_tip()?);
-            node.shadow_sync_queue_missing_canonical_bodies(scheduler)?;
-        }
+        scheduler.set_best_header(node.native_sync_best_header_tip()?);
+        node.native_sync_queue_missing_canonical_bodies(scheduler)?;
     }
 
     let record = record.ok_or_else(|| anyhow::anyhow!("imported block header has no record"))?;
@@ -4825,14 +5394,11 @@ async fn accept_peer_block(
 
 async fn request_headers_from_peer(
     peer: PeerId,
-    node: &Arc<Mutex<NodeService>>,
+    node: &NodeReadHandle,
     peers: &LivePeerManager,
     scheduler: &mut SyncScheduler,
 ) -> Result<()> {
-    let locator = {
-        let node = node.lock().await;
-        node.shadow_sync_block_locator(MAX_LOCATOR_ENTRIES)?
-    };
+    let locator = node.native_sync_block_locator(MAX_LOCATOR_ENTRIES)?;
     let action = scheduler
         .request_headers_from(peer, StdInstant::now(), &locator, BlockHash::ZERO)
         .map_err(|error| anyhow::anyhow!("failed to schedule headers request: {error}"))?;
@@ -4856,24 +5422,30 @@ async fn request_headers_from_peer(
 
 async fn submit_released_orphans(
     parent: BlockHash,
-    node: &Arc<Mutex<NodeService>>,
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     orphans: &mut BoundedOrphanPool,
 ) -> Result<()> {
     for block in orphans.take_children(parent) {
         let hash = block.hash();
-        let record = {
-            let mut node = node.lock().await;
-            match node.shadow_sync_header_record(&hash)? {
-                Some(record) => record,
-                None => node
-                    .shadow_sync_import_headers(vec![block.header.clone()])?
+        let record = match node.native_sync_header_record(&hash)? {
+            Some(record) => record,
+            None => {
+                let header = block.header.clone();
+                writer
+                    .execute(
+                        None,
+                        "import released native-sync orphan header",
+                        move |node| node.native_sync_import_headers(vec![header]),
+                    )
+                    .await?
                     .into_iter()
                     .next()
                     .ok_or_else(|| {
                         anyhow::anyhow!("released orphan header import returned no record")
-                    })?,
+                    })?
             }
         };
         scheduler.begin_local_validation(hash);
@@ -4900,9 +5472,8 @@ async fn submit_released_orphans(
             };
             for evicted in outcome.evicted {
                 let evicted_hash = evicted.hash();
-                let node = node.lock().await;
-                if let Some(evicted_record) = node.shadow_sync_header_record(&evicted_hash)? {
-                    if !node.shadow_sync_has_block(&evicted_hash)? {
+                if let Some(evicted_record) = node.native_sync_header_record(&evicted_hash)? {
+                    if !node.native_sync_has_block(&evicted_hash)? {
                         scheduler
                             .requeue_tracked_block(evicted_hash, evicted_record.height)
                             .context("failed to requeue orphan evicted during queue recovery")?;
@@ -4916,14 +5487,19 @@ async fn submit_released_orphans(
     Ok(())
 }
 
+struct ValidationResultContext<'a> {
+    node: &'a NodeReadHandle,
+    writer: &'a CanonicalStateWriter,
+    peers: &'a LivePeerManager,
+    validation: &'a ValidationSubmitter,
+    diagnostics: &'a Arc<RwLock<NativeSyncDiagnostics>>,
+}
+
 async fn handle_validation_results(
     results: Vec<OrderedValidationResult>,
-    node: &Arc<Mutex<NodeService>>,
-    peers: &LivePeerManager,
-    validation: &ValidationSubmitter,
+    context: &ValidationResultContext<'_>,
     scheduler: &mut SyncScheduler,
     orphans: &mut BoundedOrphanPool,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
 ) -> Result<()> {
     let mut validated = Vec::new();
     let mut first_failure = None;
@@ -4935,17 +5511,24 @@ async fn handle_validation_results(
                 if !validated.is_empty() {
                     handle_validated_blocks(
                         std::mem::take(&mut validated),
-                        node,
-                        validation,
+                        context.node,
+                        context.writer,
+                        context.validation,
                         scheduler,
                         orphans,
-                        diagnostics,
+                        context.diagnostics,
                     )
                     .await?;
                 }
-                if let Err(error) =
-                    handle_validation_failure(failure, node, peers, scheduler, orphans, diagnostics)
-                        .await
+                if let Err(error) = handle_validation_failure(
+                    failure,
+                    context.writer,
+                    context.peers,
+                    scheduler,
+                    orphans,
+                    context.diagnostics,
+                )
+                .await
                 {
                     first_failure.get_or_insert(error);
                 }
@@ -4954,8 +5537,16 @@ async fn handle_validation_results(
     }
 
     if !validated.is_empty() {
-        handle_validated_blocks(validated, node, validation, scheduler, orphans, diagnostics)
-            .await?;
+        handle_validated_blocks(
+            validated,
+            context.node,
+            context.writer,
+            context.validation,
+            scheduler,
+            orphans,
+            context.diagnostics,
+        )
+        .await?;
     }
 
     match first_failure {
@@ -4966,23 +5557,19 @@ async fn handle_validation_results(
 
 async fn handle_validated_blocks(
     validated: Vec<ValidatedBlock>,
-    node: &Arc<Mutex<NodeService>>,
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     orphans: &mut BoundedOrphanPool,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let mut eligible = Vec::with_capacity(validated.len());
     for validated in validated {
         let hash = validated.block.hash();
-        let (parent_available, canonical) = {
-            let node = node.lock().await;
-            (
-                validated.block.header == node.config.network.params().genesis_header()
-                    || node.shadow_sync_has_block(&validated.block.header.prev_block)?,
-                node.shadow_sync_is_canonical_header(hash, validated.height)?,
-            )
-        };
+        let parent_available = validated.block.header == node.network().params().genesis_header()
+            || node.native_sync_has_block(&validated.block.header.prev_block)?;
+        let canonical = node.native_sync_is_canonical_header(hash, validated.height)?;
         if parent_available || canonical {
             eligible.push((validated, canonical));
             continue;
@@ -5001,9 +5588,8 @@ async fn handle_validated_blocks(
         };
         for evicted in outcome.evicted {
             let evicted_hash = evicted.hash();
-            let node = node.lock().await;
-            if let Some(record) = node.shadow_sync_header_record(&evicted_hash)? {
-                if !node.shadow_sync_has_block(&evicted_hash)? {
+            if let Some(record) = node.native_sync_header_record(&evicted_hash)? {
+                if !node.native_sync_has_block(&evicted_hash)? {
                     scheduler
                         .requeue_tracked_block(evicted_hash, record.height)
                         .context("failed to requeue evicted orphan body")?;
@@ -5025,10 +5611,39 @@ async fn handle_validated_blocks(
         .iter()
         .map(|(validated, _)| validated.block.hash())
         .collect::<Vec<_>>();
-    let stored = {
-        let mut node = node.lock().await;
-        node.shadow_sync_store_validated_blocks(eligible)?
-    };
+    let mut stored = None;
+    for attempt in 0..MAX_CANONICAL_STALE_RETRIES {
+        if attempt != 0 {
+            for (validated, canonical) in &mut eligible {
+                *canonical =
+                    node.native_sync_is_canonical_header(validated.block.hash(), validated.height)?;
+            }
+        }
+        let epoch = node.canonical_epoch();
+        let batch = eligible.clone();
+        match writer
+            .execute_at_chain(
+                epoch.chain(),
+                "store validated native-sync body batch",
+                move |node| node.native_sync_store_validated_blocks(batch),
+            )
+            .await
+        {
+            Ok(records) => {
+                stored = Some(records);
+                break;
+            }
+            Err(error)
+                if canonical_writer_stale(&error) && attempt + 1 < MAX_CANONICAL_STALE_RETRIES =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let stored = stored.ok_or_else(|| {
+        anyhow::anyhow!("validated native-sync body batch exhausted stale-epoch retries")
+    })?;
     if stored.len() != expected.len()
         || stored
             .iter()
@@ -5040,32 +5655,29 @@ async fn handle_validated_blocks(
     for hash in &expected {
         scheduler.complete_block(*hash);
     }
-    {
-        let node = node.lock().await;
-        let stored_tip = node.shadow_sync_contiguous_body_tip(scheduler.stored_tip())?;
-        if scheduler.stored_tip() != stored_tip.as_ref() {
-            scheduler.set_stored_tip(stored_tip);
-        }
-        node.shadow_sync_queue_missing_canonical_bodies(scheduler)?;
+    let stored_tip = node.native_sync_contiguous_body_tip(scheduler.stored_tip())?;
+    if scheduler.stored_tip() != stored_tip.as_ref() {
+        scheduler.set_stored_tip(stored_tip);
     }
+    node.native_sync_queue_missing_canonical_bodies(scheduler)?;
     let stored_count = u64::try_from(stored.len()).unwrap_or(u64::MAX);
     update_diagnostics(diagnostics, |state| {
         state.stored_bodies = state.stored_bodies.saturating_add(stored_count);
     })
     .await;
     for record in stored {
-        submit_released_orphans(record.hash, node, validation, scheduler, orphans).await?;
+        submit_released_orphans(record.hash, node, writer, validation, scheduler, orphans).await?;
     }
     Ok(())
 }
 
 async fn handle_validation_failure(
     failure: ValidationFailure,
-    node: &Arc<Mutex<NodeService>>,
+    writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
     scheduler: &mut SyncScheduler,
     orphans: &mut BoundedOrphanPool,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let hash = failure.block.hash();
     match failure.kind {
@@ -5113,10 +5725,13 @@ async fn handle_validation_failure(
         ValidationFailureKind::InvalidBlock => {}
     }
 
-    let stored = {
-        let mut node = node.lock().await;
-        node.shadow_sync_store_failed_block(failure.block, failure.height)
-    };
+    let failed_height = failure.height;
+    let failed_block = failure.block;
+    let stored = writer
+        .execute(None, "store failed native-sync block", move |node| {
+            node.native_sync_store_failed_block(failed_block, failed_height)
+        })
+        .await;
     let stored = match stored {
         Ok(stored) => stored,
         Err(error) => {
@@ -5161,51 +5776,374 @@ async fn handle_validation_failure(
     );
 }
 
-#[cfg(test)]
-pub(super) async fn connect_stored_active_state(
-    node: &Arc<Mutex<NodeService>>,
-    peers: &LivePeerManager,
-    scheduler: &mut SyncScheduler,
-    orphans: &mut BoundedOrphanPool,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
-    maximum_connect: usize,
-) -> Result<()> {
-    let diagnostic_rpc = initialize_cached_diagnostic_rpc(node, diagnostics).await?;
-    connect_stored_active_state_with_diagnostic_rpc(
-        node,
-        peers,
-        scheduler,
-        orphans,
-        diagnostics,
-        &diagnostic_rpc,
+fn accumulate_active_state_preparation(
+    total: &mut ActiveStatePreparationMetrics,
+    attempt: ActiveStatePreparationMetrics,
+) {
+    total.blocks = total.blocks.saturating_add(attempt.blocks);
+    total.wall_micros = total.wall_micros.saturating_add(attempt.wall_micros);
+    total.aggregate_worker_micros = total
+        .aggregate_worker_micros
+        .saturating_add(attempt.aggregate_worker_micros);
+    total.maximum_in_flight = total.maximum_in_flight.max(attempt.maximum_in_flight);
+}
+
+type ActiveStateValidator =
+    Arc<dyn Fn(&Block, Height) -> std::result::Result<(), ValidationRejection> + Send + Sync>;
+
+async fn prepare_native_active_state_plan_with_validator(
+    plan: NativeActiveStatePlan,
+    network: Network,
+    workers: usize,
+    queue_capacity: usize,
+    validate: ActiveStateValidator,
+) -> Result<PreparedActiveStatePlan> {
+    let NativeActiveStatePlan {
+        epoch,
+        activation,
         maximum_connect,
+        planning_micros,
+    } = plan;
+    let NodeReorg {
+        disconnect,
+        connect,
+    } = activation;
+    let block_count = connect.len();
+    let started = StdInstant::now();
+    if block_count == 0 {
+        return Ok(PreparedActiveStatePlan {
+            epoch,
+            activation: NodeReorg {
+                disconnect,
+                connect,
+            },
+            prepared: PreparedNativeActivation::new(Vec::new())?,
+            maximum_connect,
+            planning_micros,
+            preparation: ActiveStatePreparationMetrics::default(),
+            workload: ActiveStateWorkload::default(),
+        });
+    }
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let maximum_in_flight = Arc::new(AtomicUsize::new(0));
+    let work = Arc::new({
+        let in_flight = Arc::clone(&in_flight);
+        let maximum_in_flight = Arc::clone(&maximum_in_flight);
+        let validate = Arc::clone(&validate);
+        move |input: &NativeActiveStatePreparationInput| {
+            let _permit =
+                ActiveStateWorkerPermit::acquire(Arc::clone(&in_flight), &maximum_in_flight);
+            let worker_started = StdInstant::now();
+            validate(input.import.block(), input.import.height())?;
+            Ok::<_, ValidationRejection>(NativeActiveStatePreparationOutput {
+                proof: StatelessBodyValidation::for_block(
+                    input.import.block(),
+                    input.import.height(),
+                    network,
+                ),
+                worker_micros: u64::try_from(worker_started.elapsed().as_micros())
+                    .unwrap_or(u64::MAX),
+                workload: ActiveStateWorkload::for_block(input.import.block()),
+            })
+        }
+    });
+    let (submitter, mut results) = spawn_ordered_work_pipeline(work, workers, queue_capacity)
+        .map_err(|error| {
+            anyhow::anyhow!("failed to start ordered active-state preparation: {error}")
+        })?;
+    let cancellation = submitter.clone();
+    let producer = tokio::spawn(async move {
+        for (ordinal, import) in connect.into_iter().enumerate() {
+            if let Err(error) = submitter
+                .submit(NativeActiveStatePreparationInput { ordinal, import })
+                .await
+            {
+                submitter.cancel();
+                return Err(anyhow::anyhow!(
+                    "ordered active-state preparation rejected block {ordinal}: {error}"
+                ));
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let mut prepared_connect = Vec::with_capacity(block_count);
+    let mut proofs = Vec::with_capacity(block_count);
+    let mut aggregate_worker_micros = 0u64;
+    let mut workload = ActiveStateWorkload::default();
+    for ordinal in 0..block_count {
+        let Some(result) = results.recv().await else {
+            cancellation.cancel();
+            let producer_result = producer.await;
+            if let Ok(Err(error)) = producer_result {
+                return Err(error);
+            }
+            return Err(anyhow::anyhow!(
+                "ordered active-state preparation closed after {ordinal} of {block_count} blocks"
+            ));
+        };
+        match result {
+            Ok(success) => {
+                if success.sequence != ordinal as u64 || success.input.ordinal != ordinal {
+                    cancellation.cancel();
+                    let _ = producer.await;
+                    anyhow::bail!(
+                        "ordered active-state preparation emitted sequence {} / input {} at ordinal {ordinal}",
+                        success.sequence,
+                        success.input.ordinal
+                    );
+                }
+                let input = match Arc::try_unwrap(success.input) {
+                    Ok(input) => input,
+                    Err(_) => {
+                        cancellation.cancel();
+                        let _ = producer.await;
+                        anyhow::bail!(
+                            "ordered active-state preparation retained input {ordinal} after completion"
+                        );
+                    }
+                };
+                aggregate_worker_micros =
+                    aggregate_worker_micros.saturating_add(success.output.worker_micros);
+                workload = workload.saturating_add(success.output.workload);
+                prepared_connect.push(input.import);
+                proofs.push(success.output.proof);
+            }
+            Err(failure) => {
+                cancellation.cancel();
+                let _ = producer.await;
+                let hash = failure.input.import.block().hash();
+                let height = failure.input.import.height();
+                match failure.error {
+                    OrderedWorkError::Work(rejection) => anyhow::bail!(
+                        "local stored-body integrity failure: block {} at height {} failed ordered stateless replay validation ({:?}): {}",
+                        hash.to_hex(),
+                        height,
+                        rejection.kind,
+                        rejection.reason
+                    ),
+                    OrderedWorkError::Panicked(message) => anyhow::bail!(
+                        "ordered stateless replay worker panicked for block {} at height {}: {message}",
+                        hash.to_hex(),
+                        height
+                    ),
+                    OrderedWorkError::Cancelled => anyhow::bail!(
+                        "ordered stateless replay worker was cancelled for block {} at height {}",
+                        hash.to_hex(),
+                        height
+                    ),
+                }
+            }
+        }
+    }
+    producer
+        .await
+        .context("ordered active-state producer task failed")??;
+    drop(cancellation);
+
+    Ok(PreparedActiveStatePlan {
+        epoch,
+        activation: NodeReorg {
+            disconnect,
+            connect: prepared_connect,
+        },
+        prepared: PreparedNativeActivation::new(proofs)?,
+        maximum_connect,
+        planning_micros,
+        preparation: ActiveStatePreparationMetrics {
+            blocks: block_count,
+            wall_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            aggregate_worker_micros,
+            maximum_in_flight: maximum_in_flight.load(Ordering::Acquire),
+            stale_retries: 0,
+        },
+        workload,
+    })
+}
+
+async fn execute_native_active_state_slice(
+    node: NodeReadHandle,
+    writer: CanonicalStateWriter,
+    maximum_connect: usize,
+    stored_tip_hint: Option<ChainTip>,
+    workers: usize,
+    queue_capacity: usize,
+) -> Result<NativeActiveStateSliceResult> {
+    let network = node.network();
+    let validator = HnsBodyValidator::new(network);
+    execute_native_active_state_slice_with_validator(
+        node,
+        writer,
+        maximum_connect,
+        stored_tip_hint,
+        workers,
+        queue_capacity,
+        Arc::new(move |block: &Block, height: Height| validator.validate(block, height)),
     )
     .await
 }
 
-async fn connect_stored_active_state_with_diagnostic_rpc(
-    node: &Arc<Mutex<NodeService>>,
+async fn execute_native_active_state_slice_with_validator(
+    node: NodeReadHandle,
+    writer: CanonicalStateWriter,
+    maximum_connect: usize,
+    stored_tip_hint: Option<ChainTip>,
+    workers: usize,
+    queue_capacity: usize,
+    validate: ActiveStateValidator,
+) -> Result<NativeActiveStateSliceResult> {
+    let slice_started = StdInstant::now();
+    let mut attempt_limit = maximum_connect;
+    let mut stale_retries = 0usize;
+    let mut preparation = ActiveStatePreparationMetrics::default();
+    loop {
+        let plan = match node
+            .native_sync_plan_stored_state_with_hint(attempt_limit, stored_tip_hint.as_ref())
+        {
+            Ok(plan) => plan,
+            Err(error)
+                if canonical_writer_stale(&error)
+                    && stale_retries + 1 < MAX_CANONICAL_STALE_RETRIES =>
+            {
+                stale_retries = stale_retries.saturating_add(1);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(plan) = plan else {
+            preparation.stale_retries = stale_retries;
+            return Ok(NativeActiveStateSliceResult {
+                outcome: ActiveStateConnectOutcome::default(),
+                preparation,
+                wall_millis: u64::try_from(slice_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+        };
+        let prepared = prepare_native_active_state_plan_with_validator(
+            plan,
+            node.network(),
+            workers,
+            queue_capacity,
+            Arc::clone(&validate),
+        )
+        .await
+        .context(
+            "local stored-body preparation failed; canonical state was not mutated and no peer is attributable",
+        )?;
+        let attempt_preparation = prepared.preparation;
+        let expected = prepared.epoch.clone();
+        let result = writer
+            .execute_at_chain(
+                expected,
+                "commit prepared native-sync active-state slice",
+                move |service| service.native_sync_apply_prepared_active_state(prepared),
+            )
+            .await;
+        accumulate_active_state_preparation(&mut preparation, attempt_preparation);
+        match result {
+            Ok(std::ops::ControlFlow::Continue(outcome)) => {
+                preparation.stale_retries = stale_retries;
+                return Ok(NativeActiveStateSliceResult {
+                    outcome,
+                    preparation,
+                    wall_millis: u64::try_from(slice_started.elapsed().as_millis())
+                        .unwrap_or(u64::MAX),
+                });
+            }
+            Ok(std::ops::ControlFlow::Break(DirectStagedEffectLimit {
+                retry_connect,
+                limit,
+                actual,
+            })) => {
+                if retry_connect == 0 || retry_connect >= attempt_limit {
+                    anyhow::bail!(
+                        "direct active-state retry limit {retry_connect} does not reduce attempted limit {attempt_limit}"
+                    );
+                }
+                tracing::warn!(
+                    retry_connect,
+                    limit,
+                    actual,
+                    "prepared active-state slice exceeded its atomic effect budget; replanning a smaller rollback-safe slice"
+                );
+                attempt_limit = retry_connect;
+            }
+            Err(error)
+                if canonical_writer_stale(&error)
+                    && stale_retries + 1 < MAX_CANONICAL_STALE_RETRIES =>
+            {
+                stale_retries = stale_retries.saturating_add(1);
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct ActiveStateConnectionContext<'a> {
+    node: &'a NodeReadHandle,
+    writer: &'a CanonicalStateWriter,
+    peers: &'a LivePeerManager,
+    diagnostics: &'a Arc<RwLock<NativeSyncDiagnostics>>,
+    diagnostic_rpc: &'a Arc<RwLock<CachedDiagnosticRpc>>,
+}
+
+#[cfg(test)]
+pub(super) async fn connect_stored_active_state(
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
     scheduler: &mut SyncScheduler,
     orphans: &mut BoundedOrphanPool,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
-    diagnostic_rpc: &Arc<RwLock<CachedDiagnosticRpc>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
     maximum_connect: usize,
 ) -> Result<()> {
-    // The scheduler's stored tip is already a validated contiguous frontier.
-    // Revalidate that one anchor and scan only newly available descendants;
-    // restarting at genesis here makes replay quadratic because this helper is
-    // called on every supervisor tick and after each full validation slice.
-    let stored_tip_hint = scheduler.stored_tip().cloned();
-    let slice_started = StdInstant::now();
-    let outcome = {
-        let mut node = node.lock().await;
-        node.shadow_sync_connect_stored_state_with_hint(maximum_connect, stored_tip_hint.as_ref())?
+    let diagnostic_rpc = initialize_cached_diagnostic_rpc(node, diagnostics).await?;
+    let context = ActiveStateConnectionContext {
+        node,
+        writer,
+        peers,
+        diagnostics,
+        diagnostic_rpc: &diagnostic_rpc,
     };
+    connect_stored_active_state_with_diagnostic_rpc(&context, scheduler, orphans, maximum_connect)
+        .await
+}
+
+async fn connect_stored_active_state_with_diagnostic_rpc(
+    context: &ActiveStateConnectionContext<'_>,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut BoundedOrphanPool,
+    maximum_connect: usize,
+) -> Result<()> {
+    let config = context.node.config();
+    let completed = execute_native_active_state_slice(
+        context.node.clone(),
+        context.writer.clone(),
+        maximum_connect,
+        scheduler.stored_tip().cloned(),
+        config.native_sync.validation_workers,
+        config.native_sync.validation_queue,
+    )
+    .await?;
+    complete_stored_active_state_slice(completed, context, scheduler, orphans).await
+}
+
+async fn complete_stored_active_state_slice(
+    completed: NativeActiveStateSliceResult,
+    context: &ActiveStateConnectionContext<'_>,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut BoundedOrphanPool,
+) -> Result<()> {
+    let NativeActiveStateSliceResult {
+        outcome,
+        preparation,
+        wall_millis: slice_millis,
+    } = completed;
     let slice_blocks = outcome.connected.saturating_add(outcome.disconnected);
-    if slice_blocks != 0 || outcome.contextual_failure.is_some() {
-        let slice_millis = u64::try_from(slice_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        update_diagnostics(diagnostics, |state| {
+    if slice_blocks != 0 || outcome.contextual_failure.is_some() || preparation.blocks != 0 {
+        update_diagnostics(context.diagnostics, |state| {
             state.active_state_slices = state.active_state_slices.saturating_add(1);
             state.active_state_last_slice_blocks = slice_blocks;
             state.active_state_last_slice_millis = slice_millis;
@@ -5214,6 +6152,15 @@ async fn connect_stored_active_state_with_diagnostic_rpc(
             state.active_state_last_planning_micros = outcome.planning_micros;
             state.active_state_last_commit_micros = outcome.state_commit_micros;
             state.active_state_last_post_commit_micros = outcome.post_commit_micros;
+            state.active_state_last_prepared_blocks = preparation.blocks;
+            state.active_state_last_preparation_micros = preparation.wall_micros;
+            state.active_state_last_worker_micros = preparation.aggregate_worker_micros;
+            state.active_state_max_preparation_in_flight = state
+                .active_state_max_preparation_in_flight
+                .max(preparation.maximum_in_flight);
+            state.active_state_stale_retries = state
+                .active_state_stale_retries
+                .saturating_add(preparation.stale_retries as u64);
             state.active_state_last_transactions = outcome.workload.transactions;
             state.active_state_last_non_coinbase_inputs = outcome.workload.non_coinbase_inputs;
             state.active_state_last_outputs = outcome.workload.outputs;
@@ -5221,15 +6168,17 @@ async fn connect_stored_active_state_with_diagnostic_rpc(
         })
         .await;
     }
-    // Capture the newly committed tip before a due compaction takes the
-    // state-coordination lock for its long, stable-snapshot deletion pass.
-    // Diagnostic RPC can serve this explicitly marked snapshot while all
-    // authoritative state access remains serialized behind the lock.
-    refresh_cached_diagnostic_rpc(node, diagnostics, diagnostic_rpc).await?;
-    let compaction = {
-        let mut node = node.lock().await;
-        node.compact_pruned_name_tree_nodes_if_due()?
-    };
+    // Publish the newly committed tip before a due compaction enters the
+    // canonical writer for its long, stable-snapshot deletion pass. RPC keeps
+    // serving immutable published state throughout that command.
+    refresh_cached_diagnostic_rpc(context.node, context.diagnostics, context.diagnostic_rpc)
+        .await?;
+    let compaction = context
+        .writer
+        .execute(None, "compact pruned native-sync name tree", |node| {
+            node.compact_pruned_name_tree_nodes_if_due()
+        })
+        .await?;
     if let Some(checkpoint) = compaction {
         tracing::info!(
             height = checkpoint.height,
@@ -5239,7 +6188,8 @@ async fn connect_stored_active_state_with_diagnostic_rpc(
             nodes_deleted = checkpoint.summary.nodes_deleted,
             "compacted pruned durable name tree during native sync"
         );
-        refresh_cached_diagnostic_rpc(node, diagnostics, diagnostic_rpc).await?;
+        refresh_cached_diagnostic_rpc(context.node, context.diagnostics, context.diagnostic_rpc)
+            .await?;
     }
 
     if let Some(failed) = &outcome.contextual_failure {
@@ -5249,26 +6199,25 @@ async fn connect_stored_active_state_with_diagnostic_rpc(
         discard_orphan_descendants(failed.record.hash, orphans);
     }
 
-    let (best_header, active_tip, stored_tip) = {
-        let node = node.lock().await;
-        let best_header = node.shadow_sync_best_header_tip()?;
-        let active_tip = node.shadow_sync_active_tip()?;
-        let stored_tip = node.shadow_sync_contiguous_body_tip(scheduler.stored_tip())?;
-        (best_header, active_tip, stored_tip)
-    };
+    let best_header = context.node.native_sync_best_header_tip()?;
+    let active_tip = context.node.native_sync_active_tip()?;
+    let stored_tip = context
+        .node
+        .native_sync_contiguous_body_tip(scheduler.stored_tip())?;
     scheduler.set_best_header(best_header);
     scheduler.set_active_tip(active_tip.clone());
     scheduler.set_stored_tip(stored_tip);
-    {
-        let node = node.lock().await;
-        node.shadow_sync_queue_missing_canonical_bodies(scheduler)?;
-    }
-    peers.set_local_height(active_tip.as_ref().map_or(0, |tip| tip.height));
+    context
+        .node
+        .native_sync_queue_missing_canonical_bodies(scheduler)?;
+    context
+        .peers
+        .set_local_height(active_tip.as_ref().map_or(0, |tip| tip.height));
 
     if outcome.connected != 0 || outcome.disconnected != 0 || outcome.contextual_failure.is_some() {
         let sync_snapshot = scheduler.snapshot();
         let orphan_snapshot = orphans.snapshot();
-        update_diagnostics(diagnostics, |state| {
+        update_diagnostics(context.diagnostics, |state| {
             state.sync = sync_snapshot;
             state.orphans = orphan_snapshot;
             state.connected_blocks = state
@@ -5651,7 +6600,7 @@ fn note_reconnect_failure(
 async fn handle_connect_attempt_result(
     result: ConnectAttemptResult,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) {
     let Some(persistent) = reconnects
         .get(&result.address)
@@ -5681,7 +6630,7 @@ async fn handle_connect_attempt_result(
 
 #[allow(clippy::too_many_arguments)]
 async fn refresh_diagnostics(
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
     peers: &LivePeerManager,
     scheduler: &SyncScheduler,
     orphans: &BoundedOrphanPool,
@@ -5724,7 +6673,7 @@ async fn refresh_diagnostics(
 async fn flush_address_book(
     store: &StoreHandle,
     addresses: &mut BoundedAddressBook,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) {
     let timestamp = unix_time();
     match persist_address_book(store, addresses, timestamp) {
@@ -5763,7 +6712,7 @@ async fn maintain_peer_bans(
     bans: &mut PeerBanBook,
     addresses: &mut BoundedAddressBook,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
     persistent: bool,
 ) {
     let timestamp = unix_time();
@@ -5829,7 +6778,7 @@ async fn maintain_peer_bans(
 async fn flush_peer_bans(
     store: &StoreHandle,
     bans: &mut PeerBanBook,
-    diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) {
     let timestamp = unix_time();
     match persist_peer_bans(store, bans, timestamp) {
@@ -5862,21 +6811,73 @@ async fn flush_peer_bans(
     }
 }
 
-async fn update_diagnostics<F>(diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>, update: F)
+async fn update_diagnostics<F>(diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>, update: F)
 where
-    F: FnOnce(&mut ShadowSyncDiagnostics),
+    F: FnOnce(&mut NativeSyncDiagnostics),
 {
     let mut state = diagnostics.write().await;
     update(&mut state);
 }
 
-async fn record_error(diagnostics: &Arc<RwLock<ShadowSyncDiagnostics>>, error: String) {
+async fn record_error(diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>, error: String) {
     tracing::warn!(%error, "Native sync runtime error");
     update_diagnostics(diagnostics, |state| state.last_error = Some(error)).await;
 }
 
 fn record_warning(warning: String) {
     tracing::warn!(%warning, "Native sync peer/runtime warning");
+}
+
+fn unexpected_extension_exit(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    match result {
+        Ok(Ok(())) => anyhow::anyhow!("native runtime extension terminated unexpectedly"),
+        Ok(Err(error)) => anyhow::anyhow!("native runtime extension failed: {error:#}"),
+        Err(error) => anyhow::anyhow!("native runtime extension task failed: {error}"),
+    }
+}
+
+async fn shutdown_native_runtime(
+    runtime: NodeRuntime,
+    clean_shutdown_eligible: bool,
+) -> Result<()> {
+    if clean_shutdown_eligible {
+        runtime.shutdown().await
+    } else {
+        runtime.shutdown_unclean().await
+    }
+}
+
+async fn await_extension_shutdown(
+    mut task: JoinHandle<Result<()>>,
+    shutdown_grace: Duration,
+    abort_grace: Duration,
+) -> Result<()> {
+    match tokio::time::timeout(shutdown_grace, &mut task).await {
+        Ok(result) => result
+            .context("native runtime extension task join failed")?
+            .context("native runtime extension task failed"),
+        Err(_) => {
+            task.abort();
+            // Tokio cancellation is cooperative. Join the cancelled task so
+            // yielding extensions have definitely dropped their NodeRuntime
+            // capability, but keep this second wait bounded because blocking
+            // or non-yielding extension code cannot be forcibly stopped.
+            let cancellation_joined = tokio::time::timeout(abort_grace, &mut task).await.is_ok();
+            if cancellation_joined {
+                anyhow::bail!(
+                    "native runtime extension did not stop within {} ms of shutdown; cancellation requested and task joined",
+                    shutdown_grace.as_millis()
+                )
+            }
+            anyhow::bail!(
+                "native runtime extension did not stop within {} ms of shutdown; cancellation was not observed within a further {} ms",
+                shutdown_grace.as_millis(),
+                abort_grace.as_millis()
+            )
+        }
+    }
 }
 
 async fn await_task(name: &str, task: JoinHandle<Result<()>>) -> Result<()> {
@@ -5927,7 +6928,129 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[derive(Default)]
+    struct RuntimeExtensionBoundaryProbe;
+
+    impl NativeRuntimeExtension for RuntimeExtensionBoundaryProbe {
+        fn spawn(
+            self: Box<Self>,
+            node: NodeRuntime,
+            peers: LivePeerManager,
+            shutdown: watch::Receiver<bool>,
+        ) -> JoinHandle<Result<()>> {
+            drop((self, node, peers, shutdown));
+            tokio::spawn(async { Ok(()) })
+        }
+    }
+
+    struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropNotifier {
+        fn drop(&mut self) {
+            if let Some(notify) = self.0.take() {
+                let _ = notify.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn native_runtime_extension_boundary_is_object_safe() {
+        let extension: Box<dyn NativeRuntimeExtension> = Box::new(RuntimeExtensionBoundaryProbe);
+        drop(extension);
+        let _entrypoint = NodeService::run_until_shutdown_with_extension;
+    }
+
+    #[test]
+    fn native_runtime_extension_early_exit_is_fail_closed() {
+        let error = unexpected_extension_exit(Ok(Ok(())));
+        assert_eq!(
+            error.to_string(),
+            "native runtime extension terminated unexpectedly"
+        );
+
+        let error = unexpected_extension_exit(Ok(Err(anyhow::anyhow!("extension fault"))));
+        assert_eq!(
+            error.to_string(),
+            "native runtime extension failed: extension fault"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_runtime_extension_observes_shutdown_watch() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            shutdown_rx
+                .changed()
+                .await
+                .context("extension shutdown watch closed")?;
+            if !*shutdown_rx.borrow() {
+                anyhow::bail!("extension received a non-shutdown watch update");
+            }
+            Ok(())
+        });
+
+        shutdown_tx
+            .send(true)
+            .expect("broadcast extension shutdown");
+        await_extension_shutdown(task, Duration::from_secs(1), Duration::from_secs(1))
+            .await
+            .expect("extension exits during its shutdown grace");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_supervisor_failure_shutdown_leaves_store_unclean() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        assert!(
+            !hns_store::was_clean_shutdown(&store).expect("running store marker"),
+            "a running supervisor must be marked unclean"
+        );
+
+        let runtime = NodeRuntime::spawn(node, 2).expect("node runtime");
+        shutdown_native_runtime(runtime, false)
+            .await
+            .expect("failure shutdown drains accepted writer commands");
+
+        assert!(
+            !hns_store::was_clean_shutdown(&store).expect("failure shutdown marker"),
+            "a failed native supervisor must not claim a clean shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_runtime_extension_shutdown_is_bounded() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, mut dropped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_notifier = DropNotifier(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        started_rx.await.expect("extension task started");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_extension_shutdown(task, Duration::from_millis(20), Duration::from_secs(1)),
+        )
+        .await
+        .expect("bounded extension shutdown returned")
+        .expect_err("non-cooperative extension fails shutdown");
+        assert!(
+            error
+                .to_string()
+                .contains("native runtime extension did not stop within 20 ms"),
+            "{error:#}"
+        );
+        dropped_rx
+            .try_recv()
+            .expect("cooperatively aborted extension was joined before helper returned");
+    }
+
+    #[derive(Clone, Default)]
     struct RpcMempoolView {
         coins: HashMap<Outpoint, Coin>,
     }
@@ -6015,8 +7138,8 @@ mod tests {
         )
     }
 
-    async fn call_shadow_rpc(
-        state: &ShadowSyncHttpState,
+    async fn call_native_rpc(
+        state: &NativeSyncHttpState,
         id: &str,
         method: &str,
     ) -> serde_json::Value {
@@ -6027,7 +7150,7 @@ mod tests {
             "params": [],
         });
         let response =
-            handle_shadow_sync_rpc(State(state.clone()), Bytes::from(request.to_string())).await;
+            handle_native_sync_rpc(State(state.clone()), Bytes::from(request.to_string())).await;
         serde_json::to_value(response.0).expect("serialize RPC response")
     }
 
@@ -6137,8 +7260,8 @@ mod tests {
         assert_eq!(direct_staged_effect_retry(&unrelated, false, 288), None);
     }
 
-    #[test]
-    fn parent_authority_fast_path_is_coherent_and_fail_closed() {
+    #[tokio::test]
+    async fn parent_authority_fast_path_is_coherent_and_fail_closed() {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../fixtures/hsd/blocks/genesis-v1.json"))
                 .expect("genesis fixture");
@@ -6162,6 +7285,8 @@ mod tests {
         });
         node.accept_block(NodeBlockImport::from_peer(block, 0))
             .expect("connect genesis");
+        let runtime = NodeRuntime::spawn(node, 8).expect("node runtime");
+        let node = runtime.read();
 
         let value = node.parent_authority_value(hash).expect("parent authority");
         assert_eq!(value["network"], "regtest");
@@ -6172,6 +7297,7 @@ mod tests {
         assert_eq!(value["authority"]["mode"], "native");
         assert_eq!(value["authority"]["consensus_complete"], true);
         assert_eq!(value["authoritative_mining_tip"], true);
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
     #[test]
@@ -6274,62 +7400,450 @@ mod tests {
         block
     }
 
+    fn active_state_preparation_fixture(block_count: usize) -> NativeActiveStatePlan {
+        NativeActiveStatePlan {
+            epoch: CanonicalChainEpoch::default(),
+            activation: NodeReorg {
+                disconnect: Vec::new(),
+                connect: (1..=block_count)
+                    .map(|height| {
+                        let height = Height::try_from(height).expect("fixture height");
+                        NodeBlockImport::from_peer(validator_coinbase_block(height, 1), height)
+                    })
+                    .collect(),
+            },
+            maximum_connect: block_count.max(1),
+            planning_micros: 0,
+        }
+    }
+
+    fn strict_stored_genesis_service() -> (NodeService, BlockHash) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/blocks/genesis-v1.json"))
+                .expect("genesis fixture");
+        let case = fixture["networks"]
+            .as_array()
+            .expect("networks")
+            .iter()
+            .find(|case| case["network"] == "regtest")
+            .expect("regtest fixture");
+        let block = Block::decode(&decode_fixture_hex(
+            case["raw"].as_str().expect("raw genesis"),
+        ))
+        .expect("decode genesis");
+        let hash = block.hash();
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            acknowledge_incomplete_consensus: true,
+            native_sync: NativeSyncConfig {
+                enabled: true,
+                connect_active_state: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..NativeSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let header = service
+            .native_sync_ensure_genesis_header()
+            .expect("genesis header");
+        assert_eq!(header.hash, hash);
+        service
+            .native_sync_store_validated_blocks(vec![(
+                ValidatedBlock {
+                    sequence: 0,
+                    peer: PeerId(1),
+                    height: 0,
+                    block,
+                },
+                true,
+            )])
+            .expect("strict stored genesis body");
+        assert_eq!(
+            service.state.best_block_tip().expect("active tip"),
+            None,
+            "storing a validated body must not activate state"
+        );
+        (service, hash)
+    }
+
+    #[tokio::test]
+    async fn prepared_activation_matches_serial_activation_and_commits_atomically() {
+        let (mut serial, hash) = strict_stored_genesis_service();
+        let serial_outcome = serial
+            .native_sync_connect_stored_state(1)
+            .expect("serial reference activation");
+        assert_eq!(serial_outcome.connected, 1);
+        assert_eq!(serial_outcome.disconnected, 0);
+        assert!(serial_outcome.contextual_failure.is_none());
+        let mut serial_evidence = {
+            let snapshot = serial.state.store.snapshot().expect("serial snapshot");
+            (
+                best_block_tip_from_snapshot(&snapshot).expect("serial tip"),
+                load_block_index_record(&snapshot, &hash).expect("serial block index"),
+                load_header_record(&snapshot, &hash).expect("serial header"),
+                mining_generation_from_snapshot(&snapshot).expect("serial mining generation"),
+                crate::chain_epoch_from_snapshot(&snapshot).expect("serial chain epoch"),
+                crate::load_stored_name_tree_root(&snapshot).expect("serial name root"),
+            )
+        };
+
+        let (prepared_service, prepared_hash) = strict_stored_genesis_service();
+        assert_eq!(prepared_hash, hash);
+        let runtime = NodeRuntime::spawn(prepared_service, 8).expect("prepared runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let before = node.canonical_epoch();
+        assert!(before.tip.is_none());
+        let prepared = execute_native_active_state_slice(node.clone(), writer, 1, None, 4, 8)
+            .await
+            .expect("prepared activation");
+        assert_eq!(prepared.outcome.connected, serial_outcome.connected);
+        assert_eq!(prepared.outcome.disconnected, serial_outcome.disconnected);
+        assert!(prepared.outcome.contextual_failure.is_none());
+        assert_eq!(prepared.preparation.blocks, 1);
+
+        let after = node.canonical_epoch();
+        assert_eq!(
+            after.chain_epoch,
+            before.chain_epoch.checked_add(1).expect("chain epoch"),
+            "the complete prepared activation must publish one atomic chain generation"
+        );
+        assert_eq!(after.tip, serial_evidence.0);
+        let mut prepared_evidence = node
+            .with_stable_read(|store, _headers| {
+                let snapshot = store.snapshot()?;
+                Ok((
+                    best_block_tip_from_snapshot(&snapshot)?,
+                    load_block_index_record(&snapshot, &hash)?,
+                    load_header_record(&snapshot, &hash)?,
+                    mining_generation_from_snapshot(&snapshot)?,
+                    crate::chain_epoch_from_snapshot(&snapshot)?,
+                    crate::load_stored_name_tree_root(&snapshot)?,
+                ))
+            })
+            .expect("prepared durable evidence");
+        // `validated_at` records the wall-clock second at which each independent
+        // service performed validation. Require both paths to populate it, then
+        // exclude only that observational timestamp from the exact durable-state
+        // equivalence comparison.
+        let serial_validated_at = serial_evidence
+            .1
+            .as_mut()
+            .and_then(|record| record.validated_at.take());
+        let prepared_validated_at = prepared_evidence
+            .1
+            .as_mut()
+            .and_then(|record| record.validated_at.take());
+        assert!(serial_validated_at.is_some());
+        assert!(prepared_validated_at.is_some());
+        assert_eq!(prepared_evidence, serial_evidence);
+        runtime.shutdown().await.expect("prepared runtime shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepared_activation_replans_after_a_stale_chain_epoch() {
+        let (service, hash) = strict_stored_genesis_service();
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let before = node.canonical_epoch();
+
+        let worker_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let validator = HnsBodyValidator::new(Network::Regtest);
+        let replay = tokio::spawn(execute_native_active_state_slice_with_validator(
+            node.clone(),
+            writer.clone(),
+            1,
+            None,
+            2,
+            4,
+            Arc::new({
+                let worker_started = Arc::clone(&worker_started);
+                let worker_release = Arc::clone(&worker_release);
+                let worker_paused = Arc::clone(&worker_paused);
+                move |block: &Block, height: Height| {
+                    if !worker_paused.swap(true, Ordering::AcqRel) {
+                        worker_started.store(true, Ordering::Release);
+                        while !worker_release.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    validator.validate(block, height)
+                }
+            }),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prepared worker did not start");
+
+        let competing = writer
+            .execute(None, "test competing serial activation", |service| {
+                service.native_sync_connect_stored_state(1)
+            })
+            .await
+            .expect("competing activation");
+        assert_eq!(competing.connected, 1);
+        worker_release.store(true, Ordering::Release);
+
+        let replay = replay
+            .await
+            .expect("prepared replay task join")
+            .expect("prepared replay retry");
+        assert_eq!(replay.outcome.connected, 0);
+        assert_eq!(replay.outcome.disconnected, 0);
+        assert_eq!(replay.preparation.blocks, 1);
+        assert_eq!(replay.preparation.stale_retries, 1);
+        let after = node.canonical_epoch();
+        assert_eq!(after.tip.as_ref().map(|tip| tip.hash), Some(hash));
+        assert_eq!(
+            after.chain_epoch,
+            before.chain_epoch.checked_add(1).expect("chain epoch"),
+            "stale prepared work must not publish a duplicate chain mutation"
+        );
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn stored_byte_worker_failure_is_local_terminal_and_non_mutating() {
+        let (service, _hash) = strict_stored_genesis_service();
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let before = node.canonical_epoch();
+        let error = execute_native_active_state_slice_with_validator(
+            node.clone(),
+            writer,
+            1,
+            None,
+            2,
+            4,
+            Arc::new(|_block: &Block, _height: Height| {
+                Err(ValidationRejection::invalid_block(
+                    "simulated local stored-byte corruption",
+                ))
+            }),
+        )
+        .await
+        .expect_err("stored-byte corruption must terminate the replay slice");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("local stored-body integrity failure"),
+            "{message}"
+        );
+        assert!(
+            message.contains("canonical state was not mutated"),
+            "{message}"
+        );
+        assert!(message.contains("no peer is attributable"), "{message}");
+        assert_eq!(
+            node.canonical_epoch(),
+            before,
+            "a worker failure must never enter the canonical writer"
+        );
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
     #[test]
-    fn shadow_sync_rejects_authority_modes_and_duplicate_peers() {
+    fn default_validation_parallelism_tracks_available_processors() {
+        let expected_workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_NATIVE_SYNC_VALIDATION_WORKERS);
+        let expected_queue = expected_workers
+            .saturating_mul(32)
+            .clamp(128, MAX_NATIVE_SYNC_VALIDATION_QUEUE);
+        let config = NativeSyncConfig::default();
+        assert_eq!(config.validation_workers, expected_workers);
+        assert_eq!(config.validation_queue, expected_queue);
+    }
+
+    #[tokio::test]
+    async fn ordered_active_state_preparation_is_multicore_and_order_preserving() {
+        const BLOCKS: usize = 12;
+        const DELAY: Duration = Duration::from_millis(25);
+        let expected = active_state_preparation_fixture(BLOCKS)
+            .activation
+            .connect
+            .iter()
+            .map(|import| import.block().hash())
+            .collect::<Vec<_>>();
+
+        let serial_validator = HnsBodyValidator::new(Network::Regtest);
+        let serial = tokio::time::timeout(
+            Duration::from_secs(10),
+            prepare_native_active_state_plan_with_validator(
+                active_state_preparation_fixture(BLOCKS),
+                Network::Regtest,
+                1,
+                2,
+                Arc::new(move |block: &Block, height: Height| {
+                    std::thread::sleep(DELAY);
+                    serial_validator.validate(block, height)
+                }),
+            ),
+        )
+        .await
+        .expect("one-worker replay did not deadlock")
+        .expect("one-worker replay");
+
+        let parallel_validator = HnsBodyValidator::new(Network::Regtest);
+        let parallel = tokio::time::timeout(
+            Duration::from_secs(10),
+            prepare_native_active_state_plan_with_validator(
+                active_state_preparation_fixture(BLOCKS),
+                Network::Regtest,
+                4,
+                2,
+                Arc::new(move |block: &Block, height: Height| {
+                    std::thread::sleep(DELAY);
+                    parallel_validator.validate(block, height)
+                }),
+            ),
+        )
+        .await
+        .expect("four-worker replay did not deadlock")
+        .expect("four-worker replay");
+
+        let actual = parallel
+            .activation
+            .connect
+            .iter()
+            .map(|import| import.block().hash())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "prepared activation order changed");
+        assert_eq!(parallel.prepared.stateless.len(), BLOCKS);
+        assert_eq!(parallel.preparation.blocks, BLOCKS);
+        assert_eq!(serial.preparation.maximum_in_flight, 1);
+        assert!(
+            parallel.preparation.maximum_in_flight >= 2,
+            "parallel replay never overlapped workers: {:?}",
+            parallel.preparation
+        );
+        assert!(
+            parallel.preparation.wall_micros.saturating_mul(18)
+                <= serial.preparation.wall_micros.saturating_mul(10),
+            "four-worker replay must be at least 1.8x faster (serial={}us, parallel={}us)",
+            serial.preparation.wall_micros,
+            parallel.preparation.wall_micros
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_active_state_preparation_reports_earliest_failure_and_cancels() {
+        const BLOCKS: usize = 32;
+        let started = Arc::new(AtomicUsize::new(0));
+        let validator = HnsBodyValidator::new(Network::Regtest);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            prepare_native_active_state_plan_with_validator(
+                active_state_preparation_fixture(BLOCKS),
+                Network::Regtest,
+                4,
+                2,
+                Arc::new({
+                    let started = Arc::clone(&started);
+                    move |block: &Block, height: Height| {
+                        started.fetch_add(1, Ordering::AcqRel);
+                        match height {
+                            1 => std::thread::sleep(Duration::from_millis(60)),
+                            2 => {
+                                std::thread::sleep(Duration::from_millis(30));
+                                return Err(ValidationRejection::invalid_block(
+                                    "earliest stored-byte failure",
+                                ));
+                            }
+                            3 => {
+                                return Err(ValidationRejection::invalid_block(
+                                    "later stored-byte failure",
+                                ));
+                            }
+                            _ => std::thread::sleep(Duration::from_millis(100)),
+                        }
+                        validator.validate(block, height)
+                    }
+                }),
+            ),
+        )
+        .await
+        .expect("failing ordered replay did not deadlock")
+        .expect_err("stored-byte validation failure must abort preparation");
+        let message = format!("{error:#}");
+        assert!(message.contains("height 2"), "{message}");
+        assert!(
+            message.contains("earliest stored-byte failure"),
+            "{message}"
+        );
+        assert!(!message.contains("later stored-byte failure"), "{message}");
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            started.load(Ordering::Acquire) < BLOCKS,
+            "cancellation admitted every queued replay block"
+        );
+    }
+
+    #[test]
+    fn native_sync_rejects_authority_modes_and_duplicate_peers() {
         let peer: SocketAddr = "127.0.0.1:14038".parse().expect("peer");
-        let config = ShadowSyncConfig {
+        let config = NativeSyncConfig {
             enabled: true,
             connect: vec![peer],
-            ..ShadowSyncConfig::default()
+            ..NativeSyncConfig::default()
         };
         assert!(config
             .validate(AuthorityMode::NativeExperimental, Network::Regtest)
             .is_err());
 
-        let duplicate = ShadowSyncConfig {
+        let duplicate = NativeSyncConfig {
             connect: vec![peer, peer],
             ..config
         };
         assert!(duplicate
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
     }
 
     #[test]
-    fn shadow_sync_requires_a_real_network_endpoint() {
-        let config = ShadowSyncConfig {
+    fn native_sync_requires_a_real_network_endpoint() {
+        let config = NativeSyncConfig {
             enabled: true,
-            ..ShadowSyncConfig::default()
+            ..NativeSyncConfig::default()
         };
         assert!(config
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
 
-        let active_without_network = ShadowSyncConfig {
+        let active_without_network = NativeSyncConfig {
             connect_active_state: true,
-            ..ShadowSyncConfig::default()
+            ..NativeSyncConfig::default()
         };
         assert!(active_without_network
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
 
-        let headers_without_network = ShadowSyncConfig {
+        let headers_without_network = NativeSyncConfig {
             headers_only: true,
-            ..ShadowSyncConfig::default()
+            ..NativeSyncConfig::default()
         };
         assert!(headers_without_network
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
 
-        let headers_only_active_state = ShadowSyncConfig {
+        let headers_only_active_state = NativeSyncConfig {
             enabled: true,
             headers_only: true,
             connect_active_state: true,
             connect: vec!["127.0.0.1:14038".parse().expect("peer")],
-            ..ShadowSyncConfig::default()
+            ..NativeSyncConfig::default()
         };
         assert!(headers_only_active_state
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
     }
 
@@ -6383,23 +7897,23 @@ mod tests {
             0x02
         );
 
-        let discovery = ShadowSyncConfig {
+        let discovery = NativeSyncConfig {
             enabled: true,
             discovery: true,
-            ..ShadowSyncConfig::default()
+            ..NativeSyncConfig::default()
         };
         discovery
-            .validate(AuthorityMode::Shadow, Network::Mainnet)
+            .validate(AuthorityMode::Native, Network::Mainnet)
             .expect("mainnet has HSD Brontide seeds");
         assert!(discovery
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
 
         let address = "129.153.177.220:44806".parse().expect("seed socket");
-        let mut explicit = ShadowSyncConfig {
+        let mut explicit = NativeSyncConfig {
             enabled: true,
             connect: vec![address],
-            ..ShadowSyncConfig::default()
+            ..NativeSyncConfig::default()
         };
         assert!(explicit
             .validate(AuthorityMode::Native, Network::Mainnet)
@@ -6819,7 +8333,7 @@ mod tests {
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis header");
         let mut block = linked_validator_block(1, &genesis.header);
         block.transactions.push(Transaction {
@@ -6842,9 +8356,11 @@ mod tests {
             block.header.nonce = block.header.nonce.checked_add(1).expect("regtest nonce");
         }
         service
-            .shadow_sync_import_headers(vec![block.header.clone()])
+            .native_sync_import_headers(vec![block.header.clone()])
             .expect("block header");
-        let node = Arc::new(Mutex::new(service));
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
@@ -6873,12 +8389,13 @@ mod tests {
         let compact = CompactBlock::from_block_with_nonce(&block, [1, 2, 3, 4, 5, 6, 7, 8]);
         let compact_peers = HashSet::from([peer]);
         let mut pending = HashMap::new();
-        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
 
         handle_compact_block(
             peer,
             compact,
             &node,
+            &writer,
             &peers,
             &validation,
             &mut scheduler,
@@ -6906,6 +8423,7 @@ mod tests {
             PeerId(u64::MAX),
             response.clone(),
             &node,
+            &writer,
             &peers,
             &validation,
             &mut scheduler,
@@ -6920,6 +8438,7 @@ mod tests {
             peer,
             response,
             &node,
+            &writer,
             &peers,
             &validation,
             &mut scheduler,
@@ -6942,6 +8461,7 @@ mod tests {
         assert_eq!(state.compact_block_fallbacks, 0);
 
         peers.disconnect_all().await;
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
     #[test]
@@ -7035,7 +8555,7 @@ mod tests {
             )
             .accepted());
         let mut reconnects = HashMap::from([(address, ReconnectState::new(now, false))]);
-        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
 
         assert_eq!(
             manager.penalize(peer, HSD_BAN_SCORE).await.expect("ban"),
@@ -7145,20 +8665,20 @@ mod tests {
     async fn canonical_body_is_stored_out_of_parent_body_order() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 connect: vec!["127.0.0.1:14038".parse().expect("peer")],
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis");
         let first = linked_validator_block(1, &genesis.header);
         let second = linked_validator_block(2, &first.header);
         service
-            .shadow_sync_import_headers(vec![first.header.clone(), second.header.clone()])
+            .native_sync_import_headers(vec![first.header.clone(), second.header.clone()])
             .expect("canonical headers");
         let second_hash = second.hash();
         let first_hash = first.hash();
@@ -7166,7 +8686,9 @@ mod tests {
             .accept_block(NodeBlockImport::from_peer(second.clone(), 2))
             .expect_err("ordinary import still requires the parent body");
         assert!(ordinary_error.to_string().contains("parent index"));
-        let node = Arc::new(Mutex::new(service));
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
 
         let (peers, _peer_events) =
             LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
@@ -7185,8 +8707,15 @@ mod tests {
             maximum_bytes: 1_024 * 1_024,
         })
         .expect("orphan pool");
-        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
 
+        let context = ValidationResultContext {
+            node: &node,
+            writer: &writer,
+            peers: &peers,
+            validation: &validation,
+            diagnostics: &diagnostics,
+        };
         handle_validation_results(
             vec![Ok(hns_sync::ValidatedBlock {
                 sequence: 0,
@@ -7194,55 +8723,51 @@ mod tests {
                 height: 2,
                 block: second,
             })],
-            &node,
-            &peers,
-            &validation,
+            &context,
             &mut scheduler,
             &mut orphans,
-            &diagnostics,
         )
         .await
         .expect("store out-of-order canonical body");
 
-        let node = node.lock().await;
         assert!(node
-            .shadow_sync_has_block(&second_hash)
+            .native_sync_has_block(&second_hash)
             .expect("second body lookup"));
         assert!(!node
-            .shadow_sync_has_block(&first_hash)
+            .native_sync_has_block(&first_hash)
             .expect("first body lookup"));
         assert_eq!(
-            node.shadow_sync_contiguous_body_tip(None)
+            node.native_sync_contiguous_body_tip(None)
                 .expect("contiguous body tip"),
             None
         );
-        drop(node);
         assert!(!scheduler.is_tracked_block(&second_hash));
         assert_eq!(orphans.snapshot().blocks, 0);
         assert_eq!(diagnostics.read().await.stored_bodies, 1);
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
     #[test]
     fn body_present_index_without_raw_payload_is_not_available() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 connect: vec!["127.0.0.1:14038".parse().expect("peer")],
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis");
         let block = linked_validator_block(1, &genesis.header);
         let hash = block.hash();
         service
-            .shadow_sync_import_headers(vec![block.header.clone()])
+            .native_sync_import_headers(vec![block.header.clone()])
             .expect("canonical header");
         service
-            .shadow_sync_store_validated_blocks(vec![(
+            .native_sync_store_validated_blocks(vec![(
                 ValidatedBlock {
                     sequence: 0,
                     peer: PeerId(1),
@@ -7253,7 +8778,7 @@ mod tests {
             )])
             .expect("stored body");
         assert!(service
-            .shadow_sync_has_block(&hash)
+            .native_sync_has_block(&hash)
             .expect("complete body availability"));
 
         let mut batch = service.state.store.batch();
@@ -7268,7 +8793,7 @@ mod tests {
 
         assert!(
             !service
-                .shadow_sync_has_block(&hash)
+                .native_sync_has_block(&hash)
                 .expect("missing raw payload availability"),
             "body_present metadata alone must never suppress redownload"
         );
@@ -7278,22 +8803,22 @@ mod tests {
     fn validated_body_batch_is_all_or_nothing_before_durable_commit() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 connect: vec!["127.0.0.1:14038".parse().expect("peer")],
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis");
         let first = linked_validator_block(1, &genesis.header);
         let second = linked_validator_block(2, &first.header);
         let first_hash = first.hash();
         let second_hash = second.hash();
         service
-            .shadow_sync_import_headers(vec![first.header.clone(), second.header.clone()])
+            .native_sync_import_headers(vec![first.header.clone(), second.header.clone()])
             .expect("canonical headers");
 
         let invalid_batch = vec![
@@ -7317,17 +8842,17 @@ mod tests {
             ),
         ];
         service
-            .shadow_sync_store_validated_blocks(invalid_batch)
+            .native_sync_store_validated_blocks(invalid_batch)
             .expect_err("one mismatched member rejects the complete batch");
         assert!(!service
-            .shadow_sync_has_block(&first_hash)
+            .native_sync_has_block(&first_hash)
             .expect("first body after rejected batch"));
         assert!(!service
-            .shadow_sync_has_block(&second_hash)
+            .native_sync_has_block(&second_hash)
             .expect("second body after rejected batch"));
 
         let stored = service
-            .shadow_sync_store_validated_blocks(vec![
+            .native_sync_store_validated_blocks(vec![
                 (
                     ValidatedBlock {
                         sequence: 0,
@@ -7353,21 +8878,21 @@ mod tests {
             vec![first_hash, second_hash]
         );
         assert!(service
-            .shadow_sync_has_block(&first_hash)
+            .native_sync_has_block(&first_hash)
             .expect("first stored body"));
         assert!(service
-            .shadow_sync_has_block(&second_hash)
+            .native_sync_has_block(&second_hash)
             .expect("second stored body"));
     }
 
     #[test]
-    fn ambiguous_name_page_fence_blocks_shadow_header_body_and_compaction_writes() {
+    fn ambiguous_name_page_fence_blocks_native_header_body_and_compaction_writes() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "hsrd-shadow-name-page-fence-{}-{nonce}",
+            "hsrd-native-name-page-fence-{}-{nonce}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&directory);
@@ -7394,7 +8919,7 @@ mod tests {
 
         let params = Network::Regtest.params();
         let header_error = node
-            .shadow_sync_import_headers(vec![params.genesis_header()])
+            .native_sync_import_headers(vec![params.genesis_header()])
             .expect_err("fenced header persistence");
         assert!(
             header_error.to_string().contains("restart and reopen"),
@@ -7410,7 +8935,7 @@ mod tests {
         let alternate = linked_validator_block(1, &params.genesis_header());
         let alternate_hash = alternate.hash();
         let body_error = node
-            .shadow_sync_store_validated_blocks(vec![(
+            .native_sync_store_validated_blocks(vec![(
                 ValidatedBlock {
                     sequence: 0,
                     peer: PeerId(1),
@@ -7425,7 +8950,7 @@ mod tests {
             "{body_error}"
         );
         assert!(node
-            .shadow_sync_block(&alternate_hash)
+            .native_sync_block(&alternate_hash)
             .expect("alternate body lookup")
             .is_none());
 
@@ -7438,14 +8963,14 @@ mod tests {
         );
 
         drop(node);
-        fs::remove_dir_all(directory).expect("remove shadow fence fixture");
+        fs::remove_dir_all(directory).expect("remove native fence fixture");
     }
 
     #[cfg(feature = "rocksdb-backend")]
     #[test]
     fn out_of_order_canonical_body_survives_rocksdb_reopen() {
         let path = std::env::temp_dir().join(format!(
-            "hsrd-shadow-out-of-order-{}-{}",
+            "hsrd-native-out-of-order-{}-{}",
             std::process::id(),
             current_unix_time().expect("time")
         ));
@@ -7453,11 +8978,11 @@ mod tests {
         let config = NodeConfig {
             network: Network::Regtest,
             data_dir: Some(path.clone()),
-            authority_mode: AuthorityMode::Shadow,
-            shadow_sync: ShadowSyncConfig {
+            authority_mode: AuthorityMode::Native,
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 connect: vec!["127.0.0.1:14038".parse().expect("peer")],
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             ..NodeConfig::default()
         };
@@ -7467,17 +8992,17 @@ mod tests {
         {
             let mut service = NodeService::try_new(config.clone()).expect("open first node");
             let genesis = service
-                .shadow_sync_ensure_genesis_header()
+                .native_sync_ensure_genesis_header()
                 .expect("genesis");
             let first = linked_validator_block(1, &genesis.header);
             let second = linked_validator_block(2, &first.header);
             second_hash = second.hash();
             first_hash = first.hash();
             service
-                .shadow_sync_import_headers(vec![first.header.clone(), second.header.clone()])
+                .native_sync_import_headers(vec![first.header.clone(), second.header.clone()])
                 .expect("canonical headers");
             service
-                .shadow_sync_store_validated_blocks(vec![(
+                .native_sync_store_validated_blocks(vec![(
                     ValidatedBlock {
                         sequence: 0,
                         peer: PeerId(1),
@@ -7493,10 +9018,10 @@ mod tests {
         {
             let service = NodeService::try_new(config).expect("reopen node");
             assert!(service
-                .shadow_sync_has_block(&second_hash)
+                .native_sync_has_block(&second_hash)
                 .expect("reopened second body"));
             assert!(!service
-                .shadow_sync_has_block(&first_hash)
+                .native_sync_has_block(&first_hash)
                 .expect("reopened first body"));
             mark_clean_shutdown(&service.state.store).expect("clean second shutdown");
         }
@@ -7505,13 +9030,13 @@ mod tests {
     }
 
     #[test]
-    fn shadow_header_slice_validation_is_atomic() {
+    fn native_header_slice_validation_is_atomic() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis");
         let params = Network::Regtest.params();
         let mut first = Header {
@@ -7538,12 +9063,12 @@ mod tests {
         }
 
         service
-            .shadow_sync_import_headers(vec![first, invalid_second])
+            .native_sync_import_headers(vec![first, invalid_second])
             .expect_err("late invalid header rejects the slice");
 
         assert_eq!(
             service
-                .shadow_sync_best_header_tip()
+                .native_sync_best_header_tip()
                 .expect("best header")
                 .expect("tip")
                 .hash,
@@ -7551,7 +9076,7 @@ mod tests {
         );
         assert_eq!(
             service
-                .shadow_sync_header_record(&first_hash)
+                .native_sync_header_record(&first_hash)
                 .expect("first header lookup"),
             None
         );
@@ -7564,11 +9089,11 @@ mod tests {
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis");
         let parent = BlockHash::new([0x91; 32]);
         let error = service
-            .shadow_sync_import_headers(vec![Header {
+            .native_sync_import_headers(vec![Header {
                 prev_block: parent,
                 ..Header::default()
             }])
@@ -7578,7 +9103,7 @@ mod tests {
             Some(&MissingHeaderParent { parent })
         );
         let tip = service
-            .shadow_sync_best_header_tip()
+            .native_sync_best_header_tip()
             .expect("best header")
             .expect("tip");
         assert_eq!(tip.hash, genesis.hash);
@@ -7593,12 +9118,12 @@ mod tests {
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis");
         let params = Network::Regtest.params();
         let mut previous = genesis.header;
         let mut headers = Vec::new();
-        for _ in 0..MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE {
+        for _ in 0..MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE {
             let mut header = Header {
                 prev_block: previous.hash(),
                 time: previous.time + 1,
@@ -7611,37 +9136,39 @@ mod tests {
             previous = header.clone();
             headers.push(header);
         }
-        let node = Arc::new(Mutex::new(service));
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
 
-        let imported = import_header_packet(&node, headers)
+        let imported = import_header_packet(&writer, headers)
             .await
             .expect("maximum header packet");
-        assert_eq!(imported.len(), MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE);
+        assert_eq!(imported.len(), MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE);
 
-        let node = node.lock().await;
         assert_eq!(
-            node.shadow_sync_best_header_tip()
+            node.native_sync_best_header_tip()
                 .expect("best header")
                 .expect("durable imported tip")
                 .height as usize,
-            MAX_SHADOW_SYNC_HEADER_IMPORT_SLICE
+            MAX_NATIVE_SYNC_HEADER_IMPORT_SLICE
         );
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
-    #[test]
-    fn canonical_body_queue_is_bounded_to_orphan_horizon() {
+    #[tokio::test]
+    async fn canonical_body_queue_is_bounded_to_orphan_horizon() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 orphan_blocks: 2,
                 connect: vec!["127.0.0.1:14038".parse().expect("peer")],
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis");
         let params = Network::Regtest.params();
         let mut previous = genesis.header;
@@ -7660,18 +9187,19 @@ mod tests {
             headers.push(header);
         }
         service
-            .shadow_sync_import_headers(headers)
+            .native_sync_import_headers(headers)
             .expect("canonical headers");
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
 
         let now = StdInstant::now();
         let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
         scheduler
             .register_peer(PeerId(1), hns_p2p::SERVICE_NETWORK, 4)
             .expect("peer");
-        scheduler.set_best_header(service.shadow_sync_best_header_tip().expect("best header"));
+        scheduler.set_best_header(node.native_sync_best_header_tip().expect("best header"));
         assert_eq!(
-            service
-                .shadow_sync_queue_missing_canonical_bodies(&mut scheduler)
+            node.native_sync_queue_missing_canonical_bodies(&mut scheduler)
                 .expect("body queue"),
             2
         );
@@ -7707,6 +9235,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(expanded, vec![1]);
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
     #[test]
@@ -7758,14 +9287,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn canonical_headers_derive_hsd_deployment_and_script_policy() {
+    #[tokio::test]
+    async fn canonical_headers_derive_hsd_deployment_and_script_policy() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
         });
         let genesis = service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis");
         let params = Network::Regtest.params();
         let mut previous = genesis.header;
@@ -7788,11 +9317,16 @@ mod tests {
             headers.push(header);
         }
         service
-            .shadow_sync_import_headers(headers)
+            .native_sync_import_headers(headers)
             .expect("deployment header ancestry");
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
 
-        let diagnostics = service
-            .shadow_sync_header_deployments()
+        let diagnostics = node
+            .native_sync_header_deployments(
+                StdInstant::now() + Duration::from_secs(5),
+                MAX_HEADER_DEPLOYMENT_READS,
+            )
             .expect("header deployment diagnostics");
         assert_eq!(diagnostics.best_header.height, 431);
         assert_eq!(diagnostics.next_height, 432);
@@ -7811,49 +9345,50 @@ mod tests {
                 .map(|deployment| deployment.state),
             Some(ThresholdState::Active)
         );
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
     #[test]
-    fn shadow_sync_resource_limits_fail_closed() {
+    fn native_sync_resource_limits_fail_closed() {
         let peer: SocketAddr = "127.0.0.1:14038".parse().expect("peer");
-        let too_many_peers = ShadowSyncConfig {
+        let too_many_peers = NativeSyncConfig {
             enabled: true,
             connect: vec![peer],
-            maximum_inbound: MAX_SHADOW_SYNC_PEERS,
+            maximum_inbound: MAX_NATIVE_SYNC_PEERS,
             maximum_outbound: 1,
-            ..ShadowSyncConfig::default()
+            ..NativeSyncConfig::default()
         };
         assert!(too_many_peers
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
 
-        let too_fast = ShadowSyncConfig {
+        let too_fast = NativeSyncConfig {
             poll_interval: Duration::from_millis(1),
             ..too_many_peers
         };
         assert!(too_fast
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
 
-        let zero_connector_batch = ShadowSyncConfig {
+        let zero_connector_batch = NativeSyncConfig {
             active_state_connect_batch: 0,
             ..too_fast
         };
         assert!(zero_connector_batch
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
 
-        let oversized_connector_batch = ShadowSyncConfig {
+        let oversized_connector_batch = NativeSyncConfig {
             active_state_connect_batch: MAX_ACTIVE_STATE_CONNECT_BATCH + 1,
             ..zero_connector_batch
         };
         assert!(oversized_connector_batch
-            .validate(AuthorityMode::Shadow, Network::Regtest)
+            .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
     }
 
     #[tokio::test]
-    async fn shadow_mempool_rpc_refreshes_by_generation_and_enforces_live_cap() {
+    async fn native_mempool_rpc_refreshes_by_generation_and_enforces_live_cap() {
         let rpc_limits = RpcLimits {
             maximum_collection_entries: 1,
             maximum_concurrent_requests: 1,
@@ -7864,14 +9399,16 @@ mod tests {
             rpc_limits,
             ..NodeConfig::default()
         });
-        let read_context = service.rpc_read_context();
-        let node = Arc::new(Mutex::new(service));
-        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics::default()));
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let read_context = node.rpc_read_context().expect("RPC read context");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
         let diagnostic_rpc = initialize_cached_diagnostic_rpc(&node, &diagnostics)
             .await
             .expect("initial empty RPC cache");
-        let state = ShadowSyncHttpState {
-            node: Arc::clone(&node),
+        let state = NativeSyncHttpState {
+            node: node.clone(),
             diagnostics,
             diagnostic_rpc,
             read_context,
@@ -7884,79 +9421,88 @@ mod tests {
         let mut view = RpcMempoolView::default();
         view.coins.insert(first_coin.outpoint.clone(), first_coin);
         view.coins.insert(second_coin.outpoint.clone(), second_coin);
-        {
-            let mut node = node.lock().await;
-            assert_eq!(
-                node.state
-                    .mempool
-                    .submit_with_context(
-                        first,
-                        &MempoolContext::testing(2, 2),
-                        &view,
-                        &AllowRpcMempoolInputs,
-                        &AllowRpcMempoolContext,
-                    )
-                    .expect("first mempool admission"),
-                Admission::Accepted(first_txid)
-            );
-        }
-        let captured_generation = {
-            let node = node.lock().await;
-            let direct = node.state.mempool.ordered_txids_snapshot();
-            let captured = node.rpc_request_mempool(&JsonRpcRequest {
+        let first_view = view.clone();
+        writer
+            .execute(None, "test first native mempool admission", move |node| {
+                assert_eq!(
+                    node.state
+                        .mempool
+                        .submit_with_context(
+                            first,
+                            &MempoolContext::testing(2, 2),
+                            &first_view,
+                            &AllowRpcMempoolInputs,
+                            &AllowRpcMempoolContext,
+                        )
+                        .expect("first mempool admission"),
+                    Admission::Accepted(first_txid)
+                );
+                Ok(())
+            })
+            .await
+            .expect("first writer admission");
+        let direct = node
+            .published_mempool()
+            .expect("published mempool")
+            .ordered_txids;
+        let captured = node
+            .rpc_request_mempool(&JsonRpcRequest {
                 jsonrpc: Some("2.0".to_owned()),
                 method: "getrawmempool".to_owned(),
                 params: serde_json::json!([]),
                 id: Some(serde_json::json!("capture")),
-            });
-            let ordered = captured
-                .ordered_txids
-                .expect("bounded immutable transaction-id view");
-            assert!(
-                direct.is_same_generation(&ordered),
-                "capturing the RPC collection view under NodeService must be O(1)"
-            );
-            ordered
-        };
+            })
+            .await
+            .expect("captured mempool request");
+        let captured_generation = captured
+            .ordered_txids
+            .expect("bounded immutable transaction-id view");
+        assert!(
+            direct.is_same_generation(&captured_generation),
+            "capturing the published RPC collection view must be O(1)"
+        );
 
-        let info = call_shadow_rpc(&state, "live-info-one", "getmempoolinfo").await;
+        let info = call_native_rpc(&state, "live-info-one", "getmempoolinfo").await;
         assert_eq!(info["result"]["size"], 1, "{info}");
         let collection_guard = state
             .read_context
             .try_acquire_collection()
             .expect("collection guard");
         let info_while_collection_busy =
-            call_shadow_rpc(&state, "info-while-collection-busy", "getmempoolinfo").await;
+            call_native_rpc(&state, "info-while-collection-busy", "getmempoolinfo").await;
         assert_eq!(
             info_while_collection_busy["result"]["size"], 1,
             "{info_while_collection_busy}"
         );
-        let busy = call_shadow_rpc(&state, "busy-list", "getrawmempool").await;
+        let busy = call_native_rpc(&state, "busy-list", "getrawmempool").await;
         assert_eq!(busy["error"]["code"], -32005, "{busy}");
         drop(collection_guard);
-        let entries = call_shadow_rpc(&state, "live-list-one", "getrawmempool").await;
+        let entries = call_native_rpc(&state, "live-list-one", "getrawmempool").await;
         assert_eq!(
             entries["result"],
             serde_json::json!([first_txid.to_hex()]),
             "{entries}"
         );
 
-        {
-            let mut node = node.lock().await;
-            assert!(matches!(
-                node.state
-                    .mempool
-                    .submit_with_context(
-                        second,
-                        &MempoolContext::testing(2, 2),
-                        &view,
-                        &AllowRpcMempoolInputs,
-                        &AllowRpcMempoolContext,
-                    )
-                    .expect("second mempool admission"),
-                Admission::Accepted(_)
-            ));
-        }
+        writer
+            .execute(None, "test second native mempool admission", move |node| {
+                assert!(matches!(
+                    node.state
+                        .mempool
+                        .submit_with_context(
+                            second,
+                            &MempoolContext::testing(2, 2),
+                            &view,
+                            &AllowRpcMempoolInputs,
+                            &AllowRpcMempoolContext,
+                        )
+                        .expect("second mempool admission"),
+                    Admission::Accepted(_)
+                ));
+                Ok(())
+            })
+            .await
+            .expect("second writer admission");
         let retained_response = BasicRpcService::default()
             .handle_raw_mempool(
                 JsonRpcRequest {
@@ -7974,18 +9520,19 @@ mod tests {
             "materialization after releasing NodeService must stay on the captured generation"
         );
 
-        let capped = call_shadow_rpc(&state, "live-list-capped", "getrawmempool").await;
+        let capped = call_native_rpc(&state, "live-list-capped", "getrawmempool").await;
         assert_eq!(capped["error"]["code"], -8, "{capped}");
         assert_eq!(
             capped["error"]["message"], "mempool collection exceeds the RPC limit of 1 entries",
             "{capped}"
         );
-        let info = call_shadow_rpc(&state, "live-info-two", "getmempoolinfo").await;
+        let info = call_native_rpc(&state, "live-info-two", "getmempoolinfo").await;
         assert_eq!(info["result"]["size"], 2, "{info}");
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
     #[tokio::test]
-    async fn shadow_sync_serves_capability_named_diagnostic_routes() {
+    async fn native_sync_serves_capability_named_diagnostic_routes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let rpc_limits = RpcLimits {
@@ -7998,27 +9545,23 @@ mod tests {
             ..NodeConfig::default()
         });
         service
-            .shadow_sync_ensure_genesis_header()
+            .native_sync_ensure_genesis_header()
             .expect("genesis header");
-        let read_context = service.rpc_read_context();
-        let node = Arc::new(Mutex::new(service));
-        let diagnostics = Arc::new(RwLock::new(ShadowSyncDiagnostics {
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let read_context = node.rpc_read_context().expect("RPC read context");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
             observation_only: true,
             runtime_instance: "test-runtime".to_owned(),
             experimental_registry: rpc_experimental_registry_info(&hns_p2p::DenuoSummary::default()),
-            ..ShadowSyncDiagnostics::default()
+            ..NativeSyncDiagnostics::default()
         }));
-        let diagnostic_rpc = {
-            let diagnostics_snapshot = diagnostics.read().await.clone();
-            let node_snapshot = node.lock().await;
-            Arc::new(RwLock::new(CachedDiagnosticRpc {
-                service: compose_shadow_sync_rpc_service(&node_snapshot, &diagnostics_snapshot)
-                    .expect("initial diagnostic snapshot"),
-                captured_at: unix_time(),
-            }))
-        };
+        let diagnostic_rpc = initialize_cached_diagnostic_rpc(&node, &diagnostics)
+            .await
+            .expect("initial diagnostic snapshot");
         let live_peer = PeerSnapshot::new(
             PeerId(7),
             "127.0.0.1:14039".parse().expect("live peer address"),
@@ -8034,10 +9577,10 @@ mod tests {
         let authorization =
             RpcAuthorizationHeader::new("Bearer native-sync-test").expect("authorization");
         let read_context_probe = read_context.clone();
-        let server = tokio::spawn(serve_shadow_sync_rpc(
+        let server = tokio::spawn(serve_native_sync_rpc(
             listener,
-            ShadowSyncHttpState {
-                node: Arc::clone(&node),
+            NativeSyncHttpState {
+                node: node.clone(),
                 diagnostics,
                 diagnostic_rpc,
                 read_context,
@@ -8098,7 +9641,23 @@ mod tests {
             status_registry.expect("status registry diagnostics")
         );
 
-        let node_guard = node.lock().await;
+        let (writer_started_tx, writer_started_rx) = tokio::sync::oneshot::channel();
+        let (writer_release_tx, writer_release_rx) = std::sync::mpsc::channel();
+        let blocked_writer = writer.clone();
+        let writer_task = tokio::spawn(async move {
+            blocked_writer
+                .execute(None, "test blocked canonical writer", move |_node| {
+                    let _ = writer_started_tx.send(());
+                    writer_release_rx
+                        .recv()
+                        .context("test canonical writer release channel closed")?;
+                    Ok(())
+                })
+                .await
+        });
+        writer_started_rx
+            .await
+            .expect("canonical writer entered test command");
         let cached_request = format!(
             "GET /api/v1/status HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer native-sync-test\r\nConnection: close\r\n\r\n"
         );
@@ -8118,7 +9677,7 @@ mod tests {
             response
         })
         .await
-        .expect("cached diagnostic status must not wait for the node lock");
+        .expect("cached diagnostic status must not wait for the canonical writer");
         assert!(
             cached_response.starts_with("HTTP/1.1 200 OK"),
             "{cached_response}"
@@ -8158,7 +9717,7 @@ mod tests {
             response
         })
         .await
-        .expect("live network overlay must not wait for the node lock");
+        .expect("live network overlay must not wait for the canonical writer");
         let (_, live_network_body) = live_network_response
             .split_once("\r\n\r\n")
             .expect("live network body split");
@@ -8194,7 +9753,7 @@ mod tests {
             response
         })
         .await
-        .expect("cached JSON-RPC diagnostics must not wait for the node lock");
+        .expect("cached JSON-RPC diagnostics must not wait for the canonical writer");
         let (_, cached_rpc_body) = cached_rpc_response
             .split_once("\r\n\r\n")
             .expect("cached RPC body split");
@@ -8208,7 +9767,7 @@ mod tests {
 
         // Saturate both state-access paths. Unknown and known unsupported
         // methods must still reject immediately, proving classification occurs
-        // before the node lock, point-read permit, or durable snapshot.
+        // before the canonical writer, point-read permit, or durable snapshot.
         let _point_read_guard = read_context_probe
             .try_acquire_point_read()
             .expect("point-read guard");
@@ -8258,7 +9817,13 @@ mod tests {
             assert_eq!(json["error"]["message"], expected_message, "{json}");
         }
         drop(_point_read_guard);
-        drop(node_guard);
+        writer_release_tx
+            .send(())
+            .expect("release canonical writer");
+        writer_task
+            .await
+            .expect("canonical writer task join")
+            .expect("canonical writer task result");
 
         let genesis_hash = Network::Regtest.params().genesis_hash.to_hex();
         let body = serde_json::json!({
@@ -8291,20 +9856,24 @@ mod tests {
 
         shutdown_tx.send(true).expect("shutdown");
         server.await.expect("server join").expect("server result");
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
-    #[test]
-    fn block_locator_uses_exponential_backoff_and_genesis() {
+    #[tokio::test]
+    async fn block_locator_uses_exponential_backoff_and_genesis() {
         let config = NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
         };
         let mut node = NodeService::new(config);
-        node.shadow_sync_ensure_genesis_header().expect("genesis");
+        node.native_sync_ensure_genesis_header().expect("genesis");
+        let runtime = NodeRuntime::spawn(node, 8).expect("node runtime");
+        let node = runtime.read();
         assert_eq!(
-            node.shadow_sync_block_locator(MAX_LOCATOR_ENTRIES)
+            node.native_sync_block_locator(MAX_LOCATOR_ENTRIES)
                 .expect("locator"),
             vec![Network::Regtest.params().genesis_hash]
         );
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 }

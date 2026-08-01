@@ -457,13 +457,13 @@ A multi-block reorganization uses:
 Dropping a failed staged batch leaves every durable key unchanged. Intermediate
 reorganization tips and roots are never committed.
 
-Header-only shadow import uses a separate invariant: the next in-memory header
+Native header import uses a separate invariant: the next in-memory header
 index is published only after the matching durable header/best-header batch
 commits. A storage error cannot leave the live header index ahead of disk.
 
 ## Synchronization checkpoint
 
-The shadow-sync checkpoint records:
+The native-sync checkpoint records:
 
 - format version and checksum;
 - monotonically increasing sequence;

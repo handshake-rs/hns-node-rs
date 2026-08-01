@@ -183,7 +183,7 @@ SHA-256; and verify the recorded digest:
 ```bash
 umask 077
 install -d -m 0700 /ABS/private/hsrd-candidate
-artifact=/ABS/private/hsrd-candidate/hsrd-0.2.0-COMMIT
+artifact=/ABS/private/hsrd-candidate/hsrd-0.3.0-COMMIT
 [[ ! -e "$artifact" && ! -L "$artifact" ]]
 install -m 0500 -- target/release/hsrd "$artifact"
 cmp --silent -- target/release/hsrd "$artifact"
@@ -205,7 +205,7 @@ must have at least the 150,000,000,000-byte operational limit plus the separate
 
 ```bash
 scripts/run-full-sync-qualification.sh run \
-  --binary /ABS/private/hsrd-candidate/hsrd-0.2.0-COMMIT \
+  --binary /ABS/private/hsrd-candidate/hsrd-0.3.0-COMMIT \
   --data-root /ABS/fresh-mainnet-archive \
   --evidence-dir /ABS/full-sync-evidence \
   --auth-file /ABS/private/rpc-authorization-header \

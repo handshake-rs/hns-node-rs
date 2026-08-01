@@ -198,7 +198,6 @@ pub struct RpcParityInfo {
     pub configured: bool,
     pub historical_replay_complete: bool,
     pub invalid_corpus_complete: bool,
-    pub live_shadow_active: bool,
     pub last_compared_height: Option<Height>,
     pub last_matching_block: Option<BlockHash>,
     pub divergence: Option<String>,
@@ -211,11 +210,16 @@ pub struct RpcMiningEngineInfo {
     pub transaction_relay_enabled: bool,
     pub mempool: MempoolInfo,
     pub maximum_template_variants: usize,
+    #[serde(default)]
+    pub template_build_workers: usize,
+    #[serde(default)]
+    pub template_build_queue_capacity: usize,
     pub cached_template_variants: usize,
     pub pending_publications: usize,
     pub maximum_pending_publications: usize,
     pub publication_retry_interval_ms: u64,
-    pub can_build_shadow_templates: bool,
+    #[serde(default)]
+    pub can_build_templates: bool,
     pub can_publish_solved_blocks: bool,
     pub blockers: Vec<String>,
 }
@@ -1290,15 +1294,35 @@ mod tests {
     }
 
     #[test]
-    fn basic_rpc_exposes_hsrd_authority_and_parity_diagnostics() {
+    fn bounded_mining_diagnostic_additions_default_when_absent() {
+        let mut wire = serde_json::to_value(RpcMiningEngineInfo::default())
+            .expect("serialize mining diagnostics");
+        let fields = wire.as_object_mut().expect("mining diagnostic object");
+        fields.remove("template_build_workers");
+        fields.remove("template_build_queue_capacity");
+        fields.remove("can_build_templates");
+
+        let decoded: RpcMiningEngineInfo =
+            serde_json::from_value(wire).expect("deserialize additive diagnostic schema");
+        assert_eq!(decoded, RpcMiningEngineInfo::default());
+    }
+
+    #[test]
+    fn basic_rpc_exposes_native_authority_and_bounded_mining_diagnostics() {
         let snapshot = RpcSnapshot {
+            mining_engine: RpcMiningEngineInfo {
+                template_build_workers: 4,
+                template_build_queue_capacity: 8,
+                can_build_templates: true,
+                ..RpcMiningEngineInfo::default()
+            },
             node_status: RpcNodeStatus {
                 api_version: 1,
                 release_stage: "pre-authority".to_owned(),
                 schema_version: 3,
                 network: "regtest".to_owned(),
                 authority: RpcAuthorityInfo {
-                    mode: "shadow".to_owned(),
+                    mode: "native".to_owned(),
                     blockers: vec!["script and witness authorization".to_owned()],
                     ..RpcAuthorityInfo::default()
                 },
@@ -1315,7 +1339,7 @@ mod tests {
 
         for (method, field, expected) in [
             ("gethsrdstatus", "release_stage", json!("pre-authority")),
-            ("getauthorityinfo", "mode", json!("shadow")),
+            ("getauthorityinfo", "mode", json!("native")),
             ("getparityinfo", "state", json!("not-configured")),
             ("getminingengineinfo", "enabled", json!(false)),
         ] {
@@ -1329,5 +1353,32 @@ mod tests {
                 .expect("diagnostic response");
             assert_eq!(response.result.expect("result")[field], expected);
         }
+
+        let mining = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getminingengineinfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!(2)),
+            })
+            .expect("mining diagnostic response")
+            .result
+            .expect("mining diagnostics");
+        assert_eq!(mining["template_build_workers"], 4);
+        assert_eq!(mining["template_build_queue_capacity"], 8);
+        assert_eq!(mining["can_build_templates"], true);
+        assert_eq!(mining.as_object().expect("mining object").len(), 14);
+
+        let parity = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getparityinfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!(3)),
+            })
+            .expect("parity diagnostic response")
+            .result
+            .expect("parity diagnostics");
+        assert_eq!(parity.as_object().expect("parity object").len(), 9);
     }
 }

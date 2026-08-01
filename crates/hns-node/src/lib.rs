@@ -1,24 +1,30 @@
 #![forbid(unsafe_code)]
 
 mod mining_engine;
+mod native_sync;
 mod peer_bans;
-mod shadow_sync;
 
 pub use hns_p2p::LivePeerManager;
 pub use mining_engine::{
-    MiningEngineConfig, MiningEngineDiagnostics, MiningPublicationAttempt, MiningPublicationResult,
-    MiningTemplateRequest, NativeMiningJob, NativeMiningJobRequest,
+    recommended_template_build_limits, MiningEngineConfig, MiningEngineDiagnostics,
+    MiningPublicationAttempt, MiningPublicationResult, MiningTemplateRequest, NativeMiningJob,
+    NativeMiningJobRequest,
 };
-pub use shadow_sync::{
-    NativeSyncConfig, NativeSyncDiagnostics, ShadowSyncConfig, ShadowSyncDiagnostics,
-};
+pub use native_sync::{NativeSyncConfig, NativeSyncDiagnostics};
 
 use std::{
+    any::Any,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    error::Error as StdError,
+    fmt::{self as std_fmt, Display},
     future::Future,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, RwLock, Weak,
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -54,7 +60,7 @@ use hns_consensus::{
     HistoricalScriptPolicy, HistoricalValidationPlan, NameFlags, NativeAirdropSignatureVerifier,
     Network, OpenSslDnssecVerifier, ThresholdState, MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
 };
-use hns_mempool::{MemoryMempool, Mempool, MempoolInfo, OrderedTxidSnapshot};
+use hns_mempool::{MemoryMempool, Mempool, MempoolInfo, MempoolSnapshot, OrderedTxidSnapshot};
 use hns_mining::{
     HeaderSummary, MiningEventHub, MiningGeneration, MiningSnapshot, MiningSubscriptions,
     SolvedMiningCandidate, TemplateCoordinator,
@@ -107,7 +113,7 @@ use hns_store::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
-    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
 };
 use tracing_subscriber::{fmt, EnvFilter};
@@ -224,8 +230,6 @@ const MAX_REORG_RECONCILIATION_TRANSACTIONS: u64 = 1_000_000;
 #[value(rename_all = "kebab-case")]
 pub enum AuthorityMode {
     Disabled,
-    Shadow,
-    HsdVerified,
     /// Native consensus and active-state operation. Mining remains fail closed
     /// until every readiness gate is complete and the durable tip itself has
     /// the full mining-authoritative status.
@@ -1191,8 +1195,6 @@ impl AuthorityMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::Shadow => "shadow",
-            Self::HsdVerified => "hsd-verified",
             Self::Native => "native",
             Self::NativeExperimental => "native-experimental",
         }
@@ -1271,7 +1273,7 @@ pub struct NodeConfig {
     pub transaction_index: bool,
     pub name_tree_compaction: NameTreeCompactionConfig,
     pub undo_retention: UndoRetentionConfig,
-    pub shadow_sync: ShadowSyncConfig,
+    pub native_sync: NativeSyncConfig,
     pub mining_engine: MiningEngineConfig,
 }
 
@@ -1291,7 +1293,7 @@ impl Default for NodeConfig {
             transaction_index: false,
             name_tree_compaction: NameTreeCompactionConfig::default(),
             undo_retention: UndoRetentionConfig::default(),
-            shadow_sync: ShadowSyncConfig::default(),
+            native_sync: NativeSyncConfig::default(),
             mining_engine: MiningEngineConfig::default(),
         }
     }
@@ -1343,10 +1345,7 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     config.rpc_limits.validate()?;
 
     match config.authority_mode {
-        AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::Native => {}
-        AuthorityMode::HsdVerified => anyhow::bail!(
-            "hsd-verified authority is not composed yet; use shadow mode until the independent verifier boundary exists"
-        ),
+        AuthorityMode::Disabled | AuthorityMode::Native => {}
         AuthorityMode::NativeExperimental => {
             if !cfg!(any(feature = "experimental-authority", test)) {
                 anyhow::bail!(
@@ -1368,7 +1367,7 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
 
     validate_mainnet_canary_config(config)?;
 
-    if config.shadow_sync.connect_active_state
+    if config.native_sync.connect_active_state
         && !config.acknowledge_incomplete_consensus
         && config.authority_mode != AuthorityMode::Native
     {
@@ -1379,11 +1378,11 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
 
     config.name_tree_compaction.validate()?;
     config
-        .shadow_sync
+        .native_sync
         .validate(config.authority_mode, config.network)?;
     config
         .mining_engine
-        .validate(&config.shadow_sync, config.authority_mode)
+        .validate(&config.native_sync, config.authority_mode)
 }
 
 fn validate_mainnet_canary_config(config: &NodeConfig) -> Result<()> {
@@ -1402,11 +1401,11 @@ fn validate_mainnet_canary_config(config: &NodeConfig) -> Result<()> {
         || !config.rpc_bind.ip().is_loopback()
         || config.rpc_authorization.is_none()
         || config.storage_durability != DurabilityPolicy::Sync
-        || !config.shadow_sync.enabled
-        || config.shadow_sync.headers_only
-        || !config.shadow_sync.connect_active_state
-        || config.shadow_sync.maximum_outbound < 4
-        || (!config.shadow_sync.discovery && config.shadow_sync.connect_keys.len() < 2)
+        || !config.native_sync.enabled
+        || config.native_sync.headers_only
+        || !config.native_sync.connect_active_state
+        || config.native_sync.maximum_outbound < 4
+        || (!config.native_sync.discovery && config.native_sync.connect_keys.len() < 2)
         || !config.mining_engine.enabled
         || !config.mining_engine.transaction_relay
     {
@@ -1425,7 +1424,7 @@ fn authority_can_mine_with_readiness(config: &NodeConfig, consensus_complete: bo
                 && (config.network != Network::Mainnet || config.mainnet_canary)
         }
         AuthorityMode::NativeExperimental => validate_node_config(config).is_ok(),
-        AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::HsdVerified => false,
+        AuthorityMode::Disabled => false,
     }
 }
 
@@ -1616,10 +1615,6 @@ fn authority_info(config: &NodeConfig, durable: &DurableMiningState) -> RpcAutho
 
     match config.authority_mode {
         AuthorityMode::Disabled => blockers.push("authority mode is disabled".to_owned()),
-        AuthorityMode::Shadow => blockers.push("shadow mode never authorizes mining".to_owned()),
-        AuthorityMode::HsdVerified => {
-            blockers.push("hsd-verified authority boundary is not composed".to_owned())
-        }
         AuthorityMode::Native => {}
         AuthorityMode::NativeExperimental
             if !cfg!(any(feature = "experimental-authority", test)) =>
@@ -1670,11 +1665,13 @@ fn rpc_mining_engine_info(diagnostics: MiningEngineDiagnostics) -> RpcMiningEngi
         transaction_relay_enabled: diagnostics.transaction_relay_enabled,
         mempool: diagnostics.mempool,
         maximum_template_variants: diagnostics.maximum_template_variants,
+        template_build_workers: diagnostics.template_build_workers,
+        template_build_queue_capacity: diagnostics.template_build_queue_capacity,
         cached_template_variants: diagnostics.cached_template_variants,
         pending_publications: diagnostics.pending_publications,
         maximum_pending_publications: diagnostics.maximum_pending_publications,
         publication_retry_interval_ms: diagnostics.publication_retry_interval_ms,
-        can_build_shadow_templates: diagnostics.can_build_shadow_templates,
+        can_build_templates: diagnostics.can_build_templates,
         can_publish_solved_blocks: diagnostics.can_publish_solved_blocks,
         blockers: diagnostics.blockers,
     }
@@ -1791,7 +1788,6 @@ fn parity_info() -> RpcParityInfo {
         configured: false,
         historical_replay_complete: true,
         invalid_corpus_complete: true,
-        live_shadow_active: false,
         last_compared_height: Some(HISTORICAL_REPLAY_QUALIFICATION_HEIGHT),
         last_matching_block: Some(HISTORICAL_REPLAY_QUALIFICATION_BLOCK),
         divergence: None,
@@ -1803,22 +1799,1556 @@ pub struct NodeService {
     config: NodeConfig,
     state: NodeState,
     mining_events: MiningEventHub,
-    mining_engine_templates: Mutex<TemplateCoordinator>,
+    mining_engine_templates: Arc<Mutex<TemplateCoordinator>>,
     claim_dnssec: OpenSslDnssecVerifier,
     airdrop_signatures: NativeAirdropSignatureVerifier,
 }
 
-pub type SharedNodeService = Arc<tokio::sync::Mutex<NodeService>>;
+/// Maximum number of canonical-state commands that may wait behind the
+/// dedicated writer. Keeping this ceiling in the node crate prevents a caller
+/// from turning writer serialization into an unbounded memory queue.
+pub const MAX_CANONICAL_WRITER_QUEUE_CAPACITY: usize = 1_024;
+pub const DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY: usize = 64;
+
+/// Exact durable chain generation used to reject work prepared against an old
+/// canonical view. The epoch and tip are captured from one store snapshot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CanonicalEpoch {
+    /// Process-local generation advanced after every accepted mutation,
+    /// including a closure that changes memory before returning an error.
+    pub writer_sequence: u64,
+    pub chain_epoch: u64,
+    pub tip: Option<ChainTip>,
+}
+
+impl CanonicalEpoch {
+    pub fn chain(&self) -> CanonicalChainEpoch {
+        CanonicalChainEpoch {
+            chain_epoch: self.chain_epoch,
+            tip: self.tip.clone(),
+        }
+    }
+}
+
+/// Chain-only stale guard for work that is independent of mempool and other
+/// process-local writer mutations.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CanonicalChainEpoch {
+    pub chain_epoch: u64,
+    pub tip: Option<ChainTip>,
+}
+
+#[derive(Clone, Debug)]
+enum ExpectedCanonicalState {
+    Exact(CanonicalEpoch),
+    Chain(CanonicalChainEpoch),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalWriterError {
+    StaleEpoch {
+        operation: &'static str,
+        expected: CanonicalEpoch,
+        actual: CanonicalEpoch,
+    },
+    StaleChainEpoch {
+        operation: &'static str,
+        expected: CanonicalChainEpoch,
+        actual: CanonicalChainEpoch,
+    },
+    QueueFull {
+        capacity: usize,
+    },
+    Busy,
+    ShuttingDown,
+    Stopped,
+    Terminal {
+        reason: String,
+    },
+    ResponseType {
+        operation: &'static str,
+    },
+}
+
+impl Display for CanonicalWriterError {
+    fn fmt(&self, formatter: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        match self {
+            Self::StaleEpoch {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "canonical writer rejected stale {operation} operation: expected writer/chain epoch {}/{} at {:?}, current writer/chain epoch {}/{} at {:?}",
+                expected.writer_sequence,
+                expected.chain_epoch,
+                expected.tip,
+                actual.writer_sequence,
+                actual.chain_epoch,
+                actual.tip
+            ),
+            Self::StaleChainEpoch {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "canonical writer rejected stale chain-scoped {operation} operation: expected chain epoch {} at {:?}, current chain epoch {} at {:?}",
+                expected.chain_epoch, expected.tip, actual.chain_epoch, actual.tip
+            ),
+            Self::QueueFull { capacity } => write!(
+                formatter,
+                "canonical writer queue is full at its {capacity}-command bound"
+            ),
+            Self::Busy => write!(formatter, "canonical writer generation changed during read"),
+            Self::ShuttingDown => write!(formatter, "canonical writer is shutting down"),
+            Self::Stopped => write!(formatter, "canonical writer has stopped"),
+            Self::Terminal { reason } => {
+                write!(formatter, "canonical writer stopped fail-closed: {reason}")
+            }
+            Self::ResponseType { operation } => write!(
+                formatter,
+                "canonical writer returned an unexpected response type for {operation}"
+            ),
+        }
+    }
+}
+
+impl StdError for CanonicalWriterError {}
+
+/// One atomically published, immutable view of the state that must agree when
+/// mining, RPC, and mempool readers make an authorization decision.
+#[derive(Clone, Debug)]
+pub struct PublishedNodeView {
+    canonical_epoch: CanonicalEpoch,
+    mining_generation: MiningGeneration,
+    observed_mining_snapshot: Option<Arc<MiningSnapshot>>,
+    authoritative_mining_snapshot: Option<Arc<MiningSnapshot>>,
+    mining_authoritative: bool,
+    mining_synchronized: bool,
+    mempool: PublishedMempoolView,
+    storage_operational: bool,
+    storage_fence_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublishedMempoolView {
+    pub info: MempoolInfo,
+    pub ordered_txids: OrderedTxidSnapshot,
+    snapshot: MempoolSnapshot,
+    ordered_txids_generation: u64,
+}
+
+pub(crate) type PublishedMiningInputs = (
+    CanonicalEpoch,
+    Option<Arc<MiningSnapshot>>,
+    Option<Arc<MiningSnapshot>>,
+    bool,
+    MempoolInfo,
+    MempoolSnapshot,
+);
+
+impl PublishedMempoolView {
+    fn capture(mempool: &MemoryMempool) -> Result<Self> {
+        let before = mempool.info();
+        let snapshot = mempool.snapshot();
+        let ordered_txids = mempool.ordered_txids_snapshot();
+        let after = mempool.info();
+        if before != after {
+            anyhow::bail!("mempool changed while its immutable publication was being captured");
+        }
+        Self::new(after, snapshot, ordered_txids, before.generation)
+    }
+
+    fn new(
+        info: MempoolInfo,
+        snapshot: MempoolSnapshot,
+        ordered_txids: OrderedTxidSnapshot,
+        ordered_txids_generation: u64,
+    ) -> Result<Self> {
+        let published = Self {
+            info,
+            ordered_txids,
+            snapshot,
+            ordered_txids_generation,
+        };
+        published.validate()?;
+        Ok(published)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.info.generation != self.snapshot.generation()
+            || self.info.generation != self.ordered_txids_generation
+        {
+            anyhow::bail!(
+                "published mempool generations disagree: info={}, snapshot={}, ordered={}",
+                self.info.generation,
+                self.snapshot.generation(),
+                self.ordered_txids_generation
+            );
+        }
+        if self.info.transaction_count != self.snapshot.len()
+            || self.info.transaction_count != self.ordered_txids.len()
+        {
+            anyhow::bail!(
+                "published mempool transaction counts disagree: info={}, snapshot={}, ordered={}",
+                self.info.transaction_count,
+                self.snapshot.len(),
+                self.ordered_txids.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// O(1) clone of the persistent maps for this exact published generation.
+    pub fn snapshot(&self) -> MempoolSnapshot {
+        self.snapshot.clone()
+    }
+}
+
+impl PublishedNodeView {
+    pub fn canonical_epoch(&self) -> &CanonicalEpoch {
+        &self.canonical_epoch
+    }
+
+    pub const fn mining_generation(&self) -> MiningGeneration {
+        self.mining_generation
+    }
+
+    pub fn observed_mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
+        self.observed_mining_snapshot.clone()
+    }
+
+    pub fn authoritative_mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
+        self.authoritative_mining_snapshot.clone()
+    }
+
+    pub const fn mining_authoritative(&self) -> bool {
+        self.mining_authoritative
+    }
+
+    pub const fn mining_synchronized(&self) -> bool {
+        self.mining_synchronized
+    }
+
+    pub fn mempool_info(&self) -> &MempoolInfo {
+        &self.mempool.info
+    }
+
+    pub fn ordered_txids(&self) -> &OrderedTxidSnapshot {
+        &self.mempool.ordered_txids
+    }
+
+    pub fn mempool_snapshot(&self) -> MempoolSnapshot {
+        self.mempool.snapshot()
+    }
+
+    pub fn mempool_view(&self) -> &PublishedMempoolView {
+        &self.mempool
+    }
+
+    pub const fn storage_operational(&self) -> bool {
+        self.storage_operational
+    }
+
+    pub fn storage_fence_reason(&self) -> Option<&str> {
+        self.storage_fence_reason.as_deref()
+    }
+}
+
+#[derive(Debug)]
+struct NodeRuntimeState {
+    published: RwLock<Arc<PublishedNodeView>>,
+    /// Even values identify stable published generations. The writer stores
+    /// an odd value before invoking any mutation closure and returns to even
+    /// only after the corresponding immutable view is published.
+    publication_sequence: AtomicU64,
+    accepting: AtomicBool,
+    terminal: Mutex<Option<String>>,
+}
+
+impl NodeRuntimeState {
+    fn published_unchecked(&self) -> Arc<PublishedNodeView> {
+        Arc::clone(
+            &self
+                .published
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn published(&self) -> Arc<PublishedNodeView> {
+        // The last published Arc is immutable and remains a valid committed
+        // generation while a bounded writer slice is in flight. Callers that
+        // must bind new durable reads to an epoch use `with_stable_epoch_read`.
+        self.published_unchecked()
+    }
+
+    fn publish(&self, view: PublishedNodeView) {
+        *self
+            .published
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(view);
+    }
+
+    fn terminal_reason(&self) -> Option<String> {
+        self.terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn stop_fail_closed(&self, reason: impl Into<String>) -> String {
+        self.accepting.store(false, Ordering::Release);
+        let mut terminal = self
+            .terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if terminal.is_none() {
+            *terminal = Some(reason.into());
+        }
+        terminal.clone().expect("terminal reason was initialized")
+    }
+}
+
+type CanonicalCommandValue = Box<dyn Any + Send>;
+type CanonicalCommandOperation =
+    Box<dyn FnOnce(&mut NodeService) -> Result<CanonicalCommandValue> + Send + 'static>;
+type CanonicalReadOperation =
+    Box<dyn FnOnce(&NodeService) -> Result<CanonicalCommandValue> + Send + 'static>;
+
+enum CanonicalWriterCommand {
+    Execute {
+        expected: Option<ExpectedCanonicalState>,
+        operation: &'static str,
+        execute: CanonicalCommandOperation,
+        _admission: OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<CanonicalCommandValue>>,
+    },
+    Inspect {
+        operation: &'static str,
+        inspect: CanonicalReadOperation,
+        _admission: OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<CanonicalCommandValue>>,
+    },
+    Shutdown {
+        mark_clean: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
+
+struct NodeRuntimeInner {
+    state: Arc<NodeRuntimeState>,
+    sender: mpsc::Sender<CanonicalWriterCommand>,
+    admission_slots: Arc<Semaphore>,
+    admission: Mutex<()>,
+    join: AsyncMutex<Option<thread::JoinHandle<()>>>,
+    queue_capacity: usize,
+}
+
+/// Cloneable immutable access to durable state and the coherent published
+/// chain/mempool/mining generation. This handle never exposes a mutable store
+/// or mutable header index.
+#[derive(Clone)]
+pub struct NodeReadHandle {
+    config: Arc<NodeConfig>,
+    store: StoreHandle,
+    headers: SharedHeaderIndex,
+    transaction_index: bool,
+    mining_events: MiningEventHub,
+    mining_engine_templates: Arc<Mutex<TemplateCoordinator>>,
+    state: Arc<NodeRuntimeState>,
+    runtime: Weak<NodeRuntimeInner>,
+    point_read_concurrency: Arc<Semaphore>,
+    collection_concurrency: Arc<Semaphore>,
+    template_build_admission: Arc<Semaphore>,
+    template_build_workers: Arc<Semaphore>,
+}
+
+impl NodeReadHandle {
+    pub fn config(&self) -> Arc<NodeConfig> {
+        Arc::clone(&self.config)
+    }
+
+    pub fn network(&self) -> Network {
+        self.config.network
+    }
+
+    /// Return the last immutable publication for observation. This remains
+    /// available while a writer generation is in flight and may be stale
+    /// after shutdown; authority-bearing callers must use a checked accessor
+    /// such as [`Self::published_mempool`] or [`Self::stable_canonical_epoch`].
+    pub fn published(&self) -> Arc<PublishedNodeView> {
+        self.state.published()
+    }
+
+    pub fn canonical_epoch(&self) -> CanonicalEpoch {
+        self.published().canonical_epoch.clone()
+    }
+
+    pub fn ensure_storage_operational(&self) -> Result<()> {
+        if let Some(reason) = self.state.terminal_reason() {
+            return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                reason,
+            }));
+        }
+        if !self.state.accepting.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+        }
+        let _runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        if let Some(reason) = self.state.terminal_reason() {
+            return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                reason,
+            }));
+        }
+        if !self.state.accepting.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+        }
+        let published = self.published();
+        if published.storage_operational {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "node is fail-closed: {}",
+                published
+                    .storage_fence_reason
+                    .as_deref()
+                    .unwrap_or("canonical writer is unavailable")
+            )
+        }
+    }
+
+    pub fn mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
+        self.ensure_storage_operational().ok()?;
+        let snapshot = self.published().authoritative_mining_snapshot();
+        self.ensure_storage_operational().ok()?;
+        snapshot
+    }
+
+    pub fn observed_mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
+        self.published().observed_mining_snapshot()
+    }
+
+    pub fn subscribe_observed_mining_events(&self) -> MiningSubscriptions {
+        self.mining_events.subscribe()
+    }
+
+    pub fn subscribe_mining_events(&self) -> Result<MiningSubscriptions> {
+        self.ensure_storage_operational()?;
+        if self.published().mining_authoritative {
+            let subscriptions = self.mining_events.subscribe();
+            self.ensure_storage_operational()?;
+            Ok(subscriptions)
+        } else {
+            anyhow::bail!("authoritative mining subscriptions are disabled")
+        }
+    }
+
+    pub async fn rpc_diagnostic_service(&self) -> Result<BasicRpcService> {
+        self.inspect_bounded("RPC diagnostic snapshot", |node| {
+            node.rpc_diagnostic_service()
+        })
+        .await
+    }
+
+    pub(crate) fn rpc_read_context(&self) -> Result<RpcReadContext> {
+        self.ensure_storage_operational()?;
+        Ok(RpcReadContext {
+            store: self.store.clone(),
+            headers: self.headers.clone(),
+            network: self.config.network,
+            transaction_index: self.transaction_index,
+            point_read_concurrency: Arc::clone(&self.point_read_concurrency),
+            collection_concurrency: Arc::clone(&self.collection_concurrency),
+        })
+    }
+
+    /// Checked O(1) clone of the last committed immutable mempool generation.
+    /// That generation deliberately remains readable while a writer mutation
+    /// is in flight. Terminal, stopped, and shutting-down runtimes do not
+    /// expose their last stale generation through this authority-bearing
+    /// accessor.
+    pub fn published_mempool(&self) -> Result<PublishedMempoolView> {
+        Ok(self.checked_published()?.mempool.clone())
+    }
+
+    fn checked_published(&self) -> Result<Arc<PublishedNodeView>> {
+        self.ensure_storage_operational()?;
+        let published = self.published();
+        published.mempool.validate()?;
+        self.ensure_storage_operational()?;
+        Ok(published)
+    }
+
+    pub(crate) fn published_mempool_snapshot(&self) -> Result<MempoolSnapshot> {
+        Ok(self.checked_published()?.mempool_snapshot())
+    }
+
+    pub(crate) fn published_mining_inputs(&self) -> Result<PublishedMiningInputs> {
+        let published = self.checked_published()?;
+        let inputs = (
+            published.canonical_epoch.clone(),
+            published.observed_mining_snapshot.clone(),
+            published.authoritative_mining_snapshot.clone(),
+            published.mining_authoritative,
+            published.mempool.info.clone(),
+            published.mempool.snapshot(),
+        );
+        self.ensure_storage_operational()?;
+        Ok(inputs)
+    }
+
+    pub(crate) fn template_coordinator_handle(&self) -> Arc<Mutex<TemplateCoordinator>> {
+        Arc::clone(&self.mining_engine_templates)
+    }
+
+    pub(crate) fn canonical_generation_is_stable(&self, expected: &CanonicalEpoch) -> bool {
+        if self.ensure_storage_operational().is_err() {
+            return false;
+        }
+        let before = self.state.publication_sequence.load(Ordering::Acquire);
+        if before & 1 != 0 || expected.writer_sequence != before / 2 {
+            return false;
+        }
+        let published = self.state.published_unchecked();
+        if !published.storage_operational || &published.canonical_epoch != expected {
+            return false;
+        }
+        let after = self.state.publication_sequence.load(Ordering::Acquire);
+        if before != after || after & 1 != 0 || self.ensure_storage_operational().is_err() {
+            return false;
+        }
+        let current = self.state.published_unchecked();
+        let final_sequence = self.state.publication_sequence.load(Ordering::Acquire);
+        before == final_sequence
+            && final_sequence & 1 == 0
+            && Arc::ptr_eq(&published, &current)
+            && current.storage_operational
+            && &current.canonical_epoch == expected
+    }
+
+    pub(crate) async fn rpc_request_mempool(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> Result<RpcRequestMempool> {
+        let method = RpcMethod::from_hsd_name(&request.method);
+        let published = self.checked_published()?;
+        let ordered_txids = (method == Some(RpcMethod::GetRawMempool)
+            && published.mempool.info.transaction_count
+                <= self.config.rpc_limits.maximum_collection_entries)
+            .then(|| published.mempool.ordered_txids.clone());
+        let transaction_lookup = if method == Some(RpcMethod::GetRawTransaction) {
+            rpc_string_param(request, 0)
+                .and_then(|encoded| decode_rpc_txid(encoded).ok())
+                .map(|txid| (published.mempool.snapshot(), txid))
+        } else {
+            None
+        };
+        self.ensure_storage_operational()?;
+        Ok(RpcRequestMempool {
+            info: published.mempool.info.clone(),
+            ordered_txids,
+            transaction_lookup,
+        })
+    }
+
+    pub(crate) async fn mempool_transaction(&self, txid: Txid) -> Result<Option<Transaction>> {
+        let permit = Arc::clone(&self.point_read_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let snapshot = self.published_mempool_snapshot()?;
+        let transaction = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            snapshot.transaction(&txid).cloned()
+        })
+        .await
+        .context("mempool transaction worker failed")?;
+        self.ensure_storage_operational()?;
+        Ok(transaction)
+    }
+
+    pub(crate) async fn mempool_claim(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<hns_primitives::Claim>> {
+        let permit = Arc::clone(&self.point_read_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let snapshot = self.published_mempool_snapshot()?;
+        let claim = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            snapshot.claim(&hash).map(|entry| entry.claim.clone())
+        })
+        .await
+        .context("mempool claim worker failed")?;
+        self.ensure_storage_operational()?;
+        Ok(claim)
+    }
+
+    pub(crate) async fn mempool_airdrop(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<hns_primitives::AirdropProof>> {
+        let permit = Arc::clone(&self.point_read_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let snapshot = self.published_mempool_snapshot()?;
+        let proof = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            snapshot.airdrop(&hash).map(|entry| entry.proof.clone())
+        })
+        .await
+        .context("mempool airdrop worker failed")?;
+        self.ensure_storage_operational()?;
+        Ok(proof)
+    }
+
+    pub(crate) async fn mempool_inventory(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<hns_p2p::Inventory>> {
+        if maximum > MAX_RPC_COLLECTION_ENTRIES {
+            anyhow::bail!(
+                "mempool inventory request {maximum} exceeds {MAX_RPC_COLLECTION_ENTRIES} entries"
+            );
+        }
+        let permit = Arc::clone(&self.collection_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let published = self.checked_published()?;
+        let snapshot = published.mempool.snapshot();
+        let ordered_txids = published.mempool.ordered_txids.clone();
+        let inventory = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut inventory = Vec::with_capacity(
+                maximum.min(
+                    ordered_txids
+                        .len()
+                        .saturating_add(published.mempool.info.claim_count)
+                        .saturating_add(published.mempool.info.airdrop_count),
+                ),
+            );
+            inventory.extend(
+                ordered_txids
+                    .txids()
+                    .take(maximum)
+                    .map(hns_p2p::Inventory::transaction),
+            );
+            let remaining = maximum.saturating_sub(inventory.len());
+            inventory.extend(
+                snapshot
+                    .claims_in_sequence()
+                    .take(remaining)
+                    .map(|entry| hns_p2p::Inventory::claim(entry.hash)),
+            );
+            let remaining = maximum.saturating_sub(inventory.len());
+            inventory.extend(
+                snapshot
+                    .airdrops_in_sequence()
+                    .take(remaining)
+                    .map(|entry| hns_p2p::Inventory::airdrop(entry.hash)),
+            );
+            inventory
+        })
+        .await
+        .context("mempool inventory worker failed")?;
+        self.ensure_storage_operational()?;
+        Ok(inventory)
+    }
+
+    pub(crate) async fn mempool_transactions(&self, maximum: usize) -> Result<Vec<Transaction>> {
+        if maximum > MAX_RPC_COLLECTION_ENTRIES {
+            anyhow::bail!(
+                "mempool transaction request {maximum} exceeds {MAX_RPC_COLLECTION_ENTRIES} entries"
+            );
+        }
+        let permit = Arc::clone(&self.collection_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let published = self.checked_published()?;
+        let snapshot = published.mempool.snapshot();
+        let ordered_txids = published.mempool.ordered_txids.clone();
+        let transactions = tokio::task::spawn_blocking(move || -> Result<Vec<Transaction>> {
+            let _permit = permit;
+            let mut transactions = Vec::with_capacity(maximum.min(ordered_txids.len()));
+            for txid in ordered_txids.txids().take(maximum) {
+                let transaction = snapshot.transaction(&txid).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "published mempool order references absent transaction {}",
+                        txid.to_hex()
+                    )
+                })?;
+                transactions.push(transaction.clone());
+            }
+            Ok(transactions)
+        })
+        .await
+        .context("mempool transaction collection worker failed")??;
+        self.ensure_storage_operational()?;
+        Ok(transactions)
+    }
+
+    /// Execute a short actor-owned diagnostic read in canonical-writer order.
+    /// Durable reads use stable snapshots, and mempool/template payloads use
+    /// their structurally shared published generations; neither scans nor
+    /// payload construction belong on this path.
+    async fn inspect_bounded<T, F>(&self, operation: &'static str, inspect: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&NodeService) -> Result<T> + Send + 'static,
+    {
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        if let Some(reason) = self.state.terminal_reason() {
+            return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                reason,
+            }));
+        }
+        if !self.state.accepting.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+        }
+        let admission = Arc::clone(&runtime.admission_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                anyhow::Error::new(CanonicalWriterError::QueueFull {
+                    capacity: runtime.queue_capacity,
+                })
+            })?;
+        let (reply, response) = oneshot::channel();
+        let command = CanonicalWriterCommand::Inspect {
+            operation,
+            inspect: Box::new(move |node| {
+                inspect(node).map(|value| Box::new(value) as CanonicalCommandValue)
+            }),
+            _admission: admission,
+            reply,
+        };
+        let permit = runtime
+            .sender
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        {
+            let _admission = runtime
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(reason) = self.state.terminal_reason() {
+                return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                    reason,
+                }));
+            }
+            if !self.state.accepting.load(Ordering::Acquire) {
+                return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+            }
+            permit.send(command);
+        }
+        decode_canonical_response(operation, response.await)
+    }
+
+    /// Run a durable immutable read against one stable writer generation. If
+    /// a mutation overlaps the read, discard its result and retry after the
+    /// writer publishes the matching even generation.
+    pub(crate) fn with_stable_read<T, F>(&self, read: F) -> Result<T>
+    where
+        F: FnOnce(&StoreHandle, &SharedHeaderIndex) -> Result<T>,
+    {
+        self.with_stable_epoch_read(read).map(|(_, value)| value)
+    }
+
+    /// Capture a prepare result and its exact canonical epoch without waiting
+    /// on an in-flight mutation. Busy callers may yield and retry or submit an
+    /// ordered inspector command instead.
+    pub(crate) fn with_stable_epoch_read<T, F>(&self, read: F) -> Result<(CanonicalEpoch, T)>
+    where
+        F: FnOnce(&StoreHandle, &SharedHeaderIndex) -> Result<T>,
+    {
+        self.ensure_storage_operational()?;
+        let before = self.state.publication_sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return Err(anyhow::Error::new(CanonicalWriterError::Busy));
+        }
+        let epoch = self.state.published_unchecked().canonical_epoch.clone();
+        let result = read(&self.store, &self.headers);
+        let after = self.state.publication_sequence.load(Ordering::Acquire);
+        if before != after || after & 1 != 0 || epoch.writer_sequence != after / 2 {
+            return Err(anyhow::Error::new(CanonicalWriterError::Busy));
+        }
+        self.ensure_storage_operational()?;
+        result.map(|value| (epoch, value))
+    }
+
+    pub fn stable_canonical_epoch(&self) -> Result<CanonicalEpoch> {
+        self.ensure_storage_operational()?;
+        Ok(self.canonical_epoch())
+    }
+
+    /// Reserve one configured template slot before capturing the mempool. The
+    /// permit must be held through capture and construction so admitted
+    /// snapshots remain inside the aggregate memory envelope.
+    pub(crate) fn try_acquire_template_build_admission(&self) -> Result<OwnedSemaphorePermit> {
+        self.ensure_storage_operational()?;
+        Arc::clone(&self.template_build_admission)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))
+    }
+
+    /// Wait for bounded CPU capacity before the off-actor state capture. The
+    /// permit covers capture and construction without blocking the writer.
+    pub(crate) async fn acquire_template_build_worker(&self) -> Result<OwnedSemaphorePermit> {
+        self.ensure_storage_operational()?;
+        let worker = Arc::clone(&self.template_build_workers)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        self.ensure_storage_operational()?;
+        Ok(worker)
+    }
+}
+
+impl std_fmt::Debug for NodeReadHandle {
+    fn fmt(&self, formatter: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        formatter
+            .debug_struct("NodeReadHandle")
+            .field("network", &self.config.network)
+            .field("canonical_epoch", &self.canonical_epoch())
+            .field("accepting", &self.state.accepting.load(Ordering::Acquire))
+            .field("terminal", &self.state.terminal_reason())
+            .finish()
+    }
+}
+
+/// Bounded command admission to the one OS thread that exclusively owns the
+/// mutable [`NodeService`]. Once accepted, a command runs even if its caller
+/// drops the response future.
+#[derive(Clone)]
+pub struct CanonicalStateWriter {
+    inner: Arc<NodeRuntimeInner>,
+}
+
+impl std_fmt::Debug for CanonicalStateWriter {
+    fn fmt(&self, formatter: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        formatter
+            .debug_struct("CanonicalStateWriter")
+            .field("queue_capacity", &self.inner.queue_capacity)
+            .field(
+                "accepting",
+                &self.inner.state.accepting.load(Ordering::Acquire),
+            )
+            .field("terminal", &self.inner.state.terminal_reason())
+            .finish()
+    }
+}
+
+impl CanonicalStateWriter {
+    pub async fn execute<T, F>(
+        &self,
+        expected: Option<CanonicalEpoch>,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        let admission = self.try_admission()?;
+        let (reply, response) = oneshot::channel();
+        let command = CanonicalWriterCommand::Execute {
+            expected: expected.map(ExpectedCanonicalState::Exact),
+            operation,
+            execute: Box::new(move |node| {
+                execute(node).map(|value| Box::new(value) as CanonicalCommandValue)
+            }),
+            _admission: admission,
+            reply,
+        };
+        let permit = self
+            .inner
+            .sender
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.ensure_accepting()?;
+            permit.send(command);
+        }
+        decode_canonical_response(operation, response.await)
+    }
+
+    pub async fn execute_at<T, F>(
+        &self,
+        expected: CanonicalEpoch,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        self.execute(Some(expected), operation, execute).await
+    }
+
+    pub async fn execute_at_chain<T, F>(
+        &self,
+        expected: CanonicalChainEpoch,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        self.execute_expected(
+            Some(ExpectedCanonicalState::Chain(expected)),
+            operation,
+            execute,
+        )
+        .await
+    }
+
+    pub async fn try_execute<T, F>(
+        &self,
+        expected: Option<CanonicalEpoch>,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        let admission = self.try_admission()?;
+        let permit = self
+            .inner
+            .sender
+            .clone()
+            .try_reserve_owned()
+            .map_err(|error| {
+                let kind = match error {
+                    mpsc::error::TrySendError::Full(_) => CanonicalWriterError::QueueFull {
+                        capacity: self.inner.queue_capacity,
+                    },
+                    mpsc::error::TrySendError::Closed(_) => CanonicalWriterError::Stopped,
+                };
+                anyhow::Error::new(kind)
+            })?;
+        let (reply, response) = oneshot::channel();
+        let command = CanonicalWriterCommand::Execute {
+            expected: expected.map(ExpectedCanonicalState::Exact),
+            operation,
+            execute: Box::new(move |node| {
+                execute(node).map(|value| Box::new(value) as CanonicalCommandValue)
+            }),
+            _admission: admission,
+            reply,
+        };
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.ensure_accepting()?;
+            permit.send(command);
+        }
+        decode_canonical_response(operation, response.await)
+    }
+
+    pub async fn try_execute_at<T, F>(
+        &self,
+        expected: CanonicalEpoch,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        self.try_execute(Some(expected), operation, execute).await
+    }
+
+    async fn execute_expected<T, F>(
+        &self,
+        expected: Option<ExpectedCanonicalState>,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        let admission = self.try_admission()?;
+        let (reply, response) = oneshot::channel();
+        let command = CanonicalWriterCommand::Execute {
+            expected,
+            operation,
+            execute: Box::new(move |node| {
+                execute(node).map(|value| Box::new(value) as CanonicalCommandValue)
+            }),
+            _admission: admission,
+            reply,
+        };
+        let permit = self
+            .inner
+            .sender
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.ensure_accepting()?;
+            permit.send(command);
+        }
+        decode_canonical_response(operation, response.await)
+    }
+
+    fn ensure_accepting(&self) -> Result<()> {
+        if let Some(reason) = self.inner.state.terminal_reason() {
+            return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                reason,
+            }));
+        }
+        if !self.inner.state.accepting.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+        }
+        Ok(())
+    }
+
+    fn try_admission(&self) -> Result<OwnedSemaphorePermit> {
+        self.ensure_accepting()?;
+        Arc::clone(&self.inner.admission_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                anyhow::Error::new(CanonicalWriterError::QueueFull {
+                    capacity: self.inner.queue_capacity,
+                })
+            })
+    }
+}
+
+fn decode_canonical_response<T: Send + 'static>(
+    operation: &'static str,
+    response: std::result::Result<Result<CanonicalCommandValue>, oneshot::error::RecvError>,
+) -> Result<T> {
+    let value = response.map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))??;
+    value
+        .downcast::<T>()
+        .map(|value| *value)
+        .map_err(|_| anyhow::Error::new(CanonicalWriterError::ResponseType { operation }))
+}
+
+/// Process-local owner for the dedicated canonical writer and all immutable
+/// read handles derived from it.
+#[derive(Clone)]
+pub struct NodeRuntime {
+    inner: Arc<NodeRuntimeInner>,
+    read: NodeReadHandle,
+}
+
+impl std_fmt::Debug for NodeRuntime {
+    fn fmt(&self, formatter: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        formatter
+            .debug_struct("NodeRuntime")
+            .field("queue_capacity", &self.inner.queue_capacity)
+            .field(
+                "accepting",
+                &self.inner.state.accepting.load(Ordering::Acquire),
+            )
+            .field("terminal", &self.inner.state.terminal_reason())
+            .finish()
+    }
+}
+
+impl NodeRuntime {
+    pub fn spawn(mut node: NodeService, queue_capacity: usize) -> Result<Self> {
+        if queue_capacity == 0 || queue_capacity > MAX_CANONICAL_WRITER_QUEUE_CAPACITY {
+            anyhow::bail!(
+                "canonical writer queue capacity must be between 1 and {MAX_CANONICAL_WRITER_QUEUE_CAPACITY}"
+            );
+        }
+        node.state.ensure_storage_operational()?;
+        node.mining_engine_initialize_publication_queue()?;
+        let initial = capture_published_node_view(&node, 0)?;
+        let config = Arc::new(node.config.clone());
+        let store = node.state.store.clone();
+        let headers = node.state.chain.clone();
+        let transaction_index = node.state.transaction_index;
+        let mining_events = node.mining_events.clone();
+        let mining_engine_templates = Arc::clone(&node.mining_engine_templates);
+        let maximum_concurrent_requests = node.config.rpc_limits.maximum_concurrent_requests;
+        let template_build_workers = node.config.mining_engine.template_build_workers();
+        let template_build_queue_capacity =
+            node.config.mining_engine.template_build_queue_capacity();
+        let state = Arc::new(NodeRuntimeState {
+            published: RwLock::new(Arc::new(initial)),
+            publication_sequence: AtomicU64::new(0),
+            accepting: AtomicBool::new(true),
+            terminal: Mutex::new(None),
+        });
+        let (sender, receiver) = mpsc::channel(queue_capacity);
+        let actor_state = Arc::clone(&state);
+        let join = thread::Builder::new()
+            .name("hsrd-canonical-writer".to_owned())
+            .spawn(move || canonical_writer_thread(node, receiver, actor_state))
+            .context("failed to spawn canonical writer thread")?;
+        let inner = Arc::new(NodeRuntimeInner {
+            state,
+            sender,
+            admission_slots: Arc::new(Semaphore::new(queue_capacity.saturating_add(1))),
+            admission: Mutex::new(()),
+            join: AsyncMutex::new(Some(join)),
+            queue_capacity,
+        });
+        let read = NodeReadHandle {
+            config,
+            store,
+            headers,
+            transaction_index,
+            mining_events,
+            mining_engine_templates,
+            state: Arc::clone(&inner.state),
+            runtime: Arc::downgrade(&inner),
+            point_read_concurrency: Arc::new(Semaphore::new(maximum_concurrent_requests)),
+            collection_concurrency: Arc::new(Semaphore::new(maximum_concurrent_requests)),
+            template_build_admission: Arc::new(Semaphore::new(template_build_queue_capacity)),
+            template_build_workers: Arc::new(Semaphore::new(template_build_workers)),
+        };
+        Ok(Self { inner, read })
+    }
+
+    pub fn read(&self) -> NodeReadHandle {
+        self.read.clone()
+    }
+
+    pub fn writer(&self) -> CanonicalStateWriter {
+        CanonicalStateWriter {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Authorize a clean marker only from the crate-owned runtime supervisor.
+    /// Public extensions receive read and writer capabilities, but never node
+    /// lifecycle authority.
+    pub(crate) async fn shutdown(self) -> Result<()> {
+        self.shutdown_inner(true).await
+    }
+
+    /// Drain accepted writer work and stop without authorizing a clean-store
+    /// marker. Runtime supervisors must use this path after any failed
+    /// extension, checkpoint, listener, or shutdown phase so the next process
+    /// performs exhaustive startup validation.
+    pub(crate) async fn shutdown_unclean(self) -> Result<()> {
+        self.shutdown_inner(false).await
+    }
+
+    async fn shutdown_inner(self, mark_clean: bool) -> Result<()> {
+        // Serializing on the join handle makes cloned shutdown attempts
+        // deterministic. In particular, an unclean correction cannot race a
+        // preceding clean shutdown and be overwritten by its final marker.
+        let mut join_guard = self.inner.join.lock().await;
+        let marker_result = if mark_clean {
+            Ok(())
+        } else {
+            mark_unclean_start(&self.read.store)
+                .map_err(anyhow::Error::new)
+                .context("failed to durably preserve the unclean runtime marker")
+        };
+        if join_guard.is_none() {
+            return if mark_clean {
+                Err(anyhow::Error::new(CanonicalWriterError::Stopped))
+            } else {
+                marker_result
+            };
+        }
+
+        let (reply, response) = oneshot::channel();
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.inner.state.accepting.store(false, Ordering::Release);
+        }
+        // Send even when another path already stopped admission. A cancelled
+        // shutdown may have flipped `accepting` without ever queuing the stop
+        // command, and this caller still owns the live join handle.
+        let actor_result = match self.inner.sender.clone().reserve_owned().await {
+            Ok(permit) => {
+                permit.send(CanonicalWriterCommand::Shutdown { mark_clean, reply });
+                match response.await {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::Error::new(CanonicalWriterError::Stopped)),
+                }
+            }
+            Err(_) => Err(anyhow::Error::new(CanonicalWriterError::Stopped)),
+        };
+        // Keep the handle recoverable in shared state across both await
+        // points above. If this future is cancelled before or after enqueue,
+        // another lifecycle owner can still stop and join the actor.
+        let join = join_guard
+            .take()
+            .expect("canonical writer join handle remained serialized");
+        let join_result = match tokio::task::spawn_blocking(move || join.join()).await {
+            Ok(result) => result.map_err(|_| anyhow::anyhow!("canonical writer thread panicked")),
+            Err(error) => Err(anyhow::anyhow!(
+                "failed to join canonical writer task: {error}"
+            )),
+        };
+        drop(join_guard);
+
+        let result = combine_shutdown_phase(marker_result, "canonical writer stop", actor_result);
+        let result = combine_shutdown_phase(result, "canonical writer join", join_result);
+        if mark_clean {
+            result
+        } else {
+            // A clean shutdown command may already have been queued by a
+            // cancelled clone. It can overwrite the pre-stop unclean marker,
+            // exit, and discard this correction command. Reassert only after
+            // joining so no actor-owned clean write can win afterward.
+            let final_marker_result = mark_unclean_start(&self.read.store)
+                .map_err(anyhow::Error::new)
+                .context("failed to reassert the unclean marker after canonical writer exit");
+            combine_shutdown_phase(
+                result,
+                "post-join unclean-marker reassertion",
+                final_marker_result,
+            )
+        }
+    }
+
+    pub fn terminal_error(&self) -> Option<CanonicalWriterError> {
+        self.inner
+            .state
+            .terminal_reason()
+            .map(|reason| CanonicalWriterError::Terminal { reason })
+    }
+}
+
+fn combine_shutdown_phase(
+    accumulated: Result<()>,
+    phase: &'static str,
+    phase_result: Result<()>,
+) -> Result<()> {
+    match (accumulated, phase_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error.context(phase)),
+        (Err(error), Err(additional)) => Err(error.context(format!(
+            "{phase} also failed during shutdown: {additional:#}"
+        ))),
+    }
+}
+
+fn canonical_epoch_for_node(node: &NodeService, writer_sequence: u64) -> Result<CanonicalEpoch> {
+    let snapshot = node.state.store.snapshot()?;
+    Ok(CanonicalEpoch {
+        writer_sequence,
+        chain_epoch: chain_epoch_from_snapshot(&snapshot)?,
+        tip: best_block_tip_from_snapshot(&snapshot)?,
+    })
+}
+
+fn capture_published_node_view(
+    node: &NodeService,
+    writer_sequence: u64,
+) -> Result<PublishedNodeView> {
+    node.state.ensure_storage_operational()?;
+    let canonical_epoch = canonical_epoch_for_node(node, writer_sequence)?;
+    let durable = node.state.durable_mining_state()?;
+    let mempool = PublishedMempoolView::capture(&node.state.mempool)?;
+    let authority_permit = issue_authority_permit(&node.config, &durable);
+    let authoritative_mining_snapshot = authority_permit.as_ref().and_then(|permit| {
+        node.mining_events.snapshot().filter(|snapshot| {
+            snapshot.generation == permit.generation && snapshot.tip.hash == permit.tip
+        })
+    });
+    let mining_authoritative = authority_permit.is_some()
+        && authoritative_mining_snapshot.is_some()
+        && durable.authoritative;
+    Ok(PublishedNodeView {
+        canonical_epoch,
+        mining_generation: durable.generation,
+        observed_mining_snapshot: durable.snapshot,
+        authoritative_mining_snapshot,
+        mining_authoritative,
+        mining_synchronized: durable.synchronized,
+        mempool,
+        storage_operational: true,
+        storage_fence_reason: None,
+    })
+}
+
+fn fail_closed_published_node_view(
+    node: &NodeService,
+    previous: &PublishedNodeView,
+    writer_sequence: u64,
+    reason: String,
+) -> PublishedNodeView {
+    let canonical_epoch = canonical_epoch_for_node(node, writer_sequence)
+        .unwrap_or_else(|_| previous.canonical_epoch.clone());
+    PublishedNodeView {
+        canonical_epoch,
+        mining_generation: previous.mining_generation,
+        observed_mining_snapshot: None,
+        authoritative_mining_snapshot: None,
+        mining_authoritative: false,
+        mining_synchronized: false,
+        mempool: previous.mempool.clone(),
+        storage_operational: false,
+        storage_fence_reason: Some(reason),
+    }
+}
+
+fn next_writer_sequence(current: u64) -> Option<u64> {
+    // Each writer generation consumes an odd "write in progress" value and
+    // the following even "published" value in the seqlock counter.
+    current.checked_add(1).filter(|next| *next <= u64::MAX / 2)
+}
+
+fn canonical_writer_thread(
+    mut node: NodeService,
+    mut receiver: mpsc::Receiver<CanonicalWriterCommand>,
+    state: Arc<NodeRuntimeState>,
+) {
+    let mut writer_sequence = 0u64;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        while let Some(command) = receiver.blocking_recv() {
+            match command {
+                CanonicalWriterCommand::Execute {
+                    expected,
+                    operation,
+                    execute,
+                    _admission,
+                    reply,
+                } => {
+                    if let Some(reason) = state.terminal_reason() {
+                        let _ =
+                            reply.send(Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                                reason,
+                            })));
+                        continue;
+                    }
+                    let actual = match canonical_epoch_for_node(&node, writer_sequence) {
+                        Ok(actual) => actual,
+                        Err(error) => {
+                            let reason = state.stop_fail_closed(format!(
+                                "failed to capture canonical epoch before {operation}: {error:#}"
+                            ));
+                            let previous = state.published();
+                            state.publish(fail_closed_published_node_view(
+                                &node,
+                                &previous,
+                                writer_sequence,
+                                reason.clone(),
+                            ));
+                            let _ = reply.send(Err(anyhow::Error::new(
+                                CanonicalWriterError::Terminal { reason },
+                            )));
+                            break;
+                        }
+                    };
+                    if let Some(expected) = expected {
+                        let stale = match expected {
+                            ExpectedCanonicalState::Exact(expected) if expected != actual => {
+                                Some(CanonicalWriterError::StaleEpoch {
+                                    operation,
+                                    expected,
+                                    actual: actual.clone(),
+                                })
+                            }
+                            ExpectedCanonicalState::Chain(expected)
+                                if expected != actual.chain() =>
+                            {
+                                Some(CanonicalWriterError::StaleChainEpoch {
+                                    operation,
+                                    expected,
+                                    actual: actual.chain(),
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(stale) = stale {
+                            let _ = reply.send(Err(anyhow::Error::new(stale)));
+                            continue;
+                        }
+                    }
+
+                    let Some(next_writer_sequence) = next_writer_sequence(writer_sequence) else {
+                        let reason = state.stop_fail_closed("canonical writer sequence exhausted");
+                        let previous = state.published();
+                        state.publish(fail_closed_published_node_view(
+                            &node,
+                            &previous,
+                            writer_sequence,
+                            reason.clone(),
+                        ));
+                        let _ =
+                            reply.send(Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                                reason,
+                            })));
+                        break;
+                    };
+                    writer_sequence = next_writer_sequence;
+                    let previous_publication_sequence =
+                        state.publication_sequence.fetch_add(1, Ordering::AcqRel);
+                    if previous_publication_sequence & 1 != 0 {
+                        let reason = state.stop_fail_closed(
+                            "canonical publication sequence was already write-locked",
+                        );
+                        let _ =
+                            reply.send(Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                                reason,
+                            })));
+                        break;
+                    }
+                    let operation_result = execute(&mut node);
+                    node.fail_closed_after_ambiguous_commit();
+                    let previous = state.published_unchecked();
+                    let publication = capture_published_node_view(&node, writer_sequence);
+                    let terminal = match publication {
+                        Ok(view) => {
+                            state.publish(view);
+                            None
+                        }
+                        Err(error) => {
+                            let reason = state.stop_fail_closed(format!(
+                                "failed to publish state after {operation}: {error:#}"
+                            ));
+                            state.publish(fail_closed_published_node_view(
+                                &node,
+                                &previous,
+                                writer_sequence,
+                                reason.clone(),
+                            ));
+                            Some(reason)
+                        }
+                    };
+                    state.publication_sequence.fetch_add(1, Ordering::Release);
+                    let response = match terminal {
+                        Some(reason) => Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                            reason,
+                        })),
+                        None => operation_result,
+                    };
+                    let _ = reply.send(response);
+                    if state.terminal_reason().is_some() {
+                        break;
+                    }
+                }
+                CanonicalWriterCommand::Inspect {
+                    operation,
+                    inspect,
+                    _admission,
+                    reply,
+                } => {
+                    let response = match state.terminal_reason() {
+                        Some(reason) => Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                            reason,
+                        })),
+                        None => inspect(&node),
+                    };
+                    let _ = reply.send(response.with_context(|| {
+                        format!("canonical immutable inspection failed during {operation}")
+                    }));
+                }
+                CanonicalWriterCommand::Shutdown { mark_clean, reply } => {
+                    let result = match state.terminal_reason() {
+                        Some(reason) => Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                            reason,
+                        })),
+                        None => node.state.ensure_storage_operational().and_then(|()| {
+                            if mark_clean {
+                                mark_node_store_clean(&node.state.store, node.config.network)
+                            } else {
+                                Ok(())
+                            }
+                        }),
+                    }
+                    .context(if mark_clean {
+                        "failed to mark canonical store clean before writer exit"
+                    } else {
+                        "failed to validate canonical store before unclean writer exit"
+                    });
+                    if let Err(error) = &result {
+                        node.revoke_runtime_authority();
+                        let reason = state.stop_fail_closed(format!(
+                            "canonical writer shutdown failed: {error:#}"
+                        ));
+                        let previous = state.published_unchecked();
+                        state.publish(fail_closed_published_node_view(
+                            &node,
+                            &previous,
+                            writer_sequence,
+                            reason,
+                        ));
+                    }
+                    let _ = reply.send(result);
+                    break;
+                }
+            }
+        }
+    }));
+    node.revoke_runtime_authority();
+    let fallback_reason = if result.is_err() {
+        "canonical writer thread panicked"
+    } else {
+        "canonical writer stopped"
+    };
+    let reason = state
+        .terminal_reason()
+        .unwrap_or_else(|| fallback_reason.to_owned());
+    state.accepting.store(false, Ordering::Release);
+    let previous = state.published_unchecked();
+    state.publish(fail_closed_published_node_view(
+        &node,
+        &previous,
+        writer_sequence,
+        reason.clone(),
+    ));
+    if state.publication_sequence.load(Ordering::Acquire) & 1 != 0 {
+        state.publication_sequence.fetch_add(1, Ordering::Release);
+    }
+    // Publish the terminal view and close any interrupted seqlock generation
+    // before exposing a new terminal reason. Thus observing `terminal_error`
+    // after an actor panic also synchronizes with fail-closed publication.
+    state.stop_fail_closed(reason);
+}
 
 /// Process-local extension capability for a unified MeshMine mining runtime.
 ///
-/// The node supplies its exact mutable service, live peer publication manager,
-/// and shutdown watch after native runtime initialization. An observed RPC
-/// snapshot cannot construct this capability.
+/// The node supplies a runtime capability with immutable reads and bounded
+/// canonical-writer submission, plus the live peer publication manager and
+/// shutdown watch. It never exposes mutable [`NodeService`] access or node
+/// lifecycle authority. Shutdown is owned by the crate's native supervisor:
+///
+/// ```compile_fail
+/// use hns_node::NodeRuntime;
+///
+/// async fn extension_cannot_end_node_lifecycle(runtime: NodeRuntime) {
+///     runtime.shutdown().await.unwrap();
+/// }
+/// ```
 pub trait NativeRuntimeExtension: Send {
     fn spawn(
         self: Box<Self>,
-        node: SharedNodeService,
+        node: NodeRuntime,
         peers: LivePeerManager,
         shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<Result<()>>;
@@ -1953,11 +3483,11 @@ impl NodeService {
         };
         let mining_events = MiningEventHub::from_durable(durable.generation, initial)
             .map_err(|error| anyhow::anyhow!("failed to initialize mining events: {error}"))?;
-        let mining_engine_templates = Mutex::new(
+        let mining_engine_templates = Arc::new(Mutex::new(
             TemplateCoordinator::new(config.mining_engine.maximum_template_variants).map_err(
                 |error| anyhow::anyhow!("failed to initialize mining-engine templates: {error}"),
             )?,
-        );
+        ));
         let airdrop_signatures = NativeAirdropSignatureVerifier::new().map_err(|error| {
             anyhow::anyhow!("failed to initialize airdrop relay verifier: {error}")
         })?;
@@ -2295,6 +3825,19 @@ impl NodeService {
         self.apply_reorg_with_limits(request, NodeReorgLimits::PRODUCTION)
     }
 
+    /// Writer-only native activation boundary. The returned mutation has not
+    /// yet been published to mining or reconciled with the mempool; callers
+    /// must preserve the existing commit -> mining publication -> mempool
+    /// reconciliation -> template-clear sequence in the same writer closure.
+    pub(crate) fn apply_reorg_classified_prepared(
+        &mut self,
+        request: NodeReorg,
+        prepared: PreparedNativeActivation,
+    ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
+        self.state
+            .apply_reorg_classified_prepared(request, prepared)
+    }
+
     fn apply_reorg_with_limits(
         &mut self,
         request: NodeReorg,
@@ -2359,6 +3902,10 @@ impl NodeService {
         if !self.state.storage_reopen_required() {
             return;
         }
+        self.revoke_runtime_authority();
+    }
+
+    fn revoke_runtime_authority(&self) {
         if self.config.mining_engine.enabled {
             self.mining_engine_templates
                 .lock()
@@ -2370,7 +3917,7 @@ impl NodeService {
             tracing::error!(
                 %error,
                 generation,
-                "failed to revoke mining authority after ambiguous storage commit"
+                "failed to revoke runtime mining authority"
             );
         }
     }
@@ -2409,8 +3956,8 @@ impl NodeService {
     }
 
     pub async fn run_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
-        if self.config.shadow_sync.enabled {
-            self.run_shadow_sync_until_shutdown(shutdown).await
+        if self.config.native_sync.enabled {
+            self.run_native_sync_until_shutdown(shutdown).await
         } else {
             self.run_rpc_until_shutdown(shutdown).await
         }
@@ -2421,10 +3968,10 @@ impl NodeService {
         shutdown: ShutdownSignal,
         extension: Box<dyn NativeRuntimeExtension>,
     ) -> Result<()> {
-        if !self.config.shadow_sync.enabled {
+        if !self.config.native_sync.enabled {
             anyhow::bail!("native runtime extensions require native sync");
         }
-        self.run_shadow_sync_until_shutdown_with_extension(shutdown, Some(extension))
+        self.run_native_sync_until_shutdown_with_extension(shutdown, Some(extension))
             .await
     }
 
@@ -2612,8 +4159,8 @@ impl NodeService {
             mining_generation: durable.generation,
             alternate_block_count,
             failed_block_count,
-            active_state_sync_enabled: self.config.shadow_sync.connect_active_state,
-            active_state_connect_batch: self.config.shadow_sync.active_state_connect_batch,
+            active_state_sync_enabled: self.config.native_sync.connect_active_state,
+            active_state_connect_batch: self.config.native_sync.active_state_connect_batch,
             pending_best_chain_activation,
             staged_chain_tip: durable.snapshot.is_some(),
             authoritative_mining_tip: self.mining_events.snapshot().is_some(),
@@ -2760,7 +4307,7 @@ pub(crate) struct RpcReadContext {
 pub(crate) struct RpcRequestMempool {
     info: MempoolInfo,
     ordered_txids: Option<OrderedTxidSnapshot>,
-    transaction: Option<Transaction>,
+    transaction_lookup: Option<(MempoolSnapshot, Txid)>,
 }
 
 impl NodeService {
@@ -2790,6 +4337,7 @@ fn rpc_request_mempool(
     limits: RpcLimits,
 ) -> RpcRequestMempool {
     let info = mempool.info();
+    let snapshot = mempool.snapshot();
     let method = RpcMethod::from_hsd_name(&request.method);
     let ordered_txids = if method == Some(RpcMethod::GetRawMempool)
         && info.transaction_count <= limits.maximum_collection_entries
@@ -2798,17 +4346,17 @@ fn rpc_request_mempool(
     } else {
         None
     };
-    let transaction = if method == Some(RpcMethod::GetRawTransaction) {
+    let transaction_lookup = if method == Some(RpcMethod::GetRawTransaction) {
         rpc_string_param(request, 0)
             .and_then(|encoded| decode_rpc_txid(encoded).ok())
-            .and_then(|txid| mempool.transaction(&txid).cloned())
+            .map(|txid| (snapshot, txid))
     } else {
         None
     };
     RpcRequestMempool {
         info,
         ordered_txids,
-        transaction,
+        transaction_lookup,
     }
 }
 
@@ -2835,6 +4383,11 @@ impl RpcReadContext {
     ) -> Result<BasicRpcService> {
         let method = RpcMethod::from_hsd_name(&request.method)
             .ok_or_else(|| anyhow::anyhow!("unsupported RPC method reached point-read dispatch"))?;
+        let RpcRequestMempool {
+            info: mempool_info,
+            ordered_txids: _,
+            transaction_lookup,
+        } = mempool;
         // Keep the index read lock until the durable snapshot is established.
         // Writers hold the matching exclusive lock across commit and cache
         // publication, so the pair is wholly before or wholly after one index
@@ -2857,7 +4410,7 @@ impl RpcReadContext {
         rpc.transactions.clear();
         rpc.coins.clear();
         rpc.names.clear();
-        rpc.mempool_info = mempool.info;
+        rpc.mempool_info = mempool_info;
         rpc.mempool_entries.clear();
         rpc.network_active = network_active;
         rpc.peer_count = peer_count;
@@ -2897,9 +4450,12 @@ impl RpcReadContext {
                 }
             }
             RpcMethod::GetRawTransaction => {
-                if let Some(transaction) = mempool.transaction {
+                if let Some(transaction) = transaction_lookup
+                    .as_ref()
+                    .and_then(|(snapshot, txid)| snapshot.transaction(txid))
+                {
                     rpc.transactions.push(RpcTransactionEntry::from_transaction(
-                        &transaction,
+                        transaction,
                         None,
                         None,
                     ));
@@ -3894,33 +5450,97 @@ struct ValidatedImport {
 /// block and height. The type is private to the node crate so an RPC/P2P
 /// caller cannot manufacture the fast-path capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct StatelessBodyValidation {
+pub(crate) struct StatelessBodyValidation {
     hash: BlockHash,
     height: Height,
+    transaction_start_validated: bool,
     body_sanity_validated: bool,
+    body_commitments_validated: bool,
+    name_limits_validated: bool,
+    coinbase_height_validated: bool,
 }
 
 impl StatelessBodyValidation {
-    fn for_block(block: &Block, height: Height, network: Network) -> Self {
+    pub(crate) fn for_block(block: &Block, height: Height, network: Network) -> Self {
         Self {
             hash: block.hash(),
             height,
+            transaction_start_validated: true,
             body_sanity_validated: !hns_consensus::is_hsd_historical_block(network, true, height),
+            body_commitments_validated: true,
+            name_limits_validated: true,
+            coinbase_height_validated: true,
         }
     }
 
     fn verify(self, request: &NodeBlockImport) -> Result<()> {
-        if !matches!(request.validation, ImportValidationPolicy::Strict) {
-            anyhow::bail!("stateless body evidence requires strict block validation");
+        match request.validation {
+            ImportValidationPolicy::Strict => {}
+            // Synthetic stored-chain tests retain fixture header/chainwork
+            // policy, but still run the production body validator before this
+            // exact hash+height capability is created. This variant does not
+            // exist in production builds.
+            #[cfg(test)]
+            ImportValidationPolicy::Fixture { .. } => {}
         }
         if self.height != request.height || self.hash != request.block.hash() {
             anyhow::bail!("stateless body evidence does not match the imported block");
+        }
+        if !self.transaction_start_validated || !self.coinbase_height_validated {
+            anyhow::bail!("stateless body evidence omits a required validation stage");
         }
         Ok(())
     }
 
     const fn covers(self, plan: HistoricalValidationPlan) -> bool {
-        !plan.body_sanity || self.body_sanity_validated
+        (!plan.body_sanity || self.body_sanity_validated)
+            && (!plan.body_commitments || self.body_commitments_validated)
+            && (!plan.name_limits || self.name_limits_validated)
+    }
+}
+
+/// Process-private capability assembled only from successful ordered native
+/// body-worker results. Every proof remains bound to an exact block hash and
+/// height; the writer reauthenticates it against the final activation request.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreparedNativeActivation {
+    stateless: Vec<StatelessBodyValidation>,
+}
+
+impl PreparedNativeActivation {
+    pub(crate) fn new(stateless: Vec<StatelessBodyValidation>) -> Result<Self> {
+        let mut identities = HashSet::with_capacity(stateless.len());
+        for proof in &stateless {
+            if !identities.insert((proof.hash, proof.height)) {
+                anyhow::bail!(
+                    "prepared native activation repeats block {} at height {}",
+                    proof.hash.to_hex(),
+                    proof.height
+                );
+            }
+        }
+        Ok(Self { stateless })
+    }
+
+    fn authenticate(&self, request: &NodeReorg) -> Result<()> {
+        if self.stateless.len() != request.connect.len() {
+            anyhow::bail!(
+                "prepared native activation has {} proofs for {} connected blocks",
+                self.stateless.len(),
+                request.connect.len()
+            );
+        }
+        for (proof, connect) in self.stateless.iter().zip(&request.connect) {
+            proof.verify(connect)?;
+        }
+        Ok(())
+    }
+
+    fn into_by_identity(self) -> HashMap<(BlockHash, Height), StatelessBodyValidation> {
+        self.stateless
+            .into_iter()
+            .map(|proof| ((proof.hash, proof.height), proof))
+            .collect()
     }
 }
 
@@ -8132,7 +9752,7 @@ impl NodeState {
     /// Active connection still uses `validate_import` and therefore requires
     /// the complete parent index chain. Pruned active ancestors retain that
     /// index even though their raw bodies are intentionally unavailable.
-    fn validate_prevalidated_shadow_import(
+    fn validate_prevalidated_native_import(
         &self,
         request: &NodeBlockImport,
         canonical: bool,
@@ -8142,11 +9762,11 @@ impl NodeState {
         if canonical {
             let hash = request.block.hash();
             if self.chain.canonical_hash(request.height).map_err(|error| {
-                anyhow::anyhow!("failed to read canonical shadow header: {error}")
+                anyhow::anyhow!("failed to read canonical native header: {error}")
             })? != Some(hash)
             {
                 anyhow::bail!(
-                    "shadow body {} is not the canonical header at height {}",
+                    "native body {} is not the canonical header at height {}",
                     hash.to_hex(),
                     request.height
                 );
@@ -8339,11 +9959,12 @@ impl NodeState {
         })
     }
 
-    fn validate_stored_activation<T: ReadSnapshot>(
+    fn validate_stored_activation_with_stateless<T: ReadSnapshot>(
         &self,
         snapshot: &T,
         request: &NodeBlockImport,
         record: &BlockIndexRecord,
+        stateless: Option<StatelessBodyValidation>,
     ) -> Result<ValidatedImport> {
         validate_stored_activation_status(record)?;
         let hash = request.block.hash();
@@ -8373,10 +9994,12 @@ impl NodeState {
             );
         }
         // Durable status is cacheable evidence, not authority: the local
-        // database is untrusted. Re-run the complete strict import path over
-        // these exact bytes before state connection, including transaction
-        // start, body sanity/name limits, finality, and coinbase height.
-        let validated = self.validate_import_against_policy(snapshot, request, true, None)?;
+        // database is untrusted. Re-run header, chainwork, activation-shape,
+        // finality, and every contextual state rule over these exact bytes.
+        // A process-private exact hash+height proof may skip only the
+        // context-independent body/transaction-start/coinbase checks already
+        // completed by the native worker.
+        let validated = self.validate_import_against_policy(snapshot, request, true, stateless)?;
         if validated.chainwork != record.chainwork {
             anyhow::bail!(
                 "stored activation chainwork changed during full revalidation for {}",
@@ -9056,11 +10679,16 @@ impl NodeState {
             .map_err(ChainActivationFailure::into_anyhow)
     }
 
-    fn apply_reorg_classified(
+    fn apply_reorg_classified_prepared(
         &mut self,
         request: NodeReorg,
+        prepared: PreparedNativeActivation,
     ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
-        self.apply_reorg_classified_with_limits(request, NodeReorgLimits::PRODUCTION)
+        self.apply_reorg_classified_with_limits_and_prepared(
+            request,
+            NodeReorgLimits::PRODUCTION,
+            Some(prepared),
+        )
     }
 
     fn apply_reorg_classified_with_limits(
@@ -9068,7 +10696,23 @@ impl NodeState {
         request: NodeReorg,
         limits: NodeReorgLimits,
     ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
+        self.apply_reorg_classified_with_limits_and_prepared(request, limits, None)
+    }
+
+    fn apply_reorg_classified_with_limits_and_prepared(
+        &mut self,
+        request: NodeReorg,
+        limits: NodeReorgLimits,
+        prepared: Option<PreparedNativeActivation>,
+    ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
         validate_reorg_counts(&request, limits).map_err(ChainActivationFailure::Internal)?;
+        if let Some(prepared) = prepared.as_ref() {
+            prepared
+                .authenticate(&request)
+                .context("prepared native activation proof mismatch")
+                .map_err(ChainActivationFailure::Internal)?;
+        }
+        let mut prepared = prepared.map(PreparedNativeActivation::into_by_identity);
         self.ensure_storage_operational()
             .map_err(ChainActivationFailure::Internal)?;
         if request.disconnect.is_empty() && request.connect.is_empty() {
@@ -9174,6 +10818,9 @@ impl NodeState {
 
         for connect in request.connect {
             let hash = connect.block.hash();
+            let stateless = prepared
+                .as_mut()
+                .and_then(|proofs| proofs.remove(&(hash, connect.height)));
             // Strict stored bodies are fully revalidated here because durable
             // status and bytes are both forgeable under the local-DB threat
             // model. Fixture imports retain their explicit test-only policy.
@@ -9184,17 +10831,22 @@ impl NodeState {
                 Some(stored_record)
                     if matches!(connect.validation, ImportValidationPolicy::Strict) =>
                 {
-                    self.validate_stored_activation(&staged, &connect, stored_record)
-                        .with_context(|| {
-                            format!(
-                                "failed to authenticate stored block {} at height {}",
-                                hash.to_hex(),
-                                connect.height
-                            )
-                        })
+                    self.validate_stored_activation_with_stateless(
+                        &staged,
+                        &connect,
+                        stored_record,
+                        stateless,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to authenticate stored block {} at height {}",
+                            hash.to_hex(),
+                            connect.height
+                        )
+                    })
                 }
                 Some(_) | None => self
-                    .validate_import_against_policy(&staged, &connect, true, None)
+                    .validate_import_against_policy(&staged, &connect, true, stateless)
                     .with_context(|| {
                         format!(
                             "failed to validate unstored block {} at height {}",
@@ -9244,6 +10896,12 @@ impl NodeState {
                 current: staged_connect.current,
             });
             index_updates.extend(staged_connect.pruned);
+        }
+
+        if prepared.as_ref().is_some_and(|proofs| !proofs.is_empty()) {
+            return Err(ChainActivationFailure::Internal(anyhow::anyhow!(
+                "prepared native activation retained an unmatched proof"
+            )));
         }
 
         let final_tip = best_block_tip_from_snapshot(&staged)
@@ -12849,9 +14507,26 @@ mod tests {
         let proof = StatelessBodyValidation::for_block(&block, 17, Network::Regtest);
         let request = NodeBlockImport::from_peer(block.clone(), 17);
         proof.verify(&request).expect("matching worker evidence");
+        proof
+            .verify(&NodeBlockImport::fixture(block.clone(), 17, 1))
+            .expect("test-only fixture policy accepts exact worker evidence");
+        let prepared = PreparedNativeActivation::new(vec![proof]).expect("prepared activation");
+        prepared
+            .authenticate(&NodeReorg {
+                disconnect: Vec::new(),
+                connect: vec![request.clone()],
+            })
+            .expect("prepared activation identity");
+        assert!(PreparedNativeActivation::new(vec![proof, proof]).is_err());
 
         let wrong_height = NodeBlockImport::from_peer(block.clone(), 18);
         assert!(proof.verify(&wrong_height).is_err());
+        assert!(prepared
+            .authenticate(&NodeReorg {
+                disconnect: Vec::new(),
+                connect: vec![wrong_height.clone()],
+            })
+            .is_err());
 
         let mut mutated = block;
         mutated.header.nonce = mutated.header.nonce.saturating_add(1);
@@ -12924,10 +14599,10 @@ mod tests {
     fn peer_transaction_node(tip_height: Height) -> NodeService {
         let config = NodeConfig {
             network: Network::Regtest,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             mining_engine: MiningEngineConfig {
                 enabled: true,
@@ -13074,16 +14749,16 @@ mod tests {
         }
     }
 
-    fn active_state_shadow_config() -> NodeConfig {
+    fn active_state_native_config() -> NodeConfig {
         NodeConfig {
             network: Network::Regtest,
-            authority_mode: AuthorityMode::Shadow,
+            authority_mode: AuthorityMode::Disabled,
             acknowledge_incomplete_consensus: true,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 connect_active_state: true,
                 connect: vec!["127.0.0.1:14038".parse().expect("peer")],
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             ..NodeConfig::default()
         }
@@ -13099,12 +14774,12 @@ mod tests {
             authority_mode: AuthorityMode::Native,
             mainnet_canary: true,
             storage_durability: DurabilityPolicy::Sync,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 connect_active_state: true,
                 discovery: true,
                 maximum_outbound: 4,
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             mining_engine: MiningEngineConfig {
                 enabled: true,
@@ -13117,10 +14792,21 @@ mod tests {
 
     fn store_fixture_alternate(
         node: &mut NodeService,
-        block: Block,
+        mut block: Block,
         height: Height,
         chainwork: u64,
     ) -> BlockIndexRecord {
+        let coinbase = block
+            .transactions
+            .first_mut()
+            .expect("stored alternate fixture has a coinbase");
+        assert!(
+            hns_consensus::is_coinbase(coinbase),
+            "stored alternate fixture begins with a coinbase"
+        );
+        coinbase.locktime = height;
+        block.header.merkle_root = block_merkle_root(&block);
+        block.header.witness_root = block_witness_root(&block);
         let request = NodeBlockImport::fixture(block, height, chainwork);
         let validated = node
             .state()
@@ -13822,7 +15508,7 @@ mod tests {
             network: Network::Mainnet,
             ..NodeConfig::default()
         });
-        node.shadow_sync_ensure_genesis_header()
+        node.native_sync_ensure_genesis_header()
             .expect("canonical mainnet genesis header");
         let error = node
             .state
@@ -13962,7 +15648,7 @@ mod tests {
 
     #[test]
     fn mining_snapshot_uses_interval_committed_name_root() {
-        let mut node = NodeService::new(active_state_shadow_config());
+        let mut node = NodeService::new(active_state_native_config());
         let store = node.state.store.clone();
         node.state.state_engine = StoredStateEngine::with_services(
             store,
@@ -14874,7 +16560,7 @@ mod tests {
         )
         .expect("fixture verifier");
         let mut node =
-            NodeService::try_with_state(active_state_shadow_config(), state).expect("node");
+            NodeService::try_with_state(active_state_native_config(), state).expect("node");
         let records = connect_fixture_chain(&mut node, 200, None);
         let spend_txid = node
             .state
@@ -17847,12 +19533,12 @@ mod tests {
     }
 
     #[test]
-    fn shadow_active_state_connector_resumes_in_bounded_batches_without_authority() {
+    fn native_active_state_connector_resumes_in_bounded_batches_without_authority() {
         let store = StoreHandle::memory();
-        let config = active_state_shadow_config();
+        let config = active_state_native_config();
         let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
             .expect("initial state");
-        let mut node = NodeService::try_with_state(config.clone(), state).expect("shadow node");
+        let mut node = NodeService::try_with_state(config.clone(), state).expect("native node");
 
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(90, 50)]);
         let genesis = store_fixture_alternate(&mut node, genesis, 0, 1);
@@ -17863,7 +19549,7 @@ mod tests {
         drop(node);
 
         let state = NodeState::from_store_for_network(store, Network::Regtest).expect("restart");
-        let mut restarted = NodeService::try_with_state(config, state).expect("restarted shadow");
+        let mut restarted = NodeService::try_with_state(config, state).expect("restarted native");
         assert!(restarted
             .state()
             .best_block_tip()
@@ -17871,7 +19557,7 @@ mod tests {
             .is_none());
 
         let first = restarted
-            .shadow_sync_connect_stored_state(1)
+            .native_sync_connect_stored_state(1)
             .expect("first connector batch");
         assert_eq!(first.connected, 1);
         assert_eq!(first.disconnected, 0);
@@ -17885,7 +19571,7 @@ mod tests {
             genesis.hash
         );
         let second = restarted
-            .shadow_sync_connect_stored_state(1)
+            .native_sync_connect_stored_state(1)
             .expect("second connector batch");
         assert_eq!(second.connected, 1);
         assert_eq!(
@@ -17915,8 +19601,8 @@ mod tests {
     }
 
     #[test]
-    fn shadow_active_state_direct_progress_yields_between_bounded_atomic_slices() {
-        let mut node = NodeService::new(active_state_shadow_config());
+    fn native_active_state_direct_progress_yields_between_bounded_atomic_slices() {
+        let mut node = NodeService::new(active_state_native_config());
         let mut previous = BlockHash::ZERO;
         let mut records = Vec::new();
         for height in 0..320 {
@@ -17933,11 +19619,11 @@ mod tests {
         }
 
         let first = node
-            .shadow_sync_connect_stored_state(320)
+            .native_sync_connect_stored_state(320)
             .expect("first direct connector slice");
         assert_eq!(
             first.connected,
-            shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE
+            native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE
         );
         assert_eq!(first.disconnected, 0);
         assert_eq!(
@@ -17946,11 +19632,11 @@ mod tests {
                 .expect("active tip")
                 .expect("first slice tip")
                 .hash,
-            records[shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE - 1].hash
+            records[native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE - 1].hash
         );
 
         let second = node
-            .shadow_sync_connect_stored_state(320)
+            .native_sync_connect_stored_state(320)
             .expect("second direct connector slice");
         assert_eq!(second.connected, 32);
         assert_eq!(second.disconnected, 0);
@@ -18039,14 +19725,15 @@ mod tests {
         let state = NodeState::from_store_for_network(store, Network::Regtest)
             .expect("fixture-mode restart for corruption activation");
         let mut node =
-            NodeService::try_with_state(active_state_shadow_config(), state).expect("shadow node");
+            NodeService::try_with_state(active_state_native_config(), state).expect("native node");
         let error = node
-            .shadow_sync_connect_stored_state(2)
+            .native_sync_connect_stored_state(2)
             .expect_err("forged body-valid status must not authorize activation");
         let error_chain = format!("{error:#}");
         assert!(
             error_chain.contains("block body validation")
-                || error_chain.contains("coinbase height validation"),
+                || error_chain.contains("coinbase height validation")
+                || error_chain.contains("multiple coinbase transactions"),
             "unexpected error: {error_chain}"
         );
         assert_eq!(
@@ -18057,12 +19744,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_active_state_runtime_updates_scheduler_and_diagnostics() {
-        let config = active_state_shadow_config();
+    async fn native_active_state_runtime_updates_scheduler_and_diagnostics() {
+        let config = active_state_native_config();
         let mut node = NodeService::new(config.clone());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(102, 50)]);
         let genesis = store_fixture_alternate(&mut node, genesis, 0, 1);
-        let node = Arc::new(tokio::sync::Mutex::new(node));
+        let runtime = NodeRuntime::spawn(node, DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY)
+            .expect("native runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
         let (peers, _events) =
             hns_p2p::LivePeerManager::new(hns_p2p::LivePeerConfig::for_network(Network::Regtest))
                 .expect("peers");
@@ -18076,25 +19766,30 @@ mod tests {
             maximum_bytes: 1_024 * 1_024,
         })
         .expect("orphans");
-        let diagnostics = Arc::new(tokio::sync::RwLock::new(ShadowSyncDiagnostics {
+        let diagnostics = Arc::new(tokio::sync::RwLock::new(NativeSyncDiagnostics {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
             observation_only: false,
             active_state: true,
-            ..ShadowSyncDiagnostics::default()
+            ..NativeSyncDiagnostics::default()
         }));
 
-        shadow_sync::connect_stored_active_state(
+        native_sync::connect_stored_active_state(
             &node,
+            &writer,
             &peers,
             &mut scheduler,
             &mut orphans,
             &diagnostics,
-            config.shadow_sync.active_state_connect_batch,
+            config.native_sync.active_state_connect_batch,
         )
         .await
         .expect("runtime connector");
 
+        assert_eq!(
+            node.canonical_epoch().tip.expect("canonical tip").hash,
+            genesis.hash
+        );
         assert_eq!(
             scheduler
                 .snapshot()
@@ -18103,33 +19798,37 @@ mod tests {
                 .hash,
             genesis.hash
         );
-        let diagnostics = diagnostics.read().await;
-        assert_eq!(diagnostics.connected_blocks, 1);
-        assert_eq!(diagnostics.active_state_slices, 1);
-        assert_eq!(diagnostics.active_state_last_slice_blocks, 1);
-        assert_eq!(diagnostics.active_state_last_transactions, 1);
-        assert_eq!(diagnostics.active_state_last_non_coinbase_inputs, 0);
-        assert_eq!(diagnostics.active_state_last_outputs, 1);
-        assert_eq!(diagnostics.active_state_last_name_actions, 0);
-        assert!(
-            diagnostics.active_state_max_slice_millis >= diagnostics.active_state_last_slice_millis
-        );
-        assert!(!diagnostics.observation_only);
-        assert!(diagnostics.active_state);
-        assert_eq!(
-            diagnostics
-                .sync
-                .active_tip
-                .as_ref()
-                .expect("diagnostic tip")
-                .hash,
-            genesis.hash
-        );
+        {
+            let diagnostics = diagnostics.read().await;
+            assert_eq!(diagnostics.connected_blocks, 1);
+            assert_eq!(diagnostics.active_state_slices, 1);
+            assert_eq!(diagnostics.active_state_last_slice_blocks, 1);
+            assert_eq!(diagnostics.active_state_last_transactions, 1);
+            assert_eq!(diagnostics.active_state_last_non_coinbase_inputs, 0);
+            assert_eq!(diagnostics.active_state_last_outputs, 1);
+            assert_eq!(diagnostics.active_state_last_name_actions, 0);
+            assert!(
+                diagnostics.active_state_max_slice_millis
+                    >= diagnostics.active_state_last_slice_millis
+            );
+            assert!(!diagnostics.observation_only);
+            assert!(diagnostics.active_state);
+            assert_eq!(
+                diagnostics
+                    .sync
+                    .active_tip
+                    .as_ref()
+                    .expect("diagnostic tip")
+                    .hash,
+                genesis.hash
+            );
+        }
+        runtime.shutdown().await.expect("shutdown native runtime");
     }
 
     #[test]
-    fn shadow_active_state_connector_reorganizes_a_stored_best_branch() {
-        let mut node = NodeService::new(active_state_shadow_config());
+    fn native_active_state_connector_reorganizes_a_stored_best_branch() {
+        let mut node = NodeService::new(active_state_native_config());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(92, 50)]);
         let genesis = node
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
@@ -18148,7 +19847,7 @@ mod tests {
         let side_two = store_fixture_alternate(&mut node, side_two, 2, 4);
 
         let bounded_error = node
-            .shadow_sync_connect_stored_state(1)
+            .native_sync_connect_stored_state(1)
             .expect_err("insufficient atomic reorg batch must fail closed");
         assert!(bounded_error
             .to_string()
@@ -18172,7 +19871,7 @@ mod tests {
         );
 
         let outcome = node
-            .shadow_sync_connect_stored_state(64)
+            .native_sync_connect_stored_state(64)
             .expect("stored branch activation");
         assert_eq!(outcome.connected, 2);
         assert_eq!(outcome.disconnected, 1);
@@ -18197,8 +19896,8 @@ mod tests {
     }
 
     #[test]
-    fn shadow_active_state_reorg_keeps_the_full_configured_atomic_bound() {
-        let mut node = NodeService::new(active_state_shadow_config());
+    fn native_active_state_reorg_keeps_the_full_configured_atomic_bound() {
+        let mut node = NodeService::new(active_state_native_config());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_tag(200, 50)]);
         let genesis = node
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
@@ -18210,7 +19909,7 @@ mod tests {
 
         let mut previous = genesis.hash;
         let mut side = Vec::new();
-        for offset in 0..=u32::try_from(shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE)
+        for offset in 0..=u32::try_from(native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE)
             .expect("direct slice fits u32")
         {
             let height = offset + 1;
@@ -18227,9 +19926,9 @@ mod tests {
             side.push(record);
         }
 
-        assert!(side.len() > shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+        assert!(side.len() > native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
         let outcome = node
-            .shadow_sync_connect_stored_state(side.len())
+            .native_sync_connect_stored_state(side.len())
             .expect("deep stored reorganization");
         assert_eq!(outcome.connected, side.len());
         assert_eq!(outcome.disconnected, 1);
@@ -18245,7 +19944,7 @@ mod tests {
 
     #[test]
     fn contextual_invalid_ancestor_is_durable_and_exact() {
-        let config = active_state_shadow_config();
+        let config = active_state_native_config();
         let mut node = NodeService::new(config.clone());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(96, 50)]);
         let genesis = node
@@ -18269,7 +19968,7 @@ mod tests {
         let descendant = store_fixture_alternate(&mut node, descendant, 2, 4);
 
         let outcome = node
-            .shadow_sync_connect_stored_state(64)
+            .native_sync_connect_stored_state(64)
             .expect("contextual failure classification");
         let failure = outcome.contextual_failure.expect("failed branch");
         assert_eq!(failure.record.hash, invalid.hash);
@@ -18309,7 +20008,7 @@ mod tests {
         let store = node.state().store.clone();
         drop(node);
         let state = NodeState::from_store_for_network(store, Network::Regtest).expect("restart");
-        let mut restarted = NodeService::try_with_state(config, state).expect("restarted shadow");
+        let mut restarted = NodeService::try_with_state(config, state).expect("restarted native");
         assert_eq!(
             restarted
                 .state()
@@ -18320,7 +20019,7 @@ mod tests {
             active.hash
         );
         assert!(restarted
-            .shadow_sync_connect_stored_state(64)
+            .native_sync_connect_stored_state(64)
             .expect("idempotent connector")
             .contextual_failure
             .is_none());
@@ -18328,7 +20027,7 @@ mod tests {
 
     #[test]
     fn local_state_fault_does_not_poison_a_stored_branch() {
-        let mut node = NodeService::new(active_state_shadow_config());
+        let mut node = NodeService::new(active_state_native_config());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(100, 50)]);
         let genesis = node
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
@@ -18348,7 +20047,7 @@ mod tests {
             .expect("commit local fault");
 
         let error = node
-            .shadow_sync_connect_stored_state(64)
+            .native_sync_connect_stored_state(64)
             .expect_err("missing local state root must stop the connector");
         assert!(
             format!("{error:#}").contains("durable name-tree-root metadata is missing"),
@@ -18535,21 +20234,21 @@ mod tests {
     #[test]
     fn experimental_restart_recovers_fully_stored_best_work_branch() {
         let store = StoreHandle::memory();
-        let shadow_config = NodeConfig {
+        let native_config = NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
         };
         let state =
             NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        let mut shadow = NodeService::try_with_state(shadow_config, state).expect("shadow node");
+        let mut native = NodeService::try_with_state(native_config, state).expect("native node");
 
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(50, 50)]);
-        let genesis_record = shadow
+        let genesis_record = native
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
             .expect("genesis");
         let mut active = block_with_commitments(vec![coinbase_transaction_with_address(51, 50)]);
         active.header.prev_block = genesis_record.hash;
-        shadow
+        native
             .connect_block(NodeBlockImport::fixture(active, 1, 2))
             .expect("active child");
 
@@ -18557,15 +20256,15 @@ mod tests {
         side.header.prev_block = genesis_record.hash;
         let side_hash = side.hash();
         let import = NodeBlockImport::fixture(side, 1, 3);
-        let validated = shadow
+        let validated = native
             .state()
             .validate_import(&import)
             .expect("validate side");
-        shadow
+        native
             .state_mut()
             .store_validated_alternate(import, validated)
             .expect("persist side before simulated crash");
-        drop(shadow);
+        drop(native);
 
         let state =
             NodeState::from_store_for_network(store, Network::Regtest).expect("reloaded state");
@@ -18635,13 +20334,13 @@ mod tests {
 
     #[test]
     fn authority_modes_fail_closed_except_explicit_regtest_experiment() {
-        let shadow = NodeService::new(NodeConfig {
+        let native = NodeService::new(NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
         });
-        assert!(shadow.subscribe_mining_events().is_err());
+        assert!(native.subscribe_mining_events().is_err());
         assert!(
-            !shadow
+            !native
                 .rpc_service()
                 .expect("rpc")
                 .snapshot()
@@ -18657,15 +20356,9 @@ mod tests {
             ..NodeConfig::default()
         })
         .is_err());
-        assert!(validate_node_config(&NodeConfig {
-            network: Network::Regtest,
-            authority_mode: AuthorityMode::HsdVerified,
-            ..NodeConfig::default()
-        })
-        .is_err());
-        let mut unacknowledged_active_sync = active_state_shadow_config();
+        let mut unacknowledged_active_sync = active_state_native_config();
         unacknowledged_active_sync.acknowledge_incomplete_consensus = false;
-        unacknowledged_active_sync.authority_mode = AuthorityMode::Shadow;
+        unacknowledged_active_sync.authority_mode = AuthorityMode::Disabled;
         assert!(validate_node_config(&unacknowledged_active_sync).is_err());
         unacknowledged_active_sync.authority_mode = AuthorityMode::Native;
         assert!(validate_node_config(&unacknowledged_active_sync).is_ok());
@@ -18737,7 +20430,7 @@ mod tests {
             },
             {
                 let mut value = config.clone();
-                value.shadow_sync.connect_active_state = false;
+                value.native_sync.connect_active_state = false;
                 value
             },
             {
@@ -19167,10 +20860,10 @@ mod tests {
             data_dir: Some(directory.clone()),
             transaction_index: true,
             storage_durability: DurabilityPolicy::Sync,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             mining_engine: MiningEngineConfig {
                 enabled: true,
@@ -19570,5 +21263,827 @@ mod tests {
 
         shutdown_tx.send(()).expect("shutdown");
         server.await.expect("server join").expect("server result");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_runs_accepted_work_after_caller_cancellation() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            2,
+        )
+        .expect("runtime");
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            first_writer
+                .execute(None, "blocking runtime test command", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer command entered");
+
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executed_in_command = Arc::clone(&executed);
+        let second_writer = writer.clone();
+        let second = tokio::spawn(async move {
+            second_writer
+                .execute(None, "cancelled runtime test command", move |_| {
+                    executed_in_command.store(true, Ordering::Release);
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if writer.inner.sender.capacity() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second command admission timeout");
+        assert_eq!(writer.inner.sender.capacity(), 1, "second command admitted");
+        second.abort();
+        release_tx.send(()).expect("release first command");
+        first.await.expect("first join").expect("first command");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if executed.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted command execution timeout");
+        assert!(
+            executed.load(Ordering::Acquire),
+            "dropping a reply future must not cancel accepted work"
+        );
+        runtime.shutdown().await.expect("drain and join runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_success_shutdown_marks_store_clean() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        assert!(!was_clean_shutdown(&store).expect("running store starts unclean"));
+
+        NodeRuntime::spawn(node, 2)
+            .expect("runtime")
+            .shutdown()
+            .await
+            .expect("successful shutdown");
+
+        assert!(was_clean_shutdown(&store).expect("successful shutdown marker"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_failure_shutdown_leaves_store_unclean() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        assert!(!was_clean_shutdown(&store).expect("running store starts unclean"));
+
+        NodeRuntime::spawn(node, 2)
+            .expect("runtime")
+            .shutdown_unclean()
+            .await
+            .expect("failure shutdown drains writer");
+
+        assert!(!was_clean_shutdown(&store).expect("failure shutdown marker"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_unclean_shutdown_corrects_prior_clean_clone() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let failure_correction = runtime.clone();
+
+        runtime.shutdown().await.expect("clean clone shutdown");
+        assert!(was_clean_shutdown(&store).expect("clean clone marker"));
+
+        failure_correction
+            .shutdown_unclean()
+            .await
+            .expect("unclean clone correction");
+        assert!(!was_clean_shutdown(&store).expect("corrected unclean marker"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_cancelled_enqueued_clean_shutdown_finishes_unclean() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking_command = tokio::spawn(async move {
+            writer
+                .execute(None, "clean-shutdown cancellation blocker", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer command entered");
+
+        let clean_runtime = runtime.clone();
+        let clean_shutdown = tokio::spawn(clean_runtime.shutdown());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.sender.capacity() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clean shutdown was not enqueued behind blocker");
+        clean_shutdown.abort();
+        assert!(clean_shutdown
+            .await
+            .expect_err("clean shutdown task is cancelled")
+            .is_cancelled());
+
+        let unclean_runtime = runtime.clone();
+        let unclean_shutdown = tokio::spawn(unclean_runtime.shutdown_unclean());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unclean correction was not enqueued behind cancelled clean shutdown");
+        assert!(!was_clean_shutdown(&store).expect("pre-stop unclean correction"));
+
+        release_tx.send(()).expect("release writer");
+        blocking_command
+            .await
+            .expect("blocking command join")
+            .expect("blocking command");
+        unclean_shutdown
+            .await
+            .expect("unclean shutdown join")
+            .expect_err("the prior clean command exits before the correction is processed");
+
+        assert!(
+            !was_clean_shutdown(&store).expect("post-join unclean correction"),
+            "an enqueued clean command must not overwrite the final failure marker"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_cancelled_shutdown_retains_join_authority() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 1).expect("runtime");
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            first_writer
+                .execute(None, "shutdown cancellation blocker", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer command entered");
+
+        let second = tokio::spawn(async move {
+            writer
+                .execute(None, "shutdown cancellation queued command", |_| Ok(()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued command admission timeout");
+
+        let interrupted_runtime = runtime.clone();
+        let interrupted = tokio::spawn(interrupted_runtime.shutdown_unclean());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.state.accepting.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown did not stop admission");
+        interrupted.abort();
+        assert!(interrupted
+            .await
+            .expect_err("shutdown task is cancelled")
+            .is_cancelled());
+        assert!(
+            runtime.inner.join.lock().await.is_some(),
+            "cancellation before enqueue must retain the OS-thread join handle"
+        );
+
+        release_tx.send(()).expect("release first command");
+        first.await.expect("first join").expect("first command");
+        second.await.expect("second join").expect("second command");
+        runtime
+            .shutdown_unclean()
+            .await
+            .expect("replacement shutdown drains and joins actor");
+        assert!(!was_clean_shutdown(&store).expect("cancelled shutdown remains unclean"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_epochs_are_exact_and_chain_scoped() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 4).expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let initial = read.canonical_epoch();
+        let initial_mempool = read.published_mempool().expect("initial mempool");
+
+        let error = writer
+            .execute::<(), _>(None, "erroring runtime test command", |_| {
+                anyhow::bail!("intentional command failure")
+            })
+            .await
+            .expect_err("command error");
+        assert!(error.to_string().contains("intentional command failure"));
+        let after_error = read.canonical_epoch();
+        assert_eq!(after_error.writer_sequence, initial.writer_sequence + 1);
+        assert_eq!(after_error.chain(), initial.chain());
+        assert!(initial_mempool.ordered_txids.is_same_generation(
+            &read
+                .published_mempool()
+                .expect("mempool after command error")
+                .ordered_txids
+        ));
+
+        let stale = writer
+            .execute_at(initial.clone(), "stale exact command", |_| Ok(()))
+            .await
+            .expect_err("exact sequence must be stale");
+        assert!(stale.chain().any(|cause| cause
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| { matches!(error, CanonicalWriterError::StaleEpoch { .. }) })));
+
+        writer
+            .execute_at_chain(initial.chain(), "chain-scoped command", |_| Ok(()))
+            .await
+            .expect("unrelated writer generation does not stale chain work");
+        runtime.shutdown().await.expect("shutdown");
+        assert!(was_clean_shutdown(&store).expect("clean shutdown marker"));
+        assert!(read.ensure_storage_operational().is_err());
+        assert!(read.published_mempool().is_err());
+        assert!(!read.published().storage_operational());
+        assert!(read.mining_snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stable_read_returns_busy_without_waiting_for_a_writer_slice() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            2,
+        )
+        .expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let command = tokio::spawn(async move {
+            writer
+                .execute(None, "stable-read overlap", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+        let started = Instant::now();
+        let error = read
+            .with_stable_read(|_, _| Ok(()))
+            .expect_err("overlapping read is busy");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(error
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| matches!(error, CanonicalWriterError::Busy)));
+        let _last_committed = read.published();
+
+        release_tx.send(()).expect("release writer");
+        command.await.expect("command join").expect("command");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_panic_publishes_fail_closed_and_joins() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            2,
+        )
+        .expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let error = writer
+            .execute::<(), _>(None, "panicking runtime test command", |_| {
+                panic!("intentional canonical writer panic")
+            })
+            .await
+            .expect_err("panicking command loses its reply");
+        assert!(error
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| matches!(error, CanonicalWriterError::Stopped)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.terminal_error().is_some()
+                    && !read.published().storage_operational()
+                    && runtime
+                        .inner
+                        .state
+                        .publication_sequence
+                        .load(Ordering::Acquire)
+                        & 1
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panic fail-closed publication timeout");
+        assert!(matches!(
+            runtime.terminal_error(),
+            Some(CanonicalWriterError::Terminal { .. })
+        ));
+        assert!(!read.published().storage_operational());
+        assert_eq!(
+            runtime
+                .inner
+                .state
+                .publication_sequence
+                .load(Ordering::Acquire)
+                & 1,
+            0,
+            "panic recovery must close the seqlock generation"
+        );
+        assert!(read.ensure_storage_operational().is_err());
+        assert!(runtime.shutdown().await.is_err());
+    }
+
+    #[test]
+    fn canonical_publication_sequence_refuses_two_step_wrap() {
+        assert_eq!(next_writer_sequence((u64::MAX / 2) - 1), Some(u64::MAX / 2));
+        assert_eq!(next_writer_sequence(u64::MAX / 2), None);
+        assert_eq!(next_writer_sequence(u64::MAX), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_admission_is_fail_fast_and_hard_bounded() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            1,
+        )
+        .expect("runtime");
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            first_writer
+                .execute(None, "saturation blocker", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("blocker entered");
+        let second_writer = writer.clone();
+        let second = tokio::spawn(async move {
+            second_writer
+                .execute(None, "saturation queued command", |_| Ok(()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if writer.inner.sender.capacity() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued command admission timeout");
+        assert_eq!(writer.inner.sender.capacity(), 0, "queue is saturated");
+
+        let started = Instant::now();
+        let error = writer
+            .execute(None, "saturation rejected command", |_| Ok(()))
+            .await
+            .expect_err("third outstanding command exceeds hard cap");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(error
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| matches!(error, CanonicalWriterError::QueueFull { .. })));
+
+        release_tx.send(()).expect("release writer");
+        first.await.expect("first join").expect("first command");
+        second.await.expect("second join").expect("second command");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_revokes_read_authority_before_the_actor_drains() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            2,
+        )
+        .expect("runtime");
+        let read = runtime.read();
+        let mut published = (*read.published()).clone();
+        published.authoritative_mining_snapshot = Some(Arc::new(MiningSnapshot {
+            network_id: Network::Regtest.canonical_id(),
+            generation: published.mining_generation,
+            tip: HeaderSummary {
+                hash: BlockHash::ZERO,
+                parent_hash: BlockHash::ZERO,
+                height: 0,
+                tree_root: [0; 32],
+                time: 0,
+                bits: 0,
+            },
+            parent_median_time: 0,
+            next_tree_root: [0; 32],
+            chainwork: Uint256::ZERO,
+        }));
+        published.mining_authoritative = true;
+        read.state.publish(published);
+        assert!(read.mining_snapshot().is_some());
+        assert!(read.subscribe_mining_events().is_ok());
+
+        let actor_read = read.clone();
+        let (actor_entered_tx, actor_entered_rx) = tokio::sync::oneshot::channel();
+        let (actor_release_tx, actor_release_rx) = std::sync::mpsc::channel();
+        let inspection = tokio::spawn(async move {
+            actor_read
+                .inspect_bounded("shutdown authority blocker", move |_| {
+                    let _ = actor_entered_tx.send(());
+                    actor_release_rx.recv().expect("release actor");
+                    Ok(())
+                })
+                .await
+        });
+        actor_entered_rx.await.expect("actor entered");
+
+        let stable_read = read.clone();
+        let (read_entered_tx, read_entered_rx) = tokio::sync::oneshot::channel();
+        let (read_release_tx, read_release_rx) = std::sync::mpsc::channel();
+        let stable = tokio::task::spawn_blocking(move || {
+            stable_read.with_stable_epoch_read(|_, _| {
+                let _ = read_entered_tx.send(());
+                read_release_rx.recv().expect("release stable read");
+                Ok(())
+            })
+        });
+        read_entered_rx.await.expect("stable read entered");
+
+        let state = Arc::clone(&read.state);
+        let shutdown = tokio::spawn(runtime.shutdown());
+        while state.accepting.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(state.terminal_reason().is_none(), "actor remains in flight");
+        assert!(read.published().storage_operational());
+        assert!(read.ensure_storage_operational().is_err());
+        assert!(read.published_mempool().is_err());
+        assert!(read.mining_snapshot().is_none());
+        assert!(read.subscribe_mining_events().is_err());
+
+        read_release_tx.send(()).expect("release stable read");
+        let stable_error = stable
+            .await
+            .expect("stable read join")
+            .expect_err("shutdown must reject a read that began while active");
+        assert!(stable_error
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| matches!(error, CanonicalWriterError::ShuttingDown)));
+
+        actor_release_tx.send(()).expect("release actor");
+        inspection
+            .await
+            .expect("inspection join")
+            .expect("accepted inspection");
+        shutdown.await.expect("shutdown join").expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_runtime_drop_fail_closes_surviving_reads_without_clean_marker() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let read = runtime.read();
+        let stable_read = read.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stable = tokio::task::spawn_blocking(move || {
+            stable_read.with_stable_epoch_read(|_, _| {
+                let _ = entered_tx.send(());
+                release_rx.recv().expect("release stable read");
+                Ok(())
+            })
+        });
+        entered_rx.await.expect("stable read entered");
+        drop(runtime);
+
+        assert!(read.ensure_storage_operational().is_err());
+        assert!(read.mining_snapshot().is_none());
+        assert!(read.subscribe_mining_events().is_err());
+        release_tx.send(()).expect("release stable read");
+        stable
+            .await
+            .expect("stable read join")
+            .expect_err("lost runtime must reject a read that began while active");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while read.published().storage_operational() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer observes receiver closure");
+        assert!(!read.published().storage_operational());
+        assert!(read.mining_snapshot().is_none());
+        assert!(read.rpc_diagnostic_service().await.is_err());
+        assert!(!was_clean_shutdown(&store).expect("unexpected exit stays unclean"));
+    }
+
+    #[test]
+    fn published_mempool_view_rejects_mixed_generations_and_counts() {
+        let generation_error = PublishedMempoolView::new(
+            MempoolInfo {
+                generation: 1,
+                ..MempoolInfo::default()
+            },
+            MempoolSnapshot::default(),
+            OrderedTxidSnapshot::default(),
+            1,
+        )
+        .expect_err("snapshot generation must match aggregate generation");
+        assert!(generation_error
+            .to_string()
+            .contains("published mempool generations disagree"));
+
+        let ordered_generation_error = PublishedMempoolView::new(
+            MempoolInfo::default(),
+            MempoolSnapshot::default(),
+            OrderedTxidSnapshot::default(),
+            1,
+        )
+        .expect_err("ordered generation must match aggregate generation");
+        assert!(ordered_generation_error
+            .to_string()
+            .contains("published mempool generations disagree"));
+
+        let count_error = PublishedMempoolView::new(
+            MempoolInfo {
+                transaction_count: 1,
+                ..MempoolInfo::default()
+            },
+            MempoolSnapshot::default(),
+            OrderedTxidSnapshot::default(),
+            0,
+        )
+        .expect_err("snapshot and order counts must match aggregate count");
+        assert!(count_error
+            .to_string()
+            .contains("published mempool transaction counts disagree"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persistent_mempool_reads_retain_generations_and_bypass_a_blocked_writer() {
+        let node = peer_transaction_node(0);
+        let first_outpoint = Outpoint {
+            txid: Txid::new([0xd1; 32]),
+            index: 0,
+        };
+        let second_outpoint = Outpoint {
+            txid: Txid::new([0xd2; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, first_outpoint.clone(), 10_000, 0);
+        install_script_coin(&node, second_outpoint.clone(), 10_000, 0);
+        let first = script_spend(first_outpoint, 9_000);
+        let first_txid = first.txid();
+        let second = script_spend(second_outpoint, 8_000);
+        let second_txid = second.txid();
+
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let first_admission = writer
+            .execute(None, "first persistent-view admission", move |node| {
+                node.mining_engine_accept_peer_transaction(first)
+            })
+            .await
+            .expect("first admission");
+        assert!(matches!(
+            first_admission,
+            hns_mempool::Admission::Accepted(txid) if txid == first_txid
+        ));
+        let retained = read
+            .published_mempool()
+            .expect("retained mempool generation");
+        let retained_snapshot = retained.snapshot();
+
+        let second_admission = writer
+            .execute(None, "second persistent-view admission", move |node| {
+                node.mining_engine_accept_peer_transaction(second)
+            })
+            .await
+            .expect("second admission");
+        assert!(matches!(
+            second_admission,
+            hns_mempool::Admission::Accepted(txid) if txid == second_txid
+        ));
+        let current = read
+            .published_mempool()
+            .expect("current mempool generation");
+        let current_snapshot = current.snapshot();
+        assert_eq!(retained.info.transaction_count, 1);
+        assert_eq!(current.info.transaction_count, 2);
+        assert!(retained_snapshot.transaction(&first_txid).is_some());
+        assert!(retained_snapshot.transaction(&second_txid).is_none());
+        assert!(current_snapshot.transaction(&second_txid).is_some());
+        assert!(std::ptr::eq(
+            retained_snapshot
+                .transaction(&first_txid)
+                .expect("retained transaction"),
+            current_snapshot
+                .transaction(&first_txid)
+                .expect("shared current transaction"),
+        ));
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_writer = writer.clone();
+        let command = tokio::spawn(async move {
+            blocked_writer
+                .execute(None, "blocked persistent-view writer", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release blocked writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+        assert_eq!(
+            read.state.publication_sequence.load(Ordering::Acquire) & 1,
+            1,
+            "fixture must hold an in-progress canonical generation"
+        );
+
+        let transaction_read = read.clone();
+        let inventory_read = read.clone();
+        let reads = tokio::time::timeout(Duration::from_secs(2), async move {
+            tokio::join!(
+                transaction_read.mempool_transactions(MAX_RPC_COLLECTION_ENTRIES),
+                inventory_read.mempool_inventory(MAX_RPC_COLLECTION_ENTRIES),
+            )
+        })
+        .await;
+        release_tx.send(()).expect("release writer");
+        let (transactions, inventory) = reads
+            .expect("persistent mempool collection workers must not wait for the canonical writer");
+        let transactions = transactions.expect("persistent transaction collection");
+        let inventory = inventory.expect("persistent inventory collection");
+        assert_eq!(
+            transactions
+                .iter()
+                .map(Transaction::txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid, second_txid]
+        );
+        assert_eq!(
+            inventory,
+            vec![
+                hns_p2p::Inventory::transaction(first_txid),
+                hns_p2p::Inventory::transaction(second_txid),
+            ]
+        );
+        command.await.expect("writer join").expect("writer command");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_initializes_publication_queue_and_shares_template_cache_lock() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            mining_engine: MiningEngineConfig {
+                enabled: true,
+                ..MiningEngineConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let service_cache = Arc::clone(&node.mining_engine_templates);
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime startup");
+        let read = runtime.read();
+        let read_cache = read.template_coordinator_handle();
+        assert!(Arc::ptr_eq(&service_cache, &read_cache));
+
+        let diagnostics = read
+            .mining_engine_diagnostics()
+            .await
+            .expect("mining diagnostics after startup migration");
+        assert!(!diagnostics
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("publication queue index is not initialized")));
+
+        let stable_before = read.canonical_epoch();
+        assert!(read.canonical_generation_is_stable(&stable_before));
+        let cache_guard = service_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let writer = runtime.writer();
+        let cache_clear = tokio::spawn(async move {
+            writer
+                .execute(None, "shared template-cache clear", move |node| {
+                    entered_tx.send(()).expect("signal cache clear");
+                    node.revoke_runtime_authority();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer reached shared cache");
+        assert!(!read.canonical_generation_is_stable(&stable_before));
+        drop(cache_guard);
+        cache_clear
+            .await
+            .expect("cache-clear writer join")
+            .expect("cache-clear writer command");
+        assert!(!read.canonical_generation_is_stable(&stable_before));
+        assert!(read.canonical_generation_is_stable(&read.canonical_epoch()));
+        runtime.shutdown().await.expect("shutdown");
     }
 }
