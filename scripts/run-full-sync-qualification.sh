@@ -1472,6 +1472,61 @@ process_vm_hwm_bytes() {
   printf '%s\n' "$((vm_hwm_kib * 1024))"
 }
 
+normalize_sync_status_response() {
+  local response=$1
+
+  jq -ce '
+    def canonical_block_hash:
+      if . == null then
+        null
+      elif type == "string" then
+        if test("^[0-9a-fA-F]{64}$") then
+          ascii_downcase
+        else
+          error("BlockHash string is not exactly 64 hexadecimal characters")
+        end
+      elif type == "array" then
+        if length != 32 then
+          error("BlockHash byte array does not contain exactly 32 elements")
+        elif all(.[];
+          if type == "number" then
+            floor == . and . >= 0 and . <= 255
+          else
+            false
+          end) then
+          ["0", "1", "2", "3", "4", "5", "6", "7",
+           "8", "9", "a", "b", "c", "d", "e", "f"] as $hex |
+          map(. as $byte |
+            $hex[($byte / 16 | floor)] + $hex[($byte % 16)]) |
+          join("")
+        else
+          error("BlockHash byte array contains a non-byte element")
+        end
+      else
+        error("BlockHash is neither null, a hexadecimal string, nor a byte array")
+      end;
+
+    if type != "object" then error("sync response is not an object") else . end |
+    {
+      stage,
+      best_header_height: (.best_header.height // null),
+      best_header_hash: (.best_header.hash | canonical_block_hash),
+      active_tip_height: (.active_tip.height // null),
+      active_tip_hash: (.active_tip.hash | canonical_block_hash),
+      stored_tip_height: (.stored_tip.height // null),
+      stored_tip_hash: (.stored_tip.hash | canonical_block_hash),
+      target_height,
+      pending_blocks,
+      inflight_blocks,
+      tracked_blocks,
+      validated_blocks,
+      failed_blocks,
+      sequence,
+      peer_count: (.peers | length),
+      ready_peer_count: ([.peers[] | select(.ready == true)] | length)
+    }' "$response"
+}
+
 read_sync_status() {
   local response=$1
   local url="http://127.0.0.1:$rpc_port/api/v1/sync"
@@ -1491,26 +1546,7 @@ PY
     return 1
   fi
 
-  jq -ce '
-    if type != "object" then error("sync response is not an object") else . end |
-    {
-      stage,
-      best_header_height: (.best_header.height // null),
-      best_header_hash: (.best_header.hash // null),
-      active_tip_height: (.active_tip.height // null),
-      active_tip_hash: (.active_tip.hash // null),
-      stored_tip_height: (.stored_tip.height // null),
-      stored_tip_hash: (.stored_tip.hash // null),
-      target_height,
-      pending_blocks,
-      inflight_blocks,
-      tracked_blocks,
-      validated_blocks,
-      failed_blocks,
-      sequence,
-      peer_count: (.peers | length),
-      ready_peer_count: ([.peers[] | select(.ready == true)] | length)
-    }' "$response"
+  normalize_sync_status_response "$response"
 }
 
 sync_status_is_complete() {
@@ -1520,7 +1556,7 @@ sync_status_is_complete() {
     (.best_header_height | type) == "number" and
     .best_header_height > 0 and
     (.best_header_hash | type) == "string" and
-    (.best_header_hash | test("^[0-9a-fA-F]{64}$")) and
+    (.best_header_hash | test("^[0-9a-f]{64}$")) and
     .active_tip_height == .best_header_height and
     .active_tip_hash == .best_header_hash and
     .stored_tip_height == .best_header_height and
@@ -3354,7 +3390,7 @@ if "synced-nonzero" in behavior:
     if rpc_bind is None:
         raise SystemExit(90)
     host, port_text = rpc_bind.rsplit(":", 1)
-    tip_hash = "11" * 32
+    tip_hash = [0x11] * 32
     payload = json.dumps({
         "stage": "Synced",
         "best_header": {"height": 1, "hash": tip_hash},
@@ -3526,6 +3562,134 @@ self_test_log_scanner_child_exit_race() (
   trap - EXIT
 )
 
+self_test_sync_hash_normalization() {
+  local fixture_root=$1
+  local response normalized expected uppercase index
+  local -a malformed_labels malformed_values
+
+  response="$fixture_root/sync-hash-response.json"
+  expected=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+  jq -n '
+    [range(0; 32)] as $hash |
+    {
+      stage: "Synced",
+      best_header: {height: 1, hash: $hash},
+      active_tip: {height: 1, hash: $hash},
+      stored_tip: {height: 1, hash: $hash},
+      target_height: 1,
+      pending_blocks: 0,
+      inflight_blocks: 0,
+      tracked_blocks: 0,
+      validated_blocks: 1,
+      failed_blocks: 0,
+      sequence: 1,
+      peers: [{ready: true}]
+    }' >"$response"
+  normalized=$(normalize_sync_status_response "$response") ||
+    die "self-test rejected the real byte-array BlockHash RPC shape"
+  jq -e --arg expected "$expected" '
+    .best_header_hash == $expected and
+    .active_tip_hash == $expected and
+    .stored_tip_hash == $expected
+  ' <<<"$normalized" >/dev/null ||
+    die "self-test did not canonically encode byte-array BlockHash values"
+  sync_status_is_complete "$normalized" ||
+    die "self-test did not recognize a normalized complete sync response"
+
+  uppercase=ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789
+  jq -n --arg hash "$uppercase" '
+    {
+      stage: "Synced",
+      best_header: {height: 1, hash: $hash},
+      active_tip: {height: 1, hash: $hash},
+      stored_tip: {height: 1, hash: $hash},
+      target_height: 1,
+      pending_blocks: 0,
+      inflight_blocks: 0,
+      tracked_blocks: 0,
+      validated_blocks: 1,
+      failed_blocks: 0,
+      sequence: 1,
+      peers: [{ready: true}]
+    }' >"$response"
+  normalized=$(normalize_sync_status_response "$response") ||
+    die "self-test rejected a strictly valid hexadecimal BlockHash"
+  jq -e --arg expected "${uppercase,,}" '
+    .best_header_hash == $expected and
+    .active_tip_hash == $expected and
+    .stored_tip_hash == $expected
+  ' <<<"$normalized" >/dev/null ||
+    die "self-test did not lowercase a compatible hexadecimal BlockHash"
+
+  malformed_labels=(
+    short-array
+    long-array
+    negative-byte
+    oversized-byte
+    fractional-byte
+    non-number-byte
+    wrong-container-type
+    invalid-string
+  )
+  malformed_values=(
+    "$(jq -cn '[range(0; 31)]')"
+    "$(jq -cn '[range(0; 33)]')"
+    "$(jq -cn '[range(0; 31)] + [-1]')"
+    "$(jq -cn '[range(0; 31)] + [256]')"
+    "$(jq -cn '[range(0; 31)] + [1.5]')"
+    "$(jq -cn '[range(0; 31)] + ["1"]')"
+    "$(jq -cn '{bytes: [range(0; 32)]}')"
+    "$(jq -cn '"not-a-block-hash"')"
+  )
+  for index in "${!malformed_values[@]}"; do
+    jq -n --argjson hash "${malformed_values[$index]}" '
+      {
+        stage: "Synced",
+        best_header: {height: 1, hash: $hash},
+        active_tip: {height: 1, hash: $hash},
+        stored_tip: {height: 1, hash: $hash},
+        target_height: 1,
+        pending_blocks: 0,
+        inflight_blocks: 0,
+        tracked_blocks: 0,
+        validated_blocks: 1,
+        failed_blocks: 0,
+        sequence: 1,
+        peers: [{ready: true}]
+      }' >"$response"
+    if normalize_sync_status_response "$response" >/dev/null 2>&1; then
+      die "self-test accepted malformed BlockHash: ${malformed_labels[$index]}"
+    fi
+  done
+
+  jq -n '
+    {
+      stage: "Headers",
+      best_header: null,
+      active_tip: null,
+      stored_tip: null,
+      target_height: 1,
+      pending_blocks: 0,
+      inflight_blocks: 0,
+      tracked_blocks: 0,
+      validated_blocks: 0,
+      failed_blocks: 0,
+      sequence: 1,
+      peers: []
+    }' >"$response"
+  normalized=$(normalize_sync_status_response "$response") ||
+    die "self-test rejected absent pre-sync BlockHash values"
+  jq -e '
+    .best_header_hash == null and
+    .active_tip_hash == null and
+    .stored_tip_hash == null
+  ' <<<"$normalized" >/dev/null ||
+    die "self-test changed absent pre-sync BlockHash values"
+  if sync_status_is_complete "$normalized"; then
+    die "self-test accepted an incomplete null-tip sync response"
+  fi
+}
+
 self_test() {
   local root auth mutation_auth normal_binary limit_binary reserve_binary
   local long_binary boundary_binary auth_change_binary exec_change_binary
@@ -3548,6 +3712,7 @@ self_test() {
   root=$(mktemp -d "${TMPDIR:-/tmp}/hsrd-full-sync-self-test.XXXXXX")
   chmod 700 -- "$root"
   trap 'self_test_cleanup "$root"' EXIT
+  self_test_sync_hash_normalization "$root"
   auth="$root/auth-header"
   printf '%s\n' 'Bearer self-test-high-entropy-value' >"$auth"
   chmod 600 -- "$auth"
@@ -4103,7 +4268,10 @@ PY
     die "self-test synced-nonzero fixture returned $rc; expected 14: $output"
   jq -e '
     .classification == "sync_completed_child_nonzero" and
-    .process.exit_code == 7
+    .process.exit_code == 7 and
+    .synchronized_tip.height == 1 and
+    .synchronized_tip.hash ==
+      "1111111111111111111111111111111111111111111111111111111111111111"
   ' "$synced_evidence/final-summary.json" >/dev/null ||
     die "self-test accepted a synchronized child that exited nonzero"
   set +e
@@ -4296,7 +4464,7 @@ exit "$result"
   trap - EXIT
   self_test_cleanup "$root"
   printf '%s\n' \
-    'full-sync runner self-test passed: lifecycle, sixteen forced clean-scanner-exit/child-exit race transitions, stale scanner-marker prelaunch rejection, live-orphan rejection, abrupt-loss partial recovery, monotonic counter reconciliation, terminal failure masking prevention, single operational sampled cutoff plus informational comparison schema, boundary-safe authorization redaction, durable mutation erasure, exact process-image and exec-change detection, isolated interpreter allowance, nonzero synced shutdown, sample-limit precedence, durable evidence, path safety, and private authorization'
+    'full-sync runner self-test passed: lifecycle, canonical BlockHash normalization and malformed-hash rejection, sixteen forced clean-scanner-exit/child-exit race transitions, stale scanner-marker prelaunch rejection, live-orphan rejection, abrupt-loss partial recovery, monotonic counter reconciliation, terminal failure masking prevention, single operational sampled cutoff plus informational comparison schema, boundary-safe authorization redaction, durable mutation erasure, exact process-image and exec-change detection, isolated interpreter allowance, nonzero synced shutdown, sample-limit precedence, durable evidence, path safety, and private authorization'
 }
 
 case "$command_name" in

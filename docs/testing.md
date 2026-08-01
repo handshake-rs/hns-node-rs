@@ -696,11 +696,14 @@ Each selected target must complete and remain running for at least its declared
 per-target duration. The summary includes targets not run after an earlier
 failure, exact commit/tree/tool/configuration identities, start/end
 full-worktree digests, start/completion corpus inventories, and SHA-256 hashes
-for logs and crash artifacts. Creating, removing, or changing a tracked or
-non-ignored untracked file during a campaign fails it. Weekly CI uses three
-minutes per target to keep the scheduled gate bounded; release campaigns may
-use a longer reviewed duration. Neither duration is a proof of parser
-completeness.
+for logs and crash artifacts. The start and completion worktree digests fail
+the campaign when a tracked or non-ignored untracked difference is present at
+either boundary. A transient mutation restored before completion is not
+reconstructible from those boundary digests, so release evidence also requires
+reviewed, exclusive trusted source-tree custody throughout the campaign. Weekly
+CI uses three minutes per target to keep the scheduled gate bounded; release
+campaigns may use a longer reviewed duration. Neither duration is a proof of
+parser completeness.
 The release orchestrator rejects a per-target duration below 30 minutes.
 
 ## Performance evidence

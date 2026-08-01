@@ -20,10 +20,12 @@ The tiers are intentionally separate:
 `NEW_DIR` must not exist. Refusing to reuse an evidence directory prevents a
 new run from silently inheriting an older successful artifact. `release`
 expects `DIR/external/` to exist and creates the new `DIR/software/` subtree.
-Software summaries bind the start and completion commit, tree, and full
-worktree digest, including non-ignored untracked files; a creation, removal, or
-content change while the gates run fails the result. Keep evidence and corpora
-outside the repository.
+Automated clean-tree and digest checks bind the start and completion
+boundaries. A tracked or non-ignored difference present at either boundary
+fails. A transient mutation restored between those boundaries is not
+reconstructible from the retained evidence, so release collection requires
+reviewed, exclusive, trusted source-tree custody for the entire run. Keep
+evidence and corpora outside the repository.
 
 The evidence verifier itself has positive, missing-record, tampered-artifact,
 unrelated-binary, unrelated-configuration, blank-identity, typed-artifact
@@ -183,7 +185,7 @@ SHA-256; and verify the recorded digest:
 ```bash
 umask 077
 install -d -m 0700 /ABS/private/hsrd-candidate
-artifact=/ABS/private/hsrd-candidate/hsrd-0.3.0-COMMIT
+artifact=/ABS/private/hsrd-candidate/hsrd-0.3.1-COMMIT
 [[ ! -e "$artifact" && ! -L "$artifact" ]]
 install -m 0500 -- target/release/hsrd "$artifact"
 cmp --silent -- target/release/hsrd "$artifact"
@@ -205,7 +207,7 @@ must have at least the 150,000,000,000-byte operational limit plus the separate
 
 ```bash
 scripts/run-full-sync-qualification.sh run \
-  --binary /ABS/private/hsrd-candidate/hsrd-0.3.0-COMMIT \
+  --binary /ABS/private/hsrd-candidate/hsrd-0.3.1-COMMIT \
   --data-root /ABS/fresh-mainnet-archive \
   --evidence-dir /ABS/full-sync-evidence \
   --auth-file /ABS/private/rpc-authorization-header \

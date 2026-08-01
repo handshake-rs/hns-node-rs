@@ -9,6 +9,7 @@ cargo_target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 
 cargo +"$rust_toolchain" metadata --locked --manifest-path Cargo.toml --format-version 1 >/dev/null
 cargo +"$rust_toolchain" metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
+./scripts/run-full-sync-qualification.sh self-test
 ./scripts/run-production-assurance.sh self-test
 cargo +"$rust_toolchain" deny --locked check
 cargo +"$rust_toolchain" deny --locked --manifest-path fuzz/Cargo.toml check
