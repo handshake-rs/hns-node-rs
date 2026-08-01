@@ -4202,10 +4202,13 @@ PY
     fi
     sleep 0.25
   done
-  [[ "$ready" == true ]] || {
-    wait "$orphan_resume_runner" || true
-    die "self-test did not recover the abrupt-loss partial log"
-  }
+  if [[ "$ready" != true ]]; then
+    set +e
+    wait "$orphan_resume_runner"
+    rc=$?
+    set -e
+    die "self-test did not recover the abrupt-loss partial log; runner returned $rc: $(sed -n '1,80p' "$orphan_resume_output"); state: $(jq -c '{attempt,status,runner,child,log_scanner}' "$orphan_evidence/state.json" 2>/dev/null || true); summary: $(jq -c '{classification,runner_error,process}' "$orphan_evidence/final-summary.json" 2>/dev/null || true); recovery: $(jq -c . "$recovery_marker" 2>/dev/null || true)"
+  fi
   "$SCRIPT_PATH" stop --evidence-dir "$orphan_evidence" >/dev/null
   set +e
   wait "$orphan_resume_runner"
