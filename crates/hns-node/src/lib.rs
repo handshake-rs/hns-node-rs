@@ -19042,9 +19042,10 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let permit = permit;
             let _ = started_tx.send(());
             let _ = release_rx.recv();
+            drop(permit);
             let _ = done_tx.send(());
         });
         started_rx.await.expect("point-read worker started");
@@ -19096,9 +19097,10 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let permit = permit;
             let _ = started_tx.send(());
             let _ = release_rx.recv();
+            drop(permit);
             let _ = done_tx.send(());
         });
         started_rx.await.expect("collection worker started");
