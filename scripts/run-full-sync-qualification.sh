@@ -1236,8 +1236,48 @@ assert_no_authorization_scanner_hard_stop_markers() {
   done
 }
 
+read_required_json_boolean() {
+  local key_path=$1
+  local input=$2
+
+  jq -er --arg key_path "$key_path" '
+    getpath($key_path | split(".")) as $value |
+    if ($value | type) == "boolean" then
+      $value | tostring
+    else
+      error($key_path + " must be a boolean")
+    end
+  ' "$input"
+}
+
+read_required_nonempty_json_string() {
+  local key_path=$1
+  local input=$2
+
+  jq -er --arg key_path "$key_path" '
+    getpath($key_path | split(".")) as $value |
+    if ($value | type) == "string" and ($value | length) > 0 then
+      $value
+    else
+      error($key_path + " must be a nonempty string")
+    end
+  ' "$input"
+}
+
+resume_classification_is_allowed() {
+  case "$1" in
+    operator_stop|operator_interrupt|node_exit_zero_before_sync|node_exit_nonzero)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 load_config_for_resume() {
   local config_path expected_digest actual_digest stored_evidence source_repo
+  local prior_classification
   local stored_dirty expected_binary_sha256 expected_binary_identity
   local expected_auth_identity
   local recorded_sample_count recorded_sample_digest
@@ -1292,10 +1332,12 @@ load_config_for_resume() {
   source_revision=$(jq -er '.source.revision' "$config_path")
   source_tree=$(jq -er '.source.tree' "$config_path")
   source_worktree_sha256=$(jq -er '.source.worktree_sha256' "$config_path")
-  stored_dirty=$(jq -er '.source.dirty' "$config_path")
+  stored_dirty=$(read_required_json_boolean source.dirty "$config_path") ||
+    die "campaign source dirty flag is missing or invalid"
   source_dirty=$stored_dirty
-  self_test_interpreter_image_allowance=$(jq -er \
-    '.self_test.interpreter_image_allowance' "$config_path")
+  self_test_interpreter_image_allowance=$(read_required_json_boolean \
+    self_test.interpreter_image_allowance "$config_path") ||
+    die "campaign interpreter-image allowance is missing or invalid"
 
   [[ "$stored_evidence" == "$evidence_dir" ]] ||
     die "campaign configuration is bound to a different evidence directory"
@@ -1321,26 +1363,20 @@ load_config_for_resume() {
     die "evidence directory contains a symbolic link"
   assert_no_authorization_scanner_hard_stop_markers
 
-  source_repo=$(jq -er '.source.repository // empty' "$evidence_dir/build-provenance.json")
-  [[ -z "$source_repo" || "$source_repo" == "$REPO_ROOT" ]] ||
+  source_repo=$(read_required_nonempty_json_string source.repository \
+    "$evidence_dir/build-provenance.json") ||
+    die "build provenance source repository is missing or invalid"
+  [[ "$source_repo" == "$REPO_ROOT" ]] ||
     die "campaign was initialized from a different source repository"
 
   if [[ -f "$evidence_dir/final-summary.json" ]]; then
-    case "$(jq -er '.classification' "$evidence_dir/final-summary.json")" in
-      sync_completed)
-        die "campaign is already complete"
-        ;;
-      sampled_storage_cutoff_exceeded|\
-        sampled_storage_cutoff_and_filesystem_reserve_breached|\
-        sampled_filesystem_reserve_breached|\
-        sample_limit_exceeded|authorization_value_emission_detected|\
-        log_authorization_scanner_failed|\
-        authorization_log_retention_guarantee_failed|\
-        child_process_image_changed|child_process_identity_changed|\
-        sync_completed_child_nonzero|sync_completed_forced_shutdown)
-        die "campaign has a non-resumable hard-stop classification"
-        ;;
-    esac
+    prior_classification=$(read_required_nonempty_json_string classification \
+      "$evidence_dir/final-summary.json") ||
+      die "campaign final-summary classification is missing or invalid"
+    [[ "$prior_classification" != sync_completed ]] ||
+      die "campaign is already complete"
+    resume_classification_is_allowed "$prior_classification" ||
+      die "campaign has a non-resumable hard-stop classification"
   fi
 
   if [[ -f "$evidence_dir/state.json" ]]; then
@@ -3690,6 +3726,184 @@ self_test_sync_hash_normalization() {
   fi
 }
 
+self_test_required_json_booleans() {
+  local fixture_root=$1
+  local response="$fixture_root/required-json-booleans.json"
+  local expected key_path label invalid_json value rc
+  local -a key_paths=(source.dirty self_test.interpreter_image_allowance)
+  local -a invalid_labels=(null missing string number array object)
+
+  for expected in false true; do
+    jq -n --argjson value "$expected" '{
+      source: {dirty: $value},
+      self_test: {interpreter_image_allowance: $value}
+    }' >"$response"
+    for key_path in "${key_paths[@]}"; do
+      value=
+      if value=$(read_required_json_boolean "$key_path" "$response" 2>/dev/null); then
+        rc=0
+      else
+        rc=$?
+      fi
+      [[ "$rc" == 0 && "$value" == "$expected" ]] ||
+        die "self-test did not load required boolean $key_path=$expected"
+    done
+  done
+
+  for key_path in "${key_paths[@]}"; do
+    for label in "${invalid_labels[@]}"; do
+      case "$label" in
+        null)
+          invalid_json=null
+          ;;
+        missing)
+          jq -n '{}' >"$response"
+          ;;
+        string)
+          invalid_json='"false"'
+          ;;
+        number)
+          invalid_json=0
+          ;;
+        array)
+          invalid_json='[]'
+          ;;
+        object)
+          invalid_json='{}'
+          ;;
+      esac
+      if [[ "$label" != missing ]]; then
+        jq -n --arg key_path "$key_path" --argjson value "$invalid_json" '
+          setpath($key_path | split("."); $value)
+        ' >"$response"
+      fi
+      value=
+      if value=$(read_required_json_boolean "$key_path" "$response" 2>/dev/null); then
+        rc=0
+      else
+        rc=$?
+      fi
+      [[ "$rc" != 0 ]] ||
+        die "self-test accepted $label for required boolean $key_path"
+    done
+  done
+}
+
+self_test_resume_classification_policy() {
+  local fixture_root=$1
+  local response="$fixture_root/resume-classification.json"
+  local classification label invalid_json value parser_rc policy_rc
+  local -a allowed=(
+    operator_stop
+    operator_interrupt
+    node_exit_zero_before_sync
+    node_exit_nonzero
+  )
+  local -a rejected_known=(
+    sync_completed
+    sync_completed_child_nonzero
+    sync_completed_forced_shutdown
+    sampled_storage_cutoff_exceeded
+    sampled_storage_cutoff_and_filesystem_reserve_breached
+    sampled_filesystem_reserve_breached
+    sample_limit_exceeded
+    measurement_error
+    binary_identity_changed
+    binary_identity_read_failed
+    authorization_identity_changed
+    authorization_identity_read_failed
+    child_process_identity_changed
+    child_process_image_changed
+    log_authorization_scanner_failed
+    authorization_value_emission_detected
+    authorization_log_retention_guarantee_failed
+    internal_runner_error
+  )
+  local -a invalid_labels=(empty null boolean number array object missing malformed)
+
+  for classification in "${allowed[@]}"; do
+    jq -n --arg classification "$classification" \
+      '{classification: $classification}' >"$response"
+    value=
+    if value=$(read_required_nonempty_json_string \
+      classification "$response" 2>/dev/null); then
+      parser_rc=0
+    else
+      parser_rc=$?
+    fi
+    if resume_classification_is_allowed "$value"; then
+      policy_rc=0
+    else
+      policy_rc=$?
+    fi
+    [[ "$parser_rc" == 0 && "$value" == "$classification" &&
+      "$policy_rc" == 0 ]] ||
+      die "self-test rejected resumable classification $classification"
+  done
+
+  for classification in "${rejected_known[@]}" unknown_future_classification; do
+    jq -n --arg classification "$classification" \
+      '{classification: $classification}' >"$response"
+    value=
+    if value=$(read_required_nonempty_json_string \
+      classification "$response" 2>/dev/null); then
+      parser_rc=0
+    else
+      parser_rc=$?
+    fi
+    if resume_classification_is_allowed "$value"; then
+      policy_rc=0
+    else
+      policy_rc=$?
+    fi
+    [[ "$parser_rc" == 0 && "$value" == "$classification" &&
+      "$policy_rc" != 0 ]] ||
+      die "self-test accepted non-resumable classification $classification"
+  done
+
+  for label in "${invalid_labels[@]}"; do
+    case "$label" in
+      empty)
+        invalid_json='""'
+        ;;
+      null)
+        invalid_json=null
+        ;;
+      boolean)
+        invalid_json=false
+        ;;
+      number)
+        invalid_json=0
+        ;;
+      array)
+        invalid_json='[]'
+        ;;
+      object)
+        invalid_json='{}'
+        ;;
+      missing)
+        jq -n '{}' >"$response"
+        ;;
+      malformed)
+        printf '%s\n' '{"classification":' >"$response"
+        ;;
+    esac
+    if [[ "$label" != missing && "$label" != malformed ]]; then
+      jq -n --argjson classification "$invalid_json" \
+        '{classification: $classification}' >"$response"
+    fi
+    value=
+    if value=$(read_required_nonempty_json_string \
+      classification "$response" 2>/dev/null); then
+      parser_rc=0
+    else
+      parser_rc=$?
+    fi
+    [[ "$parser_rc" != 0 ]] ||
+      die "self-test accepted $label final-summary classification"
+  done
+}
+
 self_test() {
   local root auth mutation_auth normal_binary limit_binary reserve_binary
   local long_binary boundary_binary auth_change_binary exec_change_binary
@@ -3712,6 +3926,8 @@ self_test() {
   root=$(mktemp -d "${TMPDIR:-/tmp}/hsrd-full-sync-self-test.XXXXXX")
   chmod 700 -- "$root"
   trap 'self_test_cleanup "$root"' EXIT
+  self_test_required_json_booleans "$root"
+  self_test_resume_classification_policy "$root"
   self_test_sync_hash_normalization "$root"
   auth="$root/auth-header"
   printf '%s\n' 'Bearer self-test-high-entropy-value' >"$auth"
