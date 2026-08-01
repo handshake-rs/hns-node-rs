@@ -2105,13 +2105,7 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
                 false,
             )?;
 
-            stage_transaction_spends(
-                batch,
-                &mut pending_created,
-                &mut created_coins,
-                &mut spent_coins,
-                resolved,
-            )?;
+            stage_transaction_spends(batch, &mut pending_created, &mut spent_coins, resolved)?;
             if let Some(fee) = fee {
                 total_fees = total_fees
                     .checked_add(fee)
@@ -2168,6 +2162,11 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
             created_coins.push(outpoint);
         }
     }
+
+    // Pending spends already remove their coins from this map in O(1). Prune
+    // the creation-order list once per block instead of rescanning it for
+    // every in-block spend.
+    created_coins.retain(|outpoint| pending_created.contains_key(outpoint));
 
     if let Some(coinbase_value) = coinbase_value {
         let maximum_coinbase = request
@@ -2792,7 +2791,6 @@ fn apply_transaction_name_covenants<T: ReadSnapshot>(
 fn stage_transaction_spends<B: WriteBatch>(
     batch: &mut B,
     pending_created: &mut HashMap<Outpoint, Coin>,
-    created_coins: &mut Vec<Outpoint>,
     spent_coins: &mut Vec<Coin>,
     resolved: ResolvedInputs,
 ) -> Result<(), StateError> {
@@ -2806,7 +2804,6 @@ fn stage_transaction_spends<B: WriteBatch>(
             ResolvedCoinSource::Pending => {
                 pending_created.remove(&coin.outpoint);
                 batch.delete(ColumnFamily::Utxo, &encode_outpoint_key(&coin.outpoint))?;
-                created_coins.retain(|outpoint| outpoint != &coin.outpoint);
             }
             ResolvedCoinSource::Existing => {
                 batch.delete(ColumnFamily::Utxo, &encode_outpoint_key(&coin.outpoint))?;
@@ -8769,6 +8766,78 @@ mod tests {
             .coin(&nulldata)
             .expect("restored null-data read")
             .is_none());
+    }
+
+    #[test]
+    fn connect_prunes_in_block_spends_from_undo_in_creation_order() {
+        let store = MemoryStore::new();
+        let mut state = engine(store);
+        let subsidy = coinbase(vec![output(10), output(20), output(30)]);
+        let subsidy_txid = subsidy.txid();
+        let first_spend = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    txid: subsidy_txid,
+                    index: 1,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![output(19)],
+            locktime: 0,
+        };
+        let first_spend_outpoint = Outpoint {
+            txid: first_spend.txid(),
+            index: 0,
+        };
+        let second_spend = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: first_spend_outpoint.clone(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![output(18)],
+            locktime: 0,
+        };
+        let final_outpoint = Outpoint {
+            txid: second_spend.txid(),
+            index: 0,
+        };
+        let candidate = block(78, vec![subsidy, first_spend, second_spend]);
+        let block_hash = candidate.hash();
+
+        let summary = state
+            .connect_block(ConnectBlock {
+                block_hash,
+                height: 78,
+                coinbase_maturity: 0,
+                block_reward: 60,
+                block: &candidate,
+            })
+            .expect("connect block with chained in-block spends");
+        assert_eq!(summary.coins_created, 3);
+
+        let undo = state
+            .load_undo(&block_hash)
+            .expect("undo read")
+            .expect("block undo");
+        assert_eq!(
+            undo.created_coins,
+            vec![
+                Outpoint {
+                    txid: subsidy_txid,
+                    index: 0,
+                },
+                Outpoint {
+                    txid: subsidy_txid,
+                    index: 2,
+                },
+                final_outpoint,
+            ]
+        );
+        assert!(!undo.created_coins.contains(&first_spend_outpoint));
     }
 
     fn open_output(name: &[u8]) -> Output {
