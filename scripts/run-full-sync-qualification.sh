@@ -626,6 +626,85 @@ process_identity_is_live() {
   [[ "$state" != Z && "$state" != X ]]
 }
 
+process_holds_open_path() {
+  local pid=$1
+  local path=$2
+
+  python3 - "$pid" "$path" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+pid = int(sys.argv[1])
+target = Path(sys.argv[2]).stat()
+for descriptor in Path(f"/proc/{pid}/fd").iterdir():
+    try:
+        observed = descriptor.stat()
+    except (FileNotFoundError, PermissionError):
+        continue
+    if (observed.st_dev, observed.st_ino) == (target.st_dev, target.st_ino):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+start_runner_lock() {
+  local lock_file=$1
+  local lock_input_fd lock_output_fd lock_pid lock_status=
+
+  coproc HSRD_RUNNER_LOCK {
+    exec python3 -c '
+import ctypes
+import fcntl
+import os
+import signal
+import sys
+
+lock_path = sys.argv[1]
+expected_parent = int(sys.argv[2])
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+    print("error", flush=True)
+    raise SystemExit(74)
+if os.getppid() != expected_parent:
+    print("error", flush=True)
+    raise SystemExit(74)
+descriptor = os.open(
+    lock_path,
+    os.O_WRONLY | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+    0o600,
+)
+os.fchmod(descriptor, 0o600)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("busy", flush=True)
+    raise SystemExit(73)
+print("locked", flush=True)
+while True:
+    signal.pause()
+' "$lock_file" "$runner_pid"
+  }
+  lock_pid=$HSRD_RUNNER_LOCK_PID
+  lock_output_fd=${HSRD_RUNNER_LOCK[0]}
+  lock_input_fd=${HSRD_RUNNER_LOCK[1]}
+  IFS= read -r lock_status <&"$lock_output_fd" || true
+  exec {lock_output_fd}<&-
+  exec {lock_input_fd}>&-
+  case "$lock_status" in
+    locked)
+      ;;
+    busy)
+      wait "$lock_pid" 2>/dev/null || true
+      die "campaign runner is already active"
+      ;;
+    *)
+      wait "$lock_pid" 2>/dev/null || true
+      die "could not establish the campaign runner lock"
+      ;;
+  esac
+}
+
 child_process_is_live() {
   process_identity_is_live "$child_pid" "$child_start_ticks"
 }
@@ -2585,8 +2664,7 @@ start_attempt() {
   local lock_file="$evidence_dir/runner.lock"
   local current_binary current_binary_identity current_auth
 
-  exec 9>"$lock_file"
-  flock -n 9 || die "campaign runner is already active"
+  start_runner_lock "$lock_file"
   runner_start_ticks=$(process_start_ticks "$runner_pid") ||
     die "could not capture runner process identity"
   assert_no_authorization_scanner_hard_stop_markers
@@ -3914,7 +3992,7 @@ self_test() {
   local refuse_data refuse_evidence symlink_data symlink_evidence
   local stop_data stop_evidence stop_output stop_runner ready
   local orphan_data orphan_evidence orphan_output orphan_runner orphan_child
-  local orphan_child_ticks orphan_scanner orphan_scanner_ticks
+  local orphan_child_ticks orphan_scanner orphan_scanner_ticks orphan_lock
   local orphan_resume_output orphan_resume_runner recovered_segment recovered_sha
   local recovery_marker stale_counter reconciliation_marker
   local boundary_data boundary_evidence
@@ -4141,6 +4219,14 @@ PY
   orphan_scanner=$(jq -er '.log_scanner.pid' "$orphan_evidence/state.json")
   orphan_scanner_ticks=$(jq -er \
     '.log_scanner.start_ticks' "$orphan_evidence/state.json")
+  orphan_lock="$orphan_evidence/runner.lock"
+  if flock -n "$orphan_lock" true; then
+    die "self-test runner lock was not held by the live supervisor"
+  fi
+  process_holds_open_path "$orphan_child" "$orphan_lock" &&
+    die "self-test hsrd child inherited the supervisor lock"
+  process_holds_open_path "$orphan_scanner" "$orphan_lock" &&
+    die "self-test log scanner inherited the supervisor lock"
   kill -KILL "$orphan_runner"
   set +e
   wait "$orphan_runner"
@@ -4148,6 +4234,16 @@ PY
   set -e
   [[ "$rc" == 137 ]] ||
     die "self-test could not create an interrupted-runner orphan fixture"
+  ready=false
+  for _ in {1..80}; do
+    if flock -n "$orphan_lock" true; then
+      ready=true
+      break
+    fi
+    sleep 0.05
+  done
+  [[ "$ready" == true ]] ||
+    die "self-test supervisor lock survived abrupt runner loss"
   set +e
   output=$("$SCRIPT_PATH" resume --evidence-dir "$orphan_evidence" 2>&1)
   rc=$?
