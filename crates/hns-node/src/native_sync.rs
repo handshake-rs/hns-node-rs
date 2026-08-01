@@ -62,7 +62,7 @@ use tokio::{
     net::TcpListener,
     sync::{mpsc, watch, RwLock},
     task::JoinHandle,
-    time::{Instant, MissedTickBehavior},
+    time::{Instant, Interval, MissedTickBehavior},
 };
 
 use super::{
@@ -131,6 +131,7 @@ const MAX_NATIVE_SYNC_PEERS: usize = 256;
 const MAX_NATIVE_SYNC_VALIDATION_WORKERS: usize = 128;
 const MAX_NATIVE_SYNC_VALIDATION_QUEUE: usize = 8_192;
 const MAX_VALIDATED_BODY_COMMIT_BATCH: usize = 32;
+const MAX_CANONICAL_BODY_CANDIDATE_SCAN_SLICE: usize = 256;
 const MAX_CANONICAL_STALE_RETRIES: usize = 8;
 const MAX_HEADER_DEPLOYMENT_READS: usize = 2_000_000;
 const MAX_NATIVE_SYNC_ORPHAN_BLOCKS: usize = 8_192;
@@ -1543,6 +1544,115 @@ struct ConnectAttemptResult {
     result: std::result::Result<PeerId, String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSupervisorLane {
+    Maintenance,
+    Connection,
+    Peer,
+    Validation,
+}
+
+impl NativeSupervisorLane {
+    const fn next(self) -> Self {
+        match self {
+            Self::Maintenance => Self::Connection,
+            Self::Connection => Self::Peer,
+            Self::Peer => Self::Validation,
+            Self::Validation => Self::Maintenance,
+        }
+    }
+}
+
+enum NativeSupervisorEvent {
+    Maintenance,
+    Connection(Option<ConnectAttemptResult>),
+    Peer(Option<PeerEvent>),
+    Validation(Option<OrderedValidationResult>),
+}
+
+impl NativeSupervisorEvent {
+    const fn lane(&self) -> NativeSupervisorLane {
+        match self {
+            Self::Maintenance => NativeSupervisorLane::Maintenance,
+            Self::Connection(_) => NativeSupervisorLane::Connection,
+            Self::Peer(_) => NativeSupervisorLane::Peer,
+            Self::Validation(_) => NativeSupervisorLane::Validation,
+        }
+    }
+}
+
+/// Select supervisor work in deterministic round-robin priority order.
+///
+/// Every receive and interval tick used here is cancellation safe. The caller
+/// keeps shutdown in an outer, biased select so shutdown remains strict first
+/// priority without allowing an overdue maintenance tick or a hot channel to
+/// permanently starve another ready lane.
+async fn next_native_supervisor_event(
+    next_lane: &mut NativeSupervisorLane,
+    poll: &mut Interval,
+    connect_results: &mut mpsc::Receiver<ConnectAttemptResult>,
+    peer_events: &mut mpsc::Receiver<PeerEvent>,
+    validation_results: &mut mpsc::Receiver<OrderedValidationResult>,
+) -> NativeSupervisorEvent {
+    let event = match *next_lane {
+        NativeSupervisorLane::Maintenance => {
+            tokio::select! {
+                biased;
+                _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+                result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
+                event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
+                result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
+            }
+        }
+        NativeSupervisorLane::Connection => {
+            tokio::select! {
+                biased;
+                result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
+                event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
+                result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
+                _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+            }
+        }
+        NativeSupervisorLane::Peer => {
+            tokio::select! {
+                biased;
+                event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
+                result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
+                _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+                result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
+            }
+        }
+        NativeSupervisorLane::Validation => {
+            tokio::select! {
+                biased;
+                result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
+                _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+                result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
+                event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
+            }
+        }
+    };
+    *next_lane = event.lane().next();
+    event
+}
+
+fn reset_native_supervisor_poll(poll: &mut Interval, interval: Duration) {
+    poll.reset_after(interval);
+}
+
+fn native_body_candidate_scan_window(config: &NativeSyncConfig) -> usize {
+    let validation_capacity = config
+        .validation_queue
+        .saturating_add(config.validation_workers);
+    let network_capacity = config
+        .maximum_outbound
+        .saturating_mul(NATIVE_MAX_INFLIGHT_PER_PEER);
+    config
+        .orphan_blocks
+        .min(validation_capacity.max(network_capacity).max(1))
+        .min(MAX_CANONICAL_BODY_CANDIDATE_SCAN_SLICE)
+}
+
 #[derive(Debug, Default)]
 struct DnsSeedResolution {
     addresses: Vec<hns_p2p::NetAddress>,
@@ -2016,6 +2126,7 @@ impl NodeService {
         let mut shutdown_wait = Box::pin(shutdown.wait());
         let mut terminal_error: Option<anyhow::Error> = None;
         let mut active_state_task: Option<JoinHandle<Result<NativeActiveStateSliceResult>>> = None;
+        let mut next_supervisor_lane = NativeSupervisorLane::Maintenance;
 
         loop {
             tokio::select! {
@@ -2104,11 +2215,6 @@ impl NodeService {
                         break;
                     }
                     active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
-                    update_diagnostics(&diagnostics, |state| {
-                        state.peer_event_backlog = peer_events.len();
-                        state.validation_result_backlog = validated.len();
-                    })
-                    .await;
                     refresh_diagnostics(
                         &diagnostics,
                         &peers,
@@ -2123,7 +2229,14 @@ impl NodeService {
                     )
                     .await;
                 }
-                _ = poll.tick() => {
+                event = next_native_supervisor_event(
+                    &mut next_supervisor_lane,
+                    &mut poll,
+                    &mut connect_results_rx,
+                    &mut peer_events,
+                    &mut validated,
+                ) => match event {
+                NativeSupervisorEvent::Maintenance => {
                     if rpc_task.is_finished() {
                         let message = "Native sync RPC task terminated unexpectedly".to_owned();
                         record_error(&diagnostics, message.clone()).await;
@@ -2260,8 +2373,13 @@ impl NodeService {
                         checkpoint_sequence,
                     )
                     .await;
+                    // Maintenance includes stable RocksDB/header scans. If it
+                    // exceeded the period, an already-expired next tick would
+                    // otherwise remain permanently ready in the biased outer
+                    // supervisor select.
+                    reset_native_supervisor_poll(&mut poll, native_sync_config.poll_interval);
                 }
-                result = connect_results_rx.recv() => {
+                NativeSupervisorEvent::Connection(result) => {
                     let Some(result) = result else {
                         let message = "outbound connection result channel closed".to_owned();
                         record_error(&diagnostics, message.clone()).await;
@@ -2285,7 +2403,7 @@ impl NodeService {
                         );
                     }
                 }
-                event = peer_events.recv() => {
+                NativeSupervisorEvent::Peer(event) => {
                     let Some(event) = event else {
                         let message = "peer event channel closed".to_owned();
                         record_error(&diagnostics, message.clone()).await;
@@ -2345,7 +2463,7 @@ impl NodeService {
                     )
                     .await;
                 }
-                result = validated.recv() => {
+                NativeSupervisorEvent::Validation(result) => {
                     let Some(result) = result else {
                         let message = "validation result channel closed".to_owned();
                         record_error(&diagnostics, message.clone()).await;
@@ -2374,7 +2492,12 @@ impl NodeService {
                         &mut orphan_pool,
                     )
                     .await;
-                    if let Err(error) = &validation_result {
+                    if let Err(error) = validation_result {
+                        if unreconciled_validation_batch(&error) {
+                            record_error(&diagnostics, format!("{error:#}")).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
                         record_warning(format!("{error:#}"));
                     }
                     refresh_diagnostics(
@@ -2391,7 +2514,14 @@ impl NodeService {
                     )
                     .await;
                 }
+                },
             }
+            refresh_supervisor_backlog_diagnostics(
+                &diagnostics,
+                peer_events.len(),
+                validated.len(),
+            )
+            .await;
             let storage_operational = node.ensure_storage_operational();
             if let Err(error) = storage_operational {
                 let error =
@@ -3568,7 +3698,12 @@ impl NodeReadHandle {
             return Ok(0);
         }
         let hint = scheduler.stored_tip().cloned();
-        let body_window = Height::try_from(config.native_sync.orphan_blocks)
+        // Never scan farther than the bounded validation pipeline can admit.
+        // The orphan horizon remains the durable out-of-order storage bound,
+        // while this smaller window prevents every supervisor tick from
+        // rereading a production-scale horizon on low-core hosts.
+        let candidate_scan_window = native_body_candidate_scan_window(&config.native_sync);
+        let body_window = Height::try_from(candidate_scan_window)
             .context("orphan block horizon exceeds the canonical height range")?;
         if body_window == 0 {
             anyhow::bail!("orphan block horizon is zero");
@@ -5375,15 +5510,12 @@ async fn accept_peer_block(
     let request = scheduler
         .receive_block(peer, hash, StdInstant::now())
         .map_err(|error| anyhow::anyhow!("peer block was not eligible: {error}"))?;
-    if let Err(error) = validation
-        .submit(ValidationRequest {
-            peer,
-            height: record.height,
-            attempt: request.attempt,
-            block,
-        })
-        .await
-    {
+    if let Err(error) = validation.try_submit(ValidationRequest {
+        peer,
+        height: record.height,
+        attempt: request.attempt,
+        block,
+    }) {
         scheduler
             .requeue_tracked_block(hash, record.height)
             .context("failed to preserve body work after validation queue rejection")?;
@@ -5428,62 +5560,88 @@ async fn submit_released_orphans(
     scheduler: &mut SyncScheduler,
     orphans: &mut BoundedOrphanPool,
 ) -> Result<()> {
+    let mut first_error = None;
+    let mut terminal_recovery_failure = None;
     for block in orphans.take_children(parent) {
         let hash = block.hash();
-        let record = match node.native_sync_header_record(&hash)? {
-            Some(record) => record,
-            None => {
-                let header = block.header.clone();
-                writer
-                    .execute(
-                        None,
-                        "import released native-sync orphan header",
-                        move |node| node.native_sync_import_headers(vec![header]),
-                    )
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("released orphan header import returned no record")
-                    })?
+        let record = match async {
+            match node.native_sync_header_record(&hash)? {
+                Some(record) => Ok(record),
+                None => {
+                    let header = block.header.clone();
+                    writer
+                        .execute(
+                            None,
+                            "import released native-sync orphan header",
+                            move |node| node.native_sync_import_headers(vec![header]),
+                        )
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("released orphan header import returned no record")
+                        })
+                }
+            }
+        }
+        .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                let handling_error = error.context("failed to prepare released orphan validation");
+                if let Err(reconciliation_error) =
+                    restore_released_orphan(block, scheduler, orphans)
+                {
+                    terminal_recovery_failure.get_or_insert((handling_error, reconciliation_error));
+                } else {
+                    first_error.get_or_insert(handling_error);
+                }
+                continue;
             }
         };
         scheduler.begin_local_validation(hash);
         let retry = block.clone();
-        if let Err(error) = validation
-            .submit(ValidationRequest {
-                peer: LOCAL_ORPHAN_PEER,
-                height: record.height,
-                attempt: 0,
-                block,
-            })
-            .await
-        {
-            let outcome = match orphans.insert_with_evictions(retry) {
-                Ok(outcome) => outcome,
-                Err(insert_error) => {
-                    scheduler
-                        .requeue_tracked_block(hash, record.height)
-                        .context("failed to requeue released orphan after retention failure")?;
-                    anyhow::bail!(
-                        "validation queue rejected block ({error}) and orphan retention failed: {insert_error}"
-                    );
-                }
-            };
-            for evicted in outcome.evicted {
-                let evicted_hash = evicted.hash();
-                if let Some(evicted_record) = node.native_sync_header_record(&evicted_hash)? {
-                    if !node.native_sync_has_block(&evicted_hash)? {
-                        scheduler
-                            .requeue_tracked_block(evicted_hash, evicted_record.height)
-                            .context("failed to requeue orphan evicted during queue recovery")?;
-                    }
-                }
+        if let Err(error) = validation.try_submit(ValidationRequest {
+            peer: LOCAL_ORPHAN_PEER,
+            height: record.height,
+            attempt: 0,
+            block,
+        }) {
+            let handling_error = anyhow::anyhow!("failed to submit released orphan: {error}");
+            if let Err(reconciliation_error) = restore_released_orphan(retry, scheduler, orphans) {
+                terminal_recovery_failure.get_or_insert((handling_error, reconciliation_error));
+            } else {
+                first_error.get_or_insert(handling_error);
             }
-            scheduler.complete_orphan_validation();
-            return Err(anyhow::anyhow!("failed to submit released orphan: {error}"));
         }
     }
+    match (terminal_recovery_failure, first_error) {
+        (Some((handling_error, reconciliation_error)), _) => {
+            Err(anyhow::Error::new(UnreconciledValidationBatch {
+                handling_error,
+                reconciliation_error,
+            }))
+        }
+        (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
+    }
+}
+
+fn restore_released_orphan(
+    block: Block,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut BoundedOrphanPool,
+) -> Result<()> {
+    let outcome = orphans
+        .insert_with_evictions(block)
+        .context("failed to restore released orphan ownership")?;
+    if !outcome.evicted.is_empty() {
+        anyhow::bail!(
+            "restoring released orphan unexpectedly evicted {} owned blocks",
+            outcome.evicted.len()
+        );
+    }
+    scheduler.complete_orphan_validation();
     Ok(())
 }
 
@@ -5495,6 +5653,30 @@ struct ValidationResultContext<'a> {
     diagnostics: &'a Arc<RwLock<NativeSyncDiagnostics>>,
 }
 
+#[derive(Debug)]
+struct UnreconciledValidationBatch {
+    handling_error: anyhow::Error,
+    reconciliation_error: anyhow::Error,
+}
+
+impl fmt::Display for UnreconciledValidationBatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "validated block batch lost scheduler ownership: {}; reconciliation failed: {}",
+            self.handling_error, self.reconciliation_error
+        )
+    }
+}
+
+impl Error for UnreconciledValidationBatch {}
+
+fn unreconciled_validation_batch(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<UnreconciledValidationBatch>())
+}
+
 async fn handle_validation_results(
     results: Vec<OrderedValidationResult>,
     context: &ValidationResultContext<'_>,
@@ -5502,14 +5684,15 @@ async fn handle_validation_results(
     orphans: &mut BoundedOrphanPool,
 ) -> Result<()> {
     let mut validated = Vec::new();
-    let mut first_failure = None;
+    let mut first_warning = None;
+    let mut terminal_failure = None;
 
     for result in results {
         match result {
             Ok(block) => validated.push(block),
             Err(failure) => {
                 if !validated.is_empty() {
-                    handle_validated_blocks(
+                    if let Err(error) = handle_validated_blocks(
                         std::mem::take(&mut validated),
                         context.node,
                         context.writer,
@@ -5518,7 +5701,14 @@ async fn handle_validation_results(
                         orphans,
                         context.diagnostics,
                     )
-                    .await?;
+                    .await
+                    {
+                        if unreconciled_validation_batch(&error) {
+                            terminal_failure.get_or_insert(error);
+                        } else {
+                            first_warning.get_or_insert(error);
+                        }
+                    }
                 }
                 if let Err(error) = handle_validation_failure(
                     failure,
@@ -5530,14 +5720,14 @@ async fn handle_validation_results(
                 )
                 .await
                 {
-                    first_failure.get_or_insert(error);
+                    first_warning.get_or_insert(error);
                 }
             }
         }
     }
 
     if !validated.is_empty() {
-        handle_validated_blocks(
+        if let Err(error) = handle_validated_blocks(
             validated,
             context.node,
             context.writer,
@@ -5546,16 +5736,82 @@ async fn handle_validation_results(
             orphans,
             context.diagnostics,
         )
-        .await?;
+        .await
+        {
+            if unreconciled_validation_batch(&error) {
+                terminal_failure.get_or_insert(error);
+            } else {
+                first_warning.get_or_insert(error);
+            }
+        }
     }
 
-    match first_failure {
-        Some(error) => Err(error),
-        None => Ok(()),
+    match (terminal_failure, first_warning) {
+        (Some(error), _) | (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
     }
 }
 
 async fn handle_validated_blocks(
+    validated: Vec<ValidatedBlock>,
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
+    validation: &ValidationSubmitter,
+    scheduler: &mut SyncScheduler,
+    orphans: &mut BoundedOrphanPool,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+) -> Result<()> {
+    let reservations = validated
+        .iter()
+        .map(|validated| (validated.block.hash(), validated.height))
+        .collect::<Vec<_>>();
+    let result = handle_validated_blocks_inner(
+        validated,
+        node,
+        writer,
+        validation,
+        scheduler,
+        orphans,
+        diagnostics,
+    )
+    .await;
+    let Err(handling_error) = result else {
+        return Ok(());
+    };
+
+    if let Err(reconciliation_error) =
+        reconcile_validated_reservations(&reservations, scheduler, orphans)
+    {
+        return Err(anyhow::Error::new(UnreconciledValidationBatch {
+            handling_error,
+            reconciliation_error,
+        }));
+    }
+    Err(handling_error.context("validated block reservations were reconciled after batch failure"))
+}
+
+fn reconcile_validated_reservations(
+    reservations: &[(BlockHash, Height)],
+    scheduler: &mut SyncScheduler,
+    orphans: &BoundedOrphanPool,
+) -> Result<()> {
+    for (hash, height) in reservations {
+        if !scheduler.is_tracked_block(hash) || orphans.contains(hash) {
+            continue;
+        }
+        // Do not perform another stable storage read here: the batch commonly
+        // failed because a canonical writer generation was active, so that
+        // read could immediately fail for the same reason. If the body became
+        // durable before the error, the duplicate response's existing-body
+        // fast path completes this reservation without storing it again.
+        scheduler
+            .requeue_tracked_block(*hash, *height)
+            .context("failed to return validated body reservation to the pending queue")?;
+    }
+    Ok(())
+}
+
+async fn handle_validated_blocks_inner(
     validated: Vec<ValidatedBlock>,
     node: &NodeReadHandle,
     writer: &CanonicalStateWriter,
@@ -6670,6 +6926,18 @@ async fn refresh_diagnostics(
     state.pending_compact_blocks = pending_compact_blocks.len();
 }
 
+async fn refresh_supervisor_backlog_diagnostics(
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+    peer_event_backlog: usize,
+    validation_result_backlog: usize,
+) {
+    update_diagnostics(diagnostics, |state| {
+        state.peer_event_backlog = peer_event_backlog;
+        state.validation_result_backlog = validation_result_backlog;
+    })
+    .await;
+}
+
 async fn flush_address_book(
     store: &StoreHandle,
     addresses: &mut BoundedAddressBook,
@@ -6957,6 +7225,213 @@ mod tests {
         let extension: Box<dyn NativeRuntimeExtension> = Box::new(RuntimeExtensionBoundaryProbe);
         drop(extension);
         let _entrypoint = NodeService::run_until_shutdown_with_extension;
+    }
+
+    #[tokio::test]
+    async fn native_supervisor_rotates_permanently_ready_lanes() {
+        let (connect_tx, mut connect_rx) = mpsc::channel(2);
+        let (peer_tx, mut peer_rx) = mpsc::channel(2);
+        let (validation_tx, mut validation_rx) = mpsc::channel(2);
+        let address: SocketAddr = "127.0.0.1:14038".parse().expect("address");
+        for sequence in 0..2 {
+            connect_tx
+                .send(ConnectAttemptResult {
+                    address,
+                    result: Err("fixture".to_owned()),
+                })
+                .await
+                .expect("connection result");
+            peer_tx
+                .send(PeerEvent::InboundRejected {
+                    address,
+                    reason: "fixture".to_owned(),
+                })
+                .await
+                .expect("peer event");
+            validation_tx
+                .send(Ok(ValidatedBlock {
+                    sequence,
+                    peer: PeerId(1),
+                    height: sequence as Height,
+                    block: Block {
+                        header: Header::default(),
+                        transactions: Vec::new(),
+                    },
+                }))
+                .await
+                .expect("validation result");
+        }
+
+        let mut poll = tokio::time::interval(Duration::from_secs(60));
+        let mut next_lane = NativeSupervisorLane::Maintenance;
+        let expected = [
+            NativeSupervisorLane::Maintenance,
+            NativeSupervisorLane::Connection,
+            NativeSupervisorLane::Peer,
+            NativeSupervisorLane::Validation,
+            NativeSupervisorLane::Maintenance,
+            NativeSupervisorLane::Connection,
+            NativeSupervisorLane::Peer,
+            NativeSupervisorLane::Validation,
+        ];
+        for expected_lane in expected {
+            poll.reset_at(Instant::now() - Duration::from_secs(1));
+            let event = next_native_supervisor_event(
+                &mut next_lane,
+                &mut poll,
+                &mut connect_rx,
+                &mut peer_rx,
+                &mut validation_rx,
+            )
+            .await;
+            assert_eq!(event.lane(), expected_lane);
+        }
+    }
+
+    #[tokio::test]
+    async fn overdue_supervisor_poll_is_reset_after_maintenance() {
+        let mut poll = tokio::time::interval(Duration::from_secs(60));
+        let overdue = Instant::now() - Duration::from_secs(1);
+        poll.reset_at(overdue);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(poll.poll_tick(&mut context).is_ready());
+
+        poll.reset_at(overdue);
+        reset_native_supervisor_poll(&mut poll, Duration::from_secs(60));
+        assert!(poll.poll_tick(&mut context).is_pending());
+    }
+
+    #[test]
+    fn failed_validated_batch_restores_every_unowned_reservation() {
+        let now = StdInstant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        let first = BlockHash::new([1; 32]);
+        let second = BlockHash::new([2; 32]);
+        let orphan = validator_coinbase_block(3, 1);
+        let orphan_hash = orphan.hash();
+        for (hash, height) in [(first, 1), (second, 2), (orphan_hash, 3)] {
+            scheduler.queue_block(hash, height).expect("body work");
+            scheduler.begin_local_validation(hash);
+        }
+        let mut orphans = BoundedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 2,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        orphans.insert(orphan).expect("retained orphan");
+
+        reconcile_validated_reservations(
+            &[(first, 1), (second, 2), (orphan_hash, 3)],
+            &mut scheduler,
+            &orphans,
+        )
+        .expect("reconcile consumed validation results");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 2);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.tracked_blocks, 3);
+        assert!(orphans.contains(&orphan_hash));
+    }
+
+    #[tokio::test]
+    async fn busy_validated_batch_is_reconciled_to_pending_work() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            native_sync: NativeSyncConfig {
+                enabled: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..NativeSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .native_sync_ensure_genesis_header()
+            .expect("genesis");
+        let block = linked_validator_block(1, &genesis.header);
+        let hash = block.hash();
+        service
+            .native_sync_import_headers(vec![block.header.clone()])
+            .expect("canonical header");
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let (validation, _validation_results) =
+            spawn_validation_pipeline(Arc::new(HnsBodyValidator::new(Network::Regtest)), 1, 2)
+                .expect("validation pipeline");
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        scheduler.queue_block(hash, 1).expect("body reservation");
+        scheduler.begin_local_validation(hash);
+        let mut orphans = BoundedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 2,
+            maximum_bytes: 1_000_000,
+        })
+        .expect("orphan pool");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
+
+        let previous = node
+            .state
+            .publication_sequence
+            .fetch_add(1, Ordering::AcqRel);
+        assert_eq!(previous & 1, 0, "fixture starts from a stable generation");
+        let result = handle_validated_blocks(
+            vec![ValidatedBlock {
+                sequence: 0,
+                peer: PeerId(1),
+                height: 1,
+                block,
+            }],
+            &node,
+            &writer,
+            &validation,
+            &mut scheduler,
+            &mut orphans,
+            &diagnostics,
+        )
+        .await;
+        node.state
+            .publication_sequence
+            .store(previous, Ordering::Release);
+
+        let error = result.expect_err("overlapping stable read is reconciled");
+        assert!(!unreconciled_validation_batch(&error), "{error:#}");
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.tracked_blocks, 1);
+        assert_eq!(snapshot.validated_blocks, 0);
+        assert!(!node.native_sync_has_block(&hash).expect("body lookup"));
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
+    #[test]
+    fn canonical_body_scan_is_capped_by_validation_capacity() {
+        let mut config = NativeSyncConfig {
+            validation_queue: 7,
+            validation_workers: 3,
+            maximum_outbound: 2,
+            orphan_blocks: 1_024,
+            ..NativeSyncConfig::default()
+        };
+        assert_eq!(native_body_candidate_scan_window(&config), 64);
+        config.validation_queue = 2_048;
+        assert_eq!(native_body_candidate_scan_window(&config), 256);
+    }
+
+    #[tokio::test]
+    async fn supervisor_backlogs_refresh_on_every_observation() {
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics {
+            peer_event_backlog: 99,
+            validation_result_backlog: 99,
+            ..NativeSyncDiagnostics::default()
+        }));
+        refresh_supervisor_backlog_diagnostics(&diagnostics, 3, 7).await;
+        assert_eq!(diagnostics.read().await.peer_event_backlog, 3);
+        assert_eq!(diagnostics.read().await.validation_result_backlog, 7);
+        refresh_supervisor_backlog_diagnostics(&diagnostics, 0, 2).await;
+        assert_eq!(diagnostics.read().await.peer_event_backlog, 0);
+        assert_eq!(diagnostics.read().await.validation_result_backlog, 2);
     }
 
     #[test]
