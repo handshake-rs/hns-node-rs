@@ -41,13 +41,22 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release tag to resume
+        required: false
+        type: string
+      release_run_id:
+        description: Prior release run containing platform digest artifacts
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: container-${{ github.workflow }}-${{ github.event.release.tag_name || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'release' }}
+  group: container-${{ github.workflow }}-${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' && inputs.release_tag == '' }}
 
 env:
   REGISTRY_IMAGE: ghcr.io/handshake-rs/hns-node-rs
@@ -55,7 +64,7 @@ env:
 jobs:
   verify:
     name: Verify ${{ matrix.platform }} image
-    if: github.event_name != 'release'
+    if: github.event_name != 'release' && inputs.release_tag == '' && inputs.release_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -107,7 +116,7 @@ jobs:
 
   release-preflight:
     name: Release preflight
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.release_tag != '' || inputs.release_run_id != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -116,6 +125,7 @@ jobs:
       contents: read
     outputs:
       commit: ${{ steps.validate.outputs.commit }}
+      prerelease: ${{ steps.validate.outputs.prerelease }}
       version: ${{ steps.validate.outputs.version }}
       release-tag: ${{ steps.validate.outputs.release-tag }}
       binary-asset-sha256: ${{ steps.validate.outputs.binary-asset-sha256 }}
@@ -130,15 +140,17 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag }}
 
       - name: Validate source, checks, and release assets
         id: validate
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_EVENT_SHA: ${{ github.sha }}
-          RELEASE_ID: ${{ github.event.release.id }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_EVENT_SHA: ${{ github.event_name == 'release' && github.sha || '' }}
+          RELEASE_ID: ${{ github.event.release.id || '' }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id || '' }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          RELEASE_TRIGGER: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
@@ -164,12 +176,8 @@ jobs:
 
           tag_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
           head_commit=$(git rev-parse --verify HEAD)
-          if [[ ! "$tag_commit" =~ ^[0-9a-f]{40}$ || ! "$RELEASE_EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo 'release commit identifiers are not full lowercase SHA-1 values' >&2
-            exit 1
-          fi
-          if [[ "$head_commit" != "$tag_commit" || "$RELEASE_EVENT_SHA" != "$tag_commit" ]]; then
-            echo "checked-out HEAD, release-event SHA, and peeled tag commit do not match" >&2
+          if [[ ! "$tag_commit" =~ ^[0-9a-f]{40}$ || "$head_commit" != "$tag_commit" ]]; then
+            echo 'checked-out HEAD does not equal the full peeled tag commit' >&2
             exit 1
           fi
           if ! git show-ref --verify --quiet refs/remotes/origin/main; then
@@ -177,9 +185,106 @@ jobs:
             exit 1
           fi
           main_commit=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
-          if [[ "$tag_commit" != "$main_commit" ]]; then
-            echo "release commit $tag_commit is not the exact origin/main tip $main_commit" >&2
-            exit 1
+          case "$RELEASE_TRIGGER" in
+            release)
+              if [[ ! "$RELEASE_EVENT_SHA" =~ ^[0-9a-f]{40}$ || "$RELEASE_EVENT_SHA" != "$tag_commit" ]]; then
+                echo 'release-event SHA does not equal the peeled tag commit' >&2
+                exit 1
+              fi
+              if [[ "$tag_commit" != "$main_commit" ]]; then
+                echo "release commit $tag_commit is not the exact origin/main tip $main_commit" >&2
+                exit 1
+              fi
+              ;;
+            workflow_dispatch)
+              if ! git merge-base --is-ancestor "$tag_commit" "$main_commit"; then
+                echo "resumed release commit $tag_commit is not an ancestor of origin/main" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "unsupported release trigger: $RELEASE_TRIGGER" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ -n "$RELEASE_RUN_ID" ]]; then
+            if [[ "$RELEASE_TRIGGER" != workflow_dispatch || ! "$RELEASE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "invalid release recovery run ID: $RELEASE_RUN_ID" >&2
+              exit 1
+            fi
+
+            recovery_run_file="$RUNNER_TEMP/recovery-run.json"
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}" \
+              > "$recovery_run_file"
+            if ! jq -e \
+              --arg commit "$tag_commit" \
+              --arg run_id "$RELEASE_RUN_ID" \
+              --arg tag "$RELEASE_TAG" '
+                .id == ($run_id | tonumber)
+                and .event == "release"
+                and .head_sha == $commit
+                and .head_branch == $tag
+                and .path == ".github/workflows/container.yml"
+                and .status == "completed"
+                and (.conclusion == "failure" or .conclusion == "cancelled")
+              ' "$recovery_run_file" >/dev/null; then
+              echo "run $RELEASE_RUN_ID is not a failed exact-tag container release run" >&2
+              exit 1
+            fi
+
+            recovery_jobs_file="$RUNNER_TEMP/recovery-jobs.json"
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/jobs?per_page=100" \
+              > "$recovery_jobs_file"
+            if ! jq -e '.total_count == (.jobs | length)' "$recovery_jobs_file" >/dev/null; then
+              echo "more than 100 jobs exist in recovery run $RELEASE_RUN_ID" >&2
+              exit 1
+            fi
+            for recovery_job in 'Release linux/amd64 image' 'Release linux/arm64 image'; do
+              if ! jq -e --arg commit "$tag_commit" --arg name "$recovery_job" '
+                [.jobs[]
+                  | select(.name == $name
+                      and .head_sha == $commit
+                      and .status == "completed"
+                      and .conclusion == "success")]
+                | length == 1
+              ' "$recovery_jobs_file" >/dev/null; then
+                echo "recovery run $RELEASE_RUN_ID lacks one successful $recovery_job job" >&2
+                exit 1
+              fi
+            done
+
+            recovery_artifacts_file="$RUNNER_TEMP/recovery-artifacts.json"
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_RUN_ID}/artifacts?per_page=100" \
+              > "$recovery_artifacts_file"
+            if ! jq -e \
+              --arg commit "$tag_commit" \
+              --arg run_id "$RELEASE_RUN_ID" '
+                . as $root
+                | $root.total_count == ($root.artifacts | length)
+                and ([$root.artifacts[]
+                  | select(.name | startswith("hsrd-digest-"))] | length == 2)
+                and all("hsrd-digest-amd64", "hsrd-digest-arm64"; . as $name
+                  | [$root.artifacts[]
+                      | select(.name == $name
+                          and .expired == false
+                          and .size_in_bytes > 0
+                          and .workflow_run.id == ($run_id | tonumber)
+                          and .workflow_run.head_sha == $commit)]
+                    | length == 1)
+              ' "$recovery_artifacts_file" >/dev/null; then
+              echo "recovery run $RELEASE_RUN_ID lacks the exact live platform digest artifacts" >&2
+              exit 1
+            fi
           fi
 
           checks_file="$RUNNER_TEMP/release-check-runs.json"
@@ -212,6 +317,30 @@ jobs:
             fi
           done
 
+          release_file="$RUNNER_TEMP/release.json"
+          gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            > "$release_file"
+          release_id=$(jq -er '.id | select(type == "number")' "$release_file")
+          release_prerelease=$(jq -r '
+            if .prerelease == true then "true"
+            elif .prerelease == false then "false"
+            else error("release prerelease flag is not boolean")
+            end
+          ' "$release_file")
+          if ! jq -e --arg tag "$RELEASE_TAG" '
+            .tag_name == $tag and .draft == false and (.published_at | type == "string")
+          ' "$release_file" >/dev/null; then
+            echo "release $RELEASE_TAG is not the exact published release" >&2
+            exit 1
+          fi
+          if [[ -n "$RELEASE_ID" && "$RELEASE_ID" != "$release_id" ]]; then
+            echo "release event ID $RELEASE_ID does not equal API release ID $release_id" >&2
+            exit 1
+          fi
+
           binary_name="hsrd-v${workspace_version}-aarch64-unknown-linux-gnu.tar.gz"
           source_name="hsrd-v${workspace_version}-lgpl-relink-source.tar.gz"
           checksum_name='SHA256SUMS'
@@ -226,7 +355,7 @@ jobs:
           gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            "/repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
             > "$assets_file"
           if ! jq -e --argjson expected "${#required_assets[@]}" \
             'type == "array" and length == $expected' "$assets_file" >/dev/null; then
@@ -328,6 +457,7 @@ jobs:
 
           {
             echo "commit=$tag_commit"
+            echo "prerelease=$release_prerelease"
             echo "version=$workspace_version"
             echo "release-tag=$RELEASE_TAG"
             echo "binary-asset-sha256=${expected_sha256[$binary_name]}"
@@ -340,7 +470,7 @@ jobs:
 
   release-platforms:
     name: Release ${{ matrix.platform }} image
-    if: github.event_name == 'release'
+    if: (github.event_name == 'release' || inputs.release_tag != '') && inputs.release_run_id == ''
     needs: release-preflight
     permissions:
       contents: read
@@ -431,11 +561,15 @@ jobs:
 
   release-manifest:
     name: Publish multi-platform release manifest
-    if: github.event_name == 'release'
+    if: >-
+      !cancelled() &&
+      needs.release-preflight.result == 'success' &&
+      (needs.release-platforms.result == 'success' || inputs.release_run_id != '')
     needs: [release-preflight, release-platforms]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
+      actions: read
       attestations: write
       contents: read
       id-token: write
@@ -447,6 +581,8 @@ jobs:
           path: /tmp/hsrd-digests
           pattern: hsrd-digest-*
           merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.release_run_id || github.run_id }}
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -464,16 +600,16 @@ jobs:
         with:
           images: ${{ env.REGISTRY_IMAGE }}
           tags: |
-            type=raw,value=canary-v${{ needs.release-preflight.outputs.version }},enable=${{ github.event.release.prerelease }}
-            type=semver,pattern={{version}},value=${{ needs.release-preflight.outputs.release-tag }},enable=${{ !github.event.release.prerelease }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-preflight.outputs.release-tag }},enable=${{ !github.event.release.prerelease }}
-            type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
+            type=raw,value=canary-v${{ needs.release-preflight.outputs.version }},enable=${{ needs.release-preflight.outputs.prerelease == 'true' }}
+            type=semver,pattern={{version}},value=${{ needs.release-preflight.outputs.release-tag }},enable=${{ needs.release-preflight.outputs.prerelease == 'false' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-preflight.outputs.release-tag }},enable=${{ needs.release-preflight.outputs.prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ needs.release-preflight.outputs.prerelease == 'false' }}
 
       - name: Create commit-bound candidate manifest
         id: manifest
         env:
           RELEASE_COMMIT: ${{ needs.release-preflight.outputs.commit }}
-          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_PRERELEASE: ${{ needs.release-preflight.outputs.prerelease }}
           RELEASE_TAGS_JSON: ${{ steps.meta.outputs.json }}
           RELEASE_VERSION: ${{ needs.release-preflight.outputs.version }}
         working-directory: /tmp/hsrd-digests
@@ -556,18 +692,66 @@ jobs:
             echo 'candidate manifest is empty' >&2
             exit 1
           fi
-          expected_platform_digests=$(printf 'sha256:%s\n' "${digest_files[@]}" | sort)
+          expected_children_file="$RUNNER_TEMP/expected-platform-children"
+          : > "$expected_children_file"
+          declare -A seen_platforms=()
+          for digest_ref in "${digest_refs[@]}"; do
+            source_raw=$(docker buildx imagetools inspect "$digest_ref" --raw)
+            source_platform=$(jq -er '
+              .manifests as $manifests
+              | [$manifests[]
+                  | select(.platform.os == "linux"
+                      and (.platform.architecture == "amd64"
+                        or .platform.architecture == "arm64"))] as $images
+              | [$manifests[]
+                  | select(.platform.os == "unknown"
+                      and .platform.architecture == "unknown"
+                      and .annotations["vnd.docker.reference.type"]
+                        == "attestation-manifest")] as $attestations
+              | if type == "object"
+                  and ($manifests | type == "array")
+                  and ($images | length) == 1
+                  and ($attestations | length) >= 1
+                  and ($manifests | length) == (1 + ($attestations | length))
+                  and all($attestations[];
+                    .annotations["vnd.docker.reference.digest"] == $images[0].digest)
+                then $images[0].platform.architecture
+                else error("platform digest is not one image plus bound attestations")
+                end
+            ' <<< "$source_raw")
+            if [[ -n "${seen_platforms[$source_platform]+present}" ]]; then
+              echo "duplicate platform index: $source_platform" >&2
+              exit 1
+            fi
+            seen_platforms["$source_platform"]=1
+            jq -er '
+              .manifests[]
+              | .digest
+              | select(type == "string" and test("^sha256:[0-9a-f]{64}$"))
+            ' <<< "$source_raw" >> "$expected_children_file"
+          done
+          if [[ -z "${seen_platforms[amd64]+present}" || -z "${seen_platforms[arm64]+present}" ]]; then
+            echo 'platform digests do not cover exactly amd64 and arm64' >&2
+            exit 1
+          fi
+          expected_child_count=$(wc -l < "$expected_children_file")
+          expected_platform_digests=$(sort -u "$expected_children_file")
+          if [[ "$(printf '%s\n' "$expected_platform_digests" | wc -l)" != "$expected_child_count" ]]; then
+            echo 'platform indexes contain duplicate child digests' >&2
+            exit 1
+          fi
           actual_platform_digests=$(jq -er '
             if type == "object"
               and (.manifests | type == "array")
-              and (.manifests | length == 2)
-              and all(.manifests[]; .digest | type == "string")
+              and (.manifests | length >= 4)
+              and all(.manifests[];
+                .digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
             then [.manifests[].digest] | sort | .[]
-            else error("candidate is not an exact two-entry image index")
+            else error("candidate is not an attested multi-platform image index")
             end
           ' <<< "$candidate_raw")
           if [[ "$actual_platform_digests" != "$expected_platform_digests" ]]; then
-            echo 'commit candidate does not contain the exact platform digests' >&2
+            echo 'commit candidate does not contain the exact platform-index children' >&2
             exit 1
           fi
           manifest_digest="sha256:$(printf '%s' "$candidate_raw" | sha256sum | cut -d ' ' -f 1)"
