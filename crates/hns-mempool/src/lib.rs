@@ -2901,10 +2901,7 @@ impl MemoryMempool {
     }
 
     fn enforce_size_limit(&mut self, now: u64) {
-        loop {
-            let Some((admitted_at, txid)) = self.next_expiry_root else {
-                break;
-            };
+        while let Some((admitted_at, txid)) = self.next_expiry_root {
             #[cfg(test)]
             {
                 self.expiry_root_checks = self.expiry_root_checks.saturating_add(1);

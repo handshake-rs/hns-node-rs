@@ -30,10 +30,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential clang libclang-dev
 
       - name: Install declared Rust toolchain
-        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
 
       - name: Install pinned cargo-deny
-        run: cargo +1.89.0 install cargo-deny --version 0.19.9 --locked
+        run: cargo +1.97.1 install cargo-deny --version 0.19.9 --locked
 
       - name: Run the complete locked qualification gate
         run: ./scripts/check.sh
@@ -49,16 +49,16 @@ jobs:
           persist-credentials: false
 
       - name: Install declared Rust toolchain
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: rustup toolchain install 1.97.1 --profile minimal
 
       - name: Install pinned RustSec scanner
-        run: cargo +1.89.0 install cargo-audit --version 0.22.2 --locked
+        run: cargo +1.97.1 install cargo-audit --version 0.22.2 --locked
 
       - name: Audit locked node dependencies
-        run: cargo +1.89.0 audit
+        run: cargo +1.97.1 audit
 
       - name: Audit locked fuzz dependencies
-        run: cargo +1.89.0 audit --file fuzz/Cargo.lock
+        run: cargo +1.97.1 audit --file fuzz/Cargo.lock
 
   scheduled-assurance:
     name: Scheduled sustained fuzz and performance evidence
@@ -76,11 +76,11 @@ jobs:
 
       - name: Install declared Rust toolchain
         run: |
-          rustup toolchain install 1.89.0 --profile minimal
+          rustup toolchain install 1.97.1 --profile minimal
           rustup toolchain install nightly-2025-08-07 --profile minimal
 
       - name: Install pinned cargo-fuzz
-        run: cargo +1.89.0 install cargo-fuzz --version 0.13.2 --locked
+        run: cargo +1.97.1 install cargo-fuzz --version 0.13.2 --locked
 
       - name: Run scheduled software assurance
         run: |

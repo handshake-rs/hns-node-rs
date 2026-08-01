@@ -76,8 +76,8 @@ are unchanged from the source-prefix tree.
 
 ## Extraction qualification
 
-The standalone normalization was checked on 2026-07-25 with the repository's
-pinned Rust 1.89.0 toolchain:
+The standalone normalization was checked on 2026-08-01 with the repository's
+pinned Rust 1.97.1 toolchain:
 
 - root and fuzz-workspace locked metadata resolve independently;
 - both workspaces pass `cargo fmt --all -- --check`;

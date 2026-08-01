@@ -24,7 +24,7 @@ repository.
 ./scripts/check.sh
 ```
 
-With Rust 1.89.0 by default, this verifies locked root and fuzz metadata,
+With Rust 1.97.1 by default, this verifies locked root and fuzz metadata,
 the assurance-verifier positive/tamper/missing/threshold/tool regressions, dependency policy
 for both lockfiles, formatting, every fuzz target, strict all-feature Clippy,
 all-feature and no-default-feature tests, and the optimized all-target release
@@ -59,7 +59,7 @@ it does not exercise RocksDB, synchronous durability, or saturated
 block-index-cache occupancy.
 
 Scheduled and release runs require a fully clean worktree, including no
-non-ignored untracked files, Rust 1.89.0, and the pinned
+non-ignored untracked files, Rust 1.97.1, and the pinned
 `nightly-2025-08-07` fuzz toolchain. Both tiers explicitly select
 `persistent-rocksdb-sync`. The scenario must observe the RocksDB backend with
 `Sync` durability, connect exactly 4,096 unmeasured setup blocks, observe both

@@ -637,10 +637,7 @@ impl SortedEntryRootAccumulator {
         })?;
 
         let mut retained_branches = self.branches.len();
-        loop {
-            let Some(pending_index) = retained_branches.checked_sub(1) else {
-                break;
-            };
+        while let Some(pending_index) = retained_branches.checked_sub(1) {
             let pending = self.branches[pending_index];
             if usize::from(pending.branch_depth) <= branch_depth {
                 break;

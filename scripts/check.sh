@@ -4,7 +4,7 @@ set -eu
 repo_root=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 
-rust_toolchain=${RUST_TOOLCHAIN:-1.89.0}
+rust_toolchain=${RUST_TOOLCHAIN:-1.97.1}
 cargo_target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 
 cargo +"$rust_toolchain" metadata --locked --manifest-path Cargo.toml --format-version 1 >/dev/null

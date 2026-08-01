@@ -94,7 +94,7 @@ docker buildx build \
   .
 ```
 
-The build uses the locked Cargo dependency graph, the repository's Rust 1.89.0
+The build uses the locked Cargo dependency graph, the repository's Rust 1.97.1
 toolchain, architecture-scoped compiler caches, and digest-pinned Debian base
 indexes. The runtime image contains neither Cargo nor the native build
 toolchain.

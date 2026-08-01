@@ -998,8 +998,8 @@ write_initial_artifacts() {
   local fs_json temp config_path
 
   args_json=$(jq -cn '$ARGS.positional' --args -- "${NODE_ARGS[@]}")
-  rustc_version=$(rustc +1.89.0 -Vv 2>&1 || rustc -Vv 2>&1)
-  cargo_version=$(cargo +1.89.0 -V 2>&1 || cargo -V 2>&1)
+  rustc_version=$(rustc +1.97.1 -Vv 2>&1 || rustc -Vv 2>&1)
+  cargo_version=$(cargo +1.97.1 -V 2>&1 || cargo -V 2>&1)
   active_toolchain=$(rustup show active-toolchain 2>&1 || true)
   if [[ -f "$REPO_ROOT/Cargo.lock" && ! -L "$REPO_ROOT/Cargo.lock" ]]; then
     cargo_lock_sha=$(sha256sum -- "$REPO_ROOT/Cargo.lock" | awk '{print $1}')
@@ -1052,7 +1052,7 @@ write_initial_artifacts() {
       },
       build: {
         expected_release_command:
-          "cargo +1.89.0 build --locked --release -p hns-node --bin hsrd",
+          "cargo +1.97.1 build --locked --release -p hns-node --bin hsrd",
         rustc: $rustc,
         cargo: $cargo,
         active_toolchain: $active_toolchain,

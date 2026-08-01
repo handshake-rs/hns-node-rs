@@ -49,7 +49,7 @@ gates or the separately reviewed local-state custody prerequisite.
 The qualification toolchain is exactly `nightly-2025-08-07` with
 `cargo-fuzz 0.13.2`; another cargo-fuzz version fails before a target runs, and
 scheduled/release orchestration rejects a different nightly name or stable
-project compiler. The stable compiler is exactly Rust 1.89.0. Run all ten
+project compiler. The stable compiler is exactly Rust 1.97.1. Run all ten
 targets:
 
 ```bash
@@ -174,7 +174,7 @@ verify that the remote contains that commit and that its worktree is clean, and
 only then run any release-profile command. Build the exact candidate:
 
 ```bash
-cargo +1.89.0 build --locked --release -p hns-node --bin hsrd
+cargo +1.97.1 build --locked --release -p hns-node --bin hsrd
 ```
 
 Before deleting any Cargo build target to recover space, copy that exact output
@@ -391,7 +391,7 @@ each of these types:
 build manifest. All seven records must identify the same binary path/digest and
 the same build-manifest path/digest. A single artifact path cannot be listed
 twice under different types. The build command, stable toolchain, and reported
-Rust/Cargo versions are pinned to 1.89.0. The manifest is schema version 1:
+Rust/Cargo versions are pinned to 1.97.1. The manifest is schema version 1:
 
 ```json
 {
@@ -400,8 +400,8 @@ Rust/Cargo versions are pinned to 1.89.0. The manifest is schema version 1:
   "source_revision": "40-lowercase-hex-git-commit",
   "source_tree": "40-lowercase-hex-git-tree",
   "build": {
-    "command": "cargo +1.89.0 build --locked --release -p hns-node --bin hsrd",
-    "rust_toolchain": "1.89.0",
+    "command": "cargo +1.97.1 build --locked --release -p hns-node --bin hsrd",
+    "rust_toolchain": "1.97.1",
     "rustc_version": "complete rustc --version output",
     "cargo_version": "complete cargo --version output"
   },

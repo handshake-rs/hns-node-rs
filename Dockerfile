@@ -2,7 +2,11 @@
 
 # Keep the compiler and runtime distributions on the same glibc generation.
 # Both references pin multi-platform OCI indexes that contain amd64 and arm64.
-FROM rust:1.89.0-slim-bookworm@sha256:d7fc7de78bb8c1469933aeecbf801314d30d7d6e9f0578bba4cfa285bfa37fe6 AS builder
+FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS builder
+
+# Use the compiler already installed in the builder image. This override keeps
+# rustup from installing the repository's lint-only components in this stage.
+ENV RUSTUP_TOOLCHAIN=1.97.1
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \

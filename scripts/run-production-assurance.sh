@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)
-rust_toolchain=${RUST_TOOLCHAIN:-1.89.0}
+rust_toolchain=${RUST_TOOLCHAIN:-1.97.1}
 fuzz_rust_toolchain=${FUZZ_RUST_TOOLCHAIN:-nightly-2025-08-07}
 cargo_target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 tier=${1:-}
@@ -149,8 +149,8 @@ fi
 require_clean_worktree() {
   local checked_rust_toolchain=${1:-$rust_toolchain}
   local checked_fuzz_toolchain=${2:-$fuzz_rust_toolchain}
-  if [[ "$checked_rust_toolchain" != 1.89.0 ]]; then
-    echo "$tier assurance requires RUST_TOOLCHAIN=1.89.0" >&2
+  if [[ "$checked_rust_toolchain" != 1.97.1 ]]; then
+    echo "$tier assurance requires RUST_TOOLCHAIN=1.97.1" >&2
     return 1
   fi
   if [[ "$checked_fuzz_toolchain" != nightly-2025-08-07 ]]; then
@@ -510,34 +510,34 @@ for gate, filename in gates.items():
             exact(
                 build,
                 "command",
-                "cargo +1.89.0 build --locked --release -p hns-node --bin hsrd",
+                "cargo +1.97.1 build --locked --release -p hns-node --bin hsrd",
                 "hsrd build manifest build",
             )
             exact(
                 build,
                 "rust_toolchain",
-                "1.89.0",
+                "1.97.1",
                 "hsrd build manifest build",
             )
             rustc_version = required_string(
                 build, "rustc_version", "hsrd build manifest build"
             )
             if rustc_version is not None and not re.match(
-                r"^rustc 1[.]89[.]0(?: |$)", rustc_version
+                r"^rustc 1[.]97[.]1(?: |$)", rustc_version
             ):
                 errors.append(
                     f"{current}: hsrd build manifest build.rustc_version must "
-                    "identify rustc 1.89.0"
+                    "identify rustc 1.97.1"
                 )
             cargo_version = required_string(
                 build, "cargo_version", "hsrd build manifest build"
             )
             if cargo_version is not None and not re.match(
-                r"^cargo 1[.]89[.]0(?: |$)", cargo_version
+                r"^cargo 1[.]97[.]1(?: |$)", cargo_version
             ):
                 errors.append(
                     f"{current}: hsrd build manifest build.cargo_version must "
-                    "identify cargo 1.89.0"
+                    "identify cargo 1.97.1"
                 )
         manifest_binary = build_manifest.get("binary")
         if not isinstance(manifest_binary, dict):
@@ -1175,10 +1175,10 @@ hsrd_build_manifest.write_text(
             "source_revision": revision,
             "source_tree": tree,
             "build": {
-                "command": "cargo +1.89.0 build --locked --release -p hns-node --bin hsrd",
-                "rust_toolchain": "1.89.0",
-                "rustc_version": "rustc 1.89.0 (self-test)",
-                "cargo_version": "cargo 1.89.0 (self-test)",
+                "command": "cargo +1.97.1 build --locked --release -p hns-node --bin hsrd",
+                "rust_toolchain": "1.97.1",
+                "rustc_version": "rustc 1.97.1 (self-test)",
+                "cargo_version": "cargo 1.97.1 (self-test)",
             },
             "binary": {
                 "type": "hsrd_binary",
@@ -1665,12 +1665,12 @@ PY
   stable_guard_status=$?
   set -e
   if ((stable_guard_status == 0)) ||
-    [[ "$stable_guard" != *"RUST_TOOLCHAIN=1.89.0"* ]]; then
-    echo "scheduled/release guard did not enforce Rust 1.89.0" >&2
+    [[ "$stable_guard" != *"RUST_TOOLCHAIN=1.97.1"* ]]; then
+    echo "scheduled/release guard did not enforce Rust 1.97.1" >&2
     return 1
   fi
   set +e
-  nightly_guard=$(require_clean_worktree 1.89.0 wrong-nightly 2>&1)
+  nightly_guard=$(require_clean_worktree 1.97.1 wrong-nightly 2>&1)
   nightly_guard_status=$?
   set -e
   if ((nightly_guard_status == 0)) ||
