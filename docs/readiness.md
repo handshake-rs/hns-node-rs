@@ -342,8 +342,73 @@ The historical replay, stopped-state, retained rollback, and invalid-corpus
 readiness gates have reproducible retained evidence. Longer operational
 campaigns remain hardening work rather than hidden consensus-readiness flags.
 
-## Production hardening — future
+## Production assurance — executable gates, external evidence open
 
-Fuzz, audit, profile P50/P95/P99/max latency, tune storage/P2P isolation, run WAN
-and real-hardware trials, publish recovery procedures, and produce reproducible
-signed releases.
+Implemented harness and verification surfaces:
+
+- `scripts/check.sh` and the development `smoke` tier select the performance
+  binary's default in-memory scenario: ten unmeasured warm-up blocks followed
+  by 100 measured native regtest blocks with explicit P99 limits. The assurance
+  tier retains the schema-v2 report, but this fast regression does not exercise
+  RocksDB, synchronous durability, or saturated block-index-cache occupancy;
+- scheduled and release software qualification instead select
+  `persistent-rocksdb-sync`: RocksDB with `Sync` durability, exactly 4,096
+  unmeasured setup blocks, cache capacity and occupancy fixed at 4,096, and 100
+  measured blocks. Their schema-v2 evidence must pass the backend, durability,
+  workload, cache, availability, and latency checks, and the automatically
+  created marked data root must be closed, verified, and removed;
+- `scripts/run-sustained-fuzz.sh` runs every current fuzz target under a pinned
+  nightly/cargo-fuzz toolchain and retains source/tool/configuration identities,
+  logs, crash artifacts, and SHA-256s;
+- scheduled and manually dispatched CI run a bounded three-minute-per-target
+  sanitizer campaign and retain the software evidence;
+- `scripts/run-production-assurance.sh` separates development smoke, scheduled
+  software qualification, external evidence verification, and the conjunctive
+  release decision. Scheduled/release runs require a fully clean worktree and
+  the exact stable/nightly toolchains, and reject tracked or non-ignored
+  untracked changes during execution;
+- both performance scenarios are deterministic local regtest gates. Neither is
+  full-mainnet initial synchronization, production pruning, RocksDB fault
+  injection, sustained reorganization/partition, WAN/load, physical
+  gateway/ASIC, long-duration multi-peer, or production
+  mempool/template/publication differential evidence;
+- the external verifier fails closed on absent, failed, wrong-source, malformed,
+  unreviewed, under-threshold, missing-artifact, or digest-mismatched records
+  for production-scale pruning, RocksDB fault injection, sustained
+  reorganization/partition, WAN/load latency, physical gateway/ASIC,
+  long-duration multi-peer operation, and mempool/template/publication
+  differential testing. Production pruning additionally requires the actual
+  typed `hsrd` binary and a hashed build manifest bound to the release source
+  tree, and recomputes the binary digest before accepting the configured
+  identity.
+
+Not yet completed evidence:
+
+- no reviewed deployment custody record proves exclusive `hsrd`/trusted
+  maintenance write access to the data root and external page/segment paths,
+  with owners, modes, ACLs, mount controls, privileged writers, and maintenance
+  identities retained; automated checksums do not authenticate a hostile local
+  database writer;
+- no passing exact-release production-scale pruning and process-fault campaign
+  is retained, including the required full non-pruned mainnet baseline within
+  the 150,000,000,000-byte disk envelope, separately preserved
+  10,000,000,000-byte free-filesystem reserve, and measured pruned comparison;
+  90,000,000,000 bytes is only an optional informational comparison and is not
+  a qualification or release criterion;
+- no passing six-hour real reorganization/partition campaign is retained;
+- no passing WAN/load, four-hour physical gateway/ASIC, or 24-hour eight-peer
+  soak record is retained;
+- no passing production mempool/template/publication differential record is
+  retained;
+- a scheduled fuzz artifact demonstrates bounded software exercise, not
+  exhaustive hostile-input coverage or a substitute for the external gates.
+
+The assurance harness does not delete HSD blocks. Any later removal remains a
+separate operator-approved procedure contingent on independently verified hsrd
+chain completeness, tested wallet backup/restore, and an explicit
+rollback/retention plan.
+
+The schema, minimum acceptance criteria, collection requirements, and release
+command are in [`production-assurance.md`](production-assurance.md). Until the
+exact release has a complete passing evidence bundle, production hardening
+remains open and mainnet operation remains canary-only.

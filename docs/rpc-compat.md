@@ -7,8 +7,9 @@ runtime parent boundary; in-process mining continues to use native Rust types
 and bounded channels.
 
 The HTTP/JSON surface is retained only for operator diagnostics, health checks,
-and fixture comparison. It binds to loopback by default and reads immutable
-snapshots only.
+and fixture comparison. It binds to loopback by default. Each durable lookup
+uses one immutable store snapshot; the live runtime does not materialize the
+database into a process-wide RPC snapshot.
 
 ## Currently implemented
 
@@ -20,9 +21,41 @@ snapshots only.
   transition. The native-sync handler uses keyed store reads under the chain
   coordinator lock; periodic Core requalification does not scan the UTXO,
   name-state, header, or block collections.
-- Native-sync `getblockhash` also uses a direct canonical-height lookup rather
-  than materializing the compatibility snapshot, so replay/differential probes
-  remain constant-space as retained history grows.
+- Native-sync `getblockhash` and `getblockheader` select a complete canonical
+  header record from one locked generation of the shared in-memory header
+  index. The immutable store snapshot is acquired while that read lock is still
+  held. Header import, block connect/disconnect/reorganization, invalid-branch
+  publication, and payload pruning hold the matching write lock across the
+  durable commit and infallible bounded cache publication. An RPC therefore
+  observes either the old index/old store or the new index/new store, including
+  the normally dangerous interval after the database commit has returned but
+  before publication completes. Cloning the index handle into an RPC read
+  context is constant time, and each response clones only its selected record.
+- Every JSON-RPC request is classified through the fixed `RpcMethod` registry
+  before a node lock, store snapshot, or collection read is attempted. Unknown
+  methods, `sendrawtransaction`, and `getpeerinfo` reject immediately.
+- `getblockhash`, `getblockheader`, `getblock`, `getrawtransaction`,
+  `gettxout`, `getnameinfo`, `getnameresource`, and `getnamebyhash` use keyed
+  reads. Confirmed `getrawtransaction` lookup requires `--transaction-index`;
+  a mempool transaction remains a keyed in-memory read without that option.
+  The implementation never falls back to scanning retained blocks.
+- `getmempoolinfo` reads exact transaction/claim/airdrop counts, bytes, and
+  fees from incrementally maintained `O(1)` aggregates; it never clones the
+  transaction collection. `getrawmempool` captures those aggregates plus a
+  generation-stable persistent AVL root while briefly holding the node
+  coordinator. Capturing a generation is `O(1)`; admission and removal
+  path-copy `O(log M)` nodes and share every untouched subtree, even while
+  workers retain older generations. The worker releases the coordinator before
+  walking the index, formatting hashes, or constructing JSON. If the captured
+  transaction count exceeds `--rpc-max-collection-entries`, it returns an
+  explicit bounded-result error without cloning or walking the oversized list.
+  Dependency-root expiry is also indexed by `(admitted_at, txid)` with an exact
+  cached minimum: the steady under-capacity path performs one `O(1)` due check
+  and `O(1)` capacity check, while root insert/removal is `O(log M)`. Expiring
+  `E` roots visits only due packages and their bounded dependency changes; it
+  never scans or sorts all `M` entries merely to discover that none are due.
+- `getblockchaininfo` reports the active block height and the best validated
+  header height independently, including headers-only and header-ahead sync.
 - Truthful network-active and connection-count reporting.
 - Live peer and synchronization details on the native runtime's bounded REST
   endpoints. `getpeerinfo` fails explicitly until the JSON-RPC compatibility
@@ -30,15 +63,19 @@ snapshots only.
 - Capability-named REST diagnostics under `/api/v1/status`,
   `/api/v1/authority`, `/api/v1/parity`, and `/api/v1/mining-engine`; the live
   native runtime also exposes `/api/v1/peers`, `/api/v1/sync`, and
-  `/api/v1/native-sync`. `/api/v1/shadow-sync` is a read-only compatibility
-  alias.
+  `/api/v1/native-sync`. The former `/api/v1/shadow-sync` compatibility alias
+  was removed in v0.3.0 and is not routed.
 - API-v11 node status reports whether startup name-tree compaction is enabled,
   its height interval, and the last checkpoint's height, tip, retained roots,
   and before/retained/deleted node counts. It also reports whether undo
   pruning is enabled, the exact network `pruneAfterHeight` and `keepBlocks`
   values, and independent checksummed raw-block and undo
   boundary/block/count fields. Valid
-  non-active blocks and durably failed blocks have separate counts. It exposes
+  non-active blocks and durably failed blocks have separate transition-safe
+  O(1) counters rather than a per-refresh block-index scan. Startup computes
+  those exact counters with bounded pages while retaining only a fixed 4,096
+  block-index record cache; an evicted record remains available by keyed
+  durable lookup. It exposes
   whether the active-state connector is enabled and its bounded per-pass batch
   size without presenting that non-authoritative mode as mining readiness. The
   active tip's post-state authenticated root and the height it results from are
@@ -64,9 +101,15 @@ snapshots only.
   live tip.
 - Native status, authority, parity, and mining-engine diagnostics bind before
   startup replay and remain available while the state coordinator is occupied
-  by a connect slice or name-tree compaction. Each response reports
-  `diagnostic_snapshot_cached` and `diagnostic_snapshot_captured_at`; a cached
-  response is the last committed diagnostic snapshot, not mining authority.
+  by a connect slice or name-tree compaction. HTTP requests always use the last
+  sync-loop storage capture rather than recomputing potentially linear
+  diagnostic counts under the coordinator lock. Already-bounded live
+  peer-count, network-active, registry, HIP-76, and scheduler best-header
+  fields are overlaid per request from the diagnostics lock, so ordinary
+  network/status RPCs do not freeze at their startup values. Each response reports
+  `diagnostic_snapshot_cached: true` and
+  `diagnostic_snapshot_captured_at`; that cached response is not mining
+  authority.
   `getparentauthority` is deliberately excluded and always reads one coherent
   live state.
 - Native-sync diagnostics distinguish active-state, observe-only, and
@@ -81,6 +124,48 @@ snapshots only.
   unequal values with HTTP 401. Secrets are redacted from Debug output.
 - Unsupported mutations fail explicitly. No current control endpoint performs
   a mutation.
+
+## Dispatch complexity and resource envelope
+
+The durable lookup costs below exclude the bounded cost of decoding the one
+record that was selected. `B` is the requested block size, `T(B)` its
+transaction count, and `M` the returned mempool size.
+
+The resident header graph keeps the canonical chain proportional to best height
+and caps competing or stale headers at exactly 1,000,000. Both the current
+alternate count (`records.len() - canonical.len()`) and each admission check are
+`O(1)`; bounded batch/reorganization work is checked before durable or cache
+mutation, and strict startup reconstruction refuses an over-budget graph.
+
+| Method family | Durable access | Time | Additional space |
+| --- | --- | --- | --- |
+| chain tip/count/network metadata | fixed metadata keys or cached diagnostics | `O(1)` | `O(1)` |
+| `getblockhash`, `getblockheader` | one locked generation of the shared canonical-header index | `O(1)` lookup and selected-record clone | `O(1)` |
+| `getblock` | block-index and payload point reads | `O(log N + B)` | `O(B)` |
+| confirmed `getrawtransaction` | tx index, canonical index, and one block point read | `O(log N + T(B))` | `O(B)` |
+| `gettxout`, name methods | UTXO/name-state point read | `O(log N)` | `O(1)` plus result |
+| `getmempoolinfo` | exact cached aggregate | `O(1)` | `O(1)` |
+| `getrawmempool` | `O(1)` persistent-AVL generation capture, then bounded immutable ID walk after coordinator release | `O(M)` response (`O(log M)` concurrent pool mutation) | `O(M)` response; retained generations share untouched subtrees |
+| `getparentauthority` | fixed metadata/header keys under one coordinator epoch | `O(log N)` | `O(1)` |
+
+Both standalone and native-sync listeners enforce the same fail-closed limits:
+
+- `--rpc-max-request-bytes`, default 65,536 and hard maximum 1,048,576.
+  Axum rejects a larger decoded body with HTTP 413 before JSON parsing.
+- `--rpc-max-concurrent-requests`, default 32 and hard maximum 256. Excess
+  work receives HTTP 429 rather than waiting in an unbounded queue.
+- `--rpc-execution-timeout-ms`, default 5,000 and hard maximum 30,000. An
+  expired request receives HTTP 504.
+- `--rpc-max-collection-entries`, default 50,000 and hard maximum 250,000.
+
+Durable point reads and material collection/encoding work run on the bounded
+blocking pool rather than a Tokio executor thread. Point reads and collection
+walks have distinct owned capacity permits, each bounded by the configured
+request concurrency. The permit stays inside the worker through response
+construction, so an HTTP timeout cannot release point-read or collection
+capacity while its non-cancellable work is still finishing. Authorization
+middleware remains outside these resource layers, so an unauthenticated client
+is rejected before it can occupy RPC execution capacity.
 
 Core requires authentication to be configured and rejects an otherwise valid
 authority snapshot whose `rpc_authentication_required` field is false. A

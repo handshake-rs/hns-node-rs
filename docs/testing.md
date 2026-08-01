@@ -24,15 +24,79 @@ repository.
 ./scripts/check.sh
 ```
 
-With Rust 1.89.0 by default, this verifies locked root and fuzz metadata,
-dependency policy for both lockfiles, formatting, every fuzz target, strict
-all-feature Clippy, all-feature and no-default-feature tests, and the optimized
-all-target release build. It then starts two independent regtest `hsrd`
-processes and requires ordinary P2P readiness, matching canonical Denuo
-registry negotiation, the exact registry fingerprint, and bidirectional
-traffic. The normal test matrix also covers live HIP-76 requester/provider
-admission, requester opt-out, provider opt-in/backend readiness, revocation,
-timeouts, queue/socket completion, and qname-free diagnostics.
+With Rust 1.97.1 by default, this verifies locked root and fuzz metadata,
+the assurance-verifier positive/tamper/missing/threshold/tool regressions, dependency policy
+for both lockfiles, formatting, every fuzz target, strict all-feature Clippy,
+all-feature and no-default-feature tests, and the optimized all-target release
+build. It runs the fixed native mining-path performance gate, then starts two
+independent regtest `hsrd` processes and requires ordinary P2P readiness,
+matching canonical Denuo registry negotiation, the exact registry fingerprint,
+and bidirectional traffic. The normal test matrix also covers live HIP-76
+requester/provider admission, requester opt-out, provider opt-in/backend
+readiness, revocation, timeouts, queue/socket completion, and qname-free
+diagnostics.
+
+## Production assurance tiers
+
+Fast software smoke, persistent software qualification, and independently
+collected external production evidence are separate gates:
+
+```bash
+scripts/run-production-assurance.sh smoke \
+  --evidence-dir /new/path/smoke-evidence
+scripts/run-production-assurance.sh scheduled \
+  --evidence-dir /new/path/scheduled-evidence
+scripts/run-production-assurance.sh verify-external \
+  --evidence-dir /path/to/external-evidence
+scripts/run-production-assurance.sh release \
+  --evidence-dir /path/to/complete-release-evidence
+```
+
+The `smoke` tier, like `scripts/check.sh`, uses the performance binary's
+default in-memory scenario: ten unmeasured warm-up blocks followed by 100
+measured native regtest blocks. It is a fast correctness and latency signal;
+it does not exercise RocksDB, synchronous durability, or saturated
+block-index-cache occupancy.
+
+Scheduled and release runs require a fully clean worktree, including no
+non-ignored untracked files, Rust 1.97.1, and the pinned
+`nightly-2025-08-07` fuzz toolchain. Both tiers explicitly select
+`persistent-rocksdb-sync`. The scenario must observe the RocksDB backend with
+`Sync` durability, connect exactly 4,096 unmeasured setup blocks, observe both
+cache capacity and occupancy at exactly 4,096, and retain that exact occupancy
+after 100 measured blocks. Its schema-v2 report must pass every backend,
+durability, workload, cache, availability, and latency check. In particular,
+the 100-sample P99 values must remain strictly below 25,000 microseconds for
+tip-to-job work, 5,000 microseconds for candidate validation, and 50,000
+microseconds for local connection.
+
+The assurance script intentionally supplies no `--data-root` for that
+persistent scenario. The performance gate creates a unique marked root,
+closes the database, verifies ownership of the exact root, and removes only
+that automatically created root. Scheduled and release verification requires
+the schema-v2 `automatic-create-new-scoped-cleanup` policy and rejects evidence
+when the reported root still exists. The scheduled tier also runs every fuzz
+target with the pinned nightly toolchain and emits a source-bound,
+hash-addressed summary.
+
+External verification separately requires all seven production records:
+production-scale pruning, RocksDB fault injection, sustained
+reorganization/partition, WAN/load latency, physical gateway/ASIC validation,
+long-duration multi-peer operation, and production
+mempool/template/publication differential testing. These remain open gates
+until their real campaigns and reviewed artifacts exist; a local regtest
+scenario cannot satisfy them. Every external schema-v2 record binds the same
+actual typed `hsrd` binary and build manifest to the release source tree, plus
+a hashed exact campaign configuration and gate-specific typed input artifacts.
+
+Production release also requires reviewed exclusive custody of the data root
+and external page/segment files; unaccounted writers invalidate evidence. The
+full non-pruned mainnet baseline must stay within the 150,000,000,000-byte
+operational envelope while preserving a separate 10,000,000,000-byte
+filesystem reserve. A 90,000,000,000-byte observation is informational only.
+The exact schema and minimum acceptance criteria are in
+[`production-assurance.md`](production-assurance.md). A callable verifier or
+available harness is not completed production evidence.
 
 ## Fast static gate
 
@@ -620,7 +684,27 @@ A mismatch fails closed and cannot become a silent compatibility exception.
 Fuzz P2P, header, transaction, block, witness/script, covenant, resource,
 `NameState`, Urkel, snapshot, checkpoint, diagnostics, and native
 MeshMine-boundary parsers. Allocation and execution bounds are part of the
-assertions.
+assertions. The current ten parser/manifest boundaries run through:
+
+```bash
+scripts/run-sustained-fuzz.sh \
+  --duration-seconds 1800 \
+  --output-dir /new/path/fuzz-evidence
+```
+
+Each selected target must complete and remain running for at least its declared
+per-target duration. The summary includes targets not run after an earlier
+failure, exact commit/tree/tool/configuration identities, start/end
+full-worktree digests, start/completion corpus inventories, and SHA-256 hashes
+for logs and crash artifacts. The start and completion worktree digests fail
+the campaign when a tracked or non-ignored untracked difference is present at
+either boundary. A transient mutation restored before completion is not
+reconstructible from those boundary digests, so release evidence also requires
+reviewed, exclusive trusted source-tree custody throughout the campaign. Weekly
+CI uses three minutes per target to keep the scheduled gate bounded; release
+campaigns may use a longer reviewed duration. Neither duration is a proof of
+parser completeness.
+The release orchestrator rejects a per-target duration below 30 minutes.
 
 ## Performance evidence
 
@@ -633,9 +717,12 @@ The native runtime supplies two reproducible release-build entry points:
 
 ```bash
 python3 scripts/measure-hsrd-native-sync.py --self-test
-cargo run --locked --release -p hns-node --bin hsrd-performance-gate
+cargo run --locked --release -p hns-node \
+  --bin hsrd-performance-gate -- \
+  --json-output /new/path/deterministic-performance.json
 ```
 
 The live sampler consumes `/api/v1/native-sync` without an HSD runtime. Current
 bounded results and explicit exclusions are recorded in
-[`performance.md`](performance.md).
+[`performance.md`](performance.md). WAN/load, physical-device, and long-soak
+measurements remain separate external release records.

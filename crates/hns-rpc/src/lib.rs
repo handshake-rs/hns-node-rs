@@ -6,6 +6,10 @@ use hns_primitives::{hex_encode, Block, BlockHash, Coin, Height, NameState, Txid
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+fn hsrd_software_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: Option<String>,
@@ -194,7 +198,6 @@ pub struct RpcParityInfo {
     pub configured: bool,
     pub historical_replay_complete: bool,
     pub invalid_corpus_complete: bool,
-    pub live_shadow_active: bool,
     pub last_compared_height: Option<Height>,
     pub last_matching_block: Option<BlockHash>,
     pub divergence: Option<String>,
@@ -207,11 +210,16 @@ pub struct RpcMiningEngineInfo {
     pub transaction_relay_enabled: bool,
     pub mempool: MempoolInfo,
     pub maximum_template_variants: usize,
+    #[serde(default)]
+    pub template_build_workers: usize,
+    #[serde(default)]
+    pub template_build_queue_capacity: usize,
     pub cached_template_variants: usize,
     pub pending_publications: usize,
     pub maximum_pending_publications: usize,
     pub publication_retry_interval_ms: u64,
-    pub can_build_shadow_templates: bool,
+    #[serde(default)]
+    pub can_build_templates: bool,
     pub can_publish_solved_blocks: bool,
     pub blockers: Vec<String>,
 }
@@ -226,6 +234,12 @@ pub struct RpcNameTreeCompactionInfo {
     pub last_nodes_before: Option<usize>,
     pub last_nodes_retained: Option<usize>,
     pub last_nodes_deleted: Option<usize>,
+    #[serde(default)]
+    pub name_page_compaction_overdue: bool,
+    #[serde(default)]
+    pub payload_segment_compaction_overdue: bool,
+    #[serde(default)]
+    pub production_safety_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -507,6 +521,33 @@ impl BasicRpcService {
         &self.snapshot
     }
 
+    /// Build `getrawmempool` from an immutable transaction-id view without
+    /// requiring callers to clone complete mempool entries while holding
+    /// their coordinator lock.
+    pub fn handle_raw_mempool<I>(
+        &self,
+        request: JsonRpcRequest,
+        txids: I,
+    ) -> Result<JsonRpcResponse, RpcError>
+    where
+        I: IntoIterator<Item = Txid>,
+    {
+        let id = request.id;
+        if RpcMethod::from_hsd_name(&request.method) != Some(RpcMethod::GetRawMempool) {
+            return Ok(self.err(id, -32601, "method not found"));
+        }
+        if let Err(error) = rpc_params(&request.params) {
+            return Ok(self.err(id, error.code, error.message));
+        }
+        Ok(self.ok(
+            id,
+            json!(txids
+                .into_iter()
+                .map(|txid| txid.to_hex())
+                .collect::<Vec<_>>()),
+        ))
+    }
+
     fn ok(&self, id: Option<Value>, result: Value) -> JsonRpcResponse {
         JsonRpcResponse {
             jsonrpc: "2.0".to_owned(),
@@ -556,7 +597,9 @@ impl BasicRpcService {
             RpcMethod::GetBlockchainInfo => Ok(json!({
                 "chain": self.snapshot.network,
                 "blocks": tip.map(|tip| tip.height).unwrap_or(0),
-                "headers": tip.map(|tip| tip.height).unwrap_or(0),
+                "headers": self.snapshot.node_status.best_header_height
+                    .or_else(|| tip.map(|tip| tip.height))
+                    .unwrap_or(0),
                 "bestblockhash": tip.map(|tip| tip.hash.to_hex()),
                 "chainwork": tip.map(|tip| format!("{:x}", tip.chainwork)).unwrap_or_else(|| "0".to_owned()),
                 "initialblockdownload": true,
@@ -590,8 +633,8 @@ impl BasicRpcService {
                 "getpeerinfo requires the live peer diagnostics service",
             )),
             RpcMethod::GetNetworkInfo => Ok(json!({
-                "version": 0,
-                "subversion": "/hsrd:0.1.0/",
+                "version": hsrd_software_version(),
+                "subversion": concat!("/hsrd:", env!("CARGO_PKG_VERSION"), "/"),
                 "networkactive": self.snapshot.network_active,
                 "connections": self.snapshot.peer_count,
             })),
@@ -896,6 +939,71 @@ mod tests {
     }
 
     #[test]
+    fn raw_mempool_can_materialize_an_external_immutable_id_view() {
+        let service = BasicRpcService::default();
+        let first = Txid::new([1; 32]);
+        let second = Txid::new([2; 32]);
+        let response = service
+            .handle_raw_mempool(
+                JsonRpcRequest {
+                    jsonrpc: Some("2.0".to_owned()),
+                    method: "getrawmempool".to_owned(),
+                    params: json!([]),
+                    id: Some(json!("cow-view")),
+                },
+                [second, first],
+            )
+            .expect("raw mempool response");
+        assert_eq!(
+            response.result,
+            Some(json!([second.to_hex(), first.to_hex()]))
+        );
+        assert_eq!(response.id, Some(json!("cow-view")));
+    }
+
+    #[test]
+    fn blockchain_info_reports_header_frontier_ahead_of_active_blocks() {
+        let service = BasicRpcService::new(RpcSnapshot {
+            network: "regtest".to_owned(),
+            chain_tip: Some(ChainTip {
+                hash: BlockHash::new([1; 32]),
+                height: 7,
+                chainwork: 9u64.into(),
+            }),
+            node_status: RpcNodeStatus {
+                best_header_height: Some(19),
+                ..RpcNodeStatus::default()
+            },
+            ..RpcSnapshot::default()
+        });
+        let response = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getblockchaininfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!("headers-ahead")),
+            })
+            .expect("blockchain info")
+            .result
+            .expect("blockchain result");
+        assert_eq!(response["blocks"], 7);
+        assert_eq!(response["headers"], 19);
+
+        let empty = BasicRpcService::default()
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getblockchaininfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!("empty")),
+            })
+            .expect("empty blockchain info")
+            .result
+            .expect("empty blockchain result");
+        assert_eq!(empty["blocks"], 0);
+        assert_eq!(empty["headers"], 0);
+    }
+
+    #[test]
     fn network_rpc_reports_snapshot_state_and_rejects_missing_peer_details() {
         let service = BasicRpcService::new(RpcSnapshot {
             network_active: true,
@@ -915,6 +1023,15 @@ mod tests {
             .expect("network result");
         assert_eq!(network["networkactive"], true);
         assert_eq!(network["connections"], 4);
+        assert_eq!(
+            network["version"],
+            Value::String(env!("CARGO_PKG_VERSION").to_owned())
+        );
+        assert!(network["version"].is_string());
+        assert_eq!(
+            network["subversion"],
+            concat!("/hsrd:", env!("CARGO_PKG_VERSION"), "/")
+        );
 
         let peers = service
             .handle(JsonRpcRequest {
@@ -1177,15 +1294,35 @@ mod tests {
     }
 
     #[test]
-    fn basic_rpc_exposes_hsrd_authority_and_parity_diagnostics() {
+    fn bounded_mining_diagnostic_additions_default_when_absent() {
+        let mut wire = serde_json::to_value(RpcMiningEngineInfo::default())
+            .expect("serialize mining diagnostics");
+        let fields = wire.as_object_mut().expect("mining diagnostic object");
+        fields.remove("template_build_workers");
+        fields.remove("template_build_queue_capacity");
+        fields.remove("can_build_templates");
+
+        let decoded: RpcMiningEngineInfo =
+            serde_json::from_value(wire).expect("deserialize additive diagnostic schema");
+        assert_eq!(decoded, RpcMiningEngineInfo::default());
+    }
+
+    #[test]
+    fn basic_rpc_exposes_native_authority_and_bounded_mining_diagnostics() {
         let snapshot = RpcSnapshot {
+            mining_engine: RpcMiningEngineInfo {
+                template_build_workers: 4,
+                template_build_queue_capacity: 8,
+                can_build_templates: true,
+                ..RpcMiningEngineInfo::default()
+            },
             node_status: RpcNodeStatus {
                 api_version: 1,
                 release_stage: "pre-authority".to_owned(),
                 schema_version: 3,
                 network: "regtest".to_owned(),
                 authority: RpcAuthorityInfo {
-                    mode: "shadow".to_owned(),
+                    mode: "native".to_owned(),
                     blockers: vec!["script and witness authorization".to_owned()],
                     ..RpcAuthorityInfo::default()
                 },
@@ -1202,7 +1339,7 @@ mod tests {
 
         for (method, field, expected) in [
             ("gethsrdstatus", "release_stage", json!("pre-authority")),
-            ("getauthorityinfo", "mode", json!("shadow")),
+            ("getauthorityinfo", "mode", json!("native")),
             ("getparityinfo", "state", json!("not-configured")),
             ("getminingengineinfo", "enabled", json!(false)),
         ] {
@@ -1216,5 +1353,32 @@ mod tests {
                 .expect("diagnostic response");
             assert_eq!(response.result.expect("result")[field], expected);
         }
+
+        let mining = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getminingengineinfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!(2)),
+            })
+            .expect("mining diagnostic response")
+            .result
+            .expect("mining diagnostics");
+        assert_eq!(mining["template_build_workers"], 4);
+        assert_eq!(mining["template_build_queue_capacity"], 8);
+        assert_eq!(mining["can_build_templates"], true);
+        assert_eq!(mining.as_object().expect("mining object").len(), 14);
+
+        let parity = service
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getparityinfo".to_owned(),
+                params: Value::Null,
+                id: Some(json!(3)),
+            })
+            .expect("parity diagnostic response")
+            .result
+            .expect("parity diagnostics");
+        assert_eq!(parity.as_object().expect("parity object").len(), 9);
     }
 }

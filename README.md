@@ -15,7 +15,7 @@ wallet, desktop application, domain manager, DNS server, or explorer.
 
 ## Requirements
 
-The repository pins Rust 1.89.0 in `rust-toolchain.toml`. With
+The repository pins Rust 1.97.1 in `rust-toolchain.toml`. With
 [rustup](https://rustup.rs/) installed, Cargo selects it automatically.
 
 The default build includes RocksDB and requires a C/C++ toolchain and Clang. On
@@ -126,6 +126,9 @@ documented in [Storage rollout](docs/storage-rollout.md).
 - [Readiness status](docs/readiness.md)
 - [Detailed implementation status](docs/implementation-status.md)
 - [Testing and qualification](docs/testing.md)
+- [Production assurance and external evidence](docs/production-assurance.md)
+- [Storage schema and complexity](docs/storage-schema.md)
+- [Docker and GHCR](docs/docker.md)
 - [Native mainnet mining canary](docs/mainnet-canary.md)
 - [Extraction provenance](docs/extraction-provenance.md)
 

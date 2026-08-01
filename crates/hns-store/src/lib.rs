@@ -18,10 +18,13 @@ pub use name_page::{
 pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,
     plan_segment_page_reads, scan_segment_prefix, truncate_segment_to_committed_tail,
-    SegmentAppender, SegmentArchive, SegmentArchiveScrub, SegmentChannelScrub, SegmentError,
-    SegmentFileInspection, SegmentKind, SegmentLocator, SegmentManifest, SegmentPageRead,
-    SegmentRecord, SegmentRecordRef, SegmentScan, SegmentValueLocator, SEGMENT_MAX_HINTS,
-    SEGMENT_PAGE_BYTES, SEGMENT_TARGET_BYTES,
+    SegmentAppender, SegmentArchive, SegmentArchiveScrub, SegmentArchiveScrubLimits,
+    SegmentChannelScrub, SegmentError, SegmentFileInspection, SegmentKind, SegmentLocator,
+    SegmentManifest, SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan,
+    SegmentValueLocator, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES,
+    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS,
+    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, SEGMENT_MAX_HINTS, SEGMENT_PAGE_BYTES,
+    SEGMENT_TARGET_BYTES,
 };
 
 use std::{
@@ -33,6 +36,15 @@ use std::{
     rc::Rc,
     str::FromStr,
     sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
+
+#[cfg(all(test, feature = "rocksdb-backend"))]
+use std::sync::atomic::AtomicU8;
+#[cfg(feature = "rocksdb-backend")]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
 };
 
 use serde::{Deserialize, Serialize};
@@ -52,6 +64,56 @@ pub const BLOCK_SEGMENT_MANIFEST_KEY: &[u8] = b"block-segment-manifest/v1";
 pub const UNDO_SEGMENT_MANIFEST_KEY: &[u8] = b"undo-segment-manifest/v1";
 pub const SEGMENT_MIGRATION_MAX_BATCH_RECORDS: usize = 32;
 pub const SEGMENT_MIGRATION_MAX_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Hard upper bounds for one storage-native prefix page. They protect callers
+/// from accidentally turning a cursor API back into a full-column-family
+/// materialization.
+pub const PREFIX_SCAN_MAX_ENTRIES: usize = 4_096;
+/// One maximum-size legacy inline payload plus key/iterator framing. Callers
+/// should normally choose a much smaller operational page.
+pub const PREFIX_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024 + 4 * 1024;
+pub const SEGMENT_COMPACTION_DEFAULT_SCAN_RECORDS: usize = 1_024;
+/// A mixed archive may still contain one legitimate near-maximum inline undo;
+/// the page must be able to inspect and skip it before migration completes.
+pub const SEGMENT_COMPACTION_DEFAULT_SCAN_BYTES: usize = PREFIX_SCAN_MAX_BYTES;
+pub const SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_RECORDS: u64 = 1_000_000;
+pub const SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_FRAME_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_LOCATOR_BYTES: u64 = 128 * 1024 * 1024;
+pub const SEGMENT_COMPACTION_DEFAULT_MAX_PHYSICAL_OUTPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_PUBLICATION_BYTES: u64 = 256 * 1024 * 1024;
+pub const SEGMENT_COMPACTION_DEFAULT_FILESYSTEM_RESERVE_BYTES: u64 = 10_000_000_000;
+pub const SEGMENT_COMPACTION_DEFAULT_MAX_ELAPSED: Duration = Duration::from_secs(4 * 60 * 60);
+const SEGMENT_COMPACTION_BATCH_OPERATION_OVERHEAD_BYTES: u64 = 64;
+const SEGMENT_COMPACTION_ROCKS_TEMPORARY_MULTIPLIER: u64 = 2;
+const SNAPSHOT_EMPTY_PROBE_BYTES: usize = 4 * 1024;
+// A raw archived value is moved into an `ArchivePayload` before its framed
+// encoding is built. Charge the complete key/value representation once even
+// though the value allocation moves: its operation-framing allowance covers
+// the copied fixed key, ArchivePayload descriptor and exact-capacity Vec slot.
+const ARCHIVE_EXTRACTED_PAYLOAD_COPIES: u64 = 1;
+// Segment preparation retains the encoded userspace frame while writing the
+// byte-identical durable frame. The raw payload remains live until encoding
+// completes and is charged separately above.
+const ARCHIVE_FRAME_COPIES: u64 = 2;
+// Segment preparation first retains a locator descriptor in
+// `PreparedArchive.locators`, locator substitution then retains its larger
+// encoded value in `StoreHandleBatch`, and the backend finally copies the
+// complete key/value operation into its native atomic batch. Charging the
+// encoded key/value size for all three conservatively covers the smaller
+// descriptor and its Vec slot without ABI-dependent `size_of` accounting.
+const ARCHIVE_LOCATOR_PUBLICATION_COPIES: u64 = 3;
+// `PreparedArchive` retains both manifest structs. Each is then encoded at the
+// call site, copied into `StoreHandleBatch`, and finally copied into the
+// backend's native atomic batch. Charging the complete encoded key/value for
+// all four representations conservatively covers the smaller struct fields.
+const ARCHIVE_MANIFEST_PUBLICATION_COPIES: u64 = 4;
+// Empty-hint segment frames contain the format header, record key and checksum
+// around the payload. A format-regression test below binds this local checked
+// preflight constant to `encode_segment_record` without encoding real payloads
+// before their budget has been accepted.
+const ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES: u64 = 8 + 4 + 1 + 1 + 2 + 32 + 4 + 32;
+// Manifests are fixed-width. The same format-regression test binds this value
+// to `SegmentManifest::encode` without allocating during production preflight.
+const ARCHIVE_MANIFEST_ENCODED_BYTES: usize = 8 + 4 + 8 + 4 + 8 + 32;
 
 /// HSD's MSB-first spent-allocation field contains 216,199 airdrop positions
 /// followed by 1,358 faucet positions.
@@ -76,6 +138,38 @@ const ROCKS_BULK_BLOCK_BYTES: usize = 32 * 1024;
 
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
 pub type PrefixVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PrefixScanBudget {
+    pub max_entries: usize,
+    /// Maximum combined key/value bytes returned in one page.
+    pub max_bytes: usize,
+}
+
+impl PrefixScanBudget {
+    pub fn validate(self) -> Result<Self, StoreError> {
+        if !(1..=PREFIX_SCAN_MAX_ENTRIES).contains(&self.max_entries) {
+            return Err(StoreError::Schema(format!(
+                "prefix scan entry budget must be between 1 and {PREFIX_SCAN_MAX_ENTRIES}"
+            )));
+        }
+        if !(1..=PREFIX_SCAN_MAX_BYTES).contains(&self.max_bytes) {
+            return Err(StoreError::Schema(format!(
+                "prefix scan byte budget must be between 1 and {PREFIX_SCAN_MAX_BYTES}"
+            )));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PrefixScanPage {
+    pub entries: Vec<ScanEntry>,
+    pub returned_bytes: usize,
+    /// Exclusive continuation token. Pass this exact key as `start_after` to
+    /// resume the same immutable snapshot without duplicates.
+    pub continuation: Option<Vec<u8>>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum StoreBackend {
@@ -126,6 +220,250 @@ pub struct StoreConfig {
     pub path: PathBuf,
     pub backend: StoreBackend,
     pub durability: DurabilityPolicy,
+}
+
+/// Return bytes available to an unprivileged writer on the filesystem that
+/// contains `path`.
+///
+/// Capacity-sensitive maintenance must recheck this value immediately before
+/// creating output and before its authoritative database publication; a
+/// preflight observation is not a reservation.
+pub fn filesystem_available_bytes(path: &Path) -> Result<u64, StoreError> {
+    fs4::available_space(path).map_err(|error| {
+        StoreError::Io(format!(
+            "failed to query available filesystem bytes for {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+pub const FILESYSTEM_TREE_USAGE_DEFAULT_MAX_ENTRIES: u64 = 10_000_000;
+pub const FILESYSTEM_TREE_USAGE_DEFAULT_MAX_DEPTH: u32 = 64;
+pub const FILESYSTEM_TREE_USAGE_DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+pub const FILESYSTEM_TREE_USAGE_DEFAULT_MAX_ELAPSED: Duration = Duration::from_secs(30 * 60);
+
+/// Fail-closed envelope for measuring one production data root without
+/// following links or silently crossing a mounted filesystem.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemTreeUsageLimits {
+    pub max_entries: u64,
+    pub max_depth: u32,
+    pub max_apparent_bytes: u64,
+    pub max_allocated_bytes: u64,
+    pub deadline: Instant,
+}
+
+impl Default for FilesystemTreeUsageLimits {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            max_entries: FILESYSTEM_TREE_USAGE_DEFAULT_MAX_ENTRIES,
+            max_depth: FILESYSTEM_TREE_USAGE_DEFAULT_MAX_DEPTH,
+            max_apparent_bytes: FILESYSTEM_TREE_USAGE_DEFAULT_MAX_BYTES,
+            max_allocated_bytes: FILESYSTEM_TREE_USAGE_DEFAULT_MAX_BYTES,
+            deadline: now
+                .checked_add(FILESYSTEM_TREE_USAGE_DEFAULT_MAX_ELAPSED)
+                .unwrap_or(now),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct FilesystemTreeUsage {
+    /// Root plus every descendant file or directory inspected.
+    pub entries: u64,
+    pub files: u64,
+    pub directories: u64,
+    pub maximum_depth: u32,
+    /// Sum of metadata lengths. Directory metadata is deliberately included.
+    pub apparent_bytes: u64,
+    /// Unix `st_blocks * 512`; apparent bytes on platforms without a safe
+    /// standard-library allocated-block query.
+    pub allocated_bytes: u64,
+}
+
+/// Measure one directory tree with checked arithmetic, an absolute deadline,
+/// and no symlink, special-file, or cross-device traversal. For `E` entries
+/// and maximum depth `D`, time is `O(E)` and retained traversal memory is
+/// `O(D)`; directory contents are never collected into an aggregate vector.
+pub fn filesystem_tree_usage_bounded(
+    root: &Path,
+    limits: FilesystemTreeUsageLimits,
+) -> Result<FilesystemTreeUsage, StoreError> {
+    if limits.max_entries == 0 {
+        return Err(StoreError::Schema(
+            "filesystem tree usage entry limit must be nonzero".to_owned(),
+        ));
+    }
+    ensure_filesystem_tree_usage_deadline(limits.deadline)?;
+    let metadata = std::fs::symlink_metadata(root).map_err(|error| {
+        StoreError::Io(format!(
+            "failed to inspect filesystem usage root {}: {error}",
+            root.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(StoreError::Schema(format!(
+            "filesystem usage root {} is a symlink",
+            root.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(StoreError::Schema(format!(
+            "filesystem usage root {} is not a directory",
+            root.display()
+        )));
+    }
+    let root_device = filesystem_metadata_device(&metadata);
+    let mut usage = FilesystemTreeUsage::default();
+    accumulate_filesystem_tree_usage(root, 0, root_device, limits, &mut usage)?;
+    ensure_filesystem_tree_usage_deadline(limits.deadline)?;
+    Ok(usage)
+}
+
+fn ensure_filesystem_tree_usage_deadline(deadline: Instant) -> Result<(), StoreError> {
+    if Instant::now() >= deadline {
+        return Err(StoreError::DeadlineExceeded {
+            context: "filesystem tree usage",
+        });
+    }
+    Ok(())
+}
+
+fn add_filesystem_tree_usage_resource(
+    current: u64,
+    additional: u64,
+    limit: u64,
+    context: &'static str,
+) -> Result<u64, StoreError> {
+    let actual = current.saturating_add(additional);
+    if actual > limit {
+        return Err(StoreError::LimitExceeded {
+            context,
+            limit,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
+#[cfg(unix)]
+fn filesystem_metadata_device(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn filesystem_metadata_device(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn filesystem_metadata_allocated_bytes(metadata: &std::fs::Metadata) -> Result<u64, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata
+        .blocks()
+        .checked_mul(512)
+        .ok_or_else(|| StoreError::Schema("filesystem allocated byte count overflow".to_owned()))
+}
+
+#[cfg(not(unix))]
+fn filesystem_metadata_allocated_bytes(metadata: &std::fs::Metadata) -> Result<u64, StoreError> {
+    Ok(metadata.len())
+}
+
+fn accumulate_filesystem_tree_usage(
+    path: &Path,
+    depth: u32,
+    root_device: Option<u64>,
+    limits: FilesystemTreeUsageLimits,
+    usage: &mut FilesystemTreeUsage,
+) -> Result<(), StoreError> {
+    ensure_filesystem_tree_usage_deadline(limits.deadline)?;
+    if depth > limits.max_depth {
+        return Err(StoreError::LimitExceeded {
+            context: "filesystem tree usage depth",
+            limit: u64::from(limits.max_depth),
+            actual: u64::from(depth),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        StoreError::Io(format!(
+            "failed to inspect filesystem entry {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(StoreError::Schema(format!(
+            "refusing symlink in filesystem usage tree {}",
+            path.display()
+        )));
+    }
+    if let (Some(expected), Some(actual)) = (root_device, filesystem_metadata_device(&metadata)) {
+        if actual != expected {
+            return Err(StoreError::Schema(format!(
+                "filesystem usage tree crossed devices at {}",
+                path.display()
+            )));
+        }
+    }
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err(StoreError::Schema(format!(
+            "refusing special file in filesystem usage tree {}",
+            path.display()
+        )));
+    }
+
+    usage.entries = add_filesystem_tree_usage_resource(
+        usage.entries,
+        1,
+        limits.max_entries,
+        "filesystem tree usage entries",
+    )?;
+    usage.maximum_depth = usage.maximum_depth.max(depth);
+    usage.apparent_bytes = add_filesystem_tree_usage_resource(
+        usage.apparent_bytes,
+        metadata.len(),
+        limits.max_apparent_bytes,
+        "filesystem tree apparent bytes",
+    )?;
+    usage.allocated_bytes = add_filesystem_tree_usage_resource(
+        usage.allocated_bytes,
+        filesystem_metadata_allocated_bytes(&metadata)?,
+        limits.max_allocated_bytes,
+        "filesystem tree allocated bytes",
+    )?;
+    if metadata.is_file() {
+        usage.files = usage
+            .files
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Schema("filesystem file count overflow".to_owned()))?;
+        return Ok(());
+    }
+    usage.directories = usage
+        .directories
+        .checked_add(1)
+        .ok_or_else(|| StoreError::Schema("filesystem directory count overflow".to_owned()))?;
+    let entries = std::fs::read_dir(path).map_err(|error| {
+        StoreError::Io(format!(
+            "failed to read filesystem directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    for entry in entries {
+        ensure_filesystem_tree_usage_deadline(limits.deadline)?;
+        let entry = entry.map_err(|error| {
+            StoreError::Io(format!(
+                "failed to enumerate filesystem directory {}: {error}",
+                path.display()
+            ))
+        })?;
+        let child_depth = depth.saturating_add(1);
+        accumulate_filesystem_tree_usage(&entry.path(), child_depth, root_device, limits, usage)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -207,6 +545,25 @@ pub trait ReadSnapshot {
         prefix: &[u8],
     ) -> Result<Vec<ScanEntry>, StoreError>;
 
+    /// Read one bounded, ordered page from a prefix range. `start_after` is an
+    /// exclusive continuation token previously returned for the same prefix.
+    /// Production backends override this with a native iterator. The default
+    /// exists for small test snapshots and may internally materialize.
+    fn scan_prefix_page(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        budget: PrefixScanBudget,
+    ) -> Result<PrefixScanPage, StoreError> {
+        paginate_scan_entries(
+            self.scan_prefix(family, prefix)?,
+            prefix,
+            start_after,
+            budget,
+        )
+    }
+
     /// Storage-native union of authenticated paths for a set of name keys.
     /// Page-backed snapshots override this to visit each physical page once;
     /// ordinary stores return `None` and use generic content-hash MultiGet.
@@ -235,10 +592,99 @@ pub trait ReadSnapshot {
     }
 }
 
+fn validate_prefix_scan_request(
+    prefix: &[u8],
+    start_after: Option<&[u8]>,
+    budget: PrefixScanBudget,
+) -> Result<PrefixScanBudget, StoreError> {
+    let budget = budget.validate()?;
+    if start_after.is_some_and(|cursor| !cursor.starts_with(prefix)) {
+        return Err(StoreError::Schema(
+            "prefix scan continuation does not belong to the requested prefix".to_owned(),
+        ));
+    }
+    Ok(budget)
+}
+
+fn scan_entry_bytes(key: &[u8], value: &[u8]) -> Result<usize, StoreError> {
+    key.len()
+        .checked_add(value.len())
+        .ok_or_else(|| StoreError::Schema("prefix scan entry byte count overflow".to_owned()))
+}
+
+fn push_bounded_scan_entry(
+    page: &mut PrefixScanPage,
+    key: &[u8],
+    value: &[u8],
+    budget: PrefixScanBudget,
+) -> Result<bool, StoreError> {
+    if page.entries.len() == budget.max_entries {
+        page.continuation = page.entries.last().map(|(key, _)| key.clone());
+        return Ok(false);
+    }
+    let entry_bytes = scan_entry_bytes(key, value)?;
+    if entry_bytes > budget.max_bytes {
+        return Err(StoreError::LimitExceeded {
+            context: "prefix scan page bytes",
+            limit: u64::try_from(budget.max_bytes).unwrap_or(u64::MAX),
+            actual: u64::try_from(entry_bytes).unwrap_or(u64::MAX),
+        });
+    }
+    let next_bytes = page
+        .returned_bytes
+        .checked_add(entry_bytes)
+        .ok_or_else(|| StoreError::Schema("prefix scan page byte count overflow".to_owned()))?;
+    if next_bytes > budget.max_bytes {
+        page.continuation = page.entries.last().map(|(key, _)| key.clone());
+        return Ok(false);
+    }
+    page.entries.push((key.to_vec(), value.to_vec()));
+    page.returned_bytes = next_bytes;
+    Ok(true)
+}
+
+fn paginate_scan_entries(
+    entries: Vec<ScanEntry>,
+    prefix: &[u8],
+    start_after: Option<&[u8]>,
+    budget: PrefixScanBudget,
+) -> Result<PrefixScanPage, StoreError> {
+    let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
+    let mut page = PrefixScanPage::default();
+    for (key, value) in entries {
+        if !key.starts_with(prefix) || start_after.is_some_and(|cursor| key.as_slice() <= cursor) {
+            continue;
+        }
+        if !push_bounded_scan_entry(&mut page, &key, &value, budget)? {
+            break;
+        }
+    }
+    Ok(page)
+}
+
 pub trait WriteBatch {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError>;
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError>;
+}
+
+/// The cumulative resource budget shared by a higher-level atomic mutation
+/// and the archive transformation performed during its final store commit.
+///
+/// The store computes one conservative, overflow-safe additional charge from
+/// the actual batch while holding the archive publication lock. It invokes
+/// [`Self::charge_additional`] exactly once and does not extract payloads,
+/// append segment bytes, replace locator values, or add manifest operations
+/// unless that call succeeds. Implementations must use saturating cumulative
+/// addition, preserve their consumed value on rejection, and return the
+/// caller's stable [`StoreError::LimitExceeded`] context.
+pub trait AtomicWriteEffectBudget {
+    /// Fixed allocation/backend framing allowance charged for each logical
+    /// representation of a key/value operation.
+    fn operation_framing_bytes(&self) -> u64;
+
+    /// Atomically accept one already-saturated additional effect charge.
+    fn charge_additional(&mut self, additional: u64) -> Result<(), StoreError>;
 }
 
 pub trait Store {
@@ -753,8 +1199,26 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
 
 fn snapshot_is_empty<S: ReadSnapshot>(snapshot: &S) -> Result<bool, StoreError> {
     for family in ColumnFamily::ALL {
-        if !snapshot.scan_prefix(family, b"")?.is_empty() {
-            return Ok(false);
+        match snapshot.scan_prefix_page(
+            family,
+            b"",
+            None,
+            PrefixScanBudget {
+                max_entries: 1,
+                max_bytes: SNAPSHOT_EMPTY_PROBE_BYTES,
+            },
+        ) {
+            Ok(page) if !page.entries.is_empty() => return Ok(false),
+            Ok(_) => {}
+            Err(StoreError::LimitExceeded {
+                context: "prefix scan page bytes",
+                ..
+            }) => {
+                // A value larger than the deliberately tiny probe still
+                // proves the column family is non-empty.
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(true)
@@ -820,6 +1284,8 @@ pub enum StoreHandle {
     Archived {
         inner: Box<StoreHandle>,
         archive: Arc<SegmentArchive>,
+        archive_directory: PathBuf,
+        database_directory: PathBuf,
     },
 }
 
@@ -838,6 +1304,99 @@ pub struct SegmentArchiveInventory {
     pub undo: SegmentFamilyInventory,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SegmentCompactionLimits {
+    /// Maximum number of live block/undo locators placed in the final atomic
+    /// publication batch.
+    pub max_live_records: u64,
+    /// Maximum number of live on-disk frame bytes copied into the replacement
+    /// generation.
+    pub max_live_frame_bytes: u64,
+    /// Maximum combined key/locator bytes in the final atomic publication
+    /// batch. RocksDB-internal WriteBatch overhead is additional and small.
+    pub max_atomic_locator_bytes: u64,
+    /// Record and key/value byte bounds for each immutable-snapshot iterator
+    /// page used while preparing the rewrite.
+    pub scan_page_records: usize,
+    pub scan_page_bytes: usize,
+}
+
+impl Default for SegmentCompactionLimits {
+    fn default() -> Self {
+        Self {
+            max_live_records: SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_RECORDS,
+            max_live_frame_bytes: SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_FRAME_BYTES,
+            max_atomic_locator_bytes: SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_LOCATOR_BYTES,
+            scan_page_records: SEGMENT_COMPACTION_DEFAULT_SCAN_RECORDS,
+            scan_page_bytes: SEGMENT_COMPACTION_DEFAULT_SCAN_BYTES,
+        }
+    }
+}
+
+impl SegmentCompactionLimits {
+    fn scan_budget(self) -> Result<PrefixScanBudget, StoreError> {
+        if self.max_live_records == 0
+            || self.max_live_frame_bytes == 0
+            || self.max_atomic_locator_bytes == 0
+        {
+            return Err(StoreError::Schema(
+                "segment compaction record and byte budgets must be nonzero".to_owned(),
+            ));
+        }
+        PrefixScanBudget {
+            max_entries: self.scan_page_records,
+            max_bytes: self.scan_page_bytes,
+        }
+        .validate()
+    }
+}
+
+/// Physical, publication, reserve, and absolute time envelope for one segment
+/// generation rewrite. The reserve is applied once when the payload archive
+/// and RocksDB share a filesystem, or independently to each filesystem when
+/// they reside on different mounts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentCompactionExecutionLimits {
+    pub max_physical_output_bytes: u64,
+    pub max_atomic_publication_bytes: u64,
+    pub minimum_filesystem_reserve_bytes: u64,
+    pub deadline: Instant,
+}
+
+impl Default for SegmentCompactionExecutionLimits {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            max_physical_output_bytes: SEGMENT_COMPACTION_DEFAULT_MAX_PHYSICAL_OUTPUT_BYTES,
+            max_atomic_publication_bytes: SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_PUBLICATION_BYTES,
+            minimum_filesystem_reserve_bytes: SEGMENT_COMPACTION_DEFAULT_FILESYSTEM_RESERVE_BYTES,
+            deadline: now
+                .checked_add(SEGMENT_COMPACTION_DEFAULT_MAX_ELAPSED)
+                .unwrap_or(now),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct SegmentArchiveCompactionPlan {
+    pub live_records: u64,
+    pub live_frame_bytes: u64,
+    pub physical_frame_bytes: u64,
+    pub reclaimable_frame_bytes: u64,
+    pub estimated_atomic_locator_bytes: u64,
+    /// Conservative serialized RocksDB WriteBatch size including fixed
+    /// per-operation framing and the two manifest replacements.
+    pub estimated_atomic_publication_bytes: u64,
+    /// Conservative filesystem allowance for WAL plus an equivalent
+    /// publication-sized RocksDB staging/flush copy.
+    pub estimated_rocks_temporary_bytes: u64,
+    /// New segment generation plus RocksDB temporary publication allowance.
+    /// The caller-configured persistent reserve is additional.
+    pub required_temporary_bytes: u64,
+    pub scan_page_records: usize,
+    pub scan_page_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct SegmentArchiveCompactionReport {
     pub previous_block_generation: u64,
@@ -848,6 +1407,9 @@ pub struct SegmentArchiveCompactionReport {
     pub before_frame_bytes: u64,
     pub after_frame_bytes: u64,
     pub reclaimed_frame_bytes: u64,
+    pub scan_pages: u64,
+    pub peak_scan_records: usize,
+    pub peak_scan_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -862,6 +1424,31 @@ impl StoreHandle {
         Self::Memory(MemoryStore::new())
     }
 
+    /// Whether an atomic database publication returned an error whose durable
+    /// outcome can only be resolved by closing and reopening the store.
+    pub fn reopen_required(&self) -> bool {
+        match self {
+            Self::Memory(_) => false,
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(store) => store.reopen_required(),
+            Self::Archived { inner, archive, .. } => {
+                archive.reopen_required() || inner.reopen_required()
+            }
+        }
+    }
+
+    /// Reject authority-bearing reads, writes, and maintenance after an
+    /// ambiguous publication. Reopen constructs fresh backend/archive state
+    /// from the database's atomic manifests.
+    pub fn ensure_operational(&self) -> Result<(), StoreError> {
+        if self.reopen_required() {
+            return Err(StoreError::Backend(
+                "store publication outcome is uncertain; reopen required".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub const fn durability_policy(&self) -> DurabilityPolicy {
         match self {
             Self::Memory(_) => DurabilityPolicy::Sync,
@@ -871,16 +1458,54 @@ impl StoreHandle {
         }
     }
 
+    /// Commit one already-metered atomic mutation while carrying the same
+    /// cumulative budget through any payload-archive transformation.
+    ///
+    /// Memory and non-archived RocksDB handles are transparent and leave the
+    /// budget untouched. An archived handle performs and charges a read-only
+    /// preflight before moving payload values, appending frames, replacing
+    /// locators, or extending the backend batch with its two manifests.
+    pub fn commit_with_effect_budget(
+        &self,
+        batch: StoreHandleBatch,
+        budget: &mut impl AtomicWriteEffectBudget,
+    ) -> Result<(), StoreError> {
+        self.commit_with_optional_effect_budget(batch, Some(budget))
+    }
+
+    fn commit_with_optional_effect_budget(
+        &self,
+        batch: StoreHandleBatch,
+        budget: Option<&mut dyn AtomicWriteEffectBudget>,
+    ) -> Result<(), StoreError> {
+        self.ensure_operational()?;
+        match self {
+            Self::Memory(store) => commit_memory_store_handle(store, batch),
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(store) => commit_rocks_store_handle(store, batch),
+            Self::Archived { inner, archive, .. } => {
+                commit_archived_store_handle(inner, archive, batch, budget)
+            }
+        }
+    }
+
     pub fn with_segment_archive(self, directory: PathBuf) -> Result<Self, StoreError> {
         if matches!(self, Self::Archived { .. }) {
             return Err(StoreError::Schema(
                 "segment archive is already attached".to_owned(),
             ));
         }
+        let database_directory = match &self {
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(store) => store.path.clone(),
+            Self::Memory(_) => directory.clone(),
+            Self::Archived { .. } => unreachable!("archive attachment was rejected above"),
+        };
         let snapshot = self.snapshot()?;
         let block = snapshot.get(ColumnFamily::Snapshots, BLOCK_SEGMENT_MANIFEST_KEY)?;
         let undo = snapshot.get(ColumnFamily::Snapshots, UNDO_SEGMENT_MANIFEST_KEY)?;
         drop(snapshot);
+        let archive_directory = directory.clone();
         let archive = match (block, undo) {
             (None, None) => {
                 let archive =
@@ -915,10 +1540,13 @@ impl StoreHandle {
         Ok(Self::Archived {
             inner: Box::new(self),
             archive: Arc::new(archive),
+            archive_directory,
+            database_directory,
         })
     }
 
     pub fn segment_archive_inventory(&self) -> Result<SegmentArchiveInventory, StoreError> {
+        self.ensure_operational()?;
         let Self::Archived { inner, .. } = self else {
             return Err(StoreError::Schema(
                 "segment archive inventory requires an archived store".to_owned(),
@@ -930,7 +1558,53 @@ impl StoreHandle {
         })
     }
 
+    /// Cursor-paged, aggregate-bounded inventory for automatic maintenance due
+    /// detection. This performs no filesystem-capacity or publication check.
+    pub fn segment_archive_inventory_bounded(
+        &self,
+        limits: SegmentCompactionLimits,
+        deadline: Instant,
+    ) -> Result<SegmentArchiveInventory, StoreError> {
+        self.ensure_operational()?;
+        let scan_budget = limits.scan_budget()?;
+        ensure_segment_compaction_deadline(deadline, "segment archive inventory")?;
+        let Self::Archived { inner, .. } = self else {
+            return Err(StoreError::Schema(
+                "bounded segment archive inventory requires an archived store".to_owned(),
+            ));
+        };
+        let snapshot = inner.snapshot()?;
+        let execution = SegmentCompactionExecutionLimits {
+            max_physical_output_bytes: limits.max_live_frame_bytes,
+            max_atomic_publication_bytes: u64::MAX,
+            minimum_filesystem_reserve_bytes: 0,
+            deadline,
+        };
+        let mut totals = SegmentCompactionInventoryTotals::default();
+        let inventory = SegmentArchiveInventory {
+            blocks: segment_family_inventory_bounded(
+                &snapshot,
+                ColumnFamily::Blocks,
+                scan_budget,
+                limits,
+                execution,
+                &mut totals,
+            )?,
+            undo: segment_family_inventory_bounded(
+                &snapshot,
+                ColumnFamily::Undo,
+                scan_budget,
+                limits,
+                execution,
+                &mut totals,
+            )?,
+        };
+        ensure_segment_compaction_deadline(deadline, "segment archive inventory")?;
+        Ok(inventory)
+    }
+
     pub fn scrub_segment_archive(&self) -> Result<SegmentArchiveScrub, StoreError> {
+        self.ensure_operational()?;
         let Self::Archived { archive, .. } = self else {
             return Err(StoreError::Schema(
                 "segment archive scrub requires an archived store".to_owned(),
@@ -939,7 +1613,23 @@ impl StoreHandle {
         archive.scrub().map_err(segment_store_error)
     }
 
+    pub fn scrub_segment_archive_bounded(
+        &self,
+        limits: SegmentArchiveScrubLimits,
+    ) -> Result<SegmentArchiveScrub, StoreError> {
+        self.ensure_operational()?;
+        let Self::Archived { archive, .. } = self else {
+            return Err(StoreError::Schema(
+                "bounded segment archive scrub requires an archived store".to_owned(),
+            ));
+        };
+        archive
+            .scrub_with_limits(limits)
+            .map_err(segment_store_error)
+    }
+
     pub fn segment_archive_frame_bytes(&self) -> Result<(u64, u64), StoreError> {
+        self.ensure_operational()?;
         let Self::Archived { archive, .. } = self else {
             return Err(StoreError::Schema(
                 "segment archive footprint requires an archived store".to_owned(),
@@ -948,87 +1638,396 @@ impl StoreHandle {
         archive.committed_frame_bytes().map_err(segment_store_error)
     }
 
+    /// Compute and validate the exact record/byte budget for one atomic
+    /// generation replacement without reading historical payload bytes.
+    pub fn plan_segment_archive_compaction(
+        &self,
+        limits: SegmentCompactionLimits,
+    ) -> Result<SegmentArchiveCompactionPlan, StoreError> {
+        self.plan_segment_archive_compaction_with_execution_limits(
+            limits,
+            SegmentCompactionExecutionLimits::default(),
+        )
+    }
+
+    /// Capacity- and deadline-qualified compaction plan.
+    pub fn plan_segment_archive_compaction_with_execution_limits(
+        &self,
+        limits: SegmentCompactionLimits,
+        execution: SegmentCompactionExecutionLimits,
+    ) -> Result<SegmentArchiveCompactionPlan, StoreError> {
+        let plan =
+            self.inspect_segment_archive_compaction_with_execution_limits(limits, execution)?;
+        let Self::Archived {
+            archive_directory,
+            database_directory,
+            ..
+        } = self
+        else {
+            return Err(StoreError::Schema(
+                "segment compaction planning requires an archived store".to_owned(),
+            ));
+        };
+        ensure_segment_compaction_filesystem_capacity(
+            archive_directory,
+            database_directory,
+            SegmentCompactionCapacityRequest {
+                payload_output_bytes: plan.live_frame_bytes,
+                rocks_temporary_bytes: plan.estimated_rocks_temporary_bytes,
+                reserve: execution.minimum_filesystem_reserve_bytes,
+                shared_context: "segment compaction preflight shared filesystem",
+                payload_context: "segment compaction preflight payload filesystem",
+                rocks_context: "segment compaction preflight RocksDB filesystem",
+            },
+        )?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction planning")?;
+        Ok(plan)
+    }
+
+    /// Read-only bounded footprint inspection for automatic due detection.
+    /// Inventory pages, physical segment metadata reads, and all ceiling
+    /// checks share the supplied absolute deadline, but filesystem capacity is
+    /// deliberately not required until a rewrite is actually due.
+    pub fn inspect_segment_archive_compaction_with_execution_limits(
+        &self,
+        limits: SegmentCompactionLimits,
+        execution: SegmentCompactionExecutionLimits,
+    ) -> Result<SegmentArchiveCompactionPlan, StoreError> {
+        self.ensure_operational()?;
+        let scan_budget = limits.scan_budget()?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction planning")?;
+        let Self::Archived { inner, archive, .. } = self else {
+            return Err(StoreError::Schema(
+                "segment compaction planning requires an archived store".to_owned(),
+            ));
+        };
+        let snapshot = inner.snapshot()?;
+        let mut running_inventory = SegmentCompactionInventoryTotals::default();
+        let inventory = SegmentArchiveInventory {
+            blocks: segment_family_inventory_bounded(
+                &snapshot,
+                ColumnFamily::Blocks,
+                scan_budget,
+                limits,
+                execution,
+                &mut running_inventory,
+            )?,
+            undo: segment_family_inventory_bounded(
+                &snapshot,
+                ColumnFamily::Undo,
+                scan_budget,
+                limits,
+                execution,
+                &mut running_inventory,
+            )?,
+        };
+        drop(snapshot);
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction planning")?;
+        let live_records = inventory
+            .blocks
+            .archived_records
+            .checked_add(inventory.undo.archived_records)
+            .ok_or_else(|| {
+                StoreError::Schema("segment compaction live record count overflow".to_owned())
+            })?;
+        let live_frame_bytes = inventory
+            .blocks
+            .archived_frame_bytes
+            .checked_add(inventory.undo.archived_frame_bytes)
+            .ok_or_else(|| {
+                StoreError::Schema("segment compaction live frame byte count overflow".to_owned())
+            })?;
+        let (block_bytes, undo_bytes) = archive
+            .committed_frame_bytes()
+            .map_err(segment_store_error)?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction planning")?;
+        let physical_frame_bytes = block_bytes.checked_add(undo_bytes).ok_or_else(|| {
+            StoreError::Schema("segment compaction physical byte count overflow".to_owned())
+        })?;
+        let publication = segment_compaction_publication_estimate(live_records)?;
+        let required_temporary_bytes = live_frame_bytes
+            .checked_add(publication.rocks_temporary_bytes)
+            .ok_or_else(|| {
+                StoreError::Schema("segment compaction total temporary size overflow".to_owned())
+            })?;
+        let plan = SegmentArchiveCompactionPlan {
+            live_records,
+            live_frame_bytes,
+            physical_frame_bytes,
+            reclaimable_frame_bytes: physical_frame_bytes.saturating_sub(live_frame_bytes),
+            estimated_atomic_locator_bytes: publication.atomic_locator_bytes,
+            estimated_atomic_publication_bytes: publication.atomic_publication_bytes,
+            estimated_rocks_temporary_bytes: publication.rocks_temporary_bytes,
+            required_temporary_bytes,
+            scan_page_records: limits.scan_page_records,
+            scan_page_bytes: limits.scan_page_bytes,
+        };
+        validate_segment_compaction_plan(plan, limits, execution)?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction planning")?;
+        Ok(plan)
+    }
+
     /// Rewrite only live block/undo locators into a fresh segment generation
     /// and atomically publish every replacement locator with both manifests.
     /// The caller must hold exclusive database ownership. Crash recovery uses
     /// the committed manifests to discard either an unpublished new
     /// generation or the superseded old generation.
     pub fn compact_segment_archive(&self) -> Result<SegmentArchiveCompactionReport, StoreError> {
-        let Self::Archived { inner, archive } = self else {
+        self.compact_segment_archive_with_limits(SegmentCompactionLimits::default())
+    }
+
+    /// Budgeted variant of [`Self::compact_segment_archive`]. Preparation
+    /// streams stable snapshot pages with O(page bytes + one payload) working
+    /// memory. Final publication remains one atomic locator/manifest batch, so
+    /// `max_live_records` and `max_atomic_locator_bytes` bound that necessary
+    /// O(live records) commit structure.
+    pub fn compact_segment_archive_with_limits(
+        &self,
+        limits: SegmentCompactionLimits,
+    ) -> Result<SegmentArchiveCompactionReport, StoreError> {
+        self.compact_segment_archive_with_execution_limits(
+            limits,
+            SegmentCompactionExecutionLimits::default(),
+        )
+    }
+
+    /// Execute a rewrite under one absolute deadline, physical/publication
+    /// ceilings, and a filesystem reserve. Capacity failures before the
+    /// database commit attempt safely delete the unpublished generation and
+    /// remain retryable.
+    pub fn compact_segment_archive_with_execution_limits(
+        &self,
+        limits: SegmentCompactionLimits,
+        execution: SegmentCompactionExecutionLimits,
+    ) -> Result<SegmentArchiveCompactionReport, StoreError> {
+        self.ensure_operational()?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction execution")?;
+        let Self::Archived {
+            inner,
+            archive,
+            archive_directory,
+            database_directory,
+        } = self
+        else {
             return Err(StoreError::Schema(
                 "segment compaction requires an archived store".to_owned(),
             ));
         };
-        let (before_block_bytes, before_undo_bytes) = archive
-            .committed_frame_bytes()
-            .map_err(segment_store_error)?;
+        let plan = self.plan_segment_archive_compaction_with_execution_limits(limits, execution)?;
+        let scan_budget = limits.scan_budget()?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction execution")?;
         let (previous_block, previous_undo) = archive.manifests().map_err(segment_store_error)?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction execution")?;
         let snapshot = inner.snapshot()?;
-        let block_entries = snapshot.scan_prefix(ColumnFamily::Blocks, b"")?;
-        let undo_entries = snapshot.scan_prefix(ColumnFamily::Undo, b"")?;
-        drop(snapshot);
 
+        ensure_segment_compaction_filesystem_capacity(
+            archive_directory,
+            database_directory,
+            SegmentCompactionCapacityRequest {
+                payload_output_bytes: plan.live_frame_bytes,
+                rocks_temporary_bytes: plan.estimated_rocks_temporary_bytes,
+                reserve: execution.minimum_filesystem_reserve_bytes,
+                shared_context: "segment compaction before output creation on shared filesystem",
+                payload_context: "segment compaction before output creation on payload filesystem",
+                rocks_context: "segment compaction before output creation on RocksDB filesystem",
+            },
+        )?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction execution")?;
         let mut rewrite = archive.begin_rewrite().map_err(segment_store_error)?;
+        if let Err(error) =
+            ensure_segment_compaction_deadline(execution.deadline, "segment compaction execution")
+        {
+            drop(snapshot);
+            archive
+                .abort_rewrite(rewrite)
+                .map_err(segment_store_error)?;
+            return Err(error);
+        }
         let prepared = (|| {
             let mut batch = inner.batch();
             let mut live_records = 0u64;
             let mut live_payload_bytes = 0u64;
-            for (family, kind, entries) in [
-                (ColumnFamily::Blocks, SegmentKind::Block, block_entries),
-                (ColumnFamily::Undo, SegmentKind::Undo, undo_entries),
+            let mut live_frame_bytes = 0u64;
+            let mut scan_pages = 0u64;
+            let mut peak_scan_records = 0usize;
+            let mut peak_scan_bytes = 0usize;
+            for (family, kind) in [
+                (ColumnFamily::Blocks, SegmentKind::Block),
+                (ColumnFamily::Undo, SegmentKind::Undo),
             ] {
-                for (key, raw) in entries {
-                    let Some(locator) =
-                        SegmentValueLocator::decode(&raw).map_err(segment_store_error)?
-                    else {
-                        continue;
-                    };
-                    if locator.kind != kind {
-                        return Err(StoreError::Schema(format!(
-                            "{} locator has kind {:?}; expected {kind:?}",
-                            family.name(),
-                            locator.kind
-                        )));
+                let mut continuation = None::<Vec<u8>>;
+                loop {
+                    ensure_segment_compaction_deadline(
+                        execution.deadline,
+                        "segment compaction inventory read",
+                    )?;
+                    let page = snapshot.scan_prefix_page(
+                        family,
+                        b"",
+                        continuation.as_deref(),
+                        scan_budget,
+                    )?;
+                    ensure_segment_compaction_deadline(
+                        execution.deadline,
+                        "segment compaction inventory read",
+                    )?;
+                    validate_segment_scan_page(
+                        &page,
+                        continuation.as_deref(),
+                        scan_budget,
+                        "segment compaction inventory read",
+                    )?;
+                    if !page.entries.is_empty() {
+                        scan_pages = scan_pages.checked_add(1).ok_or_else(|| {
+                            StoreError::Schema(
+                                "segment compaction scan page count overflow".to_owned(),
+                            )
+                        })?;
+                        peak_scan_records = peak_scan_records.max(page.entries.len());
+                        peak_scan_bytes = peak_scan_bytes.max(page.returned_bytes);
                     }
-                    let key_array: [u8; 32] = key.as_slice().try_into().map_err(|_| {
-                        StoreError::Schema(format!(
-                            "{} archive key contains {} bytes; expected 32",
-                            family.name(),
-                            key.len()
-                        ))
-                    })?;
-                    let payload = archive
-                        .resolve(kind, &key, &raw)
-                        .map_err(segment_store_error)?
-                        .ok_or_else(|| {
+                    for (key, raw) in page.entries {
+                        ensure_segment_compaction_deadline(
+                            execution.deadline,
+                            "segment compaction payload read",
+                        )?;
+                        let Some(locator) =
+                            SegmentValueLocator::decode(&raw).map_err(segment_store_error)?
+                        else {
+                            continue;
+                        };
+                        if locator.kind != kind {
+                            return Err(StoreError::Schema(format!(
+                                "{} locator has kind {:?}; expected {kind:?}",
+                                family.name(),
+                                locator.kind
+                            )));
+                        }
+                        live_frame_bytes = live_frame_bytes
+                            .checked_add(u64::from(locator.locator.frame_length))
+                            .ok_or_else(|| {
+                                StoreError::Schema(
+                                    "segment compaction live frame byte count overflow".to_owned(),
+                                )
+                            })?;
+                        ensure_segment_compaction_limit(
+                            live_frame_bytes,
+                            execution.max_physical_output_bytes,
+                            "segment compaction physical output bytes",
+                        )?;
+                        let key_array: [u8; 32] = key.as_slice().try_into().map_err(|_| {
                             StoreError::Schema(format!(
-                                "{} locator did not resolve to an archived payload",
-                                family.name()
+                                "{} archive key contains {} bytes; expected 32",
+                                family.name(),
+                                key.len()
                             ))
                         })?;
-                    live_records = live_records.checked_add(1).ok_or_else(|| {
-                        StoreError::Schema("segment compaction record count overflow".to_owned())
-                    })?;
-                    live_payload_bytes = live_payload_bytes
-                        .checked_add(u64::try_from(payload.len()).map_err(|_| {
+                        let payload = archive
+                            .resolve(kind, &key, &raw)
+                            .map_err(segment_store_error)?
+                            .ok_or_else(|| {
+                                StoreError::Schema(format!(
+                                    "{} locator did not resolve to an archived payload",
+                                    family.name()
+                                ))
+                            })?;
+                        ensure_segment_compaction_deadline(
+                            execution.deadline,
+                            "segment compaction payload read",
+                        )?;
+                        live_records = live_records.checked_add(1).ok_or_else(|| {
                             StoreError::Schema(
-                                "segment compaction payload length overflow".to_owned(),
-                            )
-                        })?)
-                        .ok_or_else(|| {
-                            StoreError::Schema(
-                                "segment compaction payload byte count overflow".to_owned(),
+                                "segment compaction record count overflow".to_owned(),
                             )
                         })?;
-                    let replacement = archive
-                        .append_rewrite(&mut rewrite, kind, key_array, payload)
-                        .map_err(segment_store_error)?;
-                    batch.put(family, &key, &replacement.encode())?;
+                        live_payload_bytes = live_payload_bytes
+                            .checked_add(u64::try_from(payload.len()).map_err(|_| {
+                                StoreError::Schema(
+                                    "segment compaction payload length overflow".to_owned(),
+                                )
+                            })?)
+                            .ok_or_else(|| {
+                                StoreError::Schema(
+                                    "segment compaction payload byte count overflow".to_owned(),
+                                )
+                            })?;
+                        ensure_segment_compaction_limit(
+                            live_records,
+                            limits.max_live_records,
+                            "segment compaction live records",
+                        )?;
+                        ensure_segment_compaction_deadline(
+                            execution.deadline,
+                            "segment compaction payload append",
+                        )?;
+                        let replacement = archive
+                            .append_rewrite(&mut rewrite, kind, key_array, payload)
+                            .map_err(segment_store_error)?;
+                        ensure_segment_compaction_deadline(
+                            execution.deadline,
+                            "segment compaction payload append",
+                        )?;
+                        batch.put(family, &key, &replacement.encode())?;
+                    }
+                    let Some(next) = page.continuation else {
+                        break;
+                    };
+                    if continuation
+                        .as_ref()
+                        .is_some_and(|previous| next.as_slice() <= previous.as_slice())
+                    {
+                        return Err(StoreError::Backend(format!(
+                            "{} prefix scan continuation did not advance",
+                            family.name()
+                        )));
+                    }
+                    continuation = Some(next);
                 }
             }
+            if live_records != plan.live_records || live_frame_bytes != plan.live_frame_bytes {
+                return Err(StoreError::Schema(format!(
+                    "segment compaction snapshot changed after preflight: planned {}/{} records/frame-bytes, found {live_records}/{live_frame_bytes}",
+                    plan.live_records, plan.live_frame_bytes
+                )));
+            }
+            ensure_segment_compaction_deadline(
+                execution.deadline,
+                "segment compaction output fsync",
+            )?;
             let (block_manifest, undo_manifest, after) = archive
-                .finish_rewrite(&mut rewrite)
+                .finish_rewrite(
+                    &mut rewrite,
+                    SegmentArchiveScrubLimits {
+                        max_segments: SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS,
+                        max_records: limits.max_live_records,
+                        max_durable_bytes: execution.max_physical_output_bytes,
+                        deadline: execution.deadline,
+                    },
+                )
                 .map_err(segment_store_error)?;
+            ensure_segment_compaction_deadline(
+                execution.deadline,
+                "segment compaction output fsync",
+            )?;
+            let physical_output_bytes = after
+                .blocks
+                .durable_bytes
+                .checked_add(after.undo.durable_bytes)
+                .ok_or_else(|| {
+                    StoreError::Schema(
+                        "segment compaction physical output byte count overflow".to_owned(),
+                    )
+                })?;
+            ensure_segment_compaction_limit(
+                physical_output_bytes,
+                execution.max_physical_output_bytes,
+                "segment compaction physical output bytes",
+            )?;
+            if physical_output_bytes != live_frame_bytes {
+                return Err(StoreError::Schema(format!(
+                    "segment compaction wrote {physical_output_bytes} physical bytes for {live_frame_bytes} planned live frame bytes"
+                )));
+            }
             batch.put(
                 ColumnFamily::Snapshots,
                 BLOCK_SEGMENT_MANIFEST_KEY,
@@ -1046,36 +2045,98 @@ impl StoreHandle {
                 after,
                 live_records,
                 live_payload_bytes,
+                scan_pages,
+                peak_scan_records,
+                peak_scan_bytes,
             ))
         })();
-        let (batch, block_manifest, undo_manifest, after, live_records, live_payload_bytes) =
-            match prepared {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    archive
-                        .abort_rewrite(rewrite)
-                        .map_err(segment_store_error)?;
-                    return Err(error);
-                }
-            };
-        if let Err(error) = inner.commit(batch) {
+        let (
+            batch,
+            block_manifest,
+            undo_manifest,
+            after,
+            live_records,
+            live_payload_bytes,
+            scan_pages,
+            peak_scan_records,
+            peak_scan_bytes,
+        ) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                drop(snapshot);
+                archive
+                    .abort_rewrite(rewrite)
+                    .map_err(segment_store_error)?;
+                return Err(error);
+            }
+        };
+        drop(snapshot);
+        let precommit_check = (|| {
+            ensure_segment_compaction_deadline(execution.deadline, "segment compaction precommit")?;
+            ensure_segment_compaction_filesystem_capacity(
+                archive_directory,
+                database_directory,
+                SegmentCompactionCapacityRequest {
+                    payload_output_bytes: 0,
+                    rocks_temporary_bytes: plan.estimated_rocks_temporary_bytes,
+                    reserve: execution.minimum_filesystem_reserve_bytes,
+                    shared_context: "segment compaction precommit shared filesystem",
+                    payload_context: "segment compaction precommit payload filesystem",
+                    rocks_context: "segment compaction precommit RocksDB filesystem",
+                },
+            )?;
+            ensure_segment_compaction_deadline(execution.deadline, "segment compaction precommit")
+        })();
+        if let Err(error) = precommit_check {
             archive
                 .abort_rewrite(rewrite)
                 .map_err(segment_store_error)?;
             return Err(error);
         }
+        if let Err(error) = inner.commit(batch) {
+            // Once write_opt has been invoked, an error does not prove that
+            // RocksDB rejected the atomic batch. Preserve both generations and
+            // fence this process; reopen will select the old or new manifests
+            // and remove only the generation they do not reference.
+            archive.mark_commit_outcome_uncertain();
+            drop(rewrite);
+            return Err(StoreError::Backend(format!(
+                "segment compaction database publication outcome is uncertain; reopen required: {error}"
+            )));
+        }
+        if Instant::now() >= execution.deadline {
+            // Publication succeeded but the in-memory archive has not yet
+            // installed the authoritative generation. Preserve both
+            // generations and require reopen; this is never a safe deferral.
+            archive.mark_commit_outcome_uncertain();
+            drop(rewrite);
+            return Err(StoreError::Backend(
+                "segment compaction deadline elapsed after database publication; reopen required"
+                    .to_owned(),
+            ));
+        }
         // After the atomic database commit the new generation is
         // authoritative. Never delete it on an installation/cleanup error;
         // reopening will select it from the manifests and remove predecessors.
-        archive
-            .install_rewrite(rewrite)
-            .map_err(segment_store_error)?;
+        if let Err(error) = archive.install_rewrite(rewrite) {
+            // The locator and manifest batch is already committed. The archive
+            // marks every installation/cleanup failure reopen-required so no
+            // in-process read or write can observe a partially installed
+            // generation.
+            archive.mark_commit_outcome_uncertain();
+            return Err(StoreError::Backend(format!(
+                "segment compaction database publication committed but archive installation is incomplete; reopen required: {error}"
+            )));
+        }
+        if Instant::now() >= execution.deadline {
+            archive.mark_commit_outcome_uncertain();
+            return Err(StoreError::Backend(
+                "segment compaction deadline elapsed after committed archive installation; reopen required"
+                    .to_owned(),
+            ));
+        }
 
-        let before_frame_bytes = before_block_bytes
-            .checked_add(before_undo_bytes)
-            .ok_or_else(|| {
-                StoreError::Schema("pre-compaction frame byte count overflow".to_owned())
-            })?;
+        let before_frame_bytes = plan.physical_frame_bytes;
         let after_frame_bytes = after
             .blocks
             .durable_bytes
@@ -1093,6 +2154,9 @@ impl StoreHandle {
             before_frame_bytes,
             after_frame_bytes,
             reclaimed_frame_bytes: before_frame_bytes.saturating_sub(after_frame_bytes),
+            scan_pages,
+            peak_scan_records,
+            peak_scan_bytes,
         })
     }
 
@@ -1104,6 +2168,7 @@ impl StoreHandle {
         &self,
         batch_records: usize,
     ) -> Result<SegmentMigrationReport, StoreError> {
+        self.ensure_operational()?;
         if !(1..=SEGMENT_MIGRATION_MAX_BATCH_RECORDS).contains(&batch_records) {
             return Err(StoreError::Schema(
                 format!(
@@ -1116,33 +2181,34 @@ impl StoreHandle {
                 "segment migration requires an archived store".to_owned(),
             ));
         };
+        let scan_budget = PrefixScanBudget {
+            max_entries: batch_records,
+            max_bytes: PREFIX_SCAN_MAX_BYTES,
+        }
+        .validate()?;
         let mut report = SegmentMigrationReport::default();
         for family in [ColumnFamily::Blocks, ColumnFamily::Undo] {
             for prefix in 0u8..=u8::MAX {
-                let keys = inline_segment_keys(inner, family, &[prefix])?;
-                for keys in keys.chunks(batch_records) {
-                    let snapshot = inner.snapshot()?;
-                    let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                    let values = snapshot.get_many(family, &key_refs)?;
-                    drop(snapshot);
-                    if values.len() != keys.len() {
+                let snapshot = inner.snapshot()?;
+                let mut continuation = None::<Vec<u8>>;
+                loop {
+                    let page = snapshot.scan_prefix_page(
+                        family,
+                        &[prefix],
+                        continuation.as_deref(),
+                        scan_budget,
+                    )?;
+                    if page.entries.is_empty() && page.continuation.is_some() {
                         return Err(StoreError::Backend(format!(
-                            "{} multi-get returned {} values for {} keys",
-                            family.name(),
-                            values.len(),
-                            keys.len()
+                            "{} migration prefix scan returned a continuation without progress",
+                            family.name()
                         )));
                     }
                     let mut batch = self.batch();
                     let mut staged_records = 0u64;
                     let mut staged_bytes = 0u64;
-                    for (key, value) in keys.iter().zip(values) {
-                        let value = value.ok_or_else(|| {
-                            StoreError::Schema(format!(
-                                "{} value disappeared during offline segment migration",
-                                family.name()
-                            ))
-                        })?;
+                    for (key, value) in page.entries {
+                        validate_segment_key(family, &key)?;
                         if SegmentValueLocator::decode(&value)
                             .map_err(segment_store_error)?
                             .is_some()
@@ -1172,7 +2238,7 @@ impl StoreHandle {
                             staged_records = 0;
                             staged_bytes = 0;
                         }
-                        batch.put(family, key, &value)?;
+                        batch.put(family, &key, &value)?;
                         staged_records = staged_records.checked_add(1).ok_or_else(|| {
                             StoreError::Schema(
                                 "segment migration staged record count overflow".to_owned(),
@@ -1191,6 +2257,19 @@ impl StoreHandle {
                         staged_bytes,
                         &mut report,
                     )?;
+                    let Some(next) = page.continuation else {
+                        break;
+                    };
+                    if continuation
+                        .as_ref()
+                        .is_some_and(|previous| next.as_slice() <= previous.as_slice())
+                    {
+                        return Err(StoreError::Backend(format!(
+                            "{} migration prefix scan continuation did not advance",
+                            family.name()
+                        )));
+                    }
+                    continuation = Some(next);
                 }
             }
         }
@@ -1198,11 +2277,17 @@ impl StoreHandle {
     }
 
     pub fn create_rocks_checkpoint(&self, directory: &Path) -> Result<(), StoreError> {
+        self.ensure_operational()?;
         #[cfg(feature = "rocksdb-backend")]
         {
             match self {
                 Self::Rocks(store) => store.create_checkpoint(directory),
-                Self::Archived { inner, .. } => inner.create_rocks_checkpoint(directory),
+                Self::Archived { inner, archive, .. } => {
+                    let writer = archive.writer().map_err(segment_store_error)?;
+                    let result = inner.create_rocks_checkpoint(directory);
+                    drop(writer);
+                    result
+                }
                 Self::Memory(_) => Err(StoreError::Backend(
                     "RocksDB checkpoint requested for memory store".to_owned(),
                 )),
@@ -1216,6 +2301,338 @@ impl StoreHandle {
             ))
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SegmentCompactionPublicationEstimate {
+    atomic_locator_bytes: u64,
+    atomic_publication_bytes: u64,
+    rocks_temporary_bytes: u64,
+}
+
+fn segment_compaction_publication_estimate(
+    live_records: u64,
+) -> Result<SegmentCompactionPublicationEstimate, StoreError> {
+    let locator_bytes_per_record = u64::try_from(
+        32usize
+            .checked_add(SegmentValueLocator::encoded_len())
+            .ok_or_else(|| {
+                StoreError::Schema(
+                    "segment compaction locator publication size overflow".to_owned(),
+                )
+            })?,
+    )
+    .map_err(|_| {
+        StoreError::Schema("segment compaction locator publication size overflow".to_owned())
+    })?;
+    let atomic_locator_bytes = live_records
+        .checked_mul(locator_bytes_per_record)
+        .ok_or_else(|| {
+            StoreError::Schema("segment compaction atomic locator byte count overflow".to_owned())
+        })?;
+    let locator_operation_overhead = live_records
+        .checked_mul(SEGMENT_COMPACTION_BATCH_OPERATION_OVERHEAD_BYTES)
+        .ok_or_else(|| {
+            StoreError::Schema("segment compaction locator operation overhead overflow".to_owned())
+        })?;
+    let manifest_bytes = u64::try_from(
+        SegmentManifest {
+            generation: 0,
+            active_segment: 0,
+            durable_bytes: 0,
+        }
+        .encode()
+        .len(),
+    )
+    .map_err(|_| StoreError::Schema("segment compaction manifest length overflow".to_owned()))?;
+    let manifest_publication_bytes = [
+        BLOCK_SEGMENT_MANIFEST_KEY.len(),
+        UNDO_SEGMENT_MANIFEST_KEY.len(),
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, key_len| {
+        total
+            .checked_add(u64::try_from(key_len).map_err(|_| {
+                StoreError::Schema("segment compaction manifest key length overflow".to_owned())
+            })?)
+            .and_then(|value| value.checked_add(manifest_bytes))
+            .and_then(|value| value.checked_add(SEGMENT_COMPACTION_BATCH_OPERATION_OVERHEAD_BYTES))
+            .ok_or_else(|| {
+                StoreError::Schema(
+                    "segment compaction manifest publication size overflow".to_owned(),
+                )
+            })
+    })?;
+    let atomic_publication_bytes = atomic_locator_bytes
+        .checked_add(locator_operation_overhead)
+        .and_then(|value| value.checked_add(manifest_publication_bytes))
+        .ok_or_else(|| {
+            StoreError::Schema("segment compaction atomic publication size overflow".to_owned())
+        })?;
+    let rocks_temporary_bytes = atomic_publication_bytes
+        .checked_mul(SEGMENT_COMPACTION_ROCKS_TEMPORARY_MULTIPLIER)
+        .ok_or_else(|| {
+            StoreError::Schema("segment compaction RocksDB temporary size overflow".to_owned())
+        })?;
+    Ok(SegmentCompactionPublicationEstimate {
+        atomic_locator_bytes,
+        atomic_publication_bytes,
+        rocks_temporary_bytes,
+    })
+}
+
+fn validate_segment_compaction_plan(
+    plan: SegmentArchiveCompactionPlan,
+    limits: SegmentCompactionLimits,
+    execution: SegmentCompactionExecutionLimits,
+) -> Result<(), StoreError> {
+    ensure_segment_compaction_limit(
+        plan.live_records,
+        limits.max_live_records,
+        "segment compaction live records",
+    )?;
+    ensure_segment_compaction_limit(
+        plan.live_frame_bytes,
+        limits.max_live_frame_bytes,
+        "segment compaction live frame bytes",
+    )?;
+    ensure_segment_compaction_limit(
+        plan.estimated_atomic_locator_bytes,
+        limits.max_atomic_locator_bytes,
+        "segment compaction atomic locator bytes",
+    )?;
+    ensure_segment_compaction_limit(
+        plan.live_frame_bytes,
+        execution.max_physical_output_bytes,
+        "segment compaction physical output bytes",
+    )?;
+    ensure_segment_compaction_limit(
+        plan.estimated_atomic_publication_bytes,
+        execution.max_atomic_publication_bytes,
+        "segment compaction atomic publication bytes",
+    )?;
+    Ok(())
+}
+
+fn ensure_segment_compaction_limit(
+    actual: u64,
+    limit: u64,
+    context: &'static str,
+) -> Result<(), StoreError> {
+    if actual > limit {
+        return Err(StoreError::LimitExceeded {
+            context,
+            limit,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_segment_compaction_deadline(
+    deadline: Instant,
+    context: &'static str,
+) -> Result<(), StoreError> {
+    if Instant::now() >= deadline {
+        return Err(StoreError::DeadlineExceeded { context });
+    }
+    Ok(())
+}
+
+fn ensure_segment_compaction_capacity(
+    available: u64,
+    temporary_bytes: u64,
+    reserve: u64,
+    context: &'static str,
+) -> Result<(), StoreError> {
+    let required = temporary_bytes.saturating_add(reserve);
+    if available < required {
+        return Err(StoreError::InsufficientSpace {
+            context,
+            available,
+            required,
+            reserve,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SegmentCompactionCapacityRequest {
+    payload_output_bytes: u64,
+    rocks_temporary_bytes: u64,
+    reserve: u64,
+    shared_context: &'static str,
+    payload_context: &'static str,
+    rocks_context: &'static str,
+}
+
+fn ensure_segment_compaction_filesystem_capacity(
+    archive_directory: &Path,
+    database_directory: &Path,
+    request: SegmentCompactionCapacityRequest,
+) -> Result<(), StoreError> {
+    if paths_share_filesystem(archive_directory, database_directory)? {
+        let available = filesystem_available_bytes(archive_directory)?;
+        return ensure_segment_compaction_capacity_values(true, available, available, request);
+    }
+    ensure_segment_compaction_capacity_values(
+        false,
+        filesystem_available_bytes(archive_directory)?,
+        filesystem_available_bytes(database_directory)?,
+        request,
+    )
+}
+
+fn ensure_segment_compaction_capacity_values(
+    shared_filesystem: bool,
+    archive_available: u64,
+    database_available: u64,
+    request: SegmentCompactionCapacityRequest,
+) -> Result<(), StoreError> {
+    if shared_filesystem {
+        let temporary_bytes = request
+            .payload_output_bytes
+            .saturating_add(request.rocks_temporary_bytes);
+        return ensure_segment_compaction_capacity(
+            archive_available,
+            temporary_bytes,
+            request.reserve,
+            request.shared_context,
+        );
+    }
+    ensure_segment_compaction_capacity(
+        archive_available,
+        request.payload_output_bytes,
+        request.reserve,
+        request.payload_context,
+    )?;
+    ensure_segment_compaction_capacity(
+        database_available,
+        request.rocks_temporary_bytes,
+        request.reserve,
+        request.rocks_context,
+    )
+}
+
+fn paths_share_filesystem(left: &Path, right: &Path) -> Result<bool, StoreError> {
+    let left_canonical = std::fs::canonicalize(left).map_err(|error| {
+        StoreError::Io(format!(
+            "failed to resolve filesystem path {}: {error}",
+            left.display()
+        ))
+    })?;
+    let right_canonical = std::fs::canonicalize(right).map_err(|error| {
+        StoreError::Io(format!(
+            "failed to resolve filesystem path {}: {error}",
+            right.display()
+        ))
+    })?;
+    if left_canonical == right_canonical {
+        return Ok(true);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let left_metadata = std::fs::metadata(&left_canonical).map_err(|error| {
+            StoreError::Io(format!(
+                "failed to inspect filesystem path {}: {error}",
+                left_canonical.display()
+            ))
+        })?;
+        let right_metadata = std::fs::metadata(&right_canonical).map_err(|error| {
+            StoreError::Io(format!(
+                "failed to inspect filesystem path {}: {error}",
+                right_canonical.display()
+            ))
+        })?;
+        Ok(left_metadata.dev() == right_metadata.dev())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::path::Component;
+
+        let left_prefix = left_canonical
+            .components()
+            .find_map(|component| match component {
+                Component::Prefix(prefix) => Some(prefix.as_os_str().to_owned()),
+                _ => None,
+            });
+        let right_prefix = right_canonical
+            .components()
+            .find_map(|component| match component {
+                Component::Prefix(prefix) => Some(prefix.as_os_str().to_owned()),
+                _ => None,
+            });
+        Ok(left_prefix.is_some() && left_prefix == right_prefix)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(false)
+    }
+}
+
+fn validate_segment_scan_page(
+    page: &PrefixScanPage,
+    start_after: Option<&[u8]>,
+    budget: PrefixScanBudget,
+    context: &'static str,
+) -> Result<(), StoreError> {
+    if page.entries.len() > budget.max_entries {
+        return Err(StoreError::LimitExceeded {
+            context,
+            limit: u64::try_from(budget.max_entries).unwrap_or(u64::MAX),
+            actual: u64::try_from(page.entries.len()).unwrap_or(u64::MAX),
+        });
+    }
+    let mut returned_bytes = 0usize;
+    let mut previous = start_after;
+    for (key, value) in &page.entries {
+        if previous.is_some_and(|cursor| key.as_slice() <= cursor) {
+            return Err(StoreError::Backend(format!(
+                "{context} returned non-increasing keys"
+            )));
+        }
+        returned_bytes = returned_bytes
+            .checked_add(scan_entry_bytes(key, value)?)
+            .ok_or_else(|| StoreError::Schema(format!("{context} byte count overflow")))?;
+        previous = Some(key);
+    }
+    if returned_bytes != page.returned_bytes {
+        return Err(StoreError::Backend(format!(
+            "{context} reported {} bytes for {returned_bytes} returned bytes",
+            page.returned_bytes
+        )));
+    }
+    if returned_bytes > budget.max_bytes {
+        return Err(StoreError::LimitExceeded {
+            context,
+            limit: u64::try_from(budget.max_bytes).unwrap_or(u64::MAX),
+            actual: u64::try_from(returned_bytes).unwrap_or(u64::MAX),
+        });
+    }
+    if let Some(continuation) = &page.continuation {
+        let Some((last_key, _)) = page.entries.last() else {
+            return Err(StoreError::Backend(format!(
+                "{context} returned a continuation without progress"
+            )));
+        };
+        if continuation != last_key {
+            return Err(StoreError::Backend(format!(
+                "{context} continuation does not equal its last returned key"
+            )));
+        }
+        if start_after.is_some_and(|cursor| continuation.as_slice() <= cursor) {
+            return Err(StoreError::Backend(format!(
+                "{context} continuation did not advance"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn commit_segment_migration_batch(
@@ -1251,70 +2668,141 @@ fn segment_family_inventory(
     let snapshot = store.snapshot()?;
     let mut inventory = SegmentFamilyInventory::default();
     snapshot.visit_prefix(family, b"", &mut |key, value| {
-        validate_segment_key(family, key)?;
-        match SegmentValueLocator::decode(value).map_err(segment_store_error)? {
-            Some(locator) => {
-                let expected = segmented_kind(family).expect("archive family");
-                if locator.kind != expected {
-                    return Err(StoreError::Schema(format!(
-                        "{} locator has {:?} kind",
-                        family.name(),
-                        locator.kind
-                    )));
-                }
-                inventory.archived_records =
-                    inventory.archived_records.checked_add(1).ok_or_else(|| {
-                        StoreError::Schema("segment inventory record count overflow".to_owned())
-                    })?;
-                inventory.archived_frame_bytes = inventory
-                    .archived_frame_bytes
-                    .checked_add(u64::from(locator.locator.frame_length))
-                    .ok_or_else(|| {
-                        StoreError::Schema("segment inventory frame bytes overflow".to_owned())
-                    })?;
-                inventory.locator_bytes = inventory
-                    .locator_bytes
-                    .checked_add(value.len() as u64)
-                    .ok_or_else(|| {
-                    StoreError::Schema("segment inventory locator bytes overflow".to_owned())
-                })?;
-            }
-            None => {
-                inventory.inline_records =
-                    inventory.inline_records.checked_add(1).ok_or_else(|| {
-                        StoreError::Schema("segment inventory record count overflow".to_owned())
-                    })?;
-                inventory.inline_bytes = inventory
-                    .inline_bytes
-                    .checked_add(value.len() as u64)
-                    .ok_or_else(|| {
-                        StoreError::Schema("segment inventory inline bytes overflow".to_owned())
-                    })?;
-            }
-        }
-        Ok(())
+        accumulate_segment_inventory(&mut inventory, family, key, value).map(|_| ())
     })?;
     Ok(inventory)
 }
 
-fn inline_segment_keys(
-    store: &StoreHandle,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SegmentCompactionInventoryTotals {
+    live_records: u64,
+    live_frame_bytes: u64,
+}
+
+fn segment_family_inventory_bounded<S: ReadSnapshot>(
+    snapshot: &S,
     family: ColumnFamily,
-    prefix: &[u8],
-) -> Result<Vec<Vec<u8>>, StoreError> {
-    let snapshot = store.snapshot()?;
-    let mut keys = Vec::new();
-    snapshot.visit_prefix(family, prefix, &mut |key, value| {
-        validate_segment_key(family, key)?;
-        if SegmentValueLocator::decode(value)
-            .map_err(segment_store_error)?
-            .is_none()
-        {
-            keys.push(key.to_vec());
+    budget: PrefixScanBudget,
+    limits: SegmentCompactionLimits,
+    execution: SegmentCompactionExecutionLimits,
+    totals: &mut SegmentCompactionInventoryTotals,
+) -> Result<SegmentFamilyInventory, StoreError> {
+    let mut inventory = SegmentFamilyInventory::default();
+    let mut continuation = None::<Vec<u8>>;
+    loop {
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction inventory")?;
+        let page = snapshot.scan_prefix_page(family, b"", continuation.as_deref(), budget)?;
+        ensure_segment_compaction_deadline(execution.deadline, "segment compaction inventory")?;
+        validate_segment_scan_page(
+            &page,
+            continuation.as_deref(),
+            budget,
+            "segment compaction inventory",
+        )?;
+        let next = page.continuation.clone();
+        for (key, value) in page.entries {
+            ensure_segment_compaction_deadline(execution.deadline, "segment compaction inventory")?;
+            if let Some(locator) =
+                accumulate_segment_inventory(&mut inventory, family, &key, &value)?
+            {
+                totals.live_records = totals.live_records.checked_add(1).ok_or_else(|| {
+                    StoreError::Schema(
+                        "segment compaction inventory record count overflow".to_owned(),
+                    )
+                })?;
+                totals.live_frame_bytes = totals
+                    .live_frame_bytes
+                    .checked_add(u64::from(locator.locator.frame_length))
+                    .ok_or_else(|| {
+                        StoreError::Schema(
+                            "segment compaction inventory frame byte count overflow".to_owned(),
+                        )
+                    })?;
+                ensure_segment_compaction_limit(
+                    totals.live_records,
+                    limits.max_live_records,
+                    "segment compaction live records",
+                )?;
+                ensure_segment_compaction_limit(
+                    totals.live_frame_bytes,
+                    limits.max_live_frame_bytes,
+                    "segment compaction live frame bytes",
+                )?;
+                ensure_segment_compaction_limit(
+                    totals.live_frame_bytes,
+                    execution.max_physical_output_bytes,
+                    "segment compaction physical output bytes",
+                )?;
+                let publication = segment_compaction_publication_estimate(totals.live_records)?;
+                ensure_segment_compaction_limit(
+                    publication.atomic_locator_bytes,
+                    limits.max_atomic_locator_bytes,
+                    "segment compaction atomic locator bytes",
+                )?;
+                ensure_segment_compaction_limit(
+                    publication.atomic_publication_bytes,
+                    execution.max_atomic_publication_bytes,
+                    "segment compaction atomic publication bytes",
+                )?;
+            }
         }
-        Ok(())
-    })?;
-    Ok(keys)
+        let Some(next) = next else {
+            break;
+        };
+        continuation = Some(next);
+    }
+    Ok(inventory)
+}
+
+fn accumulate_segment_inventory(
+    inventory: &mut SegmentFamilyInventory,
+    family: ColumnFamily,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Option<SegmentValueLocator>, StoreError> {
+    validate_segment_key(family, key)?;
+    match SegmentValueLocator::decode(value).map_err(segment_store_error)? {
+        Some(locator) => {
+            let expected = segmented_kind(family).expect("archive family");
+            if locator.kind != expected {
+                return Err(StoreError::Schema(format!(
+                    "{} locator has {:?} kind",
+                    family.name(),
+                    locator.kind
+                )));
+            }
+            inventory.archived_records =
+                inventory.archived_records.checked_add(1).ok_or_else(|| {
+                    StoreError::Schema("segment inventory record count overflow".to_owned())
+                })?;
+            inventory.archived_frame_bytes = inventory
+                .archived_frame_bytes
+                .checked_add(u64::from(locator.locator.frame_length))
+                .ok_or_else(|| {
+                    StoreError::Schema("segment inventory frame bytes overflow".to_owned())
+                })?;
+            inventory.locator_bytes = inventory
+                .locator_bytes
+                .checked_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    StoreError::Schema("segment inventory locator bytes overflow".to_owned())
+                })?;
+            Ok(Some(locator))
+        }
+        None => {
+            inventory.inline_records =
+                inventory.inline_records.checked_add(1).ok_or_else(|| {
+                    StoreError::Schema("segment inventory record count overflow".to_owned())
+                })?;
+            inventory.inline_bytes = inventory
+                .inline_bytes
+                .checked_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| {
+                    StoreError::Schema("segment inventory inline bytes overflow".to_owned())
+                })?;
+            Ok(None)
+        }
+    }
 }
 
 fn validate_segment_key(family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
@@ -1339,15 +2827,25 @@ impl Store for StoreHandle {
     type Batch = StoreHandleBatch;
 
     fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+        self.ensure_operational()?;
         match self {
             Self::Memory(store) => store
                 .snapshot()
                 .map(|snapshot| StoreHandleSnapshot::Memory(snapshot, PhantomData)),
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(store) => store.snapshot().map(StoreHandleSnapshot::Rocks),
-            Self::Archived { inner, archive } => inner.snapshot().map(|snapshot| {
-                StoreHandleSnapshot::Archived(Box::new(snapshot), Arc::clone(archive))
-            }),
+            Self::Archived { inner, archive, .. } => {
+                // Linearize snapshot creation with segment publication. The
+                // guard is released immediately; the backend snapshot itself
+                // remains immutable and archive reads re-check the fence.
+                let writer = archive.writer().map_err(segment_store_error)?;
+                let snapshot = inner.snapshot()?;
+                drop(writer);
+                Ok(StoreHandleSnapshot::Archived(
+                    Box::new(snapshot),
+                    Arc::clone(archive),
+                ))
+            }
         }
     }
 
@@ -1361,14 +2859,7 @@ impl Store for StoreHandle {
     }
 
     fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
-        match self {
-            Self::Memory(store) => commit_memory_store_handle(store, batch),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => commit_rocks_store_handle(store, batch),
-            Self::Archived { inner, archive } => {
-                commit_archived_store_handle(inner, archive, batch)
-            }
-        }
+        self.commit_with_optional_effect_budget(batch, None)
     }
 }
 
@@ -1422,12 +2913,23 @@ fn commit_archived_store_handle(
     inner: &StoreHandle,
     archive: &SegmentArchive,
     mut batch: StoreHandleBatch,
+    budget: Option<&mut dyn AtomicWriteEffectBudget>,
 ) -> Result<(), StoreError> {
-    let mut payloads = batch.take_archive_payloads()?;
-    if payloads.is_empty() {
+    // Serialize every database publication, including metadata-only batches,
+    // with external segment publication. Once a payload commit fences the
+    // archive, no later batch can slip through the inner backend.
+    let mut writer = archive.writer().map_err(segment_store_error)?;
+    let operation_framing_bytes = budget
+        .as_ref()
+        .map(|budget| budget.operation_framing_bytes());
+    let effects = batch.archive_commit_effects(operation_framing_bytes)?;
+    if effects.payloads == 0 {
         return inner.commit(batch);
     }
-    let mut writer = archive.writer().map_err(segment_store_error)?;
+    if let Some(budget) = budget {
+        budget.charge_additional(effects.total())?;
+    }
+    let mut payloads = batch.take_archive_payloads(effects.payloads)?;
     let prepared = match archive.prepare_locked(&mut writer, &mut payloads) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1462,10 +2964,16 @@ fn commit_archived_store_handle(
         return Err(error);
     }
     if let Err(error) = inner.commit(batch) {
-        archive
-            .rollback_locked(&mut writer)
-            .map_err(segment_store_error)?;
-        return Err(error);
+        // The database may have atomically installed the locators/manifests
+        // even though the write returned an error. Rolling the synced segment
+        // tail back here could therefore destroy committed state. Retain the
+        // bytes, poison this archive instance, and let reopen choose old or new
+        // state from the database manifests.
+        archive.mark_commit_outcome_uncertain();
+        drop(writer);
+        return Err(StoreError::Backend(format!(
+            "segment publication database outcome is uncertain; reopen required: {error}"
+        )));
     }
     writer.commit_prepared(&prepared);
     Ok(())
@@ -1555,6 +3063,38 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
         }
     }
 
+    fn scan_prefix_page(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        budget: PrefixScanBudget,
+    ) -> Result<PrefixScanPage, StoreError> {
+        match self {
+            Self::Memory(snapshot, _) => {
+                snapshot.scan_prefix_page(family, prefix, start_after, budget)
+            }
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(snapshot) => snapshot.scan_prefix_page(family, prefix, start_after, budget),
+            Self::Archived(snapshot, _) if segmented_kind(family).is_none() => {
+                snapshot.scan_prefix_page(family, prefix, start_after, budget)
+            }
+            Self::Archived(snapshot, archive) => {
+                let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
+                let raw = snapshot.scan_prefix_page(family, prefix, start_after, budget)?;
+                let mut page = PrefixScanPage::default();
+                for (key, value) in raw.entries {
+                    let value = resolve_segmented_value(archive, family, &key, value)?;
+                    if !push_bounded_scan_entry(&mut page, &key, &value, budget)? {
+                        return Ok(page);
+                    }
+                }
+                page.continuation = raw.continuation;
+                Ok(page)
+            }
+        }
+    }
+
     fn visit_prefix(
         &self,
         family: ColumnFamily,
@@ -1585,9 +3125,154 @@ pub enum StoreHandleBatch {
     Rocks(RocksBatch),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ArchiveCommitEffects {
+    payloads: usize,
+    extracted_payload_bytes: u64,
+    framed_segment_bytes: u64,
+    locator_publication_bytes: u64,
+    manifest_publication_bytes: u64,
+}
+
+impl ArchiveCommitEffects {
+    fn total(self) -> u64 {
+        self.extracted_payload_bytes
+            .saturating_add(self.framed_segment_bytes)
+            .saturating_add(self.locator_publication_bytes)
+            .saturating_add(self.manifest_publication_bytes)
+    }
+
+    fn add_payload(
+        &mut self,
+        key_bytes: usize,
+        payload_bytes: usize,
+        operation_framing_bytes: u64,
+    ) -> Result<(), StoreError> {
+        self.payloads = self
+            .payloads
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Schema("archive payload count overflow".to_owned()))?;
+        self.extracted_payload_bytes =
+            self.extracted_payload_bytes
+                .saturating_add(atomic_write_operation_charge(
+                    key_bytes,
+                    payload_bytes,
+                    operation_framing_bytes,
+                    ARCHIVE_EXTRACTED_PAYLOAD_COPIES,
+                ));
+        let frame_bytes = u64::try_from(payload_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES);
+        self.framed_segment_bytes =
+            self.framed_segment_bytes
+                .saturating_add(atomic_write_operation_charge_u64(
+                    0,
+                    frame_bytes,
+                    operation_framing_bytes,
+                    ARCHIVE_FRAME_COPIES,
+                ));
+        self.locator_publication_bytes =
+            self.locator_publication_bytes
+                .saturating_add(atomic_write_operation_charge(
+                    key_bytes,
+                    SegmentValueLocator::encoded_len(),
+                    operation_framing_bytes,
+                    ARCHIVE_LOCATOR_PUBLICATION_COPIES,
+                ));
+        Ok(())
+    }
+
+    fn add_manifests(&mut self, operation_framing_bytes: u64) {
+        // Segment manifests have a fixed encoding. Keep the calculation local
+        // to the store format and bind it to `SegmentManifest::encode` in the
+        // regression test so production preflight does not allocate even a
+        // dummy encoding before the budget decision.
+        for key in [BLOCK_SEGMENT_MANIFEST_KEY, UNDO_SEGMENT_MANIFEST_KEY] {
+            self.manifest_publication_bytes =
+                self.manifest_publication_bytes
+                    .saturating_add(atomic_write_operation_charge(
+                        key.len(),
+                        ARCHIVE_MANIFEST_ENCODED_BYTES,
+                        operation_framing_bytes,
+                        ARCHIVE_MANIFEST_PUBLICATION_COPIES,
+                    ));
+        }
+    }
+}
+
+fn atomic_write_operation_charge(
+    key_bytes: usize,
+    value_bytes: usize,
+    operation_framing_bytes: u64,
+    copies: u64,
+) -> u64 {
+    atomic_write_operation_charge_u64(
+        u64::try_from(key_bytes).unwrap_or(u64::MAX),
+        u64::try_from(value_bytes).unwrap_or(u64::MAX),
+        operation_framing_bytes,
+        copies,
+    )
+}
+
+fn atomic_write_operation_charge_u64(
+    key_bytes: u64,
+    value_bytes: u64,
+    operation_framing_bytes: u64,
+    copies: u64,
+) -> u64 {
+    key_bytes
+        .saturating_add(value_bytes)
+        .saturating_add(operation_framing_bytes)
+        .saturating_mul(copies)
+}
+
 impl StoreHandleBatch {
-    fn take_archive_payloads(&mut self) -> Result<Vec<segment::ArchivePayload>, StoreError> {
-        let mut payloads = Vec::new();
+    fn archive_commit_effects(
+        &self,
+        operation_framing_bytes: Option<u64>,
+    ) -> Result<ArchiveCommitEffects, StoreError> {
+        let mut effects = ArchiveCommitEffects::default();
+        let framing = operation_framing_bytes.unwrap_or(0);
+        self.visit_archive_payloads(&mut |_, key, value| {
+            effects.add_payload(key.len(), value.len(), framing)
+        })?;
+        if effects.payloads != 0 && operation_framing_bytes.is_some() {
+            effects.add_manifests(framing);
+        }
+        Ok(effects)
+    }
+
+    fn visit_archive_payloads(
+        &self,
+        visitor: &mut impl FnMut(ColumnFamily, &[u8], &[u8]) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(batch) => {
+                for operation in &batch.operations {
+                    let MemoryOperation::Put { key, value } = operation else {
+                        continue;
+                    };
+                    visit_archive_payload(key.family, &key.key, value, visitor)?;
+                }
+            }
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(batch) => {
+                for operation in &batch.operations {
+                    let RocksOperation::Put { family, key, value } = operation else {
+                        continue;
+                    };
+                    visit_archive_payload(*family, key, value, visitor)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn take_archive_payloads(
+        &mut self,
+        expected_payloads: usize,
+    ) -> Result<Vec<segment::ArchivePayload>, StoreError> {
+        let mut payloads = Vec::with_capacity(expected_payloads);
         match self {
             Self::Memory(batch) => {
                 for operation in &mut batch.operations {
@@ -1606,6 +3291,12 @@ impl StoreHandleBatch {
                     collect_archive_payload(*family, key, value, &mut payloads)?;
                 }
             }
+        }
+        if payloads.len() != expected_payloads {
+            return Err(StoreError::Backend(format!(
+                "archive payload preflight counted {expected_payloads} values but extraction found {}",
+                payloads.len()
+            )));
         }
         Ok(payloads)
     }
@@ -1641,6 +3332,23 @@ impl StoreHandleBatch {
         }
         Ok(())
     }
+}
+
+fn visit_archive_payload(
+    family: ColumnFamily,
+    key: &[u8],
+    value: &[u8],
+    visitor: &mut impl FnMut(ColumnFamily, &[u8], &[u8]) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    if segmented_kind(family).is_none()
+        || SegmentValueLocator::decode(value)
+            .map_err(segment_store_error)?
+            .is_some()
+    {
+        return Ok(());
+    }
+    validate_segment_key(family, key)?;
+    visitor(family, key, value)
 }
 
 fn collect_archive_payload(
@@ -1843,12 +3551,19 @@ enum MemoryOperation {
 #[derive(Clone)]
 pub struct RocksStore {
     db: Arc<rocksdb::DB>,
+    path: PathBuf,
     durability: DurabilityPolicy,
     // Keep both shared caches alive for exactly as long as the DB. Separating
     // large, mostly one-pass block/undo pages prevents them from evicting hot
     // UTXO, name-state, and Urkel point-lookup pages.
     point_cache: rocksdb::Cache,
     bulk_cache: rocksdb::Cache,
+    reopen_required: Arc<AtomicBool>,
+    /// Linearizes snapshot creation and atomic publication without holding a
+    /// lock for the snapshot's subsequent reads.
+    publication_lock: Arc<Mutex<()>>,
+    #[cfg(test)]
+    commit_fault: Arc<AtomicU8>,
 }
 
 #[cfg(feature = "rocksdb-backend")]
@@ -1859,6 +3574,7 @@ impl fmt::Debug for RocksStore {
             .field("durability", &self.durability)
             .field("point_cache_usage", &self.point_cache.get_usage())
             .field("bulk_cache_usage", &self.bulk_cache.get_usage())
+            .field("reopen_required", &self.reopen_required())
             .finish_non_exhaustive()
     }
 }
@@ -1875,6 +3591,7 @@ impl RocksStore {
     ) -> Result<Self, StoreError> {
         use rocksdb::{Cache, ColumnFamilyDescriptor, Options};
 
+        let path = path.as_ref().to_path_buf();
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
@@ -1893,18 +3610,25 @@ impl RocksStore {
             ColumnFamilyDescriptor::new(family.name(), rocks_column_family_options(family, cache))
         });
 
-        let db = rocksdb::DB::open_cf_descriptors(&db_options, path, descriptors)
+        let db = rocksdb::DB::open_cf_descriptors(&db_options, &path, descriptors)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
 
         Ok(Self {
             db: Arc::new(db),
+            path,
             durability,
             point_cache,
             bulk_cache,
+            reopen_required: Arc::new(AtomicBool::new(false)),
+            publication_lock: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            commit_fault: Arc::new(AtomicU8::new(RocksCommitFault::None as u8)),
         })
     }
 
     pub fn create_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), StoreError> {
+        let _publication = self.lock_publication()?;
+        self.ensure_operational()?;
         let checkpoint = rocksdb::checkpoint::Checkpoint::new(&self.db)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
         checkpoint
@@ -1912,10 +3636,67 @@ impl RocksStore {
             .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
+    pub fn reopen_required(&self) -> bool {
+        if self.publication_lock.is_poisoned() {
+            self.mark_commit_outcome_uncertain();
+        }
+        self.reopen_required.load(Ordering::Acquire)
+    }
+
+    fn ensure_operational(&self) -> Result<(), StoreError> {
+        if self.reopen_required() {
+            return Err(StoreError::Backend(
+                "RocksDB publication outcome is uncertain; reopen required".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn lock_publication(&self) -> Result<std::sync::MutexGuard<'_, ()>, StoreError> {
+        match self.publication_lock.lock() {
+            Ok(publication) => Ok(publication),
+            Err(_) => {
+                // The panicking thread may have crossed write_opt before
+                // unwinding. Every clone must report the same fail-stop state.
+                self.mark_commit_outcome_uncertain();
+                Err(StoreError::Backend(
+                    "RocksDB publication lock is poisoned; reopen required".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn mark_commit_outcome_uncertain(&self) {
+        self.reopen_required.store(true, Ordering::Release);
+    }
+
     fn cf(db: &rocksdb::DB, family: ColumnFamily) -> Result<&rocksdb::ColumnFamily, StoreError> {
         db.cf_handle(family.name())
             .ok_or_else(|| StoreError::MissingColumnFamily(family.name()))
     }
+
+    #[cfg(test)]
+    fn inject_next_commit_fault(&self, fault: RocksCommitFault) {
+        self.commit_fault.store(fault as u8, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn take_commit_fault(&self) -> RocksCommitFault {
+        match self.commit_fault.swap(0, Ordering::AcqRel) {
+            1 => RocksCommitFault::BeforeWrite,
+            2 => RocksCommitFault::AfterWrite,
+            _ => RocksCommitFault::None,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "rocksdb-backend"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum RocksCommitFault {
+    None = 0,
+    BeforeWrite = 1,
+    AfterWrite = 2,
 }
 
 #[cfg(feature = "rocksdb-backend")]
@@ -1943,6 +3724,8 @@ impl Store for RocksStore {
     type Batch = RocksBatch;
 
     fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+        let _publication = self.lock_publication()?;
+        self.ensure_operational()?;
         let db = self.db.as_ref();
         Ok(RocksSnapshot {
             db,
@@ -1955,6 +3738,7 @@ impl Store for RocksStore {
     }
 
     fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
+        self.ensure_operational()?;
         let mut write_batch = rocksdb::WriteBatch::default();
 
         for operation in batch.operations {
@@ -1974,9 +3758,37 @@ impl Store for RocksStore {
         options.disable_wal(false);
         options.set_sync(matches!(self.durability, DurabilityPolicy::Sync));
 
-        self.db
-            .write_opt(write_batch, &options)
-            .map_err(|error| StoreError::Backend(error.to_string()))
+        let _publication = self.lock_publication()?;
+        self.ensure_operational()?;
+
+        #[cfg(test)]
+        let fault = self.take_commit_fault();
+        #[cfg(test)]
+        if fault == RocksCommitFault::BeforeWrite {
+            return Err(StoreError::Io(
+                "injected RocksDB failure before atomic write".to_owned(),
+            ));
+        }
+
+        if let Err(error) = self.db.write_opt(write_batch, &options) {
+            // RocksDB's error acknowledgement does not prove that an atomic
+            // WAL/memtable publication is absent. Fence every clone before
+            // releasing the publication lock; reopen establishes the actual
+            // durable sequence.
+            self.mark_commit_outcome_uncertain();
+            return Err(StoreError::Backend(format!(
+                "RocksDB atomic write outcome is uncertain; reopen required: {error}"
+            )));
+        }
+
+        #[cfg(test)]
+        if fault == RocksCommitFault::AfterWrite {
+            self.mark_commit_outcome_uncertain();
+            return Err(StoreError::Io(
+                "injected RocksDB failure after atomic write; reopen required".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2032,6 +3844,37 @@ impl ReadSnapshot for RocksSnapshot<'_> {
         }
 
         Ok(entries)
+    }
+
+    fn scan_prefix_page(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        budget: PrefixScanBudget,
+    ) -> Result<PrefixScanPage, StoreError> {
+        use rocksdb::{Direction, IteratorMode};
+
+        let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
+        let cf = RocksStore::cf(self.db, family)?;
+        let start = start_after.unwrap_or(prefix);
+        let mut page = PrefixScanPage::default();
+        for item in self
+            .snapshot
+            .iterator_cf(cf, IteratorMode::From(start, Direction::Forward))
+        {
+            let (key, value) = item.map_err(|error| StoreError::Backend(error.to_string()))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if start_after.is_some_and(|cursor| key.as_ref() <= cursor) {
+                continue;
+            }
+            if !push_bounded_scan_entry(&mut page, &key, &value, budget)? {
+                break;
+            }
+        }
+        Ok(page)
     }
 
     fn visit_prefix(
@@ -2109,6 +3952,23 @@ pub enum StoreError {
     MissingColumnFamily(&'static str),
     #[error("store I/O failed: {0}")]
     Io(String),
+    #[error("{context} exceeded its resource limit: limit {limit}, actual {actual}")]
+    LimitExceeded {
+        context: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+    #[error(
+        "{context} has insufficient filesystem space: available {available}, required {required} including reserve {reserve}"
+    )]
+    InsufficientSpace {
+        context: &'static str,
+        available: u64,
+        required: u64,
+        reserve: u64,
+    },
+    #[error("{context} exceeded its monotonic deadline")]
+    DeadlineExceeded { context: &'static str },
     #[error("schema mismatch: {0}")]
     Schema(String),
 }
@@ -2118,10 +3978,49 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    const TEST_ATOMIC_WRITE_CONTEXT: &str = "reorganization staged effect bytes";
+    const TEST_ATOMIC_WRITE_FRAMING_BYTES: u64 = 128;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct TestAtomicWriteEffectBudget {
+        consumed: u64,
+        limit: u64,
+    }
+
+    impl AtomicWriteEffectBudget for TestAtomicWriteEffectBudget {
+        fn operation_framing_bytes(&self) -> u64 {
+            TEST_ATOMIC_WRITE_FRAMING_BYTES
+        }
+
+        fn charge_additional(&mut self, additional: u64) -> Result<(), StoreError> {
+            let actual = self.consumed.saturating_add(additional);
+            if actual > self.limit {
+                return Err(StoreError::LimitExceeded {
+                    context: TEST_ATOMIC_WRITE_CONTEXT,
+                    limit: self.limit,
+                    actual,
+                });
+            }
+            self.consumed = actual;
+            Ok(())
+        }
+    }
+
+    fn test_segment_compaction_execution_limits() -> SegmentCompactionExecutionLimits {
+        SegmentCompactionExecutionLimits {
+            minimum_filesystem_reserve_bytes: 0,
+            ..SegmentCompactionExecutionLimits::default()
+        }
+    }
+
     struct CountingSnapshot {
         inner: MemorySnapshot,
         gets: Cell<usize>,
         multi_gets: Cell<usize>,
+        full_scans: Cell<usize>,
+        paged_scans: Cell<usize>,
+        maximum_page_entries: Cell<usize>,
+        maximum_page_bytes: Cell<usize>,
     }
 
     impl CountingSnapshot {
@@ -2130,6 +4029,10 @@ mod tests {
                 inner,
                 gets: Cell::new(0),
                 multi_gets: Cell::new(0),
+                full_scans: Cell::new(0),
+                paged_scans: Cell::new(0),
+                maximum_page_entries: Cell::new(0),
+                maximum_page_bytes: Cell::new(0),
             }
         }
     }
@@ -2154,7 +4057,24 @@ mod tests {
             family: ColumnFamily,
             prefix: &[u8],
         ) -> Result<Vec<ScanEntry>, StoreError> {
+            self.full_scans.set(self.full_scans.get() + 1);
             self.inner.scan_prefix(family, prefix)
+        }
+
+        fn scan_prefix_page(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+            start_after: Option<&[u8]>,
+            budget: PrefixScanBudget,
+        ) -> Result<PrefixScanPage, StoreError> {
+            self.paged_scans.set(self.paged_scans.get() + 1);
+            self.maximum_page_entries
+                .set(self.maximum_page_entries.get().max(budget.max_entries));
+            self.maximum_page_bytes
+                .set(self.maximum_page_bytes.get().max(budget.max_bytes));
+            self.inner
+                .scan_prefix_page(family, prefix, start_after, budget)
         }
     }
 
@@ -2224,6 +4144,68 @@ mod tests {
                 (b"b/2".to_vec(), b"two".to_vec())
             ]
         );
+    }
+
+    #[test]
+    fn prefix_pages_enforce_record_and_byte_budgets_with_exclusive_continuations() {
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        for index in 0..7u8 {
+            batch
+                .put(ColumnFamily::Headers, &[b'p', b'/', index], &[index; 4])
+                .expect("put page fixture");
+        }
+        store.commit(batch).expect("commit page fixture");
+        let snapshot = store.snapshot().expect("snapshot");
+        let budget = PrefixScanBudget {
+            max_entries: 2,
+            max_bytes: 32,
+        };
+        let mut continuation = None::<Vec<u8>>;
+        let mut keys = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let page = snapshot
+                .scan_prefix_page(
+                    ColumnFamily::Headers,
+                    b"p/",
+                    continuation.as_deref(),
+                    budget,
+                )
+                .expect("bounded page");
+            assert!(page.entries.len() <= budget.max_entries);
+            assert!(page.returned_bytes <= budget.max_bytes);
+            keys.extend(page.entries.into_iter().map(|(key, _)| key));
+            pages += 1;
+            let Some(next) = page.continuation else {
+                break;
+            };
+            assert!(continuation
+                .as_ref()
+                .is_none_or(|previous| next > *previous));
+            continuation = Some(next);
+        }
+        assert_eq!(pages, 4);
+        assert_eq!(
+            keys,
+            (0..7u8)
+                .map(|index| vec![b'p', b'/', index])
+                .collect::<Vec<_>>()
+        );
+        assert!(snapshot
+            .scan_prefix_page(
+                ColumnFamily::Headers,
+                b"p/",
+                None,
+                PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: 6,
+                },
+            )
+            .is_err());
+        assert!(snapshot
+            .scan_prefix_page(ColumnFamily::Headers, b"p/", Some(b"other"), budget,)
+            .is_err());
     }
 
     #[test]
@@ -2547,6 +4529,45 @@ mod tests {
             snapshot.get(ColumnFamily::Meta, b"root").expect("root"),
             Some(b"bound".to_vec())
         );
+    }
+
+    #[test]
+    fn snapshot_empty_probe_uses_only_one_record_small_pages() {
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        batch
+            .put(ColumnFamily::Snapshots, b"last-family", b"value")
+            .expect("put marker");
+        store.commit(batch).expect("commit marker");
+        let snapshot = CountingSnapshot::new(store.snapshot().expect("snapshot"));
+
+        assert!(!snapshot_is_empty(&snapshot).expect("probe non-empty snapshot"));
+        assert_eq!(snapshot.full_scans.get(), 0);
+        assert_eq!(snapshot.paged_scans.get(), ColumnFamily::ALL.len());
+        assert_eq!(snapshot.maximum_page_entries.get(), 1);
+        assert_eq!(
+            snapshot.maximum_page_bytes.get(),
+            SNAPSHOT_EMPTY_PROBE_BYTES
+        );
+    }
+
+    #[test]
+    fn snapshot_empty_probe_treats_an_oversize_first_value_as_nonempty() {
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                b"oversize",
+                &vec![0; SNAPSHOT_EMPTY_PROBE_BYTES + 1],
+            )
+            .expect("put oversize marker");
+        store.commit(batch).expect("commit oversize marker");
+        let snapshot = CountingSnapshot::new(store.snapshot().expect("snapshot"));
+
+        assert!(!snapshot_is_empty(&snapshot).expect("probe oversize snapshot"));
+        assert_eq!(snapshot.full_scans.get(), 0);
+        assert_eq!(snapshot.paged_scans.get(), 1);
     }
 
     #[test]
@@ -3039,6 +5060,201 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_available_bytes_is_safe_and_fail_closed() {
+        let directory = std::env::temp_dir();
+        filesystem_available_bytes(&directory).expect("available bytes for existing filesystem");
+        let missing = directory.join(format!("hsrd-missing-capacity-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(matches!(
+            filesystem_available_bytes(&missing),
+            Err(StoreError::Io(message))
+                if message.contains("failed to query available filesystem bytes")
+        ));
+    }
+
+    #[test]
+    fn filesystem_tree_usage_is_bounded_exact_and_symlink_refusing() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hsrd-filesystem-usage-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("level-one/level-two")).expect("usage fixture");
+        std::fs::write(root.join("level-one/level-two/data"), vec![0x5a; 8_192])
+            .expect("usage data");
+        let usage = filesystem_tree_usage_bounded(
+            &root,
+            FilesystemTreeUsageLimits {
+                deadline: Instant::now() + Duration::from_secs(30),
+                ..FilesystemTreeUsageLimits::default()
+            },
+        )
+        .expect("bounded usage");
+        assert_eq!(usage.entries, 4);
+        assert_eq!(usage.files, 1);
+        assert_eq!(usage.directories, 3);
+        assert_eq!(usage.maximum_depth, 3);
+        assert!(usage.apparent_bytes >= 8_192);
+        assert!(usage.allocated_bytes > 0);
+
+        let exact = FilesystemTreeUsageLimits {
+            max_entries: usage.entries,
+            max_depth: usage.maximum_depth,
+            max_apparent_bytes: usage.apparent_bytes,
+            max_allocated_bytes: usage.allocated_bytes,
+            deadline: Instant::now() + Duration::from_secs(30),
+        };
+        assert_eq!(
+            filesystem_tree_usage_bounded(&root, exact).expect("exact usage limits"),
+            usage
+        );
+        assert!(matches!(
+            filesystem_tree_usage_bounded(
+                &root,
+                FilesystemTreeUsageLimits {
+                    max_entries: usage.entries - 1,
+                    ..exact
+                },
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "filesystem tree usage entries",
+                limit,
+                actual,
+            }) if limit == usage.entries - 1 && actual == usage.entries
+        ));
+        assert!(matches!(
+            filesystem_tree_usage_bounded(
+                &root,
+                FilesystemTreeUsageLimits {
+                    max_depth: usage.maximum_depth - 1,
+                    ..exact
+                },
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "filesystem tree usage depth",
+                limit,
+                actual,
+            }) if limit == u64::from(usage.maximum_depth - 1)
+                && actual == u64::from(usage.maximum_depth)
+        ));
+        assert!(matches!(
+            filesystem_tree_usage_bounded(
+                &root,
+                FilesystemTreeUsageLimits {
+                    max_apparent_bytes: usage.apparent_bytes - 1,
+                    ..exact
+                },
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "filesystem tree apparent bytes",
+                limit,
+                actual,
+            }) if limit == usage.apparent_bytes - 1 && actual == usage.apparent_bytes
+        ));
+        assert!(matches!(
+            filesystem_tree_usage_bounded(
+                &root,
+                FilesystemTreeUsageLimits {
+                    max_allocated_bytes: usage.allocated_bytes - 1,
+                    ..exact
+                },
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "filesystem tree allocated bytes",
+                limit,
+                actual,
+            }) if limit == usage.allocated_bytes - 1 && actual == usage.allocated_bytes
+        ));
+        assert!(matches!(
+            filesystem_tree_usage_bounded(
+                &root,
+                FilesystemTreeUsageLimits {
+                    deadline: Instant::now(),
+                    ..exact
+                },
+            ),
+            Err(StoreError::DeadlineExceeded {
+                context: "filesystem tree usage"
+            })
+        ));
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                root.join("level-one/level-two/data"),
+                root.join("linked-data"),
+            )
+            .expect("usage symlink");
+            assert!(matches!(
+                filesystem_tree_usage_bounded(
+                    &root,
+                    FilesystemTreeUsageLimits {
+                        deadline: Instant::now() + Duration::from_secs(30),
+                        ..exact
+                    },
+                ),
+                Err(StoreError::Schema(message)) if message.contains("refusing symlink")
+            ));
+        }
+        std::fs::remove_dir_all(root).expect("remove usage fixture");
+    }
+
+    #[test]
+    fn segment_compaction_capacity_accepts_exact_bounds_and_rejects_one_under() {
+        const SHARED: &str = "test shared filesystem";
+        const PAYLOAD: &str = "test payload filesystem";
+        const ROCKS: &str = "test RocksDB filesystem";
+        assert_eq!(
+            SegmentCompactionExecutionLimits::default().minimum_filesystem_reserve_bytes,
+            10_000_000_000
+        );
+        let request = SegmentCompactionCapacityRequest {
+            payload_output_bytes: 40,
+            rocks_temporary_bytes: 30,
+            reserve: 30,
+            shared_context: SHARED,
+            payload_context: PAYLOAD,
+            rocks_context: ROCKS,
+        };
+
+        ensure_segment_compaction_capacity_values(true, 100, 100, request)
+            .expect("exact shared capacity");
+        assert!(matches!(
+            ensure_segment_compaction_capacity_values(true, 99, 99, request),
+            Err(StoreError::InsufficientSpace {
+                context: SHARED,
+                available: 99,
+                required: 100,
+                reserve: 30,
+            })
+        ));
+
+        ensure_segment_compaction_capacity_values(false, 70, 60, request)
+            .expect("exact split capacity");
+        assert!(matches!(
+            ensure_segment_compaction_capacity_values(false, 69, 60, request),
+            Err(StoreError::InsufficientSpace {
+                context: PAYLOAD,
+                available: 69,
+                required: 70,
+                reserve: 30,
+            })
+        ));
+        assert!(matches!(
+            ensure_segment_compaction_capacity_values(false, 70, 59, request),
+            Err(StoreError::InsufficientSpace {
+                context: ROCKS,
+                available: 59,
+                required: 60,
+                reserve: 30,
+            })
+        ));
+    }
+
+    #[test]
     fn store_handle_dispatches_memory_backend() {
         let store = StoreHandle::memory();
         initialize_schema(&store).expect("schema");
@@ -3048,6 +5264,70 @@ mod tests {
             .get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())
             .expect("get")
             .is_some());
+    }
+
+    #[test]
+    fn effect_budget_is_transparent_for_non_archived_store_handles() {
+        let store = StoreHandle::memory();
+        let mut batch = store.batch();
+        batch
+            .put(ColumnFamily::Meta, b"transparent", b"committed")
+            .expect("stage transparent value");
+        let mut budget = TestAtomicWriteEffectBudget {
+            consumed: 7,
+            limit: 7,
+        };
+        store
+            .commit_with_effect_budget(batch, &mut budget)
+            .expect("commit non-archived batch without an archive charge");
+        assert_eq!(budget.consumed, 7);
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("snapshot")
+                .get(ColumnFamily::Meta, b"transparent")
+                .expect("transparent value"),
+            Some(b"committed".to_vec())
+        );
+    }
+
+    #[test]
+    fn archive_effect_preflight_constants_match_durable_encodings() {
+        let empty_frame = encode_segment_record(&SegmentRecord {
+            kind: SegmentKind::Block,
+            key: [0; 32],
+            hints: Vec::new(),
+            payload: Vec::new(),
+        })
+        .expect("encode empty frame");
+        assert_eq!(
+            u64::try_from(empty_frame.len()).expect("frame overhead"),
+            ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES
+        );
+        assert_eq!(
+            SegmentManifest {
+                generation: 1,
+                active_segment: 2,
+                durable_bytes: 3,
+            }
+            .encode()
+            .len(),
+            ARCHIVE_MANIFEST_ENCODED_BYTES
+        );
+        assert_eq!(
+            SegmentValueLocator {
+                kind: SegmentKind::Undo,
+                locator: SegmentLocator {
+                    generation: 1,
+                    segment: 2,
+                    offset: 3,
+                    frame_length: 4,
+                },
+            }
+            .encode()
+            .len(),
+            SegmentValueLocator::encoded_len()
+        );
     }
 
     #[test]
@@ -3154,6 +5434,143 @@ mod tests {
     }
 
     #[test]
+    fn archived_prefix_pages_bound_resolved_payloads_one_record_at_a_time() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-archive-prefix-page-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let archived = StoreHandle::memory()
+            .with_segment_archive(directory.clone())
+            .expect("attach archive");
+        let first_key = [0x31; 32];
+        let second_key = [0x32; 32];
+        let first_payload = vec![0xa1; 8 * 1024];
+        let second_payload = vec![0xb2; 8 * 1024];
+        let mut batch = archived.batch();
+        batch
+            .put(ColumnFamily::Undo, &first_key, &first_payload)
+            .expect("stage first undo");
+        batch
+            .put(ColumnFamily::Undo, &second_key, &second_payload)
+            .expect("stage second undo");
+        archived.commit(batch).expect("commit archived undos");
+
+        let snapshot = archived.snapshot().expect("archived snapshot");
+        let page_bytes = first_key.len() + first_payload.len();
+        let budget = PrefixScanBudget {
+            max_entries: 1,
+            max_bytes: page_bytes,
+        };
+        let first = snapshot
+            .scan_prefix_page(ColumnFamily::Undo, b"", None, budget)
+            .expect("first resolved page");
+        assert_eq!(first.entries, vec![(first_key.to_vec(), first_payload)]);
+        assert_eq!(first.returned_bytes, page_bytes);
+        assert_eq!(first.continuation, Some(first_key.to_vec()));
+
+        let second = snapshot
+            .scan_prefix_page(
+                ColumnFamily::Undo,
+                b"",
+                first.continuation.as_deref(),
+                budget,
+            )
+            .expect("second resolved page");
+        assert_eq!(second.entries, vec![(second_key.to_vec(), second_payload)]);
+        assert_eq!(second.returned_bytes, page_bytes);
+        assert_eq!(second.continuation, None);
+
+        assert!(matches!(
+            snapshot.scan_prefix_page(
+                ColumnFamily::Undo,
+                b"",
+                None,
+                PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: page_bytes - 1,
+                },
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "prefix scan page bytes",
+                limit,
+                actual,
+            }) if limit == (page_bytes - 1) as u64 && actual == page_bytes as u64
+        ));
+        drop(snapshot);
+        drop(archived);
+        std::fs::remove_dir_all(directory).expect("remove archive page fixture");
+    }
+
+    #[test]
+    fn segment_compaction_default_page_traverses_a_near_max_inline_undo() {
+        const NEAR_MAX_BLOCK_UNDO_BYTES: usize = 32_000_000;
+        const UNDO_KEY_BYTES: usize = 32;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-segment-inline-max-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let raw = StoreHandle::memory();
+        let mut batch = raw.batch();
+        batch
+            .put(
+                ColumnFamily::Undo,
+                &[0x5a; 32],
+                &vec![0; NEAR_MAX_BLOCK_UNDO_BYTES],
+            )
+            .expect("stage near-max inline undo");
+        raw.commit(batch).expect("commit near-max inline undo");
+        let archived = raw
+            .with_segment_archive(directory.clone())
+            .expect("attach archive");
+
+        let exact_page_bytes = NEAR_MAX_BLOCK_UNDO_BYTES + UNDO_KEY_BYTES;
+        assert!(SEGMENT_COMPACTION_DEFAULT_SCAN_BYTES >= exact_page_bytes);
+        let one_record_limits = SegmentCompactionLimits {
+            scan_page_records: 1,
+            scan_page_bytes: exact_page_bytes,
+            ..SegmentCompactionLimits::default()
+        };
+        let plan = archived
+            .plan_segment_archive_compaction_with_execution_limits(
+                one_record_limits,
+                test_segment_compaction_execution_limits(),
+            )
+            .expect("plan through one near-maximum inline undo at the exact page bound");
+        assert_eq!(plan.live_records, 0);
+        assert_eq!(plan.live_frame_bytes, 0);
+        assert_eq!(plan.scan_page_records, 1);
+        assert_eq!(plan.scan_page_bytes, exact_page_bytes);
+        assert!(matches!(
+            archived.plan_segment_archive_compaction_with_execution_limits(
+                SegmentCompactionLimits {
+                    scan_page_bytes: exact_page_bytes - 1,
+                    ..one_record_limits
+                },
+                test_segment_compaction_execution_limits(),
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "prefix scan page bytes",
+                limit,
+                actual,
+            }) if limit == (exact_page_bytes - 1) as u64
+                && actual == exact_page_bytes as u64
+        ));
+
+        drop(archived);
+        std::fs::remove_dir_all(directory).expect("remove near-max inline fixture");
+    }
+
+    #[test]
     fn segment_compaction_rewrites_only_live_locators_and_reclaims_old_generation() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3197,14 +5614,129 @@ mod tests {
         let before = archived.scrub_segment_archive().expect("pre scrub");
         assert_eq!(before.blocks.records, 2);
         assert_eq!(before.undo.records, 2);
+        let limits = SegmentCompactionLimits {
+            scan_page_records: 1,
+            scan_page_bytes: 1_024,
+            ..SegmentCompactionLimits::default()
+        };
+        let execution = test_segment_compaction_execution_limits();
+        let plan = archived
+            .plan_segment_archive_compaction_with_execution_limits(limits, execution)
+            .expect("bounded compaction plan");
+        assert_eq!(plan.live_records, 2);
+        assert!(plan.reclaimable_frame_bytes > 0);
+        let exact_limits = SegmentCompactionLimits {
+            max_live_records: plan.live_records,
+            max_live_frame_bytes: plan.live_frame_bytes,
+            max_atomic_locator_bytes: plan.estimated_atomic_locator_bytes,
+            ..limits
+        };
+        let exact_execution = SegmentCompactionExecutionLimits {
+            max_physical_output_bytes: plan.live_frame_bytes,
+            max_atomic_publication_bytes: plan.estimated_atomic_publication_bytes,
+            ..execution
+        };
+        assert_eq!(
+            archived
+                .plan_segment_archive_compaction_with_execution_limits(
+                    exact_limits,
+                    exact_execution,
+                )
+                .expect("exact compaction ceilings"),
+            plan
+        );
+        assert!(matches!(
+            archived.plan_segment_archive_compaction_with_execution_limits(
+                SegmentCompactionLimits {
+                    max_live_records: 1,
+                    ..limits
+                },
+                execution,
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "segment compaction live records",
+                limit: 1,
+                actual: 2,
+            })
+        ));
+        assert!(matches!(
+            archived.plan_segment_archive_compaction_with_execution_limits(
+                SegmentCompactionLimits {
+                    max_live_frame_bytes: plan.live_frame_bytes - 1,
+                    ..exact_limits
+                },
+                exact_execution,
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "segment compaction live frame bytes",
+                limit,
+                actual,
+            }) if limit == plan.live_frame_bytes - 1 && actual == plan.live_frame_bytes
+        ));
+        assert!(matches!(
+            archived.plan_segment_archive_compaction_with_execution_limits(
+                exact_limits,
+                SegmentCompactionExecutionLimits {
+                    max_atomic_publication_bytes: plan.estimated_atomic_publication_bytes - 1,
+                    ..exact_execution
+                },
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "segment compaction atomic publication bytes",
+                limit,
+                actual,
+            }) if limit == plan.estimated_atomic_publication_bytes - 1
+                && actual == plan.estimated_atomic_publication_bytes
+        ));
+        assert!(matches!(
+            archived.plan_segment_archive_compaction_with_execution_limits(
+                exact_limits,
+                SegmentCompactionExecutionLimits {
+                    max_physical_output_bytes: plan.live_frame_bytes - 1,
+                    ..exact_execution
+                },
+            ),
+            Err(StoreError::LimitExceeded {
+                context: "segment compaction physical output bytes",
+                limit,
+                actual,
+            }) if limit == plan.live_frame_bytes - 1 && actual == plan.live_frame_bytes
+        ));
+        assert_eq!(
+            archived
+                .scrub_segment_archive()
+                .expect("failed plan is read-only"),
+            before
+        );
+        assert!(matches!(
+            archived.plan_segment_archive_compaction_with_execution_limits(
+                limits,
+                SegmentCompactionExecutionLimits {
+                    deadline: Instant::now(),
+                    ..execution
+                },
+            ),
+            Err(StoreError::DeadlineExceeded {
+                context: "segment compaction planning"
+            })
+        ));
+        assert_eq!(
+            archived
+                .scrub_segment_archive()
+                .expect("expired plan is read-only"),
+            before
+        );
         let report = archived
-            .compact_segment_archive()
+            .compact_segment_archive_with_execution_limits(limits, execution)
             .expect("compact segment archive");
         assert_eq!(report.previous_block_generation, 1);
         assert_eq!(report.previous_undo_generation, 1);
         assert_eq!(report.generation, 2);
         assert_eq!(report.live_records, 2);
         assert!(report.reclaimed_frame_bytes > 0);
+        assert_eq!(report.scan_pages, 2);
+        assert_eq!(report.peak_scan_records, 1);
+        assert!(report.peak_scan_bytes <= limits.scan_page_bytes);
 
         let after = archived.scrub_segment_archive().expect("post scrub");
         assert_eq!(after.blocks.records, 1);
@@ -3371,6 +5903,61 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove archive fixture");
     }
 
+    #[test]
+    fn inline_archive_migration_pages_through_a_dense_hash_prefix() {
+        const RECORDS: u16 = 257;
+        const BATCH_RECORDS: usize = 17;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-inline-archive-dense-prefix-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let raw = StoreHandle::memory();
+        let mut batch = raw.batch();
+        for index in 0..RECORDS {
+            let mut key = [0x5a; 32];
+            key[1..3].copy_from_slice(&index.to_be_bytes());
+            batch
+                .put(ColumnFamily::Blocks, &key, &index.to_be_bytes())
+                .expect("stage dense-prefix value");
+        }
+        raw.commit(batch).expect("commit dense-prefix values");
+        let archived = raw
+            .with_segment_archive(directory.clone())
+            .expect("attach archive");
+        let report = archived
+            .migrate_inline_segment_payloads(BATCH_RECORDS)
+            .expect("migrate dense prefix");
+        assert_eq!(report.migrated_records, u64::from(RECORDS));
+        assert_eq!(
+            report.commits,
+            u64::from(RECORDS).div_ceil(BATCH_RECORDS as u64)
+        );
+        let inventory = archived
+            .segment_archive_inventory()
+            .expect("dense-prefix inventory");
+        assert_eq!(inventory.blocks.inline_records, 0);
+        assert_eq!(inventory.blocks.archived_records, u64::from(RECORDS));
+        for index in [0, RECORDS / 2, RECORDS - 1] {
+            let mut key = [0x5a; 32];
+            key[1..3].copy_from_slice(&index.to_be_bytes());
+            assert_eq!(
+                archived
+                    .snapshot()
+                    .expect("snapshot")
+                    .get(ColumnFamily::Blocks, &key)
+                    .expect("resolved value"),
+                Some(index.to_be_bytes().to_vec())
+            );
+        }
+        drop(archived);
+        std::fs::remove_dir_all(directory).expect("remove dense-prefix fixture");
+    }
+
     #[cfg(feature = "rocksdb-backend")]
     #[test]
     fn rocks_store_persists_across_reopen() {
@@ -3467,6 +6054,732 @@ mod tests {
         drop(archived);
         drop(rocks);
         std::fs::remove_dir_all(root).expect("remove rocks archive fixture");
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn archived_rocks_effect_budget_is_exact_and_rejects_before_any_publication() {
+        const INITIAL_CONSUMED: u64 = 4_096;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hsrd-rocks-archive-budget-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let chain_path = root.join("chain");
+        let archive_path = root.join("payloads");
+        let rocks = RocksStore::open(&chain_path).expect("open RocksDB");
+        let archived = StoreHandle::Rocks(rocks.clone())
+            .with_segment_archive(archive_path.clone())
+            .expect("attach archive");
+        let block_key = [0x91; 32];
+        let undo_key = [0x92; 32];
+        let block_payload = vec![0xa1; 4_097];
+        let undo_payload = vec![0xb2; 8_193];
+
+        let segment_lengths = || {
+            std::fs::read_dir(&archive_path)
+                .expect("read archive directory")
+                .map(|entry| {
+                    let entry = entry.expect("archive entry");
+                    let metadata = entry.metadata().expect("archive entry metadata");
+                    (entry.file_name(), metadata.len())
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before_segment_lengths = segment_lengths();
+        let raw_before = rocks.snapshot().expect("raw preflight snapshot");
+        let before_block_manifest = raw_before
+            .get(ColumnFamily::Snapshots, BLOCK_SEGMENT_MANIFEST_KEY)
+            .expect("block manifest read")
+            .expect("block manifest");
+        let before_undo_manifest = raw_before
+            .get(ColumnFamily::Snapshots, UNDO_SEGMENT_MANIFEST_KEY)
+            .expect("undo manifest read")
+            .expect("undo manifest");
+        assert_eq!(
+            raw_before
+                .get(ColumnFamily::Blocks, &block_key)
+                .expect("absent block"),
+            None
+        );
+        assert_eq!(
+            raw_before
+                .get(ColumnFamily::Undo, &undo_key)
+                .expect("absent undo"),
+            None
+        );
+        drop(raw_before);
+
+        let make_batch = || {
+            let mut batch = archived.batch();
+            batch
+                .put(ColumnFamily::Blocks, &block_key, &block_payload)
+                .expect("stage block payload");
+            batch
+                .put(ColumnFamily::Undo, &undo_key, &undo_payload)
+                .expect("stage undo payload");
+            batch
+                .put(ColumnFamily::Meta, b"archive-budget", b"published")
+                .expect("stage metadata");
+            batch
+        };
+        let rejected_batch = make_batch();
+        let effects = rejected_batch
+            .archive_commit_effects(Some(TEST_ATOMIC_WRITE_FRAMING_BYTES))
+            .expect("preflight effects");
+        assert_eq!(effects.payloads, 2);
+
+        let empty_frame = encode_segment_record(&SegmentRecord {
+            kind: SegmentKind::Block,
+            key: [0; 32],
+            hints: Vec::new(),
+            payload: Vec::new(),
+        })
+        .expect("encode empty frame");
+        assert_eq!(
+            u64::try_from(empty_frame.len()).expect("frame overhead"),
+            ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES
+        );
+        let manifest_bytes = SegmentManifest::decode(&before_block_manifest)
+            .expect("decode block manifest")
+            .encode()
+            .len();
+        assert_eq!(
+            SegmentManifest::decode(&before_undo_manifest)
+                .expect("decode undo manifest")
+                .encode()
+                .len(),
+            manifest_bytes
+        );
+        assert_eq!(manifest_bytes, ARCHIVE_MANIFEST_ENCODED_BYTES);
+
+        let expected_operation_charge = |key_bytes: u64, value_bytes: u64, copies: u64| {
+            key_bytes
+                .saturating_add(value_bytes)
+                .saturating_add(TEST_ATOMIC_WRITE_FRAMING_BYTES)
+                .saturating_mul(copies)
+        };
+        let expected_extracted = expected_operation_charge(
+            u64::try_from(block_key.len()).expect("block key length"),
+            u64::try_from(block_payload.len()).expect("block payload length"),
+            ARCHIVE_EXTRACTED_PAYLOAD_COPIES,
+        )
+        .saturating_add(expected_operation_charge(
+            u64::try_from(undo_key.len()).expect("undo key length"),
+            u64::try_from(undo_payload.len()).expect("undo payload length"),
+            ARCHIVE_EXTRACTED_PAYLOAD_COPIES,
+        ));
+        let expected_frames = expected_operation_charge(
+            0,
+            u64::try_from(block_payload.len())
+                .expect("block length")
+                .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES),
+            ARCHIVE_FRAME_COPIES,
+        )
+        .saturating_add(expected_operation_charge(
+            0,
+            u64::try_from(undo_payload.len())
+                .expect("undo length")
+                .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES),
+            ARCHIVE_FRAME_COPIES,
+        ));
+        let expected_locators = expected_operation_charge(
+            u64::try_from(block_key.len()).expect("block key length"),
+            u64::try_from(SegmentValueLocator::encoded_len()).expect("locator length"),
+            ARCHIVE_LOCATOR_PUBLICATION_COPIES,
+        )
+        .saturating_add(expected_operation_charge(
+            u64::try_from(undo_key.len()).expect("undo key length"),
+            u64::try_from(SegmentValueLocator::encoded_len()).expect("locator length"),
+            ARCHIVE_LOCATOR_PUBLICATION_COPIES,
+        ));
+        let expected_manifests = expected_operation_charge(
+            u64::try_from(BLOCK_SEGMENT_MANIFEST_KEY.len()).expect("block manifest key length"),
+            u64::try_from(manifest_bytes).expect("manifest length"),
+            ARCHIVE_MANIFEST_PUBLICATION_COPIES,
+        )
+        .saturating_add(expected_operation_charge(
+            u64::try_from(UNDO_SEGMENT_MANIFEST_KEY.len()).expect("undo manifest key length"),
+            u64::try_from(manifest_bytes).expect("manifest length"),
+            ARCHIVE_MANIFEST_PUBLICATION_COPIES,
+        ));
+        assert_eq!(effects.extracted_payload_bytes, expected_extracted);
+        assert_eq!(effects.framed_segment_bytes, expected_frames);
+        assert_eq!(effects.locator_publication_bytes, expected_locators);
+        assert_eq!(effects.manifest_publication_bytes, expected_manifests);
+        let exact_additional = expected_extracted
+            .saturating_add(expected_frames)
+            .saturating_add(expected_locators)
+            .saturating_add(expected_manifests);
+        assert_eq!(effects.total(), exact_additional);
+        let exact_cumulative = INITIAL_CONSUMED.saturating_add(exact_additional);
+
+        let mut one_short = TestAtomicWriteEffectBudget {
+            consumed: INITIAL_CONSUMED,
+            limit: exact_cumulative - 1,
+        };
+        let error = archived
+            .commit_with_effect_budget(rejected_batch, &mut one_short)
+            .expect_err("one-byte-short budget must reject");
+        assert!(matches!(
+            error,
+            StoreError::LimitExceeded {
+                context: TEST_ATOMIC_WRITE_CONTEXT,
+                limit,
+                actual,
+            } if limit == exact_cumulative - 1 && actual == exact_cumulative
+        ));
+        assert_eq!(one_short.consumed, INITIAL_CONSUMED);
+        assert_eq!(segment_lengths(), before_segment_lengths);
+        let raw_rejected = rocks.snapshot().expect("raw rejected snapshot");
+        assert_eq!(
+            raw_rejected
+                .get(ColumnFamily::Blocks, &block_key)
+                .expect("rejected block"),
+            None
+        );
+        assert_eq!(
+            raw_rejected
+                .get(ColumnFamily::Undo, &undo_key)
+                .expect("rejected undo"),
+            None
+        );
+        assert_eq!(
+            raw_rejected
+                .get(ColumnFamily::Meta, b"archive-budget")
+                .expect("rejected metadata"),
+            None
+        );
+        assert_eq!(
+            raw_rejected
+                .get(ColumnFamily::Snapshots, BLOCK_SEGMENT_MANIFEST_KEY)
+                .expect("rejected block manifest"),
+            Some(before_block_manifest.clone())
+        );
+        assert_eq!(
+            raw_rejected
+                .get(ColumnFamily::Snapshots, UNDO_SEGMENT_MANIFEST_KEY)
+                .expect("rejected undo manifest"),
+            Some(before_undo_manifest.clone())
+        );
+        drop(raw_rejected);
+
+        let mut exact = TestAtomicWriteEffectBudget {
+            consumed: INITIAL_CONSUMED,
+            limit: exact_cumulative,
+        };
+        archived
+            .commit_with_effect_budget(make_batch(), &mut exact)
+            .expect("exact cumulative archive budget");
+        assert_eq!(exact.consumed, exact_cumulative);
+
+        let raw_committed = rocks.snapshot().expect("raw committed snapshot");
+        let raw_block = raw_committed
+            .get(ColumnFamily::Blocks, &block_key)
+            .expect("raw block")
+            .expect("block locator");
+        let raw_undo = raw_committed
+            .get(ColumnFamily::Undo, &undo_key)
+            .expect("raw undo")
+            .expect("undo locator");
+        let block_locator = SegmentValueLocator::decode(&raw_block)
+            .expect("decode block locator")
+            .expect("block locator");
+        let undo_locator = SegmentValueLocator::decode(&raw_undo)
+            .expect("decode undo locator")
+            .expect("undo locator");
+        assert_eq!(
+            u64::from(block_locator.locator.frame_length),
+            u64::try_from(block_payload.len())
+                .expect("block payload length")
+                .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES)
+        );
+        assert_eq!(
+            u64::from(undo_locator.locator.frame_length),
+            u64::try_from(undo_payload.len())
+                .expect("undo payload length")
+                .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES)
+        );
+        let block_path = archive_path.join(format!(
+            "block-g{:016x}-s{:08x}.seg",
+            block_locator.locator.generation, block_locator.locator.segment
+        ));
+        let undo_path = archive_path.join(format!(
+            "undo-g{:016x}-s{:08x}.seg",
+            undo_locator.locator.generation, undo_locator.locator.segment
+        ));
+        assert_eq!(
+            std::fs::metadata(block_path)
+                .expect("committed block segment metadata")
+                .len(),
+            block_locator
+                .locator
+                .offset
+                .saturating_add(u64::from(block_locator.locator.frame_length))
+        );
+        assert_eq!(
+            std::fs::metadata(undo_path)
+                .expect("committed undo segment metadata")
+                .len(),
+            undo_locator
+                .locator
+                .offset
+                .saturating_add(u64::from(undo_locator.locator.frame_length))
+        );
+        assert_eq!(
+            raw_committed
+                .get(ColumnFamily::Meta, b"archive-budget")
+                .expect("committed metadata"),
+            Some(b"published".to_vec())
+        );
+        drop(raw_committed);
+        assert_eq!(
+            archived
+                .snapshot()
+                .expect("resolved committed snapshot")
+                .get(ColumnFamily::Blocks, &block_key)
+                .expect("resolved block"),
+            Some(block_payload)
+        );
+        assert_eq!(
+            archived
+                .snapshot()
+                .expect("resolved committed snapshot")
+                .get(ColumnFamily::Undo, &undo_key)
+                .expect("resolved undo"),
+            Some(undo_payload)
+        );
+
+        drop(archived);
+        drop(rocks);
+        std::fs::remove_dir_all(root).expect("remove RocksDB archive budget fixture");
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_commit_fault_fences_shared_clones_until_true_reopen() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-rocks-publication-fence-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let rocks = RocksStore::open(&path).expect("open rocksdb");
+        let clone = rocks.clone();
+
+        let mut rejected = rocks.batch();
+        rejected
+            .put(ColumnFamily::Meta, b"before-write", b"rejected")
+            .expect("stage before-write fault");
+        rocks.inject_next_commit_fault(RocksCommitFault::BeforeWrite);
+        assert!(rocks.commit(rejected).is_err());
+        assert!(!rocks.reopen_required());
+        assert!(!clone.reopen_required());
+
+        let mut accepted = clone.batch();
+        accepted
+            .put(ColumnFamily::Meta, b"after-before", b"accepted")
+            .expect("stage safe retry");
+        clone
+            .commit(accepted)
+            .expect("commit after known rejection");
+
+        let mut ambiguous = rocks.batch();
+        ambiguous
+            .put(ColumnFamily::Meta, b"after-write", b"committed")
+            .expect("stage after-write fault");
+        rocks.inject_next_commit_fault(RocksCommitFault::AfterWrite);
+        assert!(rocks.commit(ambiguous).is_err());
+        assert!(rocks.reopen_required());
+        assert!(clone.reopen_required());
+        assert!(rocks.snapshot().is_err());
+        assert!(clone
+            .create_checkpoint(path.with_extension("blocked-checkpoint"))
+            .is_err());
+        let mut bypass = clone.batch();
+        bypass
+            .put(ColumnFamily::Meta, b"fenced-bypass", b"rejected")
+            .expect("stage fenced bypass");
+        assert!(clone.commit(bypass).is_err());
+        drop(clone);
+        drop(rocks);
+
+        let reopened = RocksStore::open(&path).expect("truly reopen RocksDB");
+        assert!(!reopened.reopen_required());
+        let snapshot = reopened.snapshot().expect("reopened snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, b"before-write")
+                .expect("rejected value"),
+            None
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, b"after-before")
+                .expect("accepted value"),
+            Some(b"accepted".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, b"after-write")
+                .expect("ambiguous applied value"),
+            Some(b"committed".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, b"fenced-bypass")
+                .expect("fenced bypass value"),
+            None
+        );
+        drop(snapshot);
+        let poison = reopened.clone();
+        assert!(std::thread::spawn(move || {
+            let _publication = poison.publication_lock.lock().expect("publication lock");
+            panic!("inject RocksDB publication-lock poison");
+        })
+        .join()
+        .is_err());
+        assert!(reopened.reopen_required());
+        assert!(reopened.snapshot().is_err());
+        drop(reopened);
+        std::fs::remove_dir_all(path).expect("remove RocksDB fence fixture");
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_segment_publication_faults_recover_the_complete_old_or_new_batch() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hsrd-rocks-segment-fault-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let chain_path = root.join("chain");
+        let rocks = RocksStore::open(&chain_path).expect("open rocksdb");
+        let raw = StoreHandle::Rocks(rocks.clone());
+        let archive_path = root.join("payloads");
+        let archived = raw
+            .clone()
+            .with_segment_archive(archive_path.clone())
+            .expect("attach archive");
+        let retained = [0x81; 32];
+        let rejected = [0x82; 32];
+        let accepted = [0x83; 32];
+        let mut batch = archived.batch();
+        batch
+            .put(ColumnFamily::Blocks, &retained, b"retained")
+            .expect("stage retained");
+        archived.commit(batch).expect("commit retained");
+
+        let mut batch = archived.batch();
+        batch
+            .put(ColumnFamily::Blocks, &rejected, b"must remain absent")
+            .expect("stage rejected");
+        rocks.inject_next_commit_fault(RocksCommitFault::BeforeWrite);
+        assert!(archived.commit(batch).is_err());
+        assert!(archived.reopen_required());
+        assert!(!rocks.reopen_required());
+        assert!(archived.snapshot().is_err());
+        assert!(archived.segment_archive_inventory().is_err());
+        let mut metadata = archived.batch();
+        metadata
+            .put(ColumnFamily::Meta, b"must-not-bypass", b"rejected")
+            .expect("stage fenced metadata");
+        assert!(archived.commit(metadata).is_err());
+        drop(archived);
+
+        let archived = raw
+            .clone()
+            .with_segment_archive(archive_path.clone())
+            .expect("recover old publication");
+        let snapshot = archived.snapshot().expect("old snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &retained)
+                .expect("retained block"),
+            Some(b"retained".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &rejected)
+                .expect("rejected block"),
+            None
+        );
+        drop(snapshot);
+
+        let mut batch = archived.batch();
+        batch
+            .put(ColumnFamily::Blocks, &accepted, b"committed before error")
+            .expect("stage accepted");
+        rocks.inject_next_commit_fault(RocksCommitFault::AfterWrite);
+        assert!(archived.commit(batch).is_err());
+        assert!(archived.reopen_required());
+        assert!(rocks.reopen_required());
+        assert!(raw.reopen_required());
+        assert!(archived.snapshot().is_err());
+        let mut metadata = archived.batch();
+        metadata
+            .put(ColumnFamily::Meta, b"post-write-bypass", b"rejected")
+            .expect("stage post-write metadata");
+        assert!(archived.commit(metadata).is_err());
+        drop(archived);
+        drop(raw);
+        drop(rocks);
+
+        let rocks = RocksStore::open(&chain_path).expect("truly reopen RocksDB");
+        let recovered = StoreHandle::Rocks(rocks.clone())
+            .with_segment_archive(archive_path)
+            .expect("recover committed publication");
+        let snapshot = recovered.snapshot().expect("new snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &retained)
+                .expect("retained block"),
+            Some(b"retained".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &accepted)
+                .expect("accepted block"),
+            Some(b"committed before error".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &rejected)
+                .expect("rejected block"),
+            None
+        );
+        drop(snapshot);
+        drop(recovered);
+        drop(rocks);
+        std::fs::remove_dir_all(root).expect("remove segment fault fixture");
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn compaction_post_write_error_reopens_the_new_generation_without_data_loss() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hsrd-rocks-compaction-fault-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let chain_path = root.join("chain");
+        let rocks = RocksStore::open(&chain_path).expect("open rocksdb");
+        let raw = StoreHandle::Rocks(rocks.clone());
+        let archive_path = root.join("payloads");
+        let archived = raw
+            .clone()
+            .with_segment_archive(archive_path.clone())
+            .expect("attach archive");
+        let live = [0x91; 32];
+        let dead = [0x92; 32];
+        let mut batch = archived.batch();
+        batch
+            .put(ColumnFamily::Blocks, &live, b"live after compaction")
+            .expect("stage live");
+        batch
+            .put(ColumnFamily::Blocks, &dead, b"dead before compaction")
+            .expect("stage dead");
+        archived.commit(batch).expect("commit fixtures");
+        let mut batch = archived.batch();
+        batch
+            .delete(ColumnFamily::Blocks, &dead)
+            .expect("retire dead locator");
+        archived.commit(batch).expect("commit retirement");
+
+        rocks.inject_next_commit_fault(RocksCommitFault::AfterWrite);
+        let error = archived
+            .compact_segment_archive()
+            .expect_err("post-write acknowledgement fault");
+        assert!(error.to_string().contains("outcome is uncertain"));
+        assert!(archived.reopen_required());
+        assert!(raw.reopen_required());
+        assert!(rocks.reopen_required());
+        assert!(archived.snapshot().is_err());
+        assert!(archived.scrub_segment_archive().is_err());
+        let mut metadata = archived.batch();
+        metadata
+            .put(ColumnFamily::Meta, b"compaction-bypass", b"rejected")
+            .expect("stage fenced compaction metadata");
+        assert!(archived.commit(metadata).is_err());
+        drop(archived);
+        drop(raw);
+        drop(rocks);
+
+        let rocks = RocksStore::open(&chain_path).expect("truly reopen RocksDB");
+        let recovered = StoreHandle::Rocks(rocks.clone())
+            .with_segment_archive(archive_path.clone())
+            .expect("recover new generation");
+        let snapshot = recovered.snapshot().expect("recovered snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &live)
+                .expect("live block"),
+            Some(b"live after compaction".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &dead)
+                .expect("dead block"),
+            None
+        );
+        drop(snapshot);
+        assert_eq!(
+            recovered
+                .scrub_segment_archive()
+                .expect("scrub recovered generation")
+                .blocks
+                .records,
+            1
+        );
+        for entry in std::fs::read_dir(&archive_path).expect("read archive") {
+            let name = entry
+                .expect("archive entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            assert!(name.contains("-g0000000000000002-"), "{name}");
+        }
+        drop(recovered);
+        drop(rocks);
+        std::fs::remove_dir_all(root).expect("remove compaction fault fixture");
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn compaction_post_commit_install_poison_fences_and_recovers_new_generation() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hsrd-rocks-compaction-install-fault-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let chain_path = root.join("chain");
+        let rocks = RocksStore::open(&chain_path).expect("open rocksdb");
+        let raw = StoreHandle::Rocks(rocks.clone());
+        let archive_path = root.join("payloads");
+        let archived = raw
+            .clone()
+            .with_segment_archive(archive_path.clone())
+            .expect("attach archive");
+        let live = [0xa1; 32];
+        let mut batch = archived.batch();
+        batch
+            .put(
+                ColumnFamily::Blocks,
+                &live,
+                b"committed replacement generation",
+            )
+            .expect("stage live block");
+        archived.commit(batch).expect("commit live block");
+        let snapshot_before = archived.snapshot().expect("snapshot before compaction");
+
+        let StoreHandle::Archived { archive, .. } = &archived else {
+            panic!("expected archived store");
+        };
+        archive.inject_next_install_reader_poison();
+        let error = archived
+            .compact_segment_archive()
+            .expect_err("post-commit installation poison");
+        let message = error.to_string();
+        assert!(
+            message
+                .contains("database publication committed but archive installation is incomplete"),
+            "{message}"
+        );
+        assert!(message.contains("reopen required"), "{message}");
+        assert!(archived.reopen_required());
+        assert!(!raw.reopen_required());
+        assert!(!rocks.reopen_required());
+        assert!(archived.snapshot().is_err());
+        assert!(snapshot_before.get(ColumnFamily::Blocks, &live).is_err());
+        let mut fenced = archived.batch();
+        fenced
+            .put(ColumnFamily::Meta, b"install-fault-bypass", b"rejected")
+            .expect("stage fenced metadata");
+        assert!(archived.commit(fenced).is_err());
+
+        let names = std::fs::read_dir(&archive_path)
+            .expect("read preserved generations")
+            .map(|entry| {
+                entry
+                    .expect("archive entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        for expected in [
+            "block-g0000000000000001-",
+            "undo-g0000000000000001-",
+            "block-g0000000000000002-",
+            "undo-g0000000000000002-",
+        ] {
+            assert!(
+                names.iter().any(|name| name.contains(expected)),
+                "missing {expected} in {names:?}"
+            );
+        }
+        drop(snapshot_before);
+        drop(archived);
+        drop(raw);
+        drop(rocks);
+
+        let rocks = RocksStore::open(&chain_path).expect("truly reopen RocksDB");
+        let recovered = StoreHandle::Rocks(rocks.clone())
+            .with_segment_archive(archive_path.clone())
+            .expect("recover committed generation");
+        assert!(!recovered.reopen_required());
+        let snapshot = recovered.snapshot().expect("recovered snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &live)
+                .expect("resolved replacement locator"),
+            Some(b"committed replacement generation".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, b"install-fault-bypass")
+                .expect("fenced metadata"),
+            None
+        );
+        drop(snapshot);
+        assert_eq!(
+            recovered
+                .scrub_segment_archive()
+                .expect("scrub recovered generation")
+                .blocks
+                .records,
+            1
+        );
+        for entry in std::fs::read_dir(&archive_path).expect("read recovered archive") {
+            let name = entry
+                .expect("archive entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            assert!(name.contains("-g0000000000000002-"), "{name}");
+        }
+        drop(recovered);
+        drop(rocks);
+        std::fs::remove_dir_all(root).expect("remove compaction install-fault fixture");
     }
 
     #[cfg(feature = "rocksdb-backend")]

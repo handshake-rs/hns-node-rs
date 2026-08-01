@@ -3,7 +3,11 @@ use std::{
     fs::{File, OpenOptions},
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -66,6 +70,10 @@ pub struct SegmentValueLocator {
 }
 
 impl SegmentValueLocator {
+    pub const fn encoded_len() -> usize {
+        SEGMENT_VALUE_BYTES
+    }
+
     pub fn encode(self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(SEGMENT_VALUE_BYTES);
         encoded.extend_from_slice(SEGMENT_VALUE_MAGIC);
@@ -243,6 +251,110 @@ pub struct SegmentArchiveScrub {
     pub undo: SegmentChannelScrub,
 }
 
+pub const SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS: u64 = 4_096;
+pub const SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS: u64 = 20_000_000;
+/// This is the same exact decimal-byte production data-root ceiling, not a
+/// binary GiB conversion or a storage target.
+pub const SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES: u64 = 150_000_000_000;
+pub const SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED: Duration = Duration::from_secs(4 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentArchiveScrubLimits {
+    pub max_segments: u64,
+    pub max_records: u64,
+    pub max_durable_bytes: u64,
+    pub deadline: Instant,
+}
+
+impl Default for SegmentArchiveScrubLimits {
+    fn default() -> Self {
+        let now = Instant::now();
+        Self {
+            max_segments: SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS,
+            max_records: SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS,
+            max_durable_bytes: SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES,
+            deadline: now
+                .checked_add(SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED)
+                .unwrap_or(now),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SegmentArchiveScrubBudget {
+    limits: SegmentArchiveScrubLimits,
+    segments: u64,
+    records: u64,
+    durable_bytes: u64,
+}
+
+impl SegmentArchiveScrubBudget {
+    fn new(limits: SegmentArchiveScrubLimits) -> Result<Self, SegmentError> {
+        let budget = Self {
+            limits,
+            segments: 0,
+            records: 0,
+            durable_bytes: 0,
+        };
+        budget.ensure_deadline()?;
+        Ok(budget)
+    }
+
+    fn ensure_deadline(&self) -> Result<(), SegmentError> {
+        if Instant::now() >= self.limits.deadline {
+            return Err(SegmentError::DeadlineExceeded {
+                context: "segment archive scrub",
+            });
+        }
+        Ok(())
+    }
+
+    fn add_segment(&mut self, durable_bytes: u64) -> Result<(), SegmentError> {
+        self.ensure_deadline()?;
+        self.segments = add_scrub_resource(
+            self.segments,
+            1,
+            self.limits.max_segments,
+            "segment archive scrub segments",
+        )?;
+        self.durable_bytes = add_scrub_resource(
+            self.durable_bytes,
+            durable_bytes,
+            self.limits.max_durable_bytes,
+            "segment archive scrub durable bytes",
+        )?;
+        Ok(())
+    }
+
+    fn add_record(&mut self) -> Result<(), SegmentError> {
+        self.ensure_deadline()?;
+        self.records = add_scrub_resource(
+            self.records,
+            1,
+            self.limits.max_records,
+            "segment archive scrub records",
+        )?;
+        Ok(())
+    }
+}
+
+fn add_scrub_resource(
+    current: u64,
+    additional: u64,
+    limit: u64,
+    context: &'static str,
+) -> Result<u64, SegmentError> {
+    let actual = current.saturating_add(additional);
+    if actual > limit {
+        return Err(SegmentError::ResourceLimit {
+            context,
+            limit,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
 #[derive(Debug)]
 pub struct SegmentAppender {
     file: File,
@@ -385,8 +497,16 @@ pub(crate) struct SegmentArchiveWriter {
 pub struct SegmentArchive {
     directory: PathBuf,
     target_bytes: u64,
+    /// A database write error after segment bytes have been synced can have an
+    /// ambiguous commit outcome, while an installation error after a confirmed
+    /// commit can leave in-process writer/read caches incomplete. In either
+    /// case retain every remaining generation and reject further archive
+    /// access until reopen selects the authoritative manifests.
+    commit_outcome_uncertain: AtomicBool,
     writer: Mutex<SegmentArchiveWriter>,
     readers: Mutex<HashMap<(SegmentKind, u64, u32), Arc<File>>>,
+    #[cfg(all(test, feature = "rocksdb-backend"))]
+    poison_readers_on_install: AtomicBool,
 }
 
 pub(crate) struct SegmentArchiveRewrite {
@@ -412,8 +532,11 @@ impl SegmentArchive {
         Ok(Self {
             directory,
             target_bytes,
+            commit_outcome_uncertain: AtomicBool::new(false),
             writer: Mutex::new(SegmentArchiveWriter { block, undo }),
             readers: Mutex::new(HashMap::new()),
+            #[cfg(all(test, feature = "rocksdb-backend"))]
+            poison_readers_on_install: AtomicBool::new(false),
         })
     }
 
@@ -428,13 +551,59 @@ impl SegmentArchive {
         Ok(Self {
             directory,
             target_bytes: SEGMENT_TARGET_BYTES,
+            commit_outcome_uncertain: AtomicBool::new(false),
             writer: Mutex::new(SegmentArchiveWriter { block, undo }),
             readers: Mutex::new(HashMap::new()),
+            #[cfg(all(test, feature = "rocksdb-backend"))]
+            poison_readers_on_install: AtomicBool::new(false),
         })
     }
 
     pub(crate) fn writer(&self) -> Result<MutexGuard<'_, SegmentArchiveWriter>, SegmentError> {
-        self.writer.lock().map_err(|_| SegmentError::Poisoned)
+        self.ensure_operational()?;
+        let writer = match self.writer.lock() {
+            Ok(writer) => writer,
+            Err(_) => {
+                // A panic while holding the publication mutex may have
+                // interrupted external-file preparation or installation.
+                // Conservatively require reopen instead of leaving authority
+                // active behind a query that still reports healthy.
+                self.mark_commit_outcome_uncertain();
+                return Err(SegmentError::CommitOutcomeUncertain);
+            }
+        };
+        // Close the race with a waiter that observed `false` immediately
+        // before the publisher fenced the archive while holding this mutex.
+        self.ensure_operational()?;
+        Ok(writer)
+    }
+
+    pub(crate) fn reopen_required(&self) -> bool {
+        if self.writer.is_poisoned() {
+            self.mark_commit_outcome_uncertain();
+        }
+        self.commit_outcome_uncertain.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ensure_operational(&self) -> Result<(), SegmentError> {
+        if self.reopen_required() {
+            return Err(SegmentError::CommitOutcomeUncertain);
+        }
+        Ok(())
+    }
+
+    /// Fence this archive after an external-segment publication became
+    /// ambiguous or its confirmed database commit could not be installed in
+    /// process. Recovery must reopen the database, read its atomic manifests,
+    /// and only then remove the non-authoritative generation.
+    pub(crate) fn mark_commit_outcome_uncertain(&self) {
+        self.commit_outcome_uncertain.store(true, Ordering::Release);
+    }
+
+    #[cfg(all(test, feature = "rocksdb-backend"))]
+    pub(crate) fn inject_next_install_reader_poison(&self) {
+        self.poison_readers_on_install
+            .store(true, Ordering::Release);
     }
 
     pub(crate) fn prepare_locked(
@@ -517,19 +686,42 @@ impl SegmentArchive {
         Ok((writer.block.manifest, writer.undo.manifest))
     }
 
-    /// Exhaustively checksum every committed frame. Normal startup deliberately
-    /// performs only bounded active-tail recovery; the offline maintenance path
-    /// invokes this full O(archive) scrub explicitly.
+    /// Exhaustively authenticate every committed frame under the default
+    /// production envelope. Call [`Self::scrub_with_limits`] when one operation
+    /// must share a caller-owned absolute deadline.
     pub fn scrub(&self) -> Result<SegmentArchiveScrub, SegmentError> {
+        self.scrub_with_limits(SegmentArchiveScrubLimits::default())
+    }
+
+    /// Exhaustively authenticate the committed archive under aggregate
+    /// segment, frame, byte, and absolute-deadline limits. The byte and segment
+    /// totals are charged from file metadata before each file is scanned; the
+    /// record limit and deadline are then rechecked for every decoded frame.
+    /// Runtime is `O(committed bytes + frames)` and working memory is bounded
+    /// by one protocol-limited frame.
+    pub fn scrub_with_limits(
+        &self,
+        limits: SegmentArchiveScrubLimits,
+    ) -> Result<SegmentArchiveScrub, SegmentError> {
+        let mut budget = SegmentArchiveScrubBudget::new(limits)?;
         let writer = self.writer()?;
-        Ok(SegmentArchiveScrub {
-            blocks: scrub_archive_channel(
+        budget.ensure_deadline()?;
+        let scrub = SegmentArchiveScrub {
+            blocks: scrub_archive_channel_bounded(
                 &self.directory,
                 SegmentKind::Block,
                 writer.block.manifest,
+                &mut budget,
             )?,
-            undo: scrub_archive_channel(&self.directory, SegmentKind::Undo, writer.undo.manifest)?,
-        })
+            undo: scrub_archive_channel_bounded(
+                &self.directory,
+                SegmentKind::Undo,
+                writer.undo.manifest,
+                &mut budget,
+            )?,
+        };
+        budget.ensure_deadline()?;
+        Ok(scrub)
     }
 
     pub(crate) fn committed_frame_bytes(&self) -> Result<(u64, u64), SegmentError> {
@@ -597,6 +789,7 @@ impl SegmentArchive {
     pub(crate) fn finish_rewrite(
         &self,
         rewrite: &mut SegmentArchiveRewrite,
+        limits: SegmentArchiveScrubLimits,
     ) -> Result<(SegmentManifest, SegmentManifest, SegmentArchiveScrub), SegmentError> {
         let block_manifest = rewrite
             .writer
@@ -615,9 +808,20 @@ impl SegmentArchive {
         rewrite.writer.block.manifest = block_manifest;
         rewrite.writer.undo.manifest = undo_manifest;
         sync_directory(&self.directory)?;
+        let mut budget = SegmentArchiveScrubBudget::new(limits)?;
         let scrub = SegmentArchiveScrub {
-            blocks: scrub_archive_channel(&self.directory, SegmentKind::Block, block_manifest)?,
-            undo: scrub_archive_channel(&self.directory, SegmentKind::Undo, undo_manifest)?,
+            blocks: scrub_archive_channel_bounded(
+                &self.directory,
+                SegmentKind::Block,
+                block_manifest,
+                &mut budget,
+            )?,
+            undo: scrub_archive_channel_bounded(
+                &self.directory,
+                SegmentKind::Undo,
+                undo_manifest,
+                &mut budget,
+            )?,
         };
         Ok((block_manifest, undo_manifest, scrub))
     }
@@ -635,17 +839,48 @@ impl SegmentArchive {
         rewrite: SegmentArchiveRewrite,
     ) -> Result<(), SegmentError> {
         let generation = rewrite.generation;
-        {
-            let mut writer = self.writer()?;
-            *writer = rewrite.writer;
+        let mut writer = match self.writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.mark_commit_outcome_uncertain();
+                return Err(error);
+            }
+        };
+        *writer = rewrite.writer;
+        let installed = (|| {
+            #[cfg(all(test, feature = "rocksdb-backend"))]
+            if self.poison_readers_on_install.swap(false, Ordering::AcqRel) {
+                std::thread::scope(|scope| {
+                    let readers = &self.readers;
+                    let poisoned = scope
+                        .spawn(move || {
+                            let _reader_guard =
+                                readers.lock().expect("reader cache lock before injection");
+                            panic!("inject post-commit reader-cache poison");
+                        })
+                        .join()
+                        .is_err();
+                    assert!(poisoned, "reader-cache poison injection did not panic");
+                });
+            }
+            self.readers
+                .lock()
+                .map_err(|_| SegmentError::Poisoned)?
+                .clear();
+            remove_other_archive_generations(&self.directory, SegmentKind::Block, generation)?;
+            remove_other_archive_generations(&self.directory, SegmentKind::Undo, generation)?;
+            sync_directory(&self.directory)
+        })();
+        if installed.is_err() {
+            // The database already committed the replacement locators and
+            // manifests before this method runs. Any in-process installation
+            // or predecessor-cleanup failure must therefore fence all archive
+            // access before releasing the publication mutex; reopen then
+            // selects the committed generation.
+            self.mark_commit_outcome_uncertain();
         }
-        self.readers
-            .lock()
-            .map_err(|_| SegmentError::Poisoned)?
-            .clear();
-        remove_other_archive_generations(&self.directory, SegmentKind::Block, generation)?;
-        remove_other_archive_generations(&self.directory, SegmentKind::Undo, generation)?;
-        sync_directory(&self.directory)
+        drop(writer);
+        installed
     }
 }
 
@@ -776,25 +1011,40 @@ fn recover_archive_channel(
     })
 }
 
-fn scrub_archive_channel(
+fn scrub_archive_channel_bounded(
     directory: &Path,
     kind: SegmentKind,
     manifest: SegmentManifest,
+    budget: &mut SegmentArchiveScrubBudget,
 ) -> Result<SegmentChannelScrub, SegmentError> {
     let mut scrub = SegmentChannelScrub::default();
     for segment in 0..=manifest.active_segment {
+        budget.ensure_deadline()?;
         let path = archive_file_path(directory, kind, manifest.generation, segment);
-        let inspection = inspect_segment_file(path)?;
+        let metadata = std::fs::metadata(&path).map_err(segment_io)?;
+        if !metadata.is_file() || (segment < manifest.active_segment && metadata.len() == 0) {
+            return Err(SegmentError::InvalidSealedSegment(segment));
+        }
+        if segment == manifest.active_segment && metadata.len() != manifest.durable_bytes {
+            return Err(SegmentError::UncommittedTail {
+                committed: manifest.durable_bytes,
+                actual: metadata.len(),
+                torn: false,
+            });
+        }
+        budget.add_segment(metadata.len())?;
+        let inspection = inspect_segment_file_with_scrub_budget(&path, kind, budget)?;
+        let final_bytes = std::fs::metadata(&path).map_err(segment_io)?.len();
+        if inspection.file_bytes != metadata.len() || final_bytes != inspection.file_bytes {
+            return Err(SegmentError::UncommittedTail {
+                committed: metadata.len(),
+                actual: final_bytes,
+                torn: inspection.torn_tail,
+            });
+        }
         if inspection.torn_tail {
             return Err(SegmentError::CommittedTailNotBoundary {
                 committed: inspection.valid_bytes,
-            });
-        }
-        if segment == manifest.active_segment && inspection.file_bytes != manifest.durable_bytes {
-            return Err(SegmentError::UncommittedTail {
-                committed: manifest.durable_bytes,
-                actual: inspection.file_bytes,
-                torn: false,
             });
         }
         scrub.segments = scrub
@@ -1071,6 +1321,14 @@ fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> Result<
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SegmentError {
+    #[error("{context} exceeded its resource limit: limit {limit}, actual {actual}")]
+    ResourceLimit {
+        context: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+    #[error("{context} exceeded its monotonic deadline")]
+    DeadlineExceeded { context: &'static str },
     #[error("segment frame contains unknown record kind {0}")]
     UnknownKind(u8),
     #[error("segment frame contains {actual} locator hints; maximum is {maximum}")]
@@ -1132,6 +1390,8 @@ pub enum SegmentError {
     CommittedTailNotBoundary { committed: u64 },
     #[error("segment appender is poisoned by an incomplete write")]
     AppenderPoisoned,
+    #[error("segment publication outcome is uncertain; reopen storage before further access")]
+    CommitOutcomeUncertain,
     #[error("segment I/O failed: {0}")]
     Io(String),
 }
@@ -1351,6 +1611,64 @@ pub fn inspect_segment_file(path: impl AsRef<Path>) -> Result<SegmentFileInspect
     inspect_open_segment_file(&mut file)
 }
 
+fn inspect_segment_file_with_scrub_budget(
+    path: impl AsRef<Path>,
+    expected_kind: SegmentKind,
+    budget: &mut SegmentArchiveScrubBudget,
+) -> Result<SegmentFileInspection, SegmentError> {
+    budget.ensure_deadline()?;
+    let mut file = File::open(path).map_err(segment_io)?;
+    let file_bytes = file.metadata().map_err(segment_io)?.len();
+    file.seek(SeekFrom::Start(0)).map_err(segment_io)?;
+    let mut records = 0u64;
+    let mut offset = 0u64;
+    while offset < file_bytes {
+        budget.ensure_deadline()?;
+        let remaining = file_bytes - offset;
+        if remaining < 12 {
+            return Ok(SegmentFileInspection {
+                records,
+                valid_bytes: offset,
+                file_bytes,
+                torn_tail: true,
+            });
+        }
+        let Some(encoded) = read_next_frame(&mut file, remaining)? else {
+            return Ok(SegmentFileInspection {
+                records,
+                valid_bytes: offset,
+                file_bytes,
+                torn_tail: true,
+            });
+        };
+        budget.ensure_deadline()?;
+        let (record, frame_length) = decode_segment_record_ref(&encoded)?;
+        if record.kind != expected_kind {
+            return Err(SegmentError::ValueLocatorKind {
+                expected: expected_kind,
+                actual: record.kind,
+            });
+        }
+        budget.add_record()?;
+        offset = offset
+            .checked_add(
+                u64::try_from(frame_length)
+                    .map_err(|_| SegmentError::LengthOverflow(frame_length))?,
+            )
+            .ok_or(SegmentError::LocatorOverflow)?;
+        records = records
+            .checked_add(1)
+            .ok_or(SegmentError::LengthOverflow(records as usize))?;
+    }
+    budget.ensure_deadline()?;
+    Ok(SegmentFileInspection {
+        records,
+        valid_bytes: offset,
+        file_bytes,
+        torn_tail: false,
+    })
+}
+
 /// Validate the authoritative prefix, then discard any complete-or-torn
 /// uncommitted suffix. The caller supplies `committed_bytes` only from a
 /// checksum-verified manifest loaded from the atomic RocksDB state batch.
@@ -1500,7 +1818,9 @@ fn segment_io(error: std::io::Error) -> SegmentError {
 
 /// Convert arbitrary record locators into a sorted, duplicate-free page plan.
 /// Frames spanning pages add every intersected page. The executor may satisfy
-/// multiple breadth-first node requests from one page read.
+/// multiple breadth-first node requests from one page read. For `L` locators
+/// covering `P` page references and `U` unique pages, the `BTreeSet` plan takes
+/// `O(P log U)` time and `O(U)` memory.
 pub fn plan_segment_page_reads<I>(locators: I) -> Result<Vec<SegmentPageRead>, SegmentError>
 where
     I: IntoIterator<Item = SegmentLocator>,
@@ -1686,6 +2006,29 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_archive_publication_lock_requires_reopen() {
+        let directory = test_file();
+        let _ = std::fs::remove_dir_all(&directory);
+        let archive = Arc::new(
+            SegmentArchive::create_new(directory.clone(), 1).expect("create poisoned archive"),
+        );
+        let poison = Arc::clone(&archive);
+        assert!(std::thread::spawn(move || {
+            let _writer = poison.writer.lock().expect("publication lock");
+            panic!("inject publication-lock poison");
+        })
+        .join()
+        .is_err());
+        assert!(archive.reopen_required());
+        assert!(matches!(
+            archive.writer(),
+            Err(SegmentError::CommitOutcomeUncertain)
+        ));
+        drop(archive);
+        std::fs::remove_dir_all(directory).expect("remove poisoned archive fixture");
+    }
+
+    #[test]
     fn archive_initialization_never_erases_unbound_payloads() {
         let directory = test_file();
         let _ = std::fs::remove_dir_all(&directory);
@@ -1754,6 +2097,63 @@ mod tests {
         let scrub = recovered.scrub().expect("scrub rotated archive");
         assert_eq!(scrub.blocks.segments, 2);
         assert_eq!(scrub.blocks.records, 2);
+        let total_segments = scrub.blocks.segments + scrub.undo.segments;
+        let total_records = scrub.blocks.records + scrub.undo.records;
+        let total_bytes = scrub.blocks.durable_bytes + scrub.undo.durable_bytes;
+        let limits = SegmentArchiveScrubLimits {
+            max_segments: total_segments,
+            max_records: total_records,
+            max_durable_bytes: total_bytes,
+            deadline: Instant::now() + std::time::Duration::from_secs(10),
+        };
+        assert_eq!(
+            recovered
+                .scrub_with_limits(limits)
+                .expect("exact bounded scrub"),
+            scrub
+        );
+        assert!(matches!(
+            recovered.scrub_with_limits(SegmentArchiveScrubLimits {
+                max_segments: total_segments - 1,
+                ..limits
+            }),
+            Err(SegmentError::ResourceLimit {
+                context: "segment archive scrub segments",
+                limit,
+                actual,
+            }) if limit == total_segments - 1 && actual == total_segments
+        ));
+        assert!(matches!(
+            recovered.scrub_with_limits(SegmentArchiveScrubLimits {
+                max_records: total_records - 1,
+                ..limits
+            }),
+            Err(SegmentError::ResourceLimit {
+                context: "segment archive scrub records",
+                limit,
+                actual,
+            }) if limit == total_records - 1 && actual == total_records
+        ));
+        assert!(matches!(
+            recovered.scrub_with_limits(SegmentArchiveScrubLimits {
+                max_durable_bytes: total_bytes - 1,
+                ..limits
+            }),
+            Err(SegmentError::ResourceLimit {
+                context: "segment archive scrub durable bytes",
+                limit,
+                actual,
+            }) if limit == total_bytes - 1 && actual == total_bytes
+        ));
+        assert!(matches!(
+            recovered.scrub_with_limits(SegmentArchiveScrubLimits {
+                deadline: Instant::now(),
+                ..limits
+            }),
+            Err(SegmentError::DeadlineExceeded {
+                context: "segment archive scrub"
+            })
+        ));
         assert_eq!(
             recovered
                 .resolve(SegmentKind::Block, &first_key, &first.encode())

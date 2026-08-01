@@ -1,13 +1,53 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    time::{Duration, Instant},
+};
 
 use hns_primitives::{
     blake2b_256, Block, BlockHash, CompactTarget, Header, Height, Reader, Transaction, Txid,
     Uint256, Writer, HEADER_SIZE, MAX_BLOCK_WEIGHT,
 };
-use hns_store::{ColumnFamily, MetaKey, ReadSnapshot, Store, StoreError, WriteBatch};
+use hns_store::{
+    ColumnFamily, MetaKey, PrefixScanBudget, ReadSnapshot, Store, StoreError, WriteBatch,
+};
 use serde::{Deserialize, Serialize};
+
+const INDEX_LOAD_PAGE_ENTRIES: usize = 4_096;
+const INDEX_LOAD_PAGE_BYTES: usize = 4 * 1024 * 1024;
+const STORED_BLOCK_CACHE_RECORDS: usize = 4_096;
+const MAX_LIVE_HEADER_IMPORT_RECORDS: usize = 2_000;
+const MAX_LIVE_HEADER_CANONICAL_SWITCH: usize = 16_384;
+const MAX_LIVE_CACHE_UPDATE_RECORDS: usize = 1_024;
+const MAX_LIVE_FAILED_BRANCH_RECORDS: usize = 16_384;
+const MAX_LIVE_FAILED_BRANCH_ELAPSED: Duration = Duration::from_secs(30);
+/// Canonical headers scale with chain height. Competing and stale branches do
+/// not: one million resident records leaves substantial mainnet fork headroom
+/// while bounding the extra graph/map footprint well below the 8 GiB
+/// qualification envelope.
+pub const MAX_RESIDENT_ALTERNATE_HEADERS: usize = 1_000_000;
+
+fn bounded_alternate_header_count(
+    total_records: usize,
+    canonical_records: usize,
+    maximum_alternates: usize,
+) -> Result<usize, ChainError> {
+    let alternates = total_records
+        .checked_sub(canonical_records)
+        .ok_or_else(|| {
+            ChainError::Codec("canonical header count exceeds total records".to_owned())
+        })?;
+    if alternates > maximum_alternates {
+        return Err(ChainError::LiveWorkLimit {
+            context: "resident alternate headers",
+            limit: maximum_alternates,
+            actual: alternates,
+        });
+    }
+    Ok(alternates)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChainTip {
@@ -198,7 +238,7 @@ pub struct HeaderRecord {
     pub status: BlockStatus,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockIndexRecord {
     pub hash: BlockHash,
     pub height: Height,
@@ -207,6 +247,39 @@ pub struct BlockIndexRecord {
     pub status: BlockStatus,
     pub tx_count: u32,
     pub validated_at: Option<u64>,
+}
+
+impl Clone for BlockIndexRecord {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        BLOCK_INDEX_RECORD_CLONES.with(|clones| clones.set(clones.get().saturating_add(1)));
+        Self {
+            hash: self.hash,
+            height: self.height,
+            prev_hash: self.prev_hash,
+            chainwork: self.chainwork,
+            status: self.status.clone(),
+            tx_count: self.tx_count,
+            validated_at: self.validated_at,
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static BLOCK_INDEX_RECORD_CLONES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_block_index_record_clone_count() {
+    BLOCK_INDEX_RECORD_CLONES.with(|clones| clones.set(0));
+}
+
+#[cfg(test)]
+fn block_index_record_clone_count() -> usize {
+    BLOCK_INDEX_RECORD_CLONES.with(std::cell::Cell::get)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -546,6 +619,19 @@ pub struct ReorgPlan {
     pub connect: Vec<BlockHash>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReorgPlanLimits {
+    pub maximum_disconnect: usize,
+    pub maximum_connect: usize,
+}
+
+impl ReorgPlanLimits {
+    pub const UNBOUNDED: Self = Self {
+        maximum_disconnect: usize::MAX,
+        maximum_connect: usize::MAX,
+    };
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeaderImport {
     pub header: Header,
@@ -568,7 +654,12 @@ pub fn prepare_header_record(
     }
 
     let (parent_work, failed) = match (request.height, parent) {
-        (0, None) => (Uint256::ZERO, false),
+        (0, None) if request.header.prev_block == BlockHash::ZERO => (Uint256::ZERO, false),
+        (0, None) => {
+            return Err(ChainError::InvalidHeader(
+                "genesis header has a non-zero parent",
+            ));
+        }
         (0, Some(_)) => {
             return Err(ChainError::InvalidHeader(
                 "genesis import unexpectedly has a parent",
@@ -611,6 +702,35 @@ pub fn prepare_header_record(
 pub struct FailedHeaderPlan {
     pub affected: Vec<HeaderRecord>,
     pub best: ChainTip,
+    previous_best: ChainTip,
+    canonical: ReorgPlan,
+}
+
+#[derive(Clone, Debug)]
+pub struct HeaderIndexCacheUpdate {
+    records: Vec<HeaderRecord>,
+    previous_records: Vec<Option<HeaderRecord>>,
+    previous_best: Option<ChainTip>,
+    best: Option<ChainTip>,
+    canonical: ReorgPlan,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum HeaderRecordValidation {
+    #[default]
+    Strict,
+    #[cfg(any(test, feature = "test-fixtures"))]
+    TestFixtures,
+}
+
+impl HeaderRecordValidation {
+    const fn permits_synthetic_roots(self) -> bool {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if matches!(self, Self::TestFixtures) {
+            return true;
+        }
+        false
+    }
 }
 
 pub trait HeaderIndex {
@@ -627,6 +747,19 @@ pub trait HeaderIndex {
         current: &BlockHash,
         candidate: &BlockHash,
     ) -> Result<ReorgPlan, ChainError>;
+
+    fn plan_reorg_bounded(
+        &self,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
+    ) -> Result<ReorgPlan, ChainError>;
+
+    fn plan_reorg_between_bounded(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
+    ) -> Result<ReorgPlan, ChainError>;
 }
 
 pub trait BlockIndex {
@@ -640,11 +773,29 @@ pub struct MemoryHeaderIndex {
     records: HashMap<BlockHash, HeaderRecord>,
     canonical: HashMap<Height, BlockHash>,
     best: Option<ChainTip>,
+    children: HashMap<BlockHash, Vec<BlockHash>>,
+    viable: BTreeSet<(Uint256, Reverse<Height>, Reverse<BlockHash>)>,
+    root_count: usize,
+    validation: HeaderRecordValidation,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBlockIndex {
     records: HashMap<BlockHash, BlockIndexRecord>,
+    record_order: VecDeque<BlockHash>,
+    maximum_records: Option<usize>,
+    alternate_count: usize,
+    failed_count: usize,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockIndexCacheUpdate {
+    expected_generation: u64,
+    next_generation: u64,
+    alternate_count: usize,
+    failed_count: usize,
+    records: Vec<BlockIndexRecord>,
 }
 
 impl MemoryBlockIndex {
@@ -653,25 +804,89 @@ impl MemoryBlockIndex {
     }
 
     pub fn from_records(records: impl IntoIterator<Item = BlockIndexRecord>) -> Self {
+        let mut index = Self::new();
+        for record in records {
+            index
+                .insert_block_record(record)
+                .expect("unbounded memory block index counters cannot overflow");
+        }
+        index
+    }
+
+    fn bounded(maximum_records: usize) -> Self {
+        debug_assert!(maximum_records > 0);
         Self {
-            records: records
-                .into_iter()
-                .map(|record| (record.hash, record))
-                .collect(),
+            maximum_records: Some(maximum_records),
+            ..Self::default()
         }
     }
 
-    pub fn status_counts(&self) -> (usize, usize) {
-        let mut alternates = 0usize;
-        let mut failed = 0usize;
-        for record in self.records.values() {
-            if record.status.failed {
-                failed = failed.saturating_add(1);
-            } else if !record.status.active_chain {
-                alternates = alternates.saturating_add(1);
-            }
+    pub const fn status_counts(&self) -> (usize, usize) {
+        (self.alternate_count, self.failed_count)
+    }
+
+    const fn status_contribution(record: &BlockIndexRecord) -> (usize, usize) {
+        if record.status.failed {
+            (0, 1)
+        } else if !record.status.active_chain {
+            (1, 0)
+        } else {
+            (0, 0)
         }
-        (alternates, failed)
+    }
+
+    fn observe_loaded_record(&mut self, record: BlockIndexRecord) -> Result<(), ChainError> {
+        let (alternate, failed) = Self::status_contribution(&record);
+        self.alternate_count = self
+            .alternate_count
+            .checked_add(alternate)
+            .ok_or_else(|| ChainError::Codec("alternate block counter overflow".to_owned()))?;
+        self.failed_count = self
+            .failed_count
+            .checked_add(failed)
+            .ok_or_else(|| ChainError::Codec("failed block counter overflow".to_owned()))?;
+        self.cache_record(record);
+        Ok(())
+    }
+
+    fn replace_loaded_record(
+        &mut self,
+        previous: Option<&BlockIndexRecord>,
+        record: BlockIndexRecord,
+    ) -> Result<(), ChainError> {
+        let (old_alternate, old_failed) = previous.map(Self::status_contribution).unwrap_or((0, 0));
+        let (new_alternate, new_failed) = Self::status_contribution(&record);
+        let alternate_count = self
+            .alternate_count
+            .checked_sub(old_alternate)
+            .and_then(|count| count.checked_add(new_alternate))
+            .ok_or_else(|| ChainError::Codec("alternate block counter overflow".to_owned()))?;
+        let failed_count = self
+            .failed_count
+            .checked_sub(old_failed)
+            .and_then(|count| count.checked_add(new_failed))
+            .ok_or_else(|| ChainError::Codec("failed block counter overflow".to_owned()))?;
+        self.cache_record(record);
+        self.alternate_count = alternate_count;
+        self.failed_count = failed_count;
+        Ok(())
+    }
+
+    fn cache_record(&mut self, record: BlockIndexRecord) {
+        if !self.records.contains_key(&record.hash) {
+            if self
+                .maximum_records
+                .is_some_and(|maximum| self.records.len() == maximum)
+            {
+                let evicted = self
+                    .record_order
+                    .pop_front()
+                    .expect("bounded block cache order is non-empty at capacity");
+                self.records.remove(&evicted);
+            }
+            self.record_order.push_back(record.hash);
+        }
+        self.records.insert(record.hash, record);
     }
 }
 
@@ -681,14 +896,22 @@ impl BlockIndex for MemoryBlockIndex {
     }
 
     fn insert_block_record(&mut self, record: BlockIndexRecord) -> Result<(), ChainError> {
-        self.records.insert(record.hash, record);
-        Ok(())
+        let previous = self.records.get(&record.hash).cloned();
+        self.replace_loaded_record(previous.as_ref(), record)
     }
 }
 
 impl MemoryHeaderIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(test)]
+    fn new_for_test_fixtures() -> Self {
+        Self {
+            validation: HeaderRecordValidation::TestFixtures,
+            ..Self::default()
+        }
     }
 
     pub fn insert_header(
@@ -705,6 +928,16 @@ impl MemoryHeaderIndex {
     }
 
     fn insert_import(&mut self, request: HeaderImport) -> Result<HeaderRecord, ChainError> {
+        let hash = request.header.hash();
+        if self.records.contains_key(&hash) {
+            return Err(ChainError::DuplicateHeader(hash));
+        }
+        if request.height == 0 && !self.validation.permits_synthetic_roots() && self.root_count != 0
+        {
+            return Err(ChainError::InvalidHeader(
+                "header index already has a genesis root",
+            ));
+        }
         let parent = if request.height == 0 {
             None
         } else {
@@ -715,24 +948,96 @@ impl MemoryHeaderIndex {
             )
         };
         let record = prepare_header_record(&request, parent)?;
+        let projected_total = self
+            .records
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| ChainError::Codec("resident header count overflow".to_owned()))?;
+        bounded_alternate_header_count(
+            projected_total,
+            self.projected_canonical_count(&record)?,
+            MAX_RESIDENT_ALTERNATE_HEADERS,
+        )?;
 
         self.records.insert(record.hash, record.clone());
+        self.index_new_record(&record);
         self.promote_if_best(&record)?;
         Ok(record)
     }
 
     pub fn insert_record(&mut self, record: HeaderRecord) -> Result<(), ChainError> {
-        if record.height == 0 && record.status.failed {
-            return Err(ChainError::FailedGenesis(record.hash));
+        validate_header_record_identity(&record)?;
+        let previous = self.records.get(&record.hash);
+        if record.height == 0
+            && previous.is_none()
+            && !self.validation.permits_synthetic_roots()
+            && self.root_count != 0
+        {
+            return Err(ChainError::InvalidHeader(
+                "header index already has a genesis root",
+            ));
         }
-        if record.height != 0 {
-            let parent = self
-                .records
-                .get(&record.header.prev_block)
-                .ok_or(ChainError::MissingParent(record.header.prev_block))?;
-            if parent.status.failed && !record.status.failed {
-                return Err(ChainError::InconsistentFailureAncestry(record.hash));
+        let parent = if record.height == 0 {
+            None
+        } else {
+            Some(
+                self.records
+                    .get(&record.header.prev_block)
+                    .ok_or(ChainError::MissingParent(record.header.prev_block))?,
+            )
+        };
+        validate_header_record_structure(&record, parent, self.validation)?;
+        if parent.is_some_and(|parent| parent.status.failed && !record.status.failed) {
+            return Err(ChainError::InconsistentFailureAncestry(record.hash));
+        }
+        if previous.is_none() {
+            let projected_total =
+                self.records.len().checked_add(1).ok_or_else(|| {
+                    ChainError::Codec("resident header count overflow".to_owned())
+                })?;
+            bounded_alternate_header_count(
+                projected_total,
+                self.projected_canonical_count(&record)?,
+                MAX_RESIDENT_ALTERNATE_HEADERS,
+            )?;
+        }
+        if let Some(previous) = previous {
+            if previous.height != record.height
+                || previous.chainwork != record.chainwork
+                || previous.header != record.header
+            {
+                return Err(ChainError::Codec(format!(
+                    "replacement header {} changes immutable index fields",
+                    record.hash.to_hex()
+                )));
             }
+            if self
+                .best
+                .as_ref()
+                .is_some_and(|best| best.hash == record.hash)
+                && record.status.failed
+            {
+                return Err(ChainError::FailedBestHeader(record.hash));
+            }
+        }
+
+        if let Some(previous) = previous {
+            if !previous.status.failed {
+                self.viable.remove(&Self::viable_key(previous));
+            }
+        } else if record.height != 0 {
+            self.children
+                .entry(record.header.prev_block)
+                .or_default()
+                .push(record.hash);
+        } else {
+            self.root_count = self
+                .root_count
+                .checked_add(1)
+                .expect("validated header root count cannot overflow");
+        }
+        if !record.status.failed {
+            self.viable.insert(Self::viable_key(&record));
         }
         self.records.insert(record.hash, record.clone());
         self.promote_if_best(&record)
@@ -748,29 +1053,89 @@ impl MemoryHeaderIndex {
         records: impl IntoIterator<Item = HeaderRecord>,
         persisted_best: Option<BlockHash>,
     ) -> Result<Self, ChainError> {
-        let mut index = Self::new();
-        let mut records = records.into_iter().collect::<Vec<_>>();
-        records.sort_by_key(|record| (record.height, record.chainwork, record.hash));
-
+        let mut record_map = HashMap::new();
         for record in records {
-            index.records.insert(record.hash, record);
-        }
-
-        for record in index.records.values() {
-            if record.height == 0 {
-                if record.status.failed {
-                    return Err(ChainError::FailedGenesis(record.hash));
-                }
-                continue;
+            let hash = record.hash;
+            if record_map.insert(hash, record).is_some() {
+                return Err(ChainError::DuplicateHeader(hash));
             }
-            let parent = index
-                .records
-                .get(&record.header.prev_block)
-                .ok_or(ChainError::MissingParent(record.header.prev_block))?;
-            if parent.status.failed && !record.status.failed {
+        }
+        Self::from_record_map_with_best_and_validation(
+            record_map,
+            persisted_best,
+            HeaderRecordValidation::Strict,
+        )
+    }
+
+    fn from_record_map_with_best_and_validation(
+        records: HashMap<BlockHash, HeaderRecord>,
+        persisted_best: Option<BlockHash>,
+        validation: HeaderRecordValidation,
+    ) -> Result<Self, ChainError> {
+        Self::from_record_map_with_best_validation_and_alternate_limit(
+            records,
+            persisted_best,
+            validation,
+            MAX_RESIDENT_ALTERNATE_HEADERS,
+        )
+    }
+
+    fn from_record_map_with_best_validation_and_alternate_limit(
+        records: HashMap<BlockHash, HeaderRecord>,
+        persisted_best: Option<BlockHash>,
+        validation: HeaderRecordValidation,
+        maximum_alternates: usize,
+    ) -> Result<Self, ChainError> {
+        let mut children = HashMap::<BlockHash, Vec<BlockHash>>::new();
+        let mut viable = BTreeSet::new();
+        let mut roots = 0usize;
+        for record in records.values() {
+            validate_header_record_identity(record)?;
+            let parent = if record.height == 0 {
+                roots = roots
+                    .checked_add(1)
+                    .ok_or_else(|| ChainError::Codec("header root count overflow".to_owned()))?;
+                None
+            } else {
+                Some(
+                    records
+                        .get(&record.header.prev_block)
+                        .ok_or(ChainError::MissingParent(record.header.prev_block))?,
+                )
+            };
+            validate_header_record_structure(record, parent, validation)?;
+            if parent.is_some_and(|parent| parent.status.failed && !record.status.failed) {
                 return Err(ChainError::InconsistentFailureAncestry(record.hash));
             }
+            if record.height != 0 {
+                children
+                    .entry(record.header.prev_block)
+                    .or_default()
+                    .push(record.hash);
+            }
+            if !record.status.failed {
+                viable.insert(Self::viable_key(record));
+            }
         }
+        if !records.is_empty() && roots == 0 {
+            return Err(ChainError::InvalidHeader(
+                "header index has no genesis root",
+            ));
+        }
+        if roots > 1 && !validation.permits_synthetic_roots() {
+            return Err(ChainError::InvalidHeader(
+                "header index has multiple genesis roots",
+            ));
+        }
+        let mut index = Self {
+            records,
+            canonical: HashMap::new(),
+            best: None,
+            children,
+            viable,
+            root_count: roots,
+            validation,
+        };
 
         if let Some(best_hash) = persisted_best {
             let best_record = index
@@ -788,23 +1153,52 @@ impl MemoryHeaderIndex {
             {
                 return Err(ChainError::InconsistentBestHeader(best_hash));
             }
-            index.promote(&best_record)?;
+            index.promote_recovery(&best_record)?;
+            index.ensure_alternate_header_budget_with_limit(maximum_alternates)?;
             return Ok(index);
         }
 
-        let mut candidates = index
-            .records
-            .values()
-            .filter(|record| !record.status.failed)
-            .cloned()
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|record| (record.chainwork, record.height, record.hash));
-
-        for record in candidates {
-            index.promote_if_best(&record)?;
+        if let Some(best_record) = index.best_viable_excluding(&HashSet::new()).cloned() {
+            index.promote_recovery(&best_record)?;
         }
 
+        index.ensure_alternate_header_budget_with_limit(maximum_alternates)?;
         Ok(index)
+    }
+
+    fn viable_key(record: &HeaderRecord) -> (Uint256, Reverse<Height>, Reverse<BlockHash>) {
+        (
+            record.chainwork,
+            Reverse(record.height),
+            Reverse(record.hash),
+        )
+    }
+
+    fn index_new_record(&mut self, record: &HeaderRecord) {
+        if record.height != 0 {
+            self.children
+                .entry(record.header.prev_block)
+                .or_default()
+                .push(record.hash);
+        } else {
+            self.root_count = self
+                .root_count
+                .checked_add(1)
+                .expect("validated header root count cannot overflow");
+        }
+        if !record.status.failed {
+            self.viable.insert(Self::viable_key(record));
+        }
+    }
+
+    fn best_viable_excluding(&self, excluded: &HashSet<BlockHash>) -> Option<&HeaderRecord> {
+        self.viable.iter().rev().find_map(|(_, _, Reverse(hash))| {
+            if excluded.contains(hash) {
+                None
+            } else {
+                self.records.get(hash)
+            }
+        })
     }
 
     pub fn canonical_entries(&self) -> Vec<(Height, BlockHash)> {
@@ -815,6 +1209,41 @@ impl MemoryHeaderIndex {
             .collect::<Vec<_>>();
         entries.sort_by_key(|(height, _)| *height);
         entries
+    }
+
+    fn records(&self) -> impl Iterator<Item = &HeaderRecord> {
+        self.records.values()
+    }
+
+    pub fn alternate_header_count(&self) -> usize {
+        self.records.len().saturating_sub(self.canonical.len())
+    }
+
+    fn ensure_alternate_header_budget(&self) -> Result<(), ChainError> {
+        self.ensure_alternate_header_budget_with_limit(MAX_RESIDENT_ALTERNATE_HEADERS)
+    }
+
+    fn ensure_alternate_header_budget_with_limit(
+        &self,
+        maximum_alternates: usize,
+    ) -> Result<(), ChainError> {
+        bounded_alternate_header_count(self.records.len(), self.canonical.len(), maximum_alternates)
+            .map(|_| ())
+    }
+
+    fn projected_canonical_count(&self, candidate: &HeaderRecord) -> Result<usize, ChainError> {
+        let should_promote = !candidate.status.failed
+            && self
+                .best
+                .as_ref()
+                .is_none_or(|best| candidate.chainwork > best.chainwork);
+        if !should_promote {
+            return Ok(self.canonical.len());
+        }
+        usize::try_from(candidate.height)
+            .ok()
+            .and_then(|height| height.checked_add(1))
+            .ok_or_else(|| ChainError::Codec("canonical header count overflow".to_owned()))
     }
 
     fn promote_if_best(&mut self, record: &HeaderRecord) -> Result<(), ChainError> {
@@ -852,7 +1281,7 @@ impl MemoryHeaderIndex {
             return Ok(());
         }
 
-        let path = self.path_to_genesis(record.hash)?;
+        let path = self.path_to_genesis_bounded(record.hash, MAX_LIVE_HEADER_CANONICAL_SWITCH)?;
         self.canonical.clear();
 
         for hash in path.into_iter().rev() {
@@ -875,7 +1304,58 @@ impl MemoryHeaderIndex {
         Ok(())
     }
 
-    fn fail_branch(&mut self, root: BlockHash) -> Result<Vec<HeaderRecord>, ChainError> {
+    /// Reconstruct the complete canonical map once while opening a validated
+    /// durable index. Unlike live peer-triggered branch switching, recovery
+    /// must accept the full u32 height domain and therefore walks decreasing
+    /// heights without materializing an ancestry vector.
+    fn promote_recovery(&mut self, record: &HeaderRecord) -> Result<(), ChainError> {
+        if record.status.failed {
+            return Err(ChainError::FailedBestHeader(record.hash));
+        }
+        self.canonical.clear();
+        let mut current = record;
+        loop {
+            if current.status.failed {
+                return Err(ChainError::InconsistentFailureAncestry(record.hash));
+            }
+            self.canonical.insert(current.height, current.hash);
+            if current.height == 0 {
+                break;
+            }
+            current = self
+                .records
+                .get(&current.header.prev_block)
+                .ok_or(ChainError::MissingHeader(current.header.prev_block))?;
+        }
+        self.best = Some(ChainTip {
+            hash: record.hash,
+            height: record.height,
+            chainwork: record.chainwork,
+        });
+        Ok(())
+    }
+
+    fn failed_branch_plan(&self, root: BlockHash) -> Result<FailedHeaderPlan, ChainError> {
+        let now = Instant::now();
+        self.failed_branch_plan_bounded(
+            root,
+            MAX_LIVE_FAILED_BRANCH_RECORDS,
+            now.checked_add(MAX_LIVE_FAILED_BRANCH_ELAPSED)
+                .unwrap_or(now),
+        )
+    }
+
+    fn failed_branch_plan_bounded(
+        &self,
+        root: BlockHash,
+        maximum_records: usize,
+        deadline: Instant,
+    ) -> Result<FailedHeaderPlan, ChainError> {
+        if Instant::now() >= deadline {
+            return Err(ChainError::LiveWorkDeadline {
+                context: "failed header descendants",
+            });
+        }
         let root_record = self
             .records
             .get(&root)
@@ -884,24 +1364,44 @@ impl MemoryHeaderIndex {
             return Err(ChainError::FailedGenesis(root));
         }
 
-        let mut children = HashMap::<BlockHash, Vec<BlockHash>>::new();
-        for record in self.records.values() {
-            if record.height != 0 {
-                children
-                    .entry(record.header.prev_block)
-                    .or_default()
-                    .push(record.hash);
-            }
+        if maximum_records == 0 {
+            return Err(ChainError::LiveWorkLimit {
+                context: "failed header descendants",
+                limit: 0,
+                actual: 1,
+            });
         }
-
-        let mut affected_hashes = HashSet::new();
+        let mut affected_hashes = HashSet::with_capacity(maximum_records);
+        let mut affected_order = Vec::with_capacity(maximum_records);
         let mut queue = VecDeque::from([root]);
+        let mut enqueued = 1usize;
         while let Some(hash) = queue.pop_front() {
+            if Instant::now() >= deadline {
+                return Err(ChainError::LiveWorkDeadline {
+                    context: "failed header descendants",
+                });
+            }
             if !affected_hashes.insert(hash) {
                 continue;
             }
-            if let Some(descendants) = children.get(&hash) {
-                queue.extend(descendants.iter().copied());
+            affected_order.push(hash);
+            if let Some(descendants) = self.children.get(&hash) {
+                for descendant in descendants {
+                    if Instant::now() >= deadline {
+                        return Err(ChainError::LiveWorkDeadline {
+                            context: "failed header descendants",
+                        });
+                    }
+                    if enqueued == maximum_records {
+                        return Err(ChainError::LiveWorkLimit {
+                            context: "failed header descendants",
+                            limit: maximum_records,
+                            actual: maximum_records.saturating_add(1),
+                        });
+                    }
+                    queue.push_back(*descendant);
+                    enqueued += 1;
+                }
             }
         }
 
@@ -913,45 +1413,587 @@ impl MemoryHeaderIndex {
             return Err(ChainError::FailedActiveHeader(root));
         }
 
-        for hash in &affected_hashes {
-            let record = self
-                .records
-                .get_mut(hash)
-                .ok_or(ChainError::MissingHeader(*hash))?;
-            record.status.failed = true;
-        }
-
-        self.best = None;
-        self.canonical.clear();
-        let mut candidates = self
-            .records
-            .values()
-            .filter(|record| !record.status.failed)
-            .cloned()
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|record| (record.chainwork, record.height, record.hash));
-        for candidate in candidates {
-            self.promote_if_best(&candidate)?;
-        }
-
-        let mut affected = affected_hashes
+        let affected = affected_order
             .into_iter()
             .map(|hash| {
-                self.records
+                let mut record = self
+                    .records
                     .get(&hash)
                     .cloned()
-                    .ok_or(ChainError::MissingHeader(hash))
+                    .ok_or(ChainError::MissingHeader(hash))?;
+                record.status.failed = true;
+                Ok(record)
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        affected.sort_by_key(|record| (record.height, record.hash));
-        Ok(affected)
+            .collect::<Result<Vec<_>, ChainError>>()?;
+
+        let previous_best = self
+            .best
+            .clone()
+            .ok_or(ChainError::MissingBestHeaderBinding)?;
+        let next_best_record = self
+            .best_viable_excluding(&affected_hashes)
+            .cloned()
+            .ok_or(ChainError::MissingBestHeaderBinding)?;
+        let best = ChainTip {
+            hash: next_best_record.hash,
+            height: next_best_record.height,
+            chainwork: next_best_record.chainwork,
+        };
+        let canonical = if previous_best.hash == best.hash {
+            ReorgPlan::default()
+        } else {
+            self.plan_reorg_delta_bounded(
+                &previous_best.hash,
+                &best.hash,
+                ReorgPlanLimits {
+                    maximum_disconnect: MAX_LIVE_HEADER_CANONICAL_SWITCH,
+                    maximum_connect: MAX_LIVE_HEADER_CANONICAL_SWITCH,
+                },
+            )?
+        };
+        let projected_canonical = self
+            .canonical
+            .len()
+            .checked_sub(canonical.disconnect.len())
+            .and_then(|count| count.checked_add(canonical.connect.len()))
+            .ok_or_else(|| ChainError::Codec("canonical header count overflow".to_owned()))?;
+        bounded_alternate_header_count(
+            self.records.len(),
+            projected_canonical,
+            MAX_RESIDENT_ALTERNATE_HEADERS,
+        )?;
+
+        Ok(FailedHeaderPlan {
+            affected,
+            best,
+            previous_best,
+            canonical,
+        })
     }
 
-    fn path_to_genesis(&self, tip: BlockHash) -> Result<Vec<BlockHash>, ChainError> {
+    fn validate_failed_plan(&self, plan: &FailedHeaderPlan) -> Result<(), ChainError> {
+        if self.best.as_ref() != Some(&plan.previous_best) {
+            return Err(ChainError::Codec(
+                "failed-header plan was built against a stale best-header generation".to_owned(),
+            ));
+        }
+        plan.affected
+            .len()
+            .checked_add(plan.canonical.disconnect.len())
+            .and_then(|work| work.checked_add(plan.canonical.connect.len()))
+            .ok_or_else(|| {
+                ChainError::Codec("failed-header plan work count overflow".to_owned())
+            })?;
+
+        for planned in &plan.affected {
+            let current = self
+                .records
+                .get(&planned.hash)
+                .ok_or(ChainError::MissingHeader(planned.hash))?;
+            if current.height != planned.height
+                || current.chainwork != planned.chainwork
+                || current.header != planned.header
+            {
+                return Err(ChainError::Codec(format!(
+                    "failed-header plan record {} changed before publication",
+                    planned.hash.to_hex()
+                )));
+            }
+        }
+        for hash in &plan.canonical.disconnect {
+            let record = self
+                .records
+                .get(hash)
+                .ok_or(ChainError::MissingHeader(*hash))?;
+            if self.canonical.get(&record.height) != Some(hash) {
+                return Err(ChainError::Codec(format!(
+                    "failed-header plan disconnect {} is no longer canonical",
+                    hash.to_hex()
+                )));
+            }
+        }
+        for hash in &plan.canonical.connect {
+            let record = self
+                .records
+                .get(hash)
+                .ok_or(ChainError::MissingHeader(*hash))?;
+            if record.status.failed {
+                return Err(ChainError::InconsistentFailureAncestry(plan.best.hash));
+            }
+        }
+        let best_record = self
+            .records
+            .get(&plan.best.hash)
+            .ok_or(ChainError::MissingHeader(plan.best.hash))?;
+        if best_record.status.failed
+            || best_record.height != plan.best.height
+            || best_record.chainwork != plan.best.chainwork
+        {
+            return Err(ChainError::FailedBestHeader(plan.best.hash));
+        }
+        Ok(())
+    }
+
+    fn apply_validated_failed_plan(&mut self, plan: &FailedHeaderPlan) {
+        debug_assert!(self.validate_failed_plan(plan).is_ok());
+        for planned in &plan.affected {
+            let record = self
+                .records
+                .get_mut(&planned.hash)
+                .expect("failed-header plan was fully validated");
+            if !record.status.failed {
+                self.viable.remove(&Self::viable_key(record));
+            }
+            record.status = planned.status.clone();
+        }
+
+        for hash in &plan.canonical.disconnect {
+            let height = self
+                .records
+                .get(hash)
+                .expect("failed-header plan was fully validated")
+                .height;
+            self.canonical.remove(&height);
+        }
+        for hash in &plan.canonical.connect {
+            let record = self
+                .records
+                .get(hash)
+                .expect("failed-header plan was fully validated");
+            self.canonical.insert(record.height, record.hash);
+        }
+        self.best = Some(plan.best.clone());
+    }
+
+    fn prepare_cache_update(
+        &self,
+        records: &[HeaderRecord],
+    ) -> Result<HeaderIndexCacheUpdate, ChainError> {
+        if records.len() > MAX_LIVE_CACHE_UPDATE_RECORDS {
+            return Err(ChainError::LiveWorkLimit {
+                context: "header cache update records",
+                limit: MAX_LIVE_CACHE_UPDATE_RECORDS,
+                actual: records.len(),
+            });
+        }
+        let mut seen = HashSet::with_capacity(records.len());
+        let mut staged = HashMap::with_capacity(records.len());
+        let mut previous_records = Vec::with_capacity(records.len());
+        for planned in records {
+            validate_header_record_identity(planned)?;
+            if !seen.insert(planned.hash) {
+                return Err(ChainError::DuplicateHeader(planned.hash));
+            }
+            if let Some(current) = self.records.get(&planned.hash) {
+                if current.height != planned.height
+                    || current.chainwork != planned.chainwork
+                    || current.header != planned.header
+                {
+                    return Err(ChainError::Codec(format!(
+                        "header cache update {} changes immutable index fields",
+                        planned.hash.to_hex()
+                    )));
+                }
+                if current.status.failed != planned.status.failed {
+                    return Err(ChainError::Codec(format!(
+                        "header cache update {} changes failure state outside a failure plan",
+                        planned.hash.to_hex()
+                    )));
+                }
+            }
+            previous_records.push(self.records.get(&planned.hash).cloned());
+            staged.insert(planned.hash, planned.clone());
+        }
+
+        let mut roots = self.root_count;
+        for planned in records {
+            if planned.height == 0 && !self.records.contains_key(&planned.hash) {
+                roots = roots
+                    .checked_add(1)
+                    .ok_or_else(|| ChainError::Codec("header root count overflow".to_owned()))?;
+                if roots > 1 && !self.validation.permits_synthetic_roots() {
+                    return Err(ChainError::InvalidHeader(
+                        "header cache update adds a second genesis root",
+                    ));
+                }
+            }
+            let parent = if planned.height == 0 {
+                None
+            } else {
+                Some(
+                    staged
+                        .get(&planned.header.prev_block)
+                        .or_else(|| self.records.get(&planned.header.prev_block))
+                        .ok_or(ChainError::MissingParent(planned.header.prev_block))?,
+                )
+            };
+            validate_header_record_structure(planned, parent, self.validation)?;
+            if parent.is_some_and(|parent| parent.status.failed && !planned.status.failed) {
+                return Err(ChainError::InconsistentFailureAncestry(planned.hash));
+            }
+        }
+
+        let previous_best = self.best.clone();
+        let mut best = previous_best.clone();
+        for planned in records {
+            if planned.status.failed {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|current| planned.chainwork > current.chainwork)
+            {
+                best = Some(ChainTip {
+                    hash: planned.hash,
+                    height: planned.height,
+                    chainwork: planned.chainwork,
+                });
+            }
+        }
+        let canonical = match (&previous_best, &best) {
+            (Some(previous), Some(next)) if previous.hash != next.hash => self
+                .plan_reorg_delta_with_staged_bounded(
+                    &previous.hash,
+                    &next.hash,
+                    &staged,
+                    ReorgPlanLimits {
+                        maximum_disconnect: MAX_LIVE_CACHE_UPDATE_RECORDS,
+                        maximum_connect: MAX_LIVE_CACHE_UPDATE_RECORDS,
+                    },
+                )?,
+            (None, Some(next)) => {
+                let mut connect = Vec::new();
+                let mut current = next.hash;
+                loop {
+                    if connect.len() == MAX_LIVE_CACHE_UPDATE_RECORDS {
+                        return Err(ChainError::LiveWorkLimit {
+                            context: "initial header cache canonical path",
+                            limit: MAX_LIVE_CACHE_UPDATE_RECORDS,
+                            actual: MAX_LIVE_CACHE_UPDATE_RECORDS.saturating_add(1),
+                        });
+                    }
+                    let record = self.staged_record(&staged, &current)?;
+                    if record.status.failed {
+                        return Err(ChainError::InconsistentFailureAncestry(next.hash));
+                    }
+                    connect.push(current);
+                    if record.height == 0 {
+                        break;
+                    }
+                    current = record.header.prev_block;
+                }
+                connect.reverse();
+                ReorgPlan {
+                    disconnect: Vec::new(),
+                    connect,
+                }
+            }
+            _ => ReorgPlan::default(),
+        };
+        let added_records = previous_records
+            .iter()
+            .filter(|previous| previous.is_none())
+            .count();
+        let projected_total = self
+            .records
+            .len()
+            .checked_add(added_records)
+            .ok_or_else(|| ChainError::Codec("resident header count overflow".to_owned()))?;
+        let projected_canonical = self
+            .canonical
+            .len()
+            .checked_sub(canonical.disconnect.len())
+            .and_then(|count| count.checked_add(canonical.connect.len()))
+            .ok_or_else(|| ChainError::Codec("canonical header count overflow".to_owned()))?;
+        bounded_alternate_header_count(
+            projected_total,
+            projected_canonical,
+            MAX_RESIDENT_ALTERNATE_HEADERS,
+        )?;
+        Ok(HeaderIndexCacheUpdate {
+            records: records.to_vec(),
+            previous_records,
+            previous_best,
+            best,
+            canonical,
+        })
+    }
+
+    fn validate_cache_update(&self, update: &HeaderIndexCacheUpdate) -> Result<(), ChainError> {
+        if self.best != update.previous_best {
+            return Err(ChainError::Codec(
+                "header cache update was built against a stale best generation".to_owned(),
+            ));
+        }
+        if update.records.len() != update.previous_records.len() {
+            return Err(ChainError::Codec(
+                "header cache update previous-record cardinality mismatch".to_owned(),
+            ));
+        }
+        for (planned, previous) in update.records.iter().zip(&update.previous_records) {
+            if self.records.get(&planned.hash) != previous.as_ref() {
+                return Err(ChainError::Codec(format!(
+                    "header cache update {} was built against stale record state",
+                    planned.hash.to_hex()
+                )));
+            }
+        }
+        for hash in &update.canonical.disconnect {
+            let record = self
+                .records
+                .get(hash)
+                .ok_or(ChainError::MissingHeader(*hash))?;
+            if self.canonical.get(&record.height) != Some(hash) {
+                return Err(ChainError::Codec(format!(
+                    "header cache disconnect {} is no longer canonical",
+                    hash.to_hex()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_validated_cache_update(&mut self, update: HeaderIndexCacheUpdate) {
+        debug_assert!(self.validate_cache_update(&update).is_ok());
+        for planned in &update.records {
+            if let Some(current) = self.records.get_mut(&planned.hash) {
+                current.status = planned.status.clone();
+            } else {
+                self.records.insert(planned.hash, planned.clone());
+                self.index_new_record(planned);
+            }
+        }
+        for hash in &update.canonical.disconnect {
+            let height = self
+                .records
+                .get(hash)
+                .expect("prepared cache disconnect record exists")
+                .height;
+            self.canonical.remove(&height);
+        }
+        for hash in &update.canonical.connect {
+            let record = self
+                .records
+                .get(hash)
+                .expect("prepared cache connect record exists");
+            self.canonical.insert(record.height, record.hash);
+        }
+        self.best = update.best;
+    }
+
+    fn staged_record<'a>(
+        &'a self,
+        staged: &'a HashMap<BlockHash, HeaderRecord>,
+        hash: &BlockHash,
+    ) -> Result<&'a HeaderRecord, ChainError> {
+        staged
+            .get(hash)
+            .or_else(|| self.records.get(hash))
+            .ok_or(ChainError::MissingHeader(*hash))
+    }
+
+    fn plan_reorg_delta_with_staged_bounded(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+        staged: &HashMap<BlockHash, HeaderRecord>,
+        limits: ReorgPlanLimits,
+    ) -> Result<ReorgPlan, ChainError> {
+        if current == candidate {
+            return Ok(ReorgPlan::default());
+        }
+        let mut old = self.staged_record(staged, current)?.clone();
+        let mut new = self.staged_record(staged, candidate)?.clone();
+        let mut disconnect = Vec::new();
+        let mut connect_reverse = Vec::new();
+        while old.height > new.height {
+            push_reorg_hash(
+                &mut disconnect,
+                old.hash,
+                limits.maximum_disconnect,
+                "disconnect",
+            )?;
+            old = self.staged_record(staged, &old.header.prev_block)?.clone();
+        }
+        while new.height > old.height {
+            push_reorg_hash(
+                &mut connect_reverse,
+                new.hash,
+                limits.maximum_connect,
+                "connect",
+            )?;
+            new = self.staged_record(staged, &new.header.prev_block)?.clone();
+        }
+        while old.hash != new.hash {
+            if old.height == 0 || new.height == 0 {
+                if self.validation.permits_synthetic_roots() && old.height == 0 && new.height == 0 {
+                    push_reorg_hash(
+                        &mut disconnect,
+                        old.hash,
+                        limits.maximum_disconnect,
+                        "disconnect",
+                    )?;
+                    push_reorg_hash(
+                        &mut connect_reverse,
+                        new.hash,
+                        limits.maximum_connect,
+                        "connect",
+                    )?;
+                    break;
+                }
+                return Err(ChainError::NoCommonAncestor {
+                    current: *current,
+                    candidate: *candidate,
+                });
+            }
+            push_reorg_hash(
+                &mut disconnect,
+                old.hash,
+                limits.maximum_disconnect,
+                "disconnect",
+            )?;
+            push_reorg_hash(
+                &mut connect_reverse,
+                new.hash,
+                limits.maximum_connect,
+                "connect",
+            )?;
+            old = self.staged_record(staged, &old.header.prev_block)?.clone();
+            new = self.staged_record(staged, &new.header.prev_block)?.clone();
+        }
+        connect_reverse.reverse();
+        Ok(ReorgPlan {
+            disconnect,
+            connect: connect_reverse,
+        })
+    }
+
+    #[cfg(test)]
+    fn fail_branch(&mut self, root: BlockHash) -> Result<Vec<HeaderRecord>, ChainError> {
+        let plan = self.failed_branch_plan(root)?;
+        self.validate_failed_plan(&plan)?;
+        self.apply_validated_failed_plan(&plan);
+        Ok(plan.affected)
+    }
+
+    fn plan_reorg_delta_bounded(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
+    ) -> Result<ReorgPlan, ChainError> {
+        if current == candidate {
+            return Ok(ReorgPlan::default());
+        }
+
+        let mut old = self
+            .records
+            .get(current)
+            .cloned()
+            .ok_or(ChainError::MissingHeader(*current))?;
+        let mut new = self
+            .records
+            .get(candidate)
+            .cloned()
+            .ok_or(ChainError::MissingHeader(*candidate))?;
+        let mut disconnect = Vec::new();
+        let mut connect_reverse = Vec::new();
+
+        while old.height > new.height {
+            push_reorg_hash(
+                &mut disconnect,
+                old.hash,
+                limits.maximum_disconnect,
+                "disconnect",
+            )?;
+            old = self
+                .records
+                .get(&old.header.prev_block)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(old.header.prev_block))?;
+        }
+        while new.height > old.height {
+            push_reorg_hash(
+                &mut connect_reverse,
+                new.hash,
+                limits.maximum_connect,
+                "connect",
+            )?;
+            new = self
+                .records
+                .get(&new.header.prev_block)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(new.header.prev_block))?;
+        }
+        while old.hash != new.hash {
+            if old.height == 0 || new.height == 0 {
+                if self.validation.permits_synthetic_roots() && old.height == 0 && new.height == 0 {
+                    push_reorg_hash(
+                        &mut disconnect,
+                        old.hash,
+                        limits.maximum_disconnect,
+                        "disconnect",
+                    )?;
+                    push_reorg_hash(
+                        &mut connect_reverse,
+                        new.hash,
+                        limits.maximum_connect,
+                        "connect",
+                    )?;
+                    break;
+                }
+                return Err(ChainError::NoCommonAncestor {
+                    current: *current,
+                    candidate: *candidate,
+                });
+            }
+            push_reorg_hash(
+                &mut disconnect,
+                old.hash,
+                limits.maximum_disconnect,
+                "disconnect",
+            )?;
+            old = self
+                .records
+                .get(&old.header.prev_block)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(old.header.prev_block))?;
+            push_reorg_hash(
+                &mut connect_reverse,
+                new.hash,
+                limits.maximum_connect,
+                "connect",
+            )?;
+            new = self
+                .records
+                .get(&new.header.prev_block)
+                .cloned()
+                .ok_or(ChainError::MissingHeader(new.header.prev_block))?;
+        }
+
+        connect_reverse.reverse();
+        Ok(ReorgPlan {
+            disconnect,
+            connect: connect_reverse,
+        })
+    }
+
+    fn path_to_genesis_bounded(
+        &self,
+        tip: BlockHash,
+        maximum_records: usize,
+    ) -> Result<Vec<BlockHash>, ChainError> {
         let mut path = Vec::new();
         let mut current = tip;
 
         loop {
+            if path.len() == maximum_records {
+                return Err(ChainError::LiveWorkLimit {
+                    context: "canonical header path",
+                    limit: maximum_records,
+                    actual: maximum_records.saturating_add(1),
+                });
+            }
             let record = self
                 .records
                 .get(&current)
@@ -980,8 +2022,32 @@ impl<S: Store> StoredHeaderIndex<S> {
         Ok(Self { store, memory })
     }
 
+    /// Explicit synthetic-chain recovery for development fixtures. Production
+    /// constructors remain strict even when this non-default feature is built.
+    #[cfg(feature = "test-fixtures")]
+    pub fn new_for_test_fixtures(store: S) -> Result<Self, ChainError> {
+        hns_store::initialize_schema(&store)?;
+        let memory =
+            load_header_index_with_validation(&store, HeaderRecordValidation::TestFixtures)?;
+        Ok(Self { store, memory })
+    }
+
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    /// Iterate the complete resident header graph without cloning it. Recovery
+    /// callers can validate bounded ancestry without database point reads.
+    pub fn records(&self) -> impl Iterator<Item = &HeaderRecord> {
+        self.memory.records()
+    }
+
+    pub fn alternate_header_count(&self) -> usize {
+        self.memory.alternate_header_count()
+    }
+
+    pub const fn alternate_header_capacity(&self) -> usize {
+        MAX_RESIDENT_ALTERNATE_HEADERS
     }
 
     pub fn import_header(&mut self, request: HeaderImport) -> Result<HeaderRecord, ChainError> {
@@ -1000,6 +2066,13 @@ impl<S: Store> StoredHeaderIndex<S> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        if requests.len() > MAX_LIVE_HEADER_IMPORT_RECORDS {
+            return Err(ChainError::LiveWorkLimit {
+                context: "header import records",
+                limit: MAX_LIVE_HEADER_IMPORT_RECORDS,
+                actual: requests.len(),
+            });
+        }
 
         // Build a compact staged view. Cloning the complete historical index
         // for every bounded network slice would make initial header sync
@@ -1010,10 +2083,21 @@ impl<S: Store> StoredHeaderIndex<S> {
         let mut canonical_appends = Vec::with_capacity(requests.len());
         let mut staged = HashMap::<BlockHash, HeaderRecord>::with_capacity(requests.len());
         let mut records = Vec::with_capacity(requests.len());
+        let mut roots = self.memory.root_count;
         for request in requests {
             let hash = request.header.hash();
             if self.memory.records.contains_key(&hash) || staged.contains_key(&hash) {
                 return Err(ChainError::DuplicateHeader(hash));
+            }
+            if request.height == 0 {
+                roots = roots
+                    .checked_add(1)
+                    .ok_or_else(|| ChainError::Codec("header root count overflow".to_owned()))?;
+                if roots > 1 && !self.memory.validation.permits_synthetic_roots() {
+                    return Err(ChainError::InvalidHeader(
+                        "header import adds a second genesis root",
+                    ));
+                }
             }
             let parent = if request.height == 0 {
                 None
@@ -1056,27 +2140,49 @@ impl<S: Store> StoredHeaderIndex<S> {
 
         let best = next_best.ok_or(ChainError::MissingBestHeaderBinding)?;
         let best_changed = original_best.as_ref() != Some(&best);
-        let canonical_replacement = if best_changed && !direct_extension {
-            let mut canonical = HashMap::new();
-            let mut current = best.hash;
-            loop {
-                let record = staged
-                    .get(&current)
-                    .or_else(|| self.memory.records.get(&current))
-                    .ok_or(ChainError::MissingHeader(current))?;
-                if record.status.failed {
-                    return Err(ChainError::InconsistentFailureAncestry(best.hash));
-                }
-                canonical.insert(record.height, record.hash);
-                if record.height == 0 {
-                    break;
-                }
-                current = record.header.prev_block;
-            }
-            Some(canonical)
+        let canonical_delta = if best_changed && !direct_extension {
+            let previous = original_best
+                .as_ref()
+                .ok_or(ChainError::MissingBestHeaderBinding)?;
+            Some(self.memory.plan_reorg_delta_with_staged_bounded(
+                &previous.hash,
+                &best.hash,
+                &staged,
+                ReorgPlanLimits {
+                    maximum_disconnect: MAX_LIVE_HEADER_CANONICAL_SWITCH,
+                    maximum_connect: MAX_LIVE_HEADER_CANONICAL_SWITCH,
+                },
+            )?)
         } else {
             None
         };
+        let projected_total = self
+            .memory
+            .records
+            .len()
+            .checked_add(records.len())
+            .ok_or_else(|| ChainError::Codec("resident header count overflow".to_owned()))?;
+        let projected_canonical = if let Some(delta) = canonical_delta.as_ref() {
+            self.memory
+                .canonical
+                .len()
+                .checked_sub(delta.disconnect.len())
+                .and_then(|count| count.checked_add(delta.connect.len()))
+                .ok_or_else(|| ChainError::Codec("canonical header count overflow".to_owned()))?
+        } else if best_changed {
+            self.memory
+                .canonical
+                .len()
+                .checked_add(canonical_appends.len())
+                .ok_or_else(|| ChainError::Codec("canonical header count overflow".to_owned()))?
+        } else {
+            self.memory.canonical.len()
+        };
+        bounded_alternate_header_count(
+            projected_total,
+            projected_canonical,
+            MAX_RESIDENT_ALTERNATE_HEADERS,
+        )?;
 
         let mut batch = self.store.batch();
         for record in &records {
@@ -1091,10 +2197,26 @@ impl<S: Store> StoredHeaderIndex<S> {
 
         for record in &records {
             self.memory.records.insert(record.hash, record.clone());
+            self.memory.index_new_record(record);
         }
         if best_changed {
-            if let Some(canonical) = canonical_replacement {
-                self.memory.canonical = canonical;
+            if let Some(canonical) = canonical_delta {
+                for hash in canonical.disconnect {
+                    let record = self
+                        .memory
+                        .records
+                        .get(&hash)
+                        .expect("bounded canonical disconnect was validated");
+                    self.memory.canonical.remove(&record.height);
+                }
+                for hash in canonical.connect {
+                    let record = self
+                        .memory
+                        .records
+                        .get(&hash)
+                        .expect("bounded canonical connect was validated");
+                    self.memory.canonical.insert(record.height, hash);
+                }
             } else {
                 for (height, hash) in canonical_appends {
                     self.memory.canonical.insert(height, hash);
@@ -1114,6 +2236,10 @@ impl<S: Store> StoredHeaderIndex<S> {
         record: &HeaderRecord,
         memory: &MemoryHeaderIndex,
     ) -> Result<(), ChainError> {
+        if !memory.records.contains_key(&record.hash) {
+            return Err(ChainError::MissingHeader(record.hash));
+        }
+        memory.ensure_alternate_header_budget()?;
         let mut batch = self.store.batch();
         write_record_to_batch(&mut batch, record)?;
 
@@ -1141,7 +2267,9 @@ impl<S: Store> StoredHeaderIndex<S> {
         let Some(bytes) = snapshot.get(ColumnFamily::Headers, hash.as_bytes())? else {
             return Ok(None);
         };
-        HeaderRecord::decode(&bytes).map(Some)
+        let record = HeaderRecord::decode(&bytes)?;
+        validate_header_record_key(hash.as_bytes(), &record)?;
+        Ok(Some(record))
     }
 
     pub fn cache_record(&mut self, record: HeaderRecord) -> Result<(), ChainError> {
@@ -1149,32 +2277,86 @@ impl<S: Store> StoredHeaderIndex<S> {
     }
 
     pub fn plan_failed_branch(&self, root: BlockHash) -> Result<FailedHeaderPlan, ChainError> {
-        let mut next = self.memory.clone();
-        let affected = next.fail_branch(root)?;
-        let best = next
-            .best_tip()?
-            .ok_or(ChainError::MissingBestHeaderBinding)?;
-        Ok(FailedHeaderPlan { affected, best })
+        self.memory.failed_branch_plan(root)
+    }
+
+    pub fn validate_failed_plan(&self, plan: &FailedHeaderPlan) -> Result<(), ChainError> {
+        self.memory.validate_failed_plan(plan)
+    }
+
+    /// Publish a prevalidated failure plan after its complete durable batch
+    /// commits while the caller retains exclusive index access.
+    pub fn apply_validated_failed_plan(&mut self, plan: &FailedHeaderPlan) {
+        self.memory.apply_validated_failed_plan(plan);
+    }
+
+    pub fn prepare_cache_update(
+        &self,
+        records: &[HeaderRecord],
+    ) -> Result<HeaderIndexCacheUpdate, ChainError> {
+        self.memory.prepare_cache_update(records)
+    }
+
+    pub fn validate_cache_update(&self, update: &HeaderIndexCacheUpdate) -> Result<(), ChainError> {
+        self.memory.validate_cache_update(update)
+    }
+
+    pub fn apply_validated_cache_update(&mut self, update: HeaderIndexCacheUpdate) {
+        self.memory.apply_validated_cache_update(update);
     }
 }
 
 fn load_header_index<S: Store>(store: &S) -> Result<MemoryHeaderIndex, ChainError> {
+    load_header_index_with_validation(store, HeaderRecordValidation::Strict)
+}
+
+fn load_header_index_with_validation<S: Store>(
+    store: &S,
+    validation: HeaderRecordValidation,
+) -> Result<MemoryHeaderIndex, ChainError> {
     let snapshot = store.snapshot()?;
-    let records = snapshot
-        .scan_prefix(ColumnFamily::Headers, b"")?
-        .into_iter()
-        .map(|(_, bytes)| HeaderRecord::decode(&bytes))
-        .collect::<Result<Vec<_>, _>>()?;
     let persisted_best = snapshot
         .get(ColumnFamily::Meta, MetaKey::BestHeaderHash.as_bytes())?
         .map(|bytes| decode_block_hash(&bytes))
         .transpose()?;
+    let mut records = HashMap::new();
+    let mut cursor = None;
+    loop {
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::Headers,
+            b"",
+            cursor.as_deref(),
+            PrefixScanBudget {
+                max_entries: INDEX_LOAD_PAGE_ENTRIES,
+                max_bytes: INDEX_LOAD_PAGE_BYTES,
+            },
+        )?;
+        for (key, bytes) in page.entries {
+            let record = HeaderRecord::decode(&bytes)?;
+            validate_header_record_key(&key, &record)?;
+            let hash = record.hash;
+            if records.insert(hash, record).is_some() {
+                return Err(ChainError::DuplicateHeader(hash));
+            }
+        }
+        match page.continuation {
+            Some(next) => {
+                if cursor.as_ref().is_some_and(|previous| previous >= &next) {
+                    return Err(ChainError::Store(
+                        "header index page cursor did not advance".to_owned(),
+                    ));
+                }
+                cursor = Some(next);
+            }
+            None => break,
+        }
+    }
 
     if !records.is_empty() && persisted_best.is_none() {
         return Err(ChainError::MissingBestHeaderBinding);
     }
 
-    MemoryHeaderIndex::from_records_with_best(records, persisted_best)
+    MemoryHeaderIndex::from_record_map_with_best_and_validation(records, persisted_best, validation)
 }
 
 impl<S: Store> HeaderIndex for StoredHeaderIndex<S> {
@@ -1200,6 +2382,24 @@ impl<S: Store> HeaderIndex for StoredHeaderIndex<S> {
         candidate: &BlockHash,
     ) -> Result<ReorgPlan, ChainError> {
         self.memory.plan_reorg_between(current, candidate)
+    }
+
+    fn plan_reorg_bounded(
+        &self,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
+    ) -> Result<ReorgPlan, ChainError> {
+        self.memory.plan_reorg_bounded(candidate, limits)
+    }
+
+    fn plan_reorg_between_bounded(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
+    ) -> Result<ReorgPlan, ChainError> {
+        self.memory
+            .plan_reorg_between_bounded(current, candidate, limits)
     }
 }
 
@@ -1227,6 +2427,18 @@ impl<S: Store> StoredBlockIndex<S> {
         self.memory.status_counts()
     }
 
+    /// Current number of decoded block-index records retained by the bounded
+    /// live point-read cache.
+    pub fn cache_occupancy(&self) -> usize {
+        self.memory.records.len()
+    }
+
+    /// Hard live block-index cache capacity. Publication evicts one oldest
+    /// entry before inserting a new hash at exact saturation.
+    pub const fn cache_capacity(&self) -> usize {
+        STORED_BLOCK_CACHE_RECORDS
+    }
+
     pub fn store_block(
         &mut self,
         block: &Block,
@@ -1236,13 +2448,15 @@ impl<S: Store> StoredBlockIndex<S> {
     ) -> Result<BlockIndexRecord, ChainError> {
         let record = BlockIndexRecord::from_block(block, height, chainwork)?;
         let raw_record = RawBlockRecord::from_block(block, source);
+        let previous = self.load_block_record(&record.hash)?;
+        let cache_update = self.prepare_cache_update(&[(previous, record.clone())])?;
         let mut batch = self.store.batch();
 
         write_block_index_to_batch(&mut batch, &record)?;
         write_raw_block_to_batch(&mut batch, &raw_record)?;
         write_tx_index_for_block_to_batch(&mut batch, block, height)?;
         self.store.commit(batch)?;
-        self.memory.insert_block_record(record.clone())?;
+        self.publish_cache_update(cache_update);
 
         Ok(record)
     }
@@ -1255,7 +2469,9 @@ impl<S: Store> StoredBlockIndex<S> {
         let Some(bytes) = snapshot.get(ColumnFamily::BlockIndex, hash.as_bytes())? else {
             return Ok(None);
         };
-        BlockIndexRecord::decode(&bytes).map(Some)
+        let record = BlockIndexRecord::decode(&bytes)?;
+        validate_block_index_key(hash.as_bytes(), &record)?;
+        Ok(Some(record))
     }
 
     pub fn load_raw_block(&self, hash: &BlockHash) -> Result<Option<RawBlockRecord>, ChainError> {
@@ -1263,7 +2479,15 @@ impl<S: Store> StoredBlockIndex<S> {
         let Some(bytes) = snapshot.get(ColumnFamily::Blocks, hash.as_bytes())? else {
             return Ok(None);
         };
-        RawBlockRecord::decode(&bytes).map(Some)
+        let record = RawBlockRecord::decode(&bytes)?;
+        if record.hash != *hash {
+            return Err(ChainError::Codec(format!(
+                "raw block key {} has embedded hash {}",
+                hash.to_hex(),
+                record.hash.to_hex()
+            )));
+        }
+        Ok(Some(record))
     }
 
     pub fn load_block(&self, hash: &BlockHash) -> Result<Option<Block>, ChainError> {
@@ -1281,8 +2505,96 @@ impl<S: Store> StoredBlockIndex<S> {
         TxIndexEntry::decode(&bytes).map(Some)
     }
 
-    pub fn cache_record(&mut self, record: BlockIndexRecord) -> Result<(), ChainError> {
-        self.memory.insert_block_record(record)
+    pub fn cache_record(
+        &mut self,
+        previous: Option<&BlockIndexRecord>,
+        record: BlockIndexRecord,
+    ) -> Result<(), ChainError> {
+        let update = self.prepare_cache_update(&[(previous.cloned(), record)])?;
+        self.publish_cache_update(update);
+        Ok(())
+    }
+
+    pub fn prepare_cache_update(
+        &self,
+        replacements: &[(Option<BlockIndexRecord>, BlockIndexRecord)],
+    ) -> Result<BlockIndexCacheUpdate, ChainError> {
+        if replacements.len() > MAX_LIVE_CACHE_UPDATE_RECORDS {
+            return Err(ChainError::LiveWorkLimit {
+                context: "block cache update records",
+                limit: MAX_LIVE_CACHE_UPDATE_RECORDS,
+                actual: replacements.len(),
+            });
+        }
+        let mut seen = HashSet::with_capacity(replacements.len());
+        let mut alternate_count = self.memory.alternate_count;
+        let mut failed_count = self.memory.failed_count;
+        let mut records = Vec::with_capacity(replacements.len());
+        for (previous, record) in replacements {
+            if !seen.insert(record.hash) {
+                return Err(ChainError::Codec(format!(
+                    "duplicate block cache replacement {}",
+                    record.hash.to_hex()
+                )));
+            }
+            let durable = self.load_block_record(&record.hash)?;
+            if durable.as_ref() != previous.as_ref() {
+                return Err(ChainError::Codec(format!(
+                    "block cache replacement {} was built against stale durable state",
+                    record.hash.to_hex()
+                )));
+            }
+            let (old_alternate, old_failed) = previous
+                .as_ref()
+                .map(MemoryBlockIndex::status_contribution)
+                .unwrap_or((0, 0));
+            let (new_alternate, new_failed) = MemoryBlockIndex::status_contribution(record);
+            alternate_count = alternate_count
+                .checked_sub(old_alternate)
+                .and_then(|count| count.checked_add(new_alternate))
+                .ok_or_else(|| ChainError::Codec("alternate block counter overflow".to_owned()))?;
+            failed_count = failed_count
+                .checked_sub(old_failed)
+                .and_then(|count| count.checked_add(new_failed))
+                .ok_or_else(|| ChainError::Codec("failed block counter overflow".to_owned()))?;
+            records.push(record.clone());
+        }
+        let next_generation = self
+            .memory
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| ChainError::Codec("block cache generation exhausted".to_owned()))?;
+        Ok(BlockIndexCacheUpdate {
+            expected_generation: self.memory.generation,
+            next_generation,
+            alternate_count,
+            failed_count,
+            records,
+        })
+    }
+
+    pub fn validate_cache_update(&self, update: &BlockIndexCacheUpdate) -> Result<(), ChainError> {
+        if self.memory.generation != update.expected_generation
+            || update.next_generation
+                != update.expected_generation.checked_add(1).ok_or_else(|| {
+                    ChainError::Codec("block cache generation exhausted".to_owned())
+                })?
+        {
+            return Err(ChainError::Codec(
+                "block cache update was built against a stale generation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn publish_cache_update(&mut self, update: BlockIndexCacheUpdate) {
+        debug_assert!(self.validate_cache_update(&update).is_ok());
+        for record in update.records {
+            self.memory.cache_record(record);
+        }
+        self.memory.alternate_count = update.alternate_count;
+        self.memory.failed_count = update.failed_count;
+        self.memory.generation = update.next_generation;
     }
 }
 
@@ -1296,21 +2608,48 @@ impl<S: Store> BlockIndex for StoredBlockIndex<S> {
     }
 
     fn insert_block_record(&mut self, record: BlockIndexRecord) -> Result<(), ChainError> {
+        let previous = self.load_block_record(&record.hash)?;
+        let cache_update = self.prepare_cache_update(&[(previous, record.clone())])?;
         let mut batch = self.store.batch();
         write_block_index_to_batch(&mut batch, &record)?;
         self.store.commit(batch)?;
-        self.memory.insert_block_record(record)
+        self.publish_cache_update(cache_update);
+        Ok(())
     }
 }
 
 fn load_block_index<S: Store>(store: &S) -> Result<MemoryBlockIndex, ChainError> {
     let snapshot = store.snapshot()?;
-    let records = snapshot
-        .scan_prefix(ColumnFamily::BlockIndex, b"")?
-        .into_iter()
-        .map(|(_, bytes)| BlockIndexRecord::decode(&bytes))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(MemoryBlockIndex::from_records(records))
+    let mut index = MemoryBlockIndex::bounded(STORED_BLOCK_CACHE_RECORDS);
+    let mut cursor = None;
+    loop {
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::BlockIndex,
+            b"",
+            cursor.as_deref(),
+            PrefixScanBudget {
+                max_entries: INDEX_LOAD_PAGE_ENTRIES,
+                max_bytes: INDEX_LOAD_PAGE_BYTES,
+            },
+        )?;
+        for (key, bytes) in page.entries {
+            let record = BlockIndexRecord::decode(&bytes)?;
+            validate_block_index_key(&key, &record)?;
+            index.observe_loaded_record(record)?;
+        }
+        match page.continuation {
+            Some(next) => {
+                if cursor.as_ref().is_some_and(|previous| previous >= &next) {
+                    return Err(ChainError::Store(
+                        "block index page cursor did not advance".to_owned(),
+                    ));
+                }
+                cursor = Some(next);
+            }
+            None => break,
+        }
+    }
+    Ok(index)
 }
 
 pub fn write_record_to_batch<B: WriteBatch>(
@@ -1503,8 +2842,28 @@ impl HeaderIndex for MemoryHeaderIndex {
     }
 
     fn plan_reorg(&self, candidate: &BlockHash) -> Result<ReorgPlan, ChainError> {
+        self.plan_reorg_bounded(candidate, ReorgPlanLimits::UNBOUNDED)
+    }
+
+    fn plan_reorg_bounded(
+        &self,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
+    ) -> Result<ReorgPlan, ChainError> {
         let Some(best) = &self.best else {
-            let mut connect = self.path_to_genesis(*candidate)?;
+            let mut connect = Vec::new();
+            let mut current = *candidate;
+            loop {
+                push_reorg_hash(&mut connect, current, limits.maximum_connect, "connect")?;
+                let record = self
+                    .records
+                    .get(&current)
+                    .ok_or(ChainError::MissingHeader(current))?;
+                if record.height == 0 {
+                    break;
+                }
+                current = record.header.prev_block;
+            }
             connect.reverse();
             return Ok(ReorgPlan {
                 disconnect: Vec::new(),
@@ -1512,13 +2871,22 @@ impl HeaderIndex for MemoryHeaderIndex {
             });
         };
 
-        self.plan_reorg_between(&best.hash, candidate)
+        self.plan_reorg_between_bounded(&best.hash, candidate, limits)
     }
 
     fn plan_reorg_between(
         &self,
         current: &BlockHash,
         candidate: &BlockHash,
+    ) -> Result<ReorgPlan, ChainError> {
+        self.plan_reorg_between_bounded(current, candidate, ReorgPlanLimits::UNBOUNDED)
+    }
+
+    fn plan_reorg_between_bounded(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
     ) -> Result<ReorgPlan, ChainError> {
         if current == candidate {
             return Ok(ReorgPlan::default());
@@ -1538,7 +2906,12 @@ impl HeaderIndex for MemoryHeaderIndex {
         let mut connect_reverse = Vec::new();
 
         while old.height > new.height {
-            disconnect.push(old.hash);
+            push_reorg_hash(
+                &mut disconnect,
+                old.hash,
+                limits.maximum_disconnect,
+                "disconnect",
+            )?;
             old = self
                 .records
                 .get(&old.header.prev_block)
@@ -1547,7 +2920,12 @@ impl HeaderIndex for MemoryHeaderIndex {
         }
 
         while new.height > old.height {
-            connect_reverse.push(new.hash);
+            push_reorg_hash(
+                &mut connect_reverse,
+                new.hash,
+                limits.maximum_connect,
+                "connect",
+            )?;
             new = self
                 .records
                 .get(&new.header.prev_block)
@@ -1562,8 +2940,18 @@ impl HeaderIndex for MemoryHeaderIndex {
                     candidate: *candidate,
                 });
             }
-            disconnect.push(old.hash);
-            connect_reverse.push(new.hash);
+            push_reorg_hash(
+                &mut disconnect,
+                old.hash,
+                limits.maximum_disconnect,
+                "disconnect",
+            )?;
+            push_reorg_hash(
+                &mut connect_reverse,
+                new.hash,
+                limits.maximum_connect,
+                "connect",
+            )?;
             old = self
                 .records
                 .get(&old.header.prev_block)
@@ -1584,10 +2972,37 @@ impl HeaderIndex for MemoryHeaderIndex {
     }
 }
 
+fn push_reorg_hash(
+    path: &mut Vec<BlockHash>,
+    hash: BlockHash,
+    limit: usize,
+    phase: &'static str,
+) -> Result<(), ChainError> {
+    let actual = path
+        .len()
+        .checked_add(1)
+        .ok_or(ChainError::ReorgPlanLimit {
+            phase,
+            limit,
+            actual: usize::MAX,
+        })?;
+    if actual > limit {
+        return Err(ChainError::ReorgPlanLimit {
+            phase,
+            limit,
+            actual,
+        });
+    }
+    path.push(hash);
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
     #[error("chain store failed: {0}")]
     Store(String),
+    #[error("chain store failed: {0}")]
+    StoreSource(#[source] StoreError),
     #[error("chain codec failed: {0}")]
     Codec(String),
     #[error("missing parent header {0:?}")]
@@ -1613,14 +3028,122 @@ pub enum ChainError {
         current: BlockHash,
         candidate: BlockHash,
     },
+    #[error(
+        "reorganization {phase} path contains at least {actual} headers, exceeding limit {limit}"
+    )]
+    ReorgPlanLimit {
+        phase: &'static str,
+        limit: usize,
+        actual: usize,
+    },
+    #[error("{context} requires at least {actual} records, exceeding live limit {limit}")]
+    LiveWorkLimit {
+        context: &'static str,
+        limit: usize,
+        actual: usize,
+    },
+    #[error("{context} exceeded its live execution deadline")]
+    LiveWorkDeadline { context: &'static str },
     #[error("invalid header: {0}")]
     InvalidHeader(&'static str),
 }
 
+impl ChainError {
+    pub const fn is_resource_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::ReorgPlanLimit { .. }
+                | Self::LiveWorkLimit { .. }
+                | Self::LiveWorkDeadline { .. }
+        )
+    }
+}
+
 impl From<StoreError> for ChainError {
     fn from(value: StoreError) -> Self {
-        Self::Store(value.to_string())
+        Self::StoreSource(value)
     }
+}
+
+fn validate_header_record_identity(record: &HeaderRecord) -> Result<(), ChainError> {
+    let computed = record.header.hash();
+    if computed != record.hash {
+        return Err(ChainError::Codec(format!(
+            "header record hash {} disagrees with its header hash {}",
+            record.hash.to_hex(),
+            computed.to_hex()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_header_record_structure(
+    record: &HeaderRecord,
+    parent: Option<&HeaderRecord>,
+    validation: HeaderRecordValidation,
+) -> Result<(), ChainError> {
+    if record.height == 0 {
+        if parent.is_some() {
+            return Err(ChainError::InvalidHeader(
+                "genesis header unexpectedly has a parent",
+            ));
+        }
+        if record.header.prev_block != BlockHash::ZERO {
+            return Err(ChainError::InvalidHeader(
+                "genesis header has a non-zero parent",
+            ));
+        }
+        if record.status.failed {
+            return Err(ChainError::FailedGenesis(record.hash));
+        }
+    } else {
+        let parent = parent.ok_or(ChainError::MissingParent(record.header.prev_block))?;
+        if parent.hash != record.header.prev_block
+            || parent.height.checked_add(1) != Some(record.height)
+        {
+            return Err(ChainError::InvalidHeader(
+                "header height is not contiguous with parent",
+            ));
+        }
+    }
+
+    if !validation.permits_synthetic_roots() {
+        let proof = CompactTarget::from_bits(record.header.bits)
+            .proof()
+            .ok_or(ChainError::InvalidHeader("invalid proof-of-work target"))?;
+        let expected = parent
+            .map(|parent| parent.chainwork)
+            .unwrap_or(Uint256::ZERO)
+            .checked_add(proof)
+            .ok_or_else(|| ChainError::Codec("header chainwork overflow".to_owned()))?;
+        if record.chainwork != expected {
+            return Err(ChainError::InvalidHeader(
+                "header chainwork is not proof-derived",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_header_record_key(key: &[u8], record: &HeaderRecord) -> Result<(), ChainError> {
+    if key != record.hash.as_bytes() {
+        return Err(ChainError::Codec(format!(
+            "header index key disagrees with decoded hash {}",
+            record.hash.to_hex()
+        )));
+    }
+    validate_header_record_identity(record)
+}
+
+fn validate_block_index_key(key: &[u8], record: &BlockIndexRecord) -> Result<(), ChainError> {
+    if key != record.hash.as_bytes() {
+        return Err(ChainError::Codec(format!(
+            "block index key disagrees with decoded hash {}",
+            record.hash.to_hex()
+        )));
+    }
+    Ok(())
 }
 
 fn decode_block_hash(bytes: &[u8]) -> Result<BlockHash, ChainError> {
@@ -1656,7 +3179,158 @@ fn varint_size(value: u64) -> usize {
 mod tests {
     use super::*;
     use hns_primitives::{Address, Covenant, CovenantKind, Input, Outpoint, Output, Witness};
-    use hns_store::{MemoryBatch, MemorySnapshot, MemoryStore, Store};
+    use hns_store::{
+        MemoryBatch, MemorySnapshot, MemoryStore, PrefixScanPage, ReadSnapshot, Store,
+    };
+
+    #[test]
+    fn store_error_conversion_preserves_typed_limit_source_and_diagnostic() {
+        const CONTEXT: &str = "reorganization staged effect bytes";
+        const LIMIT: u64 = 268_435_456;
+        const ACTUAL: u64 = 274_597_194;
+
+        assert_eq!(
+            ChainError::Store("header index page cursor did not advance".to_owned()).to_string(),
+            "chain store failed: header index page cursor did not advance"
+        );
+
+        let error = ChainError::from(StoreError::LimitExceeded {
+            context: CONTEXT,
+            limit: LIMIT,
+            actual: ACTUAL,
+        });
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "chain store failed: {CONTEXT} exceeded its resource limit: limit {LIMIT}, actual {ACTUAL}"
+            )
+        );
+        assert!(matches!(
+            &error,
+            ChainError::StoreSource(StoreError::LimitExceeded {
+                context: CONTEXT,
+                limit: LIMIT,
+                actual: ACTUAL,
+            })
+        ));
+
+        let source = std::error::Error::source(&error).expect("typed store source");
+        let store_error = source
+            .downcast_ref::<StoreError>()
+            .expect("source remains a StoreError");
+        assert!(matches!(
+            store_error,
+            StoreError::LimitExceeded {
+                context: CONTEXT,
+                limit: LIMIT,
+                actual: ACTUAL,
+            }
+        ));
+    }
+
+    #[derive(Debug, Default)]
+    struct PagingMetrics {
+        full_scans: std::sync::atomic::AtomicUsize,
+        pages: std::sync::atomic::AtomicUsize,
+        maximum_entries: std::sync::atomic::AtomicUsize,
+        maximum_bytes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PagedStore {
+        inner: MemoryStore,
+        metrics: std::sync::Arc<PagingMetrics>,
+    }
+
+    #[derive(Debug)]
+    struct PagedSnapshot {
+        inner: MemorySnapshot,
+        metrics: std::sync::Arc<PagingMetrics>,
+    }
+
+    impl PagedStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                metrics: std::sync::Arc::new(PagingMetrics::default()),
+            }
+        }
+
+        fn reset_metrics(&self) {
+            self.metrics
+                .full_scans
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            self.metrics
+                .pages
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            self.metrics
+                .maximum_entries
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            self.metrics
+                .maximum_bytes
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ReadSnapshot for PagedSnapshot {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            self.inner.get(family, key)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<Vec<hns_store::ScanEntry>, StoreError> {
+            self.metrics
+                .full_scans
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.scan_prefix(family, prefix)
+        }
+
+        fn scan_prefix_page(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+            start_after: Option<&[u8]>,
+            budget: PrefixScanBudget,
+        ) -> Result<PrefixScanPage, StoreError> {
+            let page = self
+                .inner
+                .scan_prefix_page(family, prefix, start_after, budget)?;
+            self.metrics
+                .pages
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.metrics
+                .maximum_entries
+                .fetch_max(page.entries.len(), std::sync::atomic::Ordering::SeqCst);
+            self.metrics
+                .maximum_bytes
+                .fetch_max(page.returned_bytes, std::sync::atomic::Ordering::SeqCst);
+            Ok(page)
+        }
+    }
+
+    impl Store for PagedStore {
+        type Snapshot<'a> = PagedSnapshot;
+        type Batch = MemoryBatch;
+
+        fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
+            Ok(PagedSnapshot {
+                inner: self.inner.snapshot()?,
+                metrics: std::sync::Arc::clone(&self.metrics),
+            })
+        }
+
+        fn batch(&self) -> Self::Batch {
+            self.inner.batch()
+        }
+
+        fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
+            self.inner.commit(batch)
+        }
+    }
 
     #[derive(Clone)]
     struct InstrumentedStore {
@@ -1717,6 +3391,32 @@ mod tests {
             bits: 0x207f_ffff,
             ..Header::default()
         }
+    }
+
+    fn header_record(
+        prev_block: BlockHash,
+        nonce: u32,
+        height: Height,
+        chainwork: u64,
+    ) -> HeaderRecord {
+        let header = header(prev_block, nonce);
+        HeaderRecord {
+            hash: header.hash(),
+            height,
+            chainwork: chainwork.into(),
+            header,
+            status: BlockStatus {
+                header_context_valid: true,
+                ..BlockStatus::default()
+            },
+        }
+    }
+
+    fn indexed_hash(seed: u32) -> BlockHash {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&seed.to_be_bytes());
+        bytes[4..8].copy_from_slice(&seed.rotate_left(13).to_be_bytes());
+        BlockHash::new(bytes)
     }
 
     fn covenant() -> Covenant {
@@ -1833,6 +3533,70 @@ mod tests {
     }
 
     #[test]
+    fn alternate_header_budget_accepts_exact_and_rejects_one_over() {
+        assert_eq!(
+            bounded_alternate_header_count(
+                MAX_RESIDENT_ALTERNATE_HEADERS + 17,
+                17,
+                MAX_RESIDENT_ALTERNATE_HEADERS,
+            )
+            .expect("exact alternate-header budget"),
+            MAX_RESIDENT_ALTERNATE_HEADERS
+        );
+        assert!(matches!(
+            bounded_alternate_header_count(
+                MAX_RESIDENT_ALTERNATE_HEADERS + 18,
+                17,
+                MAX_RESIDENT_ALTERNATE_HEADERS,
+            ),
+            Err(ChainError::LiveWorkLimit {
+                context: "resident alternate headers",
+                limit: MAX_RESIDENT_ALTERNATE_HEADERS,
+                actual,
+            }) if actual == MAX_RESIDENT_ALTERNATE_HEADERS + 1
+        ));
+        assert!(matches!(
+            bounded_alternate_header_count(16, 17, MAX_RESIDENT_ALTERNATE_HEADERS),
+            Err(ChainError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn startup_reconstruction_enforces_alternate_header_budget() {
+        let genesis = header_record(BlockHash::ZERO, 70_000, 0, 1);
+        let best = header_record(genesis.hash, 70_001, 1, 4);
+        let alternate_a = header_record(genesis.hash, 70_002, 1, 2);
+        let alternate_b = header_record(genesis.hash, 70_003, 1, 3);
+        let records = [genesis, best.clone(), alternate_a, alternate_b]
+            .into_iter()
+            .map(|record| (record.hash, record))
+            .collect::<HashMap<_, _>>();
+
+        let exact = MemoryHeaderIndex::from_record_map_with_best_validation_and_alternate_limit(
+            records.clone(),
+            Some(best.hash),
+            HeaderRecordValidation::TestFixtures,
+            2,
+        )
+        .expect("two alternate headers fit an exact startup budget");
+        assert_eq!(exact.alternate_header_count(), 2);
+
+        assert!(matches!(
+            MemoryHeaderIndex::from_record_map_with_best_validation_and_alternate_limit(
+                records,
+                Some(best.hash),
+                HeaderRecordValidation::TestFixtures,
+                1,
+            ),
+            Err(ChainError::LiveWorkLimit {
+                context: "resident alternate headers",
+                limit: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
     fn equal_work_header_preserves_first_seen_best_tip() {
         let mut index = MemoryHeaderIndex::new();
         let genesis = index
@@ -1914,12 +3678,148 @@ mod tests {
     }
 
     #[test]
+    fn failed_header_plan_scales_with_descendants_and_preserves_unrelated_branches() {
+        const AFFECTED: u32 = 1_024;
+        const UNRELATED: u32 = 5_000;
+        const FALLBACK: u32 = 64;
+
+        let mut index = MemoryHeaderIndex::new_for_test_fixtures();
+        let genesis = header_record(BlockHash::ZERO, 100_000, 0, 1);
+        index.insert_record(genesis.clone()).expect("genesis");
+
+        let mut fallback_parent = genesis.hash;
+        let mut fallback_hashes = Vec::with_capacity(FALLBACK as usize);
+        for height in 1..=FALLBACK {
+            let record = header_record(
+                fallback_parent,
+                110_000 + height,
+                height,
+                u64::from(height) + 1,
+            );
+            fallback_parent = record.hash;
+            fallback_hashes.push(record.hash);
+            index.insert_record(record).expect("fallback branch");
+        }
+
+        let mut affected_parent = genesis.hash;
+        let mut affected_hashes = Vec::with_capacity(AFFECTED as usize);
+        for height in 1..=AFFECTED {
+            let record = header_record(
+                affected_parent,
+                120_000 + height,
+                height,
+                100 + u64::from(height),
+            );
+            affected_parent = record.hash;
+            affected_hashes.push(record.hash);
+            index.insert_record(record).expect("affected branch");
+        }
+
+        let mut unrelated_hashes = Vec::with_capacity(UNRELATED as usize);
+        for offset in 0..UNRELATED {
+            let record = header_record(genesis.hash, 200_000 + offset, 1, 2);
+            unrelated_hashes.push(record.hash);
+            index.insert_record(record).expect("unrelated sibling");
+        }
+
+        let plan = index
+            .failed_branch_plan(affected_hashes[0])
+            .expect("failure plan");
+        assert_eq!(plan.affected.len(), AFFECTED as usize);
+        assert_eq!(
+            plan.affected
+                .iter()
+                .map(|record| record.hash)
+                .collect::<Vec<_>>(),
+            affected_hashes,
+            "breadth-first descendant order is already publication-ready"
+        );
+        assert_eq!(
+            plan.canonical.disconnect,
+            affected_hashes.iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(plan.canonical.connect, fallback_hashes);
+        assert_eq!(plan.best.hash, fallback_parent);
+
+        index
+            .validate_failed_plan(&plan)
+            .expect("validated failure plan");
+        index.apply_validated_failed_plan(&plan);
+
+        assert_eq!(
+            index.best_tip().expect("best").expect("fallback").hash,
+            fallback_parent
+        );
+        assert!(plan.affected.iter().all(|planned| {
+            index
+                .header(&planned.hash)
+                .expect("affected header")
+                .is_some_and(|record| record.status.failed)
+        }));
+        assert!(unrelated_hashes.iter().all(|hash| {
+            index
+                .header(hash)
+                .expect("unrelated header")
+                .is_some_and(|record| !record.status.failed)
+        }));
+    }
+
+    #[test]
+    fn failed_header_plan_accepts_exact_count_and_rejects_one_over_or_expired() {
+        let mut index = MemoryHeaderIndex::new_for_test_fixtures();
+        let genesis = header_record(BlockHash::ZERO, 410_000, 0, 1);
+        index.insert_record(genesis.clone()).expect("genesis");
+        index
+            .insert_record(header_record(genesis.hash, 410_001, 1, 100))
+            .expect("dominant fallback");
+
+        let root = header_record(genesis.hash, 420_001, 1, 2);
+        let child = header_record(root.hash, 420_002, 2, 3);
+        let tip = header_record(child.hash, 420_003, 3, 4);
+        for record in [root.clone(), child, tip] {
+            index.insert_record(record).expect("affected branch");
+        }
+
+        let now = Instant::now();
+        let exact = index
+            .failed_branch_plan_bounded(
+                root.hash,
+                3,
+                now.checked_add(Duration::from_secs(30)).unwrap_or(now),
+            )
+            .expect("exact failed-branch budget");
+        assert_eq!(exact.affected.len(), 3);
+
+        assert!(matches!(
+            index.failed_branch_plan_bounded(
+                root.hash,
+                2,
+                now.checked_add(Duration::from_secs(30)).unwrap_or(now),
+            ),
+            Err(ChainError::LiveWorkLimit {
+                context: "failed header descendants",
+                limit: 2,
+                actual: 3,
+            })
+        ));
+        assert!(matches!(
+            index.failed_branch_plan_bounded(root.hash, 3, Instant::now()),
+            Err(ChainError::LiveWorkDeadline {
+                context: "failed header descendants",
+            })
+        ));
+    }
+
+    #[test]
     fn header_index_rejects_nontransitive_failure_state() {
         let genesis_header = header(BlockHash::ZERO, 1);
+        let proof = CompactTarget::from_bits(genesis_header.bits)
+            .proof()
+            .expect("fixture target proof");
         let genesis = HeaderRecord {
             hash: genesis_header.hash(),
             height: 0,
-            chainwork: Uint256::ONE,
+            chainwork: proof,
             header: genesis_header,
             status: BlockStatus::default(),
         };
@@ -1927,7 +3827,7 @@ mod tests {
         let parent = HeaderRecord {
             hash: parent_header.hash(),
             height: 1,
-            chainwork: 2u64.into(),
+            chainwork: proof.checked_add(proof).expect("parent work"),
             header: parent_header,
             status: BlockStatus {
                 failed: true,
@@ -1938,7 +3838,10 @@ mod tests {
         let child = HeaderRecord {
             hash: child_header.hash(),
             height: 2,
-            chainwork: 3u64.into(),
+            chainwork: proof
+                .checked_add(proof)
+                .and_then(|work| work.checked_add(proof))
+                .expect("child work"),
             header: child_header,
             status: BlockStatus::default(),
         };
@@ -1947,6 +3850,91 @@ mod tests {
             MemoryHeaderIndex::from_records([genesis, parent, child]),
             Err(ChainError::InconsistentFailureAncestry(_))
         ));
+    }
+
+    #[test]
+    fn strict_header_records_require_unique_root_contiguous_height_and_exact_work() {
+        let genesis_header = header(BlockHash::ZERO, 41);
+        let genesis = prepare_header_record(
+            &HeaderImport {
+                header: genesis_header,
+                height: 0,
+                verify_pow: false,
+                checkpoint_valid: true,
+            },
+            None,
+        )
+        .expect("genesis record");
+        let child_header = header(genesis.hash, 42);
+        let child = prepare_header_record(
+            &HeaderImport {
+                header: child_header,
+                height: 1,
+                verify_pow: false,
+                checkpoint_valid: true,
+            },
+            Some(&genesis),
+        )
+        .expect("child record");
+
+        let mut bad_height = child.clone();
+        bad_height.height = 2;
+        assert!(matches!(
+            MemoryHeaderIndex::from_records([genesis.clone(), bad_height]),
+            Err(ChainError::InvalidHeader(_))
+        ));
+
+        let mut bad_work = child.clone();
+        bad_work.chainwork = bad_work
+            .chainwork
+            .checked_add(Uint256::ONE)
+            .expect("forged work");
+        assert!(matches!(
+            MemoryHeaderIndex::from_records([genesis.clone(), bad_work]),
+            Err(ChainError::InvalidHeader(_))
+        ));
+
+        let second_header = header(BlockHash::ZERO, 43);
+        let second = prepare_header_record(
+            &HeaderImport {
+                header: second_header,
+                height: 0,
+                verify_pow: false,
+                checkpoint_valid: true,
+            },
+            None,
+        )
+        .expect("second root record");
+        assert!(matches!(
+            MemoryHeaderIndex::from_records([genesis, second]),
+            Err(ChainError::InvalidHeader(
+                "header index has multiple genesis roots"
+            ))
+        ));
+    }
+
+    #[test]
+    fn failed_best_replacement_leaves_viable_index_unchanged() {
+        let mut index = MemoryHeaderIndex::new();
+        let genesis = index
+            .insert_header(header(BlockHash::ZERO, 44), 0)
+            .expect("genesis");
+        let best = index
+            .insert_header(header(genesis.hash, 45), 1)
+            .expect("best");
+        let viable = MemoryHeaderIndex::viable_key(&best);
+        let mut failed = best.clone();
+        failed.status.failed = true;
+
+        assert!(matches!(
+            index.insert_record(failed),
+            Err(ChainError::FailedBestHeader(hash)) if hash == best.hash
+        ));
+        assert!(index.viable.contains(&viable));
+        assert_eq!(
+            index.best_tip().expect("best").expect("tip").hash,
+            best.hash
+        );
     }
 
     #[test]
@@ -1974,6 +3962,70 @@ mod tests {
         let plan = index.plan_reorg(&side_hash).expect("plan");
         assert_eq!(plan.disconnect, vec![old_tip.hash]);
         assert_eq!(plan.connect, vec![side_hash]);
+    }
+
+    #[test]
+    fn bounded_reorg_planner_accepts_exact_paths_and_rejects_one_over() {
+        let mut index = MemoryHeaderIndex::new();
+        let genesis = index
+            .insert_header(header(BlockHash::ZERO, 70), 0)
+            .expect("genesis");
+        let old_one = index
+            .insert_header(header(genesis.hash, 71), 1)
+            .expect("old one");
+        let old_two = index
+            .insert_header(header(old_one.hash, 72), 2)
+            .expect("old two");
+        let side_one = index
+            .insert_header(header(genesis.hash, 73), 1)
+            .expect("side one");
+        let side_two = index
+            .insert_header(header(side_one.hash, 74), 2)
+            .expect("side two");
+
+        let exact = index
+            .plan_reorg_between_bounded(
+                &old_two.hash,
+                &side_two.hash,
+                ReorgPlanLimits {
+                    maximum_disconnect: 2,
+                    maximum_connect: 2,
+                },
+            )
+            .expect("exact bounded plan");
+        assert_eq!(exact.disconnect, vec![old_two.hash, old_one.hash]);
+        assert_eq!(exact.connect, vec![side_one.hash, side_two.hash]);
+
+        assert!(matches!(
+            index.plan_reorg_between_bounded(
+                &old_two.hash,
+                &side_two.hash,
+                ReorgPlanLimits {
+                    maximum_disconnect: 1,
+                    maximum_connect: 2,
+                },
+            ),
+            Err(ChainError::ReorgPlanLimit {
+                phase: "disconnect",
+                limit: 1,
+                actual: 2,
+            })
+        ));
+        assert!(matches!(
+            index.plan_reorg_between_bounded(
+                &old_two.hash,
+                &side_two.hash,
+                ReorgPlanLimits {
+                    maximum_disconnect: 2,
+                    maximum_connect: 1,
+                },
+            ),
+            Err(ChainError::ReorgPlanLimit {
+                phase: "connect",
+                limit: 1,
+                actual: 2,
+            })
+        ));
     }
 
     #[test]
@@ -2082,6 +4134,50 @@ mod tests {
     }
 
     #[test]
+    fn memory_block_index_status_counts_track_replacement_transitions() {
+        let block = Block {
+            header: header(BlockHash::ZERO, 24),
+            transactions: Vec::new(),
+        };
+        let alternate =
+            BlockIndexRecord::from_block(&block, 0, Uint256::ONE).expect("alternate record");
+        let mut index = MemoryBlockIndex::new();
+
+        index
+            .insert_block_record(alternate.clone())
+            .expect("insert alternate");
+        assert_eq!(index.status_counts(), (1, 0));
+
+        let mut active = alternate.clone();
+        active.status.active_chain = true;
+        index
+            .insert_block_record(active.clone())
+            .expect("replace with active");
+        assert_eq!(index.status_counts(), (0, 0));
+
+        let mut failed = active;
+        failed.status.failed = true;
+        index
+            .insert_block_record(failed.clone())
+            .expect("replace with failed");
+        assert_eq!(
+            index.status_counts(),
+            (0, 1),
+            "failed status takes precedence over active-chain overlap"
+        );
+
+        index
+            .insert_block_record(failed)
+            .expect("idempotent failed replacement");
+        assert_eq!(index.status_counts(), (0, 1));
+
+        index
+            .insert_block_record(alternate)
+            .expect("replace failed with alternate");
+        assert_eq!(index.status_counts(), (1, 0));
+    }
+
+    #[test]
     fn raw_block_record_codec_checks_checksum_and_hash() {
         let block = Block {
             header: header(BlockHash::ZERO, 15),
@@ -2137,6 +4233,153 @@ mod tests {
         assert_eq!(
             reloaded.canonical_hash(0).expect("canonical"),
             Some(record.hash)
+        );
+    }
+
+    #[test]
+    fn stored_header_index_loads_directly_from_bounded_pages() {
+        const RECORDS: u32 = 5_000;
+
+        let store = PagedStore::new();
+        hns_store::initialize_schema(&store).expect("initialize schema");
+        let mut batch = store.batch();
+        let mut parent = BlockHash::ZERO;
+        let mut best = BlockHash::ZERO;
+        let mut chainwork = Uint256::ZERO;
+        for height in 0..RECORDS {
+            let mut record = header_record(parent, 300_000 + height, height, 0);
+            let proof = CompactTarget::from_bits(record.header.bits)
+                .proof()
+                .expect("fixture target proof");
+            chainwork = chainwork.checked_add(proof).expect("header chainwork");
+            record.chainwork = chainwork;
+            write_record_to_batch(&mut batch, &record).expect("stage header");
+            parent = record.hash;
+            best = record.hash;
+        }
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestHeaderHash.as_bytes(),
+                best.as_bytes(),
+            )
+            .expect("stage best header");
+        store.commit(batch).expect("populate header index");
+        store.reset_metrics();
+
+        let index = StoredHeaderIndex::new(store.clone()).expect("paged header index");
+        assert_eq!(index.memory.records.len(), RECORDS as usize);
+        assert_eq!(index.best_tip().expect("best").expect("tip").hash, best);
+        assert_eq!(
+            store
+                .metrics
+                .full_scans
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "startup must not call the unbounded scan interface"
+        );
+        assert!(
+            store
+                .metrics
+                .pages
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        );
+        assert!(
+            store
+                .metrics
+                .maximum_entries
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= INDEX_LOAD_PAGE_ENTRIES
+        );
+        assert!(
+            store
+                .metrics
+                .maximum_bytes
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= INDEX_LOAD_PAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn stored_header_index_rejects_key_and_embedded_header_hash_mismatches() {
+        let point_store = MemoryStore::new();
+        let index = StoredHeaderIndex::new(point_store.clone()).expect("empty header index");
+        let record = header_record(BlockHash::ZERO, 400_001, 0, 1);
+        let wrong_key = indexed_hash(400_002);
+        let mut batch = point_store.batch();
+        batch
+            .put(
+                ColumnFamily::Headers,
+                wrong_key.as_bytes(),
+                &record.encode(),
+            )
+            .expect("stage mismatched key");
+        point_store.commit(batch).expect("commit mismatched key");
+        assert!(matches!(
+            index.load_record(&wrong_key),
+            Err(ChainError::Codec(_))
+        ));
+
+        let startup_store = MemoryStore::new();
+        hns_store::initialize_schema(&startup_store).expect("initialize startup schema");
+        let mut corrupt = header_record(BlockHash::ZERO, 400_003, 0, 1);
+        corrupt.hash = indexed_hash(400_004);
+        let mut batch = startup_store.batch();
+        batch
+            .put(
+                ColumnFamily::Headers,
+                corrupt.hash.as_bytes(),
+                &corrupt.encode(),
+            )
+            .expect("stage corrupt record");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestHeaderHash.as_bytes(),
+                corrupt.hash.as_bytes(),
+            )
+            .expect("stage corrupt best");
+        startup_store
+            .commit(batch)
+            .expect("commit corrupt header record");
+        assert!(matches!(
+            StoredHeaderIndex::new(startup_store),
+            Err(ChainError::Codec(_))
+        ));
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn explicit_fixture_loader_does_not_weaken_strict_constructor() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("initialize schema");
+        let fixture = header_record(BlockHash::ZERO, 410_001, 0, 1);
+        let mut batch = store.batch();
+        write_record_to_batch(&mut batch, &fixture).expect("stage synthetic root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestHeaderHash.as_bytes(),
+                fixture.hash.as_bytes(),
+            )
+            .expect("stage fixture best");
+        store.commit(batch).expect("commit fixture chain");
+
+        assert!(matches!(
+            StoredHeaderIndex::new(store.clone()),
+            Err(ChainError::InvalidHeader(
+                "header chainwork is not proof-derived"
+            ))
+        ));
+        assert_eq!(
+            StoredHeaderIndex::new_for_test_fixtures(store)
+                .expect("explicit fixture loader")
+                .best_tip()
+                .expect("best")
+                .expect("tip")
+                .hash,
+            fixture.hash
         );
     }
 
@@ -2323,6 +4566,249 @@ mod tests {
             Some(block)
         );
         assert_eq!(reloaded.block(&record.hash).expect("memory"), Some(record));
+    }
+
+    #[test]
+    fn stored_block_index_uses_bounded_cache_exact_counts_and_durable_misses() {
+        const RECORDS: u32 = 5_000;
+
+        let store = PagedStore::new();
+        hns_store::initialize_schema(&store).expect("initialize schema");
+        let mut batch = store.batch();
+        let mut records = Vec::with_capacity(RECORDS as usize);
+        let mut expected_alternates = 0usize;
+        let mut expected_failed = 0usize;
+        for seed in 0..RECORDS {
+            let mut record = BlockIndexRecord {
+                hash: indexed_hash(500_000 + seed),
+                height: seed,
+                prev_hash: indexed_hash(499_999 + seed),
+                chainwork: Uint256::from(u64::from(seed) + 1),
+                status: BlockStatus::default(),
+                tx_count: 0,
+                validated_at: None,
+            };
+            match seed % 3 {
+                0 => record.status.active_chain = true,
+                1 => {
+                    record.status.failed = true;
+                    expected_failed += 1;
+                }
+                _ => expected_alternates += 1,
+            }
+            write_block_index_to_batch(&mut batch, &record).expect("stage block index");
+            records.push(record);
+        }
+        store.commit(batch).expect("populate block index");
+        store.reset_metrics();
+
+        let mut index = StoredBlockIndex::new(store.clone()).expect("paged block index");
+        assert_eq!(
+            index.cache_occupancy(),
+            STORED_BLOCK_CACHE_RECORDS,
+            "the live block index is a fixed-size point-read cache"
+        );
+        assert_eq!(index.cache_capacity(), STORED_BLOCK_CACHE_RECORDS);
+        assert_eq!(
+            index.status_counts(),
+            (expected_alternates, expected_failed),
+            "diagnostic counts cover the complete durable index, not only cached records"
+        );
+        assert_eq!(
+            store
+                .metrics
+                .full_scans
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "startup must not call the unbounded scan interface"
+        );
+        assert!(
+            store
+                .metrics
+                .maximum_entries
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= INDEX_LOAD_PAGE_ENTRIES
+        );
+        assert!(
+            store
+                .metrics
+                .maximum_bytes
+                .load(std::sync::atomic::Ordering::SeqCst)
+                <= INDEX_LOAD_PAGE_BYTES
+        );
+
+        let previous = records
+            .iter()
+            .find(|record| {
+                !record.status.failed
+                    && !record.status.active_chain
+                    && !index.memory.records.contains_key(&record.hash)
+            })
+            .cloned()
+            .expect("an alternate record was evicted");
+        assert_eq!(
+            index.block(&previous.hash).expect("durable cache miss"),
+            Some(previous.clone())
+        );
+
+        let mut active = previous.clone();
+        active.status.active_chain = true;
+        let update = index
+            .prepare_cache_update(&[(Some(previous), active.clone())])
+            .expect("prepare exact counter transition");
+        reset_block_index_record_clone_count();
+        index.publish_cache_update(update);
+        assert_eq!(
+            block_index_record_clone_count(),
+            0,
+            "O(changes) publication must move its prepared delta without cloning cache history"
+        );
+        assert_eq!(
+            index.cache_occupancy(),
+            STORED_BLOCK_CACHE_RECORDS,
+            "a new hash at exact saturation evicts instead of growing to 4,097"
+        );
+        assert_eq!(
+            index.status_counts(),
+            (expected_alternates - 1, expected_failed)
+        );
+        assert_eq!(
+            index.block(&active.hash).expect("published cache record"),
+            Some(active)
+        );
+
+        let exact_records = (0..MAX_LIVE_CACHE_UPDATE_RECORDS)
+            .map(|offset| BlockIndexRecord {
+                hash: indexed_hash(900_000 + offset as u32),
+                height: 900_000 + offset as u32,
+                prev_hash: indexed_hash(899_999 + offset as u32),
+                chainwork: Uint256::from(900_001 + offset as u64),
+                status: BlockStatus {
+                    active_chain: true,
+                    ..BlockStatus::default()
+                },
+                tx_count: 0,
+                validated_at: None,
+            })
+            .collect::<Vec<_>>();
+        let exact_update = BlockIndexCacheUpdate {
+            expected_generation: index.memory.generation,
+            next_generation: index.memory.generation + 1,
+            alternate_count: index.memory.alternate_count,
+            failed_count: index.memory.failed_count,
+            records: exact_records,
+        };
+        assert_eq!(exact_update.records.len(), MAX_LIVE_CACHE_UPDATE_RECORDS);
+        reset_block_index_record_clone_count();
+        index.publish_cache_update(exact_update);
+        assert_eq!(block_index_record_clone_count(), 0);
+        assert_eq!(index.cache_occupancy(), STORED_BLOCK_CACHE_RECORDS);
+
+        let one_over = (0..=MAX_LIVE_CACHE_UPDATE_RECORDS)
+            .map(|offset| {
+                (
+                    None,
+                    BlockIndexRecord {
+                        hash: indexed_hash(1_000_000 + offset as u32),
+                        height: 1_000_000 + offset as u32,
+                        prev_hash: indexed_hash(999_999 + offset as u32),
+                        chainwork: Uint256::from(1_000_001 + offset as u64),
+                        status: BlockStatus::default(),
+                        tx_count: 0,
+                        validated_at: None,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            index.prepare_cache_update(&one_over),
+            Err(ChainError::LiveWorkLimit {
+                context: "block cache update records",
+                limit: MAX_LIVE_CACHE_UPDATE_RECORDS,
+                actual,
+            }) if actual == MAX_LIVE_CACHE_UPDATE_RECORDS + 1
+        ));
+    }
+
+    #[test]
+    fn stored_block_index_rejects_point_key_hash_mismatch() {
+        let store = MemoryStore::new();
+        let index = StoredBlockIndex::new(store.clone()).expect("empty block index");
+        let record = BlockIndexRecord {
+            hash: indexed_hash(600_001),
+            height: 0,
+            prev_hash: BlockHash::ZERO,
+            chainwork: Uint256::ONE,
+            status: BlockStatus::default(),
+            tx_count: 0,
+            validated_at: None,
+        };
+        let wrong_key = indexed_hash(600_002);
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::BlockIndex,
+                wrong_key.as_bytes(),
+                &record.encode(),
+            )
+            .expect("stage mismatched block key");
+        store.commit(batch).expect("commit mismatched block key");
+
+        assert!(matches!(
+            index.load_block_record(&wrong_key),
+            Err(ChainError::Codec(_))
+        ));
+    }
+
+    #[test]
+    fn stored_block_index_prepares_cache_before_durable_commit() {
+        let store = InstrumentedStore::new();
+        let block = Block {
+            header: header(BlockHash::ZERO, 700_001),
+            transactions: Vec::new(),
+        };
+        let hash = block.hash();
+        let mut index = StoredBlockIndex::new(store.clone()).expect("empty block index");
+
+        store.fail_next_commit();
+        index
+            .store_block(&block, 0, Uint256::ONE, RawBlockSource::Fixture)
+            .expect_err("injected block commit failure");
+        assert_eq!(index.block(&hash).expect("live block index"), None);
+        assert_eq!(
+            index.load_block_record(&hash).expect("durable block index"),
+            None
+        );
+        assert_eq!(index.status_counts(), (0, 0));
+
+        let alternate =
+            BlockIndexRecord::from_block(&block, 0, Uint256::ONE).expect("alternate record");
+        index
+            .insert_block_record(alternate.clone())
+            .expect("initial insert");
+        assert_eq!(index.status_counts(), (1, 0));
+
+        let mut active = alternate.clone();
+        active.status.active_chain = true;
+        assert!(matches!(
+            index.prepare_cache_update(&[(None, active.clone())]),
+            Err(ChainError::Codec(_))
+        ));
+        store.fail_next_commit();
+        index
+            .insert_block_record(active)
+            .expect_err("injected replacement failure");
+        assert_eq!(
+            index.block(&hash).expect("unchanged live record"),
+            Some(alternate.clone())
+        );
+        assert_eq!(
+            index
+                .load_block_record(&hash)
+                .expect("unchanged durable record"),
+            Some(alternate)
+        );
+        assert_eq!(index.status_counts(), (1, 0));
     }
 
     #[test]

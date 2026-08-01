@@ -1,44 +1,57 @@
 #![forbid(unsafe_code)]
 
 mod mining_engine;
+mod native_sync;
 mod peer_bans;
-mod shadow_sync;
 
 pub use hns_p2p::LivePeerManager;
 pub use mining_engine::{
-    MiningEngineConfig, MiningEngineDiagnostics, MiningPublicationAttempt, MiningPublicationResult,
-    MiningTemplateRequest, NativeMiningJob, NativeMiningJobRequest,
+    recommended_template_build_limits, MiningEngineConfig, MiningEngineDiagnostics,
+    MiningPublicationAttempt, MiningPublicationResult, MiningTemplateRequest, NativeMiningJob,
+    NativeMiningJobRequest,
 };
-pub use shadow_sync::{
-    NativeSyncConfig, NativeSyncDiagnostics, ShadowSyncConfig, ShadowSyncDiagnostics,
-};
+pub use native_sync::{NativeSyncConfig, NativeSyncDiagnostics};
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    any::Any,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    error::Error as StdError,
+    fmt::{self as std_fmt, Display},
     future::Future,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, RwLock, Weak,
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use blake2::{
+    digest::{Update, VariableOutput},
+    Blake2bVar,
+};
 use clap::ValueEnum;
+#[cfg(test)]
+use hns_chain::MAX_RESIDENT_ALTERNATE_HEADERS;
 use hns_chain::{
     delete_canonical_height_from_batch, delete_tx_index_for_block_from_batch, read_canonical_hash,
     write_block_index_to_batch, write_canonical_height_to_batch, write_raw_block_to_batch,
-    write_record_to_batch, write_tx_index_for_block_to_batch, BlockIndexRecord, BlockStatus,
-    ChainTip, HeaderIndex, HeaderRecord, RawBlockRecord, RawBlockSource, ReorgPlan,
-    StoredBlockIndex, StoredHeaderIndex,
+    write_record_to_batch, write_tx_index_for_block_to_batch, BlockIndexCacheUpdate,
+    BlockIndexRecord, BlockStatus, ChainError, ChainTip, FailedHeaderPlan, HeaderImport,
+    HeaderIndex, HeaderIndexCacheUpdate, HeaderRecord, RawBlockRecord, RawBlockSource, ReorgPlan,
+    ReorgPlanLimits, StoredBlockIndex, StoredHeaderIndex, TxIndexEntry,
 };
 use hns_consensus::{
     advance_threshold_state, expected_next_bits, validate_block_finality, validate_coinbase_height,
@@ -47,48 +60,62 @@ use hns_consensus::{
     HistoricalScriptPolicy, HistoricalValidationPlan, NameFlags, NativeAirdropSignatureVerifier,
     Network, OpenSslDnssecVerifier, ThresholdState, MAX_FUTURE_BLOCK_TIME, MEDIAN_TIMESPAN,
 };
-use hns_mempool::{MemoryMempool, Mempool};
+use hns_mempool::{MemoryMempool, Mempool, MempoolInfo, MempoolSnapshot, OrderedTxidSnapshot};
 use hns_mining::{
     HeaderSummary, MiningEventHub, MiningGeneration, MiningSnapshot, MiningSubscriptions,
     SolvedMiningCandidate, TemplateCoordinator,
 };
 use hns_p2p::{DenuoSummary, Hip76Summary, PeerSnapshot};
 use hns_primitives::{
-    blake2b_256, hex_encode, Block, BlockHash, Coin, CompactTarget, Height, NameHash, NameState,
-    Reader, Transaction, Uint256, Writer,
+    blake2b_256, hex_encode, sha3_256, Block, BlockHash, Coin, CompactTarget, Height, NameHash,
+    NameState, Outpoint, Reader, Transaction, Txid, Uint256, Writer,
 };
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
     RpcConsensusReadiness, RpcErrorObject, RpcExperimentalRegistryInfo,
-    RpcExperimentalRejectionCount, RpcHeaderEntry, RpcHip76Info, RpcMiningEngineInfo,
+    RpcExperimentalRejectionCount, RpcHeaderEntry, RpcHip76Info, RpcMethod, RpcMiningEngineInfo,
     RpcNameTreeCompactionInfo, RpcNodeStatus, RpcParityInfo, RpcService, RpcSnapshot,
     RpcTransactionEntry, RpcUndoRetentionInfo,
 };
-#[cfg(test)]
-use hns_state::verify_stored_name_tree_root;
 use hns_state::{
     compact_name_tree_nodes_streaming, connect_block_to_batch_with_services, decode_coin,
-    decode_name_state, disconnect_block_to_batch, load_name_tree_snapshot_pins,
+    decode_name_state, disconnect_block_to_batch, encode_outpoint_key,
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
-    load_stored_name_tree_root, migrate_name_tree_interval_accumulator, name_page_root_key,
-    name_tree_snapshot_pin_key, pack_name_page_records, retained_name_tree_roots,
-    stage_remove_name_tree_snapshot_pin, stream_name_page_tree, stream_name_page_tree_delta,
-    validate_persisted_name_tree_overlays, validate_persisted_name_tree_root,
-    validate_persisted_name_trees, verify_name_tree_interval_state,
-    verify_stored_name_tree_root_binding, AirdropCoinbaseIssuanceVerifier, BlockUndo, ConnectBlock,
-    DisconnectBlock, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState,
-    NamePageTreeReader, NameTreeCompactionSummary, NameTreeSnapshotPin, StateError, StateServices,
-    StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
-    NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    load_stored_name_tree_root, migrate_name_tree_interval_accumulator_bounded, name_page_root_key,
+    name_tree_snapshot_pin_key, pack_name_page_records,
+    plan_name_tree_interval_accumulator_migration_bounded, retained_name_tree_roots_bounded,
+    stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits,
+    stream_name_page_tree_with_limits, validate_persisted_name_tree_overlays,
+    validate_persisted_name_tree_root, validate_persisted_name_trees,
+    verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
+    visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
+    ConnectBlock, DisconnectBlock, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot,
+    NamePageState, NamePageStreamLimits, NamePageTraversalLimits, NamePageTreeReader,
+    NamePageValidationLimits, NameTreeCompactionSummary, NameTreeIntervalMigrationLimits,
+    NameTreeMaterializationLimits, NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits,
+    PageTreeError, RetainedNameTreeRootLimits, StateError, StateServices, StoredStateEngine,
+    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
+    NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
+#[cfg(test)]
+use hns_state::{load_name_tree_snapshot_pins, verify_stored_name_tree_root};
 use hns_store::{
-    decode_u64, encode_u64, mark_unclean_start, open_store, truncate_name_pages_to_committed_tail,
-    was_clean_shutdown, ColumnFamily, DurabilityPolicy, MetaKey, NamePageAppender, ReadSnapshot,
-    StagingOverlay, Store, StoreBackend, StoreConfig, StoreHandle, WriteBatch, SCHEMA_VERSION,
-    STORAGE_PROFILE,
+    decode_u64, encode_u64, filesystem_available_bytes, filesystem_tree_usage_bounded,
+    mark_unclean_start, open_store, truncate_name_pages_to_committed_tail, was_clean_shutdown,
+    AtomicWriteEffectBudget, ColumnFamily, DurabilityPolicy, FilesystemTreeUsageLimits, MetaKey,
+    NamePageAppender, NamePageError, PrefixScanBudget, ReadSnapshot, ScanEntry,
+    SegmentArchiveScrubLimits, SegmentCompactionExecutionLimits, SegmentCompactionLimits,
+    StagingOverlay, Store, StoreBackend, StoreConfig, StoreError, StoreHandle, StoreHandleBatch,
+    WriteBatch, SCHEMA_VERSION, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES,
+    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS,
+    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, STORAGE_PROFILE,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 use tracing_subscriber::{fmt, EnvFilter};
 
 pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 13;
@@ -99,6 +126,14 @@ pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
     0x43, 0x69, 0x63, 0x85, 0x15, 0x63, 0x55, 0x86, 0x2e, 0x5f, 0xc2, 0x99, 0x14, 0xca, 0x72, 0x00,
 ]);
 pub const MAX_RPC_AUTHORIZATION_BYTES: usize = 4_096;
+pub const DEFAULT_RPC_MAX_REQUEST_BYTES: usize = 64 * 1024;
+pub const DEFAULT_RPC_MAX_CONCURRENT_REQUESTS: usize = 32;
+pub const DEFAULT_RPC_EXECUTION_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_RPC_MAX_COLLECTION_ENTRIES: usize = 50_000;
+pub const MAX_RPC_REQUEST_BYTES: usize = 1024 * 1024;
+pub const MAX_RPC_CONCURRENT_REQUESTS: usize = 256;
+pub const MAX_RPC_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_RPC_COLLECTION_ENTRIES: usize = 250_000;
 pub const STORAGE_MAINTENANCE_MARKER: &str = ".hsrd-storage-maintenance";
 pub const STORAGE_MAINTENANCE_MARKER_BODY: &str = "hsrd-storage-maintenance-v1\n";
 
@@ -126,18 +161,75 @@ const UNDO_PRUNING_CHECKPOINT_SIZE: usize = UNDO_PRUNING_CHECKPOINT_BODY_SIZE + 
 const MAX_UNDO_PRUNES_PER_BATCH: usize = 1_024;
 const PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES: u64 = 256 * 1024 * 1024;
 const NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD: u32 = 16;
+const MAX_NAME_PAGE_GENERATION_BYTES: u64 = 150_000_000_000;
+const MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES: u64 = 10_000_000_000;
+const MAX_NAME_PAGE_VALIDATION_SPILL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_NAME_PAGE_VALIDATION_RECORDS: u64 = 100_000_000;
+const MAX_NAME_PAGE_SEGMENTS: u64 = 1_000_000;
+const MAX_NAME_PAGE_VALIDATION_ELAPSED: Duration = Duration::from_secs(30 * 60);
+// Mainnet currently has roughly thirteen million materialized names. A binary
+// authenticated tree can contain almost twice as many leaf/internal records,
+// and retained rollback roots add a bounded delta. These production limits
+// leave measured headroom without accepting the compatibility API's 100M-entry
+// in-memory maps. The 8 GiB RSS qualification gate remains mandatory whenever
+// these constants or the address-map representation change.
+const MAX_NAME_PAGE_COMPACTION_RECORDS: u64 = 40_000_000;
+const MAX_NAME_PAGE_COMPACTION_KNOWN_ADDRESSES: u64 = 40_000_000;
+const MAX_NAME_PAGE_COMPACTION_FRONTIER: u64 = 8_192;
+const MAX_NAME_PAGE_ROOT_LOCATORS: u64 = 16_384;
+const MAX_NAME_PAGE_ROOT_LOCATOR_BYTES: u64 = 8 * 1024 * 1024;
+const NAME_PAGE_ROOT_LOCATOR_SCAN_PAGE_ENTRIES: usize = 1_024;
+const NAME_PAGE_ROOT_LOCATOR_SCAN_PAGE_BYTES: usize = 1024 * 1024;
+const MAX_NAME_PAGE_PUBLICATION_OPERATIONS: u64 = (MAX_NAME_PAGE_ROOT_LOCATORS * 2) + 1;
+const MAX_NAME_PAGE_PUBLICATION_BYTES: u64 = 8 * 1024 * 1024;
 const STARTUP_AUDIT_CHECKPOINT_KEY: &[u8] = b"startup-audit/v1";
+const PRODUCTION_SAFETY_FENCE_KEY: &[u8] = b"production-safety-fence/v1";
+const PRODUCTION_SAFETY_FENCE_VERSION: u32 = 1;
+const MAX_PRODUCTION_SAFETY_FENCE_BYTES: usize = 4_096;
+const MAX_PRODUCTION_SAFETY_CONTEXT_BYTES: usize = 256;
+const MAX_PRODUCTION_SAFETY_DETAIL_BYTES: usize = 2_048;
 const STARTUP_AUDIT_CHECKPOINT_VERSION: u32 = 1;
 const STARTUP_AUDIT_CHECKPOINT_BODY_SIZE: usize = 4 + 32;
 const STARTUP_AUDIT_CHECKPOINT_SIZE: usize = STARTUP_AUDIT_CHECKPOINT_BODY_SIZE + 32;
+const BLOCK_INDEX_AUDIT_PAGE_ENTRIES: usize = 4_096;
+const BLOCK_INDEX_AUDIT_PAGE_BYTES: usize = 4 * 1024 * 1024;
+const STARTUP_HEIGHT_SCAN_PAGE_ENTRIES: usize = 4_096;
+const STARTUP_HEIGHT_SCAN_PAGE_BYTES: usize = 512 * 1024;
+const STARTUP_PIN_SCAN_MAX_ELAPSED: Duration = Duration::from_secs(30 * 60);
+const NAME_TREE_SNAPSHOT_PIN_ENCODED_BYTES: u64 = 4 + 4 + 32 + 32 + 32;
+const MAX_REORG_DISCONNECT_BLOCKS: usize = 1_024;
+const MAX_REORG_CONNECT_BLOCKS: usize = 1_024;
+const MAX_REORG_BODY_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_REORG_STAGED_EFFECT_BYTES: u64 = 256 * 1024 * 1024;
+// Charge more than the current Rust enum/Vec/hash-table metadata for every
+// logical copy. This also leaves deterministic headroom for allocator and
+// backend write-batch framing without depending on a particular target ABI.
+const REORG_STAGED_OPERATION_FRAMING_BYTES: u64 = 128;
+// During state staging, the write's source encoding coexists with the backend
+// batch and the read-your-writes overlay. Deferred name nodes omit the backend
+// copy, but later coexist in the staged page map and `PackedNamePages` logical
+// records. Packing receives an additional pre-allocation charge below, so the
+// three-copy charge remains deliberately conservative for both routes.
+const REORG_STAGING_OPERATION_COPIES: u64 = 3;
+// After the overlay has been consumed, page publication retains one backend
+// copy while the source encoding is submitted to it.
+const REORG_PUBLICATION_OPERATION_COPIES: u64 = 2;
+// Packing retains the canonical fixed-size page while its byte-identical
+// physical output is appended and synced. Charge both representations plus a
+// conservative per-page framing/allocation allowance before any file write.
+const REORG_NAME_PAGE_OUTPUT_COPIES: u64 = 2;
+// `pack_name_page_records` clones each canonical node once and builds bounded
+// lookup/order/visited/address/page-record metadata before the fixed-size page
+// encoder runs. Precharge the raw clone plus a deliberately ABI-independent
+// 1 KiB per-record envelope before any of those pack allocations.
+const REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD: u64 = 1024;
+const MAX_REORG_RECONCILIATION_TRANSACTIONS: u64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[value(rename_all = "kebab-case")]
 pub enum AuthorityMode {
     Disabled,
-    Shadow,
-    HsdVerified,
     /// Native consensus and active-state operation. Mining remains fail closed
     /// until every readiness gate is complete and the durable tip itself has
     /// the full mining-authoritative status.
@@ -163,6 +255,180 @@ pub enum StorageMode {
 impl StorageMode {
     pub const fn prunes_payload_history(self) -> bool {
         matches!(self, Self::Pruned)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProductionSafetyFenceKind {
+    LiveHeaderOperation,
+    LiveHeaderReorganization,
+    FailedBranchDescendants,
+    NamePageValidation,
+    NamePageCompaction,
+    PayloadSegmentCompaction,
+    Storage,
+}
+
+impl ProductionSafetyFenceKind {
+    const fn code(self) -> u8 {
+        match self {
+            Self::LiveHeaderOperation => 1,
+            Self::LiveHeaderReorganization => 2,
+            Self::FailedBranchDescendants => 3,
+            Self::NamePageValidation => 4,
+            Self::NamePageCompaction => 5,
+            Self::PayloadSegmentCompaction => 6,
+            Self::Storage => 7,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self> {
+        match code {
+            1 => Ok(Self::LiveHeaderOperation),
+            2 => Ok(Self::LiveHeaderReorganization),
+            3 => Ok(Self::FailedBranchDescendants),
+            4 => Ok(Self::NamePageValidation),
+            5 => Ok(Self::NamePageCompaction),
+            6 => Ok(Self::PayloadSegmentCompaction),
+            7 => Ok(Self::Storage),
+            _ => anyhow::bail!("unknown production safety-fence kind {code}"),
+        }
+    }
+
+    pub const fn requires_name_page_directory(self) -> bool {
+        matches!(self, Self::NamePageValidation | Self::NamePageCompaction)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProductionSafetyFence {
+    pub version: u32,
+    pub kind: ProductionSafetyFenceKind,
+    pub context: String,
+    pub limit: u64,
+    pub actual: u64,
+    pub root: Option<BlockHash>,
+    pub candidate: Option<BlockHash>,
+    pub detail: String,
+}
+
+impl ProductionSafetyFence {
+    fn encode(&self) -> Result<Vec<u8>> {
+        if self.version != PRODUCTION_SAFETY_FENCE_VERSION
+            || self.context.is_empty()
+            || self.context.len() > MAX_PRODUCTION_SAFETY_CONTEXT_BYTES
+            || self.detail.len() > MAX_PRODUCTION_SAFETY_DETAIL_BYTES
+        {
+            anyhow::bail!("production safety-fence fields exceed their codec envelope");
+        }
+        let mut writer = Writer::new();
+        writer.write_u32(self.version);
+        writer.write_u8(self.kind.code());
+        writer.write_u16(u16::try_from(self.context.len())?);
+        writer.write_bytes(self.context.as_bytes());
+        writer.write_u64(self.limit);
+        writer.write_u64(self.actual);
+        write_optional_fence_hash(&mut writer, self.root);
+        write_optional_fence_hash(&mut writer, self.candidate);
+        writer.write_u16(u16::try_from(self.detail.len())?);
+        writer.write_bytes(self.detail.as_bytes());
+        let mut encoded = writer.finish();
+        if encoded.len().saturating_add(32) > MAX_PRODUCTION_SAFETY_FENCE_BYTES {
+            anyhow::bail!("production safety-fence encoding exceeds its durable envelope");
+        }
+        encoded.extend_from_slice(&blake2b_256(&encoded));
+        Ok(encoded)
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self> {
+        if encoded.len() < 32 || encoded.len() > MAX_PRODUCTION_SAFETY_FENCE_BYTES {
+            anyhow::bail!(
+                "production safety-fence contains invalid encoded length {}",
+                encoded.len()
+            );
+        }
+        let (body, checksum) = encoded.split_at(encoded.len() - 32);
+        if checksum != blake2b_256(body) {
+            anyhow::bail!("production safety-fence checksum mismatch");
+        }
+        let mut reader = Reader::new(body, MAX_PRODUCTION_SAFETY_FENCE_BYTES)?;
+        let version = reader.read_u32()?;
+        if version != PRODUCTION_SAFETY_FENCE_VERSION {
+            anyhow::bail!("unsupported production safety-fence version {version}");
+        }
+        let kind = ProductionSafetyFenceKind::from_code(reader.read_u8()?)?;
+        let context_len = usize::from(reader.read_u16()?);
+        if context_len == 0 || context_len > MAX_PRODUCTION_SAFETY_CONTEXT_BYTES {
+            anyhow::bail!("production safety-fence context length is invalid");
+        }
+        let context = String::from_utf8(reader.read_vec(context_len)?)
+            .context("production safety-fence context is not UTF-8")?;
+        let limit = reader.read_u64()?;
+        let actual = reader.read_u64()?;
+        let root = read_optional_fence_hash(&mut reader)?;
+        let candidate = read_optional_fence_hash(&mut reader)?;
+        let detail_len = usize::from(reader.read_u16()?);
+        if detail_len > MAX_PRODUCTION_SAFETY_DETAIL_BYTES {
+            anyhow::bail!("production safety-fence detail length is invalid");
+        }
+        let detail = String::from_utf8(reader.read_vec(detail_len)?)
+            .context("production safety-fence detail is not UTF-8")?;
+        reader.ensure_finished()?;
+        Ok(Self {
+            version,
+            kind,
+            context,
+            limit,
+            actual,
+            root,
+            candidate,
+            detail,
+        })
+    }
+
+    fn reason(&self) -> String {
+        format!(
+            "{} (kind {:?}, limit {}, actual {})",
+            self.detail, self.kind, self.limit, self.actual
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProductionSafetyFenceEvidence {
+    pub fence: ProductionSafetyFence,
+    pub encoded: Vec<u8>,
+    pub digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProductionSafetyFenceClearAcknowledgement {
+    OfflineRecoveryCompletedAndVerified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionSafetyFenceClearRequest {
+    pub expected_digest: [u8; 32],
+    pub acknowledgement: ProductionSafetyFenceClearAcknowledgement,
+    pub name_page_directory: Option<PathBuf>,
+}
+
+fn write_optional_fence_hash(writer: &mut Writer, hash: Option<BlockHash>) {
+    match hash {
+        Some(hash) => {
+            writer.write_u8(1);
+            writer.write_bytes(hash.as_bytes());
+        }
+        None => writer.write_u8(0),
+    }
+}
+
+fn read_optional_fence_hash(reader: &mut Reader<'_>) -> Result<Option<BlockHash>> {
+    match reader.read_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(BlockHash::new(reader.read_hash()?))),
+        value => anyhow::bail!("production safety-fence hash flag {value} is invalid"),
     }
 }
 
@@ -444,6 +710,316 @@ impl NameTreeCompactionCheckpoint {
 /// process lifetime. The clean-shutdown marker and this checkpoint are written
 /// in the same atomic batch. Unclean starts and any identity mismatch retain
 /// the exhaustive audit.
+struct PagedPrefixCursor<'a, S: ReadSnapshot> {
+    snapshot: &'a S,
+    family: ColumnFamily,
+    prefix: &'static [u8],
+    budget: PrefixScanBudget,
+    context: &'static str,
+    continuation: Option<Vec<u8>>,
+    buffered: std::vec::IntoIter<ScanEntry>,
+    exhausted: bool,
+}
+
+impl<'a, S: ReadSnapshot> PagedPrefixCursor<'a, S> {
+    fn new(
+        snapshot: &'a S,
+        family: ColumnFamily,
+        prefix: &'static [u8],
+        budget: PrefixScanBudget,
+        context: &'static str,
+    ) -> Result<Self> {
+        budget
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{context} has invalid page limits: {error}"))?;
+        Ok(Self {
+            snapshot,
+            family,
+            prefix,
+            budget,
+            context,
+            continuation: None,
+            buffered: Vec::new().into_iter(),
+            exhausted: false,
+        })
+    }
+
+    fn next_entry(&mut self) -> Result<Option<ScanEntry>> {
+        loop {
+            if let Some(entry) = self.buffered.next() {
+                return Ok(Some(entry));
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+
+            let start_after = self.continuation.as_deref();
+            let page = self
+                .snapshot
+                .scan_prefix_page(self.family, self.prefix, start_after, self.budget)
+                .with_context(|| format!("failed to page {}", self.context))?;
+            if page.entries.len() > self.budget.max_entries {
+                anyhow::bail!(
+                    "{} returned {} entries; page limit is {}",
+                    self.context,
+                    page.entries.len(),
+                    self.budget.max_entries
+                );
+            }
+            let mut returned_bytes = 0usize;
+            let mut previous = start_after;
+            for (key, value) in &page.entries {
+                if !key.starts_with(self.prefix) {
+                    anyhow::bail!("{} returned a key outside its prefix", self.context);
+                }
+                if previous.is_some_and(|previous| key.as_slice() <= previous) {
+                    anyhow::bail!("{} returned non-increasing keys", self.context);
+                }
+                returned_bytes = returned_bytes
+                    .checked_add(key.len())
+                    .and_then(|bytes| bytes.checked_add(value.len()))
+                    .ok_or_else(|| anyhow::anyhow!("{} byte count overflow", self.context))?;
+                previous = Some(key);
+            }
+            if returned_bytes != page.returned_bytes || returned_bytes > self.budget.max_bytes {
+                anyhow::bail!(
+                    "{} reported {} bytes for {returned_bytes} returned bytes with page limit {}",
+                    self.context,
+                    page.returned_bytes,
+                    self.budget.max_bytes
+                );
+            }
+            if let Some(next) = page.continuation.as_ref() {
+                let Some((last, _)) = page.entries.last() else {
+                    anyhow::bail!("{} returned a continuation without progress", self.context);
+                };
+                if next != last
+                    || self
+                        .continuation
+                        .as_ref()
+                        .is_some_and(|previous| next <= previous)
+                {
+                    anyhow::bail!("{} continuation did not advance", self.context);
+                }
+            }
+
+            self.continuation = page.continuation;
+            self.exhausted = self.continuation.is_none();
+            self.buffered = page.entries.into_iter();
+            if self.buffered.len() == 0 && !self.exhausted {
+                anyhow::bail!("{} returned an empty continuing page", self.context);
+            }
+        }
+    }
+}
+
+enum StartupHeightCursor<'a, S: ReadSnapshot> {
+    PointRange {
+        snapshot: &'a S,
+        next: Height,
+        end: Height,
+        finished: bool,
+    },
+    Paged(PagedPrefixCursor<'a, S>),
+}
+
+impl<'a, S: ReadSnapshot> StartupHeightCursor<'a, S> {
+    fn point_range(snapshot: &'a S, start: Height, end: Height) -> Self {
+        Self::PointRange {
+            snapshot,
+            next: start,
+            end,
+            finished: false,
+        }
+    }
+
+    fn paged(snapshot: &'a S) -> Result<Self> {
+        Ok(Self::Paged(PagedPrefixCursor::new(
+            snapshot,
+            ColumnFamily::HeightIndex,
+            b"",
+            PrefixScanBudget {
+                max_entries: STARTUP_HEIGHT_SCAN_PAGE_ENTRIES,
+                max_bytes: STARTUP_HEIGHT_SCAN_PAGE_BYTES,
+            },
+            "startup active height index",
+        )?))
+    }
+
+    fn next_entry(&mut self) -> Result<Option<ScanEntry>> {
+        match self {
+            Self::PointRange {
+                snapshot,
+                next,
+                end,
+                finished,
+            } => {
+                if *finished {
+                    return Ok(None);
+                }
+                let height = *next;
+                let hash = read_canonical_hash(*snapshot, height)?.ok_or_else(|| {
+                    anyhow::anyhow!("clean startup audit is missing canonical height {height}")
+                })?;
+                if height == *end {
+                    *finished = true;
+                } else {
+                    *next = height
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("startup height range overflow"))?;
+                }
+                Ok(Some((
+                    height.to_be_bytes().to_vec(),
+                    hash.as_bytes().to_vec(),
+                )))
+            }
+            Self::Paged(cursor) => cursor.next_entry(),
+        }
+    }
+}
+
+fn startup_pin_scan_limits(
+    snapshot: &impl ReadSnapshot,
+    network: Network,
+) -> Result<NameTreeSnapshotPinScanLimits> {
+    let tree_interval = network.params().names.tree_interval;
+    if tree_interval == 0 {
+        anyhow::bail!("network name-tree snapshot interval is zero");
+    }
+    let maximum_records = best_block_tip_from_snapshot(snapshot)?
+        .map(|tip| u64::from(tip.height / tree_interval) + 1)
+        .unwrap_or(0);
+    let maximum_bytes = maximum_records
+        .checked_mul(NAME_TREE_SNAPSHOT_PIN_ENCODED_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("startup name-tree pin byte limit overflow"))?;
+    let now = Instant::now();
+    Ok(NameTreeSnapshotPinScanLimits {
+        max_records: maximum_records,
+        max_bytes: maximum_bytes,
+        deadline: now.checked_add(STARTUP_PIN_SCAN_MAX_ELAPSED).unwrap_or(now),
+        ..NameTreeSnapshotPinScanLimits::default()
+    })
+}
+
+struct StartupPinCursor<'a, S: ReadSnapshot> {
+    entries: PagedPrefixCursor<'a, S>,
+    limits: NameTreeSnapshotPinScanLimits,
+    records: u64,
+    bytes: u64,
+}
+
+impl<'a, S: ReadSnapshot> StartupPinCursor<'a, S> {
+    fn new(snapshot: &'a S, network: Network) -> Result<Self> {
+        let limits = startup_pin_scan_limits(snapshot, network)?;
+        Ok(Self {
+            entries: PagedPrefixCursor::new(
+                snapshot,
+                ColumnFamily::Snapshots,
+                NAME_TREE_SNAPSHOT_PIN_PREFIX,
+                limits.page_budget,
+                "startup name-tree snapshot pins",
+            )?,
+            limits,
+            records: 0,
+            bytes: 0,
+        })
+    }
+
+    fn next_pin(&mut self) -> Result<Option<NameTreeSnapshotPin>> {
+        if Instant::now() >= self.limits.deadline {
+            anyhow::bail!("startup name-tree snapshot pin scan exceeded its deadline");
+        }
+        let Some((key, raw)) = self.entries.next_entry()? else {
+            return Ok(None);
+        };
+        self.records = add_reorg_resource(
+            self.records,
+            1,
+            self.limits.max_records,
+            "startup name-tree snapshot pin records",
+        )?;
+        self.bytes = add_reorg_resource(
+            self.bytes,
+            u64::try_from(raw.len()).unwrap_or(u64::MAX),
+            self.limits.max_bytes,
+            "startup name-tree snapshot pin bytes",
+        )?;
+        let pin = NameTreeSnapshotPin::decode(&raw)
+            .map_err(|error| anyhow::anyhow!("failed to decode startup name-tree pin: {error}"))?;
+        if key != name_tree_snapshot_pin_key(pin.height) {
+            anyhow::bail!(
+                "startup name-tree snapshot pin key disagrees with height {}",
+                pin.height
+            );
+        }
+        if Instant::now() >= self.limits.deadline {
+            anyhow::bail!("startup name-tree snapshot pin scan exceeded its deadline");
+        }
+        Ok(Some(pin))
+    }
+}
+
+fn seed_startup_pin_page_roots(
+    snapshot: &impl ReadSnapshot,
+    network: Network,
+    reader: &NamePageTreeReader,
+) -> Result<bool> {
+    let mut pins = StartupPinCursor::new(snapshot, network)?;
+    let maximum_addresses = pins
+        .limits
+        .max_records
+        .checked_add(2)
+        .ok_or_else(|| anyhow::anyhow!("startup name-page root limit overflow"))?;
+    let mut legacy_missing = false;
+    while let Some(pin) = pins.next_pin()? {
+        if pin.root == TreeRoot::ZERO {
+            continue;
+        }
+        let Some(record) = load_name_page_root_record(snapshot, pin.root)? else {
+            legacy_missing = true;
+            continue;
+        };
+        if record.root != pin.root || record.height > pin.height {
+            anyhow::bail!(
+                "snapshot pin at height {} has an inconsistent name-page root locator",
+                pin.height
+            );
+        }
+        reader
+            .insert_root_bounded(record.root, record.locator, maximum_addresses)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to seed snapshot-pin page root {:?}: {error}",
+                    record.root
+                )
+            })?;
+    }
+    Ok(legacy_missing)
+}
+
+fn production_name_page_validation_limits(
+    snapshot: &impl ReadSnapshot,
+    network: Network,
+) -> Result<NamePageValidationLimits> {
+    let pin_limits = startup_pin_scan_limits(snapshot, network)?;
+    let now = Instant::now();
+    Ok(NamePageValidationLimits {
+        max_segments: MAX_NAME_PAGE_SEGMENTS,
+        max_pages: MAX_NAME_PAGE_GENERATION_BYTES / hns_store::NAME_PAGE_BYTES as u64,
+        max_records: MAX_NAME_PAGE_VALIDATION_RECORDS,
+        max_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
+        max_spill_bytes: MAX_NAME_PAGE_VALIDATION_SPILL_BYTES,
+        max_published_roots: pin_limits
+            .max_records
+            .checked_add(2)
+            .ok_or_else(|| anyhow::anyhow!("startup published name-page root limit overflow"))?,
+        minimum_filesystem_reserve_bytes: MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
+        deadline: now
+            .checked_add(MAX_NAME_PAGE_VALIDATION_ELAPSED)
+            .unwrap_or(now),
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StartupAuditCheckpoint {
     state_digest: [u8; 32],
@@ -475,15 +1051,25 @@ impl StartupAuditCheckpoint {
             .ok_or_else(|| anyhow::anyhow!("durable airdrop field is missing"))?;
         writer.write_varbytes(&airdrop_field);
 
-        let mut pins = load_name_tree_snapshot_pins(snapshot)
-            .map_err(|error| anyhow::anyhow!("failed to capture name-tree pins: {error}"))?;
-        pins.sort_by_key(|pin| pin.height);
-        writer.write_u64(u64::try_from(pins.len())?);
-        for pin in pins {
-            writer.write_u32(pin.height);
-            writer.write_bytes(pin.block_hash.as_bytes());
-            writer.write_bytes(pin.root.as_bytes());
-        }
+        let mut pin_hasher = Blake2bVar::new(32)
+            .map_err(|error| anyhow::anyhow!("failed to initialize pin digest: {error}"))?;
+        pin_hasher.update(b"hsrd/startup-audit/name-tree-pins/v2");
+        let pin_summary = visit_name_tree_snapshot_pins_bounded(
+            snapshot,
+            startup_pin_scan_limits(snapshot, network)?,
+            |pin| {
+                pin_hasher.update(&pin.encode());
+                Ok(())
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("failed to capture name-tree pins: {error}"))?;
+        let mut pin_digest = [0u8; 32];
+        pin_hasher
+            .finalize_variable(&mut pin_digest)
+            .map_err(|error| anyhow::anyhow!("failed to finalize pin digest: {error}"))?;
+        writer.write_u64(pin_summary.records);
+        writer.write_u64(pin_summary.bytes);
+        writer.write_bytes(&pin_digest);
 
         write_startup_audit_optional_digest(
             &mut writer,
@@ -609,11 +1195,61 @@ impl AuthorityMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::Shadow => "shadow",
-            Self::HsdVerified => "hsd-verified",
             Self::Native => "native",
             Self::NativeExperimental => "native-experimental",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RpcLimits {
+    pub maximum_request_bytes: usize,
+    pub maximum_concurrent_requests: usize,
+    pub execution_timeout: Duration,
+    /// Maximum number of already-memory-resident entries returned by one
+    /// collection RPC. Point reads do not consume this budget.
+    pub maximum_collection_entries: usize,
+}
+
+impl Default for RpcLimits {
+    fn default() -> Self {
+        Self {
+            maximum_request_bytes: DEFAULT_RPC_MAX_REQUEST_BYTES,
+            maximum_concurrent_requests: DEFAULT_RPC_MAX_CONCURRENT_REQUESTS,
+            execution_timeout: DEFAULT_RPC_EXECUTION_TIMEOUT,
+            maximum_collection_entries: DEFAULT_RPC_MAX_COLLECTION_ENTRIES,
+        }
+    }
+}
+
+impl RpcLimits {
+    fn validate(self) -> Result<()> {
+        if self.maximum_request_bytes == 0 || self.maximum_request_bytes > MAX_RPC_REQUEST_BYTES {
+            anyhow::bail!(
+                "RPC maximum request bytes must be between 1 and {MAX_RPC_REQUEST_BYTES}"
+            );
+        }
+        if self.maximum_concurrent_requests == 0
+            || self.maximum_concurrent_requests > MAX_RPC_CONCURRENT_REQUESTS
+        {
+            anyhow::bail!(
+                "RPC maximum concurrent requests must be between 1 and {MAX_RPC_CONCURRENT_REQUESTS}"
+            );
+        }
+        if self.execution_timeout.is_zero() || self.execution_timeout > MAX_RPC_EXECUTION_TIMEOUT {
+            anyhow::bail!(
+                "RPC execution timeout must be non-zero and at most {} milliseconds",
+                MAX_RPC_EXECUTION_TIMEOUT.as_millis()
+            );
+        }
+        if self.maximum_collection_entries == 0
+            || self.maximum_collection_entries > MAX_RPC_COLLECTION_ENTRIES
+        {
+            anyhow::bail!(
+                "RPC maximum collection entries must be between 1 and {MAX_RPC_COLLECTION_ENTRIES}"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -623,6 +1259,7 @@ pub struct NodeConfig {
     pub data_dir: Option<PathBuf>,
     pub rpc_bind: SocketAddr,
     pub rpc_authorization: Option<RpcAuthorizationHeader>,
+    pub rpc_limits: RpcLimits,
     pub log_filter: String,
     pub authority_mode: AuthorityMode,
     /// Explicit operator opt-in for the native mainnet mining canary. This is
@@ -636,7 +1273,7 @@ pub struct NodeConfig {
     pub transaction_index: bool,
     pub name_tree_compaction: NameTreeCompactionConfig,
     pub undo_retention: UndoRetentionConfig,
-    pub shadow_sync: ShadowSyncConfig,
+    pub native_sync: NativeSyncConfig,
     pub mining_engine: MiningEngineConfig,
 }
 
@@ -647,6 +1284,7 @@ impl Default for NodeConfig {
             data_dir: None,
             rpc_bind: SocketAddr::from(([127, 0, 0, 1], 12037)),
             rpc_authorization: None,
+            rpc_limits: RpcLimits::default(),
             log_filter: "info".to_owned(),
             authority_mode: AuthorityMode::Native,
             mainnet_canary: false,
@@ -655,7 +1293,7 @@ impl Default for NodeConfig {
             transaction_index: false,
             name_tree_compaction: NameTreeCompactionConfig::default(),
             undo_retention: UndoRetentionConfig::default(),
-            shadow_sync: ShadowSyncConfig::default(),
+            native_sync: NativeSyncConfig::default(),
             mining_engine: MiningEngineConfig::default(),
         }
     }
@@ -704,11 +1342,10 @@ fn decode_transaction_index_mode(raw: &[u8]) -> Result<bool> {
 }
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
+    config.rpc_limits.validate()?;
+
     match config.authority_mode {
-        AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::Native => {}
-        AuthorityMode::HsdVerified => anyhow::bail!(
-            "hsd-verified authority is not composed yet; use shadow mode until the independent verifier boundary exists"
-        ),
+        AuthorityMode::Disabled | AuthorityMode::Native => {}
         AuthorityMode::NativeExperimental => {
             if !cfg!(any(feature = "experimental-authority", test)) {
                 anyhow::bail!(
@@ -730,7 +1367,7 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
 
     validate_mainnet_canary_config(config)?;
 
-    if config.shadow_sync.connect_active_state
+    if config.native_sync.connect_active_state
         && !config.acknowledge_incomplete_consensus
         && config.authority_mode != AuthorityMode::Native
     {
@@ -741,11 +1378,11 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
 
     config.name_tree_compaction.validate()?;
     config
-        .shadow_sync
+        .native_sync
         .validate(config.authority_mode, config.network)?;
     config
         .mining_engine
-        .validate(&config.shadow_sync, config.authority_mode)
+        .validate(&config.native_sync, config.authority_mode)
 }
 
 fn validate_mainnet_canary_config(config: &NodeConfig) -> Result<()> {
@@ -764,11 +1401,11 @@ fn validate_mainnet_canary_config(config: &NodeConfig) -> Result<()> {
         || !config.rpc_bind.ip().is_loopback()
         || config.rpc_authorization.is_none()
         || config.storage_durability != DurabilityPolicy::Sync
-        || !config.shadow_sync.enabled
-        || config.shadow_sync.headers_only
-        || !config.shadow_sync.connect_active_state
-        || config.shadow_sync.maximum_outbound < 4
-        || (!config.shadow_sync.discovery && config.shadow_sync.connect_keys.len() < 2)
+        || !config.native_sync.enabled
+        || config.native_sync.headers_only
+        || !config.native_sync.connect_active_state
+        || config.native_sync.maximum_outbound < 4
+        || (!config.native_sync.discovery && config.native_sync.connect_keys.len() < 2)
         || !config.mining_engine.enabled
         || !config.mining_engine.transaction_relay
     {
@@ -787,7 +1424,7 @@ fn authority_can_mine_with_readiness(config: &NodeConfig, consensus_complete: bo
                 && (config.network != Network::Mainnet || config.mainnet_canary)
         }
         AuthorityMode::NativeExperimental => validate_node_config(config).is_ok(),
-        AuthorityMode::Disabled | AuthorityMode::Shadow | AuthorityMode::HsdVerified => false,
+        AuthorityMode::Disabled => false,
     }
 }
 
@@ -978,10 +1615,6 @@ fn authority_info(config: &NodeConfig, durable: &DurableMiningState) -> RpcAutho
 
     match config.authority_mode {
         AuthorityMode::Disabled => blockers.push("authority mode is disabled".to_owned()),
-        AuthorityMode::Shadow => blockers.push("shadow mode never authorizes mining".to_owned()),
-        AuthorityMode::HsdVerified => {
-            blockers.push("hsd-verified authority boundary is not composed".to_owned())
-        }
         AuthorityMode::Native => {}
         AuthorityMode::NativeExperimental
             if !cfg!(any(feature = "experimental-authority", test)) =>
@@ -1032,11 +1665,13 @@ fn rpc_mining_engine_info(diagnostics: MiningEngineDiagnostics) -> RpcMiningEngi
         transaction_relay_enabled: diagnostics.transaction_relay_enabled,
         mempool: diagnostics.mempool,
         maximum_template_variants: diagnostics.maximum_template_variants,
+        template_build_workers: diagnostics.template_build_workers,
+        template_build_queue_capacity: diagnostics.template_build_queue_capacity,
         cached_template_variants: diagnostics.cached_template_variants,
         pending_publications: diagnostics.pending_publications,
         maximum_pending_publications: diagnostics.maximum_pending_publications,
         publication_retry_interval_ms: diagnostics.publication_retry_interval_ms,
-        can_build_shadow_templates: diagnostics.can_build_shadow_templates,
+        can_build_templates: diagnostics.can_build_templates,
         can_publish_solved_blocks: diagnostics.can_publish_solved_blocks,
         blockers: diagnostics.blockers,
     }
@@ -1153,7 +1788,6 @@ fn parity_info() -> RpcParityInfo {
         configured: false,
         historical_replay_complete: true,
         invalid_corpus_complete: true,
-        live_shadow_active: false,
         last_compared_height: Some(HISTORICAL_REPLAY_QUALIFICATION_HEIGHT),
         last_matching_block: Some(HISTORICAL_REPLAY_QUALIFICATION_BLOCK),
         divergence: None,
@@ -1165,22 +1799,1556 @@ pub struct NodeService {
     config: NodeConfig,
     state: NodeState,
     mining_events: MiningEventHub,
-    mining_engine_templates: Mutex<TemplateCoordinator>,
+    mining_engine_templates: Arc<Mutex<TemplateCoordinator>>,
     claim_dnssec: OpenSslDnssecVerifier,
     airdrop_signatures: NativeAirdropSignatureVerifier,
 }
 
-pub type SharedNodeService = Arc<tokio::sync::Mutex<NodeService>>;
+/// Maximum number of canonical-state commands that may wait behind the
+/// dedicated writer. Keeping this ceiling in the node crate prevents a caller
+/// from turning writer serialization into an unbounded memory queue.
+pub const MAX_CANONICAL_WRITER_QUEUE_CAPACITY: usize = 1_024;
+pub const DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY: usize = 64;
+
+/// Exact durable chain generation used to reject work prepared against an old
+/// canonical view. The epoch and tip are captured from one store snapshot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CanonicalEpoch {
+    /// Process-local generation advanced after every accepted mutation,
+    /// including a closure that changes memory before returning an error.
+    pub writer_sequence: u64,
+    pub chain_epoch: u64,
+    pub tip: Option<ChainTip>,
+}
+
+impl CanonicalEpoch {
+    pub fn chain(&self) -> CanonicalChainEpoch {
+        CanonicalChainEpoch {
+            chain_epoch: self.chain_epoch,
+            tip: self.tip.clone(),
+        }
+    }
+}
+
+/// Chain-only stale guard for work that is independent of mempool and other
+/// process-local writer mutations.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CanonicalChainEpoch {
+    pub chain_epoch: u64,
+    pub tip: Option<ChainTip>,
+}
+
+#[derive(Clone, Debug)]
+enum ExpectedCanonicalState {
+    Exact(CanonicalEpoch),
+    Chain(CanonicalChainEpoch),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalWriterError {
+    StaleEpoch {
+        operation: &'static str,
+        expected: CanonicalEpoch,
+        actual: CanonicalEpoch,
+    },
+    StaleChainEpoch {
+        operation: &'static str,
+        expected: CanonicalChainEpoch,
+        actual: CanonicalChainEpoch,
+    },
+    QueueFull {
+        capacity: usize,
+    },
+    Busy,
+    ShuttingDown,
+    Stopped,
+    Terminal {
+        reason: String,
+    },
+    ResponseType {
+        operation: &'static str,
+    },
+}
+
+impl Display for CanonicalWriterError {
+    fn fmt(&self, formatter: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        match self {
+            Self::StaleEpoch {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "canonical writer rejected stale {operation} operation: expected writer/chain epoch {}/{} at {:?}, current writer/chain epoch {}/{} at {:?}",
+                expected.writer_sequence,
+                expected.chain_epoch,
+                expected.tip,
+                actual.writer_sequence,
+                actual.chain_epoch,
+                actual.tip
+            ),
+            Self::StaleChainEpoch {
+                operation,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "canonical writer rejected stale chain-scoped {operation} operation: expected chain epoch {} at {:?}, current chain epoch {} at {:?}",
+                expected.chain_epoch, expected.tip, actual.chain_epoch, actual.tip
+            ),
+            Self::QueueFull { capacity } => write!(
+                formatter,
+                "canonical writer queue is full at its {capacity}-command bound"
+            ),
+            Self::Busy => write!(formatter, "canonical writer generation changed during read"),
+            Self::ShuttingDown => write!(formatter, "canonical writer is shutting down"),
+            Self::Stopped => write!(formatter, "canonical writer has stopped"),
+            Self::Terminal { reason } => {
+                write!(formatter, "canonical writer stopped fail-closed: {reason}")
+            }
+            Self::ResponseType { operation } => write!(
+                formatter,
+                "canonical writer returned an unexpected response type for {operation}"
+            ),
+        }
+    }
+}
+
+impl StdError for CanonicalWriterError {}
+
+/// One atomically published, immutable view of the state that must agree when
+/// mining, RPC, and mempool readers make an authorization decision.
+#[derive(Clone, Debug)]
+pub struct PublishedNodeView {
+    canonical_epoch: CanonicalEpoch,
+    mining_generation: MiningGeneration,
+    observed_mining_snapshot: Option<Arc<MiningSnapshot>>,
+    authoritative_mining_snapshot: Option<Arc<MiningSnapshot>>,
+    mining_authoritative: bool,
+    mining_synchronized: bool,
+    mempool: PublishedMempoolView,
+    storage_operational: bool,
+    storage_fence_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PublishedMempoolView {
+    pub info: MempoolInfo,
+    pub ordered_txids: OrderedTxidSnapshot,
+    snapshot: MempoolSnapshot,
+    ordered_txids_generation: u64,
+}
+
+pub(crate) type PublishedMiningInputs = (
+    CanonicalEpoch,
+    Option<Arc<MiningSnapshot>>,
+    Option<Arc<MiningSnapshot>>,
+    bool,
+    MempoolInfo,
+    MempoolSnapshot,
+);
+
+impl PublishedMempoolView {
+    fn capture(mempool: &MemoryMempool) -> Result<Self> {
+        let before = mempool.info();
+        let snapshot = mempool.snapshot();
+        let ordered_txids = mempool.ordered_txids_snapshot();
+        let after = mempool.info();
+        if before != after {
+            anyhow::bail!("mempool changed while its immutable publication was being captured");
+        }
+        Self::new(after, snapshot, ordered_txids, before.generation)
+    }
+
+    fn new(
+        info: MempoolInfo,
+        snapshot: MempoolSnapshot,
+        ordered_txids: OrderedTxidSnapshot,
+        ordered_txids_generation: u64,
+    ) -> Result<Self> {
+        let published = Self {
+            info,
+            ordered_txids,
+            snapshot,
+            ordered_txids_generation,
+        };
+        published.validate()?;
+        Ok(published)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.info.generation != self.snapshot.generation()
+            || self.info.generation != self.ordered_txids_generation
+        {
+            anyhow::bail!(
+                "published mempool generations disagree: info={}, snapshot={}, ordered={}",
+                self.info.generation,
+                self.snapshot.generation(),
+                self.ordered_txids_generation
+            );
+        }
+        if self.info.transaction_count != self.snapshot.len()
+            || self.info.transaction_count != self.ordered_txids.len()
+        {
+            anyhow::bail!(
+                "published mempool transaction counts disagree: info={}, snapshot={}, ordered={}",
+                self.info.transaction_count,
+                self.snapshot.len(),
+                self.ordered_txids.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// O(1) clone of the persistent maps for this exact published generation.
+    pub fn snapshot(&self) -> MempoolSnapshot {
+        self.snapshot.clone()
+    }
+}
+
+impl PublishedNodeView {
+    pub fn canonical_epoch(&self) -> &CanonicalEpoch {
+        &self.canonical_epoch
+    }
+
+    pub const fn mining_generation(&self) -> MiningGeneration {
+        self.mining_generation
+    }
+
+    pub fn observed_mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
+        self.observed_mining_snapshot.clone()
+    }
+
+    pub fn authoritative_mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
+        self.authoritative_mining_snapshot.clone()
+    }
+
+    pub const fn mining_authoritative(&self) -> bool {
+        self.mining_authoritative
+    }
+
+    pub const fn mining_synchronized(&self) -> bool {
+        self.mining_synchronized
+    }
+
+    pub fn mempool_info(&self) -> &MempoolInfo {
+        &self.mempool.info
+    }
+
+    pub fn ordered_txids(&self) -> &OrderedTxidSnapshot {
+        &self.mempool.ordered_txids
+    }
+
+    pub fn mempool_snapshot(&self) -> MempoolSnapshot {
+        self.mempool.snapshot()
+    }
+
+    pub fn mempool_view(&self) -> &PublishedMempoolView {
+        &self.mempool
+    }
+
+    pub const fn storage_operational(&self) -> bool {
+        self.storage_operational
+    }
+
+    pub fn storage_fence_reason(&self) -> Option<&str> {
+        self.storage_fence_reason.as_deref()
+    }
+}
+
+#[derive(Debug)]
+struct NodeRuntimeState {
+    published: RwLock<Arc<PublishedNodeView>>,
+    /// Even values identify stable published generations. The writer stores
+    /// an odd value before invoking any mutation closure and returns to even
+    /// only after the corresponding immutable view is published.
+    publication_sequence: AtomicU64,
+    accepting: AtomicBool,
+    terminal: Mutex<Option<String>>,
+}
+
+impl NodeRuntimeState {
+    fn published_unchecked(&self) -> Arc<PublishedNodeView> {
+        Arc::clone(
+            &self
+                .published
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn published(&self) -> Arc<PublishedNodeView> {
+        // The last published Arc is immutable and remains a valid committed
+        // generation while a bounded writer slice is in flight. Callers that
+        // must bind new durable reads to an epoch use `with_stable_epoch_read`.
+        self.published_unchecked()
+    }
+
+    fn publish(&self, view: PublishedNodeView) {
+        *self
+            .published
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(view);
+    }
+
+    fn terminal_reason(&self) -> Option<String> {
+        self.terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn stop_fail_closed(&self, reason: impl Into<String>) -> String {
+        self.accepting.store(false, Ordering::Release);
+        let mut terminal = self
+            .terminal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if terminal.is_none() {
+            *terminal = Some(reason.into());
+        }
+        terminal.clone().expect("terminal reason was initialized")
+    }
+}
+
+type CanonicalCommandValue = Box<dyn Any + Send>;
+type CanonicalCommandOperation =
+    Box<dyn FnOnce(&mut NodeService) -> Result<CanonicalCommandValue> + Send + 'static>;
+type CanonicalReadOperation =
+    Box<dyn FnOnce(&NodeService) -> Result<CanonicalCommandValue> + Send + 'static>;
+
+enum CanonicalWriterCommand {
+    Execute {
+        expected: Option<ExpectedCanonicalState>,
+        operation: &'static str,
+        execute: CanonicalCommandOperation,
+        _admission: OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<CanonicalCommandValue>>,
+    },
+    Inspect {
+        operation: &'static str,
+        inspect: CanonicalReadOperation,
+        _admission: OwnedSemaphorePermit,
+        reply: oneshot::Sender<Result<CanonicalCommandValue>>,
+    },
+    Shutdown {
+        mark_clean: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
+
+struct NodeRuntimeInner {
+    state: Arc<NodeRuntimeState>,
+    sender: mpsc::Sender<CanonicalWriterCommand>,
+    admission_slots: Arc<Semaphore>,
+    admission: Mutex<()>,
+    join: AsyncMutex<Option<thread::JoinHandle<()>>>,
+    queue_capacity: usize,
+}
+
+/// Cloneable immutable access to durable state and the coherent published
+/// chain/mempool/mining generation. This handle never exposes a mutable store
+/// or mutable header index.
+#[derive(Clone)]
+pub struct NodeReadHandle {
+    config: Arc<NodeConfig>,
+    store: StoreHandle,
+    headers: SharedHeaderIndex,
+    transaction_index: bool,
+    mining_events: MiningEventHub,
+    mining_engine_templates: Arc<Mutex<TemplateCoordinator>>,
+    state: Arc<NodeRuntimeState>,
+    runtime: Weak<NodeRuntimeInner>,
+    point_read_concurrency: Arc<Semaphore>,
+    collection_concurrency: Arc<Semaphore>,
+    template_build_admission: Arc<Semaphore>,
+    template_build_workers: Arc<Semaphore>,
+}
+
+impl NodeReadHandle {
+    pub fn config(&self) -> Arc<NodeConfig> {
+        Arc::clone(&self.config)
+    }
+
+    pub fn network(&self) -> Network {
+        self.config.network
+    }
+
+    /// Return the last immutable publication for observation. This remains
+    /// available while a writer generation is in flight and may be stale
+    /// after shutdown; authority-bearing callers must use a checked accessor
+    /// such as [`Self::published_mempool`] or [`Self::stable_canonical_epoch`].
+    pub fn published(&self) -> Arc<PublishedNodeView> {
+        self.state.published()
+    }
+
+    pub fn canonical_epoch(&self) -> CanonicalEpoch {
+        self.published().canonical_epoch.clone()
+    }
+
+    pub fn ensure_storage_operational(&self) -> Result<()> {
+        if let Some(reason) = self.state.terminal_reason() {
+            return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                reason,
+            }));
+        }
+        if !self.state.accepting.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+        }
+        let _runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        if let Some(reason) = self.state.terminal_reason() {
+            return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                reason,
+            }));
+        }
+        if !self.state.accepting.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+        }
+        let published = self.published();
+        if published.storage_operational {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "node is fail-closed: {}",
+                published
+                    .storage_fence_reason
+                    .as_deref()
+                    .unwrap_or("canonical writer is unavailable")
+            )
+        }
+    }
+
+    pub fn mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
+        self.ensure_storage_operational().ok()?;
+        let snapshot = self.published().authoritative_mining_snapshot();
+        self.ensure_storage_operational().ok()?;
+        snapshot
+    }
+
+    pub fn observed_mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
+        self.published().observed_mining_snapshot()
+    }
+
+    pub fn subscribe_observed_mining_events(&self) -> MiningSubscriptions {
+        self.mining_events.subscribe()
+    }
+
+    pub fn subscribe_mining_events(&self) -> Result<MiningSubscriptions> {
+        self.ensure_storage_operational()?;
+        if self.published().mining_authoritative {
+            let subscriptions = self.mining_events.subscribe();
+            self.ensure_storage_operational()?;
+            Ok(subscriptions)
+        } else {
+            anyhow::bail!("authoritative mining subscriptions are disabled")
+        }
+    }
+
+    pub async fn rpc_diagnostic_service(&self) -> Result<BasicRpcService> {
+        self.inspect_bounded("RPC diagnostic snapshot", |node| {
+            node.rpc_diagnostic_service()
+        })
+        .await
+    }
+
+    pub(crate) fn rpc_read_context(&self) -> Result<RpcReadContext> {
+        self.ensure_storage_operational()?;
+        Ok(RpcReadContext {
+            store: self.store.clone(),
+            headers: self.headers.clone(),
+            network: self.config.network,
+            transaction_index: self.transaction_index,
+            point_read_concurrency: Arc::clone(&self.point_read_concurrency),
+            collection_concurrency: Arc::clone(&self.collection_concurrency),
+        })
+    }
+
+    /// Checked O(1) clone of the last committed immutable mempool generation.
+    /// That generation deliberately remains readable while a writer mutation
+    /// is in flight. Terminal, stopped, and shutting-down runtimes do not
+    /// expose their last stale generation through this authority-bearing
+    /// accessor.
+    pub fn published_mempool(&self) -> Result<PublishedMempoolView> {
+        Ok(self.checked_published()?.mempool.clone())
+    }
+
+    fn checked_published(&self) -> Result<Arc<PublishedNodeView>> {
+        self.ensure_storage_operational()?;
+        let published = self.published();
+        published.mempool.validate()?;
+        self.ensure_storage_operational()?;
+        Ok(published)
+    }
+
+    pub(crate) fn published_mempool_snapshot(&self) -> Result<MempoolSnapshot> {
+        Ok(self.checked_published()?.mempool_snapshot())
+    }
+
+    pub(crate) fn published_mining_inputs(&self) -> Result<PublishedMiningInputs> {
+        let published = self.checked_published()?;
+        let inputs = (
+            published.canonical_epoch.clone(),
+            published.observed_mining_snapshot.clone(),
+            published.authoritative_mining_snapshot.clone(),
+            published.mining_authoritative,
+            published.mempool.info.clone(),
+            published.mempool.snapshot(),
+        );
+        self.ensure_storage_operational()?;
+        Ok(inputs)
+    }
+
+    pub(crate) fn template_coordinator_handle(&self) -> Arc<Mutex<TemplateCoordinator>> {
+        Arc::clone(&self.mining_engine_templates)
+    }
+
+    pub(crate) fn canonical_generation_is_stable(&self, expected: &CanonicalEpoch) -> bool {
+        if self.ensure_storage_operational().is_err() {
+            return false;
+        }
+        let before = self.state.publication_sequence.load(Ordering::Acquire);
+        if before & 1 != 0 || expected.writer_sequence != before / 2 {
+            return false;
+        }
+        let published = self.state.published_unchecked();
+        if !published.storage_operational || &published.canonical_epoch != expected {
+            return false;
+        }
+        let after = self.state.publication_sequence.load(Ordering::Acquire);
+        if before != after || after & 1 != 0 || self.ensure_storage_operational().is_err() {
+            return false;
+        }
+        let current = self.state.published_unchecked();
+        let final_sequence = self.state.publication_sequence.load(Ordering::Acquire);
+        before == final_sequence
+            && final_sequence & 1 == 0
+            && Arc::ptr_eq(&published, &current)
+            && current.storage_operational
+            && &current.canonical_epoch == expected
+    }
+
+    pub(crate) async fn rpc_request_mempool(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> Result<RpcRequestMempool> {
+        let method = RpcMethod::from_hsd_name(&request.method);
+        let published = self.checked_published()?;
+        let ordered_txids = (method == Some(RpcMethod::GetRawMempool)
+            && published.mempool.info.transaction_count
+                <= self.config.rpc_limits.maximum_collection_entries)
+            .then(|| published.mempool.ordered_txids.clone());
+        let transaction_lookup = if method == Some(RpcMethod::GetRawTransaction) {
+            rpc_string_param(request, 0)
+                .and_then(|encoded| decode_rpc_txid(encoded).ok())
+                .map(|txid| (published.mempool.snapshot(), txid))
+        } else {
+            None
+        };
+        self.ensure_storage_operational()?;
+        Ok(RpcRequestMempool {
+            info: published.mempool.info.clone(),
+            ordered_txids,
+            transaction_lookup,
+        })
+    }
+
+    pub(crate) async fn mempool_transaction(&self, txid: Txid) -> Result<Option<Transaction>> {
+        let permit = Arc::clone(&self.point_read_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let snapshot = self.published_mempool_snapshot()?;
+        let transaction = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            snapshot.transaction(&txid).cloned()
+        })
+        .await
+        .context("mempool transaction worker failed")?;
+        self.ensure_storage_operational()?;
+        Ok(transaction)
+    }
+
+    pub(crate) async fn mempool_claim(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<hns_primitives::Claim>> {
+        let permit = Arc::clone(&self.point_read_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let snapshot = self.published_mempool_snapshot()?;
+        let claim = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            snapshot.claim(&hash).map(|entry| entry.claim.clone())
+        })
+        .await
+        .context("mempool claim worker failed")?;
+        self.ensure_storage_operational()?;
+        Ok(claim)
+    }
+
+    pub(crate) async fn mempool_airdrop(
+        &self,
+        hash: [u8; 32],
+    ) -> Result<Option<hns_primitives::AirdropProof>> {
+        let permit = Arc::clone(&self.point_read_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let snapshot = self.published_mempool_snapshot()?;
+        let proof = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            snapshot.airdrop(&hash).map(|entry| entry.proof.clone())
+        })
+        .await
+        .context("mempool airdrop worker failed")?;
+        self.ensure_storage_operational()?;
+        Ok(proof)
+    }
+
+    pub(crate) async fn mempool_inventory(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<hns_p2p::Inventory>> {
+        if maximum > MAX_RPC_COLLECTION_ENTRIES {
+            anyhow::bail!(
+                "mempool inventory request {maximum} exceeds {MAX_RPC_COLLECTION_ENTRIES} entries"
+            );
+        }
+        let permit = Arc::clone(&self.collection_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let published = self.checked_published()?;
+        let snapshot = published.mempool.snapshot();
+        let ordered_txids = published.mempool.ordered_txids.clone();
+        let inventory = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut inventory = Vec::with_capacity(
+                maximum.min(
+                    ordered_txids
+                        .len()
+                        .saturating_add(published.mempool.info.claim_count)
+                        .saturating_add(published.mempool.info.airdrop_count),
+                ),
+            );
+            inventory.extend(
+                ordered_txids
+                    .txids()
+                    .take(maximum)
+                    .map(hns_p2p::Inventory::transaction),
+            );
+            let remaining = maximum.saturating_sub(inventory.len());
+            inventory.extend(
+                snapshot
+                    .claims_in_sequence()
+                    .take(remaining)
+                    .map(|entry| hns_p2p::Inventory::claim(entry.hash)),
+            );
+            let remaining = maximum.saturating_sub(inventory.len());
+            inventory.extend(
+                snapshot
+                    .airdrops_in_sequence()
+                    .take(remaining)
+                    .map(|entry| hns_p2p::Inventory::airdrop(entry.hash)),
+            );
+            inventory
+        })
+        .await
+        .context("mempool inventory worker failed")?;
+        self.ensure_storage_operational()?;
+        Ok(inventory)
+    }
+
+    pub(crate) async fn mempool_transactions(&self, maximum: usize) -> Result<Vec<Transaction>> {
+        if maximum > MAX_RPC_COLLECTION_ENTRIES {
+            anyhow::bail!(
+                "mempool transaction request {maximum} exceeds {MAX_RPC_COLLECTION_ENTRIES} entries"
+            );
+        }
+        let permit = Arc::clone(&self.collection_concurrency)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))?;
+        let published = self.checked_published()?;
+        let snapshot = published.mempool.snapshot();
+        let ordered_txids = published.mempool.ordered_txids.clone();
+        let transactions = tokio::task::spawn_blocking(move || -> Result<Vec<Transaction>> {
+            let _permit = permit;
+            let mut transactions = Vec::with_capacity(maximum.min(ordered_txids.len()));
+            for txid in ordered_txids.txids().take(maximum) {
+                let transaction = snapshot.transaction(&txid).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "published mempool order references absent transaction {}",
+                        txid.to_hex()
+                    )
+                })?;
+                transactions.push(transaction.clone());
+            }
+            Ok(transactions)
+        })
+        .await
+        .context("mempool transaction collection worker failed")??;
+        self.ensure_storage_operational()?;
+        Ok(transactions)
+    }
+
+    /// Execute a short actor-owned diagnostic read in canonical-writer order.
+    /// Durable reads use stable snapshots, and mempool/template payloads use
+    /// their structurally shared published generations; neither scans nor
+    /// payload construction belong on this path.
+    async fn inspect_bounded<T, F>(&self, operation: &'static str, inspect: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&NodeService) -> Result<T> + Send + 'static,
+    {
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        if let Some(reason) = self.state.terminal_reason() {
+            return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                reason,
+            }));
+        }
+        if !self.state.accepting.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+        }
+        let admission = Arc::clone(&runtime.admission_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                anyhow::Error::new(CanonicalWriterError::QueueFull {
+                    capacity: runtime.queue_capacity,
+                })
+            })?;
+        let (reply, response) = oneshot::channel();
+        let command = CanonicalWriterCommand::Inspect {
+            operation,
+            inspect: Box::new(move |node| {
+                inspect(node).map(|value| Box::new(value) as CanonicalCommandValue)
+            }),
+            _admission: admission,
+            reply,
+        };
+        let permit = runtime
+            .sender
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        {
+            let _admission = runtime
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(reason) = self.state.terminal_reason() {
+                return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                    reason,
+                }));
+            }
+            if !self.state.accepting.load(Ordering::Acquire) {
+                return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+            }
+            permit.send(command);
+        }
+        decode_canonical_response(operation, response.await)
+    }
+
+    /// Run a durable immutable read against one stable writer generation. If
+    /// a mutation overlaps the read, discard its result and retry after the
+    /// writer publishes the matching even generation.
+    pub(crate) fn with_stable_read<T, F>(&self, read: F) -> Result<T>
+    where
+        F: FnOnce(&StoreHandle, &SharedHeaderIndex) -> Result<T>,
+    {
+        self.with_stable_epoch_read(read).map(|(_, value)| value)
+    }
+
+    /// Capture a prepare result and its exact canonical epoch without waiting
+    /// on an in-flight mutation. Busy callers may yield and retry or submit an
+    /// ordered inspector command instead.
+    pub(crate) fn with_stable_epoch_read<T, F>(&self, read: F) -> Result<(CanonicalEpoch, T)>
+    where
+        F: FnOnce(&StoreHandle, &SharedHeaderIndex) -> Result<T>,
+    {
+        self.ensure_storage_operational()?;
+        let before = self.state.publication_sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return Err(anyhow::Error::new(CanonicalWriterError::Busy));
+        }
+        let epoch = self.state.published_unchecked().canonical_epoch.clone();
+        let result = read(&self.store, &self.headers);
+        let after = self.state.publication_sequence.load(Ordering::Acquire);
+        if before != after || after & 1 != 0 || epoch.writer_sequence != after / 2 {
+            return Err(anyhow::Error::new(CanonicalWriterError::Busy));
+        }
+        self.ensure_storage_operational()?;
+        result.map(|value| (epoch, value))
+    }
+
+    pub fn stable_canonical_epoch(&self) -> Result<CanonicalEpoch> {
+        self.ensure_storage_operational()?;
+        Ok(self.canonical_epoch())
+    }
+
+    /// Reserve one configured template slot before capturing the mempool. The
+    /// permit must be held through capture and construction so admitted
+    /// snapshots remain inside the aggregate memory envelope.
+    pub(crate) fn try_acquire_template_build_admission(&self) -> Result<OwnedSemaphorePermit> {
+        self.ensure_storage_operational()?;
+        Arc::clone(&self.template_build_admission)
+            .try_acquire_owned()
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Busy))
+    }
+
+    /// Wait for bounded CPU capacity before the off-actor state capture. The
+    /// permit covers capture and construction without blocking the writer.
+    pub(crate) async fn acquire_template_build_worker(&self) -> Result<OwnedSemaphorePermit> {
+        self.ensure_storage_operational()?;
+        let worker = Arc::clone(&self.template_build_workers)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        self.ensure_storage_operational()?;
+        Ok(worker)
+    }
+}
+
+impl std_fmt::Debug for NodeReadHandle {
+    fn fmt(&self, formatter: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        formatter
+            .debug_struct("NodeReadHandle")
+            .field("network", &self.config.network)
+            .field("canonical_epoch", &self.canonical_epoch())
+            .field("accepting", &self.state.accepting.load(Ordering::Acquire))
+            .field("terminal", &self.state.terminal_reason())
+            .finish()
+    }
+}
+
+/// Bounded command admission to the one OS thread that exclusively owns the
+/// mutable [`NodeService`]. Once accepted, a command runs even if its caller
+/// drops the response future.
+#[derive(Clone)]
+pub struct CanonicalStateWriter {
+    inner: Arc<NodeRuntimeInner>,
+}
+
+impl std_fmt::Debug for CanonicalStateWriter {
+    fn fmt(&self, formatter: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        formatter
+            .debug_struct("CanonicalStateWriter")
+            .field("queue_capacity", &self.inner.queue_capacity)
+            .field(
+                "accepting",
+                &self.inner.state.accepting.load(Ordering::Acquire),
+            )
+            .field("terminal", &self.inner.state.terminal_reason())
+            .finish()
+    }
+}
+
+impl CanonicalStateWriter {
+    pub async fn execute<T, F>(
+        &self,
+        expected: Option<CanonicalEpoch>,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        let admission = self.try_admission()?;
+        let (reply, response) = oneshot::channel();
+        let command = CanonicalWriterCommand::Execute {
+            expected: expected.map(ExpectedCanonicalState::Exact),
+            operation,
+            execute: Box::new(move |node| {
+                execute(node).map(|value| Box::new(value) as CanonicalCommandValue)
+            }),
+            _admission: admission,
+            reply,
+        };
+        let permit = self
+            .inner
+            .sender
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.ensure_accepting()?;
+            permit.send(command);
+        }
+        decode_canonical_response(operation, response.await)
+    }
+
+    pub async fn execute_at<T, F>(
+        &self,
+        expected: CanonicalEpoch,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        self.execute(Some(expected), operation, execute).await
+    }
+
+    pub async fn execute_at_chain<T, F>(
+        &self,
+        expected: CanonicalChainEpoch,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        self.execute_expected(
+            Some(ExpectedCanonicalState::Chain(expected)),
+            operation,
+            execute,
+        )
+        .await
+    }
+
+    pub async fn try_execute<T, F>(
+        &self,
+        expected: Option<CanonicalEpoch>,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        let admission = self.try_admission()?;
+        let permit = self
+            .inner
+            .sender
+            .clone()
+            .try_reserve_owned()
+            .map_err(|error| {
+                let kind = match error {
+                    mpsc::error::TrySendError::Full(_) => CanonicalWriterError::QueueFull {
+                        capacity: self.inner.queue_capacity,
+                    },
+                    mpsc::error::TrySendError::Closed(_) => CanonicalWriterError::Stopped,
+                };
+                anyhow::Error::new(kind)
+            })?;
+        let (reply, response) = oneshot::channel();
+        let command = CanonicalWriterCommand::Execute {
+            expected: expected.map(ExpectedCanonicalState::Exact),
+            operation,
+            execute: Box::new(move |node| {
+                execute(node).map(|value| Box::new(value) as CanonicalCommandValue)
+            }),
+            _admission: admission,
+            reply,
+        };
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.ensure_accepting()?;
+            permit.send(command);
+        }
+        decode_canonical_response(operation, response.await)
+    }
+
+    pub async fn try_execute_at<T, F>(
+        &self,
+        expected: CanonicalEpoch,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        self.try_execute(Some(expected), operation, execute).await
+    }
+
+    async fn execute_expected<T, F>(
+        &self,
+        expected: Option<ExpectedCanonicalState>,
+        operation: &'static str,
+        execute: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut NodeService) -> Result<T> + Send + 'static,
+    {
+        let admission = self.try_admission()?;
+        let (reply, response) = oneshot::channel();
+        let command = CanonicalWriterCommand::Execute {
+            expected,
+            operation,
+            execute: Box::new(move |node| {
+                execute(node).map(|value| Box::new(value) as CanonicalCommandValue)
+            }),
+            _admission: admission,
+            reply,
+        };
+        let permit = self
+            .inner
+            .sender
+            .clone()
+            .reserve_owned()
+            .await
+            .map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))?;
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.ensure_accepting()?;
+            permit.send(command);
+        }
+        decode_canonical_response(operation, response.await)
+    }
+
+    fn ensure_accepting(&self) -> Result<()> {
+        if let Some(reason) = self.inner.state.terminal_reason() {
+            return Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                reason,
+            }));
+        }
+        if !self.inner.state.accepting.load(Ordering::Acquire) {
+            return Err(anyhow::Error::new(CanonicalWriterError::ShuttingDown));
+        }
+        Ok(())
+    }
+
+    fn try_admission(&self) -> Result<OwnedSemaphorePermit> {
+        self.ensure_accepting()?;
+        Arc::clone(&self.inner.admission_slots)
+            .try_acquire_owned()
+            .map_err(|_| {
+                anyhow::Error::new(CanonicalWriterError::QueueFull {
+                    capacity: self.inner.queue_capacity,
+                })
+            })
+    }
+}
+
+fn decode_canonical_response<T: Send + 'static>(
+    operation: &'static str,
+    response: std::result::Result<Result<CanonicalCommandValue>, oneshot::error::RecvError>,
+) -> Result<T> {
+    let value = response.map_err(|_| anyhow::Error::new(CanonicalWriterError::Stopped))??;
+    value
+        .downcast::<T>()
+        .map(|value| *value)
+        .map_err(|_| anyhow::Error::new(CanonicalWriterError::ResponseType { operation }))
+}
+
+/// Process-local owner for the dedicated canonical writer and all immutable
+/// read handles derived from it.
+#[derive(Clone)]
+pub struct NodeRuntime {
+    inner: Arc<NodeRuntimeInner>,
+    read: NodeReadHandle,
+}
+
+impl std_fmt::Debug for NodeRuntime {
+    fn fmt(&self, formatter: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        formatter
+            .debug_struct("NodeRuntime")
+            .field("queue_capacity", &self.inner.queue_capacity)
+            .field(
+                "accepting",
+                &self.inner.state.accepting.load(Ordering::Acquire),
+            )
+            .field("terminal", &self.inner.state.terminal_reason())
+            .finish()
+    }
+}
+
+impl NodeRuntime {
+    pub fn spawn(mut node: NodeService, queue_capacity: usize) -> Result<Self> {
+        if queue_capacity == 0 || queue_capacity > MAX_CANONICAL_WRITER_QUEUE_CAPACITY {
+            anyhow::bail!(
+                "canonical writer queue capacity must be between 1 and {MAX_CANONICAL_WRITER_QUEUE_CAPACITY}"
+            );
+        }
+        node.state.ensure_storage_operational()?;
+        node.mining_engine_initialize_publication_queue()?;
+        let initial = capture_published_node_view(&node, 0)?;
+        let config = Arc::new(node.config.clone());
+        let store = node.state.store.clone();
+        let headers = node.state.chain.clone();
+        let transaction_index = node.state.transaction_index;
+        let mining_events = node.mining_events.clone();
+        let mining_engine_templates = Arc::clone(&node.mining_engine_templates);
+        let maximum_concurrent_requests = node.config.rpc_limits.maximum_concurrent_requests;
+        let template_build_workers = node.config.mining_engine.template_build_workers();
+        let template_build_queue_capacity =
+            node.config.mining_engine.template_build_queue_capacity();
+        let state = Arc::new(NodeRuntimeState {
+            published: RwLock::new(Arc::new(initial)),
+            publication_sequence: AtomicU64::new(0),
+            accepting: AtomicBool::new(true),
+            terminal: Mutex::new(None),
+        });
+        let (sender, receiver) = mpsc::channel(queue_capacity);
+        let actor_state = Arc::clone(&state);
+        let join = thread::Builder::new()
+            .name("hsrd-canonical-writer".to_owned())
+            .spawn(move || canonical_writer_thread(node, receiver, actor_state))
+            .context("failed to spawn canonical writer thread")?;
+        let inner = Arc::new(NodeRuntimeInner {
+            state,
+            sender,
+            admission_slots: Arc::new(Semaphore::new(queue_capacity.saturating_add(1))),
+            admission: Mutex::new(()),
+            join: AsyncMutex::new(Some(join)),
+            queue_capacity,
+        });
+        let read = NodeReadHandle {
+            config,
+            store,
+            headers,
+            transaction_index,
+            mining_events,
+            mining_engine_templates,
+            state: Arc::clone(&inner.state),
+            runtime: Arc::downgrade(&inner),
+            point_read_concurrency: Arc::new(Semaphore::new(maximum_concurrent_requests)),
+            collection_concurrency: Arc::new(Semaphore::new(maximum_concurrent_requests)),
+            template_build_admission: Arc::new(Semaphore::new(template_build_queue_capacity)),
+            template_build_workers: Arc::new(Semaphore::new(template_build_workers)),
+        };
+        Ok(Self { inner, read })
+    }
+
+    pub fn read(&self) -> NodeReadHandle {
+        self.read.clone()
+    }
+
+    pub fn writer(&self) -> CanonicalStateWriter {
+        CanonicalStateWriter {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Authorize a clean marker only from the crate-owned runtime supervisor.
+    /// Public extensions receive read and writer capabilities, but never node
+    /// lifecycle authority.
+    pub(crate) async fn shutdown(self) -> Result<()> {
+        self.shutdown_inner(true).await
+    }
+
+    /// Drain accepted writer work and stop without authorizing a clean-store
+    /// marker. Runtime supervisors must use this path after any failed
+    /// extension, checkpoint, listener, or shutdown phase so the next process
+    /// performs exhaustive startup validation.
+    pub(crate) async fn shutdown_unclean(self) -> Result<()> {
+        self.shutdown_inner(false).await
+    }
+
+    async fn shutdown_inner(self, mark_clean: bool) -> Result<()> {
+        // Serializing on the join handle makes cloned shutdown attempts
+        // deterministic. In particular, an unclean correction cannot race a
+        // preceding clean shutdown and be overwritten by its final marker.
+        let mut join_guard = self.inner.join.lock().await;
+        let marker_result = if mark_clean {
+            Ok(())
+        } else {
+            mark_unclean_start(&self.read.store)
+                .map_err(anyhow::Error::new)
+                .context("failed to durably preserve the unclean runtime marker")
+        };
+        if join_guard.is_none() {
+            return if mark_clean {
+                Err(anyhow::Error::new(CanonicalWriterError::Stopped))
+            } else {
+                marker_result
+            };
+        }
+
+        let (reply, response) = oneshot::channel();
+        {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.inner.state.accepting.store(false, Ordering::Release);
+        }
+        // Send even when another path already stopped admission. A cancelled
+        // shutdown may have flipped `accepting` without ever queuing the stop
+        // command, and this caller still owns the live join handle.
+        let actor_result = match self.inner.sender.clone().reserve_owned().await {
+            Ok(permit) => {
+                permit.send(CanonicalWriterCommand::Shutdown { mark_clean, reply });
+                match response.await {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::Error::new(CanonicalWriterError::Stopped)),
+                }
+            }
+            Err(_) => Err(anyhow::Error::new(CanonicalWriterError::Stopped)),
+        };
+        // Keep the handle recoverable in shared state across both await
+        // points above. If this future is cancelled before or after enqueue,
+        // another lifecycle owner can still stop and join the actor.
+        let join = join_guard
+            .take()
+            .expect("canonical writer join handle remained serialized");
+        let join_result = match tokio::task::spawn_blocking(move || join.join()).await {
+            Ok(result) => result.map_err(|_| anyhow::anyhow!("canonical writer thread panicked")),
+            Err(error) => Err(anyhow::anyhow!(
+                "failed to join canonical writer task: {error}"
+            )),
+        };
+        drop(join_guard);
+
+        let result = combine_shutdown_phase(marker_result, "canonical writer stop", actor_result);
+        let result = combine_shutdown_phase(result, "canonical writer join", join_result);
+        if mark_clean {
+            result
+        } else {
+            // A clean shutdown command may already have been queued by a
+            // cancelled clone. It can overwrite the pre-stop unclean marker,
+            // exit, and discard this correction command. Reassert only after
+            // joining so no actor-owned clean write can win afterward.
+            let final_marker_result = mark_unclean_start(&self.read.store)
+                .map_err(anyhow::Error::new)
+                .context("failed to reassert the unclean marker after canonical writer exit");
+            combine_shutdown_phase(
+                result,
+                "post-join unclean-marker reassertion",
+                final_marker_result,
+            )
+        }
+    }
+
+    pub fn terminal_error(&self) -> Option<CanonicalWriterError> {
+        self.inner
+            .state
+            .terminal_reason()
+            .map(|reason| CanonicalWriterError::Terminal { reason })
+    }
+}
+
+fn combine_shutdown_phase(
+    accumulated: Result<()>,
+    phase: &'static str,
+    phase_result: Result<()>,
+) -> Result<()> {
+    match (accumulated, phase_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error.context(phase)),
+        (Err(error), Err(additional)) => Err(error.context(format!(
+            "{phase} also failed during shutdown: {additional:#}"
+        ))),
+    }
+}
+
+fn canonical_epoch_for_node(node: &NodeService, writer_sequence: u64) -> Result<CanonicalEpoch> {
+    let snapshot = node.state.store.snapshot()?;
+    Ok(CanonicalEpoch {
+        writer_sequence,
+        chain_epoch: chain_epoch_from_snapshot(&snapshot)?,
+        tip: best_block_tip_from_snapshot(&snapshot)?,
+    })
+}
+
+fn capture_published_node_view(
+    node: &NodeService,
+    writer_sequence: u64,
+) -> Result<PublishedNodeView> {
+    node.state.ensure_storage_operational()?;
+    let canonical_epoch = canonical_epoch_for_node(node, writer_sequence)?;
+    let durable = node.state.durable_mining_state()?;
+    let mempool = PublishedMempoolView::capture(&node.state.mempool)?;
+    let authority_permit = issue_authority_permit(&node.config, &durable);
+    let authoritative_mining_snapshot = authority_permit.as_ref().and_then(|permit| {
+        node.mining_events.snapshot().filter(|snapshot| {
+            snapshot.generation == permit.generation && snapshot.tip.hash == permit.tip
+        })
+    });
+    let mining_authoritative = authority_permit.is_some()
+        && authoritative_mining_snapshot.is_some()
+        && durable.authoritative;
+    Ok(PublishedNodeView {
+        canonical_epoch,
+        mining_generation: durable.generation,
+        observed_mining_snapshot: durable.snapshot,
+        authoritative_mining_snapshot,
+        mining_authoritative,
+        mining_synchronized: durable.synchronized,
+        mempool,
+        storage_operational: true,
+        storage_fence_reason: None,
+    })
+}
+
+fn fail_closed_published_node_view(
+    node: &NodeService,
+    previous: &PublishedNodeView,
+    writer_sequence: u64,
+    reason: String,
+) -> PublishedNodeView {
+    let canonical_epoch = canonical_epoch_for_node(node, writer_sequence)
+        .unwrap_or_else(|_| previous.canonical_epoch.clone());
+    PublishedNodeView {
+        canonical_epoch,
+        mining_generation: previous.mining_generation,
+        observed_mining_snapshot: None,
+        authoritative_mining_snapshot: None,
+        mining_authoritative: false,
+        mining_synchronized: false,
+        mempool: previous.mempool.clone(),
+        storage_operational: false,
+        storage_fence_reason: Some(reason),
+    }
+}
+
+fn next_writer_sequence(current: u64) -> Option<u64> {
+    // Each writer generation consumes an odd "write in progress" value and
+    // the following even "published" value in the seqlock counter.
+    current.checked_add(1).filter(|next| *next <= u64::MAX / 2)
+}
+
+fn canonical_writer_thread(
+    mut node: NodeService,
+    mut receiver: mpsc::Receiver<CanonicalWriterCommand>,
+    state: Arc<NodeRuntimeState>,
+) {
+    let mut writer_sequence = 0u64;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        while let Some(command) = receiver.blocking_recv() {
+            match command {
+                CanonicalWriterCommand::Execute {
+                    expected,
+                    operation,
+                    execute,
+                    _admission,
+                    reply,
+                } => {
+                    if let Some(reason) = state.terminal_reason() {
+                        let _ =
+                            reply.send(Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                                reason,
+                            })));
+                        continue;
+                    }
+                    let actual = match canonical_epoch_for_node(&node, writer_sequence) {
+                        Ok(actual) => actual,
+                        Err(error) => {
+                            let reason = state.stop_fail_closed(format!(
+                                "failed to capture canonical epoch before {operation}: {error:#}"
+                            ));
+                            let previous = state.published();
+                            state.publish(fail_closed_published_node_view(
+                                &node,
+                                &previous,
+                                writer_sequence,
+                                reason.clone(),
+                            ));
+                            let _ = reply.send(Err(anyhow::Error::new(
+                                CanonicalWriterError::Terminal { reason },
+                            )));
+                            break;
+                        }
+                    };
+                    if let Some(expected) = expected {
+                        let stale = match expected {
+                            ExpectedCanonicalState::Exact(expected) if expected != actual => {
+                                Some(CanonicalWriterError::StaleEpoch {
+                                    operation,
+                                    expected,
+                                    actual: actual.clone(),
+                                })
+                            }
+                            ExpectedCanonicalState::Chain(expected)
+                                if expected != actual.chain() =>
+                            {
+                                Some(CanonicalWriterError::StaleChainEpoch {
+                                    operation,
+                                    expected,
+                                    actual: actual.chain(),
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let Some(stale) = stale {
+                            let _ = reply.send(Err(anyhow::Error::new(stale)));
+                            continue;
+                        }
+                    }
+
+                    let Some(next_writer_sequence) = next_writer_sequence(writer_sequence) else {
+                        let reason = state.stop_fail_closed("canonical writer sequence exhausted");
+                        let previous = state.published();
+                        state.publish(fail_closed_published_node_view(
+                            &node,
+                            &previous,
+                            writer_sequence,
+                            reason.clone(),
+                        ));
+                        let _ =
+                            reply.send(Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                                reason,
+                            })));
+                        break;
+                    };
+                    writer_sequence = next_writer_sequence;
+                    let previous_publication_sequence =
+                        state.publication_sequence.fetch_add(1, Ordering::AcqRel);
+                    if previous_publication_sequence & 1 != 0 {
+                        let reason = state.stop_fail_closed(
+                            "canonical publication sequence was already write-locked",
+                        );
+                        let _ =
+                            reply.send(Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                                reason,
+                            })));
+                        break;
+                    }
+                    let operation_result = execute(&mut node);
+                    node.fail_closed_after_ambiguous_commit();
+                    let previous = state.published_unchecked();
+                    let publication = capture_published_node_view(&node, writer_sequence);
+                    let terminal = match publication {
+                        Ok(view) => {
+                            state.publish(view);
+                            None
+                        }
+                        Err(error) => {
+                            let reason = state.stop_fail_closed(format!(
+                                "failed to publish state after {operation}: {error:#}"
+                            ));
+                            state.publish(fail_closed_published_node_view(
+                                &node,
+                                &previous,
+                                writer_sequence,
+                                reason.clone(),
+                            ));
+                            Some(reason)
+                        }
+                    };
+                    state.publication_sequence.fetch_add(1, Ordering::Release);
+                    let response = match terminal {
+                        Some(reason) => Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                            reason,
+                        })),
+                        None => operation_result,
+                    };
+                    let _ = reply.send(response);
+                    if state.terminal_reason().is_some() {
+                        break;
+                    }
+                }
+                CanonicalWriterCommand::Inspect {
+                    operation,
+                    inspect,
+                    _admission,
+                    reply,
+                } => {
+                    let response = match state.terminal_reason() {
+                        Some(reason) => Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                            reason,
+                        })),
+                        None => inspect(&node),
+                    };
+                    let _ = reply.send(response.with_context(|| {
+                        format!("canonical immutable inspection failed during {operation}")
+                    }));
+                }
+                CanonicalWriterCommand::Shutdown { mark_clean, reply } => {
+                    let result = match state.terminal_reason() {
+                        Some(reason) => Err(anyhow::Error::new(CanonicalWriterError::Terminal {
+                            reason,
+                        })),
+                        None => node.state.ensure_storage_operational().and_then(|()| {
+                            if mark_clean {
+                                mark_node_store_clean(&node.state.store, node.config.network)
+                            } else {
+                                Ok(())
+                            }
+                        }),
+                    }
+                    .context(if mark_clean {
+                        "failed to mark canonical store clean before writer exit"
+                    } else {
+                        "failed to validate canonical store before unclean writer exit"
+                    });
+                    if let Err(error) = &result {
+                        node.revoke_runtime_authority();
+                        let reason = state.stop_fail_closed(format!(
+                            "canonical writer shutdown failed: {error:#}"
+                        ));
+                        let previous = state.published_unchecked();
+                        state.publish(fail_closed_published_node_view(
+                            &node,
+                            &previous,
+                            writer_sequence,
+                            reason,
+                        ));
+                    }
+                    let _ = reply.send(result);
+                    break;
+                }
+            }
+        }
+    }));
+    node.revoke_runtime_authority();
+    let fallback_reason = if result.is_err() {
+        "canonical writer thread panicked"
+    } else {
+        "canonical writer stopped"
+    };
+    let reason = state
+        .terminal_reason()
+        .unwrap_or_else(|| fallback_reason.to_owned());
+    state.accepting.store(false, Ordering::Release);
+    let previous = state.published_unchecked();
+    state.publish(fail_closed_published_node_view(
+        &node,
+        &previous,
+        writer_sequence,
+        reason.clone(),
+    ));
+    if state.publication_sequence.load(Ordering::Acquire) & 1 != 0 {
+        state.publication_sequence.fetch_add(1, Ordering::Release);
+    }
+    // Publish the terminal view and close any interrupted seqlock generation
+    // before exposing a new terminal reason. Thus observing `terminal_error`
+    // after an actor panic also synchronizes with fail-closed publication.
+    state.stop_fail_closed(reason);
+}
 
 /// Process-local extension capability for a unified MeshMine mining runtime.
 ///
-/// The node supplies its exact mutable service, live peer publication manager,
-/// and shutdown watch after native runtime initialization. An observed RPC
-/// snapshot cannot construct this capability.
+/// The node supplies a runtime capability with immutable reads and bounded
+/// canonical-writer submission, plus the live peer publication manager and
+/// shutdown watch. It never exposes mutable [`NodeService`] access or node
+/// lifecycle authority. Shutdown is owned by the crate's native supervisor:
+///
+/// ```compile_fail
+/// use hns_node::NodeRuntime;
+///
+/// async fn extension_cannot_end_node_lifecycle(runtime: NodeRuntime) {
+///     runtime.shutdown().await.unwrap();
+/// }
+/// ```
 pub trait NativeRuntimeExtension: Send {
     fn spawn(
         self: Box<Self>,
-        node: SharedNodeService,
+        node: NodeRuntime,
         peers: LivePeerManager,
         shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<Result<()>>;
@@ -1315,11 +3483,11 @@ impl NodeService {
         };
         let mining_events = MiningEventHub::from_durable(durable.generation, initial)
             .map_err(|error| anyhow::anyhow!("failed to initialize mining events: {error}"))?;
-        let mining_engine_templates = Mutex::new(
+        let mining_engine_templates = Arc::new(Mutex::new(
             TemplateCoordinator::new(config.mining_engine.maximum_template_variants).map_err(
                 |error| anyhow::anyhow!("failed to initialize mining-engine templates: {error}"),
             )?,
-        );
+        ));
         let airdrop_signatures = NativeAirdropSignatureVerifier::new().map_err(|error| {
             anyhow::anyhow!("failed to initialize airdrop relay verifier: {error}")
         })?;
@@ -1345,10 +3513,23 @@ impl NodeService {
         &mut self.state
     }
 
+    pub fn block_cache_occupancy(&self) -> usize {
+        self.state.blocks.cache_occupancy()
+    }
+
+    pub fn block_cache_capacity(&self) -> usize {
+        self.state.blocks.cache_capacity()
+    }
+
     /// Run name-tree maintenance under the node's mutable coordinator. The
     /// compaction checkpoint and all record deletions share one atomic batch.
     pub fn compact_name_tree_nodes(&mut self) -> Result<NameTreeCompactionCheckpoint> {
-        self.state.compact_name_tree_nodes()
+        self.state.ensure_storage_operational()?;
+        let result = self.state.compact_name_tree_nodes();
+        if result.is_err() {
+            self.fail_closed_after_ambiguous_commit();
+        }
+        result
     }
 
     /// Mining-mode maintenance retires unreachable historical nodes on the
@@ -1374,7 +3555,13 @@ impl NodeService {
     }
 
     pub fn mining_snapshot(&self) -> Option<Arc<MiningSnapshot>> {
-        self.mining_events.snapshot()
+        if self.state.storage_reopen_required()
+            || self.state.production_safety_fence_reason().is_some()
+        {
+            None
+        } else {
+            self.mining_events.snapshot()
+        }
     }
 
     pub fn observed_mining_snapshot(&self) -> Result<Option<Arc<MiningSnapshot>>> {
@@ -1396,8 +3583,16 @@ impl NodeService {
         Ok(self.mining_events.subscribe())
     }
 
-    pub fn rpc_service(&self) -> Result<BasicRpcService> {
+    /// Aggregate fixture service used only by in-crate compatibility tests.
+    /// Production listeners construct a diagnostic snapshot and dispatch
+    /// bounded point/collection reads after method selection.
+    #[cfg(test)]
+    pub(crate) fn rpc_service(&self) -> Result<BasicRpcService> {
         Ok(BasicRpcService::new(self.rpc_snapshot()?))
+    }
+
+    fn rpc_diagnostic_service(&self) -> Result<BasicRpcService> {
+        Ok(BasicRpcService::new(self.rpc_diagnostic_snapshot()?))
     }
 
     pub fn accept_block(&mut self, request: NodeBlockImport) -> Result<BlockAcceptance> {
@@ -1410,13 +3605,38 @@ impl NodeService {
 
         if let Some(existing) = self.state.load_block_record(&block_hash)? {
             if existing.status.active_chain {
+                let snapshot = self.state.store.snapshot()?;
+                let header = load_header_record(&snapshot, &block_hash)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "active block {} is missing its header record",
+                        block_hash.to_hex()
+                    )
+                })?;
+                if read_canonical_hash(&snapshot, existing.height)? != Some(block_hash)
+                    || header.hash != existing.hash
+                    || header.height != existing.height
+                    || header.header != request.block.header
+                    || header.chainwork != existing.chainwork
+                    || header.status != existing.status
+                {
+                    anyhow::bail!(
+                        "active block index {} is not authenticated by canonical header state",
+                        block_hash.to_hex()
+                    );
+                }
                 return Ok(BlockAcceptance {
                     record: existing,
                     disposition: BlockDisposition::AlreadyKnown { active: true },
                 });
             }
         } else if self.state.is_direct_active_extension(&request)? {
-            let committed = self.state.commit_staged_block(request, validated)?;
+            let committed = match self.state.commit_staged_block(request, validated) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    self.fail_closed_after_ambiguous_commit();
+                    return Err(error);
+                }
+            };
             let mining_publication = self.publish_durable_mining_state(&committed.mining);
             let mempool_generation =
                 self.mining_engine_reconcile_connected_transactions(&active_transactions);
@@ -1431,8 +3651,17 @@ impl NodeService {
             });
         }
 
-        let stored = self.state.store_validated_alternate(request, validated)?;
-        let Some(activation) = self.state.best_chain_activation_plan(stored.record.hash)? else {
+        let stored = match self.state.store_validated_alternate(request, validated) {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.fail_closed_after_ambiguous_commit();
+                return Err(error);
+            }
+        };
+        let Some(activation) = self
+            .state
+            .best_chain_activation_plan(stored.record.hash, NodeReorgLimits::PRODUCTION)?
+        else {
             return Ok(BlockAcceptance {
                 record: stored.record.clone(),
                 disposition: if stored.already_known {
@@ -1445,6 +3674,13 @@ impl NodeService {
             });
         };
 
+        let reconciliation_snapshot = self.state.store.snapshot()?;
+        preflight_reorg_reconciliation_budget(
+            &reconciliation_snapshot,
+            &activation,
+            NodeReorgLimits::PRODUCTION,
+        )?;
+        drop(reconciliation_snapshot);
         let disconnected_transactions =
             self.disconnected_mempool_transactions(&activation.disconnect)?;
         let connected_transactions = activation
@@ -1488,6 +3724,7 @@ impl NodeService {
                 })
             }
             Err(error) => {
+                self.fail_closed_after_ambiguous_commit();
                 if is_reorg {
                     self.mining_events.reorg_aborted();
                 }
@@ -1566,7 +3803,13 @@ impl NodeService {
     pub fn disconnect_block(&mut self, request: NodeBlockDisconnect) -> Result<BlockIndexRecord> {
         let disconnected_transactions =
             self.disconnected_mempool_transactions(std::slice::from_ref(&request))?;
-        let disconnected = self.state.disconnect_block(request)?;
+        let disconnected = match self.state.disconnect_block(request) {
+            Ok(disconnected) => disconnected,
+            Err(error) => {
+                self.fail_closed_after_ambiguous_commit();
+                return Err(error);
+            }
+        };
         let mining_publication = self.publish_durable_mining_state(&disconnected.mining);
         let mempool_generation =
             self.mining_engine_reconcile_chain_transition(&disconnected_transactions, &[]);
@@ -1579,6 +3822,33 @@ impl NodeService {
     }
 
     pub fn apply_reorg(&mut self, request: NodeReorg) -> Result<NodeReorgSummary> {
+        self.apply_reorg_with_limits(request, NodeReorgLimits::PRODUCTION)
+    }
+
+    /// Writer-only native activation boundary. The returned mutation has not
+    /// yet been published to mining or reconciled with the mempool; callers
+    /// must preserve the existing commit -> mining publication -> mempool
+    /// reconciliation -> template-clear sequence in the same writer closure.
+    pub(crate) fn apply_reorg_classified_prepared(
+        &mut self,
+        request: NodeReorg,
+        prepared: PreparedNativeActivation,
+    ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
+        self.state
+            .apply_reorg_classified_prepared(request, prepared)
+    }
+
+    fn apply_reorg_with_limits(
+        &mut self,
+        request: NodeReorg,
+        limits: NodeReorgLimits,
+    ) -> Result<NodeReorgSummary> {
+        // Reject cardinality and aggregate body envelopes before syntax
+        // validation, undo reads, page discovery, transaction cloning, or any
+        // staging allocation. NodeState repeats this at the mutation boundary.
+        let reconciliation_snapshot = self.state.store.snapshot()?;
+        preflight_reorg_reconciliation_budget(&reconciliation_snapshot, &request, limits)?;
+        drop(reconciliation_snapshot);
         for connect in &request.connect {
             let summary = HeaderSummary::from_block(&connect.block, connect.height);
             self.mining_events.candidate_tip_seen(summary.clone());
@@ -1603,7 +3873,7 @@ impl NodeService {
 
         self.mining_events
             .reorg_started(request.disconnect.len(), request.connect.len());
-        match self.state.apply_reorg(request) {
+        match self.state.apply_reorg_with_limits(request, limits) {
             Ok(reorg) => {
                 let mining_publication = self.publish_durable_mining_state(&reorg.mining);
                 let mempool_generation = self.mining_engine_reconcile_chain_transition(
@@ -1618,12 +3888,37 @@ impl NodeService {
                 Ok(reorg.summary)
             }
             Err(error) => {
+                self.fail_closed_after_ambiguous_commit();
                 if let Ok(durable) = self.state.durable_mining_state() {
                     let _ = self.publish_durable_mining_state(&durable);
                 }
                 self.mining_events.reorg_aborted();
                 Err(error)
             }
+        }
+    }
+
+    fn fail_closed_after_ambiguous_commit(&self) {
+        if !self.state.storage_reopen_required() {
+            return;
+        }
+        self.revoke_runtime_authority();
+    }
+
+    fn revoke_runtime_authority(&self) {
+        if self.config.mining_engine.enabled {
+            self.mining_engine_templates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+        let generation = self.mining_events.committed_generation().saturating_add(1);
+        if let Err(error) = self.mining_events.tip_staged(None, generation) {
+            tracing::error!(
+                %error,
+                generation,
+                "failed to revoke runtime mining authority"
+            );
         }
     }
 
@@ -1661,8 +3956,8 @@ impl NodeService {
     }
 
     pub async fn run_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
-        if self.config.shadow_sync.enabled {
-            self.run_shadow_sync_until_shutdown(shutdown).await
+        if self.config.native_sync.enabled {
+            self.run_native_sync_until_shutdown(shutdown).await
         } else {
             self.run_rpc_until_shutdown(shutdown).await
         }
@@ -1673,52 +3968,72 @@ impl NodeService {
         shutdown: ShutdownSignal,
         extension: Box<dyn NativeRuntimeExtension>,
     ) -> Result<()> {
-        if !self.config.shadow_sync.enabled {
+        if !self.config.native_sync.enabled {
             anyhow::bail!("native runtime extensions require native sync");
         }
-        self.run_shadow_sync_until_shutdown_with_extension(shutdown, Some(extension))
+        self.run_native_sync_until_shutdown_with_extension(shutdown, Some(extension))
             .await
     }
 
-    pub(crate) async fn run_rpc_until_shutdown(&self, shutdown: ShutdownSignal) -> Result<()> {
-        let rpc_service = self.rpc_service()?;
-        let listener = TcpListener::bind(self.config.rpc_bind)
+    pub(crate) async fn run_rpc_until_shutdown(self, shutdown: ShutdownSignal) -> Result<()> {
+        let node = Arc::new(self);
+        // The runtime listener starts from bounded diagnostic/collection
+        // snapshots. Historical block, transaction, UTXO, and name data is
+        // loaded only after method dispatch through RpcReadContext.
+        let rpc_service = node.rpc_diagnostic_service()?;
+        // Collection responses are captured on their bounded worker after
+        // method dispatch. Do not clone the entire mempool while starting the
+        // listener.
+        let collection_service = rpc_service.clone();
+        let read_context = node.rpc_read_context();
+        let listener = TcpListener::bind(node.config.rpc_bind)
             .await
-            .with_context(|| format!("failed to bind RPC listener on {}", self.config.rpc_bind))?;
+            .with_context(|| format!("failed to bind RPC listener on {}", node.config.rpc_bind))?;
         let local_addr = listener
             .local_addr()
             .context("failed to read RPC listener address")?;
 
         tracing::info!(
-            network = %self.config.network,
+            network = %node.config.network,
             rpc_bind = %local_addr,
             mempool_size = rpc_service.snapshot().mempool_info.transaction_count,
             "hsrd rpc server started"
         );
-        let result = serve_rpc_listener_with_authorization(
+        let result = serve_rpc_listener_with_state(
             listener,
-            rpc_service,
-            self.config.rpc_authorization.clone(),
+            RpcHttpState::new(
+                rpc_service,
+                collection_service,
+                Some(read_context),
+                Some(Arc::clone(&node)),
+                node.config.rpc_limits,
+            ),
+            node.config.rpc_authorization.clone(),
             shutdown.wait(),
         )
         .await;
         if result.is_ok() {
-            mark_node_store_clean(&self.state.store, self.config.network)?;
+            mark_node_store_clean(&node.state.store, node.config.network)?;
         }
         result?;
         tracing::info!("hsrd rpc server stopped");
         Ok(())
     }
 
+    #[cfg(test)]
     fn rpc_snapshot(&self) -> Result<RpcSnapshot> {
-        self.rpc_snapshot_with_entries(true)
+        self.rpc_snapshot_with_entries(true, true)
     }
 
     fn rpc_diagnostic_snapshot(&self) -> Result<RpcSnapshot> {
-        self.rpc_snapshot_with_entries(false)
+        self.rpc_snapshot_with_entries(false, false)
     }
 
-    fn rpc_snapshot_with_entries(&self, include_entries: bool) -> Result<RpcSnapshot> {
+    fn rpc_snapshot_with_entries(
+        &self,
+        include_entries: bool,
+        include_mempool_entries: bool,
+    ) -> Result<RpcSnapshot> {
         let chain_tip = self.state.best_block_tip()?;
         let entries = if include_entries {
             self.state.rpc_entries()?
@@ -1750,7 +4065,20 @@ impl NodeService {
         };
         drop(metadata);
 
-        let authority = authority_info(&self.config, &durable);
+        let production_safety_kind = self.state.production_safety_fence_kind();
+        let production_safety_reason = self.state.production_safety_fence_reason();
+        let mut authority = authority_info(&self.config, &durable);
+        if let Some(reason) = production_safety_reason.as_ref() {
+            authority.synchronized = false;
+            authority.can_authorize_mining_templates = false;
+            authority.can_accept_mining_candidates = false;
+            authority.mainnet_canary_active = false;
+            authority
+                .blockers
+                .push(format!("durable production safety fence: {reason}"));
+            authority.blockers.sort();
+            authority.blockers.dedup();
+        }
         let parity = parity_info();
         let name_tree_compaction = RpcNameTreeCompactionInfo {
             compact_on_startup: self.config.name_tree_compaction.compact_on_startup,
@@ -1773,6 +4101,15 @@ impl NodeService {
             last_nodes_deleted: name_tree_compaction_checkpoint
                 .as_ref()
                 .map(|checkpoint| checkpoint.summary.nodes_deleted),
+            name_page_compaction_overdue: matches!(
+                production_safety_kind,
+                Some(ProductionSafetyFenceKind::NamePageCompaction)
+            ),
+            payload_segment_compaction_overdue: matches!(
+                production_safety_kind,
+                Some(ProductionSafetyFenceKind::PayloadSegmentCompaction)
+            ),
+            production_safety_reason,
         };
         let retention = self.config.network.params().block;
         let undo_retention = RpcUndoRetentionInfo {
@@ -1822,8 +4159,8 @@ impl NodeService {
             mining_generation: durable.generation,
             alternate_block_count,
             failed_block_count,
-            active_state_sync_enabled: self.config.shadow_sync.connect_active_state,
-            active_state_connect_batch: self.config.shadow_sync.active_state_connect_batch,
+            active_state_sync_enabled: self.config.native_sync.connect_active_state,
+            active_state_connect_batch: self.config.native_sync.active_state_connect_batch,
             pending_best_chain_activation,
             staged_chain_tip: durable.snapshot.is_some(),
             authoritative_mining_tip: self.mining_events.snapshot().is_some(),
@@ -1836,6 +4173,15 @@ impl NodeService {
             parity,
         };
 
+        let mempool_info = self.state.mempool.info();
+        let mempool_entries = if include_mempool_entries
+            && mempool_info.transaction_count <= self.config.rpc_limits.maximum_collection_entries
+        {
+            self.state.mempool.entries()
+        } else {
+            Vec::new()
+        };
+
         Ok(RpcSnapshot {
             network: self.config.network.to_string(),
             chain_tip,
@@ -1844,8 +4190,8 @@ impl NodeService {
             transactions: entries.transactions,
             coins: entries.coins,
             names: entries.names,
-            mempool_info: self.state.mempool.info(),
-            mempool_entries: self.state.mempool.entries(),
+            mempool_info,
+            mempool_entries,
             network_active: false,
             peer_count: 0,
             mining_engine: rpc_mining_engine_info(self.mining_engine_diagnostics()?),
@@ -1857,6 +4203,81 @@ impl NodeService {
 #[derive(Clone, Debug)]
 struct RpcHttpState {
     service: Arc<BasicRpcService>,
+    collection_service: Arc<BasicRpcService>,
+    read_context: Option<RpcReadContext>,
+    standalone_node: Option<Arc<NodeService>>,
+    fallback_point_read_concurrency: Arc<Semaphore>,
+    fallback_collection_concurrency: Arc<Semaphore>,
+    limits: RpcLimits,
+}
+
+impl RpcHttpState {
+    fn new(
+        service: BasicRpcService,
+        collection_service: BasicRpcService,
+        read_context: Option<RpcReadContext>,
+        standalone_node: Option<Arc<NodeService>>,
+        limits: RpcLimits,
+    ) -> Self {
+        Self {
+            service: Arc::new(service),
+            collection_service: Arc::new(collection_service),
+            read_context,
+            standalone_node,
+            fallback_point_read_concurrency: Arc::new(Semaphore::new(
+                limits.maximum_concurrent_requests,
+            )),
+            fallback_collection_concurrency: Arc::new(Semaphore::new(
+                limits.maximum_concurrent_requests,
+            )),
+            limits,
+        }
+    }
+
+    fn try_acquire_point_read(&self) -> Option<OwnedSemaphorePermit> {
+        match self.read_context.as_ref() {
+            Some(read_context) => read_context.try_acquire_point_read(),
+            None => Arc::clone(&self.fallback_point_read_concurrency)
+                .try_acquire_owned()
+                .ok(),
+        }
+    }
+
+    fn try_acquire_collection(&self) -> Option<OwnedSemaphorePermit> {
+        match self.read_context.as_ref() {
+            Some(read_context) => read_context.try_acquire_collection(),
+            None => Arc::clone(&self.fallback_collection_concurrency)
+                .try_acquire_owned()
+                .ok(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RpcRuntimeLimits {
+    concurrency: Arc<Semaphore>,
+    execution_timeout: Duration,
+}
+
+impl RpcRuntimeLimits {
+    pub(crate) fn new(limits: RpcLimits) -> Self {
+        Self {
+            concurrency: Arc::new(Semaphore::new(limits.maximum_concurrent_requests)),
+            execution_timeout: limits.execution_timeout,
+        }
+    }
+
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, RpcAdmissionError> {
+        Arc::clone(&self.concurrency)
+            .try_acquire_owned()
+            .map_err(|_| RpcAdmissionError::Busy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RpcAdmissionError {
+    Busy,
+    TimedOut,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1866,6 +4287,396 @@ struct RpcStoreEntries {
     transactions: Vec<RpcTransactionEntry>,
     coins: Vec<Coin>,
     names: Vec<NameState>,
+}
+
+/// Cloneable, immutable access to the durable RPC read model. Creating this
+/// handle while the native-sync coordinator is locked is O(1); all RocksDB
+/// snapshot acquisition, decoding, and bounded block reads happen after that
+/// lock has been released.
+#[derive(Clone, Debug)]
+pub(crate) struct RpcReadContext {
+    store: StoreHandle,
+    headers: SharedHeaderIndex,
+    network: Network,
+    transaction_index: bool,
+    point_read_concurrency: Arc<Semaphore>,
+    collection_concurrency: Arc<Semaphore>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RpcRequestMempool {
+    info: MempoolInfo,
+    ordered_txids: Option<OrderedTxidSnapshot>,
+    transaction_lookup: Option<(MempoolSnapshot, Txid)>,
+}
+
+impl NodeService {
+    pub(crate) fn rpc_read_context(&self) -> RpcReadContext {
+        RpcReadContext {
+            store: self.state.store.clone(),
+            headers: self.state.chain.clone(),
+            network: self.config.network,
+            transaction_index: self.state.transaction_index,
+            point_read_concurrency: Arc::new(Semaphore::new(
+                self.config.rpc_limits.maximum_concurrent_requests,
+            )),
+            collection_concurrency: Arc::new(Semaphore::new(
+                self.config.rpc_limits.maximum_concurrent_requests,
+            )),
+        }
+    }
+
+    pub(crate) fn rpc_request_mempool(&self, request: &JsonRpcRequest) -> RpcRequestMempool {
+        rpc_request_mempool(&self.state.mempool, request, self.config.rpc_limits)
+    }
+}
+
+fn rpc_request_mempool(
+    mempool: &MemoryMempool,
+    request: &JsonRpcRequest,
+    limits: RpcLimits,
+) -> RpcRequestMempool {
+    let info = mempool.info();
+    let snapshot = mempool.snapshot();
+    let method = RpcMethod::from_hsd_name(&request.method);
+    let ordered_txids = if method == Some(RpcMethod::GetRawMempool)
+        && info.transaction_count <= limits.maximum_collection_entries
+    {
+        Some(mempool.ordered_txids_snapshot())
+    } else {
+        None
+    };
+    let transaction_lookup = if method == Some(RpcMethod::GetRawTransaction) {
+        rpc_string_param(request, 0)
+            .and_then(|encoded| decode_rpc_txid(encoded).ok())
+            .map(|txid| (snapshot, txid))
+    } else {
+        None
+    };
+    RpcRequestMempool {
+        info,
+        ordered_txids,
+        transaction_lookup,
+    }
+}
+
+impl RpcReadContext {
+    pub(crate) fn try_acquire_point_read(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.point_read_concurrency)
+            .try_acquire_owned()
+            .ok()
+    }
+
+    pub(crate) fn try_acquire_collection(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.collection_concurrency)
+            .try_acquire_owned()
+            .ok()
+    }
+
+    pub(crate) fn service_for_request(
+        &self,
+        request: &JsonRpcRequest,
+        mempool: RpcRequestMempool,
+        network_active: bool,
+        peer_count: usize,
+        diagnostic_base: Option<&RpcSnapshot>,
+    ) -> Result<BasicRpcService> {
+        let method = RpcMethod::from_hsd_name(&request.method)
+            .ok_or_else(|| anyhow::anyhow!("unsupported RPC method reached point-read dispatch"))?;
+        let RpcRequestMempool {
+            info: mempool_info,
+            ordered_txids: _,
+            transaction_lookup,
+        } = mempool;
+        // Keep the index read lock until the durable snapshot is established.
+        // Writers hold the matching exclusive lock across commit and cache
+        // publication, so the pair is wholly before or wholly after one index
+        // generation; neither old-index/new-store nor new-index/old-store
+        // combinations are observable.
+        let (canonical_header, snapshot) = self
+            .headers
+            .read(|index| {
+                let canonical_header = Self::canonical_header_from_index(index, method, request)?;
+                let snapshot = self.store.snapshot()?;
+                Ok((canonical_header, snapshot))
+            })
+            .map_err(|error| anyhow::anyhow!("failed to bind RPC read generation: {error}"))?;
+        let chain_tip = best_block_tip_from_snapshot(&snapshot)?;
+        let mut rpc = diagnostic_base.cloned().unwrap_or_default();
+        rpc.network = self.network.to_string();
+        rpc.chain_tip = chain_tip;
+        rpc.headers.clear();
+        rpc.blocks.clear();
+        rpc.transactions.clear();
+        rpc.coins.clear();
+        rpc.names.clear();
+        rpc.mempool_info = mempool_info;
+        rpc.mempool_entries.clear();
+        rpc.network_active = network_active;
+        rpc.peer_count = peer_count;
+
+        match method {
+            RpcMethod::GetBlockHash => {
+                if let Some(record) = canonical_header {
+                    rpc.headers.push(RpcHeaderEntry::new(record));
+                }
+            }
+            RpcMethod::GetBlockHeader => {
+                if let Some(record) = canonical_header {
+                    rpc.headers.push(RpcHeaderEntry::new(record));
+                }
+            }
+            RpcMethod::GetParentAuthority => {
+                if let Some(hash) = rpc_block_hash_param(request, 0) {
+                    if let Some(record) = load_header_record(&snapshot, &hash)? {
+                        if read_canonical_hash(&snapshot, record.height)? == Some(hash) {
+                            rpc.headers.push(RpcHeaderEntry::new(record));
+                        }
+                    }
+                }
+            }
+            RpcMethod::GetBlock => {
+                if let Some(hash) = rpc_block_hash_param(request, 0) {
+                    if let Some(record) = load_block_index_record(&snapshot, &hash)? {
+                        if record.status.active_chain
+                            && record.status.utxo_connected
+                            && read_canonical_hash(&snapshot, record.height)? == Some(hash)
+                        {
+                            if let Some(block) = load_block(&snapshot, &hash)? {
+                                rpc.blocks.push(RpcBlockEntry::from_block(record, &block));
+                            }
+                        }
+                    }
+                }
+            }
+            RpcMethod::GetRawTransaction => {
+                if let Some(transaction) = transaction_lookup
+                    .as_ref()
+                    .and_then(|(snapshot, txid)| snapshot.transaction(txid))
+                {
+                    rpc.transactions.push(RpcTransactionEntry::from_transaction(
+                        transaction,
+                        None,
+                        None,
+                    ));
+                } else if self.transaction_index {
+                    self.load_indexed_transaction(&snapshot, request, &mut rpc)?;
+                }
+            }
+            RpcMethod::GetTxOut => {
+                if let (Some(txid), Some(index)) =
+                    (rpc_txid_param(request, 0), rpc_u32_param(request, 1))
+                {
+                    let outpoint = Outpoint { txid, index };
+                    if let Some(bytes) = snapshot
+                        .get(ColumnFamily::Utxo, &encode_outpoint_key(&outpoint))
+                        .context("failed to read RPC UTXO")?
+                    {
+                        rpc.coins.push(decode_coin(&bytes).map_err(|error| {
+                            anyhow::anyhow!("failed to decode RPC UTXO: {error}")
+                        })?);
+                    }
+                }
+            }
+            RpcMethod::GetNameInfo | RpcMethod::GetNameResource => {
+                if let Some(name) = rpc_string_param(request, 0) {
+                    let name_hash = NameHash::new(sha3_256(name.as_bytes()));
+                    if let Some(state) = load_rpc_name_state(&snapshot, name_hash)? {
+                        if state.name.as_slice() == name.as_bytes() {
+                            rpc.names.push(state);
+                        }
+                    }
+                }
+            }
+            RpcMethod::GetNameByHash => {
+                if let Some(name_hash) = rpc_name_hash_param(request, 0) {
+                    if let Some(state) = load_rpc_name_state(&snapshot, name_hash)? {
+                        rpc.names.push(state);
+                    }
+                }
+            }
+            RpcMethod::GetBlockchainInfo
+            | RpcMethod::GetBestBlockHash
+            | RpcMethod::GetBlockCount
+            | RpcMethod::GetMempoolInfo
+            | RpcMethod::GetRawMempool
+            | RpcMethod::GetNetworkInfo
+            | RpcMethod::GetConnectionCount
+            | RpcMethod::GetHsrdStatus
+            | RpcMethod::GetAuthorityInfo
+            | RpcMethod::GetParityInfo
+            | RpcMethod::GetMiningEngineInfo => {}
+            RpcMethod::SendRawTransaction | RpcMethod::GetPeerInfo => {
+                anyhow::bail!("known unsupported RPC method reached point-read dispatch");
+            }
+        }
+        drop(snapshot);
+        Ok(BasicRpcService::new(rpc))
+    }
+
+    #[cfg(test)]
+    fn canonical_header_for_request(
+        &self,
+        method: RpcMethod,
+        request: &JsonRpcRequest,
+    ) -> Result<Option<HeaderRecord>> {
+        self.headers
+            .read(|index| Self::canonical_header_from_index(index, method, request))
+            .map_err(|error| anyhow::anyhow!("failed to read canonical RPC header: {error}"))
+    }
+
+    fn canonical_header_from_index(
+        index: &StoredHeaderIndex<StoreHandle>,
+        method: RpcMethod,
+        request: &JsonRpcRequest,
+    ) -> std::result::Result<Option<HeaderRecord>, ChainError> {
+        match method {
+            RpcMethod::GetBlockHash => rpc_height_param(request, 0)
+                .map(|height| {
+                    let Some(hash) = index.canonical_hash(height)? else {
+                        return Ok(None);
+                    };
+                    index.header(&hash)
+                })
+                .transpose()
+                .map(|record| record.flatten()),
+            RpcMethod::GetBlockHeader => rpc_block_hash_param(request, 0)
+                .map(|hash| {
+                    let Some(record) = index.header(&hash)? else {
+                        return Ok(None);
+                    };
+                    if index.canonical_hash(record.height)? == Some(hash) {
+                        Ok(Some(record))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .transpose()
+                .map(|record| record.flatten()),
+            _ => Ok(None),
+        }
+    }
+
+    fn load_indexed_transaction(
+        &self,
+        snapshot: &impl ReadSnapshot,
+        request: &JsonRpcRequest,
+        rpc: &mut RpcSnapshot,
+    ) -> Result<()> {
+        let Some(txid) = rpc_txid_param(request, 0) else {
+            return Ok(());
+        };
+        let Some(raw_index) = snapshot
+            .get(ColumnFamily::TxIndex, txid.as_bytes())
+            .context("failed to read transaction index")?
+        else {
+            return Ok(());
+        };
+        let index = TxIndexEntry::decode(&raw_index)
+            .map_err(|error| anyhow::anyhow!("failed to decode transaction index: {error}"))?;
+        if index.txid != txid
+            || read_canonical_hash(snapshot, index.height)? != Some(index.block_hash)
+        {
+            return Ok(());
+        }
+        let Some(record) = load_block_index_record(snapshot, &index.block_hash)? else {
+            return Ok(());
+        };
+        if !record.status.active_chain || !record.status.utxo_connected {
+            return Ok(());
+        }
+        let Some(block) = load_block(snapshot, &index.block_hash)? else {
+            return Ok(());
+        };
+        let Some(transaction) = block
+            .transactions
+            .iter()
+            .find(|transaction| transaction.txid() == txid)
+        else {
+            anyhow::bail!(
+                "transaction index {} does not resolve inside block {}",
+                txid.to_hex(),
+                index.block_hash.to_hex()
+            );
+        };
+        rpc.transactions.push(RpcTransactionEntry::from_transaction(
+            transaction,
+            Some(index.block_hash),
+            Some(index.height),
+        ));
+        Ok(())
+    }
+}
+
+fn load_rpc_name_state(
+    snapshot: &impl ReadSnapshot,
+    name_hash: NameHash,
+) -> Result<Option<NameState>> {
+    let Some(bytes) = snapshot
+        .get(ColumnFamily::NameState, name_hash.as_bytes())
+        .context("failed to read RPC name state")?
+    else {
+        return Ok(None);
+    };
+    decode_name_state(&name_hash, &bytes)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("failed to decode RPC name state: {error}"))
+}
+
+fn rpc_params(request: &JsonRpcRequest) -> Option<&[serde_json::Value]> {
+    match &request.params {
+        serde_json::Value::Null => Some(&[]),
+        serde_json::Value::Array(params) => Some(params),
+        _ => None,
+    }
+}
+
+fn rpc_string_param(request: &JsonRpcRequest, index: usize) -> Option<&str> {
+    rpc_params(request)?.get(index)?.as_str()
+}
+
+fn rpc_u32_param(request: &JsonRpcRequest, index: usize) -> Option<u32> {
+    rpc_params(request)?
+        .get(index)?
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn rpc_height_param(request: &JsonRpcRequest, index: usize) -> Option<Height> {
+    rpc_u32_param(request, index)
+}
+
+fn rpc_block_hash_param(request: &JsonRpcRequest, index: usize) -> Option<BlockHash> {
+    rpc_string_param(request, index)
+        .and_then(|encoded| decode_rpc_hash(encoded).ok())
+        .map(BlockHash::new)
+}
+
+fn rpc_txid_param(request: &JsonRpcRequest, index: usize) -> Option<Txid> {
+    rpc_string_param(request, index).and_then(|encoded| decode_rpc_txid(encoded).ok())
+}
+
+fn rpc_name_hash_param(request: &JsonRpcRequest, index: usize) -> Option<NameHash> {
+    rpc_string_param(request, index)
+        .and_then(|encoded| decode_rpc_hash(encoded).ok())
+        .map(NameHash::new)
+}
+
+fn decode_rpc_txid(encoded: &str) -> Result<Txid> {
+    decode_rpc_hash(encoded).map(Txid::new)
+}
+
+fn decode_rpc_hash(encoded: &str) -> Result<[u8; 32]> {
+    if encoded.len() != 64 {
+        anyhow::bail!("hash must contain exactly 64 hexadecimal characters");
+    }
+    let mut raw = [0u8; 32];
+    for (index, output) in raw.iter_mut().enumerate() {
+        let offset = index * 2;
+        *output = u8::from_str_radix(&encoded[offset..offset + 2], 16)
+            .map_err(|_| anyhow::anyhow!("hash is not hexadecimal"))?;
+    }
+    Ok(raw)
 }
 
 pub async fn serve_rpc_listener<F>(
@@ -1888,9 +4699,27 @@ pub async fn serve_rpc_listener_with_authorization<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let state = RpcHttpState {
-        service: Arc::new(service),
-    };
+    serve_rpc_listener_with_state(
+        listener,
+        RpcHttpState::new(service.clone(), service, None, None, RpcLimits::default()),
+        authorization,
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_rpc_listener_with_state<F>(
+    listener: TcpListener,
+    state: RpcHttpState,
+    authorization: Option<RpcAuthorizationHeader>,
+    shutdown: F,
+) -> Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let limits = state.limits;
+    limits.validate()?;
+    let runtime_limits = RpcRuntimeLimits::new(limits);
     let app = Router::new()
         .route("/", post(handle_rpc_http))
         .route("/rpc", post(handle_rpc_http))
@@ -1898,7 +4727,12 @@ where
         .route("/api/v1/authority", get(handle_authority_http))
         .route("/api/v1/parity", get(handle_parity_http))
         .route("/api/v1/mining-engine", get(handle_mining_engine_http))
-        .with_state(state);
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(limits.maximum_request_bytes))
+        .layer(middleware::from_fn_with_state(
+            runtime_limits,
+            enforce_rpc_resource_limits,
+        ));
     let app = match authorization {
         Some(expected) => app.layer(middleware::from_fn_with_state(
             expected,
@@ -1911,6 +4745,39 @@ where
         .with_graceful_shutdown(shutdown)
         .await
         .context("RPC server failed")
+}
+
+pub(crate) async fn enforce_rpc_resource_limits(
+    State(limits): State<RpcRuntimeLimits>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    match execute_with_rpc_limits(&limits, next.run(request)).await {
+        Ok(response) => response,
+        Err(RpcAdmissionError::Busy) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "RPC concurrent request limit exceeded",
+        )
+            .into_response(),
+        Err(RpcAdmissionError::TimedOut) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "RPC request execution timed out",
+        )
+            .into_response(),
+    }
+}
+
+async fn execute_with_rpc_limits<T, F>(
+    limits: &RpcRuntimeLimits,
+    future: F,
+) -> std::result::Result<T, RpcAdmissionError>
+where
+    F: Future<Output = T>,
+{
+    let _permit = limits.try_acquire()?;
+    tokio::time::timeout(limits.execution_timeout, future)
+        .await
+        .map_err(|_| RpcAdmissionError::TimedOut)
 }
 
 pub(crate) async fn require_rpc_authorization(
@@ -1976,12 +4843,195 @@ async fn handle_rpc_http(State(state): State<RpcHttpState>, body: Bytes) -> Json
     };
     let id = request.id.clone();
 
+    let Some(method) = RpcMethod::from_hsd_name(&request.method) else {
+        return Json(json_rpc_error(id, -32601, "method not found".to_owned()));
+    };
+    if rpc_immediately_unsupported(method) {
+        return Json(
+            BasicRpcService::default()
+                .handle(request)
+                .unwrap_or_else(|error| {
+                    json_rpc_error(id, -32603, format!("internal error: {error}"))
+                }),
+        );
+    }
+
+    if method == RpcMethod::GetRawMempool {
+        let Some(collection_permit) = state.try_acquire_collection() else {
+            return Json(json_rpc_error(
+                id,
+                -32005,
+                "RPC collection-worker concurrency limit exceeded".to_owned(),
+            ));
+        };
+        let standalone_node = state.standalone_node.clone();
+        let collection_service = Arc::clone(&state.collection_service);
+        let diagnostic_service = Arc::clone(&state.service);
+        let limits = state.limits;
+        let worker_request = request;
+        let worker_id = id.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            let _collection_permit = collection_permit;
+            if let Some(node) = standalone_node {
+                let mempool = node.rpc_request_mempool(&worker_request);
+                if mempool.info.transaction_count > limits.maximum_collection_entries {
+                    return json_rpc_error(
+                        worker_id,
+                        -8,
+                        format!(
+                            "mempool collection exceeds the RPC limit of {} entries",
+                            limits.maximum_collection_entries
+                        ),
+                    );
+                }
+                let Some(ordered_txids) = mempool.ordered_txids else {
+                    return json_rpc_error(
+                        worker_id,
+                        -32603,
+                        "mempool transaction-id view was not captured".to_owned(),
+                    );
+                };
+                if ordered_txids.len() != mempool.info.transaction_count {
+                    return json_rpc_error(
+                        worker_id,
+                        -32603,
+                        "mempool transaction-id view does not match aggregate count".to_owned(),
+                    );
+                }
+                let mut snapshot = diagnostic_service.snapshot().clone();
+                snapshot.mempool_info = mempool.info;
+                snapshot.mempool_entries.clear();
+                return BasicRpcService::new(snapshot)
+                    .handle_raw_mempool(worker_request, ordered_txids.txids())
+                    .unwrap_or_else(|error| {
+                        json_rpc_error(worker_id, -32603, format!("internal error: {error}"))
+                    });
+            }
+            if rpc_collection_exceeds(&collection_service, limits) {
+                return json_rpc_error(
+                    worker_id,
+                    -8,
+                    format!(
+                        "mempool collection exceeds the RPC limit of {} entries",
+                        limits.maximum_collection_entries
+                    ),
+                );
+            }
+            collection_service
+                .handle(worker_request)
+                .unwrap_or_else(|error| {
+                    json_rpc_error(worker_id, -32603, format!("internal error: {error}"))
+                })
+        })
+        .await;
+        return Json(match response {
+            Ok(response) => response,
+            Err(error) => {
+                json_rpc_error(id, -32603, format!("RPC collection worker failed: {error}"))
+            }
+        });
+    }
+
+    if rpc_point_read_method(method) {
+        let Some(point_read_permit) = state.try_acquire_point_read() else {
+            return Json(json_rpc_error(
+                id,
+                -32005,
+                "RPC point-read concurrency limit exceeded".to_owned(),
+            ));
+        };
+        if let Some(read_context) = state.read_context.clone() {
+            let standalone_node = state.standalone_node.clone();
+            let diagnostic_service =
+                (method == RpcMethod::GetParentAuthority).then(|| Arc::clone(&state.service));
+            let read_request = request;
+            let response = match tokio::task::spawn_blocking(move || -> Result<JsonRpcResponse> {
+                let _point_read_permit = point_read_permit;
+                let mempool = standalone_node
+                    .as_deref()
+                    .map(|node| node.rpc_request_mempool(&read_request))
+                    .unwrap_or_default();
+                let diagnostic_base = diagnostic_service
+                    .as_ref()
+                    .map(|service| service.snapshot().clone());
+                let service = read_context.service_for_request(
+                    &read_request,
+                    mempool,
+                    false,
+                    0,
+                    diagnostic_base.as_ref(),
+                )?;
+                service
+                    .handle(read_request)
+                    .map_err(|error| anyhow::anyhow!("RPC response construction failed: {error}"))
+            })
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    return Json(json_rpc_error(id, -32603, error.to_string()));
+                }
+                Err(error) => {
+                    return Json(json_rpc_error(
+                        id,
+                        -32603,
+                        format!("RPC point-read worker failed: {error}"),
+                    ));
+                }
+            };
+            return Json(response);
+        } else {
+            let service = Arc::clone(&state.service);
+            let worker_request = request;
+            let worker_id = id.clone();
+            let response = tokio::task::spawn_blocking(move || {
+                let _point_read_permit = point_read_permit;
+                service.handle(worker_request).unwrap_or_else(|error| {
+                    json_rpc_error(worker_id, -32603, format!("internal error: {error}"))
+                })
+            })
+            .await;
+            return Json(match response {
+                Ok(response) => response,
+                Err(error) => {
+                    json_rpc_error(id, -32603, format!("RPC point-read worker failed: {error}"))
+                }
+            });
+        }
+    }
+
     Json(
         state
             .service
             .handle(request)
             .unwrap_or_else(|error| json_rpc_error(id, -32603, format!("internal error: {error}"))),
     )
+}
+
+pub(crate) const fn rpc_immediately_unsupported(method: RpcMethod) -> bool {
+    matches!(
+        method,
+        RpcMethod::SendRawTransaction | RpcMethod::GetPeerInfo
+    )
+}
+
+pub(crate) const fn rpc_point_read_method(method: RpcMethod) -> bool {
+    matches!(
+        method,
+        RpcMethod::GetBlockHash
+            | RpcMethod::GetBlockHeader
+            | RpcMethod::GetBlock
+            | RpcMethod::GetRawTransaction
+            | RpcMethod::GetTxOut
+            | RpcMethod::GetNameInfo
+            | RpcMethod::GetNameResource
+            | RpcMethod::GetNameByHash
+            | RpcMethod::GetParentAuthority
+    )
+}
+
+pub(crate) fn rpc_collection_exceeds(service: &BasicRpcService, limits: RpcLimits) -> bool {
+    service.snapshot().mempool_info.transaction_count > limits.maximum_collection_entries
 }
 
 fn json_rpc_error(id: Option<serde_json::Value>, code: i64, message: String) -> JsonRpcResponse {
@@ -2066,10 +5116,298 @@ pub struct NodeReorg {
     pub connect: Vec<NodeBlockImport>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NodeReorgLimits {
+    maximum_disconnect: usize,
+    maximum_connect: usize,
+    maximum_body_bytes: u64,
+    maximum_staged_effect_bytes: u64,
+}
+
+impl NodeReorgLimits {
+    const PRODUCTION: Self = Self {
+        maximum_disconnect: MAX_REORG_DISCONNECT_BLOCKS,
+        maximum_connect: MAX_REORG_CONNECT_BLOCKS,
+        maximum_body_bytes: MAX_REORG_BODY_BYTES,
+        maximum_staged_effect_bytes: MAX_REORG_STAGED_EFFECT_BYTES,
+    };
+
+    const fn with_maximum_connect(maximum_connect: usize) -> Self {
+        Self {
+            maximum_connect,
+            ..Self::PRODUCTION
+        }
+    }
+
+    const fn header_limits(self) -> ReorgPlanLimits {
+        ReorgPlanLimits {
+            maximum_disconnect: self.maximum_disconnect,
+            maximum_connect: self.maximum_connect,
+        }
+    }
+}
+
+/// Cumulative, fail-closed accounting for one reorganization's atomic write.
+///
+/// The meter is deliberately attached to the `WriteBatch` boundary instead of
+/// predicting state effects from block bodies. Every key, value, deletion and
+/// operation frame is charged before the underlying batch or overlay may copy
+/// it. Repeated writes to one logical key remain cumulative: the backend batch
+/// still retains each operation even when the overlay replaces its visible
+/// value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReorgStagedEffectMeter {
+    consumed: u64,
+    limit: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Deterministic fault injection for the production archived-store
+    /// boundary. The limit is clamped only after a reorg has physically
+    /// appended at least one name page, so the archive's next accounted charge
+    /// must reject and exercise safe page-tail rollback.
+    static TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static TEST_REORG_APPENDED_NAME_PAGE_BYTES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_REORG_MAX_GENERATED_UNDO_BYTES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_REORG_NAME_STATE_WRITES: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+impl ReorgStagedEffectMeter {
+    const CONTEXT: &'static str = "reorganization staged effect bytes";
+
+    const fn new(limit: u64) -> Self {
+        Self { consumed: 0, limit }
+    }
+
+    fn operation_charge(key_bytes: usize, value_bytes: usize, copies: u64) -> u64 {
+        u64::try_from(key_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(value_bytes).unwrap_or(u64::MAX))
+            .saturating_add(REORG_STAGED_OPERATION_FRAMING_BYTES)
+            .saturating_mul(copies)
+    }
+
+    fn charge(
+        &mut self,
+        key_bytes: usize,
+        value_bytes: usize,
+        copies: u64,
+    ) -> std::result::Result<(), StoreError> {
+        self.charge_amount(Self::operation_charge(key_bytes, value_bytes, copies))
+    }
+
+    fn charge_amount(&mut self, additional: u64) -> std::result::Result<(), StoreError> {
+        let actual = self.consumed.saturating_add(additional);
+        if actual > self.limit {
+            return Err(StoreError::LimitExceeded {
+                context: Self::CONTEXT,
+                limit: self.limit,
+                actual,
+            });
+        }
+        self.consumed = actual;
+        Ok(())
+    }
+
+    fn name_page_output_charge(page_count: usize) -> u64 {
+        u64::try_from(page_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                (hns_store::NAME_PAGE_BYTES as u64)
+                    .saturating_add(REORG_STAGED_OPERATION_FRAMING_BYTES),
+            )
+            .saturating_mul(REORG_NAME_PAGE_OUTPUT_COPIES)
+    }
+
+    fn charge_name_page_output(
+        &mut self,
+        page_count: usize,
+    ) -> std::result::Result<(), StoreError> {
+        self.charge_amount(Self::name_page_output_charge(page_count))
+    }
+
+    fn name_page_packing_charge(records: &BTreeMap<TreeRoot, Vec<u8>>) -> u64 {
+        records.values().fold(0u64, |total, canonical| {
+            total.saturating_add(
+                u64::try_from(canonical.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD),
+            )
+        })
+    }
+
+    fn charge_name_page_packing(
+        &mut self,
+        records: &BTreeMap<TreeRoot, Vec<u8>>,
+    ) -> std::result::Result<(), StoreError> {
+        self.charge_amount(Self::name_page_packing_charge(records))
+    }
+}
+
+impl AtomicWriteEffectBudget for ReorgStagedEffectMeter {
+    fn operation_framing_bytes(&self) -> u64 {
+        REORG_STAGED_OPERATION_FRAMING_BYTES
+    }
+
+    fn charge_additional(&mut self, additional: u64) -> std::result::Result<(), StoreError> {
+        self.charge_amount(additional)
+    }
+}
+
+/// A transparent write-batch decorator carrying the authoritative reorg
+/// budget across both overlay staging and the later name-page publication
+/// writes made after `StagedBatch::into_inner`.
+struct ReorgMeteredBatch<B> {
+    inner: B,
+    meter: ReorgStagedEffectMeter,
+    copies: u64,
+}
+
+impl<B> ReorgMeteredBatch<B> {
+    const fn new(inner: B, meter: ReorgStagedEffectMeter, copies: u64) -> Self {
+        Self {
+            inner,
+            meter,
+            copies,
+        }
+    }
+
+    fn into_parts(self) -> (B, ReorgStagedEffectMeter) {
+        (self.inner, self.meter)
+    }
+}
+
+impl<B: WriteBatch> WriteBatch for ReorgMeteredBatch<B> {
+    fn put(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        value: &[u8],
+    ) -> std::result::Result<(), StoreError> {
+        self.meter.charge(key.len(), value.len(), self.copies)?;
+        self.inner.put(family, key, value)?;
+        #[cfg(test)]
+        if family == ColumnFamily::Undo {
+            TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(|observed| {
+                observed.set(
+                    observed
+                        .get()
+                        .max(u64::try_from(value.len()).unwrap_or(u64::MAX)),
+                );
+            });
+        }
+        #[cfg(test)]
+        if family == ColumnFamily::NameState {
+            TEST_REORG_NAME_STATE_WRITES.with(|writes| writes.set(writes.get().saturating_add(1)));
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> std::result::Result<(), StoreError> {
+        self.meter.charge(key.len(), 0, self.copies)?;
+        self.inner.delete(family, key)
+    }
+}
+
+/// The ordinary page-backed connect/disconnect path has no reorganization
+/// budget. Reorganization publication supplies the specialized implementation
+/// below so pack scratch, physical page bytes, and database writes share one
+/// cumulative ceiling without duplicating `prepare_root`.
+///
+/// `PackedNamePages` retains cloned logical records, not encoded 64 KiB page
+/// buffers. `charge_name_page_packing` runs before those logical clones and
+/// their lookup/order/visited/address maps are allocated. After packing reveals
+/// the exact page count, `charge_name_page_output` runs before
+/// `NamePageAppender::append_with_reserve`, whose first step allocates the
+/// fixed-size encoded page. Thus both allocation boundaries reject before the
+/// newly charged representation exists.
+trait NamePagePublicationBatch: WriteBatch {
+    fn charge_name_page_packing(
+        &mut self,
+        _records: &BTreeMap<TreeRoot, Vec<u8>>,
+    ) -> std::result::Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn charge_name_page_output(
+        &mut self,
+        _page_count: usize,
+    ) -> std::result::Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn record_name_page_append(&self, _page_count: usize) {}
+}
+
+impl NamePagePublicationBatch for StoreHandleBatch {}
+
+impl<B: WriteBatch> NamePagePublicationBatch for ReorgMeteredBatch<B> {
+    fn charge_name_page_packing(
+        &mut self,
+        records: &BTreeMap<TreeRoot, Vec<u8>>,
+    ) -> std::result::Result<(), StoreError> {
+        self.meter.charge_name_page_packing(records)
+    }
+
+    fn charge_name_page_output(
+        &mut self,
+        page_count: usize,
+    ) -> std::result::Result<(), StoreError> {
+        self.meter.charge_name_page_output(page_count)
+    }
+
+    fn record_name_page_append(&self, page_count: usize) {
+        #[cfg(not(test))]
+        let _ = page_count;
+
+        #[cfg(test)]
+        TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(|observed| {
+            observed.set(
+                u64::try_from(page_count)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(hns_store::NAME_PAGE_BYTES as u64),
+            );
+        });
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NodeReorgSummary {
     pub disconnected: Vec<BlockIndexRecord>,
     pub connected: Vec<BlockIndexRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct StagedIndexRecord {
+    block: BlockIndexRecord,
+    header: HeaderRecord,
+}
+
+#[derive(Clone, Debug)]
+struct IndexStatusUpdate {
+    previous_block: Option<BlockIndexRecord>,
+    current: StagedIndexRecord,
+}
+
+#[derive(Clone, Debug)]
+struct StagedConnect {
+    current: StagedIndexRecord,
+    pruned: Vec<IndexStatusUpdate>,
+}
+
+#[derive(Debug)]
+struct PreparedIndexPublication {
+    headers: HeaderIndexCacheUpdate,
+    blocks: BlockIndexCacheUpdate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2112,33 +5450,97 @@ struct ValidatedImport {
 /// block and height. The type is private to the node crate so an RPC/P2P
 /// caller cannot manufacture the fast-path capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct StatelessBodyValidation {
+pub(crate) struct StatelessBodyValidation {
     hash: BlockHash,
     height: Height,
+    transaction_start_validated: bool,
     body_sanity_validated: bool,
+    body_commitments_validated: bool,
+    name_limits_validated: bool,
+    coinbase_height_validated: bool,
 }
 
 impl StatelessBodyValidation {
-    fn for_block(block: &Block, height: Height, network: Network) -> Self {
+    pub(crate) fn for_block(block: &Block, height: Height, network: Network) -> Self {
         Self {
             hash: block.hash(),
             height,
+            transaction_start_validated: true,
             body_sanity_validated: !hns_consensus::is_hsd_historical_block(network, true, height),
+            body_commitments_validated: true,
+            name_limits_validated: true,
+            coinbase_height_validated: true,
         }
     }
 
     fn verify(self, request: &NodeBlockImport) -> Result<()> {
-        if !matches!(request.validation, ImportValidationPolicy::Strict) {
-            anyhow::bail!("stateless body evidence requires strict block validation");
+        match request.validation {
+            ImportValidationPolicy::Strict => {}
+            // Synthetic stored-chain tests retain fixture header/chainwork
+            // policy, but still run the production body validator before this
+            // exact hash+height capability is created. This variant does not
+            // exist in production builds.
+            #[cfg(test)]
+            ImportValidationPolicy::Fixture { .. } => {}
         }
         if self.height != request.height || self.hash != request.block.hash() {
             anyhow::bail!("stateless body evidence does not match the imported block");
+        }
+        if !self.transaction_start_validated || !self.coinbase_height_validated {
+            anyhow::bail!("stateless body evidence omits a required validation stage");
         }
         Ok(())
     }
 
     const fn covers(self, plan: HistoricalValidationPlan) -> bool {
-        !plan.body_sanity || self.body_sanity_validated
+        (!plan.body_sanity || self.body_sanity_validated)
+            && (!plan.body_commitments || self.body_commitments_validated)
+            && (!plan.name_limits || self.name_limits_validated)
+    }
+}
+
+/// Process-private capability assembled only from successful ordered native
+/// body-worker results. Every proof remains bound to an exact block hash and
+/// height; the writer reauthenticates it against the final activation request.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreparedNativeActivation {
+    stateless: Vec<StatelessBodyValidation>,
+}
+
+impl PreparedNativeActivation {
+    pub(crate) fn new(stateless: Vec<StatelessBodyValidation>) -> Result<Self> {
+        let mut identities = HashSet::with_capacity(stateless.len());
+        for proof in &stateless {
+            if !identities.insert((proof.hash, proof.height)) {
+                anyhow::bail!(
+                    "prepared native activation repeats block {} at height {}",
+                    proof.hash.to_hex(),
+                    proof.height
+                );
+            }
+        }
+        Ok(Self { stateless })
+    }
+
+    fn authenticate(&self, request: &NodeReorg) -> Result<()> {
+        if self.stateless.len() != request.connect.len() {
+            anyhow::bail!(
+                "prepared native activation has {} proofs for {} connected blocks",
+                self.stateless.len(),
+                request.connect.len()
+            );
+        }
+        for (proof, connect) in self.stateless.iter().zip(&request.connect) {
+            proof.verify(connect)?;
+        }
+        Ok(())
+    }
+
+    fn into_by_identity(self) -> HashMap<(BlockHash, Height), StatelessBodyValidation> {
+        self.stateless
+            .into_iter()
+            .map(|proof| ((proof.hash, proof.height), proof))
+            .collect()
     }
 }
 
@@ -2219,6 +5621,254 @@ struct NamePageStorage {
     file_path: PathBuf,
     state: NamePageState,
     appender: Option<NamePageAppender>,
+    reopen_required: bool,
+    committed_generation_bytes: u64,
+    generation_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NamePageFilesystemLimits {
+    max_segments: u64,
+    max_directory_entries: u64,
+    max_generation_bytes: u64,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NamePageRootLocatorScanLimits {
+    max_records: u64,
+    max_bytes: u64,
+    page_budget: PrefixScanBudget,
+    deadline: Instant,
+}
+
+fn production_name_page_filesystem_limits() -> NamePageFilesystemLimits {
+    let now = Instant::now();
+    NamePageFilesystemLimits {
+        max_segments: MAX_NAME_PAGE_SEGMENTS,
+        max_directory_entries: MAX_NAME_PAGE_SEGMENTS.saturating_add(16),
+        max_generation_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
+        deadline: now
+            .checked_add(MAX_NAME_PAGE_VALIDATION_ELAPSED)
+            .unwrap_or(now),
+    }
+}
+
+fn production_name_page_stream_limits(deadline: Instant) -> NamePageStreamLimits {
+    NamePageStreamLimits {
+        max_records: MAX_NAME_PAGE_COMPACTION_RECORDS,
+        max_pages: MAX_NAME_PAGE_GENERATION_BYTES / hns_store::NAME_PAGE_BYTES as u64,
+        max_frontier: MAX_NAME_PAGE_COMPACTION_FRONTIER,
+        max_known_addresses: MAX_NAME_PAGE_COMPACTION_KNOWN_ADDRESSES,
+        minimum_filesystem_reserve_bytes: MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
+        deadline,
+    }
+}
+
+fn production_name_page_traversal_limits(deadline: Instant) -> NamePageTraversalLimits {
+    NamePageTraversalLimits {
+        max_records: MAX_NAME_PAGE_COMPACTION_RECORDS,
+        max_frontier: MAX_NAME_PAGE_COMPACTION_FRONTIER,
+        max_known_addresses: MAX_NAME_PAGE_COMPACTION_KNOWN_ADDRESSES,
+        deadline,
+    }
+}
+
+fn production_name_page_root_locator_scan_limits(
+    deadline: Instant,
+) -> NamePageRootLocatorScanLimits {
+    NamePageRootLocatorScanLimits {
+        max_records: MAX_NAME_PAGE_ROOT_LOCATORS,
+        max_bytes: MAX_NAME_PAGE_ROOT_LOCATOR_BYTES,
+        page_budget: PrefixScanBudget {
+            max_entries: NAME_PAGE_ROOT_LOCATOR_SCAN_PAGE_ENTRIES,
+            max_bytes: NAME_PAGE_ROOT_LOCATOR_SCAN_PAGE_BYTES,
+        },
+        deadline,
+    }
+}
+
+fn ensure_name_page_filesystem_deadline(
+    limits: NamePageFilesystemLimits,
+    context: &'static str,
+) -> Result<()> {
+    if Instant::now() >= limits.deadline {
+        return Err(PageTreeError::DeadlineExceeded { context }.into());
+    }
+    Ok(())
+}
+
+fn collect_name_page_root_locators(
+    snapshot: &impl ReadSnapshot,
+    limits: NamePageRootLocatorScanLimits,
+) -> Result<BTreeMap<TreeRoot, NamePageRootRecord>> {
+    if Instant::now() >= limits.deadline {
+        return Err(PageTreeError::DeadlineExceeded {
+            context: "name-page root locator scan",
+        }
+        .into());
+    }
+    let mut cursor = PagedPrefixCursor::new(
+        snapshot,
+        ColumnFamily::Snapshots,
+        NAME_PAGE_ROOT_PREFIX,
+        limits.page_budget,
+        "name-page root locator scan",
+    )?;
+    let mut records = BTreeMap::new();
+    let mut encoded_bytes = 0u64;
+    while let Some((key, raw)) = cursor.next_entry()? {
+        if Instant::now() >= limits.deadline {
+            return Err(PageTreeError::DeadlineExceeded {
+                context: "name-page root locator scan",
+            }
+            .into());
+        }
+        let actual_records = u64::try_from(records.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if actual_records > limits.max_records {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page root locator records",
+                limit: limits.max_records,
+                actual: actual_records,
+            }
+            .into());
+        }
+        let entry_bytes = u64::try_from(key.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(raw.len()).unwrap_or(u64::MAX));
+        let actual_bytes = encoded_bytes.saturating_add(entry_bytes);
+        if actual_bytes > limits.max_bytes {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page root locator bytes",
+                limit: limits.max_bytes,
+                actual: actual_bytes,
+            }
+            .into());
+        }
+        let record = NamePageRootRecord::decode(&raw)
+            .map_err(anyhow::Error::new)
+            .context("failed to decode name-page root locator")?;
+        if key != name_page_root_key(record.root) {
+            anyhow::bail!("name-page root locator key does not match its record");
+        }
+        if records.insert(record.root, record).is_some() {
+            anyhow::bail!("duplicate name-page root locator");
+        }
+        encoded_bytes = actual_bytes;
+    }
+    if Instant::now() >= limits.deadline {
+        return Err(PageTreeError::DeadlineExceeded {
+            context: "name-page root locator scan",
+        }
+        .into());
+    }
+    Ok(records)
+}
+
+fn ensure_name_page_output_capacity(
+    directory: &std::path::Path,
+    output_bytes: u64,
+    context: &'static str,
+) -> Result<()> {
+    let available = filesystem_available_bytes(directory)?;
+    let required = output_bytes.saturating_add(MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES);
+    if available < required {
+        return Err(StoreError::InsufficientSpace {
+            context,
+            available,
+            required,
+            reserve: MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn preflight_migration_data_ceiling(current_bytes: u64, temporary_bytes: u64) -> Result<u64> {
+    let aggregate_bytes = current_bytes.saturating_add(temporary_bytes);
+    if aggregate_bytes > MAX_NAME_PAGE_GENERATION_BYTES {
+        return Err(StoreError::LimitExceeded {
+            context: "schema migration data-root and temporary bytes",
+            limit: MAX_NAME_PAGE_GENERATION_BYTES,
+            actual: aggregate_bytes,
+        }
+        .into());
+    }
+    Ok(aggregate_bytes)
+}
+
+fn preflight_name_page_publication(
+    old_records: &BTreeMap<TreeRoot, NamePageRootRecord>,
+    published_root_count: usize,
+    encoded_state_bytes: usize,
+) -> Result<(u64, u64)> {
+    let old_count = u64::try_from(old_records.len()).unwrap_or(u64::MAX);
+    let published_count = u64::try_from(published_root_count).unwrap_or(u64::MAX);
+    let operations = old_count
+        .checked_add(published_count)
+        .and_then(|count| count.checked_add(1))
+        .unwrap_or(u64::MAX);
+    if operations > MAX_NAME_PAGE_PUBLICATION_OPERATIONS {
+        return Err(PageTreeError::ResourceLimit {
+            context: "name-page publication operations",
+            limit: MAX_NAME_PAGE_PUBLICATION_OPERATIONS,
+            actual: operations,
+        }
+        .into());
+    }
+
+    let root_key_bytes =
+        u64::try_from(name_page_root_key(TreeRoot::ZERO).len()).unwrap_or(u64::MAX);
+    let root_record_bytes = u64::try_from(
+        NamePageRootRecord {
+            root: TreeRoot::ZERO,
+            locator: NamePageRootLocator {
+                generation: 0,
+                address: 0,
+            },
+            height: 0,
+        }
+        .encode()
+        .len(),
+    )
+    .unwrap_or(u64::MAX);
+    let delete_bytes = old_count.saturating_mul(root_key_bytes);
+    let put_bytes =
+        published_count.saturating_mul(root_key_bytes.saturating_add(root_record_bytes));
+    let state_bytes = u64::try_from(NAME_PAGE_STATE_KEY.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(encoded_state_bytes).unwrap_or(u64::MAX));
+    let encoded_bytes = delete_bytes
+        .checked_add(put_bytes)
+        .and_then(|bytes| bytes.checked_add(state_bytes))
+        .unwrap_or(u64::MAX);
+    if encoded_bytes > MAX_NAME_PAGE_PUBLICATION_BYTES {
+        return Err(PageTreeError::ResourceLimit {
+            context: "name-page publication bytes",
+            limit: MAX_NAME_PAGE_PUBLICATION_BYTES,
+            actual: encoded_bytes,
+        }
+        .into());
+    }
+    Ok((operations, encoded_bytes))
+}
+
+fn validate_name_page_active_segment(
+    active_segment: u32,
+    limits: NamePageFilesystemLimits,
+) -> Result<()> {
+    let segments = u64::from(active_segment) + 1;
+    if segments > limits.max_segments {
+        return Err(PageTreeError::ResourceLimit {
+            context: "name-page generation segments",
+            limit: limits.max_segments,
+            actual: segments,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 enum NodeReadSnapshot<'a, S: ReadSnapshot> {
@@ -2260,6 +5910,19 @@ impl<S: ReadSnapshot> ReadSnapshot for NodeReadSnapshot<'_, S> {
         }
     }
 
+    fn scan_prefix_page(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        budget: PrefixScanBudget,
+    ) -> Result<hns_store::PrefixScanPage, hns_store::StoreError> {
+        match self {
+            Self::Base(snapshot) => snapshot.scan_prefix_page(family, prefix, start_after, budget),
+            Self::Pages(snapshot) => snapshot.scan_prefix_page(family, prefix, start_after, budget),
+        }
+    }
+
     fn prefetch_name_tree_paths(
         &self,
         root: [u8; 32],
@@ -2273,7 +5936,28 @@ impl<S: ReadSnapshot> ReadSnapshot for NodeReadSnapshot<'_, S> {
 }
 
 impl NamePageStorage {
+    fn ensure_open(&self) -> Result<()> {
+        if self.reopen_required {
+            anyhow::bail!(
+                "name-page storage is fenced after an ambiguous commit; restart and reopen the node"
+            );
+        }
+        Ok(())
+    }
+
+    /// A Store::commit error does not prove that its atomic batch was
+    /// rejected. Once publication was attempted, retain every synced page byte
+    /// that either the old or new durable manifest may reference and prohibit
+    /// all further in-process page access. Startup recovery reopens the actual
+    /// committed manifest and truncates only bytes it proves unpublished.
+    fn fence_after_commit_attempt(&mut self) {
+        self.appender.take();
+        self.reopen_required = true;
+    }
+
     fn open_or_bootstrap(directory: PathBuf, store: &StoreHandle) -> Result<Self> {
+        let filesystem_limits = production_name_page_filesystem_limits();
+        ensure_name_page_filesystem_deadline(filesystem_limits, "name-page startup recovery")?;
         std::fs::create_dir_all(&directory)
             .with_context(|| format!("failed to create {}", directory.display()))?;
         let snapshot = store.snapshot()?;
@@ -2285,6 +5969,7 @@ impl NamePageStorage {
         {
             let state = NamePageState::decode(&raw)
                 .map_err(|error| anyhow::anyhow!("failed to decode name-page state: {error}"))?;
+            validate_name_page_active_segment(state.manifest.active_segment, filesystem_limits)?;
             if state.root != durable_root {
                 anyhow::bail!("name-page root does not match the durable committed name-tree root");
             }
@@ -2299,11 +5984,13 @@ impl NamePageStorage {
                 &directory,
                 state.manifest.generation,
                 state.manifest.active_segment,
+                filesystem_limits,
             )?;
             validate_name_page_segment_set(
                 &directory,
                 state.manifest.generation,
                 state.manifest.active_segment,
+                filesystem_limits,
             )?;
             truncate_name_pages_to_committed_tail(&file_path, state.manifest.durable_bytes)
                 .map_err(|error| {
@@ -2319,11 +6006,24 @@ impl NamePageStorage {
                         file_path.display()
                     )
                 })?;
+            let generation_bytes = name_page_generation_bytes(
+                &directory,
+                state.manifest.generation,
+                filesystem_limits,
+            )?;
+            if generation_bytes > MAX_NAME_PAGE_GENERATION_BYTES {
+                anyhow::bail!(
+                    "name-page generation contains {generation_bytes} bytes; production ceiling is {MAX_NAME_PAGE_GENERATION_BYTES}"
+                );
+            }
             return Ok(Self {
                 directory,
                 file_path,
                 state,
                 appender: Some(appender),
+                reopen_required: false,
+                committed_generation_bytes: generation_bytes,
+                generation_bytes,
             });
         }
 
@@ -2338,6 +6038,15 @@ impl NamePageStorage {
                 )
             })?;
         }
+        ensure_name_page_output_capacity(
+            &directory,
+            if durable_root == TreeRoot::ZERO {
+                0
+            } else {
+                hns_store::NAME_PAGE_BYTES as u64
+            },
+            "name-page bootstrap output",
+        )?;
         let mut appender =
             NamePageAppender::create_new(&file_path, generation, segment).map_err(|error| {
                 anyhow::anyhow!(
@@ -2347,8 +6056,14 @@ impl NamePageStorage {
             })?;
         sync_directory(&directory)?;
         let height = best_block_tip_from_snapshot(&snapshot)?.map(|tip| tip.height);
-        let streamed = stream_name_page_tree(&snapshot, durable_root, &mut appender)
-            .map_err(|error| anyhow::anyhow!("failed to stream bootstrap name pages: {error}"))?;
+        let streamed = stream_name_page_tree_with_limits(
+            &snapshot,
+            durable_root,
+            &mut appender,
+            production_name_page_stream_limits(filesystem_limits.deadline),
+        )
+        .map_err(anyhow::Error::new)
+        .context("failed to stream bootstrap name pages")?;
         tracing::info!(
             records = streamed.record_count,
             pages = streamed.page_count,
@@ -2383,16 +6098,37 @@ impl NamePageStorage {
             )?;
         }
         drop(snapshot);
+        ensure_name_page_filesystem_deadline(filesystem_limits, "name-page bootstrap publication")?;
+        ensure_name_page_output_capacity(&directory, 0, "name-page bootstrap publication")?;
         store.commit(batch)?;
+        let generation_bytes =
+            name_page_generation_bytes(&directory, generation, filesystem_limits)?;
+        if generation_bytes > MAX_NAME_PAGE_GENERATION_BYTES {
+            anyhow::bail!(
+                "bootstrapped name-page generation contains {generation_bytes} bytes; production ceiling is {MAX_NAME_PAGE_GENERATION_BYTES}"
+            );
+        }
         Ok(Self {
             directory,
             file_path,
             state,
             appender: Some(appender),
+            reopen_required: false,
+            committed_generation_bytes: generation_bytes,
+            generation_bytes,
         })
     }
 
-    fn reader(&self, snapshot: &impl ReadSnapshot) -> Result<NamePageTreeReader> {
+    fn reader_for_roots<I>(
+        &self,
+        snapshot: &impl ReadSnapshot,
+        required_roots: I,
+        allow_legacy_missing: bool,
+    ) -> Result<(NamePageTreeReader, bool)>
+    where
+        I: IntoIterator<Item = TreeRoot>,
+    {
+        self.ensure_open()?;
         let locator = self.state.root_locator().unwrap_or_else(|| {
             NamePageRootLocator::new(
                 self.state.manifest.generation,
@@ -2400,75 +6136,77 @@ impl NamePageStorage {
                     .expect("zero page address fits"),
             )
         });
-        let paths = name_page_segment_paths(
+        let reader = NamePageTreeReader::open_generation(
             &self.directory,
             self.state.manifest.generation,
             self.state.manifest.active_segment,
-        )?;
-        let reader = NamePageTreeReader::open_segments(&paths, self.state.root, locator)
-            .map_err(|error| anyhow::anyhow!("failed to open name-page reader: {error}"))?;
-        for (key, raw) in snapshot
-            .scan_prefix(ColumnFamily::Snapshots, NAME_PAGE_ROOT_PREFIX)
-            .context("failed to scan name-page root locators")?
-        {
-            let record = NamePageRootRecord::decode(&raw).map_err(|error| {
-                anyhow::anyhow!("failed to decode name-page root locator: {error}")
-            })?;
-            if key != name_page_root_key(record.root) {
+            self.state.root,
+            locator,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to open name-page reader: {error}"))?;
+        let mut legacy_missing = false;
+        for root in required_roots.into_iter().collect::<BTreeSet<_>>() {
+            if root == TreeRoot::ZERO || root == self.state.root {
+                continue;
+            }
+            let Some(record) = load_name_page_root_record(snapshot, root)? else {
+                if allow_legacy_missing {
+                    legacy_missing = true;
+                    continue;
+                }
+                anyhow::bail!("required name-page root {root:?} has no durable locator");
+            };
+            if record.root != root {
                 anyhow::bail!("name-page root locator key does not match its record");
             }
             reader
                 .insert_root(record.root, record.locator)
                 .map_err(|error| anyhow::anyhow!("failed to seed page root locator: {error}"))?;
         }
-        Ok(reader)
+        Ok((reader, legacy_missing))
     }
 
     fn compact_generation(&mut self, store: &StoreHandle) -> Result<NamePageCompactionReport> {
+        self.ensure_open()?;
+        let filesystem_limits = production_name_page_filesystem_limits();
         let previous_generation = self.state.manifest.generation;
         let generation = previous_generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("name-page generation number exhausted"))?;
-        let bytes_before = name_page_generation_bytes(&self.directory, previous_generation)?;
-        remove_name_page_generation(&self.directory, generation)?;
+        let bytes_before =
+            name_page_generation_bytes(&self.directory, previous_generation, filesystem_limits)?;
+        remove_name_page_generation(&self.directory, generation, filesystem_limits)?;
 
         let snapshot = store.snapshot()?;
-        let retained_roots = retained_name_tree_roots(&snapshot)
-            .map_err(|error| anyhow::anyhow!("failed to select retained name roots: {error}"))?;
+        let retained_limits = RetainedNameTreeRootLimits {
+            deadline: filesystem_limits.deadline,
+            ..RetainedNameTreeRootLimits::default()
+        };
+        let retained_roots = retained_name_tree_roots_bounded(&snapshot, retained_limits)
+            .map_err(anyhow::Error::new)
+            .context("failed to select retained name roots")?
+            .roots;
         if !retained_roots.contains(&self.state.root) {
             anyhow::bail!("retained name roots omit the committed page root");
         }
 
-        let mut old_records = BTreeMap::new();
-        let mut old_keys = Vec::new();
-        for (key, raw) in snapshot
-            .scan_prefix(ColumnFamily::Snapshots, NAME_PAGE_ROOT_PREFIX)
-            .context("failed to scan name-page root locators for compaction")?
-        {
-            let record = NamePageRootRecord::decode(&raw).map_err(|error| {
-                anyhow::anyhow!("failed to decode name-page root locator: {error}")
-            })?;
-            if key != name_page_root_key(record.root) {
-                anyhow::bail!("name-page root locator key does not match its record");
-            }
-            old_keys.push(key);
-            if old_records.insert(record.root, record).is_some() {
-                anyhow::bail!("duplicate name-page root locator");
-            }
-        }
-        for root in retained_roots
-            .iter()
-            .copied()
-            .filter(|root| *root != TreeRoot::ZERO)
-        {
-            if !old_records.contains_key(&root) {
-                anyhow::bail!("retained name root {root:?} has no durable page locator");
-            }
-        }
-
+        let old_records = collect_name_page_root_locators(
+            &snapshot,
+            production_name_page_root_locator_scan_limits(filesystem_limits.deadline),
+        )?;
         let file_path = name_page_file_path(&self.directory, generation, 0);
         let mut commit_attempted = false;
         let staged = (|| -> Result<StagedNamePageCompaction> {
+            ensure_name_page_filesystem_deadline(filesystem_limits, "name-page compaction output")?;
+            ensure_name_page_output_capacity(
+                &self.directory,
+                if retained_roots.iter().any(|root| *root != TreeRoot::ZERO) {
+                    hns_store::NAME_PAGE_BYTES as u64
+                } else {
+                    0
+                },
+                "name-page compaction output",
+            )?;
             let mut appender =
                 NamePageAppender::create_new(&file_path, generation, 0).map_err(|error| {
                     anyhow::anyhow!(
@@ -2479,11 +6217,17 @@ impl NamePageStorage {
             sync_directory(&self.directory)?;
 
             let base = {
-                let source_reader = self.reader(&snapshot)?;
+                let (source_reader, _) =
+                    self.reader_for_roots(&snapshot, std::iter::empty(), false)?;
                 let source_snapshot = NamePageSnapshot::new(&snapshot, &source_reader);
-                stream_name_page_tree(&source_snapshot, self.state.root, &mut appender).map_err(
-                    |error| anyhow::anyhow!("failed to stream compacted name-page base: {error}"),
-                )?
+                stream_name_page_tree_with_limits(
+                    &source_snapshot,
+                    self.state.root,
+                    &mut appender,
+                    production_name_page_stream_limits(filesystem_limits.deadline),
+                )
+                .map_err(anyhow::Error::new)
+                .context("failed to stream compacted name-page base")?
             };
             let mut manifest = base.manifest;
             let mut records_written = base.record_count;
@@ -2502,26 +6246,56 @@ impl NamePageStorage {
             let output_reader = NamePageTreeReader::open_segments(&paths, self.state.root, locator)
                 .map_err(|error| anyhow::anyhow!("failed to open compacted name pages: {error}"))?;
             output_reader
-                .discover_tree_addresses(self.state.root)
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to index compacted name-page base: {error}")
-                })?;
-            let mut known = output_reader.into_known_addresses().map_err(|error| {
-                anyhow::anyhow!("failed to collect compacted name-page addresses: {error}")
-            })?;
+                .discover_tree_addresses_bounded(
+                    self.state.root,
+                    production_name_page_traversal_limits(filesystem_limits.deadline),
+                )
+                .map_err(anyhow::Error::new)
+                .context("failed to index compacted name-page base")?;
+            let mut known = output_reader
+                .into_known_addresses()
+                .map_err(anyhow::Error::new)
+                .context("failed to collect compacted name-page addresses")?;
 
-            let source_reader = self.reader(&snapshot)?;
-            let source_snapshot = NamePageSnapshot::new(&snapshot, &source_reader);
+            let (source_reader, legacy_fallback) =
+                self.reader_for_roots(&snapshot, retained_roots.iter().copied(), true)?;
+            let source_snapshot = if legacy_fallback {
+                NamePageSnapshot::with_legacy_fallback(&snapshot, &source_reader)
+            } else {
+                NamePageSnapshot::new(&snapshot, &source_reader)
+            };
             for root in retained_roots
                 .iter()
                 .copied()
                 .filter(|root| *root != TreeRoot::ZERO && *root != self.state.root)
             {
-                let delta =
-                    stream_name_page_tree_delta(&source_snapshot, root, &mut appender, &mut known)
-                        .map_err(|error| {
-                            anyhow::anyhow!("failed to stream retained name root {root:?}: {error}")
-                        })?;
+                let mut stream_limits =
+                    production_name_page_stream_limits(filesystem_limits.deadline);
+                stream_limits.max_records = stream_limits
+                    .max_records
+                    .checked_sub(records_written)
+                    .ok_or(PageTreeError::ResourceLimit {
+                        context: "name-page compacted records",
+                        limit: MAX_NAME_PAGE_COMPACTION_RECORDS,
+                        actual: records_written,
+                    })?;
+                stream_limits.max_pages = stream_limits
+                    .max_pages
+                    .checked_sub(pages_written)
+                    .ok_or_else(|| PageTreeError::ResourceLimit {
+                        context: "name-page compacted pages",
+                        limit: MAX_NAME_PAGE_GENERATION_BYTES / hns_store::NAME_PAGE_BYTES as u64,
+                        actual: pages_written,
+                    })?;
+                let delta = stream_name_page_tree_delta_with_limits(
+                    &source_snapshot,
+                    root,
+                    &mut appender,
+                    &mut known,
+                    stream_limits,
+                )
+                .map_err(anyhow::Error::new)
+                .with_context(|| format!("failed to stream retained name root {root:?}"))?;
                 manifest = delta.manifest;
                 records_written = records_written
                     .checked_add(delta.record_count)
@@ -2546,9 +6320,32 @@ impl NamePageStorage {
                 committed_height: self.state.committed_height,
                 last_sealed_height: self.state.last_sealed_height,
             };
+            let encoded_state = next
+                .encode()
+                .map_err(anyhow::Error::new)
+                .context("failed to encode compacted name-page state")?;
+            let published_root_count = retained_roots
+                .iter()
+                .filter(|root| **root != TreeRoot::ZERO)
+                .count();
+            preflight_name_page_publication(
+                &old_records,
+                published_root_count,
+                encoded_state.len(),
+            )?;
+            ensure_name_page_filesystem_deadline(
+                filesystem_limits,
+                "name-page compaction publication",
+            )?;
+            ensure_name_page_output_capacity(
+                &self.directory,
+                0,
+                "name-page compaction publication",
+            )?;
+
             let mut batch = store.batch();
-            for key in &old_keys {
-                batch.delete(ColumnFamily::Snapshots, key)?;
+            for root in old_records.keys().copied() {
+                batch.delete(ColumnFamily::Snapshots, &name_page_root_key(root))?;
             }
             let fallback_height = self.state.committed_height.unwrap_or(0);
             let mut published = BTreeMap::new();
@@ -2575,11 +6372,7 @@ impl NamePageStorage {
                 )?;
                 published.insert(root, address);
             }
-            batch.put(
-                ColumnFamily::Snapshots,
-                NAME_PAGE_STATE_KEY,
-                &next.encode()?,
-            )?;
+            batch.put(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY, &encoded_state)?;
             commit_attempted = true;
             store.commit(batch)?;
             Ok((next, appender, records_written, pages_written, published))
@@ -2589,7 +6382,10 @@ impl NamePageStorage {
             Ok(staged) => staged,
             Err(error) => {
                 if !commit_attempted {
-                    let _ = remove_name_page_generation(&self.directory, generation);
+                    let _ =
+                        remove_name_page_generation(&self.directory, generation, filesystem_limits);
+                } else {
+                    self.fence_after_commit_attempt();
                 }
                 return Err(error);
             }
@@ -2600,9 +6396,12 @@ impl NamePageStorage {
         self.file_path = file_path;
         self.state = next;
         self.appender = Some(appender);
-        remove_name_page_generations_except(&self.directory, generation)?;
+        remove_name_page_generations_except(&self.directory, generation, filesystem_limits)?;
 
-        let bytes_after = name_page_generation_bytes(&self.directory, generation)?;
+        let bytes_after =
+            name_page_generation_bytes(&self.directory, generation, filesystem_limits)?;
+        self.committed_generation_bytes = bytes_after;
+        self.generation_bytes = bytes_after;
         Ok(NamePageCompactionReport {
             previous_generation,
             generation,
@@ -2615,7 +6414,28 @@ impl NamePageStorage {
         })
     }
 
-    fn prepare_root<B: WriteBatch, S: ReadSnapshot>(
+    fn preflight_append_pages(&self, page_count: usize) -> Result<u64> {
+        let additional = u64::try_from(page_count)
+            .ok()
+            .and_then(|pages| pages.checked_mul(hns_store::NAME_PAGE_BYTES as u64))
+            .ok_or_else(|| anyhow::anyhow!("name-page append byte count overflow"))?;
+        let actual = self
+            .generation_bytes
+            .checked_add(additional)
+            .ok_or_else(|| anyhow::anyhow!("name-page generation byte count overflow"))?;
+        if actual > MAX_NAME_PAGE_GENERATION_BYTES {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page generation bytes",
+                limit: MAX_NAME_PAGE_GENERATION_BYTES,
+                actual,
+            }
+            .into());
+        }
+        ensure_name_page_output_capacity(&self.directory, additional, "name-page append output")?;
+        Ok(actual)
+    }
+
+    fn prepare_root<B: NamePagePublicationBatch, S: ReadSnapshot>(
         &mut self,
         snapshot: &S,
         batch: &mut B,
@@ -2624,6 +6444,7 @@ impl NamePageStorage {
         snapshot_pins: &[NameTreeSnapshotPin],
         target: NamePageRootTarget,
     ) -> Result<NamePageState> {
+        self.ensure_open()?;
         let NamePageRootTarget { root, height } = target;
         let mut records = BTreeMap::new();
         for (key, value) in staged_nodes {
@@ -2682,14 +6503,15 @@ impl NamePageStorage {
                                 "restored root has neither a page locator nor complete legacy records: {error}"
                             )
                         })?;
-                    let appender = self
+                    batch.charge_name_page_packing(&legacy_records)?;
+                    let next_page = self
                         .appender
-                        .as_mut()
+                        .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
                     let packed = pack_name_page_records(
                         self.state.manifest.generation,
                         self.state.manifest.active_segment,
-                        appender.next_page(),
+                        next_page.next_page(),
                         &legacy_records,
                         &HashMap::new(),
                     )
@@ -2699,9 +6521,20 @@ impl NamePageStorage {
                     let address = packed.address(root).ok_or_else(|| {
                         anyhow::anyhow!("restored legacy pack did not assign its root")
                     })?;
-                    let manifest = packed.append(appender).map_err(|error| {
-                        anyhow::anyhow!("failed to append restored legacy root: {error}")
-                    })?;
+                    let page_count = packed.page_count();
+                    let next_generation_bytes = self.preflight_append_pages(page_count)?;
+                    batch.charge_name_page_output(page_count)?;
+                    let appender = self
+                        .appender
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
+                    let manifest = packed
+                        .append_with_reserve(appender, MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES)
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to append restored legacy root: {error}")
+                        })?;
+                    batch.record_name_page_append(page_count);
+                    self.generation_bytes = next_generation_bytes;
                     next = NamePageState {
                         manifest,
                         root,
@@ -2725,17 +6558,18 @@ impl NamePageStorage {
             let height = height.ok_or_else(|| {
                 anyhow::anyhow!("non-empty name-page root has no committed height")
             })?;
+            batch.charge_name_page_packing(&records)?;
             let known = reader.known_addresses().map_err(|error| {
                 anyhow::anyhow!("failed to collect traversal page addresses: {error}")
             })?;
-            let appender = self
+            let next_page = self
                 .appender
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
             let packed = pack_name_page_records(
                 self.state.manifest.generation,
                 self.state.manifest.active_segment,
-                appender.next_page(),
+                next_page.next_page(),
                 &records,
                 &known,
             )
@@ -2778,9 +6612,18 @@ impl NamePageStorage {
                     &record.encode(),
                 )?;
             }
+            let page_count = packed.page_count();
+            let next_generation_bytes = self.preflight_append_pages(page_count)?;
+            batch.charge_name_page_output(page_count)?;
+            let appender = self
+                .appender
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
             let manifest = packed
-                .append(appender)
+                .append_with_reserve(appender, MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES)
                 .map_err(|error| anyhow::anyhow!("failed to append name-page update: {error}"))?;
+            batch.record_name_page_append(page_count);
+            self.generation_bytes = next_generation_bytes;
             next = NamePageState {
                 manifest,
                 root,
@@ -2824,9 +6667,9 @@ impl NamePageStorage {
             .active_segment
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("name-page segment number exhausted"))?;
-        self.appender.take();
         let file_path =
             name_page_file_path(&self.directory, next.manifest.generation, next_segment);
+        ensure_name_page_output_capacity(&self.directory, 0, "name-page segment seal")?;
         let mut appender =
             NamePageAppender::create_new(&file_path, next.manifest.generation, next_segment)
                 .map_err(|error| {
@@ -2839,6 +6682,7 @@ impl NamePageStorage {
             .sync_data()
             .map_err(|error| anyhow::anyhow!("failed to sync sealed successor: {error}"))?;
         sync_directory(&self.directory)?;
+        self.appender.take();
         self.file_path = file_path;
         self.appender = Some(appender);
         next.manifest = manifest;
@@ -2848,42 +6692,71 @@ impl NamePageStorage {
 
     fn commit_prepared(&mut self, prepared: NamePageState) {
         self.state = prepared;
+        self.committed_generation_bytes = self.generation_bytes;
     }
 
     fn rollback_uncommitted_tail(&mut self) -> Result<()> {
+        self.ensure_open()?;
         self.appender.take();
-        remove_unpublished_name_page_segments(
-            &self.directory,
-            self.state.manifest.generation,
-            self.state.manifest.active_segment,
-        )?;
-        self.file_path = name_page_file_path(
-            &self.directory,
-            self.state.manifest.generation,
-            self.state.manifest.active_segment,
-        );
-        truncate_name_pages_to_committed_tail(&self.file_path, self.state.manifest.durable_bytes)
+        let rollback: Result<()> = (|| {
+            remove_unpublished_name_page_segments(
+                &self.directory,
+                self.state.manifest.generation,
+                self.state.manifest.active_segment,
+                production_name_page_filesystem_limits(),
+            )?;
+            self.file_path = name_page_file_path(
+                &self.directory,
+                self.state.manifest.generation,
+                self.state.manifest.active_segment,
+            );
+            truncate_name_pages_to_committed_tail(
+                &self.file_path,
+                self.state.manifest.durable_bytes,
+            )
             .map_err(|error| anyhow::anyhow!("failed to roll back name-page tail: {error}"))?;
-        self.appender = Some(
-            NamePageAppender::open_at_committed_tail(&self.file_path, self.state.manifest)
-                .map_err(|error| anyhow::anyhow!("failed to reopen name-page appender: {error}"))?,
-        );
+            self.appender = Some(
+                NamePageAppender::open_at_committed_tail(&self.file_path, self.state.manifest)
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to reopen name-page appender: {error}")
+                    })?,
+            );
+            self.generation_bytes = self.committed_generation_bytes;
+            Ok(())
+        })();
+        if let Err(error) = rollback {
+            // A failed truncate/reopen means this process cannot prove which
+            // page bytes remain usable. Fence before propagating so the outer
+            // NodeService error path revokes authority instead of treating a
+            // failed cleanup as an ordinary rejected mutation.
+            self.fence_after_commit_attempt();
+            return Err(error
+                .context("failed to prove name-page rollback; storage is fenced until restart"));
+        }
         Ok(())
     }
 }
 
-fn staged_name_tree_snapshot_pins(overlay: &StagingOverlay) -> Result<Vec<NameTreeSnapshotPin>> {
+fn staged_name_tree_snapshot_pins(
+    snapshot: &impl ReadSnapshot,
+    heights: impl IntoIterator<Item = Height>,
+) -> Result<Vec<NameTreeSnapshotPin>> {
     let mut pins = Vec::new();
-    for (key, value) in overlay.staged_family(ColumnFamily::Snapshots) {
-        if !key.starts_with(NAME_TREE_SNAPSHOT_PIN_PREFIX) {
+    let mut seen = BTreeSet::new();
+    for height in heights {
+        if !seen.insert(height) {
             continue;
         }
-        let Some(raw) = value else {
+        let key = name_tree_snapshot_pin_key(height);
+        let Some(raw) = snapshot
+            .get(ColumnFamily::Snapshots, &key)
+            .context("failed to read staged name-tree snapshot pin")?
+        else {
             continue;
         };
         let pin = NameTreeSnapshotPin::decode(&raw)
             .map_err(|error| anyhow::anyhow!("failed to decode staged name-tree pin: {error}"))?;
-        if key != name_tree_snapshot_pin_key(pin.height) {
+        if pin.height != height || key != name_tree_snapshot_pin_key(pin.height) {
             anyhow::bail!(
                 "staged name-tree pin at height {} has a mismatched key",
                 pin.height
@@ -2912,9 +6785,13 @@ fn name_page_segment_paths(
     directory: &std::path::Path,
     generation: u64,
     active_segment: u32,
+    limits: NamePageFilesystemLimits,
 ) -> Result<BTreeMap<u32, PathBuf>> {
+    validate_name_page_active_segment(active_segment, limits)?;
+    ensure_name_page_filesystem_deadline(limits, "name-page segment validation")?;
     let mut paths = BTreeMap::new();
     for segment in 0..=active_segment {
+        ensure_name_page_filesystem_deadline(limits, "name-page segment validation")?;
         let path = name_page_file_path(directory, generation, segment);
         if !path.is_file() {
             anyhow::bail!("name-page segment {} is missing", path.display());
@@ -2928,8 +6805,10 @@ fn validate_name_page_segment_set(
     directory: &std::path::Path,
     generation: u64,
     active_segment: u32,
+    limits: NamePageFilesystemLimits,
 ) -> Result<()> {
-    for (segment, path) in name_page_segment_paths(directory, generation, active_segment)? {
+    for (segment, path) in name_page_segment_paths(directory, generation, active_segment, limits)? {
+        ensure_name_page_filesystem_deadline(limits, "name-page segment validation")?;
         if segment == active_segment {
             continue;
         }
@@ -2950,12 +6829,28 @@ fn remove_unpublished_name_page_segments(
     directory: &std::path::Path,
     generation: u64,
     active_segment: u32,
+    limits: NamePageFilesystemLimits,
 ) -> Result<()> {
+    validate_name_page_active_segment(active_segment, limits)?;
     let mut removed = false;
+    let mut entries = 0u64;
+    let mut discard = Vec::new();
     for entry in std::fs::read_dir(directory)
         .with_context(|| format!("failed to scan {}", directory.display()))?
     {
+        ensure_name_page_filesystem_deadline(limits, "name-page recovery directory scan")?;
         let entry = entry?;
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("name-page directory entry count overflow"))?;
+        if entries > limits.max_directory_entries {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page recovery directory entries",
+                limit: limits.max_directory_entries,
+                actual: entries,
+            }
+            .into());
+        }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -2963,14 +6858,18 @@ fn remove_unpublished_name_page_segments(
             continue;
         };
         if candidate_generation != generation || segment > active_segment {
-            std::fs::remove_file(entry.path()).with_context(|| {
-                format!(
-                    "failed to discard non-authoritative name-page segment {}",
-                    entry.path().display()
-                )
-            })?;
-            removed = true;
+            discard.push(entry.path());
         }
+    }
+    for path in discard {
+        ensure_name_page_filesystem_deadline(limits, "name-page recovery cleanup")?;
+        std::fs::remove_file(&path).with_context(|| {
+            format!(
+                "failed to discard non-authoritative name-page segment {}",
+                path.display()
+            )
+        })?;
+        removed = true;
     }
     if removed {
         sync_directory(directory)?;
@@ -2978,12 +6877,30 @@ fn remove_unpublished_name_page_segments(
     Ok(())
 }
 
-fn remove_name_page_generation(directory: &std::path::Path, generation: u64) -> Result<()> {
+fn remove_name_page_generation(
+    directory: &std::path::Path,
+    generation: u64,
+    limits: NamePageFilesystemLimits,
+) -> Result<()> {
     let mut removed = false;
+    let mut entries = 0u64;
+    let mut discard = Vec::new();
     for entry in std::fs::read_dir(directory)
         .with_context(|| format!("failed to scan {}", directory.display()))?
     {
+        ensure_name_page_filesystem_deadline(limits, "name-page generation directory scan")?;
         let entry = entry?;
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("name-page directory entry count overflow"))?;
+        if entries > limits.max_directory_entries {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page generation directory entries",
+                limit: limits.max_directory_entries,
+                actual: entries,
+            }
+            .into());
+        }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -2991,14 +6908,18 @@ fn remove_name_page_generation(directory: &std::path::Path, generation: u64) -> 
             continue;
         };
         if candidate_generation == generation {
-            std::fs::remove_file(entry.path()).with_context(|| {
-                format!(
-                    "failed to discard name-page generation file {}",
-                    entry.path().display()
-                )
-            })?;
-            removed = true;
+            discard.push(entry.path());
         }
+    }
+    for path in discard {
+        ensure_name_page_filesystem_deadline(limits, "name-page generation cleanup")?;
+        std::fs::remove_file(&path).with_context(|| {
+            format!(
+                "failed to discard name-page generation file {}",
+                path.display()
+            )
+        })?;
+        removed = true;
     }
     if removed {
         sync_directory(directory)?;
@@ -3006,12 +6927,30 @@ fn remove_name_page_generation(directory: &std::path::Path, generation: u64) -> 
     Ok(())
 }
 
-fn remove_name_page_generations_except(directory: &std::path::Path, generation: u64) -> Result<()> {
+fn remove_name_page_generations_except(
+    directory: &std::path::Path,
+    generation: u64,
+    limits: NamePageFilesystemLimits,
+) -> Result<()> {
     let mut removed = false;
+    let mut entries = 0u64;
+    let mut discard = Vec::new();
     for entry in std::fs::read_dir(directory)
         .with_context(|| format!("failed to scan {}", directory.display()))?
     {
+        ensure_name_page_filesystem_deadline(limits, "name-page generation directory scan")?;
         let entry = entry?;
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("name-page directory entry count overflow"))?;
+        if entries > limits.max_directory_entries {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page generation directory entries",
+                limit: limits.max_directory_entries,
+                actual: entries,
+            }
+            .into());
+        }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -3019,14 +6958,18 @@ fn remove_name_page_generations_except(directory: &std::path::Path, generation: 
             continue;
         };
         if candidate_generation != generation {
-            std::fs::remove_file(entry.path()).with_context(|| {
-                format!(
-                    "failed to discard superseded name-page generation file {}",
-                    entry.path().display()
-                )
-            })?;
-            removed = true;
+            discard.push(entry.path());
         }
+    }
+    for path in discard {
+        ensure_name_page_filesystem_deadline(limits, "name-page generation cleanup")?;
+        std::fs::remove_file(&path).with_context(|| {
+            format!(
+                "failed to discard superseded name-page generation file {}",
+                path.display()
+            )
+        })?;
+        removed = true;
     }
     if removed {
         sync_directory(directory)?;
@@ -3034,12 +6977,29 @@ fn remove_name_page_generations_except(directory: &std::path::Path, generation: 
     Ok(())
 }
 
-fn name_page_generation_bytes(directory: &std::path::Path, generation: u64) -> Result<u64> {
+fn name_page_generation_bytes(
+    directory: &std::path::Path,
+    generation: u64,
+    limits: NamePageFilesystemLimits,
+) -> Result<u64> {
     let mut bytes = 0u64;
+    let mut entries = 0u64;
     for entry in std::fs::read_dir(directory)
         .with_context(|| format!("failed to scan {}", directory.display()))?
     {
+        ensure_name_page_filesystem_deadline(limits, "name-page generation byte scan")?;
         let entry = entry?;
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("name-page directory entry count overflow"))?;
+        if entries > limits.max_directory_entries {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page generation byte-scan entries",
+                limit: limits.max_directory_entries,
+                actual: entries,
+            }
+            .into());
+        }
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -3050,6 +7010,14 @@ fn name_page_generation_bytes(directory: &std::path::Path, generation: u64) -> R
             bytes = bytes
                 .checked_add(entry.metadata()?.len())
                 .ok_or_else(|| anyhow::anyhow!("name-page byte count overflow"))?;
+            if bytes > limits.max_generation_bytes {
+                return Err(PageTreeError::ResourceLimit {
+                    context: "name-page generation bytes",
+                    limit: limits.max_generation_bytes,
+                    actual: bytes,
+                }
+                .into());
+            }
         }
     }
     Ok(bytes)
@@ -3072,6 +7040,166 @@ fn load_name_page_root_record(
         .transpose()
 }
 
+fn validate_reorg_counts(request: &NodeReorg, limits: NodeReorgLimits) -> Result<()> {
+    if request.disconnect.len() > limits.maximum_disconnect {
+        anyhow::bail!(
+            "reorganization disconnect count {} exceeds production limit {}",
+            request.disconnect.len(),
+            limits.maximum_disconnect
+        );
+    }
+    if request.connect.len() > limits.maximum_connect {
+        anyhow::bail!(
+            "reorganization connect count {} exceeds production limit {}",
+            request.connect.len(),
+            limits.maximum_connect
+        );
+    }
+    Ok(())
+}
+
+fn add_reorg_resource(
+    current: u64,
+    additional: u64,
+    limit: u64,
+    context: &'static str,
+) -> Result<u64> {
+    let actual = current.saturating_add(additional);
+    if actual > limit {
+        anyhow::bail!("{context} {actual} exceeds production limit {limit}");
+    }
+    Ok(actual)
+}
+
+fn validate_reorg_connect_body_budget(request: &NodeReorg, limits: NodeReorgLimits) -> Result<u64> {
+    validate_reorg_counts(request, limits)?;
+    let mut body_bytes = 0u64;
+    for connect in &request.connect {
+        body_bytes = add_reorg_resource(
+            body_bytes,
+            u64::try_from(connect.block.encode().len()).unwrap_or(u64::MAX),
+            limits.maximum_body_bytes,
+            "reorganization encoded body bytes",
+        )?;
+    }
+    Ok(body_bytes)
+}
+
+fn preflight_reorg_reconciliation_budget(
+    snapshot: &impl ReadSnapshot,
+    request: &NodeReorg,
+    limits: NodeReorgLimits,
+) -> Result<u64> {
+    let mut body_bytes = validate_reorg_connect_body_budget(request, limits)?;
+    let mut transaction_count = request.connect.iter().try_fold(0u64, |count, connect| {
+        add_reorg_resource(
+            count,
+            u64::try_from(connect.block.transactions.len()).unwrap_or(u64::MAX),
+            MAX_REORG_RECONCILIATION_TRANSACTIONS,
+            "reorganization reconciliation transactions",
+        )
+    })?;
+    for disconnect in &request.disconnect {
+        let encoded = snapshot
+            .get(ColumnFamily::Blocks, disconnect.block_hash.as_bytes())
+            .context("failed to read disconnect block during reconciliation preflight")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "disconnect block {} is unavailable for mempool reconciliation",
+                    disconnect.block_hash.to_hex()
+                )
+            })?;
+        body_bytes = add_reorg_resource(
+            body_bytes,
+            u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+            limits.maximum_body_bytes,
+            "reorganization reconciliation body bytes",
+        )?;
+        let raw = RawBlockRecord::decode(&encoded).map_err(|error| {
+            anyhow::anyhow!(
+                "disconnect block record {} is corrupt during reconciliation preflight: {error}",
+                disconnect.block_hash.to_hex()
+            )
+        })?;
+        if raw.hash != disconnect.block_hash {
+            anyhow::bail!(
+                "disconnect block key {} disagrees with embedded hash {}",
+                disconnect.block_hash.to_hex(),
+                raw.hash.to_hex()
+            );
+        }
+        let block = raw.decode_block().map_err(|error| {
+            anyhow::anyhow!(
+                "disconnect block {} is corrupt during reconciliation preflight: {error}",
+                disconnect.block_hash.to_hex()
+            )
+        })?;
+        transaction_count = add_reorg_resource(
+            transaction_count,
+            u64::try_from(block.transactions.len()).unwrap_or(u64::MAX),
+            MAX_REORG_RECONCILIATION_TRANSACTIONS,
+            "reorganization reconciliation transactions",
+        )?;
+    }
+    Ok(body_bytes)
+}
+
+fn preflight_reorg_page_roots(
+    snapshot: &impl ReadSnapshot,
+    request: &NodeReorg,
+    limits: NodeReorgLimits,
+) -> Result<BTreeSet<TreeRoot>> {
+    // Body and transaction materialization have an independent input budget.
+    // Actual atomic write effects are metered at every WriteBatch mutation in
+    // `apply_reorg_classified_with_limits`; no input-derived estimate is used
+    // as a substitute for the generated state/index/page writes.
+    preflight_reorg_reconciliation_budget(snapshot, request, limits)?;
+    let mut roots = BTreeSet::new();
+    for disconnect in &request.disconnect {
+        let raw = snapshot
+            .get(ColumnFamily::Undo, disconnect.block_hash.as_bytes())
+            .context("failed to read block undo during reorganization preflight")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "undo is missing for requested disconnect {}",
+                    disconnect.block_hash.to_hex()
+                )
+            })?;
+        let undo = BlockUndo::decode(&raw).map_err(|error| {
+            anyhow::anyhow!(
+                "failed to decode disconnect undo {} during reorganization preflight: {error}",
+                disconnect.block_hash.to_hex()
+            )
+        })?;
+        if undo.block_hash != disconnect.block_hash || undo.height != disconnect.height {
+            anyhow::bail!(
+                "disconnect undo identity mismatch for {} at height {}",
+                disconnect.block_hash.to_hex(),
+                disconnect.height
+            );
+        }
+        roots.extend([
+            undo.previous_tree_root,
+            undo.resulting_tree_root,
+            undo.previous_committed_tree_root,
+            undo.resulting_committed_tree_root,
+        ]);
+    }
+    roots.remove(&TreeRoot::ZERO);
+    Ok(roots)
+}
+
+fn required_name_page_rollback_roots(
+    snapshot: &impl ReadSnapshot,
+    disconnects: &[NodeBlockDisconnect],
+) -> Result<BTreeSet<TreeRoot>> {
+    let request = NodeReorg {
+        disconnect: disconnects.to_vec(),
+        connect: Vec::new(),
+    };
+    preflight_reorg_page_roots(snapshot, &request, NodeReorgLimits::PRODUCTION)
+}
+
 fn validate_name_page_root_record(
     snapshot: &impl ReadSnapshot,
     state: &NamePageState,
@@ -3091,18 +7219,815 @@ fn validate_name_page_root_record(
     }
 }
 
+fn production_fence_from_store_error(
+    kind: ProductionSafetyFenceKind,
+    error: &StoreError,
+) -> Option<ProductionSafetyFence> {
+    let (context, limit, actual) = match error {
+        StoreError::LimitExceeded {
+            context,
+            limit,
+            actual,
+        } => (*context, *limit, *actual),
+        StoreError::InsufficientSpace {
+            context,
+            available,
+            required,
+            ..
+        } => (*context, *required, *available),
+        StoreError::DeadlineExceeded { context } => (*context, 1, 2),
+        _ => return None,
+    };
+    Some(ProductionSafetyFence {
+        version: PRODUCTION_SAFETY_FENCE_VERSION,
+        kind,
+        context: context.to_owned(),
+        limit,
+        actual,
+        root: None,
+        candidate: None,
+        detail: error.to_string(),
+    })
+}
+
+fn production_fence_from_name_page_error(
+    kind: ProductionSafetyFenceKind,
+    error: &anyhow::Error,
+) -> Option<ProductionSafetyFence> {
+    for cause in error.chain() {
+        if let Some(store) = cause.downcast_ref::<StoreError>() {
+            if let Some(fence) = production_fence_from_store_error(kind, store) {
+                return Some(fence);
+            }
+        }
+        if let Some(state) = cause.downcast_ref::<StateError>() {
+            let resource = match state {
+                StateError::ResourceLimit {
+                    context,
+                    limit,
+                    actual,
+                } => Some((*context, *limit, *actual)),
+                StateError::DeadlineExceeded { context } => Some((*context, 1, 2)),
+                _ => None,
+            };
+            if let Some((context, limit, actual)) = resource {
+                return Some(ProductionSafetyFence {
+                    version: PRODUCTION_SAFETY_FENCE_VERSION,
+                    kind,
+                    context: context.to_owned(),
+                    limit,
+                    actual,
+                    root: None,
+                    candidate: None,
+                    detail: state.to_string(),
+                });
+            }
+        }
+        let Some(page) = cause.downcast_ref::<PageTreeError>() else {
+            continue;
+        };
+        let (context, limit, actual) = match page {
+            PageTreeError::Page(NamePageError::InsufficientCapacity {
+                available,
+                required,
+                ..
+            }) => (
+                "name-page generation append capacity",
+                *required,
+                *available,
+            ),
+            PageTreeError::ResourceLimit {
+                context,
+                limit,
+                actual,
+            } => (*context, *limit, *actual),
+            PageTreeError::InsufficientSpace {
+                context,
+                available,
+                required,
+                reserve,
+            } => (
+                *context,
+                required.checked_add(*reserve).unwrap_or(u64::MAX),
+                *available,
+            ),
+            PageTreeError::DeadlineExceeded { context } => (*context, 1, 2),
+            _ => continue,
+        };
+        return Some(ProductionSafetyFence {
+            version: PRODUCTION_SAFETY_FENCE_VERSION,
+            kind,
+            context: context.to_owned(),
+            limit,
+            actual,
+            root: None,
+            candidate: None,
+            detail: page.to_string(),
+        });
+    }
+    None
+}
+
+fn load_production_safety_fence(
+    store: &StoreHandle,
+) -> std::result::Result<Option<ProductionSafetyFenceEvidence>, ChainError> {
+    let snapshot = store.snapshot()?;
+    snapshot
+        .get(ColumnFamily::Snapshots, PRODUCTION_SAFETY_FENCE_KEY)?
+        .map(|encoded| {
+            let fence = ProductionSafetyFence::decode(&encoded)
+                .map_err(|error| ChainError::Store(error.to_string()))?;
+            let digest = blake2b_256(&encoded);
+            Ok(ProductionSafetyFenceEvidence {
+                fence,
+                encoded,
+                digest,
+            })
+        })
+        .transpose()
+}
+
+pub fn inspect_production_safety_fence(
+    store: &StoreHandle,
+) -> Result<Option<ProductionSafetyFenceEvidence>> {
+    load_production_safety_fence(store)
+        .map_err(|error| anyhow::anyhow!("failed to inspect production safety fence: {error}"))
+}
+
+pub fn clear_production_safety_fence_validated(
+    store: &StoreHandle,
+    network: Network,
+    request: ProductionSafetyFenceClearRequest,
+) -> Result<ProductionSafetyFenceEvidence> {
+    let ProductionSafetyFenceClearRequest {
+        expected_digest,
+        acknowledgement,
+        name_page_directory,
+    } = request;
+    match acknowledgement {
+        ProductionSafetyFenceClearAcknowledgement::OfflineRecoveryCompletedAndVerified => {}
+    }
+    store
+        .ensure_operational()
+        .context("cannot clear a safety fence while store recovery is required")?;
+    validate_existing_store_identity(store, network)?;
+    let evidence = inspect_production_safety_fence(store)?
+        .ok_or_else(|| anyhow::anyhow!("no production safety fence is present"))?;
+    if evidence.digest != expected_digest {
+        anyhow::bail!(
+            "production safety-fence digest changed; expected {}, found {}",
+            hex_encode(&expected_digest),
+            hex_encode(&evidence.digest)
+        );
+    }
+
+    match evidence.fence.kind {
+        ProductionSafetyFenceKind::LiveHeaderOperation => {
+            anyhow::bail!(
+                "generic live-header fence context `{}` has no safe automatic recovery proof; perform typed offline recovery before clearing",
+                evidence.fence.context
+            );
+        }
+        ProductionSafetyFenceKind::LiveHeaderReorganization => {
+            let candidate = evidence.fence.candidate.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "reorganization safety fence is missing its typed candidate identity"
+                )
+            })?;
+            let index = StoredHeaderIndex::new(store.clone())
+                .map_err(|error| anyhow::anyhow!("header recovery validation failed: {error}"))?;
+            match index.header(&candidate)? {
+                None => {
+                    // Offline recovery removed the exact fenced candidate.
+                }
+                Some(record) if record.status.failed => {
+                    // Offline recovery durably invalidated the exact candidate.
+                }
+                Some(_) => {
+                    let maximum = usize::try_from(evidence.fence.limit).unwrap_or(usize::MAX);
+                    index
+                        .plan_reorg_bounded(
+                            &candidate,
+                            ReorgPlanLimits {
+                                maximum_disconnect: maximum,
+                                maximum_connect: maximum,
+                            },
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "fenced reorganization candidate remains unresolved: {error}"
+                            )
+                        })?;
+                }
+            }
+        }
+        ProductionSafetyFenceKind::FailedBranchDescendants => {
+            let root = evidence.fence.root.ok_or_else(|| {
+                anyhow::anyhow!("failed-branch safety fence is missing its invalid root")
+            })?;
+            let index = StoredHeaderIndex::new(store.clone())
+                .map_err(|error| anyhow::anyhow!("header recovery validation failed: {error}"))?;
+            let record = index.header(&root)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed-branch root {} is missing; explicit header recovery is required",
+                    root.to_hex()
+                )
+            })?;
+            if !record.status.failed {
+                anyhow::bail!(
+                    "failed-branch root {} is not durably failed; refusing to clear fence",
+                    root.to_hex()
+                );
+            }
+            // StoredHeaderIndex construction validates that every descendant
+            // of a failed ancestor is also failed, so the root status plus a
+            // successful strict reconstruction proves the whole condition.
+        }
+        ProductionSafetyFenceKind::NamePageValidation
+        | ProductionSafetyFenceKind::NamePageCompaction => {
+            let directory = name_page_directory.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "name-page safety-fence recovery requires the canonical name-page directory"
+                )
+            })?;
+            let pages = NamePageStorage::open_or_bootstrap(directory.to_path_buf(), store)
+                .context("failed to reopen name pages for safety-fence validation")?;
+            let snapshot = store.snapshot()?;
+            let required_roots = [
+                load_stored_name_tree_root(&snapshot).map_err(|error| {
+                    anyhow::anyhow!("failed to load working name root: {error}")
+                })?,
+                load_stored_name_tree_commit_root(&snapshot).map_err(|error| {
+                    anyhow::anyhow!("failed to load committed name root: {error}")
+                })?,
+            ];
+            let (reader, _) = pages.reader_for_roots(&snapshot, required_roots, true)?;
+            seed_startup_pin_page_roots(&snapshot, network, &reader)?;
+            reader
+                .validate_committed_pages_with_limits(production_name_page_validation_limits(
+                    &snapshot, network,
+                )?)
+                .map_err(|error| {
+                    anyhow::anyhow!("name-page safety-fence validation failed: {error}")
+                })?;
+        }
+        ProductionSafetyFenceKind::PayloadSegmentCompaction => {
+            let now = Instant::now();
+            let scrub = store
+                .scrub_segment_archive_bounded(SegmentArchiveScrubLimits {
+                    max_segments: SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS,
+                    max_records: SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS,
+                    max_durable_bytes: SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES,
+                    deadline: now
+                        .checked_add(SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED)
+                        .unwrap_or(now),
+                })
+                .context(
+                    "payload-segment fence requires a successful bounded authenticated scrub",
+                )?;
+            tracing::info!(
+                block_segments = scrub.blocks.segments,
+                block_records = scrub.blocks.records,
+                block_bytes = scrub.blocks.durable_bytes,
+                undo_segments = scrub.undo.segments,
+                undo_records = scrub.undo.records,
+                undo_bytes = scrub.undo.durable_bytes,
+                "validated payload archive before clearing its production safety fence"
+            );
+        }
+        ProductionSafetyFenceKind::Storage => {
+            anyhow::bail!(
+                "generic storage fence context `{}` has no operation-specific automatic recovery proof; perform typed offline recovery before clearing",
+                evidence.fence.context
+            );
+        }
+    }
+
+    let current = inspect_production_safety_fence(store)?
+        .ok_or_else(|| anyhow::anyhow!("production safety fence disappeared during validation"))?;
+    if current.digest != expected_digest || current.encoded != evidence.encoded {
+        anyhow::bail!("production safety fence changed during recovery validation");
+    }
+    let mut batch = store.batch();
+    batch.delete(ColumnFamily::Snapshots, PRODUCTION_SAFETY_FENCE_KEY)?;
+    store
+        .commit(batch)
+        .context("failed to durably clear production safety fence")?;
+    Ok(evidence)
+}
+
+fn persist_production_safety_fence(
+    store: &StoreHandle,
+    fence: ProductionSafetyFence,
+) -> std::result::Result<ProductionSafetyFenceEvidence, ChainError> {
+    if let Some(existing) = load_production_safety_fence(store)? {
+        return Ok(existing);
+    }
+    let encoded = fence
+        .encode()
+        .map_err(|error| ChainError::Store(error.to_string()))?;
+    let digest = blake2b_256(&encoded);
+    let mut batch = store.batch();
+    batch.put(
+        ColumnFamily::Snapshots,
+        PRODUCTION_SAFETY_FENCE_KEY,
+        &encoded,
+    )?;
+    store.commit(batch).map_err(ChainError::from)?;
+    Ok(ProductionSafetyFenceEvidence {
+        fence,
+        encoded,
+        digest,
+    })
+}
+
+/// Cloneable access to the in-memory canonical header index.
+///
+/// Header synchronization already keeps this complete index beside the
+/// durable header records. Sharing it lets RPC resolve one canonical height
+/// in O(1) without taking the global node coordinator lock or scanning the
+/// hash-keyed header column.
+#[derive(Clone, Debug)]
+pub struct SharedHeaderIndex {
+    inner: Arc<RwLock<StoredHeaderIndex<StoreHandle>>>,
+    safety_fence: Arc<Mutex<Option<ProductionSafetyFenceEvidence>>>,
+}
+
+impl SharedHeaderIndex {
+    fn new(store: StoreHandle) -> std::result::Result<Self, ChainError> {
+        let safety_fence = load_production_safety_fence(&store)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(StoredHeaderIndex::new(store)?)),
+            safety_fence: Arc::new(Mutex::new(safety_fence)),
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_test_fixtures(store: StoreHandle) -> std::result::Result<Self, ChainError> {
+        let safety_fence = load_production_safety_fence(&store)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(StoredHeaderIndex::new_for_test_fixtures(
+                store,
+            )?)),
+            safety_fence: Arc::new(Mutex::new(safety_fence)),
+        })
+    }
+
+    fn record_resource_fence(
+        &self,
+        index: &StoredHeaderIndex<StoreHandle>,
+        error: &ChainError,
+        kind: ProductionSafetyFenceKind,
+        root: Option<BlockHash>,
+        candidate: Option<BlockHash>,
+    ) -> std::result::Result<(), ChainError> {
+        let (context, limit, actual) = match error {
+            ChainError::ReorgPlanLimit {
+                phase,
+                limit,
+                actual,
+            } => (*phase, *limit, *actual),
+            ChainError::LiveWorkLimit {
+                context,
+                limit,
+                actual,
+            } => (*context, *limit, *actual),
+            ChainError::LiveWorkDeadline { context } => (*context, 1, 2),
+            _ => return Ok(()),
+        };
+        let mut detail =
+            format!("bounded live header operation requires offline recovery: {error}");
+        if detail.len() > MAX_PRODUCTION_SAFETY_DETAIL_BYTES {
+            let mut end = MAX_PRODUCTION_SAFETY_DETAIL_BYTES;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        self.persist_first_cause(
+            index.store(),
+            ProductionSafetyFence {
+                version: PRODUCTION_SAFETY_FENCE_VERSION,
+                kind,
+                context: context.to_owned(),
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                actual: u64::try_from(actual).unwrap_or(u64::MAX),
+                root,
+                candidate,
+                detail,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn persist_first_cause(
+        &self,
+        store: &StoreHandle,
+        fence: ProductionSafetyFence,
+    ) -> std::result::Result<ProductionSafetyFenceEvidence, ChainError> {
+        // Reader-side planners may fail concurrently. Cover the entire
+        // durable load/check/put and in-memory publication so only the first
+        // cause can ever establish the record and digest.
+        let mut cached = self.safety_fence.lock().map_err(|_| {
+            ChainError::Store("production safety-fence lock is poisoned".to_owned())
+        })?;
+        if let Some(existing) = cached.as_ref() {
+            return Ok(existing.clone());
+        }
+        let evidence = persist_production_safety_fence(store, fence)?;
+        *cached = Some(evidence.clone());
+        Ok(evidence)
+    }
+
+    fn safety_fence_reason(&self) -> Option<String> {
+        self.safety_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|evidence| evidence.fence.reason())
+    }
+
+    fn safety_fence_kind(&self) -> Option<ProductionSafetyFenceKind> {
+        self.safety_fence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|evidence| evidence.fence.kind)
+    }
+
+    fn record_external_safety_fence(&self, fence: ProductionSafetyFence) -> Result<()> {
+        let index = self
+            .inner
+            .read()
+            .map_err(|_| anyhow::anyhow!("shared header-index lock is poisoned"))?;
+        self.persist_first_cause(index.store(), fence)
+            .map_err(|error| {
+                anyhow::anyhow!("failed to persist production safety fence: {error}")
+            })?;
+        Ok(())
+    }
+
+    fn ensure_mutation_unfenced(&self) -> std::result::Result<(), ChainError> {
+        if let Some(reason) = self.safety_fence_reason() {
+            return Err(ChainError::Store(format!(
+                "durable production safety fence blocks header mutation: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn read<T>(
+        &self,
+        operation: impl FnOnce(&StoredHeaderIndex<StoreHandle>) -> std::result::Result<T, ChainError>,
+    ) -> std::result::Result<T, ChainError> {
+        let index = self
+            .inner
+            .read()
+            .map_err(|_| ChainError::Store("shared header-index lock is poisoned".to_owned()))?;
+        operation(&index)
+    }
+
+    fn read_fenced<T>(
+        &self,
+        kind: ProductionSafetyFenceKind,
+        root: Option<BlockHash>,
+        candidate: Option<BlockHash>,
+        operation: impl FnOnce(&StoredHeaderIndex<StoreHandle>) -> std::result::Result<T, ChainError>,
+    ) -> std::result::Result<T, ChainError> {
+        let index = self
+            .inner
+            .read()
+            .map_err(|_| ChainError::Store("shared header-index lock is poisoned".to_owned()))?;
+        let result = operation(&index);
+        if let Err(error) = &result {
+            self.record_resource_fence(&index, error, kind, root, candidate)?;
+        }
+        result
+    }
+
+    fn acquire_unfenced_write_after(
+        &self,
+        after_initial_check: impl FnOnce(),
+    ) -> std::result::Result<
+        std::sync::RwLockWriteGuard<'_, StoredHeaderIndex<StoreHandle>>,
+        ChainError,
+    > {
+        // The first check is a cheap rejection path. The second is the
+        // authoritative admission point: fence recorders retain an inner
+        // read/write guard through durable and cached publication, so no new
+        // fence can race after this writer owns the inner lock.
+        self.ensure_mutation_unfenced()?;
+        after_initial_check();
+        let index = self
+            .inner
+            .write()
+            .map_err(|_| ChainError::Store("shared header-index lock is poisoned".to_owned()))?;
+        self.ensure_mutation_unfenced()?;
+        Ok(index)
+    }
+
+    fn write_after_initial_check<T>(
+        &self,
+        after_initial_check: impl FnOnce(),
+        operation: impl FnOnce(
+            &mut StoredHeaderIndex<StoreHandle>,
+        ) -> std::result::Result<T, ChainError>,
+    ) -> std::result::Result<T, ChainError> {
+        let mut index = self.acquire_unfenced_write_after(after_initial_check)?;
+        operation(&mut index)
+    }
+
+    fn write<T>(
+        &self,
+        operation: impl FnOnce(
+            &mut StoredHeaderIndex<StoreHandle>,
+        ) -> std::result::Result<T, ChainError>,
+    ) -> std::result::Result<T, ChainError> {
+        self.write_after_initial_check(|| {}, operation)
+    }
+
+    fn write_fenced<T>(
+        &self,
+        kind: ProductionSafetyFenceKind,
+        root: Option<BlockHash>,
+        candidate: Option<BlockHash>,
+        operation: impl FnOnce(
+            &mut StoredHeaderIndex<StoreHandle>,
+        ) -> std::result::Result<T, ChainError>,
+    ) -> std::result::Result<T, ChainError> {
+        self.write(|index| {
+            let result = operation(index);
+            if let Err(error) = &result {
+                self.record_resource_fence(index, error, kind, root, candidate)?;
+            }
+            result
+        })
+    }
+
+    fn write_exclusive<T>(
+        &self,
+        operation: impl FnOnce(&mut StoredHeaderIndex<StoreHandle>) -> Result<T>,
+    ) -> Result<T> {
+        let mut index = self
+            .acquire_unfenced_write_after(|| {})
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        operation(&mut index)
+    }
+
+    fn validate_network_consensus(&self, network: Network) -> Result<()> {
+        let maximum_time = current_unix_time()?.saturating_add(MAX_FUTURE_BLOCK_TIME);
+        let index = self
+            .inner
+            .read()
+            .map_err(|_| anyhow::anyhow!("shared header-index lock is poisoned"))?;
+        let consensus = HeaderConsensus::new(ConsensusParams::for_network(network));
+        for record in index.records() {
+            if !record.status.header_context_valid || !record.status.checkpoint_valid {
+                anyhow::bail!(
+                    "stored header {} lacks durable contextual-validation status",
+                    record.hash.to_hex()
+                );
+            }
+            let parent = if record.height == 0 {
+                None
+            } else {
+                Some(index.header(&record.header.prev_block)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "stored header {} is missing parent {}",
+                        record.hash.to_hex(),
+                        record.header.prev_block.to_hex()
+                    )
+                })?)
+            };
+            let mut lookup = |hash: &BlockHash| {
+                index
+                    .header(hash)
+                    .map_err(|error| anyhow::anyhow!("header ancestry lookup failed: {error}"))
+            };
+            let expected_bits = expected_bits_with_lookup(
+                network,
+                record.header.time,
+                parent.as_ref(),
+                &mut lookup,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to derive difficulty for stored header {} at height {}",
+                    record.hash.to_hex(),
+                    record.height
+                )
+            })?;
+            let median_time_past = parent
+                .as_ref()
+                .map(|parent| median_time_past_with_lookup(parent, &mut lookup))
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "failed to derive median time for stored header {} at height {}",
+                        record.hash.to_hex(),
+                        record.height
+                    )
+                })?;
+            let params = network.params();
+            let is_genesis = record.height == 0
+                && record.header == params.genesis_header()
+                && record.hash == params.genesis_hash;
+            consensus
+                .validate_header(
+                    &record.header,
+                    &HeaderValidationContext {
+                        height: record.height,
+                        previous: parent.as_ref().map(|parent| HeaderParent {
+                            hash: parent.hash,
+                            height: parent.height,
+                            bits: parent.header.bits,
+                            chainwork: parent.chainwork,
+                        }),
+                        enforce_checkpoints: true,
+                        expected_bits: Some(expected_bits),
+                        median_time_past,
+                        maximum_time: Some(maximum_time),
+                        require_pow: !is_genesis,
+                    },
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "stored header {} at height {} failed recovery consensus: {error}",
+                        record.hash.to_hex(),
+                        record.height
+                    )
+                })?;
+            let proof = CompactTarget::from_bits(record.header.bits)
+                .proof()
+                .ok_or_else(|| anyhow::anyhow!("stored header has an invalid target"))?;
+            let expected_work = parent
+                .as_ref()
+                .map(|parent| parent.chainwork)
+                .unwrap_or(Uint256::ZERO)
+                .checked_add(proof)
+                .ok_or_else(|| anyhow::anyhow!("stored header chainwork overflow"))?;
+            if record.chainwork != expected_work {
+                anyhow::bail!(
+                    "stored header {} has non-proof-derived chainwork",
+                    record.hash.to_hex()
+                );
+            }
+        }
+
+        let params = network.params();
+        match index.canonical_hash(0)? {
+            Some(hash) if hash == params.genesis_hash => {}
+            Some(hash) => anyhow::bail!(
+                "canonical header root {} is not the configured {} genesis",
+                hash.to_hex(),
+                network
+            ),
+            None if index.best_tip()?.is_none() => {}
+            None => anyhow::bail!("non-empty header index has no canonical genesis root"),
+        }
+        Ok(())
+    }
+
+    pub fn import_header(
+        &self,
+        request: HeaderImport,
+    ) -> std::result::Result<HeaderRecord, ChainError> {
+        let candidate = request.header.hash();
+        self.write_fenced(
+            ProductionSafetyFenceKind::LiveHeaderOperation,
+            None,
+            Some(candidate),
+            |index| index.import_header(request),
+        )
+    }
+
+    pub fn import_headers(
+        &self,
+        requests: Vec<HeaderImport>,
+    ) -> std::result::Result<Vec<HeaderRecord>, ChainError> {
+        let candidate = requests.last().map(|request| request.header.hash());
+        self.write_fenced(
+            ProductionSafetyFenceKind::LiveHeaderOperation,
+            None,
+            candidate,
+            |index| index.import_headers(requests),
+        )
+    }
+
+    pub fn load_record(
+        &self,
+        hash: &BlockHash,
+    ) -> std::result::Result<Option<HeaderRecord>, ChainError> {
+        self.read(|index| index.load_record(hash))
+    }
+
+    pub fn cache_record(&self, record: HeaderRecord) -> std::result::Result<(), ChainError> {
+        let candidate = record.hash;
+        self.write_fenced(
+            ProductionSafetyFenceKind::LiveHeaderOperation,
+            None,
+            Some(candidate),
+            |index| index.cache_record(record),
+        )
+    }
+
+    fn prepare_cache_update(
+        &self,
+        records: &[HeaderRecord],
+    ) -> std::result::Result<HeaderIndexCacheUpdate, ChainError> {
+        self.read_fenced(
+            ProductionSafetyFenceKind::LiveHeaderOperation,
+            None,
+            records.last().map(|record| record.hash),
+            |index| index.prepare_cache_update(records),
+        )
+    }
+
+    pub fn plan_failed_branch(
+        &self,
+        root: BlockHash,
+    ) -> std::result::Result<FailedHeaderPlan, ChainError> {
+        self.read_fenced(
+            ProductionSafetyFenceKind::FailedBranchDescendants,
+            Some(root),
+            None,
+            |index| index.plan_failed_branch(root),
+        )
+    }
+}
+
+impl HeaderIndex for SharedHeaderIndex {
+    fn best_tip(&self) -> std::result::Result<Option<ChainTip>, ChainError> {
+        self.read(HeaderIndex::best_tip)
+    }
+
+    fn header(&self, hash: &BlockHash) -> std::result::Result<Option<HeaderRecord>, ChainError> {
+        self.read(|index| index.header(hash))
+    }
+
+    fn canonical_hash(&self, height: Height) -> std::result::Result<Option<BlockHash>, ChainError> {
+        self.read(|index| index.canonical_hash(height))
+    }
+
+    fn plan_reorg(&self, candidate: &BlockHash) -> std::result::Result<ReorgPlan, ChainError> {
+        self.read(|index| index.plan_reorg(candidate))
+    }
+
+    fn plan_reorg_between(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+    ) -> std::result::Result<ReorgPlan, ChainError> {
+        self.read(|index| index.plan_reorg_between(current, candidate))
+    }
+
+    fn plan_reorg_bounded(
+        &self,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
+    ) -> std::result::Result<ReorgPlan, ChainError> {
+        self.read_fenced(
+            ProductionSafetyFenceKind::LiveHeaderReorganization,
+            None,
+            Some(*candidate),
+            |index| index.plan_reorg_bounded(candidate, limits),
+        )
+    }
+
+    fn plan_reorg_between_bounded(
+        &self,
+        current: &BlockHash,
+        candidate: &BlockHash,
+        limits: ReorgPlanLimits,
+    ) -> std::result::Result<ReorgPlan, ChainError> {
+        self.read_fenced(
+            ProductionSafetyFenceKind::LiveHeaderReorganization,
+            Some(*current),
+            Some(*candidate),
+            |index| index.plan_reorg_between_bounded(current, candidate, limits),
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct NodeState {
     network: Network,
     undo_retention_policy: Option<UndoRetentionPolicy>,
     startup_lifecycle: Option<StartupLifecycle>,
     pub store: StoreHandle,
-    pub chain: StoredHeaderIndex<StoreHandle>,
+    pub chain: SharedHeaderIndex,
     pub blocks: StoredBlockIndex<StoreHandle>,
     pub state_engine: StoredStateEngine<StoreHandle>,
     pub mempool: MemoryMempool,
     name_pages: Option<NamePageStorage>,
     transaction_index: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupIndexValidation {
+    Strict,
+    #[cfg(test)]
+    TestFixtures,
 }
 
 impl NodeState {
@@ -3138,9 +8063,84 @@ impl NodeState {
             None => StoreHandle::memory(),
         };
         validate_existing_store_identity(&store, config.network)?;
-        if let Some(migration) = migrate_name_tree_interval_accumulator(
+        let migration_limits = NameTreeIntervalMigrationLimits::default();
+        let migration_plan = plan_name_tree_interval_accumulator_migration_bounded(
             &store,
             config.network.params().names.tree_interval,
+            migration_limits,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("failed to preflight node state storage migration: {error}")
+        })?;
+        if let Some(plan) = migration_plan.as_ref() {
+            for (context, bytes) in [
+                ("height-index input", plan.height_index_bytes),
+                ("undo input", plan.undo_input_bytes),
+                ("legacy backup output", plan.backup_output_bytes),
+                ("undo rewrite output", plan.rewrite_output_bytes),
+                ("atomic publication", plan.publication_bytes),
+                ("temporary migration storage", plan.required_temporary_bytes),
+            ] {
+                if bytes > MAX_NAME_PAGE_GENERATION_BYTES {
+                    anyhow::bail!(
+                        "{context} requires {bytes} bytes, exceeding the 150,000,000,000-byte production data ceiling; run qualified offline maintenance"
+                    );
+                }
+            }
+            if let Some(data_dir) = &config.data_dir {
+                let chain_directory = data_dir.join("chain");
+                let usage = filesystem_tree_usage_bounded(
+                    data_dir,
+                    FilesystemTreeUsageLimits {
+                        max_apparent_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
+                        max_allocated_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
+                        deadline: migration_limits.deadline,
+                        ..FilesystemTreeUsageLimits::default()
+                    },
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to measure bounded migration data-root usage {}: {error}",
+                        data_dir.display()
+                    )
+                })?;
+                let current_bytes = usage.apparent_bytes.max(usage.allocated_bytes);
+                preflight_migration_data_ceiling(
+                    current_bytes,
+                    plan.required_temporary_bytes,
+                )
+                .with_context(|| {
+                    format!(
+                        "schema migration current data root ({current_bytes} bytes) plus temporary output ({} bytes) exceeds the exact production ceiling; run qualified offline maintenance",
+                        plan.required_temporary_bytes
+                    )
+                })?;
+                let available = filesystem_available_bytes(&chain_directory).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to inspect migration filesystem {}: {error}",
+                        chain_directory.display()
+                    )
+                })?;
+                let required = plan
+                    .required_temporary_bytes
+                    .checked_add(MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("migration temporary storage requirement overflow")
+                    })?;
+                if available < required {
+                    anyhow::bail!(
+                        "schema migration requires {} temporary bytes plus {} reserve, but {} bytes are available; run qualified offline maintenance",
+                        plan.required_temporary_bytes,
+                        MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
+                        available
+                    );
+                }
+            }
+        }
+        if let Some(migration) = migrate_name_tree_interval_accumulator_bounded(
+            &store,
+            config.network.params().names.tree_interval,
+            migration_limits,
         )
         .map_err(|error| anyhow::anyhow!("failed to migrate node state storage: {error}"))?
         {
@@ -3150,6 +8150,16 @@ impl NodeState {
                 legacy_undos_backed_up = migration.legacy_undos_backed_up,
                 pending_names = migration.pending_names,
                 tip_height = migration.tip_height,
+                height_index_bytes = migration.height_index_bytes,
+                undo_input_bytes = migration.undo_input_bytes,
+                backup_output_bytes = migration.backup_output_bytes,
+                rewrite_output_bytes = migration.rewrite_output_bytes,
+                publication_bytes = migration.publication_bytes,
+                required_temporary_bytes = migration.required_temporary_bytes,
+                peak_pending_names = migration.peak_pending_names,
+                peak_pending_name_bytes = migration.peak_pending_name_bytes,
+                peak_batch_bytes = migration.peak_batch_bytes,
+                batch_commits = migration.batch_commits,
                 "migrated name-tree state to consensus-interval accumulation"
             );
         }
@@ -3204,6 +8214,22 @@ impl NodeState {
         Self::from_store_for_network_with_undo_policy(store, network, None)
     }
 
+    #[cfg(test)]
+    fn from_store_for_network_strict_for_test(
+        store: StoreHandle,
+        network: Network,
+    ) -> Result<Self> {
+        Self::from_store_for_network_with_startup_audit_and_validation(
+            store,
+            network,
+            None,
+            None,
+            None,
+            StartupIndexValidation::Strict,
+        )
+        .map(|(state, _)| state)
+    }
+
     fn from_store_for_network_with_undo_policy(
         store: StoreHandle,
         network: Network,
@@ -3226,9 +8252,40 @@ impl NodeState {
         checkpoint: Option<&StartupAuditCheckpoint>,
         name_pages: Option<NamePageStorage>,
     ) -> Result<(Self, StartupAuditKind)> {
+        #[cfg(test)]
+        let validation = StartupIndexValidation::TestFixtures;
+        #[cfg(not(test))]
+        let validation = StartupIndexValidation::Strict;
+        Self::from_store_for_network_with_startup_audit_and_validation(
+            store,
+            network,
+            undo_retention_policy,
+            checkpoint,
+            name_pages,
+            validation,
+        )
+    }
+
+    fn from_store_for_network_with_startup_audit_and_validation(
+        store: StoreHandle,
+        network: Network,
+        undo_retention_policy: Option<UndoRetentionPolicy>,
+        checkpoint: Option<&StartupAuditCheckpoint>,
+        name_pages: Option<NamePageStorage>,
+        validation: StartupIndexValidation,
+    ) -> Result<(Self, StartupAuditKind)> {
         bind_store_identity(&store, network)?;
-        let chain = StoredHeaderIndex::new(store.clone())
-            .map_err(|error| anyhow::anyhow!("failed to initialize header index: {error}"))?;
+        let chain = match validation {
+            StartupIndexValidation::Strict => SharedHeaderIndex::new(store.clone()),
+            #[cfg(test)]
+            StartupIndexValidation::TestFixtures => {
+                SharedHeaderIndex::new_for_test_fixtures(store.clone())
+            }
+        }
+        .map_err(|error| anyhow::anyhow!("failed to initialize header index: {error}"))?;
+        if validation == StartupIndexValidation::Strict {
+            chain.validate_network_consensus(network)?;
+        }
         let blocks = StoredBlockIndex::new(store.clone())
             .map_err(|error| anyhow::anyhow!("failed to initialize block index: {error}"))?;
         let state_engine =
@@ -3247,27 +8304,49 @@ impl NodeState {
             name_pages,
             transaction_index: true,
         };
-        let audit = state.validate_durable_chain_invariants(checkpoint)?;
+        let audit = state.validate_durable_chain_invariants(
+            checkpoint,
+            validation == StartupIndexValidation::Strict,
+        )?;
         Ok((state, audit))
     }
 
     fn validate_durable_chain_invariants(
         &self,
         checkpoint: Option<&StartupAuditCheckpoint>,
+        validate_all_indexes: bool,
     ) -> Result<StartupAuditKind> {
         let raw_snapshot = self.store.snapshot()?;
-        let page_reader = self
-            .name_pages
-            .as_ref()
-            .map(|pages| pages.reader(&raw_snapshot))
-            .transpose()?;
+        let (page_reader, mut legacy_page_fallback) = match self.name_pages.as_ref() {
+            Some(pages) => {
+                let required_roots = [
+                    load_stored_name_tree_root(&raw_snapshot).map_err(|error| {
+                        anyhow::anyhow!("failed to select startup working name root: {error}")
+                    })?,
+                    load_stored_name_tree_commit_root(&raw_snapshot).map_err(|error| {
+                        anyhow::anyhow!("failed to select startup committed name root: {error}")
+                    })?,
+                ];
+                let (reader, legacy_fallback) =
+                    pages.reader_for_roots(&raw_snapshot, required_roots, true)?;
+                (Some(reader), legacy_fallback)
+            }
+            None => (None, false),
+        };
+        if let Some(reader) = page_reader.as_ref() {
+            legacy_page_fallback |=
+                seed_startup_pin_page_roots(&raw_snapshot, self.network, reader)?;
+        }
         let snapshot = match page_reader.as_ref() {
-            Some(reader) => NodeReadSnapshot::Pages(NamePageSnapshot::with_legacy_fallback(
-                &raw_snapshot,
-                reader,
-            )),
+            Some(reader) if legacy_page_fallback => NodeReadSnapshot::Pages(
+                NamePageSnapshot::with_legacy_fallback(&raw_snapshot, reader),
+            ),
+            Some(reader) => NodeReadSnapshot::Pages(NamePageSnapshot::new(&raw_snapshot, reader)),
             None => NodeReadSnapshot::Base(&raw_snapshot),
         };
+        if validate_all_indexes {
+            validate_durable_block_index_bindings(&snapshot)?;
+        }
         let checkpoint_matches = checkpoint
             .map(|checkpoint| {
                 StartupAuditCheckpoint::capture(&snapshot, self.network)
@@ -3290,11 +8369,13 @@ impl NodeState {
                 );
             }
         }
+        let name_tree_materialization_limits =
+            (!checkpoint_matches).then(NameTreeMaterializationLimits::default);
         let durable_name_tree_root = if checkpoint_matches {
             load_stored_name_tree_root(&snapshot)
                 .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?
         } else {
-            verify_stored_name_tree_root_binding(&snapshot)
+            verify_stored_name_tree_root_metadata_binding(&snapshot)
                 .map_err(|error| anyhow::anyhow!("durable name-tree invariant failed: {error}"))?
         };
         let durable_name_tree_commit_root =
@@ -3321,91 +8402,176 @@ impl NodeState {
             })
             .unwrap_or(0);
         let mut heights = if let (true, Some(tip)) = (checkpoint_matches, active_tip.as_ref()) {
-            let capacity = usize::try_from(tip.height - audit_start_height)
-                .ok()
-                .and_then(|length| length.checked_add(1))
-                .ok_or_else(|| anyhow::anyhow!("startup audit suffix length overflow"))?;
-            let mut entries = Vec::with_capacity(capacity);
-            for height in audit_start_height..=tip.height {
-                let hash = read_canonical_hash(&snapshot, height)?.ok_or_else(|| {
-                    anyhow::anyhow!("clean startup audit is missing canonical height {height}")
-                })?;
-                entries.push((height.to_be_bytes().to_vec(), hash.as_bytes().to_vec()));
-            }
-            entries
+            StartupHeightCursor::point_range(&snapshot, audit_start_height, tip.height)
         } else {
-            snapshot
-                .scan_prefix(ColumnFamily::HeightIndex, b"")
-                .context("failed to scan active height index")?
+            StartupHeightCursor::paged(&snapshot)?
         };
-        heights.sort_by(|left, right| left.0.cmp(&right.0));
         if tree_interval == 0 {
             anyhow::bail!("network name-tree snapshot interval is zero");
         }
         if !checkpoint_matches {
-            if let Some(tip) = active_tip.as_ref() {
-                verify_name_tree_interval_state(&snapshot, tree_interval, tip.height).map_err(
-                    |error| {
-                        anyhow::anyhow!(
-                            "durable name-tree interval accumulator invariant failed: {error}"
-                        )
-                    },
-                )?;
-            }
+            verify_name_tree_interval_state_bounded(
+                &snapshot,
+                tree_interval,
+                active_tip.as_ref().map_or(0, |tip| tip.height),
+                name_tree_materialization_limits
+                    .expect("checkpoint miss has materialization limits"),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("durable name-tree interval accumulator invariant failed: {error}")
+            })?;
         }
-        let pins = load_name_tree_snapshot_pins(&snapshot)
-            .map_err(|error| anyhow::anyhow!("durable name-tree snapshot pin failed: {error}"))?;
-        let pin_count = pins.len();
-        let mut name_tree_pins = pins
-            .into_iter()
-            .map(|pin| (pin.height, pin))
-            .collect::<BTreeMap<_, NameTreeSnapshotPin>>();
-        if name_tree_pins.len() != pin_count {
-            anyhow::bail!("durable name-tree snapshot pins contain duplicate heights");
-        }
-        let retained_name_tree_roots = [durable_name_tree_root, durable_name_tree_commit_root]
-            .into_iter()
-            .chain(name_tree_pins.values().map(|pin| pin.root))
-            .collect::<HashSet<_>>();
         if checkpoint_matches {
-            for root in retained_name_tree_roots {
+            for root in [durable_name_tree_root, durable_name_tree_commit_root] {
                 validate_persisted_name_tree_root(&snapshot, root).map_err(|error| {
                     anyhow::anyhow!(
                         "durable content-addressed name-tree root invariant failed: {error}"
                     )
                 })?;
             }
-        } else {
-            let validation = if let Some(reader) = page_reader.as_ref() {
-                let pages = reader.validate_committed_pages().map_err(|error| {
+            let mut pins = StartupPinCursor::new(&raw_snapshot, self.network)?;
+            while let Some(pin) = pins.next_pin()? {
+                if let Some(pages) = self.name_pages.as_ref() {
+                    if pin.root == TreeRoot::ZERO {
+                        continue;
+                    }
+                    if let Some(record) = load_name_page_root_record(&raw_snapshot, pin.root)? {
+                        if record.root != pin.root {
+                            anyhow::bail!("name-page root locator key does not match its record");
+                        }
+                        let reader = NamePageTreeReader::open_generation(
+                            &pages.directory,
+                            pages.state.manifest.generation,
+                            pages.state.manifest.active_segment,
+                            pin.root,
+                            record.locator,
+                        )
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "failed to open targeted startup pin root {:?}: {error}",
+                                pin.root
+                            )
+                        })?;
+                        let pin_snapshot = NamePageSnapshot::new(&raw_snapshot, &reader);
+                        validate_persisted_name_tree_root(&pin_snapshot, pin.root).map_err(
+                            |error| {
+                                anyhow::anyhow!(
+                                    "targeted name-page pin root {:?} failed validation: {error}",
+                                    pin.root
+                                )
+                            },
+                        )?;
+                    } else {
+                        validate_persisted_name_tree_root(&raw_snapshot, pin.root).map_err(
+                            |error| {
+                                anyhow::anyhow!(
+                                    "targeted legacy pin root {:?} failed validation: {error}",
+                                    pin.root
+                                )
+                            },
+                        )?;
+                    }
+                } else {
+                    validate_persisted_name_tree_root(&raw_snapshot, pin.root).map_err(
+                        |error| {
+                            anyhow::anyhow!(
+                                "targeted durable pin root {:?} failed validation: {error}",
+                                pin.root
+                            )
+                        },
+                    )?;
+                }
+            }
+        } else if let Some(reader) = page_reader.as_ref() {
+            let validation_limits =
+                production_name_page_validation_limits(&raw_snapshot, self.network)?;
+            let pages = reader
+                .validate_committed_pages_with_limits(validation_limits)
+                .map_err(|error| {
                     anyhow::anyhow!("authenticated name-page audit failed: {error}")
                 })?;
-                tracing::info!(
-                    segments = pages.segments,
-                    pages = pages.pages,
-                    records = pages.records,
-                    bytes = pages.bytes,
-                    "validated authenticated name pages in physical order"
-                );
+            tracing::info!(
+                segments = pages.segments,
+                pages = pages.pages,
+                records = pages.records,
+                bytes = pages.bytes,
+                "validated authenticated name pages in physical order"
+            );
+            let mut roots = Vec::with_capacity(PAGE_BACKED_STARTUP_VALIDATION_BATCH);
+            roots.extend([durable_name_tree_root, durable_name_tree_commit_root]);
+            let mut pins = StartupPinCursor::new(&raw_snapshot, self.network)?;
+            while let Some(pin) = pins.next_pin()? {
+                roots.push(pin.root);
+                if roots.len() == PAGE_BACKED_STARTUP_VALIDATION_BATCH {
+                    validate_persisted_name_tree_overlays(
+                        &raw_snapshot,
+                        roots.drain(..),
+                        &pages,
+                        PAGE_BACKED_STARTUP_VALIDATION_BATCH,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "durable content-addressed name-tree invariant failed: {error}"
+                        )
+                    })?;
+                }
+            }
+            if !roots.is_empty() {
                 validate_persisted_name_tree_overlays(
                     &raw_snapshot,
-                    retained_name_tree_roots,
+                    roots.drain(..),
                     &pages,
                     PAGE_BACKED_STARTUP_VALIDATION_BATCH,
                 )
-            } else {
-                validate_persisted_name_trees(&snapshot, retained_name_tree_roots)
-            };
-            validation.map_err(|error| {
-                anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
-            })?;
+                .map_err(|error| {
+                    anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
+                })?;
+            }
+        } else {
+            let mut roots = Vec::with_capacity(PAGE_BACKED_STARTUP_VALIDATION_BATCH);
+            roots.extend([durable_name_tree_root, durable_name_tree_commit_root]);
+            let mut pins = StartupPinCursor::new(&raw_snapshot, self.network)?;
+            while let Some(pin) = pins.next_pin()? {
+                roots.push(pin.root);
+                if roots.len() == PAGE_BACKED_STARTUP_VALIDATION_BATCH {
+                    validate_persisted_name_trees(&snapshot, roots.drain(..)).map_err(|error| {
+                        anyhow::anyhow!(
+                            "durable content-addressed name-tree invariant failed: {error}"
+                        )
+                    })?;
+                }
+            }
+            if !roots.is_empty() {
+                validate_persisted_name_trees(&snapshot, roots.drain(..)).map_err(|error| {
+                    anyhow::anyhow!("durable content-addressed name-tree invariant failed: {error}")
+                })?;
+            }
+        }
+
+        let mut name_tree_pins = StartupPinCursor::new(&raw_snapshot, self.network)?;
+        let mut next_name_tree_pin = name_tree_pins.next_pin()?;
+        while next_name_tree_pin
+            .as_ref()
+            .is_some_and(|pin| pin.height < audit_start_height)
+        {
+            if !checkpoint_matches {
+                anyhow::bail!("durable name-tree snapshot pin precedes exhaustive audit");
+            }
+            let pin = next_name_tree_pin.as_ref().expect("pin exists");
+            if !pin.height.is_multiple_of(tree_interval) {
+                anyhow::bail!(
+                    "durable name-tree snapshot pin at height {} is not an interval boundary",
+                    pin.height
+                );
+            }
+            next_name_tree_pin = name_tree_pins.next_pin()?;
         }
 
         match active_tip.as_ref() {
-            None if !heights.is_empty() => {
-                anyhow::bail!("active height index exists without a best-block binding")
-            }
             None => {
+                if heights.next_entry()?.is_some() {
+                    anyhow::bail!("active height index exists without a best-block binding");
+                }
                 if undo_pruning_checkpoint.is_some() {
                     anyhow::bail!("empty active chain has an undo-pruning checkpoint");
                 }
@@ -3421,7 +8587,7 @@ impl NodeState {
                         durable_name_tree_commit_root
                     );
                 }
-                if !name_tree_pins.is_empty() {
+                if next_name_tree_pin.is_some() {
                     anyhow::bail!("empty active chain has durable name-tree snapshot pins");
                 }
             }
@@ -3505,14 +8671,6 @@ impl NodeState {
                     .ok()
                     .and_then(|height| height.checked_add(1))
                     .ok_or_else(|| anyhow::anyhow!("active height index length overflow"))?;
-                if heights.len() != expected_len {
-                    anyhow::bail!(
-                        "active height audit has {} entries from height {} through tip height {}",
-                        heights.len(),
-                        audit_start_height,
-                        tip.height
-                    );
-                }
 
                 let (mut previous_hash, mut previous_work) = if audit_start_height == 0 {
                     (BlockHash::ZERO, Uint256::ZERO)
@@ -3562,8 +8720,13 @@ impl NodeState {
                 let mut previous_retained_committed_tree_root = None;
                 let mut tip_resulting_tree_root = None;
                 let mut tip_resulting_committed_tree_root = None;
-                for (position, (height_key, hash_bytes)) in heights.iter().enumerate() {
-                    let height = decode_height_key(height_key)?;
+                for position in 0..expected_len {
+                    let (height_key, hash_bytes) = heights.next_entry()?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "active height audit ended before position {position} from height {audit_start_height}"
+                        )
+                    })?;
+                    let height = decode_height_key(&height_key)?;
                     let expected_height = u32::try_from(position)
                         .ok()
                         .and_then(|position| audit_start_height.checked_add(position));
@@ -3572,7 +8735,7 @@ impl NodeState {
                             "active height audit is not contiguous at position {position}"
                         );
                     }
-                    let hash = block_hash_from_bytes(hash_bytes)?;
+                    let hash = block_hash_from_bytes(&hash_bytes)?;
                     let record = load_block_index_record(&snapshot, &hash)?.ok_or_else(|| {
                         anyhow::anyhow!("active block index {} is missing", hash.to_hex())
                     })?;
@@ -3805,49 +8968,52 @@ impl NodeState {
                         Some(undo)
                     };
                     if height.is_multiple_of(tree_interval) {
+                        if next_name_tree_pin
+                            .as_ref()
+                            .is_some_and(|pin| pin.height < height)
+                        {
+                            anyhow::bail!(
+                                "durable name-tree snapshot pin precedes active interval height {height}"
+                            );
+                        }
                         if undo_should_be_pruned {
-                            if name_tree_pins.remove(&height).is_some() {
+                            if next_name_tree_pin
+                                .as_ref()
+                                .is_some_and(|pin| pin.height == height)
+                            {
                                 anyhow::bail!(
                                     "pruned interval height {height} still has a name-tree snapshot pin"
                                 );
                             }
                         } else {
-                            let pin = name_tree_pins.remove(&height).ok_or_else(|| {
+                            let pin = next_name_tree_pin.take().filter(|pin| pin.height == height)
+                                .ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "active interval height {height} is missing its name-tree snapshot pin"
                                 )
                             })?;
-                            let expected_pin_root = match undo.as_ref() {
-                                Some(undo) => *undo.resulting_committed_tree_root.as_bytes(),
-                                None if position + 1 < heights.len() => {
-                                    let next_hash =
-                                        block_hash_from_bytes(&heights[position + 1].1)?;
-                                    let next =
-                                        load_header_record(&snapshot, &next_hash)?.ok_or_else(
-                                            || {
-                                                anyhow::anyhow!(
-                                                    "active header after snapshot height {height} is missing"
-                                                )
-                                            },
-                                        )?;
-                                    if next.height != height.saturating_add(1) {
-                                        anyhow::bail!(
-                                            "active header after snapshot height {height} is non-contiguous"
-                                        );
-                                    }
-                                    next.header.tree_root
-                                }
-                                None => *durable_name_tree_commit_root.as_bytes(),
-                            };
+                            let expected_pin_root = undo
+                                .as_ref()
+                                .map(|undo| *undo.resulting_committed_tree_root.as_bytes())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("retained interval height {height} has no undo")
+                                })?;
                             if pin.block_hash != hash || pin.root.as_bytes() != &expected_pin_root {
                                 anyhow::bail!(
                                     "active interval height {height} has an inconsistent name-tree snapshot pin"
                                 );
                             }
+                            next_name_tree_pin = name_tree_pins.next_pin()?;
                         }
                     }
                     previous_hash = hash;
                     previous_work = record.chainwork;
+                }
+                if heights.next_entry()?.is_some() {
+                    anyhow::bail!(
+                        "active height index contains an entry beyond tip height {}",
+                        tip.height
+                    );
                 }
 
                 if previous_hash != tip.hash || previous_work != tip.chainwork {
@@ -3871,7 +9037,7 @@ impl NodeState {
                 }
             }
         }
-        if !checkpoint_matches && !name_tree_pins.is_empty() {
+        if next_name_tree_pin.is_some() {
             anyhow::bail!("durable name-tree snapshot pins are not on active interval heights");
         }
 
@@ -3896,6 +9062,7 @@ impl NodeState {
     }
 
     fn configure_transaction_index(&mut self, enabled: bool) -> Result<()> {
+        self.ensure_storage_operational()?;
         let snapshot = self.store.snapshot()?;
         let persisted = snapshot
             .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
@@ -3906,8 +9073,17 @@ impl NodeState {
             && enabled
             && (best_block_tip_from_snapshot(&snapshot)?.is_some()
                 || !snapshot
-                    .scan_prefix(ColumnFamily::TxIndex, b"")
+                    .scan_prefix_page(
+                        ColumnFamily::TxIndex,
+                        b"",
+                        None,
+                        PrefixScanBudget {
+                            max_entries: 1,
+                            max_bytes: 4 * 1024,
+                        },
+                    )
                     .context("failed to inspect disabled transaction index")?
+                    .entries
                     .is_empty())
         {
             anyhow::bail!(
@@ -3932,12 +9108,46 @@ impl NodeState {
         self.network
     }
 
+    fn storage_reopen_required(&self) -> bool {
+        self.store.reopen_required()
+            || self
+                .name_pages
+                .as_ref()
+                .is_some_and(|pages| pages.reopen_required)
+    }
+
+    fn production_safety_fence_reason(&self) -> Option<String> {
+        self.chain.safety_fence_reason()
+    }
+
+    fn production_safety_fence_kind(&self) -> Option<ProductionSafetyFenceKind> {
+        self.chain.safety_fence_kind()
+    }
+
+    fn ensure_storage_operational(&self) -> Result<()> {
+        if self.storage_reopen_required() {
+            anyhow::bail!(
+                "node storage is fenced after an ambiguous commit; restart and reopen before authority or mutation"
+            );
+        }
+        if let Some(reason) = self.production_safety_fence_reason() {
+            anyhow::bail!("node is fail-closed behind a durable production safety fence: {reason}");
+        }
+        Ok(())
+    }
+
     fn best_block_tip(&self) -> Result<Option<ChainTip>> {
         let snapshot = self.store.snapshot()?;
         best_block_tip_from_snapshot(&snapshot)
     }
 
     fn durable_mining_state(&self) -> Result<DurableMiningState> {
+        if self.storage_reopen_required() {
+            anyhow::bail!(
+                "node storage is fenced after an ambiguous commit; restart and reopen before authority"
+            );
+        }
+        let production_safety_fenced = self.production_safety_fence_reason().is_some();
         let snapshot = self.store.snapshot()?;
         let generation = mining_generation_from_snapshot(&snapshot)?;
         let best_header = best_header_tip_from_snapshot(&snapshot)?;
@@ -3971,8 +9181,8 @@ impl NodeState {
         Ok(DurableMiningState {
             generation,
             snapshot: mining_snapshot,
-            authoritative,
-            synchronized,
+            authoritative: authoritative && !production_safety_fenced,
+            synchronized: synchronized && !production_safety_fenced,
         })
     }
 
@@ -4139,6 +9349,7 @@ impl NodeState {
         &mut self,
         candidates: Vec<(NodeBlockImport, ValidatedImport)>,
     ) -> Result<Vec<StoredBlockMutation>> {
+        self.ensure_storage_operational()?;
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -4200,7 +9411,13 @@ impl NodeState {
                 anyhow::anyhow!("failed to stage alternate block body: {error}")
             })?;
             stage_best_header_if_more_work(&staged, &mut batch, block_hash, validated.chainwork)?;
-            committed_records.push(record.clone());
+            committed_records.push(IndexStatusUpdate {
+                previous_block: None,
+                current: StagedIndexRecord {
+                    block: record.clone(),
+                    header: header_record,
+                },
+            });
             mutations.push(StoredBlockMutation {
                 record,
                 already_known: false,
@@ -4208,11 +9425,18 @@ impl NodeState {
         }
 
         let batch = batch.into_inner();
+        let publication = if committed_records.is_empty() {
+            None
+        } else {
+            Some(self.prepare_index_publication(&committed_records)?)
+        };
         drop(staged);
         drop(base);
-        if !committed_records.is_empty() {
-            self.store.commit(batch)?;
-            self.cache_committed_block_records(&committed_records)?;
+        if let Some(publication) = publication {
+            self.commit_index_publication(publication, move |state| {
+                state.store.commit(batch)?;
+                Ok(())
+            })?;
         }
         Ok(mutations)
     }
@@ -4222,6 +9446,7 @@ impl NodeState {
         request: NodeBlockImport,
         stage: FailedBlockStage,
     ) -> Result<FailedBlockMutation> {
+        self.ensure_storage_operational()?;
         let block_hash = request.block.hash();
         let snapshot = self.store.snapshot()?;
         let header = load_header_record(&snapshot, &block_hash)?.ok_or_else(|| {
@@ -4265,92 +9490,145 @@ impl NodeState {
             }
         }
 
-        let mut failure_plan = self
-            .chain
-            .plan_failed_branch(block_hash)
-            .map_err(|error| anyhow::anyhow!("failed to plan invalid branch: {error}"))?;
-        let target_header = failure_plan
-            .affected
-            .iter_mut()
-            .find(|record| record.hash == block_hash)
-            .ok_or_else(|| anyhow::anyhow!("invalid branch plan omitted its root"))?;
-        target_header.status.body_present = true;
-        match stage {
-            FailedBlockStage::BodySyntax => {
-                target_header.status.body_syntax_valid = false;
+        let chain = self.chain.clone();
+        chain.write_exclusive(|header_index| {
+            let mut failure_plan = header_index
+                .plan_failed_branch(block_hash)
+                .map_err(|error| anyhow::anyhow!("failed to plan invalid branch: {error}"))?;
+            let target_header = failure_plan
+                .affected
+                .iter_mut()
+                .find(|record| record.hash == block_hash)
+                .ok_or_else(|| anyhow::anyhow!("invalid branch plan omitted its root"))?;
+            target_header.status.body_present = true;
+            match stage {
+                FailedBlockStage::BodySyntax => {
+                    target_header.status.body_syntax_valid = false;
+                }
+                FailedBlockStage::ContextualState => {
+                    if !target_header.status.body_syntax_valid
+                        || !target_header.status.absolute_finality_valid
+                    {
+                        anyhow::bail!(
+                            "contextual failure root {} lacks prior body/finality validation",
+                            block_hash.to_hex()
+                        );
+                    }
+                }
             }
-            FailedBlockStage::ContextualState => {
-                if !target_header.status.body_syntax_valid
-                    || !target_header.status.absolute_finality_valid
+
+            let target_previous = existing.clone();
+            let mut target = existing.unwrap_or(
+                BlockIndexRecord::from_block(&request.block, request.height, header.chainwork)
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to build invalid block index: {error}")
+                    })?,
+            );
+            target.status = target_header.status.clone();
+            target.status.utxo_connected = false;
+            target.status.name_state_connected = false;
+            target.status.tree_root_valid = false;
+            target.status.undo_present = false;
+            target.status.active_chain = false;
+            target.status.failed = true;
+            target.validated_at = Some(current_unix_time()?);
+
+            let mut batch = self.store.batch();
+            let mut block_replacements = Vec::new();
+            for failed_header in &failure_plan.affected {
+                write_record_to_batch(&mut batch, failed_header)
+                    .map_err(|error| anyhow::anyhow!("failed to stage invalid header: {error}"))?;
+                if failed_header.hash == block_hash {
+                    continue;
+                }
+                if let Some(mut descendant) =
+                    load_block_index_record(&snapshot, &failed_header.hash)?
                 {
-                    anyhow::bail!(
-                        "contextual failure root {} lacks prior body/finality validation",
-                        block_hash.to_hex()
-                    );
+                    let previous = descendant.clone();
+                    if descendant.status.active_chain {
+                        anyhow::bail!(
+                            "cannot invalidate active descendant {}",
+                            descendant.hash.to_hex()
+                        );
+                    }
+                    descendant.status.failed = true;
+                    write_block_index_to_batch(&mut batch, &descendant).map_err(|error| {
+                        anyhow::anyhow!("failed to stage invalid descendant block: {error}")
+                    })?;
+                    block_replacements.push((Some(previous), descendant));
                 }
             }
-        }
-
-        let mut target = existing.unwrap_or(
-            BlockIndexRecord::from_block(&request.block, request.height, header.chainwork)
-                .map_err(|error| anyhow::anyhow!("failed to build invalid block index: {error}"))?,
-        );
-        target.status = target_header.status.clone();
-        target.status.utxo_connected = false;
-        target.status.name_state_connected = false;
-        target.status.tree_root_valid = false;
-        target.status.undo_present = false;
-        target.status.active_chain = false;
-        target.status.failed = true;
-        target.validated_at = Some(current_unix_time()?);
-
-        let mut batch = self.store.batch();
-        for failed_header in &failure_plan.affected {
-            write_record_to_batch(&mut batch, failed_header)
-                .map_err(|error| anyhow::anyhow!("failed to stage invalid header: {error}"))?;
-            if failed_header.hash == block_hash {
-                continue;
-            }
-            if let Some(mut descendant) = load_block_index_record(&snapshot, &failed_header.hash)? {
-                if descendant.status.active_chain {
-                    anyhow::bail!(
-                        "cannot invalidate active descendant {}",
-                        descendant.hash.to_hex()
-                    );
-                }
-                descendant.status.failed = true;
-                write_block_index_to_batch(&mut batch, &descendant).map_err(|error| {
-                    anyhow::anyhow!("failed to stage invalid descendant block: {error}")
+            write_block_index_to_batch(&mut batch, &target)
+                .map_err(|error| anyhow::anyhow!("failed to stage invalid block index: {error}"))?;
+            block_replacements.push((target_previous, target.clone()));
+            let raw_record = RawBlockRecord::from_block(&request.block, request.source);
+            write_raw_block_to_batch(&mut batch, &raw_record)
+                .map_err(|error| anyhow::anyhow!("failed to stage invalid block body: {error}"))?;
+            batch.put(
+                ColumnFamily::Meta,
+                MetaKey::BestHeaderHash.as_bytes(),
+                failure_plan.best.hash.as_bytes(),
+            )?;
+            let failed_header_bytes =
+                failure_plan
+                    .affected
+                    .iter()
+                    .try_fold(0usize, |total, record| {
+                        total
+                            .checked_add(record.hash.as_bytes().len())
+                            .and_then(|total| total.checked_add(record.encode().len()))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("invalid-branch header batch size overflow")
+                            })
+                    })?;
+            let failed_block_bytes =
+                block_replacements
+                    .iter()
+                    .try_fold(0usize, |total, (_, record)| {
+                        total
+                            .checked_add(record.hash.as_bytes().len())
+                            .and_then(|total| total.checked_add(record.encode().len()))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("invalid-branch block batch size overflow")
+                            })
+                    })?;
+            failed_header_bytes
+                .checked_add(failed_block_bytes)
+                .and_then(|total| total.checked_add(raw_record.hash.as_bytes().len()))
+                .and_then(|total| total.checked_add(raw_record.encode().len()))
+                .and_then(|total| total.checked_add(MetaKey::BestHeaderHash.as_bytes().len()))
+                .and_then(|total| total.checked_add(failure_plan.best.hash.as_bytes().len()))
+                .ok_or_else(|| anyhow::anyhow!("invalid-branch atomic batch size overflow"))?;
+            header_index
+                .validate_failed_plan(&failure_plan)
+                .map_err(|error| anyhow::anyhow!("invalid branch cache plan is stale: {error}"))?;
+            let block_cache_update = self
+                .blocks
+                .prepare_cache_update(&block_replacements)
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to stage invalid block cache update: {error}")
                 })?;
-            }
-        }
-        write_block_index_to_batch(&mut batch, &target)
-            .map_err(|error| anyhow::anyhow!("failed to stage invalid block index: {error}"))?;
-        write_raw_block_to_batch(
-            &mut batch,
-            &RawBlockRecord::from_block(&request.block, request.source),
-        )
-        .map_err(|error| anyhow::anyhow!("failed to stage invalid block body: {error}"))?;
-        batch.put(
-            ColumnFamily::Meta,
-            MetaKey::BestHeaderHash.as_bytes(),
-            failure_plan.best.hash.as_bytes(),
-        )?;
-        drop(snapshot);
-        let affected = failure_plan
-            .affected
-            .iter()
-            .map(|record| record.hash)
-            .collect();
-        self.store.commit(batch)?;
-        self.refresh_indexes()?;
-        Ok(FailedBlockMutation {
-            record: target,
-            affected,
+            let affected = failure_plan
+                .affected
+                .iter()
+                .map(|record| record.hash)
+                .collect();
+            drop(snapshot);
+            self.store.commit(batch)?;
+            header_index.apply_validated_failed_plan(&failure_plan);
+            self.blocks.publish_cache_update(block_cache_update);
+            Ok(FailedBlockMutation {
+                record: target,
+                affected,
+            })
         })
     }
 
-    fn best_chain_activation_plan(&self, candidate: BlockHash) -> Result<Option<NodeReorg>> {
+    fn best_chain_activation_plan(
+        &self,
+        candidate: BlockHash,
+        limits: NodeReorgLimits,
+    ) -> Result<Option<NodeReorg>> {
         let base = self.store.snapshot()?;
         // Planning revisits candidate, fork, and connect-path records while it
         // proves eligibility, validates path shape, and materializes imports.
@@ -4360,6 +9638,7 @@ impl NodeState {
         let snapshot = reads.snapshot(&base);
         let candidate_record = load_block_index_record(&snapshot, &candidate)?
             .ok_or_else(|| anyhow::anyhow!("candidate block index is missing"))?;
+        validate_block_header_binding(&snapshot, &candidate_record)?;
         if candidate_record.status.failed || candidate_record.status.active_chain {
             return Ok(None);
         }
@@ -4382,14 +9661,48 @@ impl NodeState {
         let plan = match active.as_ref() {
             Some(tip) => self
                 .chain
-                .plan_reorg_between(&tip.hash, &candidate)
-                .map_err(|error| anyhow::anyhow!("failed to plan best-chain reorg: {error}"))?,
+                .plan_reorg_between_bounded(
+                    &tip.hash,
+                    &candidate,
+                    NodeReorgLimits::PRODUCTION.header_limits(),
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to plan bounded best-chain reorg: {error}")
+                })?,
             None => ReorgPlan {
                 disconnect: Vec::new(),
-                connect: stored_path_from_genesis(&snapshot, candidate)?,
+                connect: stored_path_from_genesis_bounded(
+                    &snapshot,
+                    candidate,
+                    limits.maximum_connect,
+                )?,
             },
         };
+
+        // Header synchronization and canonical body download are intentionally
+        // allowed to advance out of order. A higher-work candidate can
+        // therefore be complete while an earlier connect-path body is still
+        // header-only. Defer activation until every connect record exists;
+        // retain fail-closed behavior when a body exists without its index.
+        for hash in &plan.connect {
+            if load_block_index_record(&snapshot, hash)?.is_none() {
+                if load_raw_block_record(&snapshot, hash)?.is_some() {
+                    anyhow::bail!(
+                        "stored block body {} is missing its block index",
+                        hash.to_hex()
+                    );
+                }
+                return Ok(None);
+            }
+        }
+
         validate_reorg_plan(&snapshot, active.as_ref(), candidate, &plan)?;
+        if plan.connect.len() > limits.maximum_connect {
+            anyhow::bail!(
+                "active-state reorganization needs more than {} replacement blocks before exceeding the active tip",
+                limits.maximum_connect
+            );
+        }
 
         let disconnect = plan
             .disconnect
@@ -4404,11 +9717,16 @@ impl NodeState {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let connect = plan
-            .connect
-            .iter()
-            .map(|hash| node_import_from_stored(&snapshot, hash))
-            .collect::<Result<Vec<_>>>()?;
+        let mut body_bytes = 0u64;
+        let mut connect = Vec::with_capacity(plan.connect.len());
+        for hash in &plan.connect {
+            connect.push(node_import_from_stored_bounded(
+                &snapshot,
+                hash,
+                &mut body_bytes,
+                limits.maximum_body_bytes,
+            )?);
+        }
 
         Ok(Some(NodeReorg {
             disconnect,
@@ -4417,6 +9735,7 @@ impl NodeState {
     }
 
     fn recover_best_stored_chain(&mut self) -> Result<Option<NodeReorgMutation>> {
+        self.ensure_storage_operational()?;
         let Some(best_header) = self
             .chain
             .best_tip()
@@ -4432,13 +9751,16 @@ impl NodeState {
             return Ok(None);
         }
 
-        let Some(plan) = self.best_chain_activation_plan(best_header.hash)? else {
+        let Some(plan) =
+            self.best_chain_activation_plan(best_header.hash, NodeReorgLimits::PRODUCTION)?
+        else {
             return Ok(None);
         };
         self.apply_reorg(plan).map(Some)
     }
 
     fn validate_import(&self, request: &NodeBlockImport) -> Result<ValidatedImport> {
+        self.ensure_storage_operational()?;
         let snapshot = self.store.snapshot()?;
         self.validate_import_against(&snapshot, request)
     }
@@ -4448,20 +9770,21 @@ impl NodeState {
     /// Active connection still uses `validate_import` and therefore requires
     /// the complete parent index chain. Pruned active ancestors retain that
     /// index even though their raw bodies are intentionally unavailable.
-    fn validate_prevalidated_shadow_import(
+    fn validate_prevalidated_native_import(
         &self,
         request: &NodeBlockImport,
         canonical: bool,
         stateless: StatelessBodyValidation,
     ) -> Result<ValidatedImport> {
+        self.ensure_storage_operational()?;
         if canonical {
             let hash = request.block.hash();
             if self.chain.canonical_hash(request.height).map_err(|error| {
-                anyhow::anyhow!("failed to read canonical shadow header: {error}")
+                anyhow::anyhow!("failed to read canonical native header: {error}")
             })? != Some(hash)
             {
                 anyhow::bail!(
-                    "shadow body {} is not the canonical header at height {}",
+                    "native body {} is not the canonical header at height {}",
                     hash.to_hex(),
                     request.height
                 );
@@ -4476,6 +9799,7 @@ impl NodeState {
     /// pending connect sequence, so parent/state checks remain in the staged
     /// overlay where they can see preceding candidates.
     fn validate_import_syntax(&self, request: &NodeBlockImport) -> Result<()> {
+        self.ensure_storage_operational()?;
         let strict = matches!(request.validation, ImportValidationPolicy::Strict);
         if strict {
             validate_transaction_start(&request.block, request.height, self.network)
@@ -4653,11 +9977,12 @@ impl NodeState {
         })
     }
 
-    fn validate_stored_activation<T: ReadSnapshot>(
+    fn validate_stored_activation_with_stateless<T: ReadSnapshot>(
         &self,
         snapshot: &T,
         request: &NodeBlockImport,
         record: &BlockIndexRecord,
+        stateless: Option<StatelessBodyValidation>,
     ) -> Result<ValidatedImport> {
         validate_stored_activation_status(record)?;
         let hash = request.block.hash();
@@ -4686,23 +10011,20 @@ impl NodeState {
                 hash.to_hex()
             );
         }
-        // The durable status was produced for the raw body stored with this
-        // header. Recompute the transaction and witness commitments so a
-        // separately corrupted/replaced raw record cannot borrow that status
-        // merely because block identity is header-derived.
-        HeaderConsensus::new(ConsensusParams::for_network(self.network))
-            .validate_block_commitments(&request.block)
-            .map_err(|error| {
-                anyhow::anyhow!("stored activation body commitment validation failed: {error}")
-            })?;
-        validate_branch_extension(snapshot, request, record.chainwork, self.network, true)?;
-        let historical_validation =
-            self.historical_validation_plan_for_block(request.height, hash, &record.status)?;
-        Ok(ValidatedImport {
-            chainwork: record.chainwork,
-            status: record.status.clone(),
-            historical_validation,
-        })
+        // Durable status is cacheable evidence, not authority: the local
+        // database is untrusted. Re-run header, chainwork, activation-shape,
+        // finality, and every contextual state rule over these exact bytes.
+        // A process-private exact hash+height proof may skip only the
+        // context-independent body/transaction-start/coinbase checks already
+        // completed by the native worker.
+        let validated = self.validate_import_against_policy(snapshot, request, true, stateless)?;
+        if validated.chainwork != record.chainwork {
+            anyhow::bail!(
+                "stored activation chainwork changed during full revalidation for {}",
+                hash.to_hex()
+            );
+        }
+        Ok(validated)
     }
 
     fn expected_bits_for_import<T: ReadSnapshot>(
@@ -4807,14 +10129,24 @@ impl NodeState {
         request: NodeBlockImport,
         validated: ValidatedImport,
     ) -> Result<NodeBlockMutation> {
+        self.ensure_storage_operational()?;
         if self.name_pages.is_some() {
             return self.commit_staged_block_with_name_pages(request, validated);
         }
         let snapshot = self.store.snapshot()?;
         let generation = next_mining_generation(&snapshot)?;
         let chain_epoch = next_chain_epoch(&snapshot)?;
+        let previous = load_block_index_record(&snapshot, &request.block.hash())?;
         let mut batch = self.store.batch();
-        let record = self.stage_connect(&snapshot, &mut batch, &request, validated, true)?;
+        let staged_connect =
+            self.stage_connect(&snapshot, &mut batch, &request, validated, true)?;
+        let record = staged_connect.current.block.clone();
+        let mut index_updates = Vec::with_capacity(staged_connect.pruned.len().saturating_add(1));
+        index_updates.push(IndexStatusUpdate {
+            previous_block: previous,
+            current: staged_connect.current,
+        });
+        index_updates.extend(staged_connect.pruned);
         batch.put(
             ColumnFamily::Meta,
             MetaKey::MiningGeneration.as_bytes(),
@@ -4825,9 +10157,12 @@ impl NodeState {
             MetaKey::ChainEpoch.as_bytes(),
             &encode_u64(chain_epoch),
         )?;
+        let publication = self.prepare_index_publication(&index_updates)?;
         drop(snapshot);
-        self.store.commit(batch)?;
-        self.cache_committed_block_records(std::slice::from_ref(&record))?;
+        self.commit_index_publication(publication, move |state| {
+            state.store.commit(batch)?;
+            Ok(())
+        })?;
 
         Ok(NodeBlockMutation {
             record,
@@ -4842,18 +10177,27 @@ impl NodeState {
     ) -> Result<NodeBlockMutation> {
         let store = self.store.clone();
         let raw = store.snapshot()?;
-        let reader = self
+        let (reader, legacy_fallback) = self
             .name_pages
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("name-page storage is unavailable"))?
-            .reader(&raw)?;
+            .reader_for_roots(&raw, std::iter::empty(), false)?;
+        debug_assert!(!legacy_fallback);
         let page_base = NamePageSnapshot::new(&raw, &reader);
         let overlay = StagingOverlay::new();
         let staged = overlay.snapshot(&page_base);
         let generation = next_mining_generation(&staged)?;
         let chain_epoch = next_chain_epoch(&staged)?;
+        let previous = load_block_index_record(&staged, &request.block.hash())?;
         let mut batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
-        let record = self.stage_connect(&staged, &mut batch, &request, validated, true)?;
+        let staged_connect = self.stage_connect(&staged, &mut batch, &request, validated, true)?;
+        let record = staged_connect.current.block.clone();
+        let mut index_updates = Vec::with_capacity(staged_connect.pruned.len().saturating_add(1));
+        index_updates.push(IndexStatusUpdate {
+            previous_block: previous,
+            current: staged_connect.current,
+        });
+        index_updates.extend(staged_connect.pruned);
         batch.put(
             ColumnFamily::Meta,
             MetaKey::MiningGeneration.as_bytes(),
@@ -4867,7 +10211,8 @@ impl NodeState {
         let root = load_stored_name_tree_commit_root(&staged)
             .map_err(|error| anyhow::anyhow!("failed to read staged page root: {error}"))?;
         let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
-        let staged_pins = staged_name_tree_snapshot_pins(&overlay)?;
+        let staged_pins = staged_name_tree_snapshot_pins(&staged, std::iter::once(request.height))?;
+        let publication = self.prepare_index_publication(&index_updates)?;
         drop(staged);
         let mut inner = batch.into_inner();
         let prepared = match self
@@ -4895,20 +10240,28 @@ impl NodeState {
             }
         };
         drop(raw);
-        if let Err(error) = store.commit(inner) {
-            self.name_pages
+        let publication_result = self.commit_index_publication(publication, move |state| {
+            if let Err(error) = store.commit(inner) {
+                state
+                    .name_pages
+                    .as_mut()
+                    .expect("page storage checked above")
+                    .fence_after_commit_attempt();
+                return Err(anyhow::anyhow!(
+                    "page-backed block commit outcome is ambiguous and requires node restart: {error}"
+                ));
+            }
+            state
+                .name_pages
                 .as_mut()
                 .expect("page storage checked above")
-                .rollback_uncommitted_tail()?;
-            return Err(anyhow::anyhow!(
-                "failed to commit page-backed block: {error}"
-            ));
+                .commit_prepared(prepared);
+            Ok(())
+        });
+        if let Err(error) = publication_result {
+            self.rollback_uncommitted_name_page_tail_if_safe()?;
+            return Err(error);
         }
-        self.name_pages
-            .as_mut()
-            .expect("page storage checked above")
-            .commit_prepared(prepared);
-        self.cache_committed_block_records(std::slice::from_ref(&record))?;
 
         Ok(NodeBlockMutation {
             record,
@@ -4923,7 +10276,7 @@ impl NodeState {
         request: &NodeBlockImport,
         validated: ValidatedImport,
         persist_raw_body: bool,
-    ) -> Result<BlockIndexRecord> {
+    ) -> Result<StagedConnect> {
         validate_active_extension(snapshot, request, validated.chainwork)?;
 
         let block_hash = request.block.hash();
@@ -4998,37 +10351,50 @@ impl NodeState {
         };
 
         write_record_to_batch(batch, &header_record)
-            .map_err(|error| anyhow::anyhow!("failed to stage header index: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage header index")?;
         write_block_index_to_batch(batch, &record)
-            .map_err(|error| anyhow::anyhow!("failed to stage block index: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage block index")?;
         if persist_raw_body {
             let raw_record = RawBlockRecord::from_block(&request.block, request.source);
             write_raw_block_to_batch(batch, &raw_record)
-                .map_err(|error| anyhow::anyhow!("failed to stage raw block: {error}"))?;
+                .map_err(anyhow::Error::new)
+                .context("failed to stage raw block")?;
         }
         if self.transaction_index {
             write_tx_index_for_block_to_batch(batch, &request.block, request.height)
-                .map_err(|error| anyhow::anyhow!("failed to stage tx index: {error}"))?;
+                .map_err(anyhow::Error::new)
+                .context("failed to stage tx index")?;
         }
         write_canonical_height_to_batch(batch, request.height, block_hash)
-            .map_err(|error| anyhow::anyhow!("failed to stage canonical height: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage canonical height")?;
         batch.put(
             ColumnFamily::Meta,
             MetaKey::BestBlockHash.as_bytes(),
             block_hash.as_bytes(),
         )?;
         stage_best_header_if_more_work(snapshot, batch, block_hash, validated.chainwork)?;
-        if let Some(policy) = self.undo_retention_policy {
+        let pruned = if let Some(policy) = self.undo_retention_policy {
             stage_due_undo_prune(
                 snapshot,
                 batch,
                 policy,
                 request.height,
                 self.network.params().names.tree_interval,
-            )?;
-        }
+            )?
+        } else {
+            Vec::new()
+        };
 
-        Ok(record)
+        Ok(StagedConnect {
+            current: StagedIndexRecord {
+                block: record,
+                header: header_record,
+            },
+            pruned,
+        })
     }
 
     fn historical_validation_plan_for_block(
@@ -5081,14 +10447,17 @@ impl NodeState {
     }
 
     fn disconnect_block(&mut self, request: NodeBlockDisconnect) -> Result<NodeBlockMutation> {
+        self.ensure_storage_operational()?;
         if self.name_pages.is_some() {
             return self.disconnect_block_with_name_pages(request);
         }
         let snapshot = self.store.snapshot()?;
         let generation = next_mining_generation(&snapshot)?;
         let chain_epoch = next_chain_epoch(&snapshot)?;
+        let previous = load_block_index_record(&snapshot, &request.block_hash)?;
         let mut batch = self.store.batch();
-        let record = self.stage_disconnect(&snapshot, &mut batch, request)?;
+        let current = self.stage_disconnect(&snapshot, &mut batch, request)?;
+        let record = current.block.clone();
         batch.put(
             ColumnFamily::Meta,
             MetaKey::MiningGeneration.as_bytes(),
@@ -5099,9 +10468,15 @@ impl NodeState {
             MetaKey::ChainEpoch.as_bytes(),
             &encode_u64(chain_epoch),
         )?;
+        let publication = self.prepare_index_publication(&[IndexStatusUpdate {
+            previous_block: previous,
+            current,
+        }])?;
         drop(snapshot);
-        self.store.commit(batch)?;
-        self.cache_committed_block_records(std::slice::from_ref(&record))?;
+        self.commit_index_publication(publication, move |state| {
+            state.store.commit(batch)?;
+            Ok(())
+        })?;
 
         Ok(NodeBlockMutation {
             record,
@@ -5115,19 +10490,27 @@ impl NodeState {
     ) -> Result<NodeBlockMutation> {
         let store = self.store.clone();
         let raw = store.snapshot()?;
-        let reader = self
+        let required_roots =
+            required_name_page_rollback_roots(&raw, std::slice::from_ref(&request))?;
+        let (reader, legacy_fallback) = self
             .name_pages
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("name-page storage is unavailable"))?
-            .reader(&raw)?;
-        let page_base = NamePageSnapshot::new(&raw, &reader);
+            .reader_for_roots(&raw, required_roots, true)?;
+        let page_base = if legacy_fallback {
+            NamePageSnapshot::with_legacy_fallback(&raw, &reader)
+        } else {
+            NamePageSnapshot::new(&raw, &reader)
+        };
         let overlay = StagingOverlay::new();
         let staged = overlay.snapshot(&page_base);
         let generation = next_mining_generation(&staged)?;
         let chain_epoch = next_chain_epoch(&staged)?;
+        let previous = load_block_index_record(&staged, &request.block_hash)?;
         let request_height = request.height;
         let mut batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
-        let record = self.stage_disconnect(&staged, &mut batch, request)?;
+        let current = self.stage_disconnect(&staged, &mut batch, request)?;
+        let record = current.block.clone();
         batch.put(
             ColumnFamily::Meta,
             MetaKey::MiningGeneration.as_bytes(),
@@ -5141,7 +10524,13 @@ impl NodeState {
         let root = load_stored_name_tree_commit_root(&staged)
             .map_err(|error| anyhow::anyhow!("failed to read restored page root: {error}"))?;
         let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
-        let staged_pins = staged_name_tree_snapshot_pins(&overlay)?;
+        // A disconnect can only remove a snapshot pin; page publication needs
+        // newly staged pins, so there is no family-wide overlay clone here.
+        let staged_pins = Vec::new();
+        let publication = self.prepare_index_publication(&[IndexStatusUpdate {
+            previous_block: previous,
+            current,
+        }])?;
         drop(staged);
         let mut inner = batch.into_inner();
         let resulting_height = request_height.checked_sub(1);
@@ -5170,20 +10559,28 @@ impl NodeState {
             }
         };
         drop(raw);
-        if let Err(error) = store.commit(inner) {
-            self.name_pages
+        let publication_result = self.commit_index_publication(publication, move |state| {
+            if let Err(error) = store.commit(inner) {
+                state
+                    .name_pages
+                    .as_mut()
+                    .expect("page storage checked above")
+                    .fence_after_commit_attempt();
+                return Err(anyhow::anyhow!(
+                    "page-backed disconnect commit outcome is ambiguous and requires node restart: {error}"
+                ));
+            }
+            state
+                .name_pages
                 .as_mut()
                 .expect("page storage checked above")
-                .rollback_uncommitted_tail()?;
-            return Err(anyhow::anyhow!(
-                "failed to commit page-backed disconnect: {error}"
-            ));
+                .commit_prepared(prepared);
+            Ok(())
+        });
+        if let Err(error) = publication_result {
+            self.rollback_uncommitted_name_page_tail_if_safe()?;
+            return Err(error);
         }
-        self.name_pages
-            .as_mut()
-            .expect("page storage checked above")
-            .commit_prepared(prepared);
-        self.cache_committed_block_records(std::slice::from_ref(&record))?;
         Ok(NodeBlockMutation {
             record,
             mining: self.durable_mining_state()?,
@@ -5195,7 +10592,7 @@ impl NodeState {
         snapshot: &T,
         batch: &mut B,
         request: NodeBlockDisconnect,
-    ) -> Result<BlockIndexRecord> {
+    ) -> Result<StagedIndexRecord> {
         let best_hash = snapshot
             .get(ColumnFamily::Meta, MetaKey::BestBlockHash.as_bytes())
             .context("failed to read best block before disconnect")?
@@ -5254,17 +10651,22 @@ impl NodeState {
             },
             &undo,
         )
-        .map_err(|error| anyhow::anyhow!("failed to stage state disconnect: {error}"))?;
+        .map_err(anyhow::Error::new)
+        .context("failed to stage state disconnect")?;
         if self.transaction_index {
             delete_tx_index_for_block_from_batch(batch, &block)
-                .map_err(|error| anyhow::anyhow!("failed to stage tx-index deletion: {error}"))?;
+                .map_err(anyhow::Error::new)
+                .context("failed to stage tx-index deletion")?;
         }
         write_block_index_to_batch(batch, &record)
-            .map_err(|error| anyhow::anyhow!("failed to stage block index update: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage block index update")?;
         write_record_to_batch(batch, &header_record)
-            .map_err(|error| anyhow::anyhow!("failed to stage header index update: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage header index update")?;
         delete_canonical_height_from_batch(batch, request.height)
-            .map_err(|error| anyhow::anyhow!("failed to stage canonical height delete: {error}"))?;
+            .map_err(anyhow::Error::new)
+            .context("failed to stage canonical height delete")?;
 
         if request.height == 0 {
             batch.delete(ColumnFamily::Meta, MetaKey::BestBlockHash.as_bytes())?;
@@ -5276,18 +10678,61 @@ impl NodeState {
             )?;
         }
 
-        Ok(record)
+        Ok(StagedIndexRecord {
+            block: record,
+            header: header_record,
+        })
     }
 
     fn apply_reorg(&mut self, request: NodeReorg) -> Result<NodeReorgMutation> {
-        self.apply_reorg_classified(request)
+        self.apply_reorg_with_limits(request, NodeReorgLimits::PRODUCTION)
+    }
+
+    fn apply_reorg_with_limits(
+        &mut self,
+        request: NodeReorg,
+        limits: NodeReorgLimits,
+    ) -> Result<NodeReorgMutation> {
+        self.apply_reorg_classified_with_limits(request, limits)
             .map_err(ChainActivationFailure::into_anyhow)
     }
 
-    fn apply_reorg_classified(
+    fn apply_reorg_classified_prepared(
         &mut self,
         request: NodeReorg,
+        prepared: PreparedNativeActivation,
     ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
+        self.apply_reorg_classified_with_limits_and_prepared(
+            request,
+            NodeReorgLimits::PRODUCTION,
+            Some(prepared),
+        )
+    }
+
+    fn apply_reorg_classified_with_limits(
+        &mut self,
+        request: NodeReorg,
+        limits: NodeReorgLimits,
+    ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
+        self.apply_reorg_classified_with_limits_and_prepared(request, limits, None)
+    }
+
+    fn apply_reorg_classified_with_limits_and_prepared(
+        &mut self,
+        request: NodeReorg,
+        limits: NodeReorgLimits,
+        prepared: Option<PreparedNativeActivation>,
+    ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
+        validate_reorg_counts(&request, limits).map_err(ChainActivationFailure::Internal)?;
+        if let Some(prepared) = prepared.as_ref() {
+            prepared
+                .authenticate(&request)
+                .context("prepared native activation proof mismatch")
+                .map_err(ChainActivationFailure::Internal)?;
+        }
+        let mut prepared = prepared.map(PreparedNativeActivation::into_by_identity);
+        self.ensure_storage_operational()
+            .map_err(ChainActivationFailure::Internal)?;
         if request.disconnect.is_empty() && request.connect.is_empty() {
             return Ok(NodeReorgMutation {
                 summary: NodeReorgSummary::default(),
@@ -5307,13 +10752,21 @@ impl NodeState {
             .snapshot()
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
-        let page_reader = self
-            .name_pages
-            .as_ref()
-            .map(|pages| pages.reader(&raw_base))
-            .transpose()
+        let required_page_roots = preflight_reorg_page_roots(&raw_base, &request, limits)
             .map_err(ChainActivationFailure::Internal)?;
+        let (page_reader, legacy_page_fallback) = match self.name_pages.as_ref() {
+            Some(pages) => {
+                let (reader, legacy_fallback) = pages
+                    .reader_for_roots(&raw_base, required_page_roots, true)
+                    .map_err(ChainActivationFailure::Internal)?;
+                (Some(reader), legacy_fallback)
+            }
+            None => (None, false),
+        };
         let base = match page_reader.as_ref() {
+            Some(reader) if legacy_page_fallback => {
+                NodeReadSnapshot::Pages(NamePageSnapshot::with_legacy_fallback(&raw_base, reader))
+            }
             Some(reader) => NodeReadSnapshot::Pages(NamePageSnapshot::new(&raw_base, reader)),
             None => NodeReadSnapshot::Base(&raw_base),
         };
@@ -5321,35 +10774,74 @@ impl NodeState {
             best_block_tip_from_snapshot(&base).map_err(ChainActivationFailure::Internal)?;
         validate_reorg_request_shape(&base, &request, original_tip.as_ref())
             .map_err(ChainActivationFailure::Internal)?;
+        let mut previous_block_records = HashMap::new();
+        for hash in request
+            .disconnect
+            .iter()
+            .map(|item| item.block_hash)
+            .chain(request.connect.iter().map(|item| item.block.hash()))
+        {
+            if previous_block_records.contains_key(&hash) {
+                return Err(ChainActivationFailure::Internal(anyhow::anyhow!(
+                    "reorganization repeats block {}",
+                    hash.to_hex()
+                )));
+            }
+            let previous =
+                load_block_index_record(&base, &hash).map_err(ChainActivationFailure::Internal)?;
+            previous_block_records.insert(hash, previous);
+        }
 
         let generation = next_mining_generation(&base).map_err(ChainActivationFailure::Internal)?;
         let chain_epoch = next_chain_epoch(&base).map_err(ChainActivationFailure::Internal)?;
+        let staged_pin_heights = request
+            .connect
+            .iter()
+            .map(NodeBlockImport::height)
+            .collect::<Vec<_>>();
         let overlay = StagingOverlay::new();
         let staged = overlay.snapshot(&base);
-        let mut batch = if self.name_pages.is_some() {
+        let staged_batch = if self.name_pages.is_some() {
             overlay.batch_with_deferred_name_tree_nodes(store.batch())
         } else {
             overlay.batch(store.batch())
         };
+        let mut batch = ReorgMeteredBatch::new(
+            staged_batch,
+            ReorgStagedEffectMeter::new(limits.maximum_staged_effect_bytes),
+            REORG_STAGING_OPERATION_COPIES,
+        );
         let mut summary = NodeReorgSummary::default();
+        let mut index_updates = Vec::new();
 
         for disconnect in request.disconnect {
-            let record = self
+            let previous = previous_block_records
+                .get(&disconnect.block_hash)
+                .cloned()
+                .ok_or_else(|| {
+                    ChainActivationFailure::Internal(anyhow::anyhow!(
+                        "reorganization cache plan omitted block {}",
+                        disconnect.block_hash.to_hex()
+                    ))
+                })?;
+            let current = self
                 .stage_disconnect(&staged, &mut batch, disconnect)
                 .map_err(ChainActivationFailure::Internal)?;
-            summary.disconnected.push(record);
+            summary.disconnected.push(current.block.clone());
+            index_updates.push(IndexStatusUpdate {
+                previous_block: previous,
+                current,
+            });
         }
 
         for connect in request.connect {
             let hash = connect.block.hash();
-            // The durable block status is internal evidence that the bounded
-            // worker pipeline already checked transaction start, commitments,
-            // name limits, and coinbase height for these exact block bytes.
-            // Reuse that evidence while retaining header, finality, branch,
-            // UTXO, script, covenant, claim/airdrop, and Urkel validation here.
-            // Direct reorg callers and fixture imports do not necessarily pass
-            // through the strict durable-body pipeline and therefore retain
-            // the complete validation route.
+            let stateless = prepared
+                .as_mut()
+                .and_then(|proofs| proofs.remove(&(hash, connect.height)));
+            // Strict stored bodies are fully revalidated here because durable
+            // status and bytes are both forgeable under the local-DB threat
+            // model. Fixture imports retain their explicit test-only policy.
             let stored_record = load_block_index_record(&staged, &hash)
                 .map_err(ChainActivationFailure::Internal)?;
             let persist_raw_body = stored_record.is_none();
@@ -5357,17 +10849,22 @@ impl NodeState {
                 Some(stored_record)
                     if matches!(connect.validation, ImportValidationPolicy::Strict) =>
                 {
-                    self.validate_stored_activation(&staged, &connect, stored_record)
-                        .with_context(|| {
-                            format!(
-                                "failed to authenticate stored block {} at height {}",
-                                hash.to_hex(),
-                                connect.height
-                            )
-                        })
+                    self.validate_stored_activation_with_stateless(
+                        &staged,
+                        &connect,
+                        stored_record,
+                        stateless,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to authenticate stored block {} at height {}",
+                            hash.to_hex(),
+                            connect.height
+                        )
+                    })
                 }
                 Some(_) | None => self
-                    .validate_import_against_policy(&staged, &connect, true, None)
+                    .validate_import_against_policy(&staged, &connect, true, stateless)
                     .with_context(|| {
                         format!(
                             "failed to validate unstored block {} at height {}",
@@ -5377,7 +10874,7 @@ impl NodeState {
                     }),
             }
             .map_err(ChainActivationFailure::Internal)?;
-            let record = match self.stage_connect(
+            let staged_connect = match self.stage_connect(
                 &staged,
                 &mut batch,
                 &connect,
@@ -5405,7 +10902,24 @@ impl NodeState {
                     ))));
                 }
             };
-            summary.connected.push(record);
+            let previous = previous_block_records.get(&hash).cloned().ok_or_else(|| {
+                ChainActivationFailure::Internal(anyhow::anyhow!(
+                    "reorganization cache plan omitted block {}",
+                    hash.to_hex()
+                ))
+            })?;
+            summary.connected.push(staged_connect.current.block.clone());
+            index_updates.push(IndexStatusUpdate {
+                previous_block: previous,
+                current: staged_connect.current,
+            });
+            index_updates.extend(staged_connect.pruned);
+        }
+
+        if prepared.as_ref().is_some_and(|proofs| !proofs.is_empty()) {
+            return Err(ChainActivationFailure::Internal(anyhow::anyhow!(
+                "prepared native activation retained an unmatched proof"
+            )));
         }
 
         let final_tip = best_block_tip_from_snapshot(&staged)
@@ -5454,11 +10968,28 @@ impl NodeState {
         let root = load_stored_name_tree_commit_root(&staged)
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
-        let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
-        let staged_pins =
-            staged_name_tree_snapshot_pins(&overlay).map_err(ChainActivationFailure::Internal)?;
-        let mut batch = batch.into_inner();
+        let staged_nodes = if self.name_pages.is_some() {
+            overlay.staged_family(ColumnFamily::NameTreeNodes)
+        } else {
+            BTreeMap::new()
+        };
+        let staged_pins = if self.name_pages.is_some() {
+            staged_name_tree_snapshot_pins(&staged, staged_pin_heights)
+                .map_err(ChainActivationFailure::Internal)?
+        } else {
+            Vec::new()
+        };
+        let publication = self
+            .prepare_index_publication(&index_updates)
+            .map_err(ChainActivationFailure::Internal)?;
+        let (batch, meter) = batch.into_parts();
+        let mut batch = ReorgMeteredBatch::new(
+            batch.into_inner(),
+            meter,
+            REORG_PUBLICATION_OPERATION_COPIES,
+        );
         drop(staged);
+        drop(overlay);
         let prepared_page_state =
             if let (Some(pages), Some(reader)) = (self.name_pages.as_mut(), page_reader.as_ref()) {
                 match pages.prepare_root(
@@ -5483,26 +11014,52 @@ impl NodeState {
             } else {
                 None
             };
-        drop(raw_base);
-        if let Err(error) = store.commit(batch) {
-            if let Some(pages) = self.name_pages.as_mut() {
-                pages
-                    .rollback_uncommitted_tail()
-                    .map_err(ChainActivationFailure::Internal)?;
+        let (batch, mut meter) = batch.into_parts();
+        #[cfg(test)]
+        {
+            let reject = TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT.with(|enabled| enabled.get())
+                && TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(|bytes| bytes.get() > 0);
+            if reject {
+                meter.limit = meter.consumed;
             }
-            return Err(ChainActivationFailure::Internal(anyhow::Error::from(error)));
         }
-        if let (Some(pages), Some(prepared)) = (self.name_pages.as_mut(), prepared_page_state) {
-            pages.commit_prepared(prepared);
+        drop(raw_base);
+        let publication_result = self.commit_index_publication(publication, move |state| {
+            match store.commit_with_effect_budget(batch, &mut meter) {
+                Ok(()) => {}
+                Err(
+                    error @ StoreError::LimitExceeded {
+                        context: ReorgStagedEffectMeter::CONTEXT,
+                        ..
+                    },
+                ) => {
+                    // The archive-aware budget boundary rejects before moving
+                    // payloads, extending its batch, or appending a segment.
+                    // The already-prepared name-page tail is therefore known
+                    // uncommitted and the outer error path may truncate it.
+                    return Err(error.into());
+                }
+                Err(error) => {
+                    if let Some(pages) = state.name_pages.as_mut() {
+                        pages.fence_after_commit_attempt();
+                    }
+                    return Err(anyhow::anyhow!(
+                        "page-backed reorganization commit outcome is ambiguous and requires node restart: {error}"
+                    ));
+                }
+            }
+            if let (Some(pages), Some(prepared)) =
+                (state.name_pages.as_mut(), prepared_page_state)
+            {
+                pages.commit_prepared(prepared);
+            }
+            Ok(())
+        });
+        if let Err(error) = publication_result {
+            self.rollback_uncommitted_name_page_tail_if_safe()
+                .map_err(ChainActivationFailure::Internal)?;
+            return Err(ChainActivationFailure::Internal(error));
         }
-        let committed_records = summary
-            .disconnected
-            .iter()
-            .chain(&summary.connected)
-            .cloned()
-            .collect::<Vec<_>>();
-        self.cache_committed_block_records(&committed_records)
-            .map_err(ChainActivationFailure::Internal)?;
 
         Ok(NodeReorgMutation {
             summary,
@@ -5512,89 +11069,80 @@ impl NodeState {
         })
     }
 
-    fn refresh_indexes(&mut self) -> Result<()> {
-        self.chain = StoredHeaderIndex::new(self.store.clone())
-            .map_err(|error| anyhow::anyhow!("failed to refresh header index: {error}"))?;
-        self.blocks = StoredBlockIndex::new(self.store.clone())
-            .map_err(|error| anyhow::anyhow!("failed to refresh block index: {error}"))?;
-        Ok(())
-    }
-
-    /// Publish the exact records written by a successful block commit into the
-    /// in-memory indexes without rebuilding them from the complete durable
-    /// header/block sets. The durable batch is already authoritative here. If
-    /// an incremental cache invariant ever rejects a committed record, reload
-    /// both indexes as a correctness-first recovery path.
-    fn cache_committed_block_records(&mut self, records: &[BlockIndexRecord]) -> Result<()> {
+    /// Validate a bounded old/new index delta before its durable transaction
+    /// commits. The block side is applied to a fixed-size staged cache clone;
+    /// the header side stages only the new or status-changed records, so
+    /// publication cannot rebuild or duplicate the complete resident index.
+    fn prepare_index_publication(
+        &self,
+        records: &[IndexStatusUpdate],
+    ) -> Result<PreparedIndexPublication> {
         if records.is_empty() {
-            return Ok(());
+            let headers = self
+                .chain
+                .prepare_cache_update(&[])
+                .map_err(|error| anyhow::anyhow!("failed to stage empty header cache: {error}"))?;
+            let blocks = self
+                .blocks
+                .prepare_cache_update(&[])
+                .map_err(|error| anyhow::anyhow!("failed to stage empty block cache: {error}"))?;
+            return Ok(PreparedIndexPublication { headers, blocks });
         }
-
         let headers = records
             .iter()
-            .map(|record| {
-                let block = self
-                    .blocks
-                    .load_block(&record.hash)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to load committed block {} for cache publication: {error}",
-                            record.hash.to_hex()
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "committed block {} has no durable body for cache publication",
-                            record.hash.to_hex()
-                        )
-                    })?;
-                if block.hash() != record.hash {
-                    anyhow::bail!(
-                        "committed block body hash {} disagrees with index {}",
-                        block.hash().to_hex(),
-                        record.hash.to_hex()
-                    );
-                }
-                Ok(HeaderRecord {
-                    hash: record.hash,
-                    height: record.height,
-                    chainwork: record.chainwork,
-                    header: block.header,
-                    status: record.status.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map(|record| record.current.header.clone())
+            .collect::<Vec<_>>();
+        let headers = self
+            .chain
+            .prepare_cache_update(&headers)
+            .map_err(|error| anyhow::anyhow!("invalid header cache publication: {error}"))?;
+        let replacements = records
+            .iter()
+            .map(|record| (record.previous_block.clone(), record.current.block.clone()))
+            .collect::<Vec<_>>();
+        let blocks = self
+            .blocks
+            .prepare_cache_update(&replacements)
+            .map_err(|error| anyhow::anyhow!("invalid block cache publication: {error}"))?;
+        Ok(PreparedIndexPublication { headers, blocks })
+    }
 
-        let incremental = (|| -> Result<()> {
-            for header in headers {
-                self.chain.cache_record(header).map_err(|error| {
-                    anyhow::anyhow!("failed to publish committed header cache record: {error}")
-                })?;
-            }
-            for record in records {
-                self.blocks.cache_record(record.clone()).map_err(|error| {
-                    anyhow::anyhow!("failed to publish committed block cache record: {error}")
-                })?;
-            }
-            Ok(())
-        })();
+    fn commit_index_publication<T>(
+        &mut self,
+        publication: PreparedIndexPublication,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let chain = self.chain.clone();
+        chain.write_exclusive(|header_index| {
+            header_index
+                .validate_cache_update(&publication.headers)
+                .map_err(|error| anyhow::anyhow!("stale header cache publication: {error}"))?;
+            self.blocks
+                .validate_cache_update(&publication.blocks)
+                .map_err(|error| anyhow::anyhow!("stale block cache publication: {error}"))?;
+            let result = operation(self)?;
+            header_index.apply_validated_cache_update(publication.headers);
+            self.blocks.publish_cache_update(publication.blocks);
+            Ok(result)
+        })
+    }
 
-        if let Err(incremental_error) = incremental {
-            tracing::warn!(
-                error = %incremental_error,
-                records = records.len(),
-                "incremental index publication failed; rebuilding durable indexes"
-            );
-            self.refresh_indexes().with_context(|| {
-                format!(
-                    "failed to rebuild indexes after incremental publication error: {incremental_error}"
-                )
-            })?;
+    /// A stale generation is rejected before the durable operation runs. Page
+    /// preparation may already have appended an uncommitted physical tail, so
+    /// reclaim it on that path. An attempted database commit fences page
+    /// storage first; an ambiguous outcome must never be truncated in-process.
+    fn rollback_uncommitted_name_page_tail_if_safe(&mut self) -> Result<()> {
+        let Some(pages) = self.name_pages.as_mut() else {
+            return Ok(());
+        };
+        if pages.reopen_required {
+            return Ok(());
         }
-        Ok(())
+        pages.rollback_uncommitted_tail()
     }
 
     pub fn compact_name_tree_nodes(&mut self) -> Result<NameTreeCompactionCheckpoint> {
+        self.ensure_storage_operational()?;
         if self.name_pages.is_some() {
             anyhow::bail!(
                 "legacy RocksDB name-node compaction is disabled after append-only page storage is active"
@@ -5608,6 +11156,7 @@ impl NodeState {
         &mut self,
         interval: Height,
     ) -> Result<Option<NameTreeCompactionCheckpoint>> {
+        self.ensure_storage_operational()?;
         if interval == 0 {
             anyhow::bail!("name-tree compaction startup interval must be non-zero");
         }
@@ -5624,6 +11173,7 @@ impl NodeState {
         &mut self,
         interval: Option<Height>,
     ) -> Result<Option<NameTreeCompactionCheckpoint>> {
+        self.ensure_storage_operational()?;
         let snapshot = self.store.snapshot()?;
         let Some(tip) = best_block_tip_from_snapshot(&snapshot)? else {
             return Ok(None);
@@ -5667,11 +11217,11 @@ impl NodeState {
     }
 
     fn prune_undo_history_to_policy(&mut self) -> Result<()> {
+        self.ensure_storage_operational()?;
         let policy = self.undo_retention_policy.ok_or_else(|| {
             anyhow::anyhow!("payload retention pruning requested without an active policy")
         })?;
         policy.validate()?;
-        let mut changed = false;
         loop {
             let snapshot = self.store.snapshot()?;
             let Some(tip) = best_block_tip_from_snapshot(&snapshot)? else {
@@ -5711,9 +11261,11 @@ impl NodeState {
             let mut pruned_undos = previous.as_ref().map_or(0, |state| state.pruned_undos);
             let mut pruned_blocks = previous.as_ref().map_or(0, |state| state.pruned_blocks);
             let mut last_hash = None;
+            let mut index_updates = Vec::new();
             for height in start..=batch_end {
-                let (hash, undo_pruned, block_pruned) =
+                let (update, undo_pruned, block_pruned) =
                     stage_prune_payload_height(&snapshot, &mut batch, height)?;
+                let hash = update.current.block.hash;
                 if undo_pruned {
                     pruned_undos = pruned_undos
                         .checked_add(1)
@@ -5725,6 +11277,7 @@ impl NodeState {
                         .ok_or_else(|| anyhow::anyhow!("pruned block count exhausted"))?;
                 }
                 last_hash = Some(hash);
+                index_updates.push(update);
             }
             let last_hash = last_hash
                 .ok_or_else(|| anyhow::anyhow!("payload-pruning batch contained no heights"))?;
@@ -5765,41 +11318,70 @@ impl NodeState {
                 UNDO_PRUNING_CHECKPOINT_KEY,
                 &checkpoint.encode(),
             )?;
+            let publication = self.prepare_index_publication(&index_updates)?;
             drop(snapshot);
-            self.store.commit(batch)?;
-            changed = true;
-        }
-        if changed {
-            self.refresh_indexes()?;
+            self.commit_index_publication(publication, move |state| {
+                state.store.commit(batch)?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
 
     fn compact_pruned_payload_segments_if_due(&self) -> Result<()> {
-        let inventory = self
+        self.ensure_storage_operational()?;
+        let limits = SegmentCompactionLimits {
+            max_live_frame_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
+            ..SegmentCompactionLimits::default()
+        };
+        let execution = SegmentCompactionExecutionLimits {
+            max_physical_output_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
+            minimum_filesystem_reserve_bytes: MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
+            ..SegmentCompactionExecutionLimits::default()
+        };
+        let plan = match self
             .store
-            .segment_archive_inventory()
-            .context("failed to inspect pruned payload locators")?;
-        let (physical_block_bytes, physical_undo_bytes) = self
-            .store
-            .segment_archive_frame_bytes()
-            .context("failed to inspect payload segment footprint")?;
-        let physical_bytes = physical_block_bytes
-            .checked_add(physical_undo_bytes)
-            .ok_or_else(|| anyhow::anyhow!("payload segment byte count overflow"))?;
-        let live_bytes = inventory
-            .blocks
-            .archived_frame_bytes
-            .checked_add(inventory.undo.archived_frame_bytes)
-            .ok_or_else(|| anyhow::anyhow!("live payload byte count overflow"))?;
-        let dead_bytes = physical_bytes.saturating_sub(live_bytes);
-        if dead_bytes < PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES {
+            .inspect_segment_archive_compaction_with_execution_limits(limits, execution)
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Some(fence) = production_fence_from_store_error(
+                    ProductionSafetyFenceKind::PayloadSegmentCompaction,
+                    &error,
+                ) {
+                    self.chain.record_external_safety_fence(fence)?;
+                    tracing::warn!(
+                        error = %error,
+                        "deferred payload-segment compaction behind a durable production safety fence"
+                    );
+                    return Ok(());
+                }
+                return Err(error).context("failed to inspect pruned payload segments");
+            }
+        };
+        if plan.reclaimable_frame_bytes < PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES {
             return Ok(());
         }
-        let report = self
+        let report = match self
             .store
-            .compact_segment_archive()
-            .context("failed to compact pruned payload segments")?;
+            .compact_segment_archive_with_execution_limits(limits, execution)
+        {
+            Ok(report) => report,
+            Err(error) => {
+                if let Some(fence) = production_fence_from_store_error(
+                    ProductionSafetyFenceKind::PayloadSegmentCompaction,
+                    &error,
+                ) {
+                    self.chain.record_external_safety_fence(fence)?;
+                    tracing::warn!(
+                        error = %error,
+                        "deferred payload-segment compaction behind a durable production safety fence"
+                    );
+                    return Ok(());
+                }
+                return Err(error).context("failed to compact pruned payload segments");
+            }
+        };
         tracing::info!(
             previous_block_generation = report.previous_block_generation,
             previous_undo_generation = report.previous_undo_generation,
@@ -5812,15 +11394,30 @@ impl NodeState {
     }
 
     fn compact_pruned_name_pages_if_due(&mut self) -> Result<()> {
+        self.ensure_storage_operational()?;
         let Some(name_pages) = self.name_pages.as_mut() else {
             return Ok(());
         };
         if name_pages.state.manifest.active_segment < NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD {
             return Ok(());
         }
-        let report = name_pages
-            .compact_generation(&self.store)
-            .context("failed to compact pruned name pages")?;
+        let report = match name_pages.compact_generation(&self.store) {
+            Ok(report) => report,
+            Err(error) => {
+                if let Some(fence) = production_fence_from_name_page_error(
+                    ProductionSafetyFenceKind::NamePageCompaction,
+                    &error,
+                ) {
+                    self.chain.record_external_safety_fence(fence)?;
+                    tracing::warn!(
+                        error = %error,
+                        "deferred name-page compaction behind a durable production safety fence"
+                    );
+                    return Ok(());
+                }
+                return Err(error).context("failed to compact pruned name pages");
+            }
+        };
         tracing::info!(
             previous_generation = report.previous_generation,
             generation = report.generation,
@@ -5897,9 +11494,17 @@ fn load_header_record(
     else {
         return Ok(None);
     };
-    HeaderRecord::decode(&bytes)
-        .map(Some)
-        .map_err(|error| anyhow::anyhow!("failed to decode header record: {error}"))
+    let record = HeaderRecord::decode(&bytes)
+        .map_err(|error| anyhow::anyhow!("failed to decode header record: {error}"))?;
+    if record.hash != *hash || record.header.hash() != *hash {
+        anyhow::bail!(
+            "header record at key {} has inconsistent embedded identity {} / {}",
+            hash.to_hex(),
+            record.hash.to_hex(),
+            record.header.hash().to_hex()
+        );
+    }
+    Ok(Some(record))
 }
 
 fn load_block_index_record(
@@ -5912,9 +11517,170 @@ fn load_block_index_record(
     else {
         return Ok(None);
     };
-    BlockIndexRecord::decode(&bytes)
-        .map(Some)
-        .map_err(|error| anyhow::anyhow!("failed to decode block index record: {error}"))
+    let record = BlockIndexRecord::decode(&bytes)
+        .map_err(|error| anyhow::anyhow!("failed to decode block index record: {error}"))?;
+    if record.hash != *hash {
+        anyhow::bail!(
+            "block index record at key {} has embedded hash {}",
+            hash.to_hex(),
+            record.hash.to_hex()
+        );
+    }
+    Ok(Some(record))
+}
+
+fn validate_durable_block_index_bindings(snapshot: &impl ReadSnapshot) -> Result<()> {
+    let mut cursor = None;
+    loop {
+        let page = snapshot
+            .scan_prefix_page(
+                ColumnFamily::BlockIndex,
+                b"",
+                cursor.as_deref(),
+                PrefixScanBudget {
+                    max_entries: BLOCK_INDEX_AUDIT_PAGE_ENTRIES,
+                    max_bytes: BLOCK_INDEX_AUDIT_PAGE_BYTES,
+                },
+            )
+            .context("failed to page durable block index")?;
+        for (key, bytes) in page.entries {
+            let record = BlockIndexRecord::decode(&bytes)
+                .map_err(|error| anyhow::anyhow!("failed to decode block index: {error}"))?;
+            if key.as_slice() != record.hash.as_bytes() {
+                anyhow::bail!(
+                    "block index key disagrees with embedded hash {}",
+                    record.hash.to_hex()
+                );
+            }
+            validate_block_header_binding(snapshot, &record)?;
+            let canonical = read_canonical_hash(snapshot, record.height)?;
+            if record.status.active_chain {
+                if canonical != Some(record.hash) {
+                    anyhow::bail!(
+                        "active block index {} is not reverse-bound at height {}",
+                        record.hash.to_hex(),
+                        record.height
+                    );
+                }
+            } else if canonical == Some(record.hash) {
+                anyhow::bail!(
+                    "non-active block index {} occupies canonical height {}",
+                    record.hash.to_hex(),
+                    record.height
+                );
+            }
+        }
+        match page.continuation {
+            Some(next) => {
+                if cursor.as_ref().is_some_and(|previous| previous >= &next) {
+                    anyhow::bail!("block-index audit page cursor did not advance");
+                }
+                cursor = Some(next);
+            }
+            None => break,
+        }
+    }
+
+    let best = best_block_tip_from_snapshot(snapshot)?;
+    let mut cursor = None;
+    let mut expected_height = 0u32;
+    let mut last = None;
+    loop {
+        let page = snapshot
+            .scan_prefix_page(
+                ColumnFamily::HeightIndex,
+                b"",
+                cursor.as_deref(),
+                PrefixScanBudget {
+                    max_entries: BLOCK_INDEX_AUDIT_PAGE_ENTRIES,
+                    max_bytes: BLOCK_INDEX_AUDIT_PAGE_BYTES,
+                },
+            )
+            .context("failed to page durable active-height index")?;
+        for (height_key, hash_bytes) in page.entries {
+            let height = decode_height_key(&height_key)?;
+            if height != expected_height {
+                anyhow::bail!(
+                    "active-height index is not exactly contiguous at expected height {expected_height}"
+                );
+            }
+            let hash = block_hash_from_bytes(&hash_bytes)?;
+            let record = load_block_index_record(snapshot, &hash)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "active-height {} points to missing block index {}",
+                    height,
+                    hash.to_hex()
+                )
+            })?;
+            validate_block_header_binding(snapshot, &record)?;
+            if record.height != height || !record.status.active_chain {
+                anyhow::bail!(
+                    "active-height {} points to non-active block {}",
+                    height,
+                    hash.to_hex()
+                );
+            }
+            last = Some((height, hash));
+            expected_height = expected_height
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("active-height index exhausted u32"))?;
+        }
+        match page.continuation {
+            Some(next) => {
+                if cursor.as_ref().is_some_and(|previous| previous >= &next) {
+                    anyhow::bail!("active-height audit page cursor did not advance");
+                }
+                cursor = Some(next);
+            }
+            None => break,
+        }
+    }
+
+    match (best, last) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => anyhow::bail!("active-height index exists without a best-block binding"),
+        (Some(_), None) => {
+            anyhow::bail!("best-block binding exists without an active-height index")
+        }
+        (Some(best), Some((height, hash)))
+            if best.height == height
+                && best.hash == hash
+                && expected_height == best.height.checked_add(1).unwrap_or(0) =>
+        {
+            Ok(())
+        }
+        (Some(best), Some((height, hash))) => anyhow::bail!(
+            "active-height tip {} at height {} disagrees with best block {} at height {}",
+            hash.to_hex(),
+            height,
+            best.hash.to_hex(),
+            best.height
+        ),
+    }
+}
+
+fn validate_block_header_binding(
+    snapshot: &impl ReadSnapshot,
+    record: &BlockIndexRecord,
+) -> Result<HeaderRecord> {
+    let header = load_header_record(snapshot, &record.hash)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "block index {} has no matching header record",
+            record.hash.to_hex()
+        )
+    })?;
+    if header.hash != record.hash
+        || header.height != record.height
+        || header.header.prev_block != record.prev_hash
+        || header.chainwork != record.chainwork
+        || header.status != record.status
+    {
+        anyhow::bail!(
+            "block index {} disagrees with its revalidated header",
+            record.hash.to_hex()
+        );
+    }
+    Ok(header)
 }
 
 fn load_block(snapshot: &impl ReadSnapshot, hash: &BlockHash) -> Result<Option<Block>> {
@@ -5926,6 +11692,13 @@ fn load_block(snapshot: &impl ReadSnapshot, hash: &BlockHash) -> Result<Option<B
     };
     let raw = RawBlockRecord::decode(&bytes)
         .map_err(|error| anyhow::anyhow!("failed to decode raw block record: {error}"))?;
+    if raw.hash != *hash {
+        anyhow::bail!(
+            "raw block record at key {} has embedded hash {}",
+            hash.to_hex(),
+            raw.hash.to_hex()
+        );
+    }
     raw.decode_block()
         .map(Some)
         .map_err(|error| anyhow::anyhow!("failed to decode raw block: {error}"))
@@ -5986,7 +11759,7 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
     policy: UndoRetentionPolicy,
     tip_height: Height,
     tree_interval: Height,
-) -> Result<()> {
+) -> Result<Vec<IndexStatusUpdate>> {
     policy.validate()?;
     let Some(target) = undo_prune_target(
         tip_height,
@@ -5994,13 +11767,13 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
         policy.keep_blocks,
         tree_interval,
     ) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let previous = load_undo_pruning_checkpoint(snapshot)?;
     if previous.as_ref().is_some_and(|state| {
         state.pruned_through >= target && state.blocks_pruned_through >= target
     }) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let first_prunable = policy.prune_after_height.saturating_add(1);
     let undo_expected = previous
@@ -6028,11 +11801,13 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
     // boundaries rather than one block at a time. Retire that bounded interval
     // atomically with the boundary block.
     let mut block_hash = None;
+    let mut updates = Vec::new();
     let mut pruned_undos = previous.as_ref().map_or(0, |state| state.pruned_undos);
     let mut pruned_blocks = previous.as_ref().map_or(0, |state| state.pruned_blocks);
     for height in expected..=target {
-        let (hash, undo_pruned, block_pruned) =
+        let (update, undo_pruned, block_pruned) =
             stage_prune_payload_height(snapshot, batch, height)?;
+        let hash = update.current.block.hash;
         pruned_undos = pruned_undos
             .checked_add(u64::from(undo_pruned))
             .ok_or_else(|| anyhow::anyhow!("pruned undo count exhausted"))?;
@@ -6040,6 +11815,7 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
             .checked_add(u64::from(block_pruned))
             .ok_or_else(|| anyhow::anyhow!("pruned block count exhausted"))?;
         block_hash = Some(hash);
+        updates.push(update);
     }
     let block_hash =
         block_hash.ok_or_else(|| anyhow::anyhow!("payload-pruning range contained no heights"))?;
@@ -6056,18 +11832,19 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
         UNDO_PRUNING_CHECKPOINT_KEY,
         &checkpoint.encode(),
     )?;
-    Ok(())
+    Ok(updates)
 }
 
 fn stage_prune_payload_height<T: ReadSnapshot, B: WriteBatch>(
     snapshot: &T,
     batch: &mut B,
     height: Height,
-) -> Result<(BlockHash, bool, bool)> {
+) -> Result<(IndexStatusUpdate, bool, bool)> {
     let hash = read_canonical_hash(snapshot, height)?
         .ok_or_else(|| anyhow::anyhow!("undo-pruning height {height} is not canonical"))?;
     let mut block = load_block_index_record(snapshot, &hash)?
         .ok_or_else(|| anyhow::anyhow!("undo-pruning block index {} is missing", hash.to_hex()))?;
+    let previous_block = block.clone();
     let mut header = load_header_record(snapshot, &hash)?
         .ok_or_else(|| anyhow::anyhow!("undo-pruning header index {} is missing", hash.to_hex()))?;
     if block.height != height || header.height != height || !block.status.active_chain {
@@ -6124,12 +11901,14 @@ fn stage_prune_payload_height<T: ReadSnapshot, B: WriteBatch>(
                 hash.to_hex()
             );
         }
-        stage_remove_name_tree_snapshot_pin(snapshot, batch, &undo).map_err(|error| {
-            anyhow::anyhow!(
-                "undo-pruning target {} could not retire its name-tree pin: {error}",
-                hash.to_hex()
-            )
-        })?;
+        stage_remove_name_tree_snapshot_pin(snapshot, batch, &undo)
+            .map_err(anyhow::Error::new)
+            .with_context(|| {
+                format!(
+                    "undo-pruning target {} could not retire its name-tree pin",
+                    hash.to_hex()
+                )
+            })?;
         block.status.undo_present = false;
         header.status.undo_present = false;
         batch.delete(ColumnFamily::Undo, hash.as_bytes())?;
@@ -6137,7 +11916,14 @@ fn stage_prune_payload_height<T: ReadSnapshot, B: WriteBatch>(
     };
     write_block_index_to_batch(batch, &block)?;
     write_record_to_batch(batch, &header)?;
-    Ok((hash, undo_pruned, block_pruned))
+    Ok((
+        IndexStatusUpdate {
+            previous_block: Some(previous_block),
+            current: StagedIndexRecord { block, header },
+        },
+        undo_pruned,
+        block_pruned,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6643,19 +12429,35 @@ fn stage_best_header_if_more_work<B: WriteBatch>(
     Ok(())
 }
 
-fn stored_path_from_genesis(
+fn validate_stored_activation_status(record: &BlockIndexRecord) -> Result<()> {
+    if record.status.failed {
+        anyhow::bail!("stored block {} is marked failed", record.hash.to_hex());
+    }
+    if !record.status.header_context_valid
+        || !record.status.body_present
+        || !record.status.body_syntax_valid
+        || !record.status.absolute_finality_valid
+    {
+        anyhow::bail!(
+            "stored block {} has not passed activation prerequisites",
+            record.hash.to_hex()
+        );
+    }
+    Ok(())
+}
+
+fn stored_path_from_genesis_bounded(
     snapshot: &impl ReadSnapshot,
     candidate: BlockHash,
+    maximum_connect: usize,
 ) -> Result<Vec<BlockHash>> {
     let mut reverse = Vec::new();
-    let mut seen = HashSet::new();
     let mut current = candidate;
 
     loop {
-        if !seen.insert(current) {
+        if reverse.len() >= maximum_connect {
             anyhow::bail!(
-                "stored header chain contains a cycle at {}",
-                current.to_hex()
+                "best-work activation needs more than {maximum_connect} replacement blocks"
             );
         }
         let record = load_header_record(snapshot, &current)?
@@ -6686,23 +12488,6 @@ fn stored_path_from_genesis(
 
     reverse.reverse();
     Ok(reverse)
-}
-
-fn validate_stored_activation_status(record: &BlockIndexRecord) -> Result<()> {
-    if record.status.failed {
-        anyhow::bail!("stored block {} is marked failed", record.hash.to_hex());
-    }
-    if !record.status.header_context_valid
-        || !record.status.body_present
-        || !record.status.body_syntax_valid
-        || !record.status.absolute_finality_valid
-    {
-        anyhow::bail!(
-            "stored block {} has not passed activation prerequisites",
-            record.hash.to_hex()
-        );
-    }
-    Ok(())
 }
 
 fn validate_reorg_plan(
@@ -6842,14 +12627,33 @@ fn validate_reorg_plan(
     Ok(())
 }
 
-fn node_import_from_stored(
+fn node_import_from_stored_bounded(
     snapshot: &impl ReadSnapshot,
     hash: &BlockHash,
+    body_bytes: &mut u64,
+    maximum_body_bytes: u64,
 ) -> Result<NodeBlockImport> {
     let record = load_block_index_record(snapshot, hash)?
         .ok_or_else(|| anyhow::anyhow!("stored block index {} is missing", hash.to_hex()))?;
-    let raw = load_raw_block_record(snapshot, hash)?
+    let encoded = snapshot
+        .get(ColumnFamily::Blocks, hash.as_bytes())
+        .context("failed to read stored block body during bounded activation planning")?
         .ok_or_else(|| anyhow::anyhow!("stored block body {} is missing", hash.to_hex()))?;
+    *body_bytes = add_reorg_resource(
+        *body_bytes,
+        u64::try_from(encoded.len()).unwrap_or(u64::MAX),
+        maximum_body_bytes,
+        "reorganization stored body bytes",
+    )?;
+    let raw = RawBlockRecord::decode(&encoded)
+        .map_err(|error| anyhow::anyhow!("stored block record is corrupt: {error}"))?;
+    if raw.hash != *hash {
+        anyhow::bail!(
+            "stored block record key {} disagrees with embedded hash {}",
+            hash.to_hex(),
+            raw.hash.to_hex()
+        );
+    }
     let block = raw
         .decode_block()
         .map_err(|error| anyhow::anyhow!("stored block body is corrupt: {error}"))?;
@@ -7113,6 +12917,9 @@ pub fn init_logging(filter: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::sync::Barrier;
+
     use hns_chain::{read_canonical_hash, BlockIndex, HeaderImport};
     use hns_consensus::{
         block_merkle_root, block_witness_root, ConsensusError, TransactionInputVerifier,
@@ -7122,14 +12929,1074 @@ mod tests {
         Transaction, Txid, Witness,
     };
     use hns_rpc::{JsonRpcRequest, RpcService};
+    #[cfg(feature = "rocksdb-backend")]
+    use hns_state::StateEngine;
     use hns_state::{
-        name_tree_snapshot_pin_key, write_coin_to_batch, RejectSpecialCoinbaseIssuance,
-        StateEngine, StateView,
+        name_tree_snapshot_pin_key, write_coin_to_batch, RejectSpecialCoinbaseIssuance, StateView,
     };
     use hns_store::ReadSnapshot;
     use hns_urkel::MemoryUrkel;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(feature = "rocksdb-backend")]
+    struct ReorgArchivePreflightRejectGuard;
+
+    #[cfg(feature = "rocksdb-backend")]
+    impl ReorgArchivePreflightRejectGuard {
+        fn enable() -> Self {
+            TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(|bytes| bytes.set(0));
+            TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(|bytes| bytes.set(0));
+            TEST_REORG_NAME_STATE_WRITES.with(|writes| writes.set(0));
+            TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT.with(|enabled| {
+                assert!(
+                    !enabled.replace(true),
+                    "reorg archive fault already enabled"
+                );
+            });
+            Self
+        }
+
+        fn appended_name_page_bytes(&self) -> u64 {
+            TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(std::cell::Cell::get)
+        }
+
+        fn maximum_generated_undo_bytes(&self) -> u64 {
+            TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(std::cell::Cell::get)
+        }
+
+        fn generated_name_state_writes(&self) -> u64 {
+            TEST_REORG_NAME_STATE_WRITES.with(std::cell::Cell::get)
+        }
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    impl Drop for ReorgArchivePreflightRejectGuard {
+        fn drop(&mut self) {
+            TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT.with(|enabled| enabled.set(false));
+            TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(|bytes| bytes.set(0));
+            TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(|bytes| bytes.set(0));
+            TEST_REORG_NAME_STATE_WRITES.with(|writes| writes.set(0));
+        }
+    }
+
+    fn complete_store_image(store: &StoreHandle) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+        let snapshot = store.snapshot().expect("complete store snapshot");
+        let mut image = Vec::new();
+        for family in ColumnFamily::ALL {
+            image.extend(
+                snapshot
+                    .scan_prefix(family, b"")
+                    .unwrap_or_else(|error| panic!("scan {}: {error}", family.name()))
+                    .into_iter()
+                    .map(|(key, value)| (family.name(), key, value)),
+            );
+        }
+        image
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    fn flat_directory_file_image(directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        let mut image = std::fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+            .map(|entry| {
+                let entry = entry.expect("read directory entry");
+                let file_type = entry.file_type().expect("read directory entry type");
+                assert!(file_type.is_file(), "unexpected non-file segment entry");
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes = std::fs::read(entry.path()).expect("read segment entry");
+                (name, bytes)
+            })
+            .collect::<Vec<_>>();
+        image.sort_by(|left, right| left.0.cmp(&right.0));
+        image
+    }
+
+    #[test]
+    fn reorg_index_staging_limit_preserves_typed_store_source() {
+        let store = StoreHandle::memory();
+        let record = regtest_genesis_record();
+        let actual = ReorgStagedEffectMeter::operation_charge(
+            record.hash.as_bytes().len(),
+            record.encode().len(),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        let limit = actual.checked_sub(1).expect("positive header write charge");
+        let overlay = StagingOverlay::new();
+        let staged_batch = overlay.batch(store.batch());
+        let mut batch = ReorgMeteredBatch::new(
+            staged_batch,
+            ReorgStagedEffectMeter::new(limit),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+
+        let error = write_record_to_batch(&mut batch, &record)
+            .map_err(anyhow::Error::new)
+            .context("failed to stage header index")
+            .expect_err("header index write must exceed the staged-effect budget");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<ChainError>().is_some()),
+            "chain staging error must remain in the source chain: {error:#}"
+        );
+        let store_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreError>())
+            .expect("typed store limit must remain in the source chain");
+        match store_error {
+            StoreError::LimitExceeded {
+                context,
+                limit: error_limit,
+                actual: error_actual,
+            } => {
+                assert_eq!(*context, ReorgStagedEffectMeter::CONTEXT);
+                assert_eq!(*error_limit, limit);
+                assert_eq!(*error_actual, actual);
+            }
+            other => panic!("unexpected typed store error: {other}"),
+        }
+        assert_eq!(batch.meter.consumed, 0);
+        assert!(overlay.staged_family(ColumnFamily::Headers).is_empty());
+    }
+
+    #[test]
+    fn undo_pruning_pin_limit_preserves_typed_store_source() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let block = block_with_commitments(vec![coinbase_transaction()]);
+        let hash = block.hash();
+        node.connect_block(NodeBlockImport::fixture(block, 0, 1))
+            .expect("connect pruning fixture");
+        let store = node.state.store.clone();
+        let snapshot = store.snapshot().expect("pruning snapshot");
+        let pin_key = name_tree_snapshot_pin_key(0);
+        assert!(snapshot
+            .get(ColumnFamily::Snapshots, &pin_key)
+            .expect("read pruning pin")
+            .is_some());
+
+        let body_delete_charge = ReorgStagedEffectMeter::operation_charge(
+            hash.as_bytes().len(),
+            0,
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        let pin_delete_charge = ReorgStagedEffectMeter::operation_charge(
+            pin_key.len(),
+            0,
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        let mut batch = ReorgMeteredBatch::new(
+            store.batch(),
+            ReorgStagedEffectMeter::new(body_delete_charge),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+
+        let error = stage_prune_payload_height(&snapshot, &mut batch, 0)
+            .expect_err("name-tree pin deletion must exceed the staged-effect budget");
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<StateError>().is_some()),
+            "state staging error must remain in the source chain: {error:#}"
+        );
+        let store_error = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StoreError>())
+            .expect("typed pin-deletion limit must remain in the source chain");
+        match store_error {
+            StoreError::LimitExceeded {
+                context,
+                limit,
+                actual,
+            } => {
+                assert_eq!(*context, ReorgStagedEffectMeter::CONTEXT);
+                assert_eq!(*limit, body_delete_charge);
+                assert_eq!(
+                    *actual,
+                    body_delete_charge.saturating_add(pin_delete_charge)
+                );
+            }
+            other => panic!("unexpected typed store error: {other}"),
+        }
+        assert_eq!(batch.meter.consumed, body_delete_charge);
+    }
+
+    #[test]
+    fn reorg_meter_exact_limit_covers_generated_disconnect_index_name_and_page_writes() {
+        let store = StoreHandle::memory();
+        let old_undo_key = [0x11; 32];
+        let new_undo_key = [0x22; 32];
+        let shared_outpoint = [0x33; 36];
+        let old_coin = b"old-coin";
+        let replacement_coin = vec![0x44; 512];
+        let generated_large_undo = vec![0x55; 2 * 1024 * 1024];
+        let tx_index_key = [0x66; 32];
+        let tx_index_value = vec![0x67; 96];
+        let name_key = [0x77; 32];
+        let name_state = vec![0x78; 4 * 1024];
+        let name_node_key = [0x88; 32];
+        let deferred_name_node = vec![0x89; 8 * 1024];
+        let page_key = b"page-publication";
+        let page_value = vec![0x99; 384];
+
+        let mut seed = store.batch();
+        seed.put(ColumnFamily::Undo, &old_undo_key, b"disconnect-undo")
+            .expect("seed disconnect undo");
+        seed.put(ColumnFamily::Utxo, &shared_outpoint, old_coin)
+            .expect("seed replaced coin");
+        store.commit(seed).expect("commit meter seed");
+
+        let phase_one_charge = [
+            (old_undo_key.len(), 0),
+            (shared_outpoint.len(), 0),
+            (shared_outpoint.len(), replacement_coin.len()),
+            (new_undo_key.len(), generated_large_undo.len()),
+            (tx_index_key.len(), tx_index_value.len()),
+            (name_key.len(), name_state.len()),
+            (name_node_key.len(), deferred_name_node.len()),
+        ]
+        .into_iter()
+        .fold(0u64, |total, (key, value)| {
+            total.saturating_add(ReorgStagedEffectMeter::operation_charge(
+                key,
+                value,
+                REORG_STAGING_OPERATION_COPIES,
+            ))
+        });
+        let page_charge = ReorgStagedEffectMeter::operation_charge(
+            page_key.len(),
+            page_value.len(),
+            REORG_PUBLICATION_OPERATION_COPIES,
+        );
+        let packing_records =
+            BTreeMap::from([(TreeRoot::new(name_node_key), deferred_name_node.clone())]);
+        let packing_charge = ReorgStagedEffectMeter::name_page_packing_charge(&packing_records);
+        let physical_page_charge = ReorgStagedEffectMeter::name_page_output_charge(1);
+        let exact_limit = phase_one_charge
+            .checked_add(packing_charge)
+            .expect("exact page packing limit")
+            .checked_add(physical_page_charge)
+            .expect("exact physical page limit")
+            .checked_add(page_charge)
+            .expect("exact meter limit");
+
+        let base = store.snapshot().expect("meter base");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&base);
+        let staged_batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
+        let mut batch = ReorgMeteredBatch::new(
+            staged_batch,
+            ReorgStagedEffectMeter::new(exact_limit),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        batch
+            .delete(ColumnFamily::Undo, &old_undo_key)
+            .expect("meter disconnect undo deletion");
+        batch
+            .delete(ColumnFamily::Utxo, &shared_outpoint)
+            .expect("meter disconnected coin deletion");
+        batch
+            .put(ColumnFamily::Utxo, &shared_outpoint, &replacement_coin)
+            .expect("meter replacement coin");
+        batch
+            .put(ColumnFamily::Undo, &new_undo_key, &generated_large_undo)
+            .expect("meter connect-generated undo");
+        batch
+            .put(ColumnFamily::TxIndex, &tx_index_key, &tx_index_value)
+            .expect("meter transaction index");
+        batch
+            .put(ColumnFamily::NameState, &name_key, &name_state)
+            .expect("meter name state");
+        batch
+            .put(
+                ColumnFamily::NameTreeNodes,
+                &name_node_key,
+                &deferred_name_node,
+            )
+            .expect("meter deferred name node");
+
+        assert_eq!(
+            staged
+                .get(ColumnFamily::Utxo, &shared_outpoint)
+                .expect("staged replacement coin"),
+            Some(replacement_coin.clone()),
+            "disconnect/connect writes to one logical key must retain read-your-writes semantics"
+        );
+        assert_eq!(
+            staged
+                .get(ColumnFamily::Undo, &old_undo_key)
+                .expect("staged disconnect undo"),
+            None
+        );
+        assert_eq!(
+            overlay
+                .staged_family(ColumnFamily::NameTreeNodes)
+                .get(name_node_key.as_slice())
+                .cloned()
+                .flatten(),
+            Some(deferred_name_node.clone())
+        );
+        batch
+            .charge_name_page_packing(&packing_records)
+            .expect("exact-limit name-page packing");
+
+        let (batch, meter) = batch.into_parts();
+        assert_eq!(
+            meter.consumed,
+            phase_one_charge.saturating_add(packing_charge)
+        );
+        let mut batch = ReorgMeteredBatch::new(
+            batch.into_inner(),
+            meter,
+            REORG_PUBLICATION_OPERATION_COPIES,
+        );
+        batch
+            .charge_name_page_output(1)
+            .expect("exact-limit physical name page");
+        batch
+            .put(ColumnFamily::Snapshots, page_key, &page_value)
+            .expect("exact-limit page publication");
+        assert_eq!(batch.meter.consumed, exact_limit);
+        let error = batch
+            .delete(ColumnFamily::Snapshots, b"one-operation-over")
+            .expect_err("post-overlay page write must share the exhausted budget");
+        assert!(matches!(
+            error,
+            StoreError::LimitExceeded {
+                context: ReorgStagedEffectMeter::CONTEXT,
+                limit,
+                actual,
+            } if limit == exact_limit && actual > limit
+        ));
+        assert_eq!(batch.meter.consumed, exact_limit);
+
+        let (inner, _) = batch.into_parts();
+        drop(staged);
+        drop(base);
+        drop(overlay);
+        store.commit(inner).expect("commit exact-limit batch");
+        let committed = store.snapshot().expect("committed meter snapshot");
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Utxo, &shared_outpoint)
+                .expect("committed replacement coin"),
+            Some(replacement_coin)
+        );
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Undo, &old_undo_key)
+                .expect("committed disconnect undo deletion"),
+            None
+        );
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Undo, &new_undo_key)
+                .expect("committed generated undo"),
+            Some(generated_large_undo)
+        );
+        assert_eq!(
+            committed
+                .get(ColumnFamily::NameTreeNodes, &name_node_key)
+                .expect("deferred name node backend"),
+            None,
+            "deferred name nodes belong to the page map, not the backend batch"
+        );
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Snapshots, page_key)
+                .expect("committed page mutation"),
+            Some(page_value)
+        );
+    }
+
+    #[test]
+    fn reorg_meter_rejects_one_budget_byte_over_before_any_staging_copy() {
+        let store = StoreHandle::memory();
+        let key = [0xa1; 32];
+        let value = vec![0xa2; 64 * 1024];
+        let charge = ReorgStagedEffectMeter::operation_charge(
+            key.len(),
+            value.len(),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        let limit = charge.checked_sub(1).expect("positive operation charge");
+        let overlay = StagingOverlay::new();
+        let staged_batch = overlay.batch(store.batch());
+        let mut batch = ReorgMeteredBatch::new(
+            staged_batch,
+            ReorgStagedEffectMeter::new(limit),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+
+        let error = batch
+            .put(ColumnFamily::Undo, &key, &value)
+            .expect_err("one budget byte over");
+        assert!(matches!(
+            error,
+            StoreError::LimitExceeded {
+                context: ReorgStagedEffectMeter::CONTEXT,
+                limit: error_limit,
+                actual,
+            } if error_limit == limit && actual == charge
+        ));
+        assert_eq!(batch.meter.consumed, 0);
+        assert!(overlay.staged_family(ColumnFamily::Undo).is_empty());
+        let (batch, _) = batch.into_parts();
+        store
+            .commit(batch.into_inner())
+            .expect("rejected batch remains empty");
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("post-rejection snapshot")
+                .get(ColumnFamily::Undo, &key)
+                .expect("post-rejection lookup"),
+            None
+        );
+    }
+
+    #[test]
+    fn reorg_meter_rejects_one_byte_over_physical_page_before_output() {
+        let charge = ReorgStagedEffectMeter::name_page_output_charge(1);
+        let limit = charge.checked_sub(1).expect("positive page charge");
+        let mut meter = ReorgStagedEffectMeter::new(limit);
+        let error = meter
+            .charge_name_page_output(1)
+            .expect_err("one byte over fixed-size page output");
+        assert!(matches!(
+            error,
+            StoreError::LimitExceeded {
+                context: ReorgStagedEffectMeter::CONTEXT,
+                limit: error_limit,
+                actual,
+            } if error_limit == limit && actual == charge
+        ));
+        assert_eq!(meter.consumed, 0);
+    }
+
+    #[test]
+    fn reorg_meter_rejects_one_byte_over_before_name_page_pack_allocations() {
+        let modeled_per_record_metadata = std::mem::size_of::<(TreeRoot, Vec<u8>)>()
+            .saturating_add(std::mem::size_of::<(TreeRoot, &[u8])>())
+            .saturating_add(3usize.saturating_mul(std::mem::size_of::<TreeRoot>()))
+            .saturating_add(std::mem::size_of::<(TreeRoot, hns_store::NamePageAddress)>())
+            .saturating_add(std::mem::size_of::<hns_store::NamePageRecord>());
+        assert!(
+            modeled_per_record_metadata.saturating_mul(2)
+                <= REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD as usize,
+            "the 1 KiB packing allowance must cover modeled structs plus 2x container headroom"
+        );
+        let records = BTreeMap::from([(TreeRoot::new([0xb1; 32]), vec![0xb2; 8 * 1024])]);
+        let charge = ReorgStagedEffectMeter::name_page_packing_charge(&records);
+        let limit = charge.checked_sub(1).expect("positive packing charge");
+        let mut meter = ReorgStagedEffectMeter::new(limit);
+        let error = meter
+            .charge_name_page_packing(&records)
+            .expect_err("one byte over name-page packing budget");
+        assert!(matches!(
+            error,
+            StoreError::LimitExceeded {
+                context: ReorgStagedEffectMeter::CONTEXT,
+                limit: error_limit,
+                actual,
+            } if error_limit == limit && actual == charge
+        ));
+        assert_eq!(meter.consumed, 0);
+    }
+
+    #[test]
+    fn rollback_uncommitted_tail_removes_a_prepared_segment_seal() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-name-page-seal-rollback-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let initialized = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize seal rollback store");
+        drop(initialized);
+        let mut pages =
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("open pages");
+        let state_before = pages.state.clone();
+        let path_before = pages.file_path.clone();
+        let store_before = complete_store_image(&store);
+        let successor_path = name_page_file_path(
+            &directory,
+            state_before.manifest.generation,
+            state_before.manifest.active_segment + 1,
+        );
+
+        let snapshot = store.snapshot().expect("seal rollback snapshot");
+        let (reader, legacy) = pages
+            .reader_for_roots(&snapshot, std::iter::empty(), false)
+            .expect("seal rollback reader");
+        assert!(!legacy);
+        let mut batch = store.batch();
+        let prepared = pages
+            .prepare_root(
+                &snapshot,
+                &mut batch,
+                &reader,
+                BTreeMap::new(),
+                &[],
+                NamePageRootTarget {
+                    root: state_before.root,
+                    height: Some(NAME_PAGE_SEGMENT_BLOCKS),
+                },
+            )
+            .expect("prepare unpublished segment seal");
+        assert_eq!(
+            prepared.manifest.active_segment,
+            state_before.manifest.active_segment + 1
+        );
+        assert!(successor_path.exists());
+        assert_eq!(pages.file_path, successor_path);
+        drop(reader);
+        drop(snapshot);
+        drop(batch);
+
+        pages
+            .rollback_uncommitted_tail()
+            .expect("roll back unpublished segment seal");
+        assert!(!successor_path.exists());
+        assert_eq!(pages.file_path, path_before);
+        assert_eq!(pages.state, state_before);
+        assert_eq!(pages.generation_bytes, pages.committed_generation_bytes);
+        assert_eq!(complete_store_image(&store), store_before);
+
+        drop(pages);
+        std::fs::remove_dir_all(directory).expect("remove seal rollback fixture");
+    }
+
+    #[test]
+    fn failed_name_page_tail_rollback_fences_node_storage() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-name-page-rollback-fence-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize rollback fence store");
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("open pages"),
+        );
+        // Deterministically make truncate validation fail after the rollback
+        // has surrendered its live appender. This models remove/truncate/reopen
+        // failures without relying on platform-specific open-file semantics.
+        state
+            .name_pages
+            .as_mut()
+            .expect("page storage")
+            .state
+            .manifest
+            .durable_bytes = 1;
+        let error = state
+            .name_pages
+            .as_mut()
+            .expect("page storage")
+            .rollback_uncommitted_tail()
+            .expect_err("invalid committed boundary must fail rollback");
+        assert!(
+            format!("{error:#}").contains("storage is fenced until restart"),
+            "{error:#}"
+        );
+        let pages = state.name_pages.as_ref().expect("fenced pages");
+        assert!(pages.reopen_required);
+        assert!(pages.appender.is_none());
+        assert!(state.storage_reopen_required());
+        let authority_error = state
+            .ensure_storage_operational()
+            .expect_err("fenced rollback must revoke node storage authority");
+        assert!(
+            authority_error.to_string().contains("restart and reopen"),
+            "{authority_error:#}"
+        );
+
+        drop(state);
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove rollback fence fixture");
+    }
+
+    struct CountingNamePageSnapshot<'a, S> {
+        inner: &'a S,
+        locator_gets: Cell<usize>,
+        locator_scans: Cell<usize>,
+    }
+
+    #[test]
+    fn concurrent_safety_fences_preserve_one_first_cause_record() {
+        const WORKERS: usize = 8;
+
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize fenced store");
+        let chain = state.chain.clone();
+        let barrier = Arc::new(Barrier::new(WORKERS));
+        let mut workers = Vec::new();
+        for index in 0..WORKERS {
+            let store = store.clone();
+            let chain = chain.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                chain
+                    .record_external_safety_fence(ProductionSafetyFence {
+                        version: PRODUCTION_SAFETY_FENCE_VERSION,
+                        kind: ProductionSafetyFenceKind::Storage,
+                        context: format!("concurrent-first-cause-{index}"),
+                        limit: 100,
+                        actual: 101 + index as u64,
+                        root: None,
+                        candidate: None,
+                        detail: format!("concurrent fence candidate {index}"),
+                    })
+                    .expect("persist concurrent fence");
+                inspect_production_safety_fence(&store)
+                    .expect("inspect concurrent fence")
+                    .expect("fence exists")
+                    .digest
+            }));
+        }
+        let digests = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("fence worker"))
+            .collect::<Vec<_>>();
+        assert!(digests.windows(2).all(|pair| pair[0] == pair[1]));
+        let first = inspect_production_safety_fence(&store)
+            .expect("inspect first cause")
+            .expect("first cause");
+
+        chain
+            .record_external_safety_fence(ProductionSafetyFence {
+                version: PRODUCTION_SAFETY_FENCE_VERSION,
+                kind: ProductionSafetyFenceKind::PayloadSegmentCompaction,
+                context: "later-different-cause".to_owned(),
+                limit: 1,
+                actual: 2,
+                root: None,
+                candidate: None,
+                detail: "must not replace first cause".to_owned(),
+            })
+            .expect("later fence remains idempotent");
+        let final_evidence = inspect_production_safety_fence(&store)
+            .expect("inspect final fence")
+            .expect("final fence");
+        assert_eq!(final_evidence.encoded, first.encoded);
+        assert_eq!(final_evidence.digest, first.digest);
+    }
+
+    #[test]
+    fn waiting_writer_rechecks_fence_after_acquiring_inner_lock() {
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize writer-race store");
+        let chain = state.chain.clone();
+        let reader = chain.inner.read().expect("hold inner read lock");
+        let (prechecked_tx, prechecked_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+        let mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_mutated = Arc::clone(&mutated);
+        let worker_chain = chain.clone();
+        let worker = std::thread::spawn(move || {
+            worker_chain.write_after_initial_check(
+                || {
+                    prechecked_tx.send(()).expect("announce initial precheck");
+                    continue_rx.recv().expect("resume waiting writer");
+                },
+                |_index| {
+                    worker_mutated.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+        });
+
+        prechecked_rx.recv().expect("writer reached inner lock");
+        chain
+            .persist_first_cause(
+                reader.store(),
+                ProductionSafetyFence {
+                    version: PRODUCTION_SAFETY_FENCE_VERSION,
+                    kind: ProductionSafetyFenceKind::LiveHeaderOperation,
+                    context: "deterministic writer admission race".to_owned(),
+                    limit: 1,
+                    actual: 2,
+                    root: None,
+                    candidate: Some(BlockHash::new([0x6a; 32])),
+                    detail: "reader published while writer waited".to_owned(),
+                },
+            )
+            .expect("reader publishes fence while retaining inner lock");
+        continue_tx.send(()).expect("resume writer");
+        drop(reader);
+
+        let error = worker
+            .join()
+            .expect("writer thread")
+            .expect_err("writer must reject the newly published fence");
+        assert!(
+            error
+                .to_string()
+                .contains("production safety fence blocks header mutation"),
+            "unexpected writer error: {error}"
+        );
+        assert!(!mutated.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            inspect_production_safety_fence(&store)
+                .expect("inspect writer-race fence")
+                .expect("writer-race fence")
+                .fence
+                .context,
+            "deterministic writer admission race"
+        );
+    }
+
+    #[test]
+    fn generic_header_fence_refuses_unproven_clear() {
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize clear-refusal store");
+        state
+            .chain
+            .record_external_safety_fence(ProductionSafetyFence {
+                version: PRODUCTION_SAFETY_FENCE_VERSION,
+                kind: ProductionSafetyFenceKind::LiveHeaderOperation,
+                context: "header import records".to_owned(),
+                limit: 2_000,
+                actual: 2_001,
+                root: None,
+                candidate: Some(BlockHash::new([0x55; 32])),
+                detail: "offline recovery required".to_owned(),
+            })
+            .expect("persist generic header fence");
+        let evidence = inspect_production_safety_fence(&store)
+            .expect("inspect generic fence")
+            .expect("generic fence");
+        let error = clear_production_safety_fence_validated(
+            &store,
+            Network::Regtest,
+            ProductionSafetyFenceClearRequest {
+                expected_digest: evidence.digest,
+                acknowledgement:
+                    ProductionSafetyFenceClearAcknowledgement::OfflineRecoveryCompletedAndVerified,
+                name_page_directory: None,
+            },
+        )
+        .expect_err("generic header clear lacks typed proof");
+        assert!(error
+            .to_string()
+            .contains("no safe automatic recovery proof"));
+        assert_eq!(
+            inspect_production_safety_fence(&store)
+                .expect("reinspect generic fence")
+                .expect("generic fence remains")
+                .encoded,
+            evidence.encoded
+        );
+    }
+
+    #[test]
+    fn alternate_header_budget_failure_records_typed_live_header_fence() {
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize alternate-header fence store");
+        let candidate = BlockHash::new([0x4a; 32]);
+        {
+            let index = state.chain.inner.read().expect("header index read lock");
+            state
+                .chain
+                .record_resource_fence(
+                    &index,
+                    &ChainError::LiveWorkLimit {
+                        context: "resident alternate headers",
+                        limit: MAX_RESIDENT_ALTERNATE_HEADERS,
+                        actual: MAX_RESIDENT_ALTERNATE_HEADERS + 1,
+                    },
+                    ProductionSafetyFenceKind::LiveHeaderOperation,
+                    None,
+                    Some(candidate),
+                )
+                .expect("persist alternate-header fence");
+        }
+
+        let evidence = inspect_production_safety_fence(&store)
+            .expect("inspect alternate-header fence")
+            .expect("alternate-header fence");
+        assert_eq!(
+            evidence.fence.kind,
+            ProductionSafetyFenceKind::LiveHeaderOperation
+        );
+        assert_eq!(evidence.fence.context, "resident alternate headers");
+        assert_eq!(evidence.fence.limit, MAX_RESIDENT_ALTERNATE_HEADERS as u64);
+        assert_eq!(
+            evidence.fence.actual,
+            MAX_RESIDENT_ALTERNATE_HEADERS as u64 + 1
+        );
+        assert_eq!(evidence.fence.candidate, Some(candidate));
+    }
+
+    #[test]
+    fn reorganization_fence_without_candidate_and_generic_storage_fence_refuse_clear() {
+        for (kind, context, expected) in [
+            (
+                ProductionSafetyFenceKind::LiveHeaderReorganization,
+                "reorg disconnect",
+                "typed candidate identity",
+            ),
+            (
+                ProductionSafetyFenceKind::Storage,
+                "unknown storage recovery",
+                "operation-specific automatic recovery proof",
+            ),
+        ] {
+            let store = StoreHandle::memory();
+            let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+                .expect("initialize refusal store");
+            state
+                .chain
+                .record_external_safety_fence(ProductionSafetyFence {
+                    version: PRODUCTION_SAFETY_FENCE_VERSION,
+                    kind,
+                    context: context.to_owned(),
+                    limit: 1,
+                    actual: 2,
+                    root: None,
+                    candidate: None,
+                    detail: "typed recovery evidence is unavailable".to_owned(),
+                })
+                .expect("persist refusal fence");
+            let evidence = inspect_production_safety_fence(&store)
+                .expect("inspect refusal fence")
+                .expect("refusal fence");
+            let error = clear_production_safety_fence_validated(
+                &store,
+                Network::Regtest,
+                ProductionSafetyFenceClearRequest {
+                    expected_digest: evidence.digest,
+                    acknowledgement:
+                        ProductionSafetyFenceClearAcknowledgement::OfflineRecoveryCompletedAndVerified,
+                    name_page_directory: None,
+                },
+            )
+            .expect_err("untyped fence must refuse clear");
+            assert!(error.to_string().contains(expected), "{error:#}");
+            assert_eq!(
+                inspect_production_safety_fence(&store)
+                    .expect("reinspect refusal fence")
+                    .expect("refusal fence remains")
+                    .digest,
+                evidence.digest
+            );
+        }
+    }
+
+    #[test]
+    fn reorganization_fence_clears_when_exact_candidate_was_removed_offline() {
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize missing-candidate store");
+        let candidate = BlockHash::new([0x73; 32]);
+        state
+            .chain
+            .record_external_safety_fence(ProductionSafetyFence {
+                version: PRODUCTION_SAFETY_FENCE_VERSION,
+                kind: ProductionSafetyFenceKind::LiveHeaderReorganization,
+                context: "reorg connect".to_owned(),
+                limit: 1_024,
+                actual: 1_025,
+                root: None,
+                candidate: Some(candidate),
+                detail: "offline candidate removal required".to_owned(),
+            })
+            .expect("persist reorganization fence");
+        let evidence = inspect_production_safety_fence(&store)
+            .expect("inspect reorganization fence")
+            .expect("reorganization fence");
+        let cleared = clear_production_safety_fence_validated(
+            &store,
+            Network::Regtest,
+            ProductionSafetyFenceClearRequest {
+                expected_digest: evidence.digest,
+                acknowledgement:
+                    ProductionSafetyFenceClearAcknowledgement::OfflineRecoveryCompletedAndVerified,
+                name_page_directory: None,
+            },
+        )
+        .expect("removed exact candidate resolves reorganization fence");
+        assert_eq!(cleared.digest, evidence.digest);
+        assert!(inspect_production_safety_fence(&store)
+            .expect("inspect cleared reorganization fence")
+            .is_none());
+    }
+
+    #[test]
+    fn payload_compaction_fence_refuses_clear_without_bounded_scrub() {
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize payload-fence store");
+        state
+            .chain
+            .record_external_safety_fence(ProductionSafetyFence {
+                version: PRODUCTION_SAFETY_FENCE_VERSION,
+                kind: ProductionSafetyFenceKind::PayloadSegmentCompaction,
+                context: "segment compaction output bytes".to_owned(),
+                limit: 150_000_000_000,
+                actual: 150_000_000_001,
+                root: None,
+                candidate: None,
+                detail: "bounded authenticated scrub required".to_owned(),
+            })
+            .expect("persist payload fence");
+        let evidence = inspect_production_safety_fence(&store)
+            .expect("inspect payload fence")
+            .expect("payload fence");
+        let error = clear_production_safety_fence_validated(
+            &store,
+            Network::Regtest,
+            ProductionSafetyFenceClearRequest {
+                expected_digest: evidence.digest,
+                acknowledgement:
+                    ProductionSafetyFenceClearAcknowledgement::OfflineRecoveryCompletedAndVerified,
+                name_page_directory: None,
+            },
+        )
+        .expect_err("payload clear requires a bounded scrub");
+        assert!(
+            error.to_string().contains("bounded authenticated scrub"),
+            "{error:#}"
+        );
+        assert_eq!(
+            inspect_production_safety_fence(&store)
+                .expect("reinspect payload fence")
+                .expect("payload fence remains")
+                .digest,
+            evidence.digest
+        );
+    }
+
+    #[test]
+    fn name_page_compaction_fence_clears_only_after_bounded_physical_audit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-name-page-fence-clear-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize page-fence store");
+        drop(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store)
+                .expect("bootstrap authoritative pages"),
+        );
+        state
+            .chain
+            .record_external_safety_fence(ProductionSafetyFence {
+                version: PRODUCTION_SAFETY_FENCE_VERSION,
+                kind: ProductionSafetyFenceKind::NamePageCompaction,
+                context: "name-page root locator records".to_owned(),
+                limit: MAX_NAME_PAGE_ROOT_LOCATORS,
+                actual: MAX_NAME_PAGE_ROOT_LOCATORS + 1,
+                root: None,
+                candidate: None,
+                detail: "offline compaction recovery required".to_owned(),
+            })
+            .expect("persist page fence");
+        let evidence = inspect_production_safety_fence(&store)
+            .expect("inspect page fence")
+            .expect("page fence");
+
+        let cleared = clear_production_safety_fence_validated(
+            &store,
+            Network::Regtest,
+            ProductionSafetyFenceClearRequest {
+                expected_digest: evidence.digest,
+                acknowledgement:
+                    ProductionSafetyFenceClearAcknowledgement::OfflineRecoveryCompletedAndVerified,
+                name_page_directory: Some(directory.clone()),
+            },
+        )
+        .expect("bounded physical audit clears recovered page fence");
+        assert_eq!(cleared.digest, evidence.digest);
+        assert!(inspect_production_safety_fence(&store)
+            .expect("reinspect cleared page fence")
+            .is_none());
+        std::fs::remove_dir_all(directory).expect("remove page-fence directory");
+    }
+
+    impl<'a, S> CountingNamePageSnapshot<'a, S> {
+        fn new(inner: &'a S) -> Self {
+            Self {
+                inner,
+                locator_gets: Cell::new(0),
+                locator_scans: Cell::new(0),
+            }
+        }
+    }
+
+    impl<S: ReadSnapshot> ReadSnapshot for CountingNamePageSnapshot<'_, S> {
+        fn get(
+            &self,
+            family: ColumnFamily,
+            key: &[u8],
+        ) -> std::result::Result<Option<Vec<u8>>, hns_store::StoreError> {
+            if family == ColumnFamily::Snapshots && key.starts_with(NAME_PAGE_ROOT_PREFIX) {
+                self.locator_gets.set(self.locator_gets.get() + 1);
+            }
+            self.inner.get(family, key)
+        }
+
+        fn get_many(
+            &self,
+            family: ColumnFamily,
+            keys: &[&[u8]],
+        ) -> std::result::Result<Vec<Option<Vec<u8>>>, hns_store::StoreError> {
+            self.inner.get_many(family, keys)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> std::result::Result<Vec<hns_store::ScanEntry>, hns_store::StoreError> {
+            if family == ColumnFamily::Snapshots && prefix == NAME_PAGE_ROOT_PREFIX {
+                self.locator_scans.set(self.locator_scans.get() + 1);
+            }
+            self.inner.scan_prefix(family, prefix)
+        }
+
+        fn prefetch_name_tree_paths(
+            &self,
+            root: [u8; 32],
+            keys: &[[u8; 32]],
+        ) -> std::result::Result<Option<Vec<hns_store::NameTreePathRecord>>, hns_store::StoreError>
+        {
+            self.inner.prefetch_name_tree_paths(root, keys)
+        }
+    }
 
     #[derive(Clone, Copy, Debug)]
     struct AllowAllInputVerifier;
@@ -7253,6 +14120,79 @@ mod tests {
             .chunks_exact(2)
             .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
             .collect()
+    }
+
+    fn mine_header(mut header: Header) -> Header {
+        while !header.verify_pow() {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        header
+    }
+
+    fn unmined_header(mut header: Header) -> Header {
+        while header.verify_pow() {
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        header
+    }
+
+    fn strict_header_record(
+        header: Header,
+        height: Height,
+        parent: Option<&HeaderRecord>,
+    ) -> HeaderRecord {
+        hns_chain::prepare_header_record(
+            &HeaderImport {
+                header,
+                height,
+                verify_pow: false,
+                checkpoint_valid: true,
+            },
+            parent,
+        )
+        .expect("strict fixture header record")
+    }
+
+    fn strict_header_store(records: &[HeaderRecord], best: BlockHash) -> StoreHandle {
+        let store = StoreHandle::memory();
+        hns_store::initialize_schema(&store).expect("initialize strict header store");
+        let mut batch = store.batch();
+        for record in records {
+            write_record_to_batch(&mut batch, record).expect("stage strict header record");
+        }
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestHeaderHash.as_bytes(),
+                best.as_bytes(),
+            )
+            .expect("stage strict best header");
+        store.commit(batch).expect("commit strict header store");
+        store
+    }
+
+    fn regtest_genesis_record() -> HeaderRecord {
+        strict_header_record(Network::Regtest.params().genesis_header(), 0, None)
+    }
+
+    fn regtest_child_record(
+        parent: &HeaderRecord,
+        time: u64,
+        bits: u32,
+        require_pow: bool,
+    ) -> HeaderRecord {
+        let header = Header {
+            prev_block: parent.hash,
+            time,
+            bits,
+            ..Header::default()
+        };
+        let header = if require_pow {
+            mine_header(header)
+        } else {
+            unmined_header(header)
+        };
+        strict_header_record(header, parent.height + 1, Some(parent))
     }
 
     // Raw HSD `getblockheader <hash> false` response for mainnet height
@@ -7585,9 +14525,26 @@ mod tests {
         let proof = StatelessBodyValidation::for_block(&block, 17, Network::Regtest);
         let request = NodeBlockImport::from_peer(block.clone(), 17);
         proof.verify(&request).expect("matching worker evidence");
+        proof
+            .verify(&NodeBlockImport::fixture(block.clone(), 17, 1))
+            .expect("test-only fixture policy accepts exact worker evidence");
+        let prepared = PreparedNativeActivation::new(vec![proof]).expect("prepared activation");
+        prepared
+            .authenticate(&NodeReorg {
+                disconnect: Vec::new(),
+                connect: vec![request.clone()],
+            })
+            .expect("prepared activation identity");
+        assert!(PreparedNativeActivation::new(vec![proof, proof]).is_err());
 
         let wrong_height = NodeBlockImport::from_peer(block.clone(), 18);
         assert!(proof.verify(&wrong_height).is_err());
+        assert!(prepared
+            .authenticate(&NodeReorg {
+                disconnect: Vec::new(),
+                connect: vec![wrong_height.clone()],
+            })
+            .is_err());
 
         let mut mutated = block;
         mutated.header.nonce = mutated.header.nonce.saturating_add(1);
@@ -7660,10 +14617,10 @@ mod tests {
     fn peer_transaction_node(tip_height: Height) -> NodeService {
         let config = NodeConfig {
             network: Network::Regtest,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             mining_engine: MiningEngineConfig {
                 enabled: true,
@@ -7810,16 +14767,16 @@ mod tests {
         }
     }
 
-    fn active_state_shadow_config() -> NodeConfig {
+    fn active_state_native_config() -> NodeConfig {
         NodeConfig {
             network: Network::Regtest,
-            authority_mode: AuthorityMode::Shadow,
+            authority_mode: AuthorityMode::Disabled,
             acknowledge_incomplete_consensus: true,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 connect_active_state: true,
                 connect: vec!["127.0.0.1:14038".parse().expect("peer")],
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             ..NodeConfig::default()
         }
@@ -7835,12 +14792,12 @@ mod tests {
             authority_mode: AuthorityMode::Native,
             mainnet_canary: true,
             storage_durability: DurabilityPolicy::Sync,
-            shadow_sync: ShadowSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: true,
                 connect_active_state: true,
                 discovery: true,
                 maximum_outbound: 4,
-                ..ShadowSyncConfig::default()
+                ..NativeSyncConfig::default()
             },
             mining_engine: MiningEngineConfig {
                 enabled: true,
@@ -7853,10 +14810,21 @@ mod tests {
 
     fn store_fixture_alternate(
         node: &mut NodeService,
-        block: Block,
+        mut block: Block,
         height: Height,
         chainwork: u64,
     ) -> BlockIndexRecord {
+        let coinbase = block
+            .transactions
+            .first_mut()
+            .expect("stored alternate fixture has a coinbase");
+        assert!(
+            hns_consensus::is_coinbase(coinbase),
+            "stored alternate fixture begins with a coinbase"
+        );
+        coinbase.locktime = height;
+        block.header.merkle_root = block_merkle_root(&block);
+        block.header.witness_root = block_witness_root(&block);
         let request = NodeBlockImport::fixture(block, height, chainwork);
         let validated = node
             .state()
@@ -8284,6 +15252,155 @@ mod tests {
     }
 
     #[test]
+    fn strict_startup_accepts_network_genesis_and_valid_header_branches() {
+        let genesis = regtest_genesis_record();
+        let child = regtest_child_record(
+            &genesis,
+            genesis.header.time + 1,
+            Network::Regtest.params().pow.bits,
+            true,
+        );
+        let store = strict_header_store(&[genesis, child.clone()], child.hash);
+
+        let state = NodeState::from_store_for_network_strict_for_test(store, Network::Regtest)
+            .expect("strict valid header recovery");
+        assert_eq!(
+            state.chain.best_tip().expect("best").expect("tip").hash,
+            child.hash
+        );
+    }
+
+    #[test]
+    fn strict_startup_rejects_wrong_network_root_and_invalid_side_headers() {
+        let mut wrong_header = Network::Regtest.params().genesis_header();
+        wrong_header.nonce ^= 1;
+        let wrong = strict_header_record(wrong_header, 0, None);
+        let error = NodeState::from_store_for_network_strict_for_test(
+            strict_header_store(std::slice::from_ref(&wrong), wrong.hash),
+            Network::Regtest,
+        )
+        .expect_err("wrong genesis must fail recovery");
+        assert!(
+            format!("{error:#}").contains("genesis header does not match"),
+            "{error:#}"
+        );
+
+        let cases = [
+            (
+                "difficulty",
+                regtest_child_record(
+                    &regtest_genesis_record(),
+                    Network::Regtest.params().genesis_time + 1,
+                    0x207f_fffe,
+                    true,
+                ),
+                "unexpected difficulty bits",
+            ),
+            (
+                "median-time",
+                regtest_child_record(
+                    &regtest_genesis_record(),
+                    Network::Regtest.params().genesis_time,
+                    Network::Regtest.params().pow.bits,
+                    true,
+                ),
+                "median time",
+            ),
+            (
+                "proof-of-work",
+                regtest_child_record(
+                    &regtest_genesis_record(),
+                    Network::Regtest.params().genesis_time + 1,
+                    Network::Regtest.params().pow.bits,
+                    false,
+                ),
+                "proof of work",
+            ),
+            (
+                "future-time",
+                regtest_child_record(
+                    &regtest_genesis_record(),
+                    current_unix_time()
+                        .expect("current time")
+                        .saturating_add(MAX_FUTURE_BLOCK_TIME)
+                        .saturating_add(60),
+                    Network::Regtest.params().pow.bits,
+                    true,
+                ),
+                "too far in the future",
+            ),
+        ];
+        for (name, mut invalid, expected) in cases {
+            let genesis = regtest_genesis_record();
+            invalid.status.failed = true;
+            let store = strict_header_store(&[genesis.clone(), invalid], genesis.hash);
+            let error = NodeState::from_store_for_network_strict_for_test(store, Network::Regtest)
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{name} corruption returned {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_startup_rejects_block_header_and_bidirectional_height_mismatches() {
+        let cases = [
+            ("status", false, false),
+            ("active-reverse", true, false),
+            ("height-forward", false, true),
+        ];
+        for (name, active, forged_height) in cases {
+            let mut genesis = regtest_genesis_record();
+            genesis.status.active_chain = active;
+            let store = strict_header_store(std::slice::from_ref(&genesis), genesis.hash);
+            let mut block = BlockIndexRecord {
+                hash: genesis.hash,
+                height: genesis.height,
+                prev_hash: genesis.header.prev_block,
+                chainwork: genesis.chainwork,
+                status: genesis.status.clone(),
+                tx_count: 0,
+                validated_at: None,
+            };
+            if name == "status" {
+                block.status.body_present = true;
+            }
+            let mut batch = store.batch();
+            write_block_index_to_batch(&mut batch, &block).expect("stage block index");
+            if forged_height {
+                write_canonical_height_to_batch(&mut batch, 0, block.hash)
+                    .expect("stage forged active height");
+            }
+            store.commit(batch).expect("commit corrupt block binding");
+
+            let error = NodeState::from_store_for_network_strict_for_test(store, Network::Regtest)
+                .unwrap_err();
+            let detail = format!("{error:#}");
+            assert!(
+                detail.contains("disagrees")
+                    || detail.contains("reverse-bound")
+                    || detail.contains("non-active"),
+                "{name} corruption returned {detail}"
+            );
+        }
+
+        let genesis = regtest_genesis_record();
+        let store = strict_header_store(std::slice::from_ref(&genesis), genesis.hash);
+        let missing = BlockHash::new([0x5a; 32]);
+        let mut batch = store.batch();
+        write_canonical_height_to_batch(&mut batch, 0, missing)
+            .expect("stage missing forward binding");
+        store.commit(batch).expect("commit missing forward binding");
+        let error = NodeState::from_store_for_network_strict_for_test(store, Network::Regtest)
+            .expect_err("height index to missing block must fail");
+        assert!(
+            format!("{error:#}").contains("points to missing block index"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn strict_import_accepts_every_canonical_hsd_genesis_block() {
         let fixture: Value =
             serde_json::from_str(include_str!("../../../fixtures/hsd/blocks/genesis-v1.json"))
@@ -8409,7 +15526,7 @@ mod tests {
             network: Network::Mainnet,
             ..NodeConfig::default()
         });
-        node.shadow_sync_ensure_genesis_header()
+        node.native_sync_ensure_genesis_header()
             .expect("canonical mainnet genesis header");
         let error = node
             .state
@@ -8549,7 +15666,7 @@ mod tests {
 
     #[test]
     fn mining_snapshot_uses_interval_committed_name_root() {
-        let mut node = NodeService::new(active_state_shadow_config());
+        let mut node = NodeService::new(active_state_native_config());
         let store = node.state.store.clone();
         node.state.state_engine = StoredStateEngine::with_services(
             store,
@@ -8636,6 +15753,805 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_page_reader_does_not_scan_historical_root_locators() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-node-name-page-point-roots-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = StoreHandle::memory();
+        drop(
+            NodeState::from_store_for_network(store.clone(), Network::Regtest)
+                .expect("initialize page store"),
+        );
+        let pages =
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("open pages");
+        let locator = NamePageRootLocator::new(
+            pages.state.manifest.generation,
+            hns_store::NamePageAddress::new(0, 0, 0).expect("test locator"),
+        );
+        let mut historical_roots = Vec::new();
+        let mut batch = store.batch();
+        for index in 1u32..=1_024 {
+            let mut raw_root = [0u8; 32];
+            raw_root[..4].copy_from_slice(&index.to_le_bytes());
+            let root = TreeRoot::new(raw_root);
+            historical_roots.push(root);
+            batch
+                .put(
+                    ColumnFamily::Snapshots,
+                    &name_page_root_key(root),
+                    &NamePageRootRecord {
+                        root,
+                        locator,
+                        height: index,
+                    }
+                    .encode(),
+                )
+                .expect("stage historical locator");
+        }
+        store.commit(batch).expect("publish historical locators");
+
+        let snapshot = store.snapshot().expect("counted snapshot");
+        {
+            let counted = CountingNamePageSnapshot::new(&snapshot);
+            let (_reader, legacy_fallback) = pages
+                .reader_for_roots(&counted, std::iter::empty(), false)
+                .expect("ordinary connect reader");
+            assert!(!legacy_fallback);
+            assert_eq!(counted.locator_scans.get(), 0);
+            assert_eq!(counted.locator_gets.get(), 0);
+
+            let (_reader, legacy_fallback) = pages
+                .reader_for_roots(&counted, [historical_roots[731]], false)
+                .expect("rollback root reader");
+            assert!(!legacy_fallback);
+            assert_eq!(counted.locator_scans.get(), 0);
+            assert_eq!(
+                counted.locator_gets.get(),
+                1,
+                "one requested rollback root must cost one point lookup"
+            );
+        }
+        drop(snapshot);
+        drop(pages);
+        std::fs::remove_dir_all(directory).expect("remove page directory");
+    }
+
+    #[test]
+    fn startup_page_segment_limit_is_checked_before_range_collection() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-node-name-page-segment-bound-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("create segment fixture");
+        for segment in 0..=1 {
+            std::fs::File::create(name_page_file_path(&directory, 1, segment))
+                .expect("create segment");
+        }
+        let now = Instant::now();
+        let limits = NamePageFilesystemLimits {
+            max_segments: 2,
+            max_directory_entries: 4,
+            max_generation_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
+            deadline: now.checked_add(Duration::from_secs(30)).unwrap_or(now),
+        };
+        assert_eq!(
+            name_page_segment_paths(&directory, 1, 1, limits)
+                .expect("exact segment limit")
+                .len(),
+            2
+        );
+        let error = name_page_segment_paths(&directory, 1, 2, limits)
+            .expect_err("one-over active segment must fail before path collection");
+        assert!(
+            error.to_string().contains("reached 3, exceeding limit 2"),
+            "{error:#}"
+        );
+
+        let expired = NamePageFilesystemLimits {
+            deadline: Instant::now(),
+            ..limits
+        };
+        let error = name_page_segment_paths(&directory, 1, 1, expired)
+            .expect_err("expired startup segment deadline");
+        assert!(error.to_string().contains("deadline"));
+
+        std::fs::remove_dir_all(directory).expect("remove segment fixture");
+    }
+
+    #[test]
+    fn name_page_locator_scan_accepts_exact_limits_and_rejects_one_over_or_expired() {
+        let store = StoreHandle::memory();
+        let mut batch = store.batch();
+        let mut encoded_bytes = 0u64;
+        for index in 1u32..=2 {
+            let mut raw_root = [0u8; 32];
+            raw_root[..4].copy_from_slice(&index.to_le_bytes());
+            let root = TreeRoot::new(raw_root);
+            let key = name_page_root_key(root);
+            let value = NamePageRootRecord {
+                root,
+                locator: NamePageRootLocator {
+                    generation: 7,
+                    address: u64::from(index),
+                },
+                height: index,
+            }
+            .encode();
+            encoded_bytes += u64::try_from(key.len() + value.len()).expect("fixture byte count");
+            batch
+                .put(ColumnFamily::Snapshots, &key, &value)
+                .expect("stage locator");
+        }
+        store.commit(batch).expect("commit locators");
+        let snapshot = store.snapshot().expect("locator snapshot");
+        let now = Instant::now();
+        let exact = NamePageRootLocatorScanLimits {
+            max_records: 2,
+            max_bytes: encoded_bytes,
+            page_budget: PrefixScanBudget {
+                max_entries: 1,
+                max_bytes: 1024,
+            },
+            deadline: now.checked_add(Duration::from_secs(30)).unwrap_or(now),
+        };
+        assert_eq!(
+            collect_name_page_root_locators(&snapshot, exact)
+                .expect("exact locator limits")
+                .len(),
+            2
+        );
+
+        let error = collect_name_page_root_locators(
+            &snapshot,
+            NamePageRootLocatorScanLimits {
+                max_records: 1,
+                ..exact
+            },
+        )
+        .expect_err("one-over locator count");
+        assert!(error.to_string().contains("locator records"), "{error:#}");
+
+        let error = collect_name_page_root_locators(
+            &snapshot,
+            NamePageRootLocatorScanLimits {
+                max_bytes: encoded_bytes - 1,
+                ..exact
+            },
+        )
+        .expect_err("one-over locator bytes");
+        assert!(error.to_string().contains("locator bytes"), "{error:#}");
+
+        let error = collect_name_page_root_locators(
+            &snapshot,
+            NamePageRootLocatorScanLimits {
+                deadline: Instant::now(),
+                ..exact
+            },
+        )
+        .expect_err("expired locator deadline");
+        assert!(error.to_string().contains("deadline"), "{error:#}");
+    }
+
+    #[test]
+    fn name_page_publication_accepts_exact_operations_and_rejects_one_over_or_bytes() {
+        let mut old_records = BTreeMap::new();
+        for index in 1..=MAX_NAME_PAGE_ROOT_LOCATORS {
+            let mut raw_root = [0u8; 32];
+            raw_root[..8].copy_from_slice(&index.to_le_bytes());
+            let root = TreeRoot::new(raw_root);
+            old_records.insert(
+                root,
+                NamePageRootRecord {
+                    root,
+                    locator: NamePageRootLocator {
+                        generation: 1,
+                        address: index,
+                    },
+                    height: u32::try_from(index).expect("fixture height"),
+                },
+            );
+        }
+        let (operations, bytes) = preflight_name_page_publication(
+            &old_records,
+            usize::try_from(MAX_NAME_PAGE_ROOT_LOCATORS).expect("root count"),
+            128,
+        )
+        .expect("exact publication operation count");
+        assert_eq!(operations, MAX_NAME_PAGE_PUBLICATION_OPERATIONS);
+        assert!(bytes <= MAX_NAME_PAGE_PUBLICATION_BYTES);
+
+        let error = preflight_name_page_publication(
+            &old_records,
+            usize::try_from(MAX_NAME_PAGE_ROOT_LOCATORS + 1).expect("one-over root count"),
+            128,
+        )
+        .expect_err("one-over publication operations");
+        assert!(
+            error.to_string().contains("publication operations"),
+            "{error:#}"
+        );
+
+        let error = preflight_name_page_publication(
+            &BTreeMap::new(),
+            0,
+            usize::try_from(MAX_NAME_PAGE_PUBLICATION_BYTES).expect("byte ceiling"),
+        )
+        .expect_err("one-over publication bytes");
+        assert!(error.to_string().contains("publication bytes"), "{error:#}");
+    }
+
+    #[test]
+    fn migration_data_ceiling_accepts_exact_and_rejects_one_over() {
+        assert_eq!(
+            preflight_migration_data_ceiling(MAX_NAME_PAGE_GENERATION_BYTES - 1, 1)
+                .expect("exact migration data ceiling"),
+            MAX_NAME_PAGE_GENERATION_BYTES
+        );
+        let error = preflight_migration_data_ceiling(MAX_NAME_PAGE_GENERATION_BYTES - 1, 2)
+            .expect_err("one-over migration data ceiling");
+        assert!(
+            error.to_string().contains("schema migration data-root"),
+            "{error:#}"
+        );
+        let error = preflight_migration_data_ceiling(u64::MAX, 1)
+            .expect_err("overflowed migration data ceiling");
+        assert!(
+            error.to_string().contains(&u64::MAX.to_string()),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn startup_pin_cursor_rejects_an_expired_deadline_before_reading() {
+        let store = StoreHandle::memory();
+        drop(
+            NodeState::from_store_for_network(store.clone(), Network::Regtest)
+                .expect("initialize pin cursor store"),
+        );
+        let snapshot = store.snapshot().expect("pin cursor snapshot");
+        let mut cursor =
+            StartupPinCursor::new(&snapshot, Network::Regtest).expect("startup pin cursor");
+        cursor.limits.deadline = Instant::now();
+        let error = cursor
+            .next_pin()
+            .expect_err("expired pin cursor must fail before scanning");
+        assert!(error.to_string().contains("deadline"));
+    }
+
+    #[test]
+    fn exhaustive_page_audit_seeds_more_than_4096_historical_pin_roots() {
+        const PIN_COUNT: u32 = 4_097;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-node-name-page-many-pins-{}-{nonce}.pages",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let store = StoreHandle::memory();
+        drop(
+            NodeState::from_store_for_network(store.clone(), Network::Simnet)
+                .expect("initialize pin store"),
+        );
+        let tip_hash = BlockHash::new([0x42; 32]);
+        let tip_height = (PIN_COUNT - 1) * Network::Simnet.params().names.tree_interval;
+        let mut records = BTreeMap::new();
+        let mut roots = Vec::with_capacity(PIN_COUNT as usize);
+        for index in 0..PIN_COUNT {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&index.to_be_bytes());
+            key[31] = 0xa5;
+            let tree =
+                MemoryUrkel::from_entries([(NameHash::new(key), index.to_le_bytes().to_vec())])
+                    .expect("single-leaf historical tree");
+            let root = tree.root();
+            roots.push(root);
+            records.extend(tree.node_records().expect("historical leaf record"));
+        }
+        let packed = pack_name_page_records(1, 0, 0, &records, &HashMap::new())
+            .expect("pack historical roots");
+        let mut appender = NamePageAppender::create_new(&path, 1, 0).expect("create pin pages");
+        let manifest = packed.append(&mut appender).expect("append pin pages");
+        drop(appender);
+
+        let mut batch = store.batch();
+        let tip = BlockIndexRecord {
+            hash: tip_hash,
+            height: tip_height,
+            prev_hash: BlockHash::ZERO,
+            chainwork: Uint256::ONE,
+            status: BlockStatus {
+                active_chain: true,
+                ..BlockStatus::default()
+            },
+            tx_count: 0,
+            validated_at: None,
+        };
+        write_block_index_to_batch(&mut batch, &tip).expect("stage high pin tip");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestBlockHash.as_bytes(),
+                tip_hash.as_bytes(),
+            )
+            .expect("bind high pin tip");
+        for (index, root) in roots.iter().copied().enumerate() {
+            let height = u32::try_from(index).expect("pin index")
+                * Network::Simnet.params().names.tree_interval;
+            let block_hash = BlockHash::new(blake2b_256(&height.to_le_bytes()));
+            let locator = packed.root_locator(root).expect("historical root locator");
+            batch
+                .put(
+                    ColumnFamily::Snapshots,
+                    &name_tree_snapshot_pin_key(height),
+                    &NameTreeSnapshotPin {
+                        height,
+                        block_hash,
+                        root,
+                    }
+                    .encode(),
+                )
+                .expect("stage historical pin");
+            batch
+                .put(
+                    ColumnFamily::Snapshots,
+                    &name_page_root_key(root),
+                    &NamePageRootRecord {
+                        root,
+                        locator,
+                        height,
+                    }
+                    .encode(),
+                )
+                .expect("stage historical root locator");
+        }
+        store.commit(batch).expect("publish historical pins");
+
+        let snapshot = store.snapshot().expect("pin snapshot");
+        let first_root = roots[0];
+        let reader = NamePageTreeReader::open(
+            &path,
+            first_root,
+            packed.root_locator(first_root).expect("first root locator"),
+        )
+        .expect("open historical pin pages");
+        assert!(
+            !seed_startup_pin_page_roots(&snapshot, Network::Simnet, &reader)
+                .expect("seed every historical pin")
+        );
+        assert_eq!(
+            reader.known_addresses().expect("seeded addresses").len(),
+            PIN_COUNT as usize
+        );
+
+        let now = Instant::now();
+        let validation = reader
+            .validate_committed_pages_with_limits(NamePageValidationLimits {
+                max_segments: 1,
+                max_pages: u64::try_from(packed.page_count()).expect("page count"),
+                max_records: u64::from(PIN_COUNT),
+                max_bytes: manifest.durable_bytes,
+                max_spill_bytes: u64::from(PIN_COUNT) * 34,
+                max_published_roots: u64::from(PIN_COUNT),
+                minimum_filesystem_reserve_bytes: 0,
+                deadline: now.checked_add(Duration::from_secs(60)).unwrap_or(now),
+            })
+            .expect("physically validate every historical pin");
+        validate_persisted_name_tree_overlays(&snapshot, roots, &validation, PIN_COUNT as usize)
+            .expect("validate historical page roots without legacy LSM nodes");
+
+        drop(reader);
+        drop(snapshot);
+        std::fs::remove_file(path).expect("remove pin pages");
+    }
+
+    #[test]
+    fn page_compaction_materializes_pre_page_retained_roots_and_fails_closed_if_missing() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-node-name-page-upgrade-roots-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = StoreHandle::memory();
+        drop(
+            NodeState::from_store_for_network(store.clone(), Network::Regtest)
+                .expect("initialize upgrade store"),
+        );
+        let historical = MemoryUrkel::from_entries([
+            (NameHash::new([0x11; 32]), b"historical-left".to_vec()),
+            (NameHash::new([0x91; 32]), b"historical-right".to_vec()),
+        ])
+        .expect("historical tree");
+        let current = MemoryUrkel::from_entries([
+            (NameHash::new([0x11; 32]), b"current-left".to_vec()),
+            (NameHash::new([0x91; 32]), b"historical-right".to_vec()),
+        ])
+        .expect("current tree");
+        let historical_root = historical.root();
+        let current_root = current.root();
+        let undo_hash = BlockHash::new([0x61; 32]);
+        let undo = BlockUndo {
+            block_hash: undo_hash,
+            height: 1,
+            previous_tree_root: historical_root,
+            resulting_tree_root: current_root,
+            previous_committed_tree_root: historical_root,
+            resulting_committed_tree_root: current_root,
+            spent_coins: Vec::new(),
+            created_coins: Vec::new(),
+            airdrop_positions: Vec::new(),
+            previous_name_states: Vec::new(),
+            name_tree_interval_boundary: false,
+            previous_name_tree_accumulator_last_height: None,
+            previous_name_tree_accumulator: None,
+        };
+        let mut batch = store.batch();
+        for tree in [&historical, &current] {
+            for (root, raw) in tree.node_records().expect("tree records") {
+                batch
+                    .put(ColumnFamily::NameTreeNodes, root.as_bytes(), &raw)
+                    .expect("stage legacy tree record");
+            }
+        }
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                current_root.as_bytes(),
+            )
+            .expect("stage working root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                current_root.as_bytes(),
+            )
+            .expect("stage committed root");
+        batch
+            .put(
+                ColumnFamily::Undo,
+                undo_hash.as_bytes(),
+                &undo.encode().expect("encode retained undo"),
+            )
+            .expect("stage retained undo");
+        store.commit(batch).expect("publish pre-page state");
+
+        let mut pages =
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("bootstrap pages");
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                &name_page_root_key(current_root),
+                &NamePageRootRecord {
+                    root: current_root,
+                    locator: pages.state.root_locator().expect("current root locator"),
+                    height: 1,
+                }
+                .encode(),
+            )
+            .expect("stage current page locator");
+        store.commit(batch).expect("publish current page locator");
+        let snapshot = store.snapshot().expect("bootstrap snapshot");
+        assert!(load_name_page_root_record(&snapshot, current_root)
+            .expect("current locator")
+            .is_some());
+        assert!(
+            load_name_page_root_record(&snapshot, historical_root)
+                .expect("historical locator")
+                .is_none(),
+            "pre-page historical undo roots begin without page locators"
+        );
+        drop(snapshot);
+
+        let report = pages
+            .compact_generation(&store)
+            .expect("materialize retained upgrade root");
+        assert_eq!(report.generation, 2);
+        let snapshot = store.snapshot().expect("compacted snapshot");
+        for root in [current_root, historical_root] {
+            let record = load_name_page_root_record(&snapshot, root)
+                .expect("retained locator")
+                .expect("published retained locator");
+            assert_eq!(record.locator.generation, report.generation);
+        }
+        let (reader, legacy_fallback) = pages
+            .reader_for_roots(&snapshot, [current_root, historical_root], false)
+            .expect("compacted retained readers");
+        assert!(!legacy_fallback);
+        let page_snapshot = NamePageSnapshot::new(&snapshot, &reader);
+        validate_persisted_name_trees(&page_snapshot, [current_root, historical_root])
+            .expect("validate materialized retained roots");
+        drop(reader);
+        drop(snapshot);
+
+        let missing_root = TreeRoot::new([0xee; 32]);
+        let missing_hash = BlockHash::new([0x62; 32]);
+        let missing_undo = BlockUndo {
+            block_hash: missing_hash,
+            height: 2,
+            previous_tree_root: missing_root,
+            resulting_tree_root: current_root,
+            previous_committed_tree_root: missing_root,
+            resulting_committed_tree_root: current_root,
+            spent_coins: Vec::new(),
+            created_coins: Vec::new(),
+            airdrop_positions: Vec::new(),
+            previous_name_states: Vec::new(),
+            name_tree_interval_boundary: false,
+            previous_name_tree_accumulator_last_height: None,
+            previous_name_tree_accumulator: None,
+        };
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Undo,
+                missing_hash.as_bytes(),
+                &missing_undo.encode().expect("encode missing undo"),
+            )
+            .expect("stage missing retained undo");
+        store.commit(batch).expect("publish missing retained root");
+        let generation_before = pages.state.manifest.generation;
+        assert!(pages.compact_generation(&store).is_err());
+        assert_eq!(pages.state.manifest.generation, generation_before);
+        assert!(!pages.reopen_required);
+
+        drop(pages);
+        std::fs::remove_dir_all(directory).expect("remove upgrade page directory");
+    }
+
+    #[test]
+    fn ambiguous_name_page_commit_fence_preserves_old_or_new_recovery_bytes() {
+        fn append_synced_page(pages: &mut NamePageStorage, tag: u8) -> hns_store::SegmentManifest {
+            pages
+                .appender
+                .as_mut()
+                .expect("page appender")
+                .append(&[hns_store::NamePageRecord {
+                    key: [tag; 32],
+                    children: Vec::new(),
+                    canonical: vec![tag],
+                }])
+                .expect("append page");
+            pages
+                .appender
+                .as_mut()
+                .expect("page appender")
+                .sync_data()
+                .expect("sync page")
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let rejected_directory = std::env::temp_dir().join(format!(
+            "hsrd-name-page-rejected-fence-{}-{nonce}",
+            std::process::id()
+        ));
+        let applied_directory = std::env::temp_dir().join(format!(
+            "hsrd-name-page-applied-fence-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&rejected_directory);
+        let _ = std::fs::remove_dir_all(&applied_directory);
+
+        // Simulate Store::commit rejecting before its write. The synced tail
+        // remains untouched while the process is fenced; reopening the old
+        // durable manifest is the only operation allowed to truncate it.
+        let rejected_store = StoreHandle::memory();
+        let _rejected_state =
+            NodeState::from_store_for_network(rejected_store.clone(), Network::Regtest)
+                .expect("initialize rejected store");
+        let mut rejected_pages =
+            NamePageStorage::open_or_bootstrap(rejected_directory.clone(), &rejected_store)
+                .expect("rejected pages");
+        let rejected_committed = rejected_pages.state.manifest.durable_bytes;
+        let _ = append_synced_page(&mut rejected_pages, 0x41);
+        let rejected_tail = std::fs::metadata(&rejected_pages.file_path)
+            .expect("rejected tail metadata")
+            .len();
+        assert!(rejected_tail > rejected_committed);
+        rejected_pages.fence_after_commit_attempt();
+        assert!(rejected_pages.reopen_required);
+        assert!(rejected_pages.appender.is_none());
+        assert_eq!(
+            std::fs::metadata(&rejected_pages.file_path)
+                .expect("fenced rejected metadata")
+                .len(),
+            rejected_tail
+        );
+        assert!(rejected_pages
+            .reader_for_roots(
+                &rejected_store.snapshot().expect("rejected snapshot"),
+                std::iter::empty(),
+                false,
+            )
+            .is_err());
+        drop(rejected_pages);
+        let rejected_reopened =
+            NamePageStorage::open_or_bootstrap(rejected_directory.clone(), &rejected_store)
+                .expect("reopen rejected pages");
+        assert_eq!(
+            std::fs::metadata(&rejected_reopened.file_path)
+                .expect("reopened rejected metadata")
+                .len(),
+            rejected_committed
+        );
+
+        // Simulate Store::commit applying its batch and then returning Err.
+        // Reopening must follow the new durable manifest and preserve every
+        // page byte referenced by that applied batch.
+        let applied_store = StoreHandle::memory();
+        let _applied_state =
+            NodeState::from_store_for_network(applied_store.clone(), Network::Regtest)
+                .expect("initialize applied store");
+        let mut applied_pages =
+            NamePageStorage::open_or_bootstrap(applied_directory.clone(), &applied_store)
+                .expect("applied pages");
+        let applied_manifest = append_synced_page(&mut applied_pages, 0x42);
+        let applied_tail = std::fs::metadata(&applied_pages.file_path)
+            .expect("applied tail metadata")
+            .len();
+        let mut applied_state = applied_pages.state.clone();
+        applied_state.manifest = applied_manifest;
+        let mut batch = applied_store.batch();
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                NAME_PAGE_STATE_KEY,
+                &applied_state.encode().expect("encode applied page state"),
+            )
+            .expect("stage applied page state");
+        applied_store
+            .commit(batch)
+            .expect("simulate applied commit batch");
+        applied_pages.fence_after_commit_attempt();
+        assert_eq!(
+            std::fs::metadata(&applied_pages.file_path)
+                .expect("fenced applied metadata")
+                .len(),
+            applied_tail
+        );
+        drop(applied_pages);
+        let applied_reopened =
+            NamePageStorage::open_or_bootstrap(applied_directory.clone(), &applied_store)
+                .expect("reopen applied pages");
+        assert_eq!(applied_reopened.state.manifest, applied_manifest);
+        assert_eq!(
+            std::fs::metadata(&applied_reopened.file_path)
+                .expect("reopened applied metadata")
+                .len(),
+            applied_tail
+        );
+
+        drop(rejected_reopened);
+        drop(applied_reopened);
+        std::fs::remove_dir_all(rejected_directory).expect("remove rejected fence fixture");
+        std::fs::remove_dir_all(applied_directory).expect("remove applied fence fixture");
+    }
+
+    #[test]
+    fn ambiguous_name_page_fence_revokes_node_authority_and_mutation() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-name-page-authority-fence-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let store = StoreHandle::memory();
+        let mut state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        state.name_pages =
+            Some(NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages"));
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("node");
+        let publication_hash = BlockHash::new([0x55; 32]);
+        let mut publication_key = Vec::with_capacity(hns_mining::PUBLICATION_KEY_PREFIX.len() + 32);
+        publication_key.extend_from_slice(hns_mining::PUBLICATION_KEY_PREFIX);
+        publication_key.extend_from_slice(publication_hash.as_bytes());
+        let mut publication_batch = store.batch();
+        publication_batch
+            .put(
+                ColumnFamily::Snapshots,
+                &publication_key,
+                b"fenced-publication-intent",
+            )
+            .expect("stage publication intent");
+        store
+            .commit(publication_batch)
+            .expect("commit publication intent");
+        node.state
+            .name_pages
+            .as_mut()
+            .expect("page storage")
+            .fence_after_commit_attempt();
+        node.fail_closed_after_ambiguous_commit();
+
+        assert!(node.state.storage_reopen_required());
+        assert!(node.observed_mining_snapshot().is_err());
+        assert!(node.subscribe_mining_events().is_err());
+        assert!(node.mining_snapshot().is_none());
+        assert_eq!(node.mining_events.committed_generation(), 1);
+        let mempool_before = node.state.mempool.info();
+        for error in [
+            node.mining_engine_accept_peer_transaction(coinbase_transaction())
+                .expect_err("fenced peer transaction"),
+            node.mining_engine_accept_peer_claim(hns_primitives::Claim::default())
+                .expect_err("fenced peer claim"),
+            node.mining_engine_accept_peer_airdrop(hns_primitives::AirdropProof {
+                index: 0,
+                proof: Vec::new(),
+                subindex: 0,
+                subproof: Vec::new(),
+                key: Vec::new(),
+                version: 0,
+                address: Vec::new(),
+                fee: 0,
+                signature: Vec::new(),
+            })
+            .expect_err("fenced peer airdrop"),
+        ] {
+            assert!(error.to_string().contains("restart and reopen"), "{error}");
+        }
+        assert_eq!(node.state.mempool.info(), mempool_before);
+        let publication_error = node
+            .mining_engine_complete_publication(publication_hash)
+            .expect_err("fenced publication-intent deletion");
+        assert!(
+            publication_error.to_string().contains("restart and reopen"),
+            "{publication_error}"
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("publication snapshot")
+                .get(ColumnFamily::Snapshots, &publication_key)
+                .expect("publication lookup")
+                .as_deref(),
+            Some(b"fenced-publication-intent".as_slice())
+        );
+        let error = node
+            .connect_block(NodeBlockImport::fixture(
+                block_with_commitments(vec![coinbase_transaction()]),
+                0,
+                1,
+            ))
+            .expect_err("fenced mutation");
+        assert!(error.to_string().contains("restart and reopen"), "{error}");
+
+        drop(node);
+        std::fs::remove_dir_all(directory).expect("remove authority fence fixture");
+    }
+
+    #[test]
     fn page_backed_node_commits_interval_root_without_lsm_name_nodes_and_restarts() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8662,7 +16578,7 @@ mod tests {
         )
         .expect("fixture verifier");
         let mut node =
-            NodeService::try_with_state(active_state_shadow_config(), state).expect("node");
+            NodeService::try_with_state(active_state_native_config(), state).expect("node");
         let records = connect_fixture_chain(&mut node, 200, None);
         let spend_txid = node
             .state
@@ -8727,12 +16643,12 @@ mod tests {
         assert_ne!(page_state.root, TreeRoot::ZERO);
         assert!(page_state.manifest.durable_bytes > 0);
         assert_eq!(page_state.committed_height, Some(205));
-        let reader = node
+        let (reader, _) = node
             .state
             .name_pages
             .as_ref()
             .expect("page storage")
-            .reader(&snapshot)
+            .reader_for_roots(&snapshot, std::iter::empty(), false)
             .expect("page reader");
         let duplicate = reader
             .load(page_state.root)
@@ -8803,12 +16719,12 @@ mod tests {
 
         let raw = store.snapshot().expect("pre-seal snapshot");
         let root = load_stored_name_tree_commit_root(&raw).expect("pre-seal root");
-        let reader = node
+        let (reader, _) = node
             .state
             .name_pages
             .as_ref()
             .expect("page storage")
-            .reader(&raw)
+            .reader_for_roots(&raw, std::iter::empty(), false)
             .expect("pre-seal reader");
         let mut batch = store.batch();
         let skipped_seal_height = NAME_PAGE_SEGMENT_BLOCKS
@@ -8874,8 +16790,8 @@ mod tests {
             NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("reopen pages");
         assert!(!unpublished_path.exists());
         let snapshot = store.snapshot().expect("sealed snapshot");
-        let reader = pages
-            .reader(&snapshot)
+        let (reader, _) = pages
+            .reader_for_roots(&snapshot, std::iter::empty(), false)
             .expect("sealed multi-segment reader");
         assert!(reader
             .load(prepared.root)
@@ -8946,7 +16862,9 @@ mod tests {
         ];
 
         let raw = store.snapshot().expect("base snapshot");
-        let reader = pages.reader(&raw).expect("base reader");
+        let (reader, _) = pages
+            .reader_for_roots(&raw, std::iter::empty(), false)
+            .expect("base reader");
         let mut batch = store.batch();
         let prepared = pages
             .prepare_root(
@@ -8972,7 +16890,9 @@ mod tests {
                 .expect("load locator")
                 .expect("published locator");
             assert_eq!(record.height, expected_height);
-            let reader = pages.reader(&snapshot).expect("published reader");
+            let (reader, _) = pages
+                .reader_for_roots(&snapshot, [root], false)
+                .expect("published reader");
             assert!(reader.load(root).expect("load pinned root").is_some());
         }
         drop(snapshot);
@@ -9026,7 +16946,9 @@ mod tests {
             assert!(load_name_page_root_record(&snapshot, stale_root)
                 .expect("stale locator read")
                 .is_none());
-            let reader = pages.reader(&snapshot).expect("compacted reader");
+            let (reader, _) = pages
+                .reader_for_roots(&snapshot, [first_root, second_root], false)
+                .expect("compacted reader");
             let page_snapshot = NamePageSnapshot::new(&snapshot, &reader);
             assert!(
                 validate_persisted_name_trees(&page_snapshot, [first_root, second_root])
@@ -9706,6 +17628,34 @@ mod tests {
             assert_eq!(header.status.undo_present, retained, "height {height}");
             assert_eq!(stored.status.body_present, retained, "height {height}");
             assert_eq!(header.status.body_present, retained, "height {height}");
+            let live_block = node
+                .state()
+                .blocks
+                .block(&record.hash)
+                .expect("live block cache")
+                .expect("live block");
+            let live_header = node
+                .state()
+                .chain
+                .header(&record.hash)
+                .expect("live header cache")
+                .expect("live header");
+            assert_eq!(
+                live_block.status.undo_present, retained,
+                "live block undo height {height}"
+            );
+            assert_eq!(
+                live_header.status.undo_present, retained,
+                "live header undo height {height}"
+            );
+            assert_eq!(
+                live_block.status.body_present, retained,
+                "live block body height {height}"
+            );
+            assert_eq!(
+                live_header.status.body_present, retained,
+                "live header body height {height}"
+            );
             assert_eq!(
                 snapshot
                     .get(ColumnFamily::Undo, record.hash.as_bytes())
@@ -10037,6 +17987,22 @@ mod tests {
         assert_eq!(checkpoint.blocks_pruned_through, 5);
         assert_eq!(checkpoint.blocks_checkpoint, records[5].hash);
         assert_eq!(checkpoint.pruned_blocks, 5);
+        for record in records.iter().take(6).skip(1) {
+            let live_block = state
+                .blocks
+                .block(&record.hash)
+                .expect("startup live block")
+                .expect("startup block record");
+            let live_header = state
+                .chain
+                .header(&record.hash)
+                .expect("startup live header")
+                .expect("startup header record");
+            assert!(!live_block.status.undo_present);
+            assert!(!live_header.status.undo_present);
+            assert!(!live_block.status.body_present);
+            assert!(!live_header.status.body_present);
+        }
         drop(snapshot);
         NodeState::from_store_for_network_with_undo_policy(store, Network::Regtest, Some(policy))
             .expect("caught-up state reopens");
@@ -10178,29 +18144,17 @@ mod tests {
                 state,
             )
             .expect("node");
-            let active = block_with_commitments(vec![coinbase_transaction()]);
-            node.connect_block(NodeBlockImport::fixture(active, 0, 1))
-                .expect("connect active block");
+            node.state.state_engine = StoredStateEngine::with_services(
+                store.clone(),
+                Network::Regtest,
+                NameFlags::NONE,
+                true,
+                Arc::new(AllowAllInputVerifier),
+                Arc::new(RejectSpecialCoinbaseIssuance),
+            )
+            .expect("fixture input verifier");
+            connect_fixture_chain(&mut node, 200, Some(200));
             drop(node);
-            let name_block =
-                block_with_commitments(vec![open_coinbase_transaction(b"persistedstartupnode")]);
-            let mut proof_state =
-                StoredStateEngine::with_native_authorization_and_verified_name_flags(
-                    store.clone(),
-                    Network::Regtest,
-                    NameFlags::NONE,
-                )
-                .expect("proof state");
-            proof_state
-                .connect_block(ConnectBlock {
-                    block_hash: name_block.hash(),
-                    height: 200,
-                    coinbase_maturity: 0,
-                    block_reward: 50,
-                    block: &name_block,
-                })
-                .expect("stage authenticated name state");
-            drop(proof_state);
 
             let snapshot = store.snapshot().expect("snapshot");
             let root = snapshot
@@ -10254,7 +18208,7 @@ mod tests {
         );
         assert_eq!(
             state
-                .validate_durable_chain_invariants(Some(&checkpoint))
+                .validate_durable_chain_invariants(Some(&checkpoint), false)
                 .expect("matching audit"),
             StartupAuditKind::CleanCheckpoint
         );
@@ -10275,7 +18229,7 @@ mod tests {
         store.commit(batch).expect("commit identity drift");
         assert_eq!(
             state
-                .validate_durable_chain_invariants(Some(&checkpoint))
+                .validate_durable_chain_invariants(Some(&checkpoint), false)
                 .expect("mismatch falls back to exhaustive audit"),
             StartupAuditKind::Exhaustive
         );
@@ -10317,13 +18271,13 @@ mod tests {
 
         assert_eq!(
             node.state
-                .validate_durable_chain_invariants(Some(&checkpoint))
+                .validate_durable_chain_invariants(Some(&checkpoint), false)
                 .expect("bounded clean audit"),
             StartupAuditKind::CleanCheckpoint
         );
         let error = node
             .state
-            .validate_durable_chain_invariants(None)
+            .validate_durable_chain_invariants(None, false)
             .expect_err("unclean audit must inspect complete history");
         assert!(error.to_string().contains("body"), "{error}");
     }
@@ -10744,6 +18698,237 @@ mod tests {
         assert_eq!(coin.result.expect("coin")["value"], 50);
     }
 
+    #[test]
+    fn rpc_point_reads_materialize_only_requested_records() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            transaction_index: true,
+            ..NodeConfig::default()
+        });
+        let block = block_with_commitments(vec![coinbase_transaction()]);
+        let record = node
+            .connect_block(NodeBlockImport::fixture(block.clone(), 0, 1))
+            .expect("connect block");
+        let txid = block.transactions[0].txid();
+        let context = node.rpc_read_context();
+
+        for (method, params, expected_collection) in [
+            (
+                RpcMethod::GetBlockHash,
+                json!([0]),
+                (1usize, 0usize, 0usize, 0usize),
+            ),
+            (
+                RpcMethod::GetBlock,
+                json!([record.hash.to_hex(), true]),
+                (0, 1, 0, 0),
+            ),
+            (
+                RpcMethod::GetRawTransaction,
+                json!([txid.to_hex(), true]),
+                (0, 0, 1, 0),
+            ),
+            (RpcMethod::GetTxOut, json!([txid.to_hex(), 0]), (0, 0, 0, 1)),
+        ] {
+            let request = JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: match method {
+                    RpcMethod::GetBlockHash => "getblockhash",
+                    RpcMethod::GetBlock => "getblock",
+                    RpcMethod::GetRawTransaction => "getrawtransaction",
+                    RpcMethod::GetTxOut => "gettxout",
+                    _ => unreachable!(),
+                }
+                .to_owned(),
+                params,
+                id: Some(json!(method)),
+            };
+            let service = context
+                .service_for_request(&request, node.rpc_request_mempool(&request), false, 0, None)
+                .expect("bounded point-read service");
+            let snapshot = service.snapshot();
+            assert_eq!(
+                (
+                    snapshot.headers.len(),
+                    snapshot.blocks.len(),
+                    snapshot.transactions.len(),
+                    snapshot.coins.len(),
+                ),
+                expected_collection
+            );
+            let response = service.handle(request).expect("RPC response");
+            assert!(response.error.is_none(), "{response:?}");
+        }
+    }
+
+    #[test]
+    fn rpc_header_selection_never_reloads_a_new_index_generation_from_an_old_snapshot() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let context = node.rpc_read_context();
+        let stale_snapshot = context.store.snapshot().expect("pre-import snapshot");
+        let record = node
+            .state_mut()
+            .chain
+            .import_header(HeaderImport {
+                header: Header {
+                    bits: Network::Regtest.params().pow.bits,
+                    ..Header::default()
+                },
+                height: 0,
+                verify_pow: false,
+                checkpoint_valid: false,
+            })
+            .expect("publish header after snapshot");
+        assert!(
+            load_header_record(&stale_snapshot, &record.hash)
+                .expect("stale header lookup")
+                .is_none(),
+            "the barrier fixture must retain a snapshot from before publication"
+        );
+
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".to_owned()),
+            method: "getblockhash".to_owned(),
+            params: json!([0]),
+            id: Some(json!("header-generation")),
+        };
+        assert_eq!(
+            context
+                .canonical_header_for_request(RpcMethod::GetBlockHash, &request)
+                .expect("atomic header selection")
+                .map(|selected| selected.hash),
+            Some(record.hash)
+        );
+        let service = context
+            .service_for_request(&request, node.rpc_request_mempool(&request), false, 0, None)
+            .expect("coherent header RPC");
+        let response = service.handle(request).expect("header RPC response");
+        assert_eq!(response.result, Some(json!(record.hash.to_hex())));
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn rpc_generation_read_blocks_between_durable_commit_and_cache_publication() {
+        let mut state = NodeState::from_store_for_network(StoreHandle::memory(), Network::Regtest)
+            .expect("empty state");
+        let context = RpcReadContext {
+            store: state.store.clone(),
+            headers: state.chain.clone(),
+            network: Network::Regtest,
+            transaction_index: false,
+            point_read_concurrency: Arc::new(Semaphore::new(1)),
+            collection_concurrency: Arc::new(Semaphore::new(1)),
+        };
+        let block = block_with_commitments(vec![coinbase_transaction_with_address(0x71, 50)]);
+        let hash = block.hash();
+        let status = BlockStatus {
+            header_context_valid: true,
+            body_present: true,
+            body_syntax_valid: true,
+            active_chain: true,
+            ..BlockStatus::default()
+        };
+        let mut block_record =
+            BlockIndexRecord::from_block(&block, 0, Uint256::ONE).expect("block record");
+        block_record.status = status.clone();
+        let header_record = HeaderRecord {
+            hash,
+            height: 0,
+            chainwork: Uint256::ONE,
+            header: block.header,
+            status,
+        };
+        let publication = state
+            .prepare_index_publication(&[IndexStatusUpdate {
+                previous_block: None,
+                current: StagedIndexRecord {
+                    block: block_record.clone(),
+                    header: header_record.clone(),
+                },
+            }])
+            .expect("prepare publication");
+        let mut batch = state.store.batch();
+        write_record_to_batch(&mut batch, &header_record).expect("stage header");
+        write_block_index_to_batch(&mut batch, &block_record).expect("stage block index");
+        write_canonical_height_to_batch(&mut batch, 0, hash).expect("stage canonical height");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestHeaderHash.as_bytes(),
+                hash.as_bytes(),
+            )
+            .expect("stage best header");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestBlockHash.as_bytes(),
+                hash.as_bytes(),
+            )
+            .expect("stage best block");
+
+        let (committed_tx, committed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            state
+                .commit_index_publication(publication, move |state| {
+                    state.store.commit(batch)?;
+                    committed_tx
+                        .send(())
+                        .map_err(|_| anyhow::anyhow!("commit signal receiver dropped"))?;
+                    release_rx
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("publication release sender dropped"))?;
+                    Ok(())
+                })
+                .expect("commit and publish generation");
+        });
+        committed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("durable commit signal");
+
+        assert!(matches!(
+            context.headers.inner.try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+
+        let request = JsonRpcRequest {
+            jsonrpc: Some("2.0".to_owned()),
+            method: "getblockhash".to_owned(),
+            params: json!([0]),
+            id: Some(json!("atomic-generation")),
+        };
+        let (reader_started_tx, reader_started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            reader_started_tx.send(()).expect("signal reader start");
+            let service = context
+                .service_for_request(&request, RpcRequestMempool::default(), false, 0, None)
+                .expect("coherent request service");
+            let response = service.handle(request).expect("header response");
+            result_tx.send(response.result).expect("send RPC result");
+        });
+        reader_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reader start");
+        assert!(matches!(
+            result_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_tx.send(()).expect("release publication");
+        assert_eq!(
+            result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("post-publication RPC result"),
+            Some(json!(hash.to_hex()))
+        );
+        writer.join().expect("writer thread");
+        reader.join().expect("reader thread");
+    }
+
     #[tokio::test]
     async fn node_serves_json_rpc_over_http() {
         let node = NodeService::new(NodeConfig {
@@ -10785,6 +18970,166 @@ mod tests {
 
         shutdown_tx.send(()).expect("shutdown");
         server.await.expect("server join").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn rpc_http_rejects_oversized_request_bodies() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let service = node.rpc_diagnostic_service().expect("RPC service");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let limits = RpcLimits {
+            maximum_request_bytes: 64,
+            ..RpcLimits::default()
+        };
+        let server = tokio::spawn(async move {
+            serve_rpc_listener_with_state(
+                listener,
+                RpcHttpState::new(service.clone(), service, None, None, limits),
+                None,
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
+            .await
+        });
+
+        let body = "x".repeat(65);
+        let request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write oversized request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("read response");
+        assert!(
+            response.starts_with("HTTP/1.1 413 Payload Too Large"),
+            "{response}"
+        );
+
+        shutdown_tx.send(()).expect("shutdown");
+        server.await.expect("server join").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn timed_out_point_read_retains_worker_capacity_until_completion() {
+        let config = NodeConfig {
+            network: Network::Regtest,
+            rpc_limits: RpcLimits {
+                maximum_concurrent_requests: 1,
+                execution_timeout: Duration::from_millis(10),
+                ..RpcLimits::default()
+            },
+            ..NodeConfig::default()
+        };
+        let node = NodeService::new(config.clone());
+        let read_context = node.rpc_read_context();
+        let permit = read_context
+            .try_acquire_point_read()
+            .expect("first point-read permit");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let permit = permit;
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            drop(permit);
+            let _ = done_tx.send(());
+        });
+        started_rx.await.expect("point-read worker started");
+
+        let runtime_limits = RpcRuntimeLimits::new(config.rpc_limits);
+        let result = execute_with_rpc_limits(&runtime_limits, async move {
+            let _ = worker.await;
+        })
+        .await;
+        assert_eq!(result, Err(RpcAdmissionError::TimedOut));
+        assert!(
+            read_context.try_acquire_point_read().is_none(),
+            "timed-out blocking worker must retain point-read capacity"
+        );
+        assert_eq!(
+            execute_with_rpc_limits(&runtime_limits, async { 7 }).await,
+            Ok(7),
+            "outer request capacity must be released after timeout"
+        );
+
+        release_tx.send(()).expect("release point-read worker");
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("worker completion timeout")
+            .expect("worker completion");
+        assert!(
+            read_context.try_acquire_point_read().is_some(),
+            "point-read capacity must return when detached worker completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_collection_retains_worker_capacity_until_completion() {
+        let config = NodeConfig {
+            network: Network::Regtest,
+            rpc_limits: RpcLimits {
+                maximum_concurrent_requests: 1,
+                execution_timeout: Duration::from_millis(10),
+                ..RpcLimits::default()
+            },
+            ..NodeConfig::default()
+        };
+        let node = NodeService::new(config.clone());
+        let read_context = node.rpc_read_context();
+        let permit = read_context
+            .try_acquire_collection()
+            .expect("first collection permit");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let permit = permit;
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            drop(permit);
+            let _ = done_tx.send(());
+        });
+        started_rx.await.expect("collection worker started");
+
+        let runtime_limits = RpcRuntimeLimits::new(config.rpc_limits);
+        let result = execute_with_rpc_limits(&runtime_limits, async move {
+            let _ = worker.await;
+        })
+        .await;
+        assert_eq!(result, Err(RpcAdmissionError::TimedOut));
+        assert!(
+            read_context.try_acquire_collection().is_none(),
+            "timed-out blocking worker must retain collection capacity"
+        );
+        assert_eq!(
+            execute_with_rpc_limits(&runtime_limits, async { 7 }).await,
+            Ok(7),
+            "outer request capacity must be released after timeout"
+        );
+
+        release_tx.send(()).expect("release collection worker");
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("worker completion timeout")
+            .expect("worker completion");
+        assert!(
+            read_context.try_acquire_collection().is_some(),
+            "collection capacity must return when detached worker completes"
+        );
     }
 
     #[tokio::test]
@@ -11130,6 +19475,24 @@ mod tests {
                 .status
                 .failed
         );
+        assert!(
+            node.state()
+                .chain
+                .header(&descendant.hash)
+                .expect("live descendant header")
+                .expect("live descendant")
+                .status
+                .failed
+        );
+        assert!(
+            node.state()
+                .blocks
+                .block(&invalid_hash)
+                .expect("live invalid block")
+                .expect("live invalid record")
+                .status
+                .failed
+        );
 
         let store = node.state().store.clone();
         drop(node);
@@ -11190,12 +19553,12 @@ mod tests {
     }
 
     #[test]
-    fn shadow_active_state_connector_resumes_in_bounded_batches_without_authority() {
+    fn native_active_state_connector_resumes_in_bounded_batches_without_authority() {
         let store = StoreHandle::memory();
-        let config = active_state_shadow_config();
+        let config = active_state_native_config();
         let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
             .expect("initial state");
-        let mut node = NodeService::try_with_state(config.clone(), state).expect("shadow node");
+        let mut node = NodeService::try_with_state(config.clone(), state).expect("native node");
 
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(90, 50)]);
         let genesis = store_fixture_alternate(&mut node, genesis, 0, 1);
@@ -11206,7 +19569,7 @@ mod tests {
         drop(node);
 
         let state = NodeState::from_store_for_network(store, Network::Regtest).expect("restart");
-        let mut restarted = NodeService::try_with_state(config, state).expect("restarted shadow");
+        let mut restarted = NodeService::try_with_state(config, state).expect("restarted native");
         assert!(restarted
             .state()
             .best_block_tip()
@@ -11214,7 +19577,7 @@ mod tests {
             .is_none());
 
         let first = restarted
-            .shadow_sync_connect_stored_state(1)
+            .native_sync_connect_stored_state(1)
             .expect("first connector batch");
         assert_eq!(first.connected, 1);
         assert_eq!(first.disconnected, 0);
@@ -11228,7 +19591,7 @@ mod tests {
             genesis.hash
         );
         let second = restarted
-            .shadow_sync_connect_stored_state(1)
+            .native_sync_connect_stored_state(1)
             .expect("second connector batch");
         assert_eq!(second.connected, 1);
         assert_eq!(
@@ -11258,8 +19621,8 @@ mod tests {
     }
 
     #[test]
-    fn shadow_active_state_direct_progress_yields_between_bounded_atomic_slices() {
-        let mut node = NodeService::new(active_state_shadow_config());
+    fn native_active_state_direct_progress_yields_between_bounded_atomic_slices() {
+        let mut node = NodeService::new(active_state_native_config());
         let mut previous = BlockHash::ZERO;
         let mut records = Vec::new();
         for height in 0..320 {
@@ -11276,11 +19639,11 @@ mod tests {
         }
 
         let first = node
-            .shadow_sync_connect_stored_state(320)
+            .native_sync_connect_stored_state(320)
             .expect("first direct connector slice");
         assert_eq!(
             first.connected,
-            shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE
+            native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE
         );
         assert_eq!(first.disconnected, 0);
         assert_eq!(
@@ -11289,11 +19652,11 @@ mod tests {
                 .expect("active tip")
                 .expect("first slice tip")
                 .hash,
-            records[shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE - 1].hash
+            records[native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE - 1].hash
         );
 
         let second = node
-            .shadow_sync_connect_stored_state(320)
+            .native_sync_connect_stored_state(320)
             .expect("second direct connector slice");
         assert_eq!(second.connected, 32);
         assert_eq!(second.disconnected, 0);
@@ -11308,31 +19671,89 @@ mod tests {
     }
 
     #[test]
-    fn stored_activation_rebinds_durable_status_to_body_commitments() {
-        let mut node = NodeService::new(active_state_shadow_config());
-        let original = block_with_commitments(vec![coinbase_transaction_with_address(103, 50)]);
-        let record = store_fixture_alternate(&mut node, original.clone(), 0, 1);
+    fn stored_activation_revalidates_full_body_despite_coordinated_status_forgery() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../fixtures/hsd/blocks/genesis-v1.json"))
+                .expect("HSD genesis fixture");
+        let genesis_case = fixture["networks"]
+            .as_array()
+            .expect("genesis networks")
+            .iter()
+            .find(|case| case["network"] == "regtest")
+            .expect("regtest genesis");
+        let genesis_block = Block::decode(&decode_hex(
+            genesis_case["raw"].as_str().expect("raw genesis"),
+        ))
+        .expect("canonical regtest genesis");
+        let mut genesis = strict_header_record(genesis_block.header.clone(), 0, None);
 
-        let mut replaced = original;
-        replaced.transactions[0].outputs[0].value = 49;
-        assert_eq!(replaced.hash(), record.hash);
-        let replacement = RawBlockRecord::from_block(&replaced, RawBlockSource::Peer);
-        let mut batch = node.state.store.batch();
-        batch
-            .put(
-                ColumnFamily::Blocks,
-                record.hash.as_bytes(),
-                &replacement.encode(),
-            )
-            .expect("replace raw body");
-        node.state.store.commit(batch).expect("commit replacement");
+        let duplicate = coinbase_transaction();
+        let mut invalid = block_with_commitments(vec![duplicate.clone(), duplicate]);
+        invalid.header.prev_block = genesis.hash;
+        invalid.header.time = genesis.header.time + 1;
+        invalid.header.bits = Network::Regtest.params().pow.bits;
+        invalid.header = mine_header(invalid.header);
+        HeaderConsensus::new(ConsensusParams::for_network(Network::Regtest))
+            .validate_block_commitments(&invalid)
+            .expect("invalid body remains commitment-consistent");
+        let mut candidate = strict_header_record(invalid.header.clone(), 1, Some(&genesis));
 
+        let forged = BlockStatus {
+            header_context_valid: true,
+            checkpoint_valid: true,
+            body_present: true,
+            body_syntax_valid: true,
+            absolute_finality_valid: true,
+            ..BlockStatus::default()
+        };
+        genesis.status = forged.clone();
+        candidate.status = forged.clone();
+        let store = strict_header_store(&[genesis.clone(), candidate.clone()], candidate.hash);
+        let genesis_index = BlockIndexRecord {
+            hash: genesis.hash,
+            height: genesis.height,
+            prev_hash: genesis.header.prev_block,
+            chainwork: genesis.chainwork,
+            status: forged.clone(),
+            tx_count: genesis_block.transactions.len() as u32,
+            validated_at: None,
+        };
+        let candidate_index = BlockIndexRecord {
+            hash: candidate.hash,
+            height: candidate.height,
+            prev_hash: candidate.header.prev_block,
+            chainwork: candidate.chainwork,
+            status: forged,
+            tx_count: invalid.transactions.len() as u32,
+            validated_at: None,
+        };
+        let mut batch = store.batch();
+        write_block_index_to_batch(&mut batch, &genesis_index).expect("stage genesis index");
+        write_block_index_to_batch(&mut batch, &candidate_index).expect("stage candidate index");
+        write_raw_block_to_batch(
+            &mut batch,
+            &RawBlockRecord::from_block(&genesis_block, RawBlockSource::Peer),
+        )
+        .expect("stage genesis body");
+        write_raw_block_to_batch(
+            &mut batch,
+            &RawBlockRecord::from_block(&invalid, RawBlockSource::Peer),
+        )
+        .expect("stage invalid body");
+        store.commit(batch).expect("commit forged stored branch");
+
+        let state = NodeState::from_store_for_network(store, Network::Regtest)
+            .expect("fixture-mode restart for corruption activation");
+        let mut node =
+            NodeService::try_with_state(active_state_native_config(), state).expect("native node");
         let error = node
-            .shadow_sync_connect_stored_state(1)
-            .expect_err("replacement body must not borrow durable validation status");
+            .native_sync_connect_stored_state(2)
+            .expect_err("forged body-valid status must not authorize activation");
         let error_chain = format!("{error:#}");
         assert!(
-            error_chain.contains("body commitment"),
+            error_chain.contains("block body validation")
+                || error_chain.contains("coinbase height validation")
+                || error_chain.contains("multiple coinbase transactions"),
             "unexpected error: {error_chain}"
         );
         assert_eq!(
@@ -11343,12 +19764,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_active_state_runtime_updates_scheduler_and_diagnostics() {
-        let config = active_state_shadow_config();
+    async fn native_active_state_runtime_updates_scheduler_and_diagnostics() {
+        let config = active_state_native_config();
         let mut node = NodeService::new(config.clone());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(102, 50)]);
         let genesis = store_fixture_alternate(&mut node, genesis, 0, 1);
-        let node = Arc::new(tokio::sync::Mutex::new(node));
+        let runtime = NodeRuntime::spawn(node, DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY)
+            .expect("native runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
         let (peers, _events) =
             hns_p2p::LivePeerManager::new(hns_p2p::LivePeerConfig::for_network(Network::Regtest))
                 .expect("peers");
@@ -11362,25 +19786,30 @@ mod tests {
             maximum_bytes: 1_024 * 1_024,
         })
         .expect("orphans");
-        let diagnostics = Arc::new(tokio::sync::RwLock::new(ShadowSyncDiagnostics {
+        let diagnostics = Arc::new(tokio::sync::RwLock::new(NativeSyncDiagnostics {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
             observation_only: false,
             active_state: true,
-            ..ShadowSyncDiagnostics::default()
+            ..NativeSyncDiagnostics::default()
         }));
 
-        shadow_sync::connect_stored_active_state(
+        native_sync::connect_stored_active_state(
             &node,
+            &writer,
             &peers,
             &mut scheduler,
             &mut orphans,
             &diagnostics,
-            config.shadow_sync.active_state_connect_batch,
+            config.native_sync.active_state_connect_batch,
         )
         .await
         .expect("runtime connector");
 
+        assert_eq!(
+            node.canonical_epoch().tip.expect("canonical tip").hash,
+            genesis.hash
+        );
         assert_eq!(
             scheduler
                 .snapshot()
@@ -11389,33 +19818,37 @@ mod tests {
                 .hash,
             genesis.hash
         );
-        let diagnostics = diagnostics.read().await;
-        assert_eq!(diagnostics.connected_blocks, 1);
-        assert_eq!(diagnostics.active_state_slices, 1);
-        assert_eq!(diagnostics.active_state_last_slice_blocks, 1);
-        assert_eq!(diagnostics.active_state_last_transactions, 1);
-        assert_eq!(diagnostics.active_state_last_non_coinbase_inputs, 0);
-        assert_eq!(diagnostics.active_state_last_outputs, 1);
-        assert_eq!(diagnostics.active_state_last_name_actions, 0);
-        assert!(
-            diagnostics.active_state_max_slice_millis >= diagnostics.active_state_last_slice_millis
-        );
-        assert!(!diagnostics.observation_only);
-        assert!(diagnostics.active_state);
-        assert_eq!(
-            diagnostics
-                .sync
-                .active_tip
-                .as_ref()
-                .expect("diagnostic tip")
-                .hash,
-            genesis.hash
-        );
+        {
+            let diagnostics = diagnostics.read().await;
+            assert_eq!(diagnostics.connected_blocks, 1);
+            assert_eq!(diagnostics.active_state_slices, 1);
+            assert_eq!(diagnostics.active_state_last_slice_blocks, 1);
+            assert_eq!(diagnostics.active_state_last_transactions, 1);
+            assert_eq!(diagnostics.active_state_last_non_coinbase_inputs, 0);
+            assert_eq!(diagnostics.active_state_last_outputs, 1);
+            assert_eq!(diagnostics.active_state_last_name_actions, 0);
+            assert!(
+                diagnostics.active_state_max_slice_millis
+                    >= diagnostics.active_state_last_slice_millis
+            );
+            assert!(!diagnostics.observation_only);
+            assert!(diagnostics.active_state);
+            assert_eq!(
+                diagnostics
+                    .sync
+                    .active_tip
+                    .as_ref()
+                    .expect("diagnostic tip")
+                    .hash,
+                genesis.hash
+            );
+        }
+        runtime.shutdown().await.expect("shutdown native runtime");
     }
 
     #[test]
-    fn shadow_active_state_connector_reorganizes_a_stored_best_branch() {
-        let mut node = NodeService::new(active_state_shadow_config());
+    fn native_active_state_connector_reorganizes_a_stored_best_branch() {
+        let mut node = NodeService::new(active_state_native_config());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(92, 50)]);
         let genesis = node
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
@@ -11434,7 +19867,7 @@ mod tests {
         let side_two = store_fixture_alternate(&mut node, side_two, 2, 4);
 
         let bounded_error = node
-            .shadow_sync_connect_stored_state(1)
+            .native_sync_connect_stored_state(1)
             .expect_err("insufficient atomic reorg batch must fail closed");
         assert!(bounded_error
             .to_string()
@@ -11458,7 +19891,7 @@ mod tests {
         );
 
         let outcome = node
-            .shadow_sync_connect_stored_state(64)
+            .native_sync_connect_stored_state(64)
             .expect("stored branch activation");
         assert_eq!(outcome.connected, 2);
         assert_eq!(outcome.disconnected, 1);
@@ -11483,8 +19916,8 @@ mod tests {
     }
 
     #[test]
-    fn shadow_active_state_reorg_keeps_the_full_configured_atomic_bound() {
-        let mut node = NodeService::new(active_state_shadow_config());
+    fn native_active_state_reorg_keeps_the_full_configured_atomic_bound() {
+        let mut node = NodeService::new(active_state_native_config());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_tag(200, 50)]);
         let genesis = node
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
@@ -11496,7 +19929,7 @@ mod tests {
 
         let mut previous = genesis.hash;
         let mut side = Vec::new();
-        for offset in 0..=u32::try_from(shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE)
+        for offset in 0..=u32::try_from(native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE)
             .expect("direct slice fits u32")
         {
             let height = offset + 1;
@@ -11513,9 +19946,9 @@ mod tests {
             side.push(record);
         }
 
-        assert!(side.len() > shadow_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+        assert!(side.len() > native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
         let outcome = node
-            .shadow_sync_connect_stored_state(side.len())
+            .native_sync_connect_stored_state(side.len())
             .expect("deep stored reorganization");
         assert_eq!(outcome.connected, side.len());
         assert_eq!(outcome.disconnected, 1);
@@ -11531,7 +19964,7 @@ mod tests {
 
     #[test]
     fn contextual_invalid_ancestor_is_durable_and_exact() {
-        let config = active_state_shadow_config();
+        let config = active_state_native_config();
         let mut node = NodeService::new(config.clone());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(96, 50)]);
         let genesis = node
@@ -11555,7 +19988,7 @@ mod tests {
         let descendant = store_fixture_alternate(&mut node, descendant, 2, 4);
 
         let outcome = node
-            .shadow_sync_connect_stored_state(64)
+            .native_sync_connect_stored_state(64)
             .expect("contextual failure classification");
         let failure = outcome.contextual_failure.expect("failed branch");
         assert_eq!(failure.record.hash, invalid.hash);
@@ -11595,7 +20028,7 @@ mod tests {
         let store = node.state().store.clone();
         drop(node);
         let state = NodeState::from_store_for_network(store, Network::Regtest).expect("restart");
-        let mut restarted = NodeService::try_with_state(config, state).expect("restarted shadow");
+        let mut restarted = NodeService::try_with_state(config, state).expect("restarted native");
         assert_eq!(
             restarted
                 .state()
@@ -11606,7 +20039,7 @@ mod tests {
             active.hash
         );
         assert!(restarted
-            .shadow_sync_connect_stored_state(64)
+            .native_sync_connect_stored_state(64)
             .expect("idempotent connector")
             .contextual_failure
             .is_none());
@@ -11614,7 +20047,7 @@ mod tests {
 
     #[test]
     fn local_state_fault_does_not_poison_a_stored_branch() {
-        let mut node = NodeService::new(active_state_shadow_config());
+        let mut node = NodeService::new(active_state_native_config());
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(100, 50)]);
         let genesis = node
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
@@ -11634,7 +20067,7 @@ mod tests {
             .expect("commit local fault");
 
         let error = node
-            .shadow_sync_connect_stored_state(64)
+            .native_sync_connect_stored_state(64)
             .expect_err("missing local state root must stop the connector");
         assert!(
             format!("{error:#}").contains("durable name-tree-root metadata is missing"),
@@ -11821,21 +20254,21 @@ mod tests {
     #[test]
     fn experimental_restart_recovers_fully_stored_best_work_branch() {
         let store = StoreHandle::memory();
-        let shadow_config = NodeConfig {
+        let native_config = NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
         };
         let state =
             NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        let mut shadow = NodeService::try_with_state(shadow_config, state).expect("shadow node");
+        let mut native = NodeService::try_with_state(native_config, state).expect("native node");
 
         let genesis = block_with_commitments(vec![coinbase_transaction_with_address(50, 50)]);
-        let genesis_record = shadow
+        let genesis_record = native
             .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
             .expect("genesis");
         let mut active = block_with_commitments(vec![coinbase_transaction_with_address(51, 50)]);
         active.header.prev_block = genesis_record.hash;
-        shadow
+        native
             .connect_block(NodeBlockImport::fixture(active, 1, 2))
             .expect("active child");
 
@@ -11843,15 +20276,15 @@ mod tests {
         side.header.prev_block = genesis_record.hash;
         let side_hash = side.hash();
         let import = NodeBlockImport::fixture(side, 1, 3);
-        let validated = shadow
+        let validated = native
             .state()
             .validate_import(&import)
             .expect("validate side");
-        shadow
+        native
             .state_mut()
             .store_validated_alternate(import, validated)
             .expect("persist side before simulated crash");
-        drop(shadow);
+        drop(native);
 
         let state =
             NodeState::from_store_for_network(store, Network::Regtest).expect("reloaded state");
@@ -11921,13 +20354,13 @@ mod tests {
 
     #[test]
     fn authority_modes_fail_closed_except_explicit_regtest_experiment() {
-        let shadow = NodeService::new(NodeConfig {
+        let native = NodeService::new(NodeConfig {
             network: Network::Regtest,
             ..NodeConfig::default()
         });
-        assert!(shadow.subscribe_mining_events().is_err());
+        assert!(native.subscribe_mining_events().is_err());
         assert!(
-            !shadow
+            !native
                 .rpc_service()
                 .expect("rpc")
                 .snapshot()
@@ -11943,15 +20376,9 @@ mod tests {
             ..NodeConfig::default()
         })
         .is_err());
-        assert!(validate_node_config(&NodeConfig {
-            network: Network::Regtest,
-            authority_mode: AuthorityMode::HsdVerified,
-            ..NodeConfig::default()
-        })
-        .is_err());
-        let mut unacknowledged_active_sync = active_state_shadow_config();
+        let mut unacknowledged_active_sync = active_state_native_config();
         unacknowledged_active_sync.acknowledge_incomplete_consensus = false;
-        unacknowledged_active_sync.authority_mode = AuthorityMode::Shadow;
+        unacknowledged_active_sync.authority_mode = AuthorityMode::Disabled;
         assert!(validate_node_config(&unacknowledged_active_sync).is_err());
         unacknowledged_active_sync.authority_mode = AuthorityMode::Native;
         assert!(validate_node_config(&unacknowledged_active_sync).is_ok());
@@ -12023,7 +20450,7 @@ mod tests {
             },
             {
                 let mut value = config.clone();
-                value.shadow_sync.connect_active_state = false;
+                value.native_sync.connect_active_state = false;
                 value
             },
             {
@@ -12274,6 +20701,479 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn staged_effect_rejection_preserves_database_pages_indexes_mining_and_mempool() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        // Page storage deliberately enforces the production 10 GB reserve;
+        // `/tmp` is commonly a much smaller tmpfs. Keep this fixture on the
+        // build-target filesystem that already hosts the test artifacts.
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-reorg-staged-effect-rejection-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let mut state =
+            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
+        state.name_pages =
+            Some(NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages"));
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                transaction_index: true,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("page-backed indexed node");
+        let old_block = block_with_commitments(vec![coinbase_transaction_with_address(0xb1, 50)]);
+        let old_record = node
+            .connect_block(NodeBlockImport::fixture(old_block.clone(), 0, 1))
+            .expect("connect old tip");
+        let disconnect = NodeBlockDisconnect {
+            block_hash: old_record.hash,
+            height: 0,
+        };
+
+        // Measure the exact disconnect prefix with the same boundary wrapper.
+        // The integrated attempt receives exactly this allowance, proving all
+        // disconnect undo/UTXO/tx-index writes fit and the first connect-side
+        // generated write is rejected before it can enter either retained
+        // staging copy.
+        let raw = store.snapshot().expect("disconnect charge snapshot");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&raw);
+        let staged_batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
+        let mut charged = ReorgMeteredBatch::new(
+            staged_batch,
+            ReorgStagedEffectMeter::new(u64::MAX),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        node.state
+            .stage_disconnect(&staged, &mut charged, disconnect)
+            .expect("measure disconnect staging prefix");
+        let disconnect_limit = charged.meter.consumed;
+        assert!(disconnect_limit > 0);
+        drop(charged);
+        drop(staged);
+        drop(raw);
+        drop(overlay);
+
+        let durable_before = complete_store_image(&store);
+        let block_tip_before = node.state.best_block_tip().expect("block tip before");
+        let header_tip_before = node.state.chain.best_tip().expect("header tip before");
+        let mining_before = node
+            .observed_mining_snapshot()
+            .expect("mining state before")
+            .map(|snapshot| (snapshot.generation, snapshot.tip.hash));
+        let mining_generation_before = node.mining_events.committed_generation();
+        let mempool_before = node.state.mempool.info();
+        let (page_path, page_state_before, page_generation_before, page_bytes_before) = {
+            let pages = node.state.name_pages.as_ref().expect("page storage");
+            (
+                pages.file_path.clone(),
+                pages.state.clone(),
+                (pages.committed_generation_bytes, pages.generation_bytes),
+                std::fs::read(&pages.file_path).expect("page bytes before"),
+            )
+        };
+
+        let replacement = block_with_commitments(vec![coinbase_transaction_with_address(0xb2, 60)]);
+        let replacement_hash = replacement.hash();
+        let error = node
+            .apply_reorg_with_limits(
+                NodeReorg {
+                    disconnect: vec![disconnect],
+                    connect: vec![NodeBlockImport::fixture(replacement, 0, 2)],
+                },
+                NodeReorgLimits {
+                    maximum_staged_effect_bytes: disconnect_limit,
+                    ..NodeReorgLimits::PRODUCTION
+                },
+            )
+            .expect_err("first connect write exceeds exact disconnect allowance");
+        assert!(
+            format!("{error:#}").contains(ReorgStagedEffectMeter::CONTEXT),
+            "{error:#}"
+        );
+
+        assert_eq!(complete_store_image(&store), durable_before);
+        assert_eq!(
+            node.state.best_block_tip().expect("block tip after"),
+            block_tip_before
+        );
+        assert_eq!(
+            node.state.chain.best_tip().expect("header tip after"),
+            header_tip_before
+        );
+        assert!(
+            node.state
+                .blocks
+                .load_block_record(&old_record.hash)
+                .expect("old index after")
+                .expect("old index")
+                .status
+                .active_chain
+        );
+        assert!(node
+            .state
+            .blocks
+            .load_block_record(&replacement_hash)
+            .expect("replacement index after")
+            .is_none());
+        assert_eq!(
+            node.observed_mining_snapshot()
+                .expect("mining state after")
+                .map(|snapshot| (snapshot.generation, snapshot.tip.hash)),
+            mining_before
+        );
+        assert_eq!(
+            node.mining_events.committed_generation(),
+            mining_generation_before
+        );
+        assert_eq!(node.state.mempool.info(), mempool_before);
+        let pages = node.state.name_pages.as_ref().expect("page storage after");
+        assert_eq!(pages.file_path, page_path);
+        assert_eq!(pages.state, page_state_before);
+        assert_eq!(
+            (pages.committed_generation_bytes, pages.generation_bytes),
+            page_generation_before
+        );
+        assert_eq!(
+            std::fs::read(&pages.file_path).expect("page bytes after"),
+            page_bytes_before
+        );
+
+        drop(node);
+        std::fs::remove_dir_all(directory).expect("remove staged-effect fixture");
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn archive_budget_rejection_after_name_page_append_rolls_back_entire_reorg() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        // Name-page publication preserves a 10 GB filesystem reserve, so keep
+        // the real RocksDB/archive fixture beside the configured build target
+        // instead of assuming `/tmp` has production-scale free space.
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-reorg-archive-page-budget-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create archived reorg fixture");
+
+        let mut node = NodeService::try_new(NodeConfig {
+            network: Network::Regtest,
+            data_dir: Some(directory.clone()),
+            transaction_index: true,
+            storage_durability: DurabilityPolicy::Sync,
+            native_sync: NativeSyncConfig {
+                enabled: true,
+                listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                ..NativeSyncConfig::default()
+            },
+            mining_engine: MiningEngineConfig {
+                enabled: true,
+                transaction_relay: true,
+                ..MiningEngineConfig::default()
+            },
+            ..NodeConfig::default()
+        })
+        .expect("open archived RocksDB node");
+        let store = node.state.store.clone();
+        node.state.state_engine = StoredStateEngine::with_services(
+            store.clone(),
+            Network::Regtest,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+        .expect("fixture state services");
+
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_tag(0, 50)]);
+        let genesis = node
+            .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("connect archived genesis");
+        let names = (0u32..10_000)
+            .map(|index| format!("archive-reorg-page-{index}"))
+            .filter(|name| {
+                let hash = NameHash::new(sha3_256(name.as_bytes()));
+                hns_consensus::rollout_height(&hash, Network::Regtest.params().names) == 0
+                    && !hns_consensus::is_reserved(&hash, 1, Network::Regtest.params().names)
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names.len(),
+            2,
+            "find two immediately rolled-out unreserved names"
+        );
+        let name_funding = Outpoint {
+            txid: Txid::new([0xd4; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, name_funding.clone(), 10_000, 0);
+        let mut opening = block_with_commitments(vec![
+            coinbase_transaction_with_tag(1, 50),
+            open_transaction(names[0].as_bytes(), name_funding),
+        ]);
+        opening.header.prev_block = genesis.hash;
+        opening.header.nonce = 101;
+        let opening = node
+            .connect_block(NodeBlockImport::fixture(opening, 1, 2))
+            .expect("connect pending OPEN");
+
+        let mut previous = opening.hash;
+        let mut height_three = None;
+        let mut old_tip = None;
+        for height in 2..=4 {
+            let snapshot = store.snapshot().expect("pre-boundary root snapshot");
+            let root = load_stored_name_tree_commit_root(&snapshot).expect("pre-boundary root");
+            drop(snapshot);
+            let mut block = block_with_commitments(vec![coinbase_transaction_with_tag(height, 50)]);
+            block.header.prev_block = previous;
+            block.header.tree_root = *root.as_bytes();
+            block.header.nonce = height.saturating_add(100);
+            let record = node
+                .connect_block(NodeBlockImport::fixture(
+                    block,
+                    height,
+                    u64::from(height) + 1,
+                ))
+                .unwrap_or_else(|error| panic!("connect active height {height}: {error}"));
+            previous = record.hash;
+            if height == 3 {
+                height_three = Some(record.clone());
+            }
+            if height == 4 {
+                old_tip = Some(record);
+            }
+        }
+        let height_three = height_three.expect("height-three ancestor");
+        let old_tip = old_tip.expect("old height-four tip");
+
+        // The second replacement block spends an output created by the first.
+        // This forces the production StagingOverlay read-your-writes path while
+        // the 2,048-output parent generates a nontrivial real undo and tx index.
+        let replacement_funding = Outpoint {
+            txid: Txid::new([0xe4; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, replacement_funding.clone(), 1_000_000, 0);
+        let mempool_funding = Outpoint {
+            txid: Txid::new([0xf4; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, mempool_funding.clone(), 10_000, 0);
+        let mempool_transaction = script_spend(mempool_funding, 9_000);
+        let mempool_txid = mempool_transaction.txid();
+        assert!(matches!(
+            node.mining_engine_accept_peer_transaction(mempool_transaction)
+                .expect("seed unrelated mempool transaction"),
+            hns_mempool::Admission::Accepted(txid) if txid == mempool_txid
+        ));
+        let replacement_name_funding = Outpoint {
+            txid: Txid::new([0xa4; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, replacement_name_funding.clone(), 10_000, 0);
+        let replacement_name_transaction =
+            open_transaction(names[1].as_bytes(), replacement_name_funding);
+        let mut parent = script_spend(replacement_funding, 900_000);
+        parent.outputs = (0..2_048)
+            .map(|index| Output {
+                value: 100,
+                address: Address::new(0, vec![(index % 251) as u8; 20])
+                    .expect("replacement output address"),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            })
+            .collect();
+        let parent_txid = parent.txid();
+        let current_root = {
+            let snapshot = store.snapshot().expect("replacement root snapshot");
+            let root = load_stored_name_tree_commit_root(&snapshot).expect("replacement root");
+            drop(snapshot);
+            root
+        };
+        let mut replacement = block_with_commitments(vec![
+            coinbase_transaction_with_tag(0x400, 50),
+            parent,
+            replacement_name_transaction,
+        ]);
+        replacement.header.prev_block = height_three.hash;
+        replacement.header.tree_root = *current_root.as_bytes();
+        replacement.header.nonce = 0x404;
+        let replacement_hash = replacement.hash();
+
+        let child_transaction = script_spend(
+            Outpoint {
+                txid: parent_txid,
+                index: 0,
+            },
+            90,
+        );
+        let child_txid = child_transaction.txid();
+        let mut child = block_with_commitments(vec![
+            coinbase_transaction_with_tag(0x500, 50),
+            child_transaction,
+        ]);
+        child.header.prev_block = replacement_hash;
+        child.header.tree_root = *current_root.as_bytes();
+        child.header.nonce = 0x505;
+        let child_hash = child.hash();
+
+        let durable_before = complete_store_image(&store);
+        let block_tip_before = node.state.best_block_tip().expect("block tip before");
+        let header_tip_before = node.state.chain.best_tip().expect("header tip before");
+        let mining_before = node
+            .observed_mining_snapshot()
+            .expect("mining state before")
+            .map(|snapshot| (snapshot.generation, snapshot.tip.hash));
+        let mining_generation_before = node.mining_events.committed_generation();
+        let mempool_before = node.state.mempool.info();
+        let (page_path, page_state_before, page_generation_before, page_bytes_before) = {
+            let pages = node.state.name_pages.as_ref().expect("page storage");
+            (
+                pages.file_path.clone(),
+                pages.state.clone(),
+                (pages.committed_generation_bytes, pages.generation_bytes),
+                std::fs::read(&pages.file_path).expect("page bytes before"),
+            )
+        };
+        let payload_directory = directory.join("payload-segments");
+        let payload_bytes_before = flat_directory_file_image(&payload_directory);
+
+        let fault = ReorgArchivePreflightRejectGuard::enable();
+        let error = node
+            .apply_reorg(NodeReorg {
+                disconnect: vec![NodeBlockDisconnect {
+                    block_hash: old_tip.hash,
+                    height: old_tip.height,
+                }],
+                connect: vec![
+                    NodeBlockImport::fixture(replacement, 4, 6),
+                    NodeBlockImport::fixture(child, 5, 7),
+                ],
+            })
+            .expect_err("archive budget must reject after page append");
+        assert!(
+            format!("{error:#}").contains(ReorgStagedEffectMeter::CONTEXT),
+            "{error:#}"
+        );
+        assert!(
+            fault.appended_name_page_bytes() >= hns_store::NAME_PAGE_BYTES as u64,
+            "the fault must be armed only after a real fixed-size page append"
+        );
+        assert!(
+            fault.maximum_generated_undo_bytes() >= 64 * 1024,
+            "the replacement must generate and stage a substantial encoded undo"
+        );
+        assert!(
+            fault.generated_name_state_writes() > 0,
+            "a replacement OPEN must generate a real NameState batch write"
+        );
+        assert!(
+            !node.state.storage_reopen_required(),
+            "read-only archive budget rejection is unambiguous"
+        );
+
+        assert_eq!(complete_store_image(&store), durable_before);
+        assert_eq!(
+            flat_directory_file_image(&payload_directory),
+            payload_bytes_before,
+            "archive preflight rejection must happen before segment append"
+        );
+        assert_eq!(
+            node.state.best_block_tip().expect("block tip after"),
+            block_tip_before
+        );
+        assert_eq!(
+            node.state.chain.best_tip().expect("header tip after"),
+            header_tip_before
+        );
+        assert!(
+            node.state
+                .blocks
+                .load_block_record(&old_tip.hash)
+                .expect("old index after")
+                .expect("old index")
+                .status
+                .active_chain
+        );
+        for hash in [replacement_hash, child_hash] {
+            assert!(node
+                .state
+                .blocks
+                .load_block_record(&hash)
+                .expect("replacement index after")
+                .is_none());
+        }
+        assert!(node
+            .state
+            .blocks
+            .load_tx_index(&parent_txid)
+            .expect("parent tx index after")
+            .is_none());
+        assert!(node
+            .state
+            .blocks
+            .load_tx_index(&child_txid)
+            .expect("child tx index after")
+            .is_none());
+        assert_eq!(
+            node.observed_mining_snapshot()
+                .expect("mining state after")
+                .map(|snapshot| (snapshot.generation, snapshot.tip.hash)),
+            mining_before
+        );
+        assert_eq!(
+            node.mining_events.committed_generation(),
+            mining_generation_before
+        );
+        assert_eq!(node.state.mempool.info(), mempool_before);
+        assert_eq!(
+            node.mining_engine_mempool_transaction(&mempool_txid)
+                .as_ref()
+                .map(Transaction::txid),
+            Some(mempool_txid),
+            "unrelated live mempool content must survive the rejected reorg"
+        );
+        let pages = node.state.name_pages.as_ref().expect("page storage after");
+        assert_eq!(pages.file_path, page_path);
+        assert_eq!(pages.state, page_state_before);
+        assert_eq!(
+            (pages.committed_generation_bytes, pages.generation_bytes),
+            page_generation_before
+        );
+        assert_eq!(
+            std::fs::read(&pages.file_path).expect("page bytes after"),
+            page_bytes_before,
+            "late rejection must truncate the uncommitted page tail"
+        );
+
+        drop(fault);
+        drop(node);
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove archived reorg fixture");
+    }
+
     #[tokio::test]
     async fn node_serves_read_only_diagnostics() {
         let node = NodeService::new(NodeConfig {
@@ -12383,5 +21283,827 @@ mod tests {
 
         shutdown_tx.send(()).expect("shutdown");
         server.await.expect("server join").expect("server result");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_runs_accepted_work_after_caller_cancellation() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            2,
+        )
+        .expect("runtime");
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            first_writer
+                .execute(None, "blocking runtime test command", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer command entered");
+
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executed_in_command = Arc::clone(&executed);
+        let second_writer = writer.clone();
+        let second = tokio::spawn(async move {
+            second_writer
+                .execute(None, "cancelled runtime test command", move |_| {
+                    executed_in_command.store(true, Ordering::Release);
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if writer.inner.sender.capacity() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second command admission timeout");
+        assert_eq!(writer.inner.sender.capacity(), 1, "second command admitted");
+        second.abort();
+        release_tx.send(()).expect("release first command");
+        first.await.expect("first join").expect("first command");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if executed.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted command execution timeout");
+        assert!(
+            executed.load(Ordering::Acquire),
+            "dropping a reply future must not cancel accepted work"
+        );
+        runtime.shutdown().await.expect("drain and join runtime");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_success_shutdown_marks_store_clean() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        assert!(!was_clean_shutdown(&store).expect("running store starts unclean"));
+
+        NodeRuntime::spawn(node, 2)
+            .expect("runtime")
+            .shutdown()
+            .await
+            .expect("successful shutdown");
+
+        assert!(was_clean_shutdown(&store).expect("successful shutdown marker"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_failure_shutdown_leaves_store_unclean() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        assert!(!was_clean_shutdown(&store).expect("running store starts unclean"));
+
+        NodeRuntime::spawn(node, 2)
+            .expect("runtime")
+            .shutdown_unclean()
+            .await
+            .expect("failure shutdown drains writer");
+
+        assert!(!was_clean_shutdown(&store).expect("failure shutdown marker"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_unclean_shutdown_corrects_prior_clean_clone() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let failure_correction = runtime.clone();
+
+        runtime.shutdown().await.expect("clean clone shutdown");
+        assert!(was_clean_shutdown(&store).expect("clean clone marker"));
+
+        failure_correction
+            .shutdown_unclean()
+            .await
+            .expect("unclean clone correction");
+        assert!(!was_clean_shutdown(&store).expect("corrected unclean marker"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_cancelled_enqueued_clean_shutdown_finishes_unclean() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking_command = tokio::spawn(async move {
+            writer
+                .execute(None, "clean-shutdown cancellation blocker", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer command entered");
+
+        let clean_runtime = runtime.clone();
+        let clean_shutdown = tokio::spawn(clean_runtime.shutdown());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.sender.capacity() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clean shutdown was not enqueued behind blocker");
+        clean_shutdown.abort();
+        assert!(clean_shutdown
+            .await
+            .expect_err("clean shutdown task is cancelled")
+            .is_cancelled());
+
+        let unclean_runtime = runtime.clone();
+        let unclean_shutdown = tokio::spawn(unclean_runtime.shutdown_unclean());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unclean correction was not enqueued behind cancelled clean shutdown");
+        assert!(!was_clean_shutdown(&store).expect("pre-stop unclean correction"));
+
+        release_tx.send(()).expect("release writer");
+        blocking_command
+            .await
+            .expect("blocking command join")
+            .expect("blocking command");
+        unclean_shutdown
+            .await
+            .expect("unclean shutdown join")
+            .expect_err("the prior clean command exits before the correction is processed");
+
+        assert!(
+            !was_clean_shutdown(&store).expect("post-join unclean correction"),
+            "an enqueued clean command must not overwrite the final failure marker"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_cancelled_shutdown_retains_join_authority() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 1).expect("runtime");
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            first_writer
+                .execute(None, "shutdown cancellation blocker", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer command entered");
+
+        let second = tokio::spawn(async move {
+            writer
+                .execute(None, "shutdown cancellation queued command", |_| Ok(()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued command admission timeout");
+
+        let interrupted_runtime = runtime.clone();
+        let interrupted = tokio::spawn(interrupted_runtime.shutdown_unclean());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.state.accepting.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown did not stop admission");
+        interrupted.abort();
+        assert!(interrupted
+            .await
+            .expect_err("shutdown task is cancelled")
+            .is_cancelled());
+        assert!(
+            runtime.inner.join.lock().await.is_some(),
+            "cancellation before enqueue must retain the OS-thread join handle"
+        );
+
+        release_tx.send(()).expect("release first command");
+        first.await.expect("first join").expect("first command");
+        second.await.expect("second join").expect("second command");
+        runtime
+            .shutdown_unclean()
+            .await
+            .expect("replacement shutdown drains and joins actor");
+        assert!(!was_clean_shutdown(&store).expect("cancelled shutdown remains unclean"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_epochs_are_exact_and_chain_scoped() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 4).expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let initial = read.canonical_epoch();
+        let initial_mempool = read.published_mempool().expect("initial mempool");
+
+        let error = writer
+            .execute::<(), _>(None, "erroring runtime test command", |_| {
+                anyhow::bail!("intentional command failure")
+            })
+            .await
+            .expect_err("command error");
+        assert!(error.to_string().contains("intentional command failure"));
+        let after_error = read.canonical_epoch();
+        assert_eq!(after_error.writer_sequence, initial.writer_sequence + 1);
+        assert_eq!(after_error.chain(), initial.chain());
+        assert!(initial_mempool.ordered_txids.is_same_generation(
+            &read
+                .published_mempool()
+                .expect("mempool after command error")
+                .ordered_txids
+        ));
+
+        let stale = writer
+            .execute_at(initial.clone(), "stale exact command", |_| Ok(()))
+            .await
+            .expect_err("exact sequence must be stale");
+        assert!(stale.chain().any(|cause| cause
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| { matches!(error, CanonicalWriterError::StaleEpoch { .. }) })));
+
+        writer
+            .execute_at_chain(initial.chain(), "chain-scoped command", |_| Ok(()))
+            .await
+            .expect("unrelated writer generation does not stale chain work");
+        runtime.shutdown().await.expect("shutdown");
+        assert!(was_clean_shutdown(&store).expect("clean shutdown marker"));
+        assert!(read.ensure_storage_operational().is_err());
+        assert!(read.published_mempool().is_err());
+        assert!(!read.published().storage_operational());
+        assert!(read.mining_snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stable_read_returns_busy_without_waiting_for_a_writer_slice() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            2,
+        )
+        .expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let command = tokio::spawn(async move {
+            writer
+                .execute(None, "stable-read overlap", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+        let started = Instant::now();
+        let error = read
+            .with_stable_read(|_, _| Ok(()))
+            .expect_err("overlapping read is busy");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(error
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| matches!(error, CanonicalWriterError::Busy)));
+        let _last_committed = read.published();
+
+        release_tx.send(()).expect("release writer");
+        command.await.expect("command join").expect("command");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_panic_publishes_fail_closed_and_joins() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            2,
+        )
+        .expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let error = writer
+            .execute::<(), _>(None, "panicking runtime test command", |_| {
+                panic!("intentional canonical writer panic")
+            })
+            .await
+            .expect_err("panicking command loses its reply");
+        assert!(error
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| matches!(error, CanonicalWriterError::Stopped)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.terminal_error().is_some()
+                    && !read.published().storage_operational()
+                    && runtime
+                        .inner
+                        .state
+                        .publication_sequence
+                        .load(Ordering::Acquire)
+                        & 1
+                        == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panic fail-closed publication timeout");
+        assert!(matches!(
+            runtime.terminal_error(),
+            Some(CanonicalWriterError::Terminal { .. })
+        ));
+        assert!(!read.published().storage_operational());
+        assert_eq!(
+            runtime
+                .inner
+                .state
+                .publication_sequence
+                .load(Ordering::Acquire)
+                & 1,
+            0,
+            "panic recovery must close the seqlock generation"
+        );
+        assert!(read.ensure_storage_operational().is_err());
+        assert!(runtime.shutdown().await.is_err());
+    }
+
+    #[test]
+    fn canonical_publication_sequence_refuses_two_step_wrap() {
+        assert_eq!(next_writer_sequence((u64::MAX / 2) - 1), Some(u64::MAX / 2));
+        assert_eq!(next_writer_sequence(u64::MAX / 2), None);
+        assert_eq!(next_writer_sequence(u64::MAX), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canonical_runtime_admission_is_fail_fast_and_hard_bounded() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            1,
+        )
+        .expect("runtime");
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_writer = writer.clone();
+        let first = tokio::spawn(async move {
+            first_writer
+                .execute(None, "saturation blocker", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("blocker entered");
+        let second_writer = writer.clone();
+        let second = tokio::spawn(async move {
+            second_writer
+                .execute(None, "saturation queued command", |_| Ok(()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if writer.inner.sender.capacity() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued command admission timeout");
+        assert_eq!(writer.inner.sender.capacity(), 0, "queue is saturated");
+
+        let started = Instant::now();
+        let error = writer
+            .execute(None, "saturation rejected command", |_| Ok(()))
+            .await
+            .expect_err("third outstanding command exceeds hard cap");
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(error
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| matches!(error, CanonicalWriterError::QueueFull { .. })));
+
+        release_tx.send(()).expect("release writer");
+        first.await.expect("first join").expect("first command");
+        second.await.expect("second join").expect("second command");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_revokes_read_authority_before_the_actor_drains() {
+        let runtime = NodeRuntime::spawn(
+            NodeService::new(NodeConfig {
+                network: Network::Regtest,
+                authority_mode: AuthorityMode::Disabled,
+                ..NodeConfig::default()
+            }),
+            2,
+        )
+        .expect("runtime");
+        let read = runtime.read();
+        let mut published = (*read.published()).clone();
+        published.authoritative_mining_snapshot = Some(Arc::new(MiningSnapshot {
+            network_id: Network::Regtest.canonical_id(),
+            generation: published.mining_generation,
+            tip: HeaderSummary {
+                hash: BlockHash::ZERO,
+                parent_hash: BlockHash::ZERO,
+                height: 0,
+                tree_root: [0; 32],
+                time: 0,
+                bits: 0,
+            },
+            parent_median_time: 0,
+            next_tree_root: [0; 32],
+            chainwork: Uint256::ZERO,
+        }));
+        published.mining_authoritative = true;
+        read.state.publish(published);
+        assert!(read.mining_snapshot().is_some());
+        assert!(read.subscribe_mining_events().is_ok());
+
+        let actor_read = read.clone();
+        let (actor_entered_tx, actor_entered_rx) = tokio::sync::oneshot::channel();
+        let (actor_release_tx, actor_release_rx) = std::sync::mpsc::channel();
+        let inspection = tokio::spawn(async move {
+            actor_read
+                .inspect_bounded("shutdown authority blocker", move |_| {
+                    let _ = actor_entered_tx.send(());
+                    actor_release_rx.recv().expect("release actor");
+                    Ok(())
+                })
+                .await
+        });
+        actor_entered_rx.await.expect("actor entered");
+
+        let stable_read = read.clone();
+        let (read_entered_tx, read_entered_rx) = tokio::sync::oneshot::channel();
+        let (read_release_tx, read_release_rx) = std::sync::mpsc::channel();
+        let stable = tokio::task::spawn_blocking(move || {
+            stable_read.with_stable_epoch_read(|_, _| {
+                let _ = read_entered_tx.send(());
+                read_release_rx.recv().expect("release stable read");
+                Ok(())
+            })
+        });
+        read_entered_rx.await.expect("stable read entered");
+
+        let state = Arc::clone(&read.state);
+        let shutdown = tokio::spawn(runtime.shutdown());
+        while state.accepting.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(state.terminal_reason().is_none(), "actor remains in flight");
+        assert!(read.published().storage_operational());
+        assert!(read.ensure_storage_operational().is_err());
+        assert!(read.published_mempool().is_err());
+        assert!(read.mining_snapshot().is_none());
+        assert!(read.subscribe_mining_events().is_err());
+
+        read_release_tx.send(()).expect("release stable read");
+        let stable_error = stable
+            .await
+            .expect("stable read join")
+            .expect_err("shutdown must reject a read that began while active");
+        assert!(stable_error
+            .downcast_ref::<CanonicalWriterError>()
+            .is_some_and(|error| matches!(error, CanonicalWriterError::ShuttingDown)));
+
+        actor_release_tx.send(()).expect("release actor");
+        inspection
+            .await
+            .expect("inspection join")
+            .expect("accepted inspection");
+        shutdown.await.expect("shutdown join").expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unexpected_runtime_drop_fail_closes_surviving_reads_without_clean_marker() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            ..NodeConfig::default()
+        });
+        let store = node.state.store.clone();
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let read = runtime.read();
+        let stable_read = read.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let stable = tokio::task::spawn_blocking(move || {
+            stable_read.with_stable_epoch_read(|_, _| {
+                let _ = entered_tx.send(());
+                release_rx.recv().expect("release stable read");
+                Ok(())
+            })
+        });
+        entered_rx.await.expect("stable read entered");
+        drop(runtime);
+
+        assert!(read.ensure_storage_operational().is_err());
+        assert!(read.mining_snapshot().is_none());
+        assert!(read.subscribe_mining_events().is_err());
+        release_tx.send(()).expect("release stable read");
+        stable
+            .await
+            .expect("stable read join")
+            .expect_err("lost runtime must reject a read that began while active");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while read.published().storage_operational() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer observes receiver closure");
+        assert!(!read.published().storage_operational());
+        assert!(read.mining_snapshot().is_none());
+        assert!(read.rpc_diagnostic_service().await.is_err());
+        assert!(!was_clean_shutdown(&store).expect("unexpected exit stays unclean"));
+    }
+
+    #[test]
+    fn published_mempool_view_rejects_mixed_generations_and_counts() {
+        let generation_error = PublishedMempoolView::new(
+            MempoolInfo {
+                generation: 1,
+                ..MempoolInfo::default()
+            },
+            MempoolSnapshot::default(),
+            OrderedTxidSnapshot::default(),
+            1,
+        )
+        .expect_err("snapshot generation must match aggregate generation");
+        assert!(generation_error
+            .to_string()
+            .contains("published mempool generations disagree"));
+
+        let ordered_generation_error = PublishedMempoolView::new(
+            MempoolInfo::default(),
+            MempoolSnapshot::default(),
+            OrderedTxidSnapshot::default(),
+            1,
+        )
+        .expect_err("ordered generation must match aggregate generation");
+        assert!(ordered_generation_error
+            .to_string()
+            .contains("published mempool generations disagree"));
+
+        let count_error = PublishedMempoolView::new(
+            MempoolInfo {
+                transaction_count: 1,
+                ..MempoolInfo::default()
+            },
+            MempoolSnapshot::default(),
+            OrderedTxidSnapshot::default(),
+            0,
+        )
+        .expect_err("snapshot and order counts must match aggregate count");
+        assert!(count_error
+            .to_string()
+            .contains("published mempool transaction counts disagree"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persistent_mempool_reads_retain_generations_and_bypass_a_blocked_writer() {
+        let node = peer_transaction_node(0);
+        let first_outpoint = Outpoint {
+            txid: Txid::new([0xd1; 32]),
+            index: 0,
+        };
+        let second_outpoint = Outpoint {
+            txid: Txid::new([0xd2; 32]),
+            index: 0,
+        };
+        install_script_coin(&node, first_outpoint.clone(), 10_000, 0);
+        install_script_coin(&node, second_outpoint.clone(), 10_000, 0);
+        let first = script_spend(first_outpoint, 9_000);
+        let first_txid = first.txid();
+        let second = script_spend(second_outpoint, 8_000);
+        let second_txid = second.txid();
+
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let first_admission = writer
+            .execute(None, "first persistent-view admission", move |node| {
+                node.mining_engine_accept_peer_transaction(first)
+            })
+            .await
+            .expect("first admission");
+        assert!(matches!(
+            first_admission,
+            hns_mempool::Admission::Accepted(txid) if txid == first_txid
+        ));
+        let retained = read
+            .published_mempool()
+            .expect("retained mempool generation");
+        let retained_snapshot = retained.snapshot();
+
+        let second_admission = writer
+            .execute(None, "second persistent-view admission", move |node| {
+                node.mining_engine_accept_peer_transaction(second)
+            })
+            .await
+            .expect("second admission");
+        assert!(matches!(
+            second_admission,
+            hns_mempool::Admission::Accepted(txid) if txid == second_txid
+        ));
+        let current = read
+            .published_mempool()
+            .expect("current mempool generation");
+        let current_snapshot = current.snapshot();
+        assert_eq!(retained.info.transaction_count, 1);
+        assert_eq!(current.info.transaction_count, 2);
+        assert!(retained_snapshot.transaction(&first_txid).is_some());
+        assert!(retained_snapshot.transaction(&second_txid).is_none());
+        assert!(current_snapshot.transaction(&second_txid).is_some());
+        assert!(std::ptr::eq(
+            retained_snapshot
+                .transaction(&first_txid)
+                .expect("retained transaction"),
+            current_snapshot
+                .transaction(&first_txid)
+                .expect("shared current transaction"),
+        ));
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_writer = writer.clone();
+        let command = tokio::spawn(async move {
+            blocked_writer
+                .execute(None, "blocked persistent-view writer", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release blocked writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+        assert_eq!(
+            read.state.publication_sequence.load(Ordering::Acquire) & 1,
+            1,
+            "fixture must hold an in-progress canonical generation"
+        );
+
+        let transaction_read = read.clone();
+        let inventory_read = read.clone();
+        let reads = tokio::time::timeout(Duration::from_secs(2), async move {
+            tokio::join!(
+                transaction_read.mempool_transactions(MAX_RPC_COLLECTION_ENTRIES),
+                inventory_read.mempool_inventory(MAX_RPC_COLLECTION_ENTRIES),
+            )
+        })
+        .await;
+        release_tx.send(()).expect("release writer");
+        let (transactions, inventory) = reads
+            .expect("persistent mempool collection workers must not wait for the canonical writer");
+        let transactions = transactions.expect("persistent transaction collection");
+        let inventory = inventory.expect("persistent inventory collection");
+        assert_eq!(
+            transactions
+                .iter()
+                .map(Transaction::txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid, second_txid]
+        );
+        assert_eq!(
+            inventory,
+            vec![
+                hns_p2p::Inventory::transaction(first_txid),
+                hns_p2p::Inventory::transaction(second_txid),
+            ]
+        );
+        command.await.expect("writer join").expect("writer command");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_initializes_publication_queue_and_shares_template_cache_lock() {
+        let node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            authority_mode: AuthorityMode::Disabled,
+            mining_engine: MiningEngineConfig {
+                enabled: true,
+                ..MiningEngineConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let service_cache = Arc::clone(&node.mining_engine_templates);
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime startup");
+        let read = runtime.read();
+        let read_cache = read.template_coordinator_handle();
+        assert!(Arc::ptr_eq(&service_cache, &read_cache));
+
+        let diagnostics = read
+            .mining_engine_diagnostics()
+            .await
+            .expect("mining diagnostics after startup migration");
+        assert!(!diagnostics
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("publication queue index is not initialized")));
+
+        let stable_before = read.canonical_epoch();
+        assert!(read.canonical_generation_is_stable(&stable_before));
+        let cache_guard = service_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let writer = runtime.writer();
+        let cache_clear = tokio::spawn(async move {
+            writer
+                .execute(None, "shared template-cache clear", move |node| {
+                    entered_tx.send(()).expect("signal cache clear");
+                    node.revoke_runtime_authority();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer reached shared cache");
+        assert!(!read.canonical_generation_is_stable(&stable_before));
+        drop(cache_guard);
+        cache_clear
+            .await
+            .expect("cache-clear writer join")
+            .expect("cache-clear writer command");
+        assert!(!read.canonical_generation_is_stable(&stable_before));
+        assert!(read.canonical_generation_is_stable(&read.canonical_epoch()));
+        runtime.shutdown().await.expect("shutdown");
     }
 }

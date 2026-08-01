@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -13,9 +12,8 @@ use clap::Parser;
 use hns_consensus::Network;
 use hns_primitives::{hex_encode, Coin, Writer};
 use hns_state::{
-    decode_coin, derive_working_name_tree_root, encode_outpoint_key, BlockUndo, NamePageRootRecord,
-    NamePageSnapshot, NamePageState, NamePageTreeReader, NAME_PAGE_ROOT_PREFIX,
-    NAME_PAGE_STATE_KEY,
+    decode_coin, derive_working_name_tree_root, encode_outpoint_key, BlockUndo, NamePageSnapshot,
+    NamePageState, NamePageTreeReader, NAME_PAGE_STATE_KEY,
 };
 use hns_store::{
     open_store, ColumnFamily, DurabilityPolicy, MetaKey, ReadSnapshot, Store, StoreBackend,
@@ -274,32 +272,14 @@ fn open_name_page_reader<S: ReadSnapshot>(
         .parent()
         .context("chain directory has no parent for name-page segments")?;
     let directory = root.join("name-pages");
-    let mut paths = BTreeMap::new();
-    for segment in 0..=state.manifest.active_segment {
-        let path = directory.join(format!(
-            "name-g{:016x}-s{segment:08x}.pages",
-            state.manifest.generation
-        ));
-        if !path.is_file() {
-            bail!("name-page segment {} is missing", path.display());
-        }
-        paths.insert(segment, path);
-    }
-    let reader = NamePageTreeReader::open_segments(&paths, state.root, root_locator)
-        .context("failed to open name-page segments")?;
-    for (key, raw) in snapshot
-        .scan_prefix(ColumnFamily::Snapshots, NAME_PAGE_ROOT_PREFIX)
-        .context("failed to scan name-page root locators")?
-    {
-        let record =
-            NamePageRootRecord::decode(&raw).context("failed to decode name-page root locator")?;
-        if key != hns_state::name_page_root_key(record.root) {
-            bail!("name-page root locator key does not match its record");
-        }
-        reader
-            .insert_root(record.root, record.locator)
-            .context("failed to seed name-page root locator")?;
-    }
+    let reader = NamePageTreeReader::open_generation(
+        directory,
+        state.manifest.generation,
+        state.manifest.active_segment,
+        state.root,
+        root_locator,
+    )
+    .context("failed to open current name-page generation")?;
     Ok(Some(reader))
 }
 
@@ -518,8 +498,61 @@ fn audit_undo<S: ReadSnapshot>(snapshot: &S) -> Result<UndoManifest, StoreError>
 mod tests {
     use super::*;
     use hns_primitives::{Address, Covenant, CovenantKind, Outpoint, Txid};
-    use hns_state::encode_coin;
-    use hns_store::{MemoryStore, WriteBatch};
+    use hns_state::{encode_coin, TreeRoot};
+    use hns_store::{MemoryStore, NamePageAddress, SegmentManifest, WriteBatch, NAME_PAGE_BYTES};
+
+    struct PointOnlyNamePageSnapshot {
+        state: Vec<u8>,
+    }
+
+    impl ReadSnapshot for PointOnlyNamePageSnapshot {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            Ok(
+                (family == ColumnFamily::Snapshots && key == NAME_PAGE_STATE_KEY)
+                    .then(|| self.state.clone()),
+            )
+        }
+
+        fn scan_prefix(
+            &self,
+            _family: ColumnFamily,
+            _prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+            panic!("current-generation reader construction must not scan historical locators")
+        }
+    }
+
+    #[test]
+    fn name_page_reader_is_lazy_and_current_generation_only() {
+        let generation = 9;
+        let active_segment = 7;
+        let root_address = NamePageAddress::new(active_segment, 0, 0).expect("root address");
+        let state = NamePageState {
+            manifest: SegmentManifest {
+                generation,
+                active_segment,
+                durable_bytes: NAME_PAGE_BYTES as u64,
+            },
+            root: TreeRoot::new([0x42; 32]),
+            root_address: Some(root_address),
+            committed_height: Some(1),
+            last_sealed_height: None,
+        };
+        let snapshot = PointOnlyNamePageSnapshot {
+            state: state.encode().expect("name-page state"),
+        };
+        let chain_dir = std::env::temp_dir().join(format!(
+            "hsrd-state-manifest-lazy-reader-{}",
+            std::process::id()
+        ));
+
+        let reader = open_name_page_reader(&snapshot, &chain_dir)
+            .expect("lazy reader")
+            .expect("page state");
+
+        assert_eq!(reader.generation(), generation);
+        assert_eq!(reader.segment(), active_segment);
+    }
 
     #[test]
     fn ordered_digest_is_order_and_domain_sensitive() {

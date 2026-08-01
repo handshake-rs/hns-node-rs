@@ -7,7 +7,9 @@
 //! callers must install complete verifiers; the default `submit` boundary
 //! remains fail closed.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use hns_consensus::{
     is_coinbase, is_final_transaction, reserved_name, transaction_sigops, transaction_weight,
@@ -571,15 +573,524 @@ impl MempoolPackage {
     }
 }
 
+/// Immutable ordered map backed by a persistent AVL tree.
+///
+/// Keys, values, and untouched subtrees are structurally shared. Capturing or
+/// cloning a root is O(1); insertion, replacement, and removal copy O(log N)
+/// nodes under adversarial key order. AVL height depends only on the number of
+/// records, never on attacker-influenced hashes or randomized priorities.
+#[derive(Clone, Debug)]
+struct PersistentMap<K, V> {
+    root: Option<Arc<PersistentMapNode<K, V>>>,
+    len: usize,
+    /// Number of nodes allocated by the operation which produced this root.
+    /// This is retained in production because it is a constant-size field and
+    /// makes complexity assertions deterministic without a global test hook.
+    mutation_nodes: usize,
+    total_mutation_nodes: usize,
+}
+
+#[derive(Debug)]
+struct PersistentMapNode<K, V> {
+    key: K,
+    value: V,
+    height: u16,
+    size: usize,
+    left: Option<Arc<Self>>,
+    right: Option<Arc<Self>>,
+}
+
+struct PersistentMapIter<'a, K, V> {
+    stack: Vec<&'a PersistentMapNode<K, V>>,
+    remaining: usize,
+}
+
+impl<K, V> Default for PersistentMap<K, V> {
+    fn default() -> Self {
+        Self {
+            root: None,
+            len: 0,
+            mutation_nodes: 0,
+            total_mutation_nodes: 0,
+        }
+    }
+}
+
+impl<K: Ord + Clone, V: Clone> PersistentMap<K, V> {
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn get(&self, key: &K) -> Option<&V> {
+        let mut node = self.root.as_deref();
+        while let Some(current) = node {
+            match key.cmp(&current.key) {
+                Ordering::Less => node = current.left.as_deref(),
+                Ordering::Greater => node = current.right.as_deref(),
+                Ordering::Equal => return Some(&current.value),
+            }
+        }
+        None
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn keys(&self) -> impl ExactSizeIterator<Item = &K> {
+        self.iter().map(|(key, _)| key)
+    }
+
+    fn values(&self) -> impl ExactSizeIterator<Item = &V> {
+        self.iter().map(|(_, value)| value)
+    }
+
+    fn iter(&self) -> PersistentMapIter<'_, K, V> {
+        let mut iter = PersistentMapIter {
+            stack: Vec::new(),
+            remaining: self.len,
+        };
+        iter.push_left(self.root.as_deref());
+        iter
+    }
+
+    /// Iterate strictly after `lower` in O(log N + returned records).
+    fn iter_after(&self, lower: Option<&K>) -> PersistentMapIter<'_, K, V> {
+        let Some(lower) = lower else {
+            return self.iter();
+        };
+        let mut stack = Vec::new();
+        let mut remaining = 0usize;
+        let mut node = self.root.as_deref();
+        while let Some(current) = node {
+            if current.key <= *lower {
+                node = current.right.as_deref();
+            } else {
+                stack.push(current);
+                remaining = remaining
+                    .checked_add(1)
+                    .and_then(|count| count.checked_add(persistent_map_size(&current.right)))
+                    .expect("persistent map range length overflow");
+                node = current.left.as_deref();
+            }
+        }
+        PersistentMapIter { stack, remaining }
+    }
+
+    fn insert(&self, key: K, value: V) -> (Self, Option<V>) {
+        let mut mutation_nodes = 0;
+        let (root, previous) = persistent_map_insert(&self.root, key, value, &mut mutation_nodes);
+        (
+            Self {
+                root,
+                len: if previous.is_none() {
+                    self.len
+                        .checked_add(1)
+                        .expect("persistent mempool map length overflow")
+                } else {
+                    self.len
+                },
+                mutation_nodes,
+                total_mutation_nodes: self.total_mutation_nodes.saturating_add(mutation_nodes),
+            },
+            previous,
+        )
+    }
+
+    fn remove(&self, key: &K) -> (Self, Option<V>) {
+        let mut mutation_nodes = 0;
+        let (root, previous) = persistent_map_remove(&self.root, key, &mut mutation_nodes);
+        (
+            Self {
+                root,
+                len: if previous.is_some() {
+                    self.len
+                        .checked_sub(1)
+                        .expect("persistent mempool map length underflow")
+                } else {
+                    self.len
+                },
+                mutation_nodes,
+                total_mutation_nodes: self.total_mutation_nodes.saturating_add(mutation_nodes),
+            },
+            previous,
+        )
+    }
+
+    #[cfg(test)]
+    fn height(&self) -> usize {
+        usize::from(persistent_map_height(&self.root))
+    }
+
+    #[cfg(test)]
+    fn is_same_root(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+impl<'a, K, V> PersistentMapIter<'a, K, V> {
+    fn push_left(&mut self, mut node: Option<&'a PersistentMapNode<K, V>>) {
+        while let Some(current) = node {
+            self.stack.push(current);
+            node = current.left.as_deref();
+        }
+    }
+}
+
+impl<'a, K, V> Iterator for PersistentMapIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.stack.pop()?;
+        self.push_left(node.right.as_deref());
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .expect("persistent map iterator length underflow");
+        Some((&node.key, &node.value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<K, V> ExactSizeIterator for PersistentMapIter<'_, K, V> {
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
+fn persistent_map_height<K, V>(node: &Option<Arc<PersistentMapNode<K, V>>>) -> u16 {
+    node.as_ref().map_or(0, |node| node.height)
+}
+
+fn persistent_map_size<K, V>(node: &Option<Arc<PersistentMapNode<K, V>>>) -> usize {
+    node.as_ref().map_or(0, |node| node.size)
+}
+
+fn persistent_map_node<K, V>(
+    key: K,
+    value: V,
+    left: Option<Arc<PersistentMapNode<K, V>>>,
+    right: Option<Arc<PersistentMapNode<K, V>>>,
+    mutation_nodes: &mut usize,
+) -> Arc<PersistentMapNode<K, V>> {
+    *mutation_nodes = mutation_nodes.saturating_add(1);
+    Arc::new(PersistentMapNode {
+        key,
+        value,
+        height: persistent_map_height(&left)
+            .max(persistent_map_height(&right))
+            .checked_add(1)
+            .expect("persistent mempool map height overflow"),
+        size: persistent_map_size(&left)
+            .checked_add(persistent_map_size(&right))
+            .and_then(|size| size.checked_add(1))
+            .expect("persistent mempool map subtree length overflow"),
+        left,
+        right,
+    })
+}
+
+fn persistent_map_balance_factor<K, V>(node: &PersistentMapNode<K, V>) -> i32 {
+    i32::from(persistent_map_height(&node.left)) - i32::from(persistent_map_height(&node.right))
+}
+
+fn persistent_map_rotate_left<K: Clone, V: Clone>(
+    root: &Arc<PersistentMapNode<K, V>>,
+    mutation_nodes: &mut usize,
+) -> Arc<PersistentMapNode<K, V>> {
+    let pivot = root
+        .right
+        .as_ref()
+        .expect("persistent map left rotation requires a right child");
+    let left = persistent_map_node(
+        root.key.clone(),
+        root.value.clone(),
+        root.left.clone(),
+        pivot.left.clone(),
+        mutation_nodes,
+    );
+    persistent_map_node(
+        pivot.key.clone(),
+        pivot.value.clone(),
+        Some(left),
+        pivot.right.clone(),
+        mutation_nodes,
+    )
+}
+
+fn persistent_map_rotate_right<K: Clone, V: Clone>(
+    root: &Arc<PersistentMapNode<K, V>>,
+    mutation_nodes: &mut usize,
+) -> Arc<PersistentMapNode<K, V>> {
+    let pivot = root
+        .left
+        .as_ref()
+        .expect("persistent map right rotation requires a left child");
+    let right = persistent_map_node(
+        root.key.clone(),
+        root.value.clone(),
+        pivot.right.clone(),
+        root.right.clone(),
+        mutation_nodes,
+    );
+    persistent_map_node(
+        pivot.key.clone(),
+        pivot.value.clone(),
+        pivot.left.clone(),
+        Some(right),
+        mutation_nodes,
+    )
+}
+
+fn persistent_map_balance<K: Clone, V: Clone>(
+    key: K,
+    value: V,
+    left: Option<Arc<PersistentMapNode<K, V>>>,
+    right: Option<Arc<PersistentMapNode<K, V>>>,
+    mutation_nodes: &mut usize,
+) -> Arc<PersistentMapNode<K, V>> {
+    let mut root = persistent_map_node(key, value, left, right, mutation_nodes);
+    if persistent_map_balance_factor(&root) > 1 {
+        if persistent_map_balance_factor(
+            root.left
+                .as_ref()
+                .expect("persistent map left-heavy node has a left child"),
+        ) < 0
+        {
+            let rotated = persistent_map_rotate_left(
+                root.left
+                    .as_ref()
+                    .expect("persistent map left-heavy node has a left child"),
+                mutation_nodes,
+            );
+            root = persistent_map_node(
+                root.key.clone(),
+                root.value.clone(),
+                Some(rotated),
+                root.right.clone(),
+                mutation_nodes,
+            );
+        }
+        return persistent_map_rotate_right(&root, mutation_nodes);
+    }
+    if persistent_map_balance_factor(&root) < -1 {
+        if persistent_map_balance_factor(
+            root.right
+                .as_ref()
+                .expect("persistent map right-heavy node has a right child"),
+        ) > 0
+        {
+            let rotated = persistent_map_rotate_right(
+                root.right
+                    .as_ref()
+                    .expect("persistent map right-heavy node has a right child"),
+                mutation_nodes,
+            );
+            root = persistent_map_node(
+                root.key.clone(),
+                root.value.clone(),
+                root.left.clone(),
+                Some(rotated),
+                mutation_nodes,
+            );
+        }
+        return persistent_map_rotate_left(&root, mutation_nodes);
+    }
+    root
+}
+
+fn persistent_map_insert<K: Ord + Clone, V: Clone>(
+    root: &Option<Arc<PersistentMapNode<K, V>>>,
+    key: K,
+    value: V,
+    mutation_nodes: &mut usize,
+) -> (Option<Arc<PersistentMapNode<K, V>>>, Option<V>) {
+    let Some(node) = root else {
+        return (
+            Some(persistent_map_node(key, value, None, None, mutation_nodes)),
+            None,
+        );
+    };
+    match key.cmp(&node.key) {
+        Ordering::Less => {
+            let (left, previous) = persistent_map_insert(&node.left, key, value, mutation_nodes);
+            (
+                Some(persistent_map_balance(
+                    node.key.clone(),
+                    node.value.clone(),
+                    left,
+                    node.right.clone(),
+                    mutation_nodes,
+                )),
+                previous,
+            )
+        }
+        Ordering::Greater => {
+            let (right, previous) = persistent_map_insert(&node.right, key, value, mutation_nodes);
+            (
+                Some(persistent_map_balance(
+                    node.key.clone(),
+                    node.value.clone(),
+                    node.left.clone(),
+                    right,
+                    mutation_nodes,
+                )),
+                previous,
+            )
+        }
+        Ordering::Equal => (
+            Some(persistent_map_node(
+                key,
+                value,
+                node.left.clone(),
+                node.right.clone(),
+                mutation_nodes,
+            )),
+            Some(node.value.clone()),
+        ),
+    }
+}
+
+fn persistent_map_remove_min<K: Clone, V: Clone>(
+    root: &Arc<PersistentMapNode<K, V>>,
+    mutation_nodes: &mut usize,
+) -> (Option<Arc<PersistentMapNode<K, V>>>, K, V) {
+    let Some(left) = root.left.as_ref() else {
+        return (root.right.clone(), root.key.clone(), root.value.clone());
+    };
+    let (new_left, key, value) = persistent_map_remove_min(left, mutation_nodes);
+    (
+        Some(persistent_map_balance(
+            root.key.clone(),
+            root.value.clone(),
+            new_left,
+            root.right.clone(),
+            mutation_nodes,
+        )),
+        key,
+        value,
+    )
+}
+
+fn persistent_map_remove<K: Ord + Clone, V: Clone>(
+    root: &Option<Arc<PersistentMapNode<K, V>>>,
+    key: &K,
+    mutation_nodes: &mut usize,
+) -> (Option<Arc<PersistentMapNode<K, V>>>, Option<V>) {
+    let Some(node) = root else {
+        return (None, None);
+    };
+    match key.cmp(&node.key) {
+        Ordering::Less => {
+            let (left, previous) = persistent_map_remove(&node.left, key, mutation_nodes);
+            if previous.is_none() {
+                return (root.clone(), None);
+            }
+            (
+                Some(persistent_map_balance(
+                    node.key.clone(),
+                    node.value.clone(),
+                    left,
+                    node.right.clone(),
+                    mutation_nodes,
+                )),
+                previous,
+            )
+        }
+        Ordering::Greater => {
+            let (right, previous) = persistent_map_remove(&node.right, key, mutation_nodes);
+            if previous.is_none() {
+                return (root.clone(), None);
+            }
+            (
+                Some(persistent_map_balance(
+                    node.key.clone(),
+                    node.value.clone(),
+                    node.left.clone(),
+                    right,
+                    mutation_nodes,
+                )),
+                previous,
+            )
+        }
+        Ordering::Equal => {
+            let previous = Some(node.value.clone());
+            match (&node.left, &node.right) {
+                (None, _) => (node.right.clone(), previous),
+                (_, None) => (node.left.clone(), previous),
+                (Some(left), Some(right)) => {
+                    let (right, successor_key, successor_value) =
+                        persistent_map_remove_min(right, mutation_nodes);
+                    (
+                        Some(persistent_map_balance(
+                            successor_key,
+                            successor_value,
+                            Some(left.clone()),
+                            right,
+                            mutation_nodes,
+                        )),
+                        previous,
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn persistent_map_replace<K: Ord + Clone, V: Clone>(
+    map: &mut PersistentMap<K, V>,
+    key: K,
+    value: V,
+) -> Option<V> {
+    let (next, previous) = map.insert(key, value);
+    debug_assert!(
+        next.mutation_nodes > 0,
+        "persistent replacement copies one path"
+    );
+    *map = next;
+    previous
+}
+
+fn persistent_map_delete<K: Ord + Clone, V: Clone>(
+    map: &mut PersistentMap<K, V>,
+    key: &K,
+) -> Option<V> {
+    let (next, previous) = map.remove(key);
+    debug_assert!(
+        previous.is_some() || next.mutation_nodes == 0,
+        "missing persistent deletion retains the existing root"
+    );
+    *map = next;
+    previous
+}
+
+type SpecialPoolKey = (u64, [u8; 32]);
+
+/// Immutable, structurally shared view used by template and bounded read
+/// workers. Every field is one persistent root, so capture and clone are O(1).
 #[derive(Clone, Debug, Default)]
 pub struct MempoolSnapshot {
     generation: u64,
-    entries: BTreeMap<Txid, MempoolEntry>,
-    transactions: BTreeMap<Txid, Transaction>,
-    parents: BTreeMap<Txid, BTreeSet<Txid>>,
-    exclusive_names: BTreeMap<Txid, Vec<[u8; 32]>>,
-    claims: BTreeMap<[u8; 32], ClaimMempoolEntry>,
-    airdrops: BTreeMap<[u8; 32], AirdropMempoolEntry>,
+    entries: PersistentMap<Txid, Arc<MempoolEntry>>,
+    transactions: PersistentMap<Txid, Arc<Transaction>>,
+    parents: PersistentMap<Txid, Arc<BTreeSet<Txid>>>,
+    children: PersistentMap<Txid, Arc<BTreeSet<Txid>>>,
+    exclusive_names: PersistentMap<Txid, Arc<Vec<[u8; 32]>>>,
+    claims: PersistentMap<[u8; 32], Arc<ClaimMempoolEntry>>,
+    claims_by_sequence: PersistentMap<SpecialPoolKey, Arc<ClaimMempoolEntry>>,
+    airdrops: PersistentMap<[u8; 32], Arc<AirdropMempoolEntry>>,
+    airdrops_by_sequence: PersistentMap<SpecialPoolKey, Arc<AirdropMempoolEntry>>,
 }
 
 impl MempoolSnapshot {
@@ -596,31 +1107,59 @@ impl MempoolSnapshot {
     }
 
     pub fn entry(&self, txid: &Txid) -> Option<&MempoolEntry> {
-        self.entries.get(txid)
+        self.entries.get(txid).map(Arc::as_ref)
     }
 
     pub fn transaction(&self, txid: &Txid) -> Option<&Transaction> {
-        self.transactions.get(txid)
+        self.transactions.get(txid).map(Arc::as_ref)
     }
 
-    pub fn txids(&self) -> impl Iterator<Item = Txid> + '_ {
+    pub fn txids(&self) -> impl ExactSizeIterator<Item = Txid> + '_ {
         self.entries.keys().copied()
     }
 
     pub fn claim(&self, hash: &[u8; 32]) -> Option<&ClaimMempoolEntry> {
-        self.claims.get(hash)
+        self.claims.get(hash).map(Arc::as_ref)
     }
 
     pub fn claims(&self) -> impl Iterator<Item = &ClaimMempoolEntry> {
-        self.claims.values()
+        self.claims.values().map(Arc::as_ref)
     }
 
     pub fn airdrop(&self, hash: &[u8; 32]) -> Option<&AirdropMempoolEntry> {
-        self.airdrops.get(hash)
+        self.airdrops.get(hash).map(Arc::as_ref)
     }
 
     pub fn airdrops(&self) -> impl Iterator<Item = &AirdropMempoolEntry> {
-        self.airdrops.values()
+        self.airdrops.values().map(Arc::as_ref)
+    }
+
+    /// Parents in deterministic txid order. Lookup is O(log N) and iteration
+    /// is O(parent count), bounded by the configured ancestor envelope.
+    pub fn parents(&self, txid: &Txid) -> impl Iterator<Item = Txid> + '_ {
+        self.parents
+            .get(txid)
+            .into_iter()
+            .flat_map(|parents| parents.iter().copied())
+    }
+
+    /// Children in deterministic txid order. Lookup is O(log N) and iteration
+    /// is O(child count), bounded by the configured descendant envelope.
+    pub fn children(&self, txid: &Txid) -> impl Iterator<Item = Txid> + '_ {
+        self.children
+            .get(txid)
+            .into_iter()
+            .flat_map(|children| children.iter().copied())
+    }
+
+    /// Claims in exact admission order without sorting or payload cloning.
+    pub fn claims_in_sequence(&self) -> impl Iterator<Item = &ClaimMempoolEntry> {
+        self.claims_by_sequence.values().map(Arc::as_ref)
+    }
+
+    /// Airdrops in exact admission order without sorting or payload cloning.
+    pub fn airdrops_in_sequence(&self) -> impl Iterator<Item = &AirdropMempoolEntry> {
+        self.airdrops_by_sequence.values().map(Arc::as_ref)
     }
 
     pub fn package_for(
@@ -632,8 +1171,17 @@ impl MempoolSnapshot {
             return Err(MempoolError::UnknownTransaction(txid));
         }
         let mut visiting = HashSet::new();
+        let mut emitted = HashSet::new();
         let mut ordered = Vec::new();
-        self.visit_package(txid, already_selected, &mut visiting, &mut ordered)?;
+        let mut dependency_visits = 0usize;
+        self.visit_package(
+            txid,
+            already_selected,
+            &mut visiting,
+            &mut emitted,
+            &mut ordered,
+            &mut dependency_visits,
+        )?;
         if ordered.len() > MAX_PACKAGE_MEMBERS {
             return Err(MempoolError::LimitExceeded {
                 context: "template package members",
@@ -671,7 +1219,7 @@ impl MempoolSnapshot {
             renewals = renewals.saturating_add(entry.renewals);
             oldest_sequence = oldest_sequence.min(entry.sequence);
             if let Some(member_names) = self.exclusive_names.get(member) {
-                for name in member_names {
+                for name in member_names.iter() {
                     if !names.insert(*name) {
                         return Err(MempoolError::Policy(
                             "package contains conflicting exclusive name operations".to_owned(),
@@ -704,20 +1252,31 @@ impl MempoolSnapshot {
         txid: Txid,
         already_selected: &HashSet<Txid>,
         visiting: &mut HashSet<Txid>,
+        emitted: &mut HashSet<Txid>,
         ordered: &mut Vec<Txid>,
+        dependency_visits: &mut usize,
     ) -> Result<(), MempoolError> {
-        if already_selected.contains(&txid) || ordered.contains(&txid) {
+        *dependency_visits = dependency_visits.saturating_add(1);
+        if already_selected.contains(&txid) || emitted.contains(&txid) {
             return Ok(());
         }
         if !visiting.insert(txid) {
             return Err(MempoolError::DependencyCycle(txid));
         }
         if let Some(parents) = self.parents.get(&txid) {
-            for parent in parents {
-                self.visit_package(*parent, already_selected, visiting, ordered)?;
+            for parent in parents.iter() {
+                self.visit_package(
+                    *parent,
+                    already_selected,
+                    visiting,
+                    emitted,
+                    ordered,
+                    dependency_visits,
+                )?;
             }
         }
         visiting.remove(&txid);
+        emitted.insert(txid);
         ordered.push(txid);
         Ok(())
     }
@@ -742,27 +1301,332 @@ struct CovenantMetrics {
     exclusive_names: Vec<[u8; 32]>,
 }
 
+type OrderedTxidKey = (u64, Txid);
+
+/// Immutable, structurally shared transaction-id generation.
+///
+/// The persistent AVL tree gives RPC an O(1) snapshot clone while admissions
+/// and removals path-copy only O(log N) nodes, even when workers retain older
+/// generations. Iteration remains deterministic in `(sequence, txid)` order.
+#[derive(Clone, Debug, Default)]
+pub struct OrderedTxidSnapshot {
+    root: Option<Arc<OrderedTxidNode>>,
+    len: usize,
+}
+
+#[derive(Debug)]
+struct OrderedTxidNode {
+    key: OrderedTxidKey,
+    height: u16,
+    left: Option<Arc<Self>>,
+    right: Option<Arc<Self>>,
+}
+
+pub struct OrderedTxidIter<'a> {
+    stack: Vec<&'a OrderedTxidNode>,
+    remaining: usize,
+}
+
+impl OrderedTxidSnapshot {
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn is_same_generation(&self, other: &Self) -> bool {
+        self.len == other.len
+            && match (&self.root, &other.root) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub fn txids(&self) -> impl Iterator<Item = Txid> + '_ {
+        self.iter().map(|(_, txid)| *txid)
+    }
+
+    fn iter(&self) -> OrderedTxidIter<'_> {
+        let mut iter = OrderedTxidIter {
+            stack: Vec::new(),
+            remaining: self.len,
+        };
+        iter.push_left(self.root.as_deref());
+        iter
+    }
+
+    fn insert(&self, key: OrderedTxidKey) -> (Self, bool) {
+        let (root, inserted) = ordered_txid_insert(&self.root, key);
+        (
+            Self {
+                root,
+                len: if inserted {
+                    self.len
+                        .checked_add(1)
+                        .expect("persistent mempool txid count overflow")
+                } else {
+                    self.len
+                },
+            },
+            inserted,
+        )
+    }
+
+    fn remove(&self, key: &OrderedTxidKey) -> (Self, bool) {
+        let (root, removed) = ordered_txid_remove(&self.root, key);
+        (
+            Self {
+                root,
+                len: if removed {
+                    self.len
+                        .checked_sub(1)
+                        .expect("persistent mempool txid count underflow")
+                } else {
+                    self.len
+                },
+            },
+            removed,
+        )
+    }
+}
+
+impl<'a> OrderedTxidIter<'a> {
+    fn push_left(&mut self, mut node: Option<&'a OrderedTxidNode>) {
+        while let Some(current) = node {
+            self.stack.push(current);
+            node = current.left.as_deref();
+        }
+    }
+}
+
+impl<'a> Iterator for OrderedTxidIter<'a> {
+    type Item = &'a OrderedTxidKey;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.stack.pop()?;
+        self.push_left(node.right.as_deref());
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .expect("persistent mempool iterator length underflow");
+        Some(&node.key)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for OrderedTxidIter<'_> {}
+
+fn ordered_txid_height(node: &Option<Arc<OrderedTxidNode>>) -> u16 {
+    node.as_ref().map_or(0, |node| node.height)
+}
+
+fn ordered_txid_node(
+    key: OrderedTxidKey,
+    left: Option<Arc<OrderedTxidNode>>,
+    right: Option<Arc<OrderedTxidNode>>,
+) -> Arc<OrderedTxidNode> {
+    Arc::new(OrderedTxidNode {
+        key,
+        height: ordered_txid_height(&left)
+            .max(ordered_txid_height(&right))
+            .checked_add(1)
+            .expect("persistent mempool AVL height overflow"),
+        left,
+        right,
+    })
+}
+
+fn ordered_txid_balance_factor(node: &OrderedTxidNode) -> i32 {
+    i32::from(ordered_txid_height(&node.left)) - i32::from(ordered_txid_height(&node.right))
+}
+
+fn ordered_txid_rotate_left(root: &Arc<OrderedTxidNode>) -> Arc<OrderedTxidNode> {
+    let pivot = root
+        .right
+        .as_ref()
+        .expect("left rotation requires a right child");
+    let left = ordered_txid_node(root.key, root.left.clone(), pivot.left.clone());
+    ordered_txid_node(pivot.key, Some(left), pivot.right.clone())
+}
+
+fn ordered_txid_rotate_right(root: &Arc<OrderedTxidNode>) -> Arc<OrderedTxidNode> {
+    let pivot = root
+        .left
+        .as_ref()
+        .expect("right rotation requires a left child");
+    let right = ordered_txid_node(root.key, pivot.right.clone(), root.right.clone());
+    ordered_txid_node(pivot.key, pivot.left.clone(), Some(right))
+}
+
+fn ordered_txid_balance(
+    key: OrderedTxidKey,
+    left: Option<Arc<OrderedTxidNode>>,
+    right: Option<Arc<OrderedTxidNode>>,
+) -> Arc<OrderedTxidNode> {
+    let mut root = ordered_txid_node(key, left, right);
+    if ordered_txid_balance_factor(&root) > 1 {
+        if ordered_txid_balance_factor(
+            root.left
+                .as_ref()
+                .expect("left-heavy node has a left child"),
+        ) < 0
+        {
+            let rotated = ordered_txid_rotate_left(
+                root.left
+                    .as_ref()
+                    .expect("left-heavy node has a left child"),
+            );
+            root = ordered_txid_node(root.key, Some(rotated), root.right.clone());
+        }
+        return ordered_txid_rotate_right(&root);
+    }
+    if ordered_txid_balance_factor(&root) < -1 {
+        if ordered_txid_balance_factor(
+            root.right
+                .as_ref()
+                .expect("right-heavy node has a right child"),
+        ) > 0
+        {
+            let rotated = ordered_txid_rotate_right(
+                root.right
+                    .as_ref()
+                    .expect("right-heavy node has a right child"),
+            );
+            root = ordered_txid_node(root.key, root.left.clone(), Some(rotated));
+        }
+        return ordered_txid_rotate_left(&root);
+    }
+    root
+}
+
+fn ordered_txid_insert(
+    root: &Option<Arc<OrderedTxidNode>>,
+    key: OrderedTxidKey,
+) -> (Option<Arc<OrderedTxidNode>>, bool) {
+    let Some(node) = root else {
+        return (Some(ordered_txid_node(key, None, None)), true);
+    };
+    match key.cmp(&node.key) {
+        Ordering::Less => {
+            let (left, inserted) = ordered_txid_insert(&node.left, key);
+            if !inserted {
+                return (root.clone(), false);
+            }
+            (
+                Some(ordered_txid_balance(node.key, left, node.right.clone())),
+                true,
+            )
+        }
+        Ordering::Greater => {
+            let (right, inserted) = ordered_txid_insert(&node.right, key);
+            if !inserted {
+                return (root.clone(), false);
+            }
+            (
+                Some(ordered_txid_balance(node.key, node.left.clone(), right)),
+                true,
+            )
+        }
+        Ordering::Equal => (root.clone(), false),
+    }
+}
+
+fn ordered_txid_remove_min(
+    root: &Arc<OrderedTxidNode>,
+) -> (Option<Arc<OrderedTxidNode>>, OrderedTxidKey) {
+    let Some(left) = root.left.as_ref() else {
+        return (root.right.clone(), root.key);
+    };
+    let (new_left, minimum) = ordered_txid_remove_min(left);
+    (
+        Some(ordered_txid_balance(root.key, new_left, root.right.clone())),
+        minimum,
+    )
+}
+
+fn ordered_txid_remove(
+    root: &Option<Arc<OrderedTxidNode>>,
+    key: &OrderedTxidKey,
+) -> (Option<Arc<OrderedTxidNode>>, bool) {
+    let Some(node) = root else {
+        return (None, false);
+    };
+    match key.cmp(&node.key) {
+        Ordering::Less => {
+            let (left, removed) = ordered_txid_remove(&node.left, key);
+            if !removed {
+                return (root.clone(), false);
+            }
+            (
+                Some(ordered_txid_balance(node.key, left, node.right.clone())),
+                true,
+            )
+        }
+        Ordering::Greater => {
+            let (right, removed) = ordered_txid_remove(&node.right, key);
+            if !removed {
+                return (root.clone(), false);
+            }
+            (
+                Some(ordered_txid_balance(node.key, node.left.clone(), right)),
+                true,
+            )
+        }
+        Ordering::Equal => match (&node.left, &node.right) {
+            (None, _) => (node.right.clone(), true),
+            (_, None) => (node.left.clone(), true),
+            (Some(left), Some(right)) => {
+                let (right, successor) = ordered_txid_remove_min(right);
+                (
+                    Some(ordered_txid_balance(successor, Some(left.clone()), right)),
+                    true,
+                )
+            }
+        },
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MemoryMempool {
     limits: MempoolLimits,
-    entries: HashMap<Txid, MempoolEntry>,
-    transactions: HashMap<Txid, Transaction>,
+    entries: HashMap<Txid, Arc<MempoolEntry>>,
+    ordered_txids: OrderedTxidSnapshot,
+    /// Exact dependency-root membership ordered by original admission time.
+    /// This replaces a full-pool scan and sort with O(log N) root mutations.
+    expiry_roots: BTreeSet<(u64, Txid)>,
+    /// Cached minimum of `expiry_roots`, making the common not-due check O(1).
+    next_expiry_root: Option<(u64, Txid)>,
+    transactions: HashMap<Txid, Arc<Transaction>>,
     orphans: HashMap<Txid, OrphanEntry>,
     spent_outpoints: HashMap<Outpoint, Txid>,
-    parents: HashMap<Txid, BTreeSet<Txid>>,
-    children: HashMap<Txid, BTreeSet<Txid>>,
-    exclusive_names: HashMap<Txid, Vec<[u8; 32]>>,
+    parents: HashMap<Txid, Arc<BTreeSet<Txid>>>,
+    children: HashMap<Txid, Arc<BTreeSet<Txid>>>,
+    exclusive_names: HashMap<Txid, Arc<Vec<[u8; 32]>>>,
     exclusive_name_owners: HashMap<[u8; 32], Txid>,
-    claims: HashMap<[u8; 32], ClaimMempoolEntry>,
+    claims: HashMap<[u8; 32], Arc<ClaimMempoolEntry>>,
     claim_names: HashMap<[u8; 32], [u8; 32]>,
-    airdrops: HashMap<[u8; 32], AirdropMempoolEntry>,
+    airdrops: HashMap<[u8; 32], Arc<AirdropMempoolEntry>>,
     airdrop_positions: HashMap<u32, [u8; 32]>,
+    /// Template-visible immutable roots, updated with every corresponding
+    /// live-index mutation before the generation is published.
+    snapshot_state: MempoolSnapshot,
     bytes: usize,
+    // Wider than the public `Amount` so add/remove remains reversible even
+    // when the compatibility summary saturates at `u64::MAX`.
+    total_fee: u128,
     orphan_bytes: usize,
     free_count: f64,
     last_free_time: u64,
     generation: u64,
     next_sequence: u64,
+    #[cfg(test)]
+    expiry_root_checks: usize,
 }
 
 impl Default for MemoryMempool {
@@ -781,6 +1645,9 @@ impl MemoryMempool {
         Ok(Self {
             limits,
             entries: HashMap::new(),
+            ordered_txids: OrderedTxidSnapshot::default(),
+            expiry_roots: BTreeSet::new(),
+            next_expiry_root: None,
             transactions: HashMap::new(),
             orphans: HashMap::new(),
             spent_outpoints: HashMap::new(),
@@ -792,12 +1659,16 @@ impl MemoryMempool {
             claim_names: HashMap::new(),
             airdrops: HashMap::new(),
             airdrop_positions: HashMap::new(),
+            snapshot_state: MempoolSnapshot::default(),
             bytes: 0,
+            total_fee: 0,
             orphan_bytes: 0,
             free_count: 0.0,
             last_free_time: 0,
             generation: 0,
             next_sequence: 1,
+            #[cfg(test)]
+            expiry_root_checks: 0,
         })
     }
 
@@ -806,7 +1677,11 @@ impl MemoryMempool {
     }
 
     pub fn transaction(&self, txid: &Txid) -> Option<&Transaction> {
-        self.transactions.get(txid)
+        self.transactions.get(txid).map(Arc::as_ref)
+    }
+
+    pub fn ordered_txids_snapshot(&self) -> OrderedTxidSnapshot {
+        self.ordered_txids.clone()
     }
 
     pub fn claim(&self, hash: &[u8; 32]) -> Option<&Claim> {
@@ -814,9 +1689,29 @@ impl MemoryMempool {
     }
 
     pub fn claim_entries(&self) -> Vec<ClaimMempoolEntry> {
-        let mut entries = self.claims.values().cloned().collect::<Vec<_>>();
+        let mut entries = self
+            .claims
+            .values()
+            .map(|entry| entry.as_ref().clone())
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| (entry.sequence, entry.hash));
         entries
+    }
+
+    /// Return at most `limit` claims strictly after an admission-order cursor.
+    /// The lookup is O(log N), traversal is O(limit), and returned payloads are
+    /// shared with the live pool and retained template generations.
+    pub fn claim_entries_page(
+        &self,
+        after: Option<(u64, [u8; 32])>,
+        limit: usize,
+    ) -> Vec<Arc<ClaimMempoolEntry>> {
+        self.snapshot_state
+            .claims_by_sequence
+            .iter_after(after.as_ref())
+            .take(limit.min(MAX_MEMPOOL_TRANSACTIONS))
+            .map(|(_, entry)| entry.clone())
+            .collect()
     }
 
     pub fn airdrop(&self, hash: &[u8; 32]) -> Option<&AirdropProof> {
@@ -824,9 +1719,29 @@ impl MemoryMempool {
     }
 
     pub fn airdrop_entries(&self) -> Vec<AirdropMempoolEntry> {
-        let mut entries = self.airdrops.values().cloned().collect::<Vec<_>>();
+        let mut entries = self
+            .airdrops
+            .values()
+            .map(|entry| entry.as_ref().clone())
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| (entry.sequence, entry.hash));
         entries
+    }
+
+    /// Return at most `limit` airdrops strictly after an admission-order
+    /// cursor with the same O(log N + limit) and payload-sharing guarantees as
+    /// `claim_entries_page`.
+    pub fn airdrop_entries_page(
+        &self,
+        after: Option<(u64, [u8; 32])>,
+        limit: usize,
+    ) -> Vec<Arc<AirdropMempoolEntry>> {
+        self.snapshot_state
+            .airdrops_by_sequence
+            .iter_after(after.as_ref())
+            .take(limit.min(MAX_MEMPOOL_TRANSACTIONS))
+            .map(|(_, entry)| entry.clone())
+            .collect()
     }
 
     pub fn orphan(&self, txid: &Txid) -> Option<&Transaction> {
@@ -844,39 +1759,8 @@ impl MemoryMempool {
     }
 
     pub fn snapshot(&self) -> MempoolSnapshot {
-        MempoolSnapshot {
-            generation: self.generation,
-            entries: self
-                .entries
-                .iter()
-                .map(|(txid, entry)| (*txid, entry.clone()))
-                .collect(),
-            transactions: self
-                .transactions
-                .iter()
-                .map(|(txid, transaction)| (*txid, transaction.clone()))
-                .collect(),
-            parents: self
-                .parents
-                .iter()
-                .map(|(txid, parents)| (*txid, parents.clone()))
-                .collect(),
-            exclusive_names: self
-                .exclusive_names
-                .iter()
-                .map(|(txid, names)| (*txid, names.clone()))
-                .collect(),
-            claims: self
-                .claims
-                .iter()
-                .map(|(hash, entry)| (*hash, entry.clone()))
-                .collect(),
-            airdrops: self
-                .airdrops
-                .iter()
-                .map(|(hash, entry)| (*hash, entry.clone()))
-                .collect(),
-        }
+        debug_assert_eq!(self.snapshot_state.generation, self.generation);
+        self.snapshot_state.clone()
     }
 
     /// Admit one HSD DNSSEC ownership claim against the exact next-block
@@ -938,31 +1822,43 @@ impl MemoryMempool {
             &authenticated.output,
             authenticated.verified.name.len(),
         );
+        let claim_fee = authenticated.verified.fee;
+        let counts_toward_total_fee = authenticated.verified.commit_height == 1;
         let sequence = self.take_sequence();
-        self.claim_names.insert(name_hash, hash);
-        self.claims.insert(
+        let entry = Arc::new(ClaimMempoolEntry {
             hash,
-            ClaimMempoolEntry {
-                hash,
-                name_hash,
-                name: authenticated.verified.name,
-                address: authenticated.output.address,
-                value: authenticated.verified.value,
-                fee: authenticated.verified.fee,
-                policy_size,
-                coinbase_weight,
-                memory_usage,
-                weak: authenticated.verified.weak,
-                commit_hash: authenticated.verified.commit_hash,
-                commit_height: authenticated.verified.commit_height,
-                inception: authenticated.inception,
-                expiration: authenticated.expiration,
-                admitted_at: context.current_time,
-                sequence,
-                claim,
-            },
+            name_hash,
+            name: authenticated.verified.name,
+            address: authenticated.output.address,
+            value: authenticated.verified.value,
+            fee: authenticated.verified.fee,
+            policy_size,
+            coinbase_weight,
+            memory_usage,
+            weak: authenticated.verified.weak,
+            commit_hash: authenticated.verified.commit_hash,
+            commit_height: authenticated.verified.commit_height,
+            inception: authenticated.inception,
+            expiration: authenticated.expiration,
+            admitted_at: context.current_time,
+            sequence,
+            claim,
+        });
+        self.claim_names.insert(name_hash, hash);
+        let previous = self.claims.insert(hash, entry.clone());
+        debug_assert!(previous.is_none(), "accepted claim hash is unique");
+        let previous = persistent_map_replace(&mut self.snapshot_state.claims, hash, entry.clone());
+        debug_assert!(previous.is_none(), "accepted snapshot claim hash is unique");
+        let previous = persistent_map_replace(
+            &mut self.snapshot_state.claims_by_sequence,
+            (sequence, hash),
+            entry,
         );
+        debug_assert!(previous.is_none(), "accepted claim sequence is unique");
         self.bytes = projected_bytes;
+        if counts_toward_total_fee {
+            self.total_fee = self.total_fee.saturating_add(u128::from(claim_fee));
+        }
         self.advance_generation();
         if !self.limit_size_claim(hash, context.current_time) {
             return Ok(rejected_claim("mempool-full"));
@@ -1183,24 +2079,37 @@ impl MemoryMempool {
             .ok_or(MempoolError::WeightOverflow)?;
         let policy_size = raw.len().div_ceil(WITNESS_SCALE_FACTOR);
         let coinbase_weight = airdrop_coinbase_weight(raw.len(), &output);
+        let airdrop_fee = proof.fee;
         let sequence = self.take_sequence();
-        self.airdrop_positions.insert(position, hash);
-        self.airdrops.insert(
+        let entry = Arc::new(AirdropMempoolEntry {
             hash,
-            AirdropMempoolEntry {
-                hash,
-                position,
-                value: verified.value,
-                fee: proof.fee,
-                policy_size,
-                coinbase_weight,
-                memory_usage,
-                admitted_at: context.current_time,
-                sequence,
-                proof,
-            },
+            position,
+            value: verified.value,
+            fee: proof.fee,
+            policy_size,
+            coinbase_weight,
+            memory_usage,
+            admitted_at: context.current_time,
+            sequence,
+            proof,
+        });
+        self.airdrop_positions.insert(position, hash);
+        let previous = self.airdrops.insert(hash, entry.clone());
+        debug_assert!(previous.is_none(), "accepted airdrop hash is unique");
+        let previous =
+            persistent_map_replace(&mut self.snapshot_state.airdrops, hash, entry.clone());
+        debug_assert!(
+            previous.is_none(),
+            "accepted snapshot airdrop hash is unique"
         );
+        let previous = persistent_map_replace(
+            &mut self.snapshot_state.airdrops_by_sequence,
+            (sequence, hash),
+            entry,
+        );
+        debug_assert!(previous.is_none(), "accepted airdrop sequence is unique");
         self.bytes = projected_bytes;
+        self.total_fee = self.total_fee.saturating_add(u128::from(airdrop_fee));
         self.advance_generation();
         if !self.limit_size_airdrop(hash, context.current_time) {
             return Ok(rejected_airdrop("mempool-full"));
@@ -1419,8 +2328,7 @@ impl MemoryMempool {
                 source
                     .transactions
                     .get(&txid)
-                    .cloned()
-                    .map(|transaction| (transaction, admitted_at))
+                    .map(|transaction| (transaction.as_ref().clone(), admitted_at))
             })
             .collect::<Vec<_>>();
         let mut ordered_orphans = source
@@ -1462,6 +2370,12 @@ impl MemoryMempool {
         rebuilt.claim_names = source.claim_names.clone();
         rebuilt.airdrops = source.airdrops.clone();
         rebuilt.airdrop_positions = source.airdrop_positions.clone();
+        rebuilt.snapshot_state.claims = source.snapshot_state.claims.clone();
+        rebuilt.snapshot_state.claims_by_sequence =
+            source.snapshot_state.claims_by_sequence.clone();
+        rebuilt.snapshot_state.airdrops = source.snapshot_state.airdrops.clone();
+        rebuilt.snapshot_state.airdrops_by_sequence =
+            source.snapshot_state.airdrops_by_sequence.clone();
         rebuilt.bytes = rebuilt
             .claims
             .values()
@@ -1470,6 +2384,16 @@ impl MemoryMempool {
             })
             .saturating_add(rebuilt.airdrops.values().fold(0usize, |total, entry| {
                 total.saturating_add(entry.memory_usage)
+            }));
+        rebuilt.total_fee = rebuilt
+            .claims
+            .values()
+            .filter(|entry| entry.commit_height == 1)
+            .fold(0u128, |total, entry| {
+                total.saturating_add(u128::from(entry.fee))
+            })
+            .saturating_add(rebuilt.airdrops.values().fold(0u128, |total, entry| {
+                total.saturating_add(u128::from(entry.fee))
             }));
         rebuilt.next_sequence = self.next_sequence;
         for (transaction, allow_orphan, admitted_at, charge_free_relay) in candidates {
@@ -1594,7 +2518,7 @@ impl MemoryMempool {
             previous_generation
         };
         if changed {
-            rebuilt.generation = generation;
+            rebuilt.set_generation(generation);
             *self = rebuilt;
         }
         Ok(MempoolRevalidation {
@@ -1872,17 +2796,66 @@ impl MemoryMempool {
                 .insert(input.previous_output.clone(), txid);
         }
         for parent in &direct_parents {
-            self.children.entry(*parent).or_default().insert(txid);
+            let children = self.children.entry(*parent).or_default();
+            Arc::make_mut(children).insert(txid);
+            let children = children.clone();
+            let previous =
+                persistent_map_replace(&mut self.snapshot_state.children, *parent, children);
+            debug_assert!(
+                previous.is_some(),
+                "accepted parent has a snapshot child set"
+            );
         }
-        self.parents.insert(txid, direct_parents);
-        self.children.entry(txid).or_default();
+        let direct_parents = Arc::new(direct_parents);
+        let previous = self.parents.insert(txid, direct_parents.clone());
+        debug_assert!(
+            previous.is_none(),
+            "accepted transaction parent set is unique"
+        );
+        let previous =
+            persistent_map_replace(&mut self.snapshot_state.parents, txid, direct_parents);
+        debug_assert!(previous.is_none(), "accepted snapshot parent set is unique");
+        let children = self.children.entry(txid).or_default().clone();
+        let previous = persistent_map_replace(&mut self.snapshot_state.children, txid, children);
+        debug_assert!(previous.is_none(), "accepted snapshot child set is unique");
         for name in &exclusive_names {
             self.exclusive_name_owners.insert(*name, txid);
         }
-        self.exclusive_names.insert(txid, exclusive_names);
+        let exclusive_names = Arc::new(exclusive_names);
+        let previous = self.exclusive_names.insert(txid, exclusive_names.clone());
+        debug_assert!(previous.is_none(), "accepted exclusive-name set is unique");
+        let previous = persistent_map_replace(
+            &mut self.snapshot_state.exclusive_names,
+            txid,
+            exclusive_names,
+        );
+        debug_assert!(previous.is_none(), "accepted snapshot name set is unique");
         self.bytes = projected_bytes;
-        self.entries.insert(txid, entry);
-        self.transactions.insert(txid, transaction);
+        self.total_fee = self.total_fee.saturating_add(u128::from(fee));
+        let (ordered_txids, inserted) = self.ordered_txids.insert((sequence, txid));
+        debug_assert!(inserted, "accepted mempool txid index entry is unique");
+        self.ordered_txids = ordered_txids;
+        let entry = Arc::new(entry);
+        let transaction = Arc::new(transaction);
+        let previous = self.entries.insert(txid, entry.clone());
+        debug_assert!(previous.is_none(), "accepted mempool entry is unique");
+        let previous = persistent_map_replace(&mut self.snapshot_state.entries, txid, entry);
+        debug_assert!(previous.is_none(), "accepted snapshot entry is unique");
+        let previous = self.transactions.insert(txid, transaction.clone());
+        debug_assert!(previous.is_none(), "accepted mempool transaction is unique");
+        let previous =
+            persistent_map_replace(&mut self.snapshot_state.transactions, txid, transaction);
+        debug_assert!(
+            previous.is_none(),
+            "accepted snapshot transaction is unique"
+        );
+        if self
+            .parents
+            .get(&txid)
+            .is_some_and(|parents| parents.is_empty())
+        {
+            self.insert_expiry_root((admitted_at, txid));
+        }
         self.advance_generation();
         if !self.limit_size(txid, context.current_time) {
             return Ok(rejected("mempool-full"));
@@ -1928,18 +2901,24 @@ impl MemoryMempool {
     }
 
     fn enforce_size_limit(&mut self, now: u64) {
-        let mut expired = self
-            .entries
-            .values()
-            .filter(|entry| {
-                self.parents.get(&entry.txid).is_none_or(BTreeSet::is_empty)
-                    && now >= entry.admitted_at.saturating_add(self.limits.expiry_time)
-            })
-            .map(|entry| (entry.admitted_at, entry.txid))
-            .collect::<Vec<_>>();
-        expired.sort();
-        for (_, txid) in expired {
-            self.remove_transaction_without_generation(txid, true);
+        while let Some((admitted_at, txid)) = self.next_expiry_root {
+            #[cfg(test)]
+            {
+                self.expiry_root_checks = self.expiry_root_checks.saturating_add(1);
+            }
+            if now < admitted_at.saturating_add(self.limits.expiry_time) {
+                break;
+            }
+            let removed = self.remove_transaction_without_generation(txid, true);
+            if removed == 0 {
+                // Fail closed against an internally stale key and guarantee
+                // forward progress even in non-debug builds.
+                self.remove_expiry_root((admitted_at, txid));
+            }
+            debug_assert_ne!(
+                removed, 0,
+                "expiry index referenced a missing transaction root"
+            );
         }
 
         if self.member_count() <= self.limits.maximum_transactions
@@ -2046,6 +3025,22 @@ impl MemoryMempool {
         }
     }
 
+    fn insert_expiry_root(&mut self, key: (u64, Txid)) {
+        let inserted = self.expiry_roots.insert(key);
+        debug_assert!(inserted, "new dependency root has one expiry index entry");
+        if self.next_expiry_root.is_none_or(|current| key < current) {
+            self.next_expiry_root = Some(key);
+        }
+    }
+
+    fn remove_expiry_root(&mut self, key: (u64, Txid)) -> bool {
+        let removed = self.expiry_roots.remove(&key);
+        if removed && self.next_expiry_root == Some(key) {
+            self.next_expiry_root = self.expiry_roots.iter().next().copied();
+        }
+        removed
+    }
+
     fn member_count(&self) -> usize {
         self.entries
             .len()
@@ -2136,6 +3131,9 @@ impl MemoryMempool {
             return 0;
         }
         self.entries.clear();
+        self.ordered_txids = OrderedTxidSnapshot::default();
+        self.expiry_roots.clear();
+        self.next_expiry_root = None;
         self.transactions.clear();
         self.orphans.clear();
         self.spent_outpoints.clear();
@@ -2147,7 +3145,9 @@ impl MemoryMempool {
         self.claim_names.clear();
         self.airdrops.clear();
         self.airdrop_positions.clear();
+        self.snapshot_state = MempoolSnapshot::default();
         self.bytes = 0;
+        self.total_fee = 0;
         self.orphan_bytes = 0;
         self.advance_generation();
         removed
@@ -2165,10 +3165,30 @@ impl MemoryMempool {
         let Some(entry) = self.claims.remove(hash) else {
             return false;
         };
+        let mirrored = persistent_map_delete(&mut self.snapshot_state.claims, hash);
+        debug_assert!(
+            mirrored
+                .as_ref()
+                .is_some_and(|mirrored| Arc::ptr_eq(mirrored, &entry)),
+            "live and snapshot claim indexes share the removed entry"
+        );
+        let ordered = persistent_map_delete(
+            &mut self.snapshot_state.claims_by_sequence,
+            &(entry.sequence, entry.hash),
+        );
+        debug_assert!(
+            ordered
+                .as_ref()
+                .is_some_and(|ordered| Arc::ptr_eq(ordered, &entry)),
+            "claim admission-order index shares the removed entry"
+        );
         if self.claim_names.get(&entry.name_hash) == Some(hash) {
             self.claim_names.remove(&entry.name_hash);
         }
         self.bytes = self.bytes.saturating_sub(entry.memory_usage);
+        if entry.commit_height == 1 {
+            self.total_fee = self.total_fee.saturating_sub(u128::from(entry.fee));
+        }
         true
     }
 
@@ -2184,10 +3204,28 @@ impl MemoryMempool {
         let Some(entry) = self.airdrops.remove(hash) else {
             return false;
         };
+        let mirrored = persistent_map_delete(&mut self.snapshot_state.airdrops, hash);
+        debug_assert!(
+            mirrored
+                .as_ref()
+                .is_some_and(|mirrored| Arc::ptr_eq(mirrored, &entry)),
+            "live and snapshot airdrop indexes share the removed entry"
+        );
+        let ordered = persistent_map_delete(
+            &mut self.snapshot_state.airdrops_by_sequence,
+            &(entry.sequence, entry.hash),
+        );
+        debug_assert!(
+            ordered
+                .as_ref()
+                .is_some_and(|ordered| Arc::ptr_eq(ordered, &entry)),
+            "airdrop admission-order index shares the removed entry"
+        );
         if self.airdrop_positions.get(&entry.position) == Some(hash) {
             self.airdrop_positions.remove(&entry.position);
         }
         self.bytes = self.bytes.saturating_sub(entry.memory_usage);
+        self.total_fee = self.total_fee.saturating_sub(u128::from(entry.fee));
         true
     }
 
@@ -2385,7 +3423,7 @@ impl MemoryMempool {
                     .outputs
                     .iter()
                     .any(|output| output.covenant.kind.is_name())
-                    .then_some((entry.sequence, *txid, transaction))
+                    .then_some((entry.sequence, *txid, transaction.as_ref()))
             })
             .collect::<Vec<_>>();
         ordered.sort_by_key(|(sequence, txid, _)| (*sequence, *txid));
@@ -2426,10 +3464,8 @@ impl MemoryMempool {
         let mut pending = self
             .children
             .get(&txid)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
+            .map(|children| children.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
         while let Some(child) = pending.pop() {
             if !descendants.insert(child) {
                 continue;
@@ -2459,35 +3495,97 @@ impl MemoryMempool {
         let affected_descendants = self
             .collect_descendants(txid)
             .expect("accepted mempool descendants stay within configured bounds");
-        let Some(_entry) = self.entries.remove(&txid) else {
+        let Some(entry) = self.entries.remove(&txid) else {
             self.transactions.insert(txid, transaction);
             return false;
         };
+        let mirrored_transaction =
+            persistent_map_delete(&mut self.snapshot_state.transactions, &txid);
+        debug_assert!(
+            mirrored_transaction
+                .as_ref()
+                .is_some_and(|mirrored| Arc::ptr_eq(mirrored, &transaction)),
+            "live and snapshot transaction indexes share the removed payload"
+        );
+        let mirrored_entry = persistent_map_delete(&mut self.snapshot_state.entries, &txid);
+        debug_assert!(
+            mirrored_entry
+                .as_ref()
+                .is_some_and(|mirrored| Arc::ptr_eq(mirrored, &entry)),
+            "live and snapshot entry indexes share the removed record"
+        );
+        self.remove_expiry_root((entry.admitted_at, txid));
         self.bytes = self.bytes.saturating_sub(transaction.encode().len());
+        self.total_fee = self.total_fee.saturating_sub(u128::from(entry.fee));
+        let (ordered_txids, removed) = self.ordered_txids.remove(&(entry.sequence, txid));
+        debug_assert!(removed, "removed mempool txid has an ordered index entry");
+        self.ordered_txids = ordered_txids;
         for input in &transaction.inputs {
             if self.spent_outpoints.get(&input.previous_output) == Some(&txid) {
                 self.spent_outpoints.remove(&input.previous_output);
             }
         }
         if let Some(parents) = self.parents.remove(&txid) {
-            for parent in parents {
+            let mirrored = persistent_map_delete(&mut self.snapshot_state.parents, &txid);
+            debug_assert!(
+                mirrored
+                    .as_ref()
+                    .is_some_and(|mirrored| Arc::ptr_eq(mirrored, &parents)),
+                "live and snapshot parent indexes share the removed set"
+            );
+            for parent in parents.iter().copied() {
                 if let Some(children) = self.children.get_mut(&parent) {
-                    children.remove(&txid);
+                    Arc::make_mut(children).remove(&txid);
+                    let previous = persistent_map_replace(
+                        &mut self.snapshot_state.children,
+                        parent,
+                        children.clone(),
+                    );
+                    debug_assert!(previous.is_some(), "retained parent has snapshot children");
                 }
             }
         }
         if let Some(children) = self.children.remove(&txid) {
-            for child in children {
+            let mirrored = persistent_map_delete(&mut self.snapshot_state.children, &txid);
+            debug_assert!(
+                mirrored
+                    .as_ref()
+                    .is_some_and(|mirrored| Arc::ptr_eq(mirrored, &children)),
+                "live and snapshot child indexes share the removed set"
+            );
+            for child in children.iter().copied() {
                 if let Some(parents) = self.parents.get_mut(&child) {
-                    parents.remove(&txid);
+                    let was_root = parents.is_empty();
+                    Arc::make_mut(parents).remove(&txid);
+                    let previous = persistent_map_replace(
+                        &mut self.snapshot_state.parents,
+                        child,
+                        parents.clone(),
+                    );
+                    debug_assert!(previous.is_some(), "retained child has snapshot parents");
+                    if !was_root && parents.is_empty() {
+                        let child_admitted_at = self
+                            .entries
+                            .get(&child)
+                            .expect("retained child has a mempool entry")
+                            .admitted_at;
+                        self.insert_expiry_root((child_admitted_at, child));
+                    }
                 }
             }
         }
         self.refresh_cached_ancestry(&affected_descendants);
         if let Some(names) = self.exclusive_names.remove(&txid) {
-            for name in names {
-                if self.exclusive_name_owners.get(&name) == Some(&txid) {
-                    self.exclusive_name_owners.remove(&name);
+            let mirrored = persistent_map_delete(&mut self.snapshot_state.exclusive_names, &txid);
+            debug_assert!(
+                mirrored
+                    .as_ref()
+                    .is_some_and(|mirrored| Arc::ptr_eq(mirrored, &names)),
+                "live and snapshot name indexes share the removed set"
+            );
+            for name in names.iter() {
+                if self.exclusive_name_owners.get(name) == Some(&txid) {
+                    self.exclusive_name_owners.remove(name);
                 }
             }
         }
@@ -2545,11 +3643,22 @@ impl MemoryMempool {
                 .entries
                 .get_mut(txid)
                 .expect("retained descendant has a mutable mempool entry");
-            entry.parents = direct_parents.into_iter().collect();
+            let entry = Arc::make_mut(entry);
+            entry.parents = direct_parents.iter().copied().collect();
             entry.ancestor_count = ancestors.len();
             entry.ancestor_fee = ancestor_fee;
             entry.ancestor_weight = ancestor_weight;
             entry.ancestor_policy_size = ancestor_policy_size;
+            let entry = self
+                .entries
+                .get(txid)
+                .expect("refreshed descendant has a mempool entry")
+                .clone();
+            let previous = persistent_map_replace(&mut self.snapshot_state.entries, *txid, entry);
+            debug_assert!(
+                previous.is_some(),
+                "refreshed descendant has a snapshot entry"
+            );
         }
     }
 
@@ -2560,7 +3669,12 @@ impl MemoryMempool {
     }
 
     fn advance_generation(&mut self) {
-        self.generation = self.generation.saturating_add(1).max(1);
+        self.set_generation(self.generation.saturating_add(1).max(1));
+    }
+
+    fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+        self.snapshot_state.generation = generation;
     }
 }
 
@@ -2571,21 +3685,7 @@ impl Mempool for MemoryMempool {
             claim_count: self.claims.len(),
             airdrop_count: self.airdrops.len(),
             bytes: self.bytes,
-            total_fee: self
-                .entries
-                .values()
-                .fold(0u64, |total, entry| total.saturating_add(entry.fee))
-                .saturating_add(
-                    self.claims
-                        .values()
-                        .filter(|entry| entry.commit_height == 1)
-                        .fold(0u64, |total, entry| total.saturating_add(entry.fee)),
-                )
-                .saturating_add(
-                    self.airdrops
-                        .values()
-                        .fold(0u64, |total, entry| total.saturating_add(entry.fee)),
-                ),
+            total_fee: Amount::try_from(self.total_fee).unwrap_or(Amount::MAX),
             orphan_count: self.orphans.len(),
             orphan_bytes: self.orphan_bytes,
             generation: self.generation,
@@ -2593,9 +3693,16 @@ impl Mempool for MemoryMempool {
     }
 
     fn entries(&self) -> Vec<MempoolEntry> {
-        let mut entries = self.entries.values().cloned().collect::<Vec<_>>();
-        entries.sort_by_key(|entry| (entry.sequence, entry.txid));
-        entries
+        self.ordered_txids
+            .txids()
+            .map(|txid| {
+                self.entries
+                    .get(&txid)
+                    .expect("ordered mempool index references an accepted entry")
+                    .as_ref()
+                    .clone()
+            })
+            .collect()
     }
 
     fn submit(&mut self, _transaction: Transaction) -> Result<Admission, MempoolError> {
@@ -3005,6 +4112,523 @@ mod tests {
         }
     }
 
+    fn validate_persistent_map_node<K: Ord + std::fmt::Debug, V>(
+        node: Option<&PersistentMapNode<K, V>>,
+        minimum: Option<&K>,
+        maximum: Option<&K>,
+    ) -> (usize, u16) {
+        let Some(node) = node else {
+            return (0, 0);
+        };
+        assert!(minimum.is_none_or(|minimum| &node.key > minimum));
+        assert!(maximum.is_none_or(|maximum| &node.key < maximum));
+        let (left_size, left_height) =
+            validate_persistent_map_node(node.left.as_deref(), minimum, Some(&node.key));
+        let (right_size, right_height) =
+            validate_persistent_map_node(node.right.as_deref(), Some(&node.key), maximum);
+        let size = left_size.saturating_add(right_size).saturating_add(1);
+        assert_eq!(node.size, size);
+        assert_eq!(node.height, left_height.max(right_height).saturating_add(1));
+        assert!(
+            left_height.abs_diff(right_height) <= 1,
+            "persistent map AVL balance violated at {:?}: left={left_height}, right={right_height}",
+            node.key
+        );
+        (size, node.height)
+    }
+
+    fn validate_persistent_map<K: Ord + Clone + std::fmt::Debug, V: Clone>(
+        map: &PersistentMap<K, V>,
+    ) {
+        let (size, height) = validate_persistent_map_node(map.root.as_deref(), None, None);
+        assert_eq!(size, map.len());
+        assert_eq!(usize::from(height), map.height());
+        assert_eq!(map.iter().len(), map.len());
+        assert_eq!(map.iter().count(), map.len());
+    }
+
+    fn assert_snapshot_mirror_exact(pool: &MemoryMempool) {
+        let snapshot = &pool.snapshot_state;
+        assert_eq!(snapshot.generation, pool.generation);
+        assert_eq!(snapshot.entries.len(), pool.entries.len());
+        assert_eq!(snapshot.transactions.len(), pool.transactions.len());
+        assert_eq!(snapshot.parents.len(), pool.parents.len());
+        assert_eq!(snapshot.children.len(), pool.children.len());
+        assert_eq!(snapshot.exclusive_names.len(), pool.exclusive_names.len());
+        assert_eq!(snapshot.claims.len(), pool.claims.len());
+        assert_eq!(snapshot.claims_by_sequence.len(), pool.claims.len());
+        assert_eq!(snapshot.airdrops.len(), pool.airdrops.len());
+        assert_eq!(snapshot.airdrops_by_sequence.len(), pool.airdrops.len());
+
+        for (txid, entry) in &pool.entries {
+            assert!(Arc::ptr_eq(
+                entry,
+                snapshot.entries.get(txid).expect("mirrored entry")
+            ));
+        }
+        for (txid, transaction) in &pool.transactions {
+            assert!(Arc::ptr_eq(
+                transaction,
+                snapshot
+                    .transactions
+                    .get(txid)
+                    .expect("mirrored transaction")
+            ));
+        }
+        for (txid, parents) in &pool.parents {
+            assert!(Arc::ptr_eq(
+                parents,
+                snapshot.parents.get(txid).expect("mirrored parent set")
+            ));
+        }
+        for (txid, children) in &pool.children {
+            assert!(Arc::ptr_eq(
+                children,
+                snapshot.children.get(txid).expect("mirrored child set")
+            ));
+        }
+        for (txid, names) in &pool.exclusive_names {
+            assert!(Arc::ptr_eq(
+                names,
+                snapshot
+                    .exclusive_names
+                    .get(txid)
+                    .expect("mirrored exclusive-name set")
+            ));
+        }
+        for (hash, claim) in &pool.claims {
+            assert!(Arc::ptr_eq(
+                claim,
+                snapshot.claims.get(hash).expect("mirrored claim")
+            ));
+            assert!(Arc::ptr_eq(
+                claim,
+                snapshot
+                    .claims_by_sequence
+                    .get(&(claim.sequence, *hash))
+                    .expect("ordered mirrored claim")
+            ));
+        }
+        for (hash, airdrop) in &pool.airdrops {
+            assert!(Arc::ptr_eq(
+                airdrop,
+                snapshot.airdrops.get(hash).expect("mirrored airdrop")
+            ));
+            assert!(Arc::ptr_eq(
+                airdrop,
+                snapshot
+                    .airdrops_by_sequence
+                    .get(&(airdrop.sequence, *hash))
+                    .expect("ordered mirrored airdrop")
+            ));
+        }
+
+        validate_persistent_map(&snapshot.entries);
+        validate_persistent_map(&snapshot.transactions);
+        validate_persistent_map(&snapshot.parents);
+        validate_persistent_map(&snapshot.children);
+        validate_persistent_map(&snapshot.exclusive_names);
+        validate_persistent_map(&snapshot.claims);
+        validate_persistent_map(&snapshot.claims_by_sequence);
+        validate_persistent_map(&snapshot.airdrops);
+        validate_persistent_map(&snapshot.airdrops_by_sequence);
+    }
+
+    fn snapshot_total_mutation_nodes(snapshot: &MempoolSnapshot) -> usize {
+        [
+            snapshot.entries.total_mutation_nodes,
+            snapshot.transactions.total_mutation_nodes,
+            snapshot.parents.total_mutation_nodes,
+            snapshot.children.total_mutation_nodes,
+            snapshot.exclusive_names.total_mutation_nodes,
+            snapshot.claims.total_mutation_nodes,
+            snapshot.claims_by_sequence.total_mutation_nodes,
+            snapshot.airdrops.total_mutation_nodes,
+            snapshot.airdrops_by_sequence.total_mutation_nodes,
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add)
+    }
+
+    fn assert_snapshot_roots_identical(left: &MempoolSnapshot, right: &MempoolSnapshot) {
+        assert!(left.entries.is_same_root(&right.entries));
+        assert!(left.transactions.is_same_root(&right.transactions));
+        assert!(left.parents.is_same_root(&right.parents));
+        assert!(left.children.is_same_root(&right.children));
+        assert!(left.exclusive_names.is_same_root(&right.exclusive_names));
+        assert!(left.claims.is_same_root(&right.claims));
+        assert!(left
+            .claims_by_sequence
+            .is_same_root(&right.claims_by_sequence));
+        assert!(left.airdrops.is_same_root(&right.airdrops));
+        assert!(left
+            .airdrops_by_sequence
+            .is_same_root(&right.airdrops_by_sequence));
+    }
+
+    fn assert_cached_info_exact(pool: &MemoryMempool) {
+        let expected_ordered_txids = pool
+            .entries
+            .values()
+            .map(|entry| (entry.sequence, entry.txid))
+            .collect::<BTreeSet<_>>();
+        let expected_expiry_roots = pool
+            .entries
+            .values()
+            .filter(|entry| {
+                pool.parents
+                    .get(&entry.txid)
+                    .is_some_and(|parents| parents.is_empty())
+            })
+            .map(|entry| (entry.admitted_at, entry.txid))
+            .collect::<BTreeSet<_>>();
+        let expected_bytes = pool
+            .transactions
+            .values()
+            .fold(0usize, |total, transaction| {
+                total.saturating_add(transaction.encode().len())
+            })
+            .saturating_add(pool.claims.values().fold(0usize, |total, entry| {
+                total.saturating_add(entry.memory_usage)
+            }))
+            .saturating_add(pool.airdrops.values().fold(0usize, |total, entry| {
+                total.saturating_add(entry.memory_usage)
+            }));
+        let expected_orphan_bytes = pool
+            .orphans
+            .values()
+            .fold(0usize, |total, entry| total.saturating_add(entry.bytes));
+        let expected_total_fee = pool
+            .entries
+            .values()
+            .fold(0u128, |total, entry| {
+                total.saturating_add(u128::from(entry.fee))
+            })
+            .saturating_add(
+                pool.claims
+                    .values()
+                    .filter(|entry| entry.commit_height == 1)
+                    .fold(0u128, |total, entry| {
+                        total.saturating_add(u128::from(entry.fee))
+                    }),
+            )
+            .saturating_add(pool.airdrops.values().fold(0u128, |total, entry| {
+                total.saturating_add(u128::from(entry.fee))
+            }));
+        let info = pool.info();
+        assert_eq!(info.transaction_count, pool.entries.len());
+        assert_eq!(info.claim_count, pool.claims.len());
+        assert_eq!(info.airdrop_count, pool.airdrops.len());
+        assert_eq!(info.orphan_count, pool.orphans.len());
+        assert_eq!(info.bytes, expected_bytes);
+        assert_eq!(info.orphan_bytes, expected_orphan_bytes);
+        assert_eq!(pool.total_fee, expected_total_fee);
+        assert_eq!(
+            pool.ordered_txids.iter().copied().collect::<BTreeSet<_>>(),
+            expected_ordered_txids
+        );
+        assert_eq!(pool.expiry_roots, expected_expiry_roots);
+        assert_eq!(
+            pool.next_expiry_root,
+            expected_expiry_roots.iter().next().copied()
+        );
+        assert_eq!(
+            info.total_fee,
+            Amount::try_from(expected_total_fee).unwrap_or(Amount::MAX)
+        );
+        assert_snapshot_mirror_exact(pool);
+    }
+
+    fn ordered_test_key(sequence: u64) -> OrderedTxidKey {
+        let mut raw = [0u8; 32];
+        raw[..8].copy_from_slice(&sequence.to_be_bytes());
+        (sequence, Txid::new(raw))
+    }
+
+    fn reference_visit_package(
+        snapshot: &MempoolSnapshot,
+        txid: Txid,
+        visiting: &mut HashSet<Txid>,
+        ordered: &mut Vec<Txid>,
+    ) -> Result<(), MempoolError> {
+        if ordered.contains(&txid) {
+            return Ok(());
+        }
+        if !visiting.insert(txid) {
+            return Err(MempoolError::DependencyCycle(txid));
+        }
+        if let Some(parents) = snapshot.parents.get(&txid) {
+            for parent in parents.iter().copied() {
+                reference_visit_package(snapshot, parent, visiting, ordered)?;
+            }
+        }
+        visiting.remove(&txid);
+        ordered.push(txid);
+        Ok(())
+    }
+
+    fn validate_ordered_txid_node(
+        node: Option<&OrderedTxidNode>,
+        minimum: Option<OrderedTxidKey>,
+        maximum: Option<OrderedTxidKey>,
+    ) -> (usize, u16) {
+        let Some(node) = node else {
+            return (0, 0);
+        };
+        assert!(minimum.is_none_or(|minimum| node.key > minimum));
+        assert!(maximum.is_none_or(|maximum| node.key < maximum));
+        let (left_count, left_height) =
+            validate_ordered_txid_node(node.left.as_deref(), minimum, Some(node.key));
+        let (right_count, right_height) =
+            validate_ordered_txid_node(node.right.as_deref(), Some(node.key), maximum);
+        assert_eq!(node.height, left_height.max(right_height).saturating_add(1));
+        assert!(
+            left_height.abs_diff(right_height) <= 1,
+            "persistent AVL balance violated at {:?}: left={left_height}, right={right_height}",
+            node.key
+        );
+        (
+            left_count
+                .checked_add(right_count)
+                .and_then(|count| count.checked_add(1))
+                .expect("test node count"),
+            node.height,
+        )
+    }
+
+    fn validate_ordered_txid_snapshot(snapshot: &OrderedTxidSnapshot) -> u16 {
+        let (count, height) = validate_ordered_txid_node(snapshot.root.as_deref(), None, None);
+        assert_eq!(count, snapshot.len());
+        assert_eq!(snapshot.is_empty(), count == 0);
+        height
+    }
+
+    fn collect_ordered_txid_node_pointers(
+        node: Option<&Arc<OrderedTxidNode>>,
+        pointers: &mut HashSet<usize>,
+    ) {
+        let Some(node) = node else {
+            return;
+        };
+        pointers.insert(Arc::as_ptr(node) as usize);
+        collect_ordered_txid_node_pointers(node.left.as_ref(), pointers);
+        collect_ordered_txid_node_pointers(node.right.as_ref(), pointers);
+    }
+
+    fn count_shared_ordered_txid_nodes(
+        node: Option<&Arc<OrderedTxidNode>>,
+        pointers: &HashSet<usize>,
+    ) -> usize {
+        let Some(node) = node else {
+            return 0;
+        };
+        usize::from(pointers.contains(&(Arc::as_ptr(node) as usize)))
+            .saturating_add(count_shared_ordered_txid_nodes(
+                node.left.as_ref(),
+                pointers,
+            ))
+            .saturating_add(count_shared_ordered_txid_nodes(
+                node.right.as_ref(),
+                pointers,
+            ))
+    }
+
+    #[test]
+    fn persistent_map_is_adversarially_balanced_and_range_bounded() {
+        const MEMBERS: u64 = 4_096;
+        let mut map = PersistentMap::default();
+        for key in 0..MEMBERS {
+            let previous_height = map.height();
+            let (next, previous) = map.insert(key, Arc::new(key));
+            assert!(previous.is_none());
+            assert!(
+                next.mutation_nodes <= 8usize.saturating_mul(previous_height.saturating_add(1)),
+                "insertion copied {} nodes at height {previous_height}",
+                next.mutation_nodes
+            );
+            map = next;
+        }
+        validate_persistent_map(&map);
+        assert!(
+            map.height()
+                <= 2usize
+                    .saturating_mul(usize::try_from(MEMBERS.ilog2() + 1).expect("height bound")),
+            "sorted attacker-controlled keys produced height {}",
+            map.height()
+        );
+
+        let lower = MEMBERS - 17;
+        let mut tail = map.iter_after(Some(&lower));
+        assert_eq!(tail.len(), 16);
+        assert_eq!(tail.size_hint(), (16, Some(16)));
+        assert_eq!(tail.next().map(|(key, _)| *key), Some(lower + 1));
+        assert_eq!(tail.len(), 15);
+        assert_eq!(tail.last().map(|(key, _)| *key), Some(MEMBERS - 1));
+
+        let retained = map.clone();
+        let cloned = retained.clone();
+        assert!(retained.is_same_root(&cloned));
+        assert_eq!(
+            retained.total_mutation_nodes, cloned.total_mutation_nodes,
+            "O(1) clone must allocate no tree nodes"
+        );
+        for key in (0..MEMBERS).rev() {
+            let previous_height = map.height();
+            let (next, previous) = map.remove(&key);
+            assert_eq!(previous.as_deref(), Some(&key));
+            assert!(
+                next.mutation_nodes <= 8usize.saturating_mul(previous_height.saturating_add(1)),
+                "removal copied {} nodes at height {previous_height}",
+                next.mutation_nodes
+            );
+            map = next;
+        }
+        assert!(map.is_empty());
+        assert_eq!(retained.len(), usize::try_from(MEMBERS).expect("members"));
+        assert_eq!(retained.get(&0).map(Arc::as_ref), Some(&0));
+        validate_persistent_map(&retained);
+    }
+
+    #[test]
+    fn shared_ancestor_package_matches_reference_with_linear_dependency_work() {
+        let txids = (0..6u64)
+            .map(|sequence| ordered_test_key(sequence).1)
+            .collect::<Vec<_>>();
+        let dependencies = [
+            Vec::new(),
+            vec![txids[0]],
+            vec![txids[0]],
+            vec![txids[1], txids[2]],
+            vec![txids[1], txids[2]],
+            vec![txids[3], txids[4]],
+        ];
+        let mut snapshot = MempoolSnapshot::default();
+        for (sequence, (txid, parents)) in txids.iter().zip(dependencies.iter()).enumerate() {
+            let entry = Arc::new(MempoolEntry {
+                txid: *txid,
+                fee: 1,
+                base_size: 1,
+                witness_size: 0,
+                weight: 1,
+                policy_size: 1,
+                sigops: 0,
+                opens: 0,
+                updates: 0,
+                renewals: 0,
+                parents: parents.clone(),
+                ancestor_count: 0,
+                ancestor_fee: 1,
+                ancestor_weight: 1,
+                ancestor_policy_size: 1,
+                admitted_at: 0,
+                sequence: u64::try_from(sequence).expect("sequence"),
+            });
+            persistent_map_replace(&mut snapshot.entries, *txid, entry);
+            persistent_map_replace(
+                &mut snapshot.parents,
+                *txid,
+                Arc::new(parents.iter().copied().collect()),
+            );
+            persistent_map_replace(&mut snapshot.exclusive_names, *txid, Arc::new(Vec::new()));
+        }
+
+        let mut reference = Vec::new();
+        reference_visit_package(&snapshot, txids[5], &mut HashSet::new(), &mut reference)
+            .expect("reference package");
+        let package = snapshot
+            .package_for(txids[5], &HashSet::new())
+            .expect("persistent package");
+        assert_eq!(package.txids, reference);
+        assert_eq!(package.txids, txids);
+
+        let mut visiting = HashSet::new();
+        let mut emitted = HashSet::new();
+        let mut ordered = Vec::new();
+        let mut dependency_visits = 0usize;
+        snapshot
+            .visit_package(
+                txids[5],
+                &HashSet::new(),
+                &mut visiting,
+                &mut emitted,
+                &mut ordered,
+                &mut dependency_visits,
+            )
+            .expect("counted package");
+        let dependency_edges = dependencies.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(dependency_visits, dependency_edges + 1);
+        assert_eq!(emitted.len(), txids.len());
+        assert_eq!(ordered, reference);
+    }
+
+    #[test]
+    fn persistent_ordered_txids_bound_sorted_mutation_and_share_generations() {
+        const MEMBERS: u64 = 4_096;
+        let mut snapshot = OrderedTxidSnapshot::default();
+        for sequence in 0..MEMBERS {
+            let (next, inserted) = snapshot.insert(ordered_test_key(sequence));
+            assert!(inserted);
+            snapshot = next;
+        }
+        let height = validate_ordered_txid_snapshot(&snapshot);
+        assert!(
+            height <= 2 * u16::try_from(MEMBERS.ilog2() + 1).expect("height bound"),
+            "sorted insertions produced an unexpectedly tall AVL: {height}"
+        );
+
+        let ordered = snapshot.iter().copied().collect::<Vec<_>>();
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(ordered.len(), usize::try_from(MEMBERS).expect("members"));
+        let mut iterator = snapshot.iter();
+        let mut remaining = usize::try_from(MEMBERS).expect("members");
+        while iterator.next().is_some() {
+            remaining -= 1;
+            assert_eq!(iterator.size_hint(), (remaining, Some(remaining)));
+            assert_eq!(iterator.len(), remaining);
+        }
+        assert_eq!(iterator.size_hint(), (0, Some(0)));
+
+        let (duplicate, inserted) = snapshot.insert(ordered_test_key(MEMBERS / 2));
+        assert!(!inserted);
+        assert!(snapshot.is_same_generation(&duplicate));
+        let (missing, removed) = snapshot.remove(&ordered_test_key(MEMBERS + 9));
+        assert!(!removed);
+        assert!(snapshot.is_same_generation(&missing));
+
+        let retained = snapshot.clone();
+        let mut retained_pointers = HashSet::new();
+        collect_ordered_txid_node_pointers(retained.root.as_ref(), &mut retained_pointers);
+        let (extended, inserted) = snapshot.insert(ordered_test_key(MEMBERS));
+        assert!(inserted);
+        assert_eq!(extended.len(), retained.len() + 1);
+        assert_eq!(retained.len(), usize::try_from(MEMBERS).expect("members"));
+        let shared = count_shared_ordered_txid_nodes(extended.root.as_ref(), &retained_pointers);
+        assert!(
+            shared >= retained.len().saturating_sub(64),
+            "path-copy insertion shared only {shared} of {} retained nodes",
+            retained.len()
+        );
+        validate_ordered_txid_snapshot(&extended);
+
+        let mut reduced = extended;
+        for sequence in 0..=MEMBERS {
+            let (next, removed) = reduced.remove(&ordered_test_key(sequence));
+            assert!(removed, "missing sorted removal {sequence}");
+            reduced = next;
+            if sequence % 256 == 0 || sequence == MEMBERS {
+                validate_ordered_txid_snapshot(&reduced);
+            }
+        }
+        assert!(reduced.is_empty());
+        assert_eq!(retained.len(), usize::try_from(MEMBERS).expect("members"));
+        assert_eq!(
+            retained.txids().next(),
+            Some(ordered_test_key(0).1),
+            "old generation changed after persistent removals"
+        );
+        validate_ordered_txid_snapshot(&retained);
+    }
+
     #[test]
     fn claim_admission_indexes_revalidates_and_reconciles_coinbases() {
         let (fixture, block) = fixture_claim_block();
@@ -3021,8 +4645,22 @@ mod tests {
                 .expect("claim admission"),
             ClaimAdmission::Accepted(hash)
         );
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().claim_count, 1);
         assert_eq!(pool.info().bytes, 500 + claim.blob.len());
+        let retained_claims = pool.snapshot();
+        let claim_page = pool.claim_entries_page(None, 1);
+        assert_eq!(claim_page.len(), 1);
+        assert!(Arc::ptr_eq(
+            &claim_page[0],
+            pool.claims.get(&hash).expect("live claim")
+        ));
+        assert!(Arc::ptr_eq(
+            pool.claims.get(&hash).expect("live claim"),
+            retained_claims.claims.get(&hash).expect("snapshot claim")
+        ));
+        let claim_cursor = (claim_page[0].sequence, hash);
+        assert!(pool.claim_entries_page(Some(claim_cursor), 1).is_empty());
         assert!(matches!(
             pool.submit_claim_with_context(claim.clone(), &context, &view, &dnssec)
                 .expect("duplicate claim"),
@@ -3036,17 +4674,24 @@ mod tests {
         .expect("bounded claim pool");
         assert!(matches!(
             bounded
-                .submit_claim_with_context(claim, &context, &view, &dnssec)
+                .submit_claim_with_context(claim.clone(), &context, &view, &dnssec)
                 .expect("bounded claim admission"),
             ClaimAdmission::Rejected { reason } if reason == "mempool-full"
         ));
+        assert_cached_info_exact(&bounded);
         assert_eq!(bounded.info().claim_count, 0);
 
         assert_eq!(pool.remove_confirmed(std::slice::from_ref(&coinbase)), 1);
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().claim_count, 0);
+        assert_eq!(
+            retained_claims.claim(&hash).map(|entry| &entry.claim),
+            Some(&claim)
+        );
         assert!(pool
             .reconcile_claims_with_context(&[coinbase], &context, &view, &dnssec)
             .expect("claim disconnect reconciliation"));
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().claim_count, 2);
     }
 
@@ -3068,7 +4713,26 @@ mod tests {
             .expect("airdrop admission"),
             AirdropAdmission::Accepted(hash)
         );
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().airdrop_count, 1);
+        let retained_airdrops = pool.snapshot();
+        let airdrop_page = pool.airdrop_entries_page(None, 1);
+        assert_eq!(airdrop_page.len(), 1);
+        assert!(Arc::ptr_eq(
+            &airdrop_page[0],
+            pool.airdrops.get(&hash).expect("live airdrop")
+        ));
+        assert!(Arc::ptr_eq(
+            pool.airdrops.get(&hash).expect("live airdrop"),
+            retained_airdrops
+                .airdrops
+                .get(&hash)
+                .expect("snapshot airdrop")
+        ));
+        let airdrop_cursor = (airdrop_page[0].sequence, hash);
+        assert!(pool
+            .airdrop_entries_page(Some(airdrop_cursor), 1)
+            .is_empty());
 
         let mut bounded = MemoryMempool::with_limits(MempoolLimits {
             maximum_bytes: 300 + raw_size - 1,
@@ -3086,6 +4750,7 @@ mod tests {
                 .expect("bounded admission"),
             AirdropAdmission::Rejected { reason } if reason == "mempool-full"
         ));
+        assert_cached_info_exact(&bounded);
         assert_eq!(bounded.info().airdrop_count, 0);
         assert_eq!(pool.info().bytes, 300 + raw_size);
         assert_eq!(pool.info().total_fee, proof.fee);
@@ -3109,7 +4774,12 @@ mod tests {
                 &UnavailableAirdropSignatureVerifier,
             )
             .expect("spent revalidation"));
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().airdrop_count, 0);
+        assert_eq!(
+            retained_airdrops.airdrop(&hash).map(|entry| &entry.proof),
+            Some(&proof)
+        );
 
         let disabled = AirdropMempoolContext {
             airstop: true,
@@ -3136,6 +4806,7 @@ mod tests {
             .expect("readmit"),
             AirdropAdmission::Accepted(_)
         ));
+        assert_cached_info_exact(&pool);
         let coinbase = Transaction {
             version: 0,
             inputs: vec![
@@ -3156,6 +4827,7 @@ mod tests {
             locktime: 2,
         };
         assert_eq!(pool.remove_confirmed(std::slice::from_ref(&coinbase)), 1);
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().airdrop_count, 0);
         assert!(pool
             .reconcile_airdrops_with_context(
@@ -3165,6 +4837,7 @@ mod tests {
                 &UnavailableAirdropSignatureVerifier,
             )
             .expect("disconnect reconciliation"));
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().airdrop_count, 1);
     }
 
@@ -3305,6 +4978,282 @@ mod tests {
     }
 
     #[test]
+    fn ordered_txid_snapshot_is_generation_stable_across_mutation() {
+        let first_input = outpoint(0xc1, 0);
+        let second_input = outpoint(0xc2, 0);
+        let mut view = FixedView::with_coin(first_input.clone(), 20);
+        view.coins.insert(
+            second_input.clone(),
+            Coin {
+                outpoint: second_input.clone(),
+                value: 20,
+                height: 1,
+                coinbase: false,
+                address: Address::new(0, vec![3; 20]).expect("address"),
+                covenant: covenant(),
+            },
+        );
+        let first = transaction(first_input, 15);
+        let first_txid = first.txid();
+        let second = transaction(second_input, 14);
+        let second_txid = second.txid();
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, first, &view),
+            Admission::Accepted(_)
+        ));
+        let first_generation = pool.ordered_txids_snapshot();
+        assert_eq!(
+            first_generation
+                .iter()
+                .map(|(_, txid)| *txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid]
+        );
+
+        assert!(matches!(
+            submit(&mut pool, second, &view),
+            Admission::Accepted(_)
+        ));
+        let second_generation = pool.ordered_txids_snapshot();
+        assert_eq!(
+            first_generation
+                .iter()
+                .map(|(_, txid)| *txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid],
+            "a retained RPC view must not observe later admission"
+        );
+        assert_eq!(
+            second_generation
+                .iter()
+                .map(|(_, txid)| *txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid, second_txid]
+        );
+
+        assert_eq!(pool.remove_transaction(first_txid, false), 1);
+        assert_eq!(
+            second_generation
+                .iter()
+                .map(|(_, txid)| *txid)
+                .collect::<Vec<_>>(),
+            vec![first_txid, second_txid],
+            "a retained RPC view must not observe later removal"
+        );
+        assert_cached_info_exact(&pool);
+    }
+
+    #[test]
+    fn full_snapshot_capture_is_o1_and_shares_transaction_payloads() {
+        let first_input = outpoint(0xb1, 0);
+        let second_input = outpoint(0xb2, 0);
+        let mut view = FixedView::with_coin(first_input.clone(), 20);
+        view.coins.insert(
+            second_input.clone(),
+            Coin {
+                outpoint: second_input.clone(),
+                value: 20,
+                height: 1,
+                coinbase: false,
+                address: Address::new(0, vec![3; 20]).expect("address"),
+                covenant: covenant(),
+            },
+        );
+        let mut first = transaction(first_input, 15);
+        first.inputs[0].witness.items.push(vec![0x5a; 16 * 1024]);
+        let first_txid = first.txid();
+        let second = transaction(second_input, 14);
+        let second_txid = second.txid();
+        let mut pool = MemoryMempool::new();
+        assert!(matches!(
+            submit(&mut pool, first.clone(), &view),
+            Admission::Accepted(id) if id == first_txid
+        ));
+
+        let retained = pool.snapshot();
+        let allocations = snapshot_total_mutation_nodes(&retained);
+        let cloned = retained.clone();
+        assert_snapshot_roots_identical(&retained, &cloned);
+        assert_eq!(snapshot_total_mutation_nodes(&cloned), allocations);
+        assert!(Arc::ptr_eq(
+            pool.transactions
+                .get(&first_txid)
+                .expect("live transaction"),
+            retained
+                .transactions
+                .get(&first_txid)
+                .expect("snapshot transaction")
+        ));
+
+        assert!(matches!(
+            submit(&mut pool, second, &view),
+            Admission::Accepted(id) if id == second_txid
+        ));
+        assert_eq!(retained.transaction(&first_txid), Some(&first));
+        assert!(retained.transaction(&second_txid).is_none());
+        assert!(Arc::ptr_eq(
+            pool.transactions
+                .get(&first_txid)
+                .expect("live transaction"),
+            retained
+                .transactions
+                .get(&first_txid)
+                .expect("retained transaction")
+        ));
+
+        assert_eq!(pool.remove_transaction(first_txid, false), 1);
+        assert_eq!(retained.transaction(&first_txid), Some(&first));
+        assert!(pool.transaction(&first_txid).is_none());
+        assert_cached_info_exact(&pool);
+    }
+
+    #[test]
+    fn parent_removal_path_copies_only_logarithmic_paths_per_affected_descendant() {
+        const MEMBERS: usize = 16;
+        let root_input = outpoint(0xb3, 0);
+        let mut pool = MemoryMempool::new();
+        let root = transaction(root_input.clone(), 1_000);
+        assert!(matches!(
+            submit(&mut pool, root, &FixedView::with_coin(root_input, 1_001)),
+            Admission::Accepted(_)
+        ));
+        let mut txids = pool.snapshot().txids().collect::<Vec<_>>();
+        for index in 1..MEMBERS {
+            let parent = *txids.last().expect("chain parent");
+            let child = transaction(
+                Outpoint {
+                    txid: parent,
+                    index: 0,
+                },
+                1_000u64.saturating_sub(u64::try_from(index).expect("index")),
+            );
+            let child_txid = child.txid();
+            assert!(matches!(
+                submit(&mut pool, child, &FixedView::default()),
+                Admission::Accepted(id) if id == child_txid
+            ));
+            txids.push(child_txid);
+        }
+        let root_txid = txids[0];
+        let retained = pool.snapshot();
+        let before_allocations = snapshot_total_mutation_nodes(&retained);
+        assert_eq!(
+            retained.children(&root_txid).collect::<Vec<_>>(),
+            vec![txids[1]]
+        );
+
+        assert_eq!(pool.remove_transaction(root_txid, false), 1);
+        let current = pool.snapshot();
+        let copied = snapshot_total_mutation_nodes(&current)
+            .checked_sub(before_allocations)
+            .expect("allocation counters are monotonic");
+        let logarithmic_height = usize::try_from(MEMBERS.ilog2() + 2).expect("height");
+        let affected_records = MEMBERS.saturating_sub(1).saturating_add(10);
+        let bound = affected_records
+            .saturating_mul(8)
+            .saturating_mul(logarithmic_height);
+        assert!(
+            copied <= bound,
+            "parent removal copied {copied} nodes, bound {bound} for {} descendants",
+            MEMBERS - 1
+        );
+        assert!(current.parents(&txids[1]).next().is_none());
+        assert!(current.children(&root_txid).next().is_none());
+        for (index, txid) in txids.iter().enumerate().skip(1) {
+            assert_eq!(
+                current
+                    .entry(txid)
+                    .expect("retained descendant")
+                    .ancestor_count,
+                index - 1
+            );
+        }
+        assert_eq!(
+            retained.transaction(&root_txid).map(Transaction::txid),
+            Some(root_txid)
+        );
+        assert_cached_info_exact(&pool);
+    }
+
+    #[test]
+    fn randomized_serial_admission_removal_and_reconcile_matches_set_oracle() {
+        const MEMBERS: usize = 64;
+        const OPERATIONS: usize = 384;
+        let mut view = FixedView::default();
+        let mut candidates = Vec::with_capacity(MEMBERS);
+        for index in 0..MEMBERS {
+            let byte = u8::try_from(index + 1).expect("fixture index");
+            let input = outpoint(byte, 0);
+            view.coins.insert(
+                input.clone(),
+                Coin {
+                    outpoint: input.clone(),
+                    value: 100,
+                    height: 1,
+                    coinbase: false,
+                    address: Address::new(0, vec![3; 20]).expect("address"),
+                    covenant: covenant(),
+                },
+            );
+            candidates.push(transaction(input, 90));
+        }
+
+        let mut pool = MemoryMempool::new();
+        let mut expected = BTreeSet::new();
+        let mut state = 0x4d59_5df4_d0f3_3173u64;
+        for operation in 0..OPERATIONS {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let index = usize::try_from(state % MEMBERS as u64).expect("candidate index");
+            let candidate = candidates[index].clone();
+            let txid = candidate.txid();
+            match (state >> 32) & 3 {
+                0 => {
+                    let admission = submit(&mut pool, candidate, &view);
+                    if expected.insert(txid) {
+                        assert!(matches!(admission, Admission::Accepted(id) if id == txid));
+                    } else {
+                        assert!(matches!(admission, Admission::Rejected { .. }));
+                    }
+                }
+                1 => {
+                    let was_present = expected.remove(&txid);
+                    assert_eq!(
+                        pool.remove_transaction(txid, false),
+                        usize::from(was_present)
+                    );
+                }
+                2 => {
+                    let was_present = expected.remove(&txid);
+                    let summary = pool
+                        .reconcile_connected_with_context(
+                            std::slice::from_ref(&candidate),
+                            &MempoolContext::testing(3, 3),
+                            &view,
+                            &AllowInputs,
+                            &AllowContext,
+                        )
+                        .expect("deterministic reconcile");
+                    assert_eq!(summary.changed, was_present);
+                }
+                _ if operation % 31 == 0 => {
+                    assert_eq!(pool.clear(), expected.len());
+                    expected.clear();
+                }
+                _ => {
+                    let snapshot = pool.snapshot();
+                    let clone = snapshot.clone();
+                    assert_snapshot_roots_identical(&snapshot, &clone);
+                }
+            }
+            assert_eq!(pool.snapshot().txids().collect::<BTreeSet<_>>(), expected);
+            assert_cached_info_exact(&pool);
+        }
+    }
+
+    #[test]
     fn contextual_verifier_receives_name_transactions_in_admission_order() {
         let first_input = outpoint(0xd1, 0);
         let second_input = outpoint(0xd2, 0);
@@ -3408,6 +5357,7 @@ mod tests {
             submit(&mut pool, retained, &view),
             Admission::Accepted(_)
         ));
+        assert_cached_info_exact(&pool);
         let previous_generation = pool.info().generation;
         let summary = pool
             .reconcile_connected_with_context(
@@ -3425,6 +5375,7 @@ mod tests {
         assert_eq!(summary.generation, previous_generation + 1);
         assert!(pool.transaction(&stale_txid).is_none());
         assert!(pool.transaction(&retained_txid).is_some());
+        assert_cached_info_exact(&pool);
 
         let stable = pool
             .reconcile_connected_with_context(
@@ -3437,6 +5388,7 @@ mod tests {
             .expect("stable revalidation");
         assert!(!stable.changed);
         assert_eq!(stable.generation, summary.generation);
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -3585,6 +5537,7 @@ mod tests {
             pool.snapshot().entry(&child_txid).expect("child").parents,
             vec![parent_txid]
         );
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4079,6 +6032,101 @@ mod tests {
         assert!(pool.transaction(&child_txid).is_none());
         assert!(pool.transaction(&trigger_txid).is_some());
         assert_eq!(pool.info().transaction_count, 1);
+        assert_cached_info_exact(&pool);
+    }
+
+    #[test]
+    fn under_capacity_admissions_probe_only_the_earliest_expiry_root() {
+        const ADMISSIONS: usize = 4_096;
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            maximum_transactions: ADMISSIONS + 1,
+            expiry_time: u64::MAX,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+
+        for sequence in 0..ADMISSIONS {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(
+                &u64::try_from(sequence)
+                    .expect("test sequence fits u64")
+                    .to_be_bytes(),
+            );
+            let input = Outpoint {
+                txid: Txid::new(raw),
+                index: 0,
+            };
+            assert!(matches!(
+                submit_at(
+                    &mut pool,
+                    transaction(input.clone(), 999),
+                    &FixedView::with_coin(input, 1_000),
+                    100,
+                ),
+                Admission::Accepted(_)
+            ));
+        }
+
+        assert_eq!(pool.info().transaction_count, ADMISSIONS);
+        assert_eq!(pool.expiry_roots.len(), ADMISSIONS);
+        assert_eq!(
+            pool.expiry_root_checks, ADMISSIONS,
+            "the common under-capacity path must not scan all dependency roots"
+        );
+        assert_cached_info_exact(&pool);
+    }
+
+    #[test]
+    fn child_becoming_a_root_keeps_its_original_expiry_age() {
+        let mut pool = MemoryMempool::with_limits(MempoolLimits {
+            expiry_time: 10,
+            ..MempoolLimits::default()
+        })
+        .expect("limits");
+        let parent_input = outpoint(0xd1, 0);
+        let parent = transaction(parent_input.clone(), 999);
+        let parent_txid = parent.txid();
+        assert!(matches!(
+            submit_at(
+                &mut pool,
+                parent.clone(),
+                &FixedView::with_coin(parent_input, 1_000),
+                1,
+            ),
+            Admission::Accepted(_)
+        ));
+        let child = transaction(
+            Outpoint {
+                txid: parent_txid,
+                index: 0,
+            },
+            998,
+        );
+        let child_txid = child.txid();
+        assert!(matches!(
+            submit_at(&mut pool, child, &FixedView::default(), 2),
+            Admission::Accepted(_)
+        ));
+
+        assert_eq!(pool.remove_confirmed(&[parent]), 1);
+        assert_eq!(pool.next_expiry_root, Some((2, child_txid)));
+        assert_cached_info_exact(&pool);
+
+        let trigger_input = outpoint(0xd2, 0);
+        let trigger = transaction(trigger_input.clone(), 999);
+        let trigger_txid = trigger.txid();
+        assert!(matches!(
+            submit_at(
+                &mut pool,
+                trigger,
+                &FixedView::with_coin(trigger_input, 1_000),
+                12,
+            ),
+            Admission::Accepted(_)
+        ));
+        assert!(pool.transaction(&child_txid).is_none());
+        assert!(pool.transaction(&trigger_txid).is_some());
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4112,6 +6160,7 @@ mod tests {
         assert_eq!(revalidation.removed, 1);
         assert_eq!(revalidation.retained_transactions, 0);
         assert_eq!(pool.info().transaction_count, 0);
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4170,6 +6219,7 @@ mod tests {
         assert!(pool.transaction(&standalone_txid).is_none());
         assert!(pool.transaction(&candidate_txid).is_none());
         assert_eq!(pool.info().transaction_count, 2);
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4205,6 +6255,7 @@ mod tests {
         ));
         assert_eq!(pool.info().transaction_count, 1);
         assert!(pool.transaction(&high_fee_txid).is_some());
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4233,6 +6284,7 @@ mod tests {
         assert_eq!(pool.info().transaction_count, 1);
         assert!(pool.transaction(&newest).is_some());
         assert_eq!(pool.entries()[0].admitted_at, 3);
+        assert_cached_info_exact(&pool);
     }
 
     #[test]
@@ -4304,9 +6356,11 @@ mod tests {
             submit(&mut pool, grandchild, &view),
             Admission::Accepted(_)
         ));
+        assert_cached_info_exact(&pool);
         let generation_before = pool.info().generation;
 
         assert_eq!(pool.remove_confirmed(&[parent]), 1);
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().generation, generation_before + 1);
         assert!(pool.transaction(&parent_txid).is_none());
         assert!(pool.transaction(&child_txid).is_some());
@@ -4359,8 +6413,10 @@ mod tests {
             submit(&mut pool, transaction(missing, 1), &FixedView::default()),
             Admission::Orphan(_)
         ));
+        assert_cached_info_exact(&pool);
         let generation_before = pool.info().generation;
         assert_eq!(pool.clear(), 2);
+        assert_cached_info_exact(&pool);
         assert_eq!(pool.info().generation, generation_before + 1);
         assert_eq!(pool.clear(), 0);
         assert_eq!(pool.info().generation, generation_before + 1);

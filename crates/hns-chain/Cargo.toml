@@ -5,6 +5,10 @@ edition.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+test-fixtures = []
+
 [dependencies]
 hns-primitives = { path = "../hns-primitives" }
 hns-store = { path = "../hns-store", default-features = false }

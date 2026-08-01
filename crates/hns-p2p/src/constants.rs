@@ -8,7 +8,7 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 pub const SERVICE_NETWORK: u64 = 1 << 0;
 pub const SERVICE_BLOOM: u64 = 1 << 1;
-pub const DEFAULT_USER_AGENT: &str = "/hsrd:0.1.0/";
+pub const DEFAULT_USER_AGENT: &str = concat!("/hsrd:", env!("CARGO_PKG_VERSION"), "/");
 
 pub const FRAME_HEADER_SIZE: usize = 9;
 pub const MAX_FRAME_PAYLOAD_SIZE: usize = 8_000_000;
@@ -29,3 +29,18 @@ pub const MAX_USER_AGENT_SIZE: usize = u8::MAX as usize;
 pub const MAX_REJECT_REASON_SIZE: usize = u8::MAX as usize;
 pub const NET_ADDRESS_SIZE: usize = 88;
 pub const BAN_SCORE: i32 = 100;
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_USER_AGENT;
+
+    #[test]
+    fn default_user_agent_tracks_package_version() {
+        assert_eq!(
+            DEFAULT_USER_AGENT
+                .strip_prefix("/hsrd:")
+                .and_then(|value| value.strip_suffix('/')),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+}

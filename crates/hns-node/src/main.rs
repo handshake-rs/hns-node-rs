@@ -17,15 +17,21 @@ use clap::{Parser, ValueEnum};
 use hns_consensus::Network;
 use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
-    init_logging, validate_node_config, AuthorityMode, MiningEngineConfig,
-    NameTreeCompactionConfig, NativeSyncConfig, NodeConfig, NodeService, RpcAuthorizationHeader,
-    ShutdownSignal, StorageMode, UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
+    init_logging, recommended_template_build_limits, validate_node_config, AuthorityMode,
+    MiningEngineConfig, NameTreeCompactionConfig, NativeSyncConfig, NodeConfig, NodeService,
+    RpcAuthorizationHeader, RpcLimits, ShutdownSignal, StorageMode, UndoRetentionConfig,
+    DEFAULT_NAME_TREE_COMPACTION_INTERVAL, DEFAULT_RPC_MAX_COLLECTION_ENTRIES,
+    DEFAULT_RPC_MAX_CONCURRENT_REQUESTS, DEFAULT_RPC_MAX_REQUEST_BYTES,
     MAX_RPC_AUTHORIZATION_BYTES,
 };
 use hns_store::DurabilityPolicy;
 
 #[derive(Debug, Parser)]
-#[command(name = "hsrd", about = "Lean Handshake consensus and mining full node")]
+#[command(
+    name = "hsrd",
+    version,
+    about = "Lean Handshake consensus and mining full node"
+)]
 struct Cli {
     #[arg(long, value_enum, default_value_t = NetworkArg::Mainnet)]
     network: NetworkArg,
@@ -39,6 +45,22 @@ struct Cli {
     /// Read the exact required HTTP Authorization value from a mode-0600 file.
     #[arg(long)]
     rpc_authorization_header_file: Option<PathBuf>,
+
+    /// Maximum accepted HTTP request body size for every RPC route.
+    #[arg(long, default_value_t = DEFAULT_RPC_MAX_REQUEST_BYTES)]
+    rpc_max_request_bytes: usize,
+
+    /// Maximum number of RPC requests executing at once; excess work gets HTTP 429.
+    #[arg(long, default_value_t = DEFAULT_RPC_MAX_CONCURRENT_REQUESTS)]
+    rpc_max_concurrent_requests: usize,
+
+    /// Maximum wall-clock execution time for one RPC request.
+    #[arg(long, default_value_t = 5_000)]
+    rpc_execution_timeout_ms: u64,
+
+    /// Maximum entries returned by a single collection RPC.
+    #[arg(long, default_value_t = DEFAULT_RPC_MAX_COLLECTION_ENTRIES)]
+    rpc_max_collection_entries: usize,
 
     #[arg(long, env = "HSRD_LOG", default_value = "info")]
     log_filter: String,
@@ -80,15 +102,11 @@ struct Cli {
     prune_undo_history: bool,
 
     /// Enable native P2P, headers, block-body, and active-state synchronization.
-    #[arg(long = "native-sync", alias = "shadow-sync")]
+    #[arg(long = "native-sync")]
     native_sync: bool,
 
     /// Validate and persist only headers; do not download or connect bodies.
-    #[arg(
-        long = "native-sync-headers-only",
-        alias = "shadow-sync-headers-only",
-        requires = "native_sync"
-    )]
+    #[arg(long = "native-sync-headers-only", requires = "native_sync")]
     native_sync_headers_only: bool,
 
     /// Download bodies without connecting them to active state.
@@ -125,11 +143,15 @@ struct Cli {
     #[arg(long, default_value_t = 8)]
     maximum_outbound: usize,
 
-    #[arg(long, default_value_t = 4)]
-    validation_workers: usize,
+    /// Concurrent stateless block-validation workers. When omitted, use all
+    /// visible CPUs within the native runtime's hard maximum of 128.
+    #[arg(long)]
+    validation_workers: Option<usize>,
 
-    #[arg(long, default_value_t = 128)]
-    validation_queue: usize,
+    /// Admitted validation jobs. When omitted, derive 32 slots per default
+    /// worker, with a 128-slot floor and a hard maximum of 8192.
+    #[arg(long)]
+    validation_queue: Option<usize>,
 
     #[arg(long, default_value_t = 1_024)]
     orphan_blocks: usize,
@@ -173,6 +195,16 @@ struct Cli {
     #[arg(long, default_value_t = 16)]
     template_variants: usize,
 
+    /// Concurrent template assemblies. Defaults from online CPU and memory
+    /// capacity; hard-capped at 16 and never above --template-variants.
+    #[arg(long)]
+    template_build_workers: Option<usize>,
+
+    /// Active plus waiting template assemblies. Must cover all workers, is
+    /// hard-capped at 64, and must fit the 2 GiB snapshot-memory envelope.
+    #[arg(long)]
+    template_build_queue_capacity: Option<usize>,
+
     #[arg(long, default_value_t = 64)]
     pending_publications: usize,
 
@@ -203,11 +235,29 @@ impl Cli {
             .as_deref()
             .map(read_rpc_authorization)
             .transpose()?;
+        let native_sync_defaults = NativeSyncConfig::default();
+        let mempool_limits = MempoolLimits {
+            maximum_transactions: self.mempool_max_transactions,
+            maximum_bytes: self.mempool_max_bytes,
+            maximum_orphans: self.mempool_max_orphans,
+            maximum_orphan_bytes: self.mempool_max_orphan_bytes,
+            maximum_ancestors: self.mempool_max_ancestors,
+            maximum_descendants: self.mempool_max_descendants,
+            expiry_time: self.mempool_expiry_time,
+        };
+        let (recommended_template_workers, recommended_template_queue) =
+            recommended_template_build_limits(&mempool_limits, self.template_variants);
         Ok(NodeConfig {
             network: self.network.into(),
             data_dir: self.data_dir,
             rpc_bind: self.rpc_bind,
             rpc_authorization,
+            rpc_limits: RpcLimits {
+                maximum_request_bytes: self.rpc_max_request_bytes,
+                maximum_concurrent_requests: self.rpc_max_concurrent_requests,
+                execution_timeout: Duration::from_millis(self.rpc_execution_timeout_ms),
+                maximum_collection_entries: self.rpc_max_collection_entries,
+            },
             log_filter: self.log_filter,
             authority_mode: self.authority_mode,
             mainnet_canary: self.mainnet_canary,
@@ -222,7 +272,7 @@ impl Cli {
                 prune_history: self.prune_undo_history
                     || self.storage_mode.prunes_payload_history(),
             },
-            shadow_sync: NativeSyncConfig {
+            native_sync: NativeSyncConfig {
                 enabled: self.native_sync,
                 headers_only: self.native_sync_headers_only,
                 connect_active_state: self.native_sync
@@ -236,8 +286,12 @@ impl Cli {
                 maximum_known_addresses: self.maximum_known_addresses,
                 maximum_inbound: self.maximum_inbound,
                 maximum_outbound: self.maximum_outbound,
-                validation_workers: self.validation_workers,
-                validation_queue: self.validation_queue,
+                validation_workers: self
+                    .validation_workers
+                    .unwrap_or(native_sync_defaults.validation_workers),
+                validation_queue: self
+                    .validation_queue
+                    .unwrap_or(native_sync_defaults.validation_queue),
                 orphan_blocks: self.orphan_blocks,
                 orphan_bytes: self.orphan_bytes,
                 poll_interval: Duration::from_millis(self.native_sync_poll_ms),
@@ -245,16 +299,14 @@ impl Cli {
             mining_engine: MiningEngineConfig {
                 enabled: self.mining_engine,
                 transaction_relay: self.transaction_relay,
-                mempool_limits: MempoolLimits {
-                    maximum_transactions: self.mempool_max_transactions,
-                    maximum_bytes: self.mempool_max_bytes,
-                    maximum_orphans: self.mempool_max_orphans,
-                    maximum_orphan_bytes: self.mempool_max_orphan_bytes,
-                    maximum_ancestors: self.mempool_max_ancestors,
-                    maximum_descendants: self.mempool_max_descendants,
-                    expiry_time: self.mempool_expiry_time,
-                },
+                mempool_limits,
                 maximum_template_variants: self.template_variants,
+                template_build_workers: self
+                    .template_build_workers
+                    .unwrap_or(recommended_template_workers),
+                template_build_queue_capacity: self
+                    .template_build_queue_capacity
+                    .unwrap_or(recommended_template_queue),
                 maximum_pending_publications: self.pending_publications,
                 publication_retry_interval: Duration::from_millis(self.publication_retry_ms),
             },
@@ -370,14 +422,24 @@ async fn main() -> anyhow::Result<()> {
             mainnet_canary = config.mainnet_canary,
             storage_durability = %config.storage_durability,
             transaction_index = config.transaction_index,
+            rpc_max_request_bytes = config.rpc_limits.maximum_request_bytes,
+            rpc_max_concurrent_requests = config.rpc_limits.maximum_concurrent_requests,
+            rpc_execution_timeout_ms = config.rpc_limits.execution_timeout.as_millis(),
+            rpc_max_collection_entries = config.rpc_limits.maximum_collection_entries,
             compact_name_tree_on_startup = config.name_tree_compaction.compact_on_startup,
             name_tree_compaction_interval = config.name_tree_compaction.startup_interval,
             prune_undo_history = config.undo_retention.prune_history,
-            native_sync = config.shadow_sync.enabled,
-            native_sync_headers_only = config.shadow_sync.headers_only,
-            native_sync_active_state = config.shadow_sync.connect_active_state,
+            native_sync = config.native_sync.enabled,
+            native_sync_headers_only = config.native_sync.headers_only,
+            native_sync_active_state = config.native_sync.connect_active_state,
+            validation_workers = config.native_sync.validation_workers,
+            validation_queue = config.native_sync.validation_queue,
             mining_engine = config.mining_engine.enabled,
             transaction_relay = config.mining_engine.transaction_relay,
+            mempool_max_bytes = config.mining_engine.mempool_limits.maximum_bytes,
+            template_variants = config.mining_engine.maximum_template_variants,
+            template_build_workers = config.mining_engine.template_build_workers,
+            template_build_queue_capacity = config.mining_engine.template_build_queue_capacity,
             "configuration parsed successfully"
         );
         return Ok(());
@@ -390,6 +452,15 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_advertises_the_cargo_package_version() {
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn storage_mode_defaults_to_pruned_and_archive_is_explicit() {
@@ -429,5 +500,182 @@ mod tests {
             .expect("local peer");
         assert!(local.key.is_none());
         assert!("01aa@127.0.0.1:44806".parse::<P2pConnectArg>().is_err());
+    }
+
+    #[test]
+    fn rpc_resource_limits_parse_and_validate_fail_closed() {
+        let config = Cli::try_parse_from([
+            "hsrd",
+            "--rpc-max-request-bytes",
+            "8192",
+            "--rpc-max-concurrent-requests",
+            "7",
+            "--rpc-execution-timeout-ms",
+            "2500",
+            "--rpc-max-collection-entries",
+            "1234",
+        ])
+        .expect("bounded RPC CLI")
+        .into_config()
+        .expect("bounded RPC config");
+        assert_eq!(config.rpc_limits.maximum_request_bytes, 8192);
+        assert_eq!(config.rpc_limits.maximum_concurrent_requests, 7);
+        assert_eq!(
+            config.rpc_limits.execution_timeout,
+            Duration::from_millis(2500)
+        );
+        assert_eq!(config.rpc_limits.maximum_collection_entries, 1234);
+        validate_node_config(&config).expect("bounded RPC config validates");
+
+        let unbounded = Cli::try_parse_from(["hsrd", "--rpc-max-request-bytes", "0"])
+            .expect("zero parses for fail-closed validation")
+            .into_config()
+            .expect("zero config");
+        assert!(validate_node_config(&unbounded).is_err());
+    }
+
+    #[test]
+    fn native_sync_flags_map_directly_to_native_configuration() {
+        let native = Cli::try_parse_from([
+            "hsrd",
+            "--native-sync",
+            "--native-sync-headers-only",
+            "--p2p-discovery",
+        ])
+        .expect("direct native sync CLI")
+        .into_config()
+        .expect("direct native sync config");
+        assert!(native.native_sync.enabled);
+        assert!(native.native_sync.headers_only);
+        assert!(!native.native_sync.connect_active_state);
+    }
+
+    #[test]
+    fn native_validation_limits_default_from_visible_parallelism() {
+        let expected = NativeSyncConfig::default();
+        let config = Cli::try_parse_from(["hsrd"])
+            .expect("default CLI")
+            .into_config()
+            .expect("default config");
+        assert_eq!(
+            config.native_sync.validation_workers,
+            expected.validation_workers
+        );
+        assert_eq!(
+            config.native_sync.validation_queue,
+            expected.validation_queue
+        );
+
+        let explicit = Cli::try_parse_from([
+            "hsrd",
+            "--native-sync",
+            "--p2p-discovery",
+            "--validation-workers",
+            "3",
+            "--validation-queue",
+            "257",
+        ])
+        .expect("explicit validation CLI")
+        .into_config()
+        .expect("explicit validation config");
+        assert_eq!(explicit.native_sync.validation_workers, 3);
+        assert_eq!(explicit.native_sync.validation_queue, 257);
+        validate_node_config(&explicit).expect("explicit validation config validates");
+    }
+
+    #[test]
+    fn template_build_limits_default_from_engine_configuration() {
+        let expected = MiningEngineConfig::default();
+        let config = Cli::try_parse_from(["hsrd"])
+            .expect("default CLI")
+            .into_config()
+            .expect("default config");
+
+        assert_eq!(
+            config.mining_engine.template_build_workers,
+            expected.template_build_workers
+        );
+        assert_eq!(
+            config.mining_engine.template_build_queue_capacity,
+            expected.template_build_queue_capacity
+        );
+
+        let one_variant = Cli::try_parse_from(["hsrd", "--template-variants", "1"])
+            .expect("single-variant CLI")
+            .into_config()
+            .expect("single-variant config");
+        let one_variant_expected = recommended_template_build_limits(
+            &one_variant.mining_engine.mempool_limits,
+            one_variant.mining_engine.maximum_template_variants,
+        );
+        assert_eq!(
+            (
+                one_variant.mining_engine.template_build_workers,
+                one_variant.mining_engine.template_build_queue_capacity,
+            ),
+            one_variant_expected
+        );
+        validate_node_config(&one_variant).expect("single-variant defaults validate");
+
+        let maximum_mempool_bytes = hns_mempool::MAX_MEMPOOL_BYTES.to_string();
+        let maximum_mempool = Cli::try_parse_from([
+            "hsrd".to_owned(),
+            "--mempool-max-bytes".to_owned(),
+            maximum_mempool_bytes,
+        ])
+        .expect("maximum-mempool CLI")
+        .into_config()
+        .expect("maximum-mempool config");
+        let maximum_mempool_expected = recommended_template_build_limits(
+            &maximum_mempool.mining_engine.mempool_limits,
+            maximum_mempool.mining_engine.maximum_template_variants,
+        );
+        assert_eq!(
+            (
+                maximum_mempool.mining_engine.template_build_workers,
+                maximum_mempool.mining_engine.template_build_queue_capacity,
+            ),
+            maximum_mempool_expected
+        );
+        validate_node_config(&maximum_mempool).expect("maximum-mempool defaults validate");
+    }
+
+    #[test]
+    fn template_build_limits_parse_and_validate_fail_closed() {
+        let config = Cli::try_parse_from([
+            "hsrd",
+            "--template-variants",
+            "4",
+            "--template-build-workers",
+            "2",
+            "--template-build-queue-capacity",
+            "3",
+        ])
+        .expect("bounded template CLI")
+        .into_config()
+        .expect("bounded template config");
+        assert_eq!(config.mining_engine.maximum_template_variants, 4);
+        assert_eq!(config.mining_engine.template_build_workers, 2);
+        assert_eq!(config.mining_engine.template_build_queue_capacity, 3);
+        validate_node_config(&config).expect("bounded template config validates");
+
+        let fewer_slots_than_workers = Cli::try_parse_from([
+            "hsrd",
+            "--template-build-workers",
+            "2",
+            "--template-build-queue-capacity",
+            "1",
+        ])
+        .expect("invalid bounds parse for fail-closed validation")
+        .into_config()
+        .expect("invalid bounds reach typed config validation");
+        assert!(validate_node_config(&fewer_slots_than_workers).is_err());
+
+        let above_hard_queue_limit =
+            Cli::try_parse_from(["hsrd", "--template-build-queue-capacity", "65"])
+                .expect("hard-limit violation parses for fail-closed validation")
+                .into_config()
+                .expect("hard-limit violation reaches typed config validation");
+        assert!(validate_node_config(&above_hard_queue_limit).is_err());
     }
 }

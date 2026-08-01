@@ -34,6 +34,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+hns-chain = { path = "../hns-chain", features = ["test-fixtures"] }
 hns-urkel = { path = "../hns-urkel" }
 
 [[bin]]

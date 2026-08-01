@@ -41,6 +41,14 @@ pub const MAX_ADDRESS_HASH_SIZE: usize = 40;
 pub const MIN_ADDRESS_HASH_SIZE: usize = 2;
 pub const MAX_NAME_SIZE: usize = 63;
 
+// Minimum canonical encodings used to reject impossible collection counts
+// before reserving attacker-controlled Vec capacity.
+const MIN_TRANSACTION_BYTES: usize = 4 + 1 + 1 + 4;
+// Each input has a 40-byte base record and at least a one-byte witness-count
+// varint later in the transaction encoding.
+const MIN_TRANSACTION_INPUT_BYTES: usize = 32 + 4 + 4 + 1;
+const MIN_TRANSACTION_OUTPUT_BYTES: usize = 8 + 1 + 1 + MIN_ADDRESS_HASH_SIZE + 1 + 1;
+
 pub type Amount = u64;
 pub type Height = u32;
 
@@ -460,6 +468,11 @@ impl Transaction {
     pub fn read_from(reader: &mut Reader<'_>) -> Result<Self, PrimitiveError> {
         let version = reader.read_u32()?;
         let input_count = reader.read_varint_usize("transaction inputs")?;
+        reader.ensure_count_fits_remaining(
+            input_count,
+            MIN_TRANSACTION_INPUT_BYTES,
+            "transaction inputs",
+        )?;
         let mut inputs = Vec::with_capacity(input_count);
 
         for _ in 0..input_count {
@@ -467,6 +480,11 @@ impl Transaction {
         }
 
         let output_count = reader.read_varint_usize("transaction outputs")?;
+        reader.ensure_count_fits_remaining(
+            output_count,
+            MIN_TRANSACTION_OUTPUT_BYTES,
+            "transaction outputs",
+        )?;
         let mut outputs = Vec::with_capacity(output_count);
 
         for _ in 0..output_count {
@@ -732,6 +750,11 @@ impl Block {
     pub fn read_from(reader: &mut Reader<'_>) -> Result<Self, PrimitiveError> {
         let header = Header::read_from(reader)?;
         let transaction_count = reader.read_varint_usize("block transactions")?;
+        reader.ensure_count_fits_remaining(
+            transaction_count,
+            MIN_TRANSACTION_BYTES,
+            "block transactions",
+        )?;
         let mut transactions = Vec::with_capacity(transaction_count);
 
         for _ in 0..transaction_count {
@@ -1522,6 +1545,24 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn ensure_count_fits_remaining(
+        &self,
+        count: usize,
+        minimum_item_bytes: usize,
+        context: &'static str,
+    ) -> Result<(), PrimitiveError> {
+        debug_assert_ne!(minimum_item_bytes, 0);
+        let maximum = self.remaining() / minimum_item_bytes;
+        if count > maximum {
+            return Err(PrimitiveError::LimitExceeded {
+                context,
+                limit: maximum,
+                actual: count,
+            });
+        }
+        Ok(())
+    }
+
     pub fn read_varbytes(
         &mut self,
         max_len: usize,
@@ -1914,6 +1955,76 @@ mod tests {
 
         assert_eq!(decoded, block);
         assert_eq!(decoded.encode(), raw);
+    }
+
+    #[test]
+    fn transaction_rejects_impossible_input_count_before_allocation() {
+        let mut writer = Writer::new();
+        writer.write_u32(1);
+        writer.write_u8(0xff);
+        writer.write_u64(u64::MAX);
+
+        let error = Transaction::decode(&writer.finish()).expect_err("input count must fail");
+        assert!(matches!(
+            error,
+            PrimitiveError::LimitExceeded {
+                context: "transaction inputs",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn transaction_rejects_impossible_output_count_before_allocation() {
+        let mut writer = Writer::new();
+        writer.write_u32(1);
+        writer.write_u8(0);
+        writer.write_u8(0xff);
+        writer.write_u64(u64::MAX);
+
+        let error = Transaction::decode(&writer.finish()).expect_err("output count must fail");
+        assert!(matches!(
+            error,
+            PrimitiveError::LimitExceeded {
+                context: "transaction outputs",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn block_rejects_impossible_transaction_count_before_allocation() {
+        let mut writer = Writer::new();
+        Header::default().write_to(&mut writer);
+        writer.write_u8(0xff);
+        writer.write_u64(u64::MAX);
+
+        let error = Block::decode(&writer.finish()).expect_err("transaction count must fail");
+        assert!(matches!(
+            error,
+            PrimitiveError::LimitExceeded {
+                context: "block transactions",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reader_count_guard_accepts_exact_bound_and_rejects_one_over() {
+        let payload = [0; MIN_TRANSACTION_BYTES * 2];
+        let reader = Reader::new(&payload, payload.len()).expect("reader");
+
+        reader
+            .ensure_count_fits_remaining(2, MIN_TRANSACTION_BYTES, "test items")
+            .expect("exact bound must be accepted");
+        assert!(matches!(
+            reader.ensure_count_fits_remaining(3, MIN_TRANSACTION_BYTES, "test items"),
+            Err(PrimitiveError::LimitExceeded {
+                context: "test items",
+                limit: 2,
+                actual: 3,
+            })
+        ));
     }
 
     #[test]
