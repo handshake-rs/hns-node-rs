@@ -9678,6 +9678,24 @@ impl NodeState {
                 )?,
             },
         };
+
+        // Header synchronization and canonical body download are intentionally
+        // allowed to advance out of order. A higher-work candidate can
+        // therefore be complete while an earlier connect-path body is still
+        // header-only. Defer activation until every connect record exists;
+        // retain fail-closed behavior when a body exists without its index.
+        for hash in &plan.connect {
+            if load_block_index_record(&snapshot, hash)?.is_none() {
+                if load_raw_block_record(&snapshot, hash)?.is_some() {
+                    anyhow::bail!(
+                        "stored block body {} is missing its block index",
+                        hash.to_hex()
+                    );
+                }
+                return Ok(None);
+            }
+        }
+
         validate_reorg_plan(&snapshot, active.as_ref(), candidate, &plan)?;
         if plan.connect.len() > limits.maximum_connect {
             anyhow::bail!(
