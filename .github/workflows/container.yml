@@ -17,6 +17,7 @@ on:
       - docker/**
       - docs/docker.md
       - fixtures/**
+      - fuzz/Cargo.lock
       - rust-toolchain.toml
       - vendor/**
   pull_request:
@@ -34,6 +35,7 @@ on:
       - docker/**
       - docs/docker.md
       - fixtures/**
+      - fuzz/Cargo.lock
       - rust-toolchain.toml
       - vendor/**
   release:
