@@ -24,6 +24,18 @@ use hns_store::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod swap;
+
+pub use swap::{
+    register_tracked_contract, tracked_contract, tracked_contract_events,
+    tracked_contract_funding, tracked_contract_fundings, validate_tracked_contract_registry,
+    ContractId, ContractRegistration, ContractRegistrationOutcome,
+    HnsHtlcDescriptor, RevealedPreimage, ShakedexV2Descriptor, TrackedContractCursor,
+    TrackedContractEvent, TrackedContractEventPage, TrackedContractFunding,
+    TrackedContractFundingPage, TrackedContractKind, TrackedContractSpendKind,
+    MAX_TRACKED_CONTRACTS, MAX_TRACKED_CONTRACTS_PER_ADDRESS,
+};
+
 /// Persistent profile key. Changing a non-empty chain's profile requires an
 /// explicit offline reindex.
 pub const INDEX_PROFILE_MODE_KEY: &[u8] = b"wallet-index-profile/v1";
@@ -367,6 +379,18 @@ pub enum IndexError {
     /// A position exceeds the persisted fixed-width schema.
     #[error("wallet index position exceeds u32")]
     PositionOverflow,
+    /// A public Shakedex/HTLC descriptor is malformed or unsupported.
+    #[error("wallet tracked-contract descriptor is invalid")]
+    InvalidContract,
+    /// One script address has reached its bounded descriptor candidate limit.
+    #[error("wallet tracked-contract address candidate set is full")]
+    ContractAddressCapacity,
+    /// The configured immutable contract registry has reached its hard bound.
+    #[error("wallet tracked-contract registry is full")]
+    ContractCapacity,
+    /// No immutable contract registration exists for the requested identity.
+    #[error("wallet tracked-contract registration is unknown")]
+    UnknownContract,
     /// Persisted data is malformed or inconsistent.
     #[error("wallet index corruption: {0}")]
     Corrupt(&'static str),
@@ -464,6 +488,7 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
             )?;
         }
     }
+    swap::stage_connect(snapshot, batch, block, height, profile)?;
     Ok(())
 }
 
@@ -471,7 +496,8 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
 ///
 /// `undo` must be the same checked block undo consumed by active-state
 /// disconnection and `batch` must be the same uncommitted atomic batch.
-pub fn stage_disconnect<B: WriteBatch>(
+pub fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
+    snapshot: &S,
     batch: &mut B,
     block: &Block,
     undo: &BlockUndo,
@@ -567,6 +593,7 @@ pub fn stage_disconnect<B: WriteBatch>(
             )?;
         }
     }
+    swap::stage_disconnect(snapshot, batch, block, undo, profile)?;
     Ok(())
 }
 
@@ -1067,14 +1094,17 @@ mod tests {
         assert!(spent_history.entries[0].direction.spent);
         drop(snapshot);
 
+        let snapshot = store.snapshot().unwrap();
         let mut disconnect = store.batch();
         stage_disconnect(
+            &snapshot,
             &mut disconnect,
             &block,
             &undo(&block, vec![previous_coin.clone()]),
             profile,
         )
         .unwrap();
+        drop(snapshot);
         store.commit(disconnect).unwrap();
         let snapshot = store.snapshot().unwrap();
         assert!(script_utxos(

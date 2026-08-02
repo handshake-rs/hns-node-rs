@@ -8,7 +8,10 @@ repository.workspace = true
 
 [dependencies]
 hns-primitives = { path = "../hns-primitives" }
+hns-secp256k1 = { path = "../hns-secp256k1" }
 hns-state = { path = "../hns-state", default-features = false }
 hns-store = { path = "../hns-store", default-features = false }
 serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
 thiserror.workspace = true

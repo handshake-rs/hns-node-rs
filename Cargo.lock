@@ -1008,9 +1008,12 @@ name = "hns-wallet-index"
 version = "0.3.3"
 dependencies = [
  "hns-primitives 0.3.3",
+ "hns-secp256k1",
  "hns-state",
  "hns-store",
  "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
 ]
 

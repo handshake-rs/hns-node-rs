@@ -268,6 +268,41 @@ clean marker or matching startup checkpoint cannot restore authority.
 
 Fixtures are evidence, not authority.
 
+## Wallet derivative-index invariants
+
+- Wallet and public-contract indexes are optional derivatives committed in the
+  canonical state batch; their profile matching must never add a consensus
+  condition. A consensus-accepted contract spend outside the pinned wallet
+  profile is stored as `Unrecognized`, removes the active funding, and is
+  disconnected exactly without retaining a guessed preimage.
+- Contract IDs hash an explicit versioned canonical binary encoding, not a
+  serializer representation. They are network-independent names for public
+  terms; database network/genesis binding remains the authority for recorded
+  events. An address has a sorted checksummed candidate set capped at 256 under
+  the global 16,384 registration cap; exact output terms select the descriptor,
+  so key reuse is not silently prohibited or treated as protocol authority.
+- Only public descriptors and already revealed, hashlock-validated on-chain
+  preimages enter the index. Preimage `Debug` output is redacted and raw access
+  requires an explicitly named settlement accessor. No unrevealed secret,
+  seed, password, or signing capability enters node storage.
+- Multi-script confirmed and mempool results use positions in the sorted
+  request. Confirmed cursors bind the script-set digest and durable chain epoch;
+  mempool cursors bind the immutable mempool generation. Wallet adapters retain
+  an explicit reverse map to derivation-order records and discard partial scans
+  when either generation changes.
+- Combined transaction evidence binds status, inclusion, payload availability,
+  chain epoch, tip, and mempool generation. Combined name evidence labels both
+  pending current state and interval-root-authenticated state and resolves
+  owners from the same snapshot. Authority-bearing reads verify the published
+  chain epoch before and after decoding and return retryable
+  `StaleCanonicalRead` for an in-flight writer or chain-changing overlap,
+  including for a terminal restoration page; a completed mempool-only
+  publication does not stale a durable-chain result.
+- Local Shakedex/HTLC script and branch duplication is not protocol authority.
+  Frozen vectors are temporary cross-boundary evidence; release qualification
+  requires a published canonical `hns-swap` commit plus a pinned, qualified
+  adapter.
+
 ## Failure policy
 
 - Unsupported consensus data fails closed.
@@ -311,5 +346,6 @@ Fixtures are evidence, not authority.
 - Template, mempool, intent, retry, and fan-out paths cannot issue or
   bypass a mining authority permit.
 - Local solved-block admission precedes every peer publication attempt.
-- No wallet, key-management, DNS, domain-action, or SQLite consensus surface is
-  linked into the node.
+- Optional wallet and public contract indexes remain derivative, non-consensus,
+  bounded, and noncustodial. No wallet key-management, seed, unrevealed
+  preimage, domain-action, or SQLite authority surface is linked into the node.

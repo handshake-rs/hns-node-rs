@@ -370,6 +370,23 @@ Tests must cover:
 - header-index memory publication only after durable commit;
 - failure before commit leaving every durable key unchanged;
 - true snapshot consistency during concurrent writes;
+- wallet index registration restart reads, checksum/key relocation failure,
+  bounded cursors, funding/spend disconnect restoration, and same-block
+  create/spend reversal;
+- same-address/different-term contract registrations, per-address candidate
+  caps, exact output selection, and startup topology/count validation;
+- contract-ID- and chain-epoch-bound funding/event continuations plus terminal-
+  page canonical-generation overlap rejection;
+- global sorted-script confirmed history/UTXO traversal, reverse index mapping,
+  script-set cursor binding, and stale-chain-epoch rejection;
+- frozen canonical-binary contract identities and Shakedex/HTLC script/address
+  vectors, supported fulfillment/recovery/redemption/refund branches, preimage
+  redaction, and malformed key/signature/witness rejection;
+- proof that a consensus-accepted but wallet-profile-unrecognized contract
+  spend is durably classified and never rejects optional-index block staging;
+- generation-stable combined transaction evidence, tree-root-bearing tips,
+  active-height hashes, and one-snapshot current/proof-state/owner name
+  evidence;
 - bounded aggregate RocksDB WAL retention across all column families;
 - WAL/sync restart points and fault-injected batch failure.
 

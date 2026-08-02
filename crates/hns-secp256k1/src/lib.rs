@@ -247,6 +247,11 @@ impl Secp256k1Verifier {
         Ok(Self)
     }
 
+    /// Parse and validate one compressed secp256k1 public key.
+    pub fn validate_public_key(&self, compressed: &[u8; 33]) -> Result<(), SecpError> {
+        with_context(|context| parse_public_key(context, compressed).map(|_| ()))
+    }
+
     /// Parse a 64-byte compact `(r,s)` signature and enforce HSD's low-S rule.
     pub fn validate_compact_signature(&self, compact: &[u8; 64]) -> Result<(), SecpError> {
         with_context(|context| {

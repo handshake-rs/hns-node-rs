@@ -85,16 +85,22 @@ before passing exact canonical bytes to `DenuoRelayHandle::put`. The node core:
 - does not automatically accept or execute swaps.
 
 The current `hns-node-rs` dependency pin still exposes the Denuo V1 registry
-without marketplace subprotocol assignments. Consequently the cache/role
-service and tests are implemented, while live marketplace wire advertisement
-must remain disabled until the repository pins the generated Denuo V2 registry
-from `hns-rs` (registry version 2, protocol/message assignments, and generated
-fingerprint) and adds its typed envelope adapter. No sibling-path dependency or
-unassigned production message ID is used as a workaround. Enabling a local
-role creates only the bounded service for an installed native adapter; it does
-not make this revision advertise a marketplace protocol on its own.
+without marketplace subprotocol assignments. The canonical Denuo V2 registry,
+generated fingerprint, and typed marketplace envelopes now exist in the local
+`hns-rs` 0.2 source, but that release is unpublished. Live marketplace wire
+advertisement must remain disabled until `hns-node-rs` can replace its immutable
+Git V1 pin with the published, revision-qualified 0.2 canonical dependency and
+the node adapter is qualified against that exact fingerprint. No sibling-path
+dependency or unassigned production message ID is used as a workaround.
+Enabling a local role creates only the bounded service for an installed native
+adapter; it does not make this revision advertise a marketplace protocol.
 
-This revision also does not implement Shakedex order interpretation, HTLC
-construction/monitoring, secret-preimage storage or extraction, swap wallet
-state, or automatic execution. `SwapStatus` is only an authenticated-adapter
-supplied bounded relay role, not a live swap engine.
+The node now has descriptor-bound, restart-durable confirmed Shakedex-v2 and
+HNS-HTLC-v1 funding/spend/preimage tracking plus bounded mempool reconciliation.
+That local tracking profile is derivative source implementation, not Denuo or
+swap protocol authority: its frozen vectors cannot replace a published,
+revision-pinned canonical `hns-swap` commit and qualified node adapter.
+It still does not construct or sign transactions, own swap workflow state,
+choose matches, store unrevealed preimages, or automatically execute a swap.
+`SwapStatus` remains an authenticated-adapter-supplied bounded relay role, not
+a chain-authoritative swap engine.

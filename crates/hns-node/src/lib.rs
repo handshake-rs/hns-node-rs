@@ -17,8 +17,11 @@ pub use hns_denuo_market_relay::{
 };
 pub use hns_p2p::LivePeerManager;
 pub use hns_wallet_index::{
-    ScriptHistoryCursor, ScriptHistoryDirection, ScriptHistoryEntry, ScriptHistoryPage, ScriptId,
-    ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage, SpendingTransaction, WalletIndexProfile,
+    ContractId, ContractRegistration, ContractRegistrationOutcome, HnsHtlcDescriptor,
+    RevealedPreimage, ScriptHistoryCursor, ScriptHistoryDirection, ScriptHistoryEntry,
+    ScriptHistoryPage, ScriptId, ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage,
+    ShakedexV2Descriptor, SpendingTransaction, TrackedContractEvent, TrackedContractFunding,
+    TrackedContractKind, TrackedContractSpendKind, WalletIndexProfile,
 };
 pub use mining_engine::{
     recommended_template_build_limits, MiningEngineConfig, MiningEngineDiagnostics,
@@ -27,8 +30,14 @@ pub use mining_engine::{
 };
 pub use native_sync::{NativeSyncConfig, NativeSyncDiagnostics};
 pub use wallet_backend::{
-    BroadcastResult, FeeEstimate, FeeEstimateSource, NameOwnerTransaction, NameProofResult,
-    TransactionInclusion, TransactionStatus, WalletBackend, WalletBackendError, WalletChainTip,
+    BroadcastResult, ConfirmedScriptHistory, ConfirmedScriptUtxo, ConfirmedScriptsCursor,
+    ConfirmedScriptsPage, FeeEstimate, FeeEstimateSource, MempoolContractActivity,
+    MempoolContractEvent, MempoolContractPage, MempoolScriptActivity, MempoolScriptOutput,
+    MempoolScriptPage, MempoolScriptSpend, NameEvidence, NameOwnerTransaction, NameProofResult,
+    TransactionEvidence, TransactionInclusion, TransactionPayload, TransactionStatus,
+    WalletBackend, WalletBackendError, WalletChainTip, WalletContractEventCursor,
+    WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
+    WalletMempoolCursor, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
 };
 
 use std::{
@@ -130,8 +139,10 @@ use hns_store::{
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, STORAGE_PROFILE,
 };
 use hns_wallet_index::{
-    decode_index_profile, encode_index_profile, stage_connect as stage_wallet_index_connect,
-    stage_disconnect as stage_wallet_index_disconnect, INDEX_PROFILE_MODE_KEY,
+    decode_index_profile, encode_index_profile, register_tracked_contract,
+    stage_connect as stage_wallet_index_connect,
+    stage_disconnect as stage_wallet_index_disconnect, validate_tracked_contract_registry,
+    INDEX_PROFILE_MODE_KEY,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -2548,6 +2559,37 @@ impl NodeReadHandle {
             && &current.canonical_epoch == expected
     }
 
+    /// Verify that the published durable chain generation remained unchanged.
+    /// Completed mempool-only writer generations are allowed; an in-flight
+    /// writer or any chain epoch/tip change fails the check.
+    pub(crate) fn canonical_chain_generation_is_stable(
+        &self,
+        expected: &CanonicalChainEpoch,
+    ) -> bool {
+        if self.ensure_storage_operational().is_err() {
+            return false;
+        }
+        let before = self.state.publication_sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            return false;
+        }
+        let published = self.state.published_unchecked();
+        if !published.storage_operational || &published.canonical_epoch.chain() != expected {
+            return false;
+        }
+        let after = self.state.publication_sequence.load(Ordering::Acquire);
+        if before != after || after & 1 != 0 || self.ensure_storage_operational().is_err() {
+            return false;
+        }
+        let current = self.state.published_unchecked();
+        let final_sequence = self.state.publication_sequence.load(Ordering::Acquire);
+        before == final_sequence
+            && final_sequence & 1 == 0
+            && Arc::ptr_eq(&published, &current)
+            && current.storage_operational
+            && &current.canonical_epoch.chain() == expected
+    }
+
     pub(crate) async fn rpc_request_mempool(
         &self,
         request: &JsonRpcRequest,
@@ -3801,6 +3843,25 @@ impl NodeService {
         } else {
             self.mining_events.snapshot()
         }
+    }
+
+    pub(crate) fn register_wallet_contract(
+        &mut self,
+        registration: ContractRegistration,
+    ) -> Result<ContractRegistrationOutcome> {
+        self.state.ensure_storage_operational()?;
+        let snapshot = self.state.store.snapshot()?;
+        let mut batch = self.state.store.batch();
+        let outcome = register_tracked_contract(
+            &snapshot,
+            &mut batch,
+            self.state.wallet_index_profile,
+            &registration,
+        )
+        .map_err(anyhow::Error::new)?;
+        drop(snapshot);
+        self.state.store.commit(batch)?;
+        Ok(outcome)
     }
 
     pub fn observed_mining_snapshot(&self) -> Result<Option<Arc<MiningSnapshot>>> {
@@ -9455,6 +9516,9 @@ impl NodeState {
                 "wallet index keys exist without a persistent profile; run offline verification/reindex before startup"
             );
         }
+        validate_tracked_contract_registry(&snapshot, profile)
+            .map_err(anyhow::Error::new)
+            .context("failed to validate tracked wallet contracts")?;
         drop(snapshot);
         if persisted != Some(profile) {
             let mut batch = self.store.batch();
@@ -11032,7 +11096,7 @@ impl NodeState {
                 .map_err(anyhow::Error::new)
                 .context("failed to stage tx-index deletion")?;
         }
-        stage_wallet_index_disconnect(batch, &block, &undo, self.wallet_index_profile)
+        stage_wallet_index_disconnect(snapshot, batch, &block, &undo, self.wallet_index_profile)
             .map_err(anyhow::Error::new)
             .context("failed to stage wallet-index disconnect")?;
         write_block_index_to_batch(batch, &record)

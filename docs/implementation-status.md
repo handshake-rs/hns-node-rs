@@ -119,15 +119,29 @@ Implemented:
   `--wallet-index` active-chain profiles, staged atomically with UTXO/name
   state and exactly reversed on disconnect/reorganization. The typed
   noncustodial backend, bounded fee estimator, current name proof/owner lookup,
-  and contextual transaction admission/P2P fanout are implemented and tested;
-  all remain disabled by default. These are confirmed-chain indexes: wallet
-  mempool restoration/subscriptions and Shakedex/HTLC/preimage tracking remain
-  explicit gaps.
+  contextual transaction admission/P2P fanout, one-pass bounded multi-script
+  mempool reconciliation, chain-epoch-bound global confirmed history/UTXO
+  restoration, active-height hash reads, atomically bundled transaction/name
+  evidence, and generation-bound pagination are implemented in source; all
+  remain disabled by default. Immutable public Shakedex-v2 and
+  HNS-HTLC-v1 registrations drive restart-durable funding, fulfillment,
+  recovery, redemption, refund, and revealed-preimage events in the canonical
+  block/reorg batch. Consensus-valid spends outside the pinned wallet profile
+  are recorded as `Unrecognized` rather than rejected. Contract IDs use an
+  explicit versioned canonical binary encoding, while bounded one-to-many
+  address candidates preserve valid key reuse and match exact output terms.
+  Contract pages bind their contract and chain epoch. The new tranche is awaiting
+  the repository's full gate, a published and pinned canonical `hns-swap`
+  commit, and cross-repository adapter qualification; local script duplication
+  and frozen vectors are not protocol authority and no release-readiness claim
+  is made by this source status update.
 - A bounded hash-first Denuo marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live
-  marketplace wire advertisement remains disabled until the generated Denuo V2
-  registry crate is pinned by revision; no live swap engine is claimed.
+  marketplace wire advertisement remains disabled until the currently
+  unpublished canonical `hns-rs` 0.2 Denuo V2 registry/envelope release is
+  pinned by revision and its adapter is qualified; no live swap engine is
+  claimed.
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
   block/header undo status and advances a checksummed checkpoint; startup

@@ -121,6 +121,27 @@ sequence-consistent `rocksdb::Snapshot`, so related reads cannot cross a commit
 boundary. Compaction and pruning remain bounded background work without access
 to the mining lane's reserved storage budget.
 
+## Noncustodial wallet boundary
+
+The optional wallet profile adds only derivative public indexes. The typed
+backend exposes active-height hashes and tree-root-bearing tips, combines
+transaction status/inclusion/payload with one chain/mempool generation, and
+bundles current versus interval-root-authenticated name state, proof, and owner
+evidence in one snapshot. Confirmed history/UTXO restoration uses a global
+script-set- and chain-epoch-bound cursor so a reorganization cannot tear a
+multi-page scan. Multi-script result positions refer to the sorted request, so
+the wallet adapter owns the reverse map to derivation order.
+
+Public Shakedex/HTLC registrations and confirmed events share the canonical
+block/reorg batch, but never participate in consensus validity. An accepted
+spend outside the pinned wallet profile becomes `Unrecognized`; it cannot make
+the optional index reject a block. Bounded address candidate sets preserve
+descriptors that share a script while matching their exact output terms; key
+uniqueness is not a protocol assumption. Local profile duplication and frozen vectors
+are not protocol authority. Release qualification requires a published and
+pinned canonical `hns-swap` commit and qualified adapter. Wallet secrets,
+signing, workflow decisions, and unrevealed preimages remain outside the node.
+
 ## Compatibility boundary
 
 `hns-consensus` is deterministic, synchronous, and independent of networking,
@@ -129,7 +150,10 @@ Urkel/liburkel are comparison oracles, not runtime architectural dependencies.
 Ordinary VERSION/VERACK precedes the connection-local Denuo Experimental V1
 registry exchange; typed HIP-76 `f0`/`f1` traffic is admitted only after that
 agreement and under separate requester/provider role policy. These extensions
-do not enter consensus or authority.
+do not enter consensus or authority. Marketplace roles remain locally bounded
+and wire-disabled until the currently unpublished canonical `hns-rs` 0.2 Denuo
+V2 registry/envelope release is revision-pinned and qualified; a sibling path
+is not an acceptable dependency substitute.
 
 The authority and production-hardening boundary is governed by
 [`mining-node-scope.md`](mining-node-scope.md).

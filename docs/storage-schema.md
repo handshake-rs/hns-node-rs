@@ -314,11 +314,25 @@ cannot promote a block or grant authority.
   first indexed block. Enabling it after unindexed history exists fails closed
   until an offline rebuild or a new data directory is used.
   Versioned `wallet-index/v1/` subspaces in the same column family optionally
-  store script history, outpoint spenders, and script UTXOs. Their keys cannot
-  collide with the fixed 32-byte transaction keys. History and spender values
-  checksum their exact key; UTXO reads reconstruct the script/outpoint key and
-  verify the decoded address identity, so relocated values fail closed. The
-  checksummed `wallet-index-profile/v1` snapshot record prevents partially
+  store script history, outpoint spenders, script UTXOs, immutable public
+  Shakedex/HTLC registrations and address bindings, active contract fundings,
+  and confirmed contract events. Their keys cannot collide with fixed 32-byte
+  transaction keys. Every derivative value is checksummed against its exact
+  key; UTXO reads reconstruct the script/outpoint key and contract reads verify
+  descriptor/content/address topology, so relocated values fail closed. The
+  public contract ID uses a domain-separated, versioned canonical binary
+  encoding with a fixed kind tag and big-endian integer fields; JSON/serde is
+  used only as a checksummed record payload and never defines durable identity.
+  IDs intentionally omit network identity, while every stored funding/event is
+  constrained by this database's independently validated network/genesis
+  binding. Each address key contains a sorted checksummed list of at most 256
+  descriptor IDs because script addresses do not commit every tracked funding
+  term; the global registry remains capped at 16,384 and output matching checks
+  complete descriptor terms. Consensus-valid spends outside the pinned wallet
+  branch profile are durably classified `Unrecognized` and reversed normally,
+  so this optional
+  derivative index cannot reject an active-chain transition. The checksummed
+  `wallet-index-profile/v1` snapshot record prevents partially
   indexed history
   from being enabled after startup; see
   [Handshake wallet indexes](HNS_NODE_WALLET_INDEX.md).

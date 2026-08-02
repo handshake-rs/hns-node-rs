@@ -134,6 +134,39 @@ Further hardening:
 - production-scale pruning and RocksDB crash/fault qualification;
 - sustained live mainnet reorganization/root campaigns.
 
+## Noncustodial wallet and contract indexes — implementation qualification pending
+
+Implemented in source:
+
+- optional transaction, script-history, spender, and restoration UTXO indexes;
+- chain-epoch- and script-set-bound global confirmed restoration pages across
+  history and UTXOs, rejecting continuations after a reorganization;
+- bounded one-pass reconciliation of up to 10,000 sorted-unique wallet scripts
+  against generation-bound immutable mempool pages, with result indexes
+  explicitly defined against sorted request order for adapter reverse mapping;
+- active-height block hash reads, tree-root-bearing tips, combined
+  generation-stable transaction evidence, and tip/root-bound current-versus-
+  authenticated name evidence;
+- immutable public Shakedex-v2 and HNS-HTLC-v1 registrations with pinned
+  secp256k1 key parsing, canonical scripts, exact signature-hash profiles, and
+  an explicit versioned canonical-binary descriptor identity plus bounded
+  one-to-many address candidate sets for terms not committed by the script;
+- checksummed, key-bound active funding and confirmed fulfillment, recovery,
+  redemption, refund, and revealed-preimage events committed and disconnected
+  in the canonical chain batch, with consensus-valid out-of-profile spends
+  preserved as `Unrecognized` rather than rejected;
+- bounded startup topology validation, query pagination, typed
+  disabled/corrupt/pruned failures, and explicit preimage redaction.
+
+This tranche is not release-qualified until the full repository gate, a
+published and pinned canonical `hns-swap` commit, and cross-repository wallet
+adapter/restart/reorg qualification pass on its final commit. Local script
+duplication and frozen vectors are temporary cross-boundary checks, not
+protocol authority. It stores no wallet key or unrevealed preimage and remains
+disabled by default. Live marketplace wire advertisement separately awaits the
+published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
+adapter gate.
+
 ## Live P2P and synchronization — native path implemented and qualified
 
 Implemented:
