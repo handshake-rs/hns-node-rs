@@ -12,7 +12,10 @@ latency.
 The `hsrd` process is deliberately not a wallet, desktop application, domain
 manager, DNS server, explorer, or general `hsd` compatibility distribution.
 The separately deployed [native resolver companion](hns-resolverd.md) consumes
-one narrow atomic state read without expanding `hsrd`'s authority. MeshMine
+one narrow atomic state read without expanding `hsrd`'s authority. It now signs
+the Handshake root with the canonical HSD KSK/ZSK, validates recursive DNSSEC,
+and imports eligible absent ICANN TLD referrals through an independently
+validated IANA trust domain. MeshMine
 uses native in-process Rust interfaces for mining; the bounded HTTP control
 surface exists for diagnostics, operations, and differential testing.
 

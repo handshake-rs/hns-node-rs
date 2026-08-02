@@ -19,6 +19,14 @@ The initial native implementation provides:
 - atomic Handshake resource reads from one immutable `hsrd` state snapshot;
 - HSD-compatible DS, NS, GLUE4, GLUE6, SYNTH4, SYNTH6, and binary TXT
   projection;
+- Handshake root DNSKEY publication, P-256 KSK/ZSK signing, signed NSEC
+  denial, and recursive validation from the fixed Handshake KSK;
+- DNSSEC-validated dynamic fallback for eligible ICANN root names only when no
+  Handshake resource exists, using a separate IANA trust-anchor set and direct
+  iterative resolution seeded only by the configured ICANN root hints;
+- Handshake-wins precedence for registered eligible ICANN names, plus HSD's
+  decentralized-name collision blacklist, so fallback cannot override chain
+  state or claim names assigned to other decentralized systems;
 - iterative recursion through delegated authoritative name servers;
 - bounded record and name-server caches, recursion depth, DNS concurrency,
   `hsrd` concurrency, RPC time, and TCP request time;
@@ -35,16 +43,14 @@ The initial native implementation provides:
 The following are not complete yet and must not be inferred from the presence
 of a DNS listener:
 
-- Handshake root DNSSEC signing and recursive DNSSEC validation;
-- HSD's DNSSEC-validated dynamic fallback for unclaimed ICANN TLDs;
 - DNS over HTTPS, DNS over TLS, or DNS over QUIC;
 - a public-recursive-resolver deployment profile.
 
-Until root signing and validation land, this is suitable for integration and
-ordinary HNS lookup, but it is not a security-equivalent replacement for a
-validating `hnsd` deployment. It should not yet be used as the DNSSEC trust
-decision for DANE or certificate pinning. It is also HNS-only at this stage, so
-do not replace a machine's general ICANN resolver with it.
+The raw listener remains a private sidecar/local-resolver interface. Do not
+publish it as an open resolver. DNSSEC validation and dual-root fallback are
+enabled by default, but release qualification still requires live HSD/hnsd
+differential fixtures before treating this implementation as an independently
+audited DANE or certificate-pinning authority.
 
 ## Build and run
 
@@ -91,7 +97,19 @@ dig @127.0.0.1 -p 5350 example. TXT
 
 Run `hns-resolverd --help` for cache and concurrency controls.
 `--hsrd-chain-state-poll-ms` controls the synchronization detection and cache
-generation interval; it does not change Handshake consensus behavior.
+generation interval; it does not change Handshake consensus behavior. ICANN
+fallback uses the 13 compiled InterNIC root-hint IPv4 addresses, Hickory's IANA
+KSK-2017/KSK-2024 anchors, a three-second timeout, 16 permits, and a 4,096-entry
+cache by default. `--icann-root-server` replaces the root-hint list when
+repeated; `--disable-icann-fallback` produces an HNS-only resolver.
+
+The compiled addresses come from InterNIC's
+[`named.root`](https://www.internic.net/domain/named.root), and the validation
+keys come from IANA's [DNSSEC trust-anchor publication](https://www.iana.org/dnssec/files).
+Release qualification must recheck both sources. Hickory 0.25.2 includes the
+active KSK-2017 and pre-published KSK-2024; IANA currently schedules the active
+rollover for October 11, 2026, so anchor rollover remains an explicit operator
+and dependency-update obligation rather than an assumption.
 
 ## Pinner sidecar
 
@@ -121,12 +139,12 @@ Pinner / browser adapter / local forwarder
                   |
              DNS UDP/TCP
                   |
-           hns-resolverd
-             |         |
-   getdnsresource    iterative DNS
-      (loopback)      (delegated NS)
-             |         |
-            hsrd   authoritative servers
+                hns-resolverd
+            /         |          \
+ getdnsresource  iterative DNS   validating ICANN recursion
+   (loopback)     (delegated NS)   (ICANN fallback)
+       |               |                |
+      hsrd     authoritative servers  ICANN roots
              |
   immutable active-state snapshot
 ```
@@ -156,6 +174,14 @@ architecture. The native design changes the boundary in several ways:
   height, name-tree root, network, or chain epoch changes;
 - recursion and name-server discovery have separate depth bounds;
 - outbound delegated servers are filtered before connection;
+- Handshake and ICANN validation use disjoint trust-anchor sets; ICANN NS data,
+  parent DS or authenticated denial, and name-server addresses are resolved in
+  the IANA trust domain before the delegation is re-signed into the Handshake
+  root view;
+- fallback is derived from the vendored reserved-name provenance bit, runs
+  only after an atomic chain lookup proves the Handshake resource absent, and
+  fails closed on timeout, overload, malformed referrals, bogus DS, or missing
+  authenticated denial of DS;
 - the internal root adapter retains an exact ephemeral transport and never
   requires a privileged port 53;
 - authentication secrets are read only from bounded, nonsymlink, mode-0600
@@ -181,6 +207,8 @@ recursive lookup depth.
 | Iterative resolution | network-dependent `O(D)` rounds | bounded caches/tasks | depth 12, NS depth 16 |
 | Concurrent public work | `O(1)` admission | fixed permits | 256 queries |
 | Concurrent `hsrd` work | `O(1)` admission | fixed permits | 32 requests, 2 s timeout, 16 KiB body |
+| ICANN fallback referral | network-dependent `O(D + N)` rounds | bounded LRU/tasks/records | 13 roots, 32 NS, 16 permits, 3 s, 256 records |
+| DNSSEC signing | `O(K log K)` canonical RRset encoding | `O(K)` response-local | `K` bounded by resource/referral limits |
 | Chain-state check | `O(1)` RPC point read | one active generation | every 1 s |
 | Reorg/block invalidation | `O(1)` cache swap | old generation drains via `Arc` | every identity change |
 
@@ -193,11 +221,7 @@ attacker input.
 
 The next resolver work should be completed in this order:
 
-1. Port HSD's fixed Handshake root KSK/ZSK records, signed NSEC proofs, and
-   root trust anchor; enable validating recursion and add bad-signature tests.
-2. Add DNSSEC-validated ICANN dynamic fallback with a separate ICANN trust
-   anchor and collision tests.
-3. Add live HSD/hnsd differential fixtures for every resource type, negative
+1. Add live HSD/hnsd differential fixtures for every resource type, negative
    proof, delegation form, CNAME chain, truncation/TCP retry, and reorganization.
-4. Add an optional authenticated local DoH frontend after the DNSSEC boundary
+2. Add an optional authenticated local DoH frontend after the DNSSEC boundary
    is complete; keep the raw DNS listener private by default.

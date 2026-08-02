@@ -14,6 +14,9 @@ pub struct ReservedName {
     pub name: Vec<u8>,
     pub target: Vec<u8>,
     pub value: u64,
+    /// The entry originated in the ICANN root zone and is eligible for
+    /// authenticated dynamic fallback when Handshake has no replacement.
+    pub root: bool,
 }
 
 pub fn reserved_name(name: &[u8]) -> Option<ReservedName> {
@@ -51,6 +54,7 @@ pub fn reserved_name(name: &[u8]) -> Option<ReservedName> {
         name: normalized,
         target,
         value,
+        root: flags & 1 != 0,
     })
 }
 
@@ -963,5 +967,11 @@ mod tests {
         assert!(database_contains(RESERVED_DB, 28, &first_reserved));
         let first_locked: [u8; 32] = LOCKUP_DB[4..36].try_into().expect("hash");
         assert!(database_contains(LOCKUP_DB, 4, &first_locked));
+    }
+
+    #[test]
+    fn reserved_database_exposes_icann_root_provenance() {
+        assert!(reserved_name(b"com").expect("com entry").root);
+        assert!(!reserved_name(b"bit").expect("bit entry").root);
     }
 }

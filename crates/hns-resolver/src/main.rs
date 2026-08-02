@@ -3,7 +3,7 @@
 use std::{
     fs,
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -77,6 +77,23 @@ struct Cli {
     #[arg(long)]
     allow_private_name_servers: bool,
 
+    /// Disable DNSSEC-validated fallback for unclaimed ICANN root names.
+    #[arg(long)]
+    disable_icann_fallback: bool,
+
+    /// Override an ICANN root-hints address (repeat for multiple servers).
+    #[arg(long = "icann-root-server")]
+    icann_root_servers: Vec<IpAddr>,
+
+    #[arg(long, default_value_t = 3_000)]
+    icann_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 16)]
+    icann_max_concurrent_queries: usize,
+
+    #[arg(long, default_value_t = 4_096)]
+    icann_cache_size: usize,
+
     #[arg(long, env = "HNS_RESOLVERD_LOG", default_value = "info")]
     log_filter: String,
 }
@@ -104,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(cli.hsrd_timeout_ms),
         cli.hsrd_max_concurrent_requests,
     )?;
+    let defaults = ResolverConfig::default();
     let config = ResolverConfig {
         listen: cli.listen,
         require_synchronized: !cli.allow_unsynchronized,
@@ -114,7 +132,16 @@ async fn main() -> anyhow::Result<()> {
         maximum_negative_ttl: Duration::from_secs(cli.maximum_negative_ttl_seconds),
         deny_private_name_servers: !cli.allow_private_name_servers,
         chain_state_poll_interval: Duration::from_millis(cli.hsrd_chain_state_poll_ms),
-        ..ResolverConfig::default()
+        icann_fallback: !cli.disable_icann_fallback,
+        icann_root_servers: if cli.icann_root_servers.is_empty() {
+            defaults.icann_root_servers.clone()
+        } else {
+            cli.icann_root_servers
+        },
+        icann_timeout: Duration::from_millis(cli.icann_timeout_ms),
+        icann_maximum_concurrent_queries: cli.icann_max_concurrent_queries,
+        icann_cache_size: cli.icann_cache_size,
+        ..defaults
     };
     let runtime = ResolverRuntime::bind(Arc::new(source), config).await?;
     runtime

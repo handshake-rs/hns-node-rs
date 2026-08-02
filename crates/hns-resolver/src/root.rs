@@ -10,7 +10,7 @@ use data_encoding::BASE32HEX_NOPAD;
 use hickory_server::{
     authority::MessageResponseBuilder,
     proto::{
-        dnssec::{rdata::DNSSECRData, rdata::DS, Algorithm, DigestType},
+        dnssec::{rdata::DNSSECRData, rdata::DS, rdata::NSEC, Algorithm, DigestType},
         op::{Header, ResponseCode},
         rr::{
             rdata::{A, AAAA, NS, SOA, TXT},
@@ -19,10 +19,11 @@ use hickory_server::{
     },
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
 };
+use hns_consensus::reserved_name;
 use hns_primitives::{verify_name, DecodedResourceRecord, Resource};
 use tracing::{debug, warn};
 
-use crate::NameResourceSource;
+use crate::{dnssec::RootDnssec, IcannLookup, IcannReferral, NameResourceSource};
 
 /// One name-tree interval at the target ten-minute block cadence.
 pub const DEFAULT_RESOURCE_TTL: u32 = 21_600;
@@ -59,6 +60,8 @@ impl RootAnswer {
 pub struct HandshakeRoot {
     source: Arc<dyn NameResourceSource>,
     require_synchronized: bool,
+    dnssec: RootDnssec,
+    icann: Option<Arc<dyn IcannLookup>>,
 }
 
 impl HandshakeRoot {
@@ -66,12 +69,23 @@ impl HandshakeRoot {
         Self {
             source,
             require_synchronized,
+            dnssec: RootDnssec::new().expect("embedded Handshake DNSSEC keys are valid"),
+            icann: None,
         }
+    }
+
+    pub fn with_icann(mut self, icann: Arc<dyn IcannLookup>) -> Self {
+        self.icann = Some(icann);
+        self
     }
 
     pub async fn answer(&self, qname: &Name, qtype: RecordType) -> RootAnswer {
         if qname.is_root() {
-            return root_zone_answer(qtype);
+            let mut answer = root_zone_answer(qtype);
+            if matches!(qtype, RecordType::DNSKEY | RecordType::ANY) {
+                answer.answers.extend(self.dnssec.dnskey_records());
+            }
+            return answer;
         }
 
         if let Some(answer) = synth_answer(qname, qtype) {
@@ -105,9 +119,40 @@ impl HandshakeRoot {
             );
             return RootAnswer::servfail();
         }
-        let Some(resource_hex) = response.resource else {
+        let resource = if is_hns_icann_collision(&tld) {
+            None
+        } else {
+            response.resource
+        };
+        let Some(resource_hex) = resource else {
+            if !is_hns_icann_collision(&tld) {
+                if let Some(icann) = self
+                    .icann
+                    .as_ref()
+                    .filter(|_| reserved_name(tld.as_bytes()).is_some_and(|reserved| reserved.root))
+                {
+                    let owner = match Name::from_ascii(format!("{tld}.")) {
+                        Ok(owner) => owner,
+                        Err(_) => return RootAnswer::servfail(),
+                    };
+                    return match icann.referral(&owner).await {
+                        Ok(referral) => icann_answer(
+                            qname,
+                            qtype,
+                            &owner,
+                            referral,
+                            response.context.active_height,
+                        ),
+                        Err(error) => {
+                            warn!(%error, %qname, "validated ICANN root fallback failed");
+                            RootAnswer::servfail()
+                        }
+                    };
+                }
+            }
             let mut answer = RootAnswer::empty(ResponseCode::NXDomain, true);
             answer.soa.push(root_soa(response.context.active_height));
+            add_missing_name_proof(&mut answer, &tld);
             return answer;
         };
         let resource_bytes = match hex::decode(resource_hex) {
@@ -139,6 +184,17 @@ impl HandshakeRoot {
             }
         }
     }
+
+    pub async fn signed_answer(&self, qname: &Name, qtype: RecordType) -> RootAnswer {
+        let mut answer = self.answer(qname, qtype).await;
+        if answer.response_code != ResponseCode::ServFail {
+            if let Err(error) = self.dnssec.sign_answer(&mut answer, qname.is_root()) {
+                warn!(%error, %qname, ?qtype, "failed to sign Handshake root answer");
+                return RootAnswer::servfail();
+            }
+        }
+        answer
+    }
 }
 
 #[async_trait]
@@ -163,7 +219,9 @@ impl RequestHandler for HandshakeRoot {
             }
         };
         let qname = Name::from(request_info.query.name());
-        let answer = self.answer(&qname, request_info.query.query_type()).await;
+        let answer = self
+            .signed_answer(&qname, request_info.query.query_type())
+            .await;
         let mut header = Header::response_from_request(request.header());
         header.set_authoritative(answer.authoritative);
         header.set_recursion_available(false);
@@ -291,6 +349,10 @@ fn resource_answer(
         answer.answers = txt_records;
         if answer.answers.is_empty() {
             answer.soa.push(root_soa(height));
+            answer.authorities.push(existing_name_nsec(
+                &owner,
+                &[RecordType::RRSIG, RecordType::NSEC],
+            ));
         }
         return Ok(answer);
     }
@@ -299,6 +361,12 @@ fn resource_answer(
         answer.answers = ds_records;
         if answer.answers.is_empty() {
             answer.soa.push(root_soa(height));
+            let types = if has_ns {
+                &[RecordType::NS, RecordType::RRSIG, RecordType::NSEC][..]
+            } else {
+                &[RecordType::RRSIG, RecordType::NSEC][..]
+            };
+            answer.authorities.push(existing_name_nsec(&owner, types));
         }
         return Ok(answer);
     }
@@ -306,13 +374,149 @@ fn resource_answer(
         let mut answer = RootAnswer::empty(ResponseCode::NoError, false);
         answer.authorities = ns_records;
         answer.authorities.extend(ds_records);
+        if !answer
+            .authorities
+            .iter()
+            .any(|record| record.record_type() == RecordType::DS)
+        {
+            answer.authorities.push(existing_name_nsec(
+                &owner,
+                &[RecordType::NS, RecordType::RRSIG, RecordType::NSEC],
+            ));
+        }
         answer.additionals = glue_records;
         return Ok(answer);
     }
 
     let mut answer = RootAnswer::empty(ResponseCode::NoError, true);
     answer.soa.push(root_soa(height));
+    answer.authorities.push(existing_name_nsec(
+        &owner,
+        &[RecordType::RRSIG, RecordType::NSEC],
+    ));
     Ok(answer)
+}
+
+fn icann_answer(
+    qname: &Name,
+    qtype: RecordType,
+    owner: &Name,
+    mut referral: IcannReferral,
+    height: Option<u32>,
+) -> RootAnswer {
+    for record in referral
+        .name_servers
+        .iter_mut()
+        .chain(referral.delegation_signers.iter_mut())
+        .chain(referral.glue.iter_mut())
+    {
+        record.set_ttl(record.ttl().min(DEFAULT_RESOURCE_TTL));
+    }
+    let apex = qname == owner;
+    if apex && qtype == RecordType::DS {
+        let mut answer = RootAnswer::empty(ResponseCode::NoError, true);
+        answer.answers = referral.delegation_signers;
+        if answer.answers.is_empty() {
+            answer.soa.push(root_soa(height));
+            answer.authorities.push(existing_name_nsec(
+                owner,
+                &[RecordType::NS, RecordType::RRSIG, RecordType::NSEC],
+            ));
+        }
+        return answer;
+    }
+
+    let mut answer = RootAnswer::empty(ResponseCode::NoError, false);
+    answer.authorities = referral.name_servers;
+    answer.authorities.extend(referral.delegation_signers);
+    if !answer
+        .authorities
+        .iter()
+        .any(|record| record.record_type() == RecordType::DS)
+    {
+        answer.authorities.push(existing_name_nsec(
+            owner,
+            &[RecordType::NS, RecordType::RRSIG, RecordType::NSEC],
+        ));
+    }
+    answer.additionals = referral.glue;
+    answer
+}
+
+fn existing_name_nsec(owner: &Name, types: &[RecordType]) -> Record {
+    Record::from_rdata(
+        owner.clone(),
+        DEFAULT_RESOURCE_TTL,
+        RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(
+            next_name(owner),
+            types.iter().copied(),
+        ))),
+    )
+}
+
+fn add_missing_name_proof(answer: &mut RootAnswer, tld: &str) {
+    let mut label = tld.as_bytes().to_vec();
+    if let Some(last) = label.last_mut() {
+        *last = last.saturating_sub(1);
+    }
+    if label.len() < 63 {
+        label.push(0xff);
+    }
+    let Ok(previous) = Name::from_labels([label.as_slice()]) else {
+        return;
+    };
+    let Ok(owner) = Name::from_ascii(format!("{tld}.")) else {
+        return;
+    };
+    answer.authorities.push(Record::from_rdata(
+        previous,
+        DEFAULT_RESOURCE_TTL,
+        RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(
+            next_name(&owner),
+            [RecordType::RRSIG, RecordType::NSEC],
+        ))),
+    ));
+    answer.authorities.push(Record::from_rdata(
+        Name::from_labels([b"!".as_slice()]).expect("wildcard denial owner"),
+        DEFAULT_RESOURCE_TTL,
+        RData::DNSSEC(DNSSECRData::NSEC(NSEC::new(
+            Name::from_labels([b"+".as_slice()]).expect("wildcard denial successor"),
+            [RecordType::RRSIG, RecordType::NSEC],
+        ))),
+    ));
+    // Hickory validates the closest encloser for a one-label query as the
+    // root itself. Keep HSD's !. -> +. wildcard proof above and also publish
+    // the real root RRset bitmap through its first synthetic successor.
+    answer.authorities.push(existing_name_nsec(
+        &Name::root(),
+        &[
+            RecordType::NS,
+            RecordType::SOA,
+            RecordType::RRSIG,
+            RecordType::NSEC,
+            RecordType::DNSKEY,
+        ],
+    ));
+}
+
+fn next_name(owner: &Name) -> Name {
+    let Some(current) = owner.iter().next() else {
+        return Name::from_labels([b"!".as_slice()]).expect("root successor");
+    };
+    let mut label = current.to_vec();
+    if label.len() < 63 {
+        label.push(0);
+    } else if let Some(last) = label.last_mut() {
+        *last = last.saturating_add(1);
+    }
+    Name::from_labels([label.as_slice()]).expect("derived NSEC successor is valid")
+}
+
+fn is_hns_icann_collision(tld: &str) -> bool {
+    matches!(
+        tld,
+        "bit" | "eth" | "exit" | "gnu" | "i2p" | "onion" | "tor" | "zkey"
+    )
 }
 
 fn push_ns(owner: &Name, ns: Name, seen: &mut HashSet<Name>, records: &mut Vec<Record>) {
@@ -342,13 +546,47 @@ fn root_zone_answer(qtype: RecordType) -> RootAnswer {
         // root pool from this RRset and silently replaces the exact ephemeral
         // transport port with port 53. NODATA makes it retain the bounded,
         // explicitly configured root transport. TLD referrals are unaffected.
-        RecordType::NS => answer.soa.push(root_soa(None)),
+        RecordType::NS => {
+            answer.soa.push(root_soa(None));
+            answer.authorities.push(existing_name_nsec(
+                &root,
+                &[
+                    RecordType::SOA,
+                    RecordType::RRSIG,
+                    RecordType::NSEC,
+                    RecordType::DNSKEY,
+                ],
+            ));
+        }
         RecordType::SOA => {
             answer.answers.push(root_soa(None));
             answer.authorities.push(ns_record);
             answer.additionals.push(glue);
         }
-        _ => answer.soa.push(root_soa(None)),
+        RecordType::DNSKEY => {}
+        RecordType::NSEC => answer.answers.push(existing_name_nsec(
+            &root,
+            &[
+                RecordType::NS,
+                RecordType::SOA,
+                RecordType::RRSIG,
+                RecordType::NSEC,
+                RecordType::DNSKEY,
+            ],
+        )),
+        _ => {
+            answer.soa.push(root_soa(None));
+            answer.authorities.push(existing_name_nsec(
+                &root,
+                &[
+                    RecordType::NS,
+                    RecordType::SOA,
+                    RecordType::RRSIG,
+                    RecordType::NSEC,
+                    RecordType::DNSKEY,
+                ],
+            ));
+        }
     }
     answer
 }
@@ -382,6 +620,10 @@ fn synth_answer(qname: &Name, qtype: RecordType) -> Option<RootAnswer> {
     if labels.len() != 2 || !labels[0].starts_with(b"_") {
         let mut answer = RootAnswer::empty(ResponseCode::NoError, true);
         answer.soa.push(root_soa(None));
+        answer.authorities.push(existing_name_nsec(
+            qname,
+            &[RecordType::RRSIG, RecordType::NSEC],
+        ));
         return Some(answer);
     }
     let encoded = str::from_utf8(&labels[0][1..]).ok()?.to_ascii_uppercase();
@@ -402,7 +644,13 @@ fn synth_answer(qname: &Name, qtype: RecordType) -> Option<RootAnswer> {
                 RData::AAAA(AAAA(Ipv6Addr::from(raw))),
             ));
         }
-        _ => answer.soa.push(root_soa(None)),
+        _ => {
+            answer.soa.push(root_soa(None));
+            answer.authorities.push(existing_name_nsec(
+                qname,
+                &[RecordType::RRSIG, RecordType::NSEC],
+            ));
+        }
     }
     Some(answer)
 }
@@ -411,8 +659,9 @@ fn synth_answer(qname: &Name, qtype: RecordType) -> Option<RootAnswer> {
 mod tests {
     use super::*;
     use hns_rpc::{RpcDnsContext, RpcDnsResource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::BackendError;
+    use crate::{BackendError, IcannError};
 
     struct MockSource {
         response: RpcDnsResource,
@@ -423,6 +672,40 @@ mod tests {
         async fn resource(&self, _name: &str) -> Result<RpcDnsResource, BackendError> {
             Ok(self.response.clone())
         }
+    }
+
+    struct MockIcann {
+        calls: AtomicUsize,
+        referral: IcannReferral,
+    }
+
+    #[async_trait]
+    impl IcannLookup for MockIcann {
+        async fn referral(&self, _tld: &Name) -> Result<IcannReferral, IcannError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.referral.clone())
+        }
+    }
+
+    fn icann() -> Arc<MockIcann> {
+        let owner = Name::from_ascii("com.").expect("owner");
+        let ns = Name::from_ascii("a.gtld-servers.net.").expect("name server");
+        Arc::new(MockIcann {
+            calls: AtomicUsize::new(0),
+            referral: IcannReferral {
+                name_servers: vec![Record::from_rdata(
+                    owner,
+                    DEFAULT_RESOURCE_TTL,
+                    RData::NS(NS(ns.clone())),
+                )],
+                delegation_signers: Vec::new(),
+                glue: vec![Record::from_rdata(
+                    ns,
+                    DEFAULT_RESOURCE_TTL,
+                    RData::A(A::new(192, 5, 6, 30)),
+                )],
+            },
+        })
     }
 
     fn source(resource: Option<&[u8]>, synchronized: bool) -> Arc<dyn NameResourceSource> {
@@ -454,8 +737,14 @@ mod tests {
 
         assert_eq!(answer.response_code, ResponseCode::NoError);
         assert!(!answer.authoritative);
-        assert_eq!(answer.authorities.len(), 1);
-        assert_eq!(answer.authorities[0].record_type(), RecordType::NS);
+        assert_eq!(
+            answer
+                .authorities
+                .iter()
+                .filter(|record| record.record_type() == RecordType::NS)
+                .count(),
+            1
+        );
         assert_eq!(answer.additionals.len(), 1);
         assert_eq!(answer.additionals[0].record_type(), RecordType::A);
     }
@@ -501,6 +790,14 @@ mod tests {
         assert_eq!(answer.response_code, ResponseCode::NXDomain);
         assert!(answer.authoritative);
         assert_eq!(answer.soa.len(), 1);
+        assert_eq!(
+            answer
+                .authorities
+                .iter()
+                .filter(|record| record.record_type() == RecordType::NSEC)
+                .count(),
+            3
+        );
     }
 
     #[tokio::test]
@@ -516,7 +813,8 @@ mod tests {
         assert_eq!(answer.response_code, ResponseCode::NoError);
         assert!(answer.authoritative);
         assert!(answer.answers.is_empty());
-        assert!(answer.authorities.is_empty());
+        assert_eq!(answer.authorities.len(), 1);
+        assert_eq!(answer.authorities[0].record_type(), RecordType::NSEC);
         assert_eq!(answer.soa.len(), 1);
     }
 
@@ -534,7 +832,14 @@ mod tests {
             .await;
 
         assert!(!answer.authoritative);
-        assert_eq!(answer.authorities.len(), 1);
+        assert_eq!(
+            answer
+                .authorities
+                .iter()
+                .filter(|record| record.record_type() == RecordType::NS)
+                .count(),
+            1
+        );
         assert!(answer.additionals.is_empty());
     }
 
@@ -560,5 +865,89 @@ mod tests {
         assert!(answer.authoritative);
         assert!(answer.answers.is_empty());
         assert_eq!(answer.soa.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn signed_root_dnskey_rrset_uses_the_canonical_ksk() {
+        let root = HandshakeRoot::new(source(None, true), true);
+        let answer = root.signed_answer(&Name::root(), RecordType::DNSKEY).await;
+        assert_eq!(
+            answer
+                .answers
+                .iter()
+                .filter(|record| record.record_type() == RecordType::DNSKEY)
+                .count(),
+            2
+        );
+        assert!(answer.answers.iter().any(|record| {
+            matches!(
+                record.data(),
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                    if rrsig.type_covered() == RecordType::DNSKEY
+                        && rrsig.key_tag() == 35_215
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn eligible_missing_name_uses_signed_icann_referral() {
+        let icann = icann();
+        let lookup: Arc<dyn IcannLookup> = icann.clone();
+        let root = HandshakeRoot::new(source(None, true), true).with_icann(lookup);
+        let answer = root
+            .signed_answer(&Name::from_ascii("www.com.").expect("query"), RecordType::A)
+            .await;
+
+        assert_eq!(icann.calls.load(Ordering::Relaxed), 1);
+        assert!(!answer.authoritative);
+        assert!(answer
+            .authorities
+            .iter()
+            .any(|record| record.record_type() == RecordType::NS));
+        assert!(answer.authorities.iter().any(|record| {
+            matches!(
+                record.data(),
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                    if rrsig.type_covered() == RecordType::NSEC
+            )
+        }));
+        assert!(!answer.authorities.iter().any(|record| {
+            matches!(
+                record.data(),
+                RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
+                    if rrsig.type_covered() == RecordType::NS
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn handshake_resource_takes_precedence_over_icann_fallback() {
+        let icann = icann();
+        let lookup: Arc<dyn IcannLookup> = icann.clone();
+        let root =
+            HandshakeRoot::new(source(Some(&[0, 4, 127, 0, 0, 1]), true), true).with_icann(lookup);
+        let answer = root
+            .answer(&Name::from_ascii("www.com.").expect("query"), RecordType::A)
+            .await;
+
+        assert_eq!(icann.calls.load(Ordering::Relaxed), 0);
+        assert!(answer
+            .additionals
+            .iter()
+            .any(|record| record.data() == &RData::A(A::new(127, 0, 0, 1))));
+    }
+
+    #[tokio::test]
+    async fn decentralized_collision_blacklist_suppresses_chain_and_icann_data() {
+        let icann = icann();
+        let lookup: Arc<dyn IcannLookup> = icann.clone();
+        let root =
+            HandshakeRoot::new(source(Some(&[0, 4, 127, 0, 0, 1]), true), true).with_icann(lookup);
+        let answer = root
+            .answer(&Name::from_ascii("www.bit.").expect("query"), RecordType::A)
+            .await;
+
+        assert_eq!(answer.response_code, ResponseCode::NXDomain);
+        assert_eq!(icann.calls.load(Ordering::Relaxed), 0);
     }
 }

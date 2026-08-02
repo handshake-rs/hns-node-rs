@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -38,7 +38,10 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::{HandshakeRoot, NameResourceSource};
+use crate::{
+    dnssec::RootDnssec, HandshakeRoot, IcannLookup, NameResourceSource, ValidatingIcann,
+    DEFAULT_ICANN_ROOT_SERVERS,
+};
 
 #[derive(Clone, Debug)]
 pub struct ResolverConfig {
@@ -54,6 +57,11 @@ pub struct ResolverConfig {
     pub deny_private_name_servers: bool,
     pub tcp_request_timeout: Duration,
     pub chain_state_poll_interval: Duration,
+    pub icann_fallback: bool,
+    pub icann_root_servers: Vec<IpAddr>,
+    pub icann_timeout: Duration,
+    pub icann_maximum_concurrent_queries: usize,
+    pub icann_cache_size: usize,
 }
 
 impl Default for ResolverConfig {
@@ -77,6 +85,11 @@ impl Default for ResolverConfig {
             deny_private_name_servers: true,
             tcp_request_timeout: Duration::from_secs(10),
             chain_state_poll_interval: Duration::from_secs(1),
+            icann_fallback: true,
+            icann_root_servers: DEFAULT_ICANN_ROOT_SERVERS.to_vec(),
+            icann_timeout: Duration::from_secs(3),
+            icann_maximum_concurrent_queries: 16,
+            icann_cache_size: 4_096,
         }
     }
 }
@@ -150,6 +163,12 @@ impl ResolverRuntime {
             !config.chain_state_poll_interval.is_zero(),
             "chain-state poll interval must be non-zero"
         );
+        if config.icann_fallback {
+            anyhow::ensure!(
+                !config.icann_root_servers.is_empty(),
+                "ICANN fallback requires at least one root server"
+            );
+        }
 
         let initial = match source.resource("a").await {
             Ok(response) => Some(response),
@@ -169,10 +188,17 @@ impl ResolverRuntime {
         let root_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let internal_root_addr = root_tcp.local_addr()?;
         let root_udp = UdpSocket::bind(internal_root_addr).await?;
-        let mut root = ServerFuture::new(HandshakeRoot::new(
-            Arc::clone(&source),
-            config.require_synchronized,
-        ));
+        let mut root_handler = HandshakeRoot::new(Arc::clone(&source), config.require_synchronized);
+        if config.icann_fallback {
+            let icann: Arc<dyn IcannLookup> = Arc::new(ValidatingIcann::new(
+                &config.icann_root_servers,
+                config.icann_timeout,
+                config.icann_maximum_concurrent_queries,
+                config.icann_cache_size,
+            )?);
+            root_handler = root_handler.with_icann(icann);
+        }
+        let mut root = ServerFuture::new(root_handler);
         root.register_socket(root_udp);
         root.register_listener(root_tcp, config.tcp_request_timeout);
 
@@ -267,7 +293,9 @@ fn build_recursor(
             Some(config.maximum_positive_ttl),
             Some(config.maximum_negative_ttl),
         ))
-        .dnssec_policy(DnssecPolicy::SecurityUnaware)
+        .dnssec_policy(DnssecPolicy::ValidateWithStaticKey {
+            trust_anchor: Some(RootDnssec::trust_anchors()),
+        })
         .case_randomization(true);
     if config.deny_private_name_servers {
         let allow = Vec::<IpNet>::new();
@@ -500,6 +528,15 @@ mod tests {
     }
 
     async fn udp_response(listen: SocketAddr, id: u16) -> Message {
+        udp_query(listen, id, "missing.", RecordType::A).await
+    }
+
+    async fn udp_query(
+        listen: SocketAddr,
+        id: u16,
+        name: &str,
+        record_type: RecordType,
+    ) -> Message {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind client");
@@ -507,8 +544,8 @@ mod tests {
         query.set_id(id);
         query.set_recursion_desired(true);
         query.add_query(Query::query(
-            Name::from_ascii("missing.").expect("query name"),
-            RecordType::A,
+            Name::from_ascii(name).expect("query name"),
+            record_type,
         ));
         socket
             .send_to(&query.to_vec().expect("encode query"), listen)
@@ -618,6 +655,43 @@ mod tests {
             ResponseCode::NXDomain
         );
         assert_eq!(source.missing_lookups.load(Ordering::Relaxed), 2);
+
+        shutdown_send.send(()).expect("request shutdown");
+        timeout(Duration::from_secs(3), server)
+            .await
+            .expect("resolver shutdown timeout")
+            .expect("resolver task")
+            .expect("graceful resolver shutdown");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live ICANN DNS connectivity"]
+    async fn udp_daemon_resolves_through_validated_icann_fallback() {
+        let runtime = ResolverRuntime::bind(
+            Arc::new(MissingSource),
+            ResolverConfig {
+                listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                maximum_concurrent_queries: 8,
+                name_server_cache_size: 64,
+                record_cache_size: 256,
+                icann_timeout: Duration::from_secs(5),
+                ..ResolverConfig::default()
+            },
+        )
+        .await
+        .expect("bind resolver");
+        let listen = runtime.listen_addr;
+        let (shutdown_send, shutdown_receive) = oneshot::channel();
+        let server = tokio::spawn(runtime.serve_until(async {
+            let _ = shutdown_receive.await;
+        }));
+
+        let response = udp_query(listen, 81, "example.com.", RecordType::A).await;
+        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert!(response
+            .answers()
+            .iter()
+            .any(|record| record.record_type() == RecordType::A));
 
         shutdown_send.send(()).expect("request shutdown");
         timeout(Duration::from_secs(3), server)
