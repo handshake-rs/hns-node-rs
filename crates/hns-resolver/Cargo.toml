@@ -11,7 +11,7 @@ anyhow.workspace = true
 async-trait = "0.1"
 clap.workspace = true
 data-encoding = "2.11"
-hickory-server = { version = "0.25.2", features = ["dnssec-ring", "recursor"] }
+hickory-server = { version = "0.26.1", features = ["dnssec-ring", "recursor"] }
 hns-consensus = { path = "../hns-consensus" }
 hns-primitives = { path = "../hns-primitives" }
 hns-rpc = { path = "../hns-rpc" }

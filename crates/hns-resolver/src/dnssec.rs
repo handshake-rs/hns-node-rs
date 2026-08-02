@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use hickory_server::proto::{
     dnssec::{
         crypto::signing_key_from_der, rdata::DNSSECRData, rdata::DNSKEY, rdata::RRSIG, Algorithm,
-        PublicKeyBuf, SigSigner, TrustAnchors, TBS,
+        DnssecSigner, PublicKeyBuf, TrustAnchors,
     },
     rr::{DNSClass, Name, RData, Record, RecordSet, RecordType},
 };
@@ -43,8 +43,8 @@ const ZSK_PUBLIC_KEY: &[u8] = &hex_literal::hex!(
 );
 
 pub(crate) struct RootDnssec {
-    ksk: SigSigner,
-    zsk: SigSigner,
+    ksk: DnssecSigner,
+    zsk: DnssecSigner,
     ksk_dnskey: DNSKEY,
     zsk_dnskey: DNSKEY,
 }
@@ -64,13 +64,13 @@ impl RootDnssec {
             .map_err(|error| anyhow::anyhow!("invalid embedded Handshake ZSK: {error}"))?;
         let root = Name::root();
         Ok(Self {
-            ksk: SigSigner::dnssec(
+            ksk: DnssecSigner::new(
                 ksk_dnskey.clone(),
                 ksk_key,
                 root.clone(),
                 SIGNATURE_VALIDITY,
             ),
-            zsk: SigSigner::dnssec(zsk_dnskey.clone(), zsk_key, root, SIGNATURE_VALIDITY),
+            zsk: DnssecSigner::new(zsk_dnskey.clone(), zsk_key, root, SIGNATURE_VALIDITY),
             ksk_dnskey,
             zsk_dnskey,
         })
@@ -130,8 +130,8 @@ impl RootDnssec {
 }
 
 fn sign_section(
-    ksk: &SigSigner,
-    zsk: &SigSigner,
+    ksk: &DnssecSigner,
+    zsk: &DnssecSigner,
     records: &mut Vec<Record>,
     eligible: impl Fn(RecordType) -> bool,
 ) -> anyhow::Result<()> {
@@ -139,13 +139,12 @@ fn sign_section(
     for record in records.iter() {
         let record_type = record.record_type();
         if record_type != RecordType::RRSIG && eligible(record_type) {
-            rrsets.insert((record.name().clone(), record_type));
+            rrsets.insert((record.name.clone(), record_type));
         }
     }
 
     let inception =
         OffsetDateTime::now_utc() - time::Duration::seconds(SIGNATURE_INCEPTION_SKEW_SECONDS);
-    let expiration = inception + time::Duration::seconds(SIGNATURE_VALIDITY.as_secs() as i64);
     let mut signatures = Vec::with_capacity(rrsets.len());
     for (name, record_type) in rrsets {
         let mut rrset = RecordSet::with_ttl(
@@ -153,12 +152,12 @@ fn sign_section(
             record_type,
             records
                 .iter()
-                .find(|record| record.name() == &name && record.record_type() == record_type)
-                .map_or(0, Record::ttl),
+                .find(|record| record.name == name && record.record_type() == record_type)
+                .map_or(0, |record| record.ttl),
         );
         for record in records
             .iter()
-            .filter(|record| record.name() == &name && record.record_type() == record_type)
+            .filter(|record| record.name == name && record.record_type() == record_type)
         {
             rrset.insert(record.clone(), 0);
         }
@@ -167,22 +166,11 @@ fn sign_section(
         } else {
             zsk
         };
-        let tbs = TBS::from_rrset(&rrset, DNSClass::IN, inception, expiration, signer)?;
-        let signature = signer.sign(&tbs)?;
+        let signature = RRSIG::from_rrset(&rrset, DNSClass::IN, inception, signer)?;
         signatures.push(Record::from_rdata(
             name,
             rrset.ttl(),
-            RData::DNSSEC(DNSSECRData::RRSIG(RRSIG::new(
-                record_type,
-                signer.key().algorithm(),
-                rrset.name().num_labels(),
-                rrset.ttl(),
-                expiration.unix_timestamp() as u32,
-                inception.unix_timestamp() as u32,
-                signer.calculate_key_tag()?,
-                signer.signer_name().clone(),
-                signature,
-            ))),
+            RData::DNSSEC(DNSSECRData::RRSIG(signature)),
         ));
     }
     records.extend(signatures);
@@ -221,7 +209,7 @@ mod tests {
         let zsk = dnssec
             .dnskey_records()
             .into_iter()
-            .find_map(|record| match record.into_data() {
+            .find_map(|record| match record.data {
                 RData::DNSSEC(DNSSECRData::DNSKEY(key)) if key.flags() == 256 => Some(key),
                 _ => None,
             })
@@ -229,9 +217,9 @@ mod tests {
         let rrsig = answer
             .answers
             .iter()
-            .find_map(|record| match record.data() {
+            .find_map(|record| match &record.data {
                 RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
-                    if rrsig.type_covered() == RecordType::A =>
+                    if rrsig.input().type_covered == RecordType::A =>
                 {
                     Some(rrsig.clone())
                 }

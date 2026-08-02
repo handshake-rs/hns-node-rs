@@ -8,16 +8,17 @@ use std::{
 use async_trait::async_trait;
 use data_encoding::BASE32HEX_NOPAD;
 use hickory_server::{
-    authority::MessageResponseBuilder,
+    net::runtime::Time,
     proto::{
         dnssec::{rdata::DNSSECRData, rdata::DS, rdata::NSEC, Algorithm, DigestType},
-        op::{Header, ResponseCode},
+        op::{Header, Metadata, ResponseCode},
         rr::{
             rdata::{A, AAAA, NS, SOA, TXT},
             Name, RData, Record, RecordType,
         },
     },
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
+    zone_handler::MessageResponseBuilder,
 };
 use hns_consensus::reserved_name;
 use hns_primitives::{verify_name, DecodedResourceRecord, Resource};
@@ -199,7 +200,7 @@ impl HandshakeRoot {
 
 #[async_trait]
 impl RequestHandler for HandshakeRoot {
-    async fn handle_request<R: ResponseHandler>(
+    async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
         mut response_handle: R,
@@ -208,26 +209,32 @@ impl RequestHandler for HandshakeRoot {
             Ok(info) => info,
             Err(error) => {
                 warn!(%error, "invalid internal root DNS request");
-                let mut header = Header::response_from_request(request.header());
-                header.set_response_code(ResponseCode::FormErr);
-                let response =
-                    MessageResponseBuilder::from_message_request(request).build_no_records(header);
+                let mut metadata = Metadata::response_from_request(&request.metadata);
+                metadata.response_code = ResponseCode::FormErr;
+                let response = MessageResponseBuilder::from_message_request(request)
+                    .build_no_records(metadata);
                 return response_handle
                     .send_response(response)
                     .await
-                    .unwrap_or_else(|_| header.into());
+                    .unwrap_or_else(|_| {
+                        Header {
+                            metadata,
+                            counts: Default::default(),
+                        }
+                        .into()
+                    });
             }
         };
         let qname = Name::from(request_info.query.name());
         let answer = self
             .signed_answer(&qname, request_info.query.query_type())
             .await;
-        let mut header = Header::response_from_request(request.header());
-        header.set_authoritative(answer.authoritative);
-        header.set_recursion_available(false);
-        header.set_response_code(answer.response_code);
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.authoritative = answer.authoritative;
+        metadata.recursion_available = false;
+        metadata.response_code = answer.response_code;
         let response = MessageResponseBuilder::from_message_request(request).build(
-            header,
+            metadata,
             answer.answers.iter(),
             answer.authorities.iter(),
             answer.soa.iter(),
@@ -238,7 +245,11 @@ impl RequestHandler for HandshakeRoot {
             .await
             .unwrap_or_else(|error| {
                 warn!(%error, "failed to send internal root DNS response");
-                header.into()
+                Header {
+                    metadata,
+                    counts: Default::default(),
+                }
+                .into()
             })
     }
 }
@@ -410,7 +421,7 @@ fn icann_answer(
         .chain(referral.delegation_signers.iter_mut())
         .chain(referral.glue.iter_mut())
     {
-        record.set_ttl(record.ttl().min(DEFAULT_RESOURCE_TTL));
+        record.ttl = record.ttl.min(DEFAULT_RESOURCE_TTL);
     }
     let apex = qname == owner;
     if apex && qtype == RecordType::DS {
@@ -855,7 +866,7 @@ mod tests {
 
         assert!(answer.authoritative);
         assert_eq!(answer.answers.len(), 1);
-        assert_eq!(answer.answers[0].data(), &RData::A(A::new(127, 0, 0, 1)));
+        assert_eq!(answer.answers[0].data, RData::A(A::new(127, 0, 0, 1)));
     }
 
     #[test]
@@ -881,10 +892,10 @@ mod tests {
         );
         assert!(answer.answers.iter().any(|record| {
             matches!(
-                record.data(),
+                &record.data,
                 RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
-                    if rrsig.type_covered() == RecordType::DNSKEY
-                        && rrsig.key_tag() == 35_215
+                    if rrsig.input().type_covered == RecordType::DNSKEY
+                        && rrsig.input().key_tag == 35_215
             )
         }));
     }
@@ -906,16 +917,16 @@ mod tests {
             .any(|record| record.record_type() == RecordType::NS));
         assert!(answer.authorities.iter().any(|record| {
             matches!(
-                record.data(),
+                &record.data,
                 RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
-                    if rrsig.type_covered() == RecordType::NSEC
+                    if rrsig.input().type_covered == RecordType::NSEC
             )
         }));
         assert!(!answer.authorities.iter().any(|record| {
             matches!(
-                record.data(),
+                &record.data,
                 RData::DNSSEC(DNSSECRData::RRSIG(rrsig))
-                    if rrsig.type_covered() == RecordType::NS
+                    if rrsig.input().type_covered == RecordType::NS
             )
         }));
     }
@@ -934,7 +945,7 @@ mod tests {
         assert!(answer
             .additionals
             .iter()
-            .any(|record| record.data() == &RData::A(A::new(127, 0, 0, 1))));
+            .any(|record| record.data == RData::A(A::new(127, 0, 0, 1))));
     }
 
     #[tokio::test]

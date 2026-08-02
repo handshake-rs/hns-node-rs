@@ -2,7 +2,7 @@ name: hns-node-rs
 
 services:
   hsrd:
-    image: ${HSRD_IMAGE:-ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.2}
+    image: ${HSRD_IMAGE:-ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.3}
     restart: unless-stopped
     stop_grace_period: 2m
     read_only: true

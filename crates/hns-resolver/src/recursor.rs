@@ -10,27 +10,25 @@ use std::{
 
 use async_trait::async_trait;
 use hickory_server::{
-    authority::{
-        Authority, AuthorityObject, Catalog, LookupControlFlow, LookupError, LookupObject,
-        LookupOptions, MessageRequest, Nsec3QueryInfo, UpdateResult, ZoneType,
-    },
     dnssec::NxProofKind,
+    net::{runtime::TokioRuntimeProvider, NetError},
     proto::{
         op::{Query, ResponseCode},
-        rr::{LowerName, Name, Record, RecordType},
-        xfer::Protocol,
+        rr::{LowerName, Name, RecordType, TSigResponseContext},
     },
-    recursor::{DnssecPolicy, Recursor},
     resolver::{
-        config::{NameServerConfig, NameServerConfigGroup},
-        dns_lru::TtlConfig,
-        lookup::Lookup,
+        config::{ConnectionConfig, ResolverOpts},
+        recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorOptions},
+        ConnectionProvider, PoolContext, TtlConfig,
     },
-    server::RequestInfo,
-    ServerFuture,
+    server::{Request, RequestInfo},
+    zone_handler::{
+        AuthLookup, AxfrPolicy, Catalog, LookupControlFlow, LookupError, LookupOptions,
+        Nsec3QueryInfo, ZoneHandler, ZoneType,
+    },
+    Server,
 };
 use hns_rpc::{RpcDnsContext, RpcDnsResource};
-use ipnet::IpNet;
 use tokio::{
     net::TcpListener,
     net::UdpSocket,
@@ -42,6 +40,52 @@ use crate::{
     dnssec::RootDnssec, HandshakeRoot, IcannLookup, NameResourceSource, ValidatingIcann,
     DEFAULT_ICANN_ROOT_SERVERS,
 };
+
+const TCP_RESPONSE_BUFFER_SIZE: usize = 128;
+
+type HnsRecursor = Recursor<InternalRootProvider>;
+
+/// Hickory 0.26 accepts root hints as IP addresses and normally connects to
+/// port 53. The Handshake root authority is intentionally private and bound to
+/// an ephemeral loopback port, so this provider rewrites only that root-hint
+/// endpoint while preserving Hickory's maintained transport implementation.
+#[derive(Clone)]
+struct InternalRootProvider {
+    runtime: TokioRuntimeProvider,
+    root_addr: SocketAddr,
+}
+
+impl InternalRootProvider {
+    fn new(root_addr: SocketAddr) -> Self {
+        Self {
+            runtime: TokioRuntimeProvider::default(),
+            root_addr,
+        }
+    }
+}
+
+impl ConnectionProvider for InternalRootProvider {
+    type Conn = <TokioRuntimeProvider as ConnectionProvider>::Conn;
+    type FutureConn = <TokioRuntimeProvider as ConnectionProvider>::FutureConn;
+    type RuntimeProvider = TokioRuntimeProvider;
+
+    fn new_connection(
+        &self,
+        ip: IpAddr,
+        config: &ConnectionConfig,
+        context: &PoolContext,
+    ) -> Result<Self::FutureConn, NetError> {
+        let mut config = config.clone();
+        if ip == self.root_addr.ip() && config.port == 53 {
+            config.port = self.root_addr.port();
+        }
+        self.runtime.new_connection(ip, &config, context)
+    }
+
+    fn runtime_provider(&self) -> &Self::RuntimeProvider {
+        &self.runtime
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ResolverConfig {
@@ -133,10 +177,10 @@ impl ChainGate {
 pub struct ResolverRuntime {
     pub listen_addr: SocketAddr,
     pub internal_root_addr: SocketAddr,
-    root: ServerFuture<HandshakeRoot>,
-    public: ServerFuture<Catalog>,
+    root: Server<HandshakeRoot>,
+    public: Server<Catalog>,
     source: Arc<dyn NameResourceSource>,
-    recursor: Arc<RwLock<Arc<Recursor>>>,
+    recursor: Arc<RwLock<Arc<HnsRecursor>>>,
     gate: Arc<ChainGate>,
     config: ResolverConfig,
     initial_identity: Option<ChainIdentity>,
@@ -198,9 +242,13 @@ impl ResolverRuntime {
             )?);
             root_handler = root_handler.with_icann(icann);
         }
-        let mut root = ServerFuture::new(root_handler);
+        let mut root = Server::new(root_handler);
         root.register_socket(root_udp);
-        root.register_listener(root_tcp, config.tcp_request_timeout);
+        root.register_listener(
+            root_tcp,
+            config.tcp_request_timeout,
+            TCP_RESPONSE_BUFFER_SIZE,
+        );
 
         let recursor = Arc::new(build_recursor(internal_root_addr, &config)?);
         let recursor = Arc::new(RwLock::new(recursor));
@@ -213,15 +261,19 @@ impl ResolverRuntime {
         let mut catalog = Catalog::new();
         catalog.upsert(
             LowerName::from(Name::root()),
-            vec![Arc::new(authority) as Arc<dyn AuthorityObject>],
+            vec![Arc::new(authority) as Arc<dyn ZoneHandler>],
         );
 
         let public_tcp = TcpListener::bind(config.listen).await?;
         let listen_addr = public_tcp.local_addr()?;
         let public_udp = UdpSocket::bind(listen_addr).await?;
-        let mut public = ServerFuture::new(catalog);
+        let mut public = Server::new(catalog);
         public.register_socket(public_udp);
-        public.register_listener(public_tcp, config.tcp_request_timeout);
+        public.register_listener(
+            public_tcp,
+            config.tcp_request_timeout,
+            TCP_RESPONSE_BUFFER_SIZE,
+        );
 
         Ok(Self {
             listen_addr,
@@ -270,44 +322,38 @@ impl ResolverRuntime {
 fn build_recursor(
     internal_root_addr: SocketAddr,
     config: &ResolverConfig,
-) -> anyhow::Result<Recursor> {
-    let mut roots = NameServerConfigGroup::new();
-    for protocol in [Protocol::Udp, Protocol::Tcp] {
-        roots.push(NameServerConfig {
-            socket_addr: internal_root_addr,
-            protocol,
-            tls_dns_name: None,
-            http_endpoint: None,
-            trust_negative_responses: false,
-            bind_addr: None,
-        });
+) -> anyhow::Result<HnsRecursor> {
+    let mut resolver_options = ResolverOpts::default();
+    resolver_options.positive_max_ttl = Some(config.maximum_positive_ttl);
+    resolver_options.negative_max_ttl = Some(config.maximum_negative_ttl);
+    let mut options = RecursorOptions {
+        ns_cache_size: config.name_server_cache_size,
+        response_cache_size: u64::try_from(config.record_cache_size)
+            .map_err(|_| anyhow::anyhow!("resolver record cache size exceeds u64"))?,
+        recursion_limit: config.recursion_limit,
+        ns_recursion_limit: config.name_server_recursion_limit,
+        cache_policy: TtlConfig::from_opts(&resolver_options),
+        case_randomization: true,
+        ..RecursorOptions::default()
+    };
+    if !config.deny_private_name_servers {
+        options.deny_server.clear();
     }
-    let mut builder = Recursor::builder()
-        .ns_cache_size(config.name_server_cache_size)
-        .record_cache_size(config.record_cache_size)
-        .recursion_limit(Some(config.recursion_limit))
-        .ns_recursion_limit(Some(config.name_server_recursion_limit))
-        .ttl_config(TtlConfig::new(
-            None,
-            None,
-            Some(config.maximum_positive_ttl),
-            Some(config.maximum_negative_ttl),
-        ))
-        .dnssec_policy(DnssecPolicy::ValidateWithStaticKey {
-            trust_anchor: Some(RootDnssec::trust_anchors()),
-        })
-        .case_randomization(true);
-    if config.deny_private_name_servers {
-        let allow = Vec::<IpNet>::new();
-        let deny = Vec::<IpNet>::new();
-        builder = builder.nameserver_filter(allow.iter(), deny.iter());
-    }
-    builder.build(roots).map_err(anyhow::Error::from)
+    let mut dnssec = DnssecConfig::default();
+    dnssec.trust_anchor = Some(RootDnssec::trust_anchors());
+    Recursor::new(
+        &[internal_root_addr.ip()],
+        DnssecPolicy::ValidateWithStaticKey(dnssec),
+        None,
+        options,
+        InternalRootProvider::new(internal_root_addr),
+    )
+    .map_err(anyhow::Error::from)
 }
 
 async fn monitor_chain_state(
     source: Arc<dyn NameResourceSource>,
-    recursor: Arc<RwLock<Arc<Recursor>>>,
+    recursor: Arc<RwLock<Arc<HnsRecursor>>>,
     gate: Arc<ChainGate>,
     internal_root_addr: SocketAddr,
     config: ResolverConfig,
@@ -347,25 +393,23 @@ async fn monitor_chain_state(
 
 struct RecursiveAuthority {
     origin: LowerName,
-    recursor: Arc<RwLock<Arc<Recursor>>>,
+    recursor: Arc<RwLock<Arc<HnsRecursor>>>,
     capacity: Arc<Semaphore>,
     gate: Arc<ChainGate>,
 }
 
 #[async_trait]
-impl Authority for RecursiveAuthority {
-    type Lookup = RecursiveLookup;
-
+impl ZoneHandler for RecursiveAuthority {
     fn zone_type(&self) -> ZoneType {
         ZoneType::External
     }
 
-    fn is_axfr_allowed(&self) -> bool {
-        false
+    fn axfr_policy(&self) -> AxfrPolicy {
+        AxfrPolicy::Deny
     }
 
-    async fn update(&self, _update: &MessageRequest) -> UpdateResult<bool> {
-        Err(ResponseCode::NotImp)
+    fn can_validate_dnssec(&self) -> bool {
+        true
     }
 
     fn origin(&self) -> &LowerName {
@@ -376,8 +420,9 @@ impl Authority for RecursiveAuthority {
         &self,
         name: &LowerName,
         record_type: RecordType,
+        _request_info: Option<&RequestInfo<'_>>,
         lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         if !self.gate.ready.load(Ordering::Acquire) {
             return LookupControlFlow::Continue(Err(LookupError::ResponseCode(
                 ResponseCode::ServFail,
@@ -395,7 +440,7 @@ impl Authority for RecursiveAuthority {
         };
         let query = Query::query(name.into(), record_type);
         let result = recursor
-            .resolve(query, Instant::now(), lookup_options.dnssec_ok())
+            .resolve(query, Instant::now(), lookup_options.dnssec_ok)
             .await;
         if !self.gate.ready.load(Ordering::Acquire)
             || self.gate.generation.load(Ordering::Acquire) != generation
@@ -405,38 +450,45 @@ impl Authority for RecursiveAuthority {
             )));
         }
         match result {
-            Ok(lookup) => LookupControlFlow::Continue(Ok(RecursiveLookup(lookup))),
+            Ok(response) => LookupControlFlow::Continue(Ok(AuthLookup::Response(response))),
             Err(error) => LookupControlFlow::Continue(Err(LookupError::from(error))),
         }
     }
 
     async fn search(
         &self,
-        request: RequestInfo<'_>,
+        request: &Request,
         lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
-        Authority::lookup(
-            self,
-            request.query.name(),
-            request.query.query_type(),
-            lookup_options,
+    ) -> (LookupControlFlow<AuthLookup>, Option<TSigResponseContext>) {
+        let request_info = match request.request_info() {
+            Ok(info) => info,
+            Err(error) => return (LookupControlFlow::Break(Err(error)), None),
+        };
+        (
+            self.lookup(
+                request_info.query.name(),
+                request_info.query.query_type(),
+                Some(&request_info),
+                lookup_options,
+            )
+            .await,
+            None,
         )
-        .await
     }
 
-    async fn get_nsec_records(
+    async fn nsec_records(
         &self,
         _name: &LowerName,
         _lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         LookupControlFlow::Continue(Err(LookupError::ResponseCode(ResponseCode::NotImp)))
     }
 
-    async fn get_nsec3_records(
+    async fn nsec3_records(
         &self,
         _info: Nsec3QueryInfo<'_>,
         _lookup_options: LookupOptions,
-    ) -> LookupControlFlow<Self::Lookup> {
+    ) -> LookupControlFlow<AuthLookup> {
         LookupControlFlow::Continue(Err(LookupError::ResponseCode(ResponseCode::NotImp)))
     }
 
@@ -445,27 +497,11 @@ impl Authority for RecursiveAuthority {
     }
 }
 
-struct RecursiveLookup(Lookup);
-
-impl LookupObject for RecursiveLookup {
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Record> + Send + 'a> {
-        Box::new(self.0.record_iter())
-    }
-
-    fn take_additionals(&mut self) -> Option<Box<dyn LookupObject>> {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::BackendError;
-    use hickory_server::proto::op::Message;
+    use hickory_server::proto::op::{Message, MessageType, OpCode};
     use hns_rpc::{RpcDnsContext, RpcDnsResource};
     use std::sync::atomic::AtomicU64;
     use tokio::{sync::oneshot, time::timeout};
@@ -540,9 +576,8 @@ mod tests {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind client");
-        let mut query = Message::new();
-        query.set_id(id);
-        query.set_recursion_desired(true);
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query.metadata.recursion_desired = true;
         query.add_query(Query::query(
             Name::from_ascii(name).expect("query name"),
             record_type,
@@ -552,7 +587,7 @@ mod tests {
             .await
             .expect("send query");
         let mut buffer = [0; 1_232];
-        let (length, _) = timeout(Duration::from_secs(3), socket.recv_from(&mut buffer))
+        let (length, _) = timeout(Duration::from_secs(10), socket.recv_from(&mut buffer))
             .await
             .expect("DNS response timeout")
             .expect("receive response");
@@ -595,9 +630,9 @@ mod tests {
 
         let response = udp_response(listen, 77).await;
 
-        assert_eq!(response.id(), 77);
-        assert_eq!(response.response_code(), ResponseCode::NXDomain);
-        assert!(response.recursion_available());
+        assert_eq!(response.id, 77);
+        assert_eq!(response.response_code, ResponseCode::NXDomain);
+        assert!(response.recursion_available);
         shutdown_send.send(()).expect("request shutdown");
         timeout(Duration::from_secs(3), server)
             .await
@@ -633,7 +668,7 @@ mod tests {
         }));
 
         assert_eq!(
-            udp_response(listen, 78).await.response_code(),
+            udp_response(listen, 78).await.response_code,
             ResponseCode::NXDomain
         );
         assert_eq!(source.missing_lookups.load(Ordering::Relaxed), 1);
@@ -642,7 +677,7 @@ mod tests {
         let probes = source.probes.load(Ordering::Acquire);
         wait_for_probe_after(&source, probes).await;
         assert_eq!(
-            udp_response(listen, 79).await.response_code(),
+            udp_response(listen, 79).await.response_code,
             ResponseCode::ServFail
         );
         assert_eq!(source.missing_lookups.load(Ordering::Relaxed), 1);
@@ -651,7 +686,7 @@ mod tests {
         let probes = source.probes.load(Ordering::Acquire);
         wait_for_probe_after(&source, probes).await;
         assert_eq!(
-            udp_response(listen, 80).await.response_code(),
+            udp_response(listen, 80).await.response_code,
             ResponseCode::NXDomain
         );
         assert_eq!(source.missing_lookups.load(Ordering::Relaxed), 2);
@@ -667,6 +702,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live ICANN DNS connectivity"]
     async fn udp_daemon_resolves_through_validated_icann_fallback() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("hickory_resolver=info,hickory_server=info,hns_resolver=trace")
+            .with_test_writer()
+            .try_init();
         let runtime = ResolverRuntime::bind(
             Arc::new(MissingSource),
             ResolverConfig {
@@ -687,9 +726,9 @@ mod tests {
         }));
 
         let response = udp_query(listen, 81, "example.com.", RecordType::A).await;
-        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.response_code, ResponseCode::NoError);
         assert!(response
-            .answers()
+            .answers
             .iter()
             .any(|record| record.record_type() == RecordType::A));
 

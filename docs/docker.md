@@ -4,11 +4,11 @@ The release image is published as a multi-platform OCI image for
 `linux/amd64` (x86_64) and `linux/arm64` (AArch64):
 
 ```sh
-docker pull ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.2
+docker pull ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.3
 ```
 
-Docker selects the matching platform automatically. The v0.3.2 prerelease
-publishes only the exact `canary-v0.3.2` tag. Stable releases publish the exact
+Docker selects the matching platform automatically. The v0.3.3 prerelease
+publishes only the exact `canary-v0.3.3` tag. Stable releases publish the exact
 version, minor-version, and `latest` tags. Production deployments should pin
 the manifest digest recorded by the release workflow:
 
@@ -30,7 +30,7 @@ docker compose logs --follow hsrd
 ```
 
 The checked-in Compose configuration defaults to
-`ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.2` for this prerelease. Override
+`ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.3` for this prerelease. Override
 `HSRD_IMAGE` with an immutable manifest digest for a pinned deployment.
 
 The Compose service runs as UID/GID 10001, drops every Linux capability, uses
@@ -121,7 +121,7 @@ GitHub artifact attestation for the final manifest. Verify the latter with:
 
 ```sh
 gh attestation verify \
-  oci://ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.2 \
+  oci://ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.3 \
   --repo handshake-rs/hns-node-rs
 ```
 

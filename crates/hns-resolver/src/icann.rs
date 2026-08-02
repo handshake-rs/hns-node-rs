@@ -7,20 +7,24 @@ use std::{
 
 use async_trait::async_trait;
 use hickory_server::{
+    net::runtime::TokioRuntimeProvider,
     proto::{
         dnssec::Proof,
-        op::Query,
+        op::{Message, Query},
         rr::{Name, RData, Record, RecordType},
     },
-    recursor::{DnssecPolicy, Recursor},
-    resolver::{config::NameServerConfigGroup, dns_lru::TtlConfig},
+    resolver::{
+        config::ResolverOpts,
+        recursor::{DnssecConfig, DnssecPolicy, Recursor, RecursorOptions},
+        TtlConfig,
+    },
 };
-use ipnet::IpNet;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const MAX_REFERRAL_RECORDS: usize = 256;
 const MAX_ROOT_SERVERS: usize = 64;
 const MAX_NAME_SERVERS: usize = 32;
+const MAX_GLUE_NAME_SERVERS: usize = 4;
 
 /// Current InterNIC root hints. Operators can override this list without
 /// rebuilding; it is deliberately kept independent of the OS resolver.
@@ -65,7 +69,7 @@ pub trait IcannLookup: Send + Sync {
 }
 
 pub struct ValidatingIcann {
-    recursor: Arc<Recursor>,
+    recursor: Arc<Recursor<TokioRuntimeProvider>>,
     capacity: Arc<Semaphore>,
     timeout: Duration,
 }
@@ -95,29 +99,31 @@ impl ValidatingIcann {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let roots = NameServerConfigGroup::from_ips_clear(&root_servers, 53, true);
-        let allow = Vec::<IpNet>::new();
-        let deny = Vec::<IpNet>::new();
-        let recursor = Recursor::builder()
-            .ns_cache_size((cache_size / 4).max(1))
-            .record_cache_size(cache_size)
-            .recursion_limit(Some(12))
-            .ns_recursion_limit(Some(16))
-            .ttl_config(TtlConfig::new(
-                None,
-                None,
-                Some(Duration::from_secs(30 * 60)),
-                Some(Duration::from_secs(5 * 60)),
-            ))
-            .dnssec_policy(DnssecPolicy::ValidateWithStaticKey {
-                // Hickory's default anchors contain both IANA KSK-2017 and
-                // the pre-published KSK-2024 rollover key.
-                trust_anchor: None,
-            })
-            .nameserver_filter(allow.iter(), deny.iter())
-            .case_randomization(true)
-            .build(roots)
-            .map_err(|error| anyhow::anyhow!("could not build ICANN recursor: {error}"))?;
+        let mut resolver_options = ResolverOpts::default();
+        resolver_options.positive_max_ttl = Some(Duration::from_secs(30 * 60));
+        resolver_options.negative_max_ttl = Some(Duration::from_secs(5 * 60));
+        let options = RecursorOptions {
+            ns_cache_size: (cache_size / 4).max(1),
+            response_cache_size: u64::try_from(cache_size)
+                .map_err(|_| anyhow::anyhow!("ICANN cache size exceeds u64"))?,
+            recursion_limit: 12,
+            ns_recursion_limit: 16,
+            cache_policy: TtlConfig::from_opts(&resolver_options),
+            case_randomization: true,
+            ..RecursorOptions::default()
+        };
+        let mut dnssec = DnssecConfig::default();
+        // Hickory's default anchors contain both IANA KSK-2017 and the
+        // pre-published KSK-2024 rollover key.
+        dnssec.trust_anchor = None;
+        let recursor = Recursor::new(
+            &root_servers,
+            DnssecPolicy::ValidateWithStaticKey(dnssec),
+            None,
+            options,
+            TokioRuntimeProvider::default(),
+        )
+        .map_err(|error| anyhow::anyhow!("could not build ICANN recursor: {error}"))?;
         Ok(Self {
             recursor: Arc::new(recursor),
             capacity: Arc::new(Semaphore::new(maximum_concurrent_queries)),
@@ -158,8 +164,9 @@ impl ValidatingIcann {
     async fn resolve_referral(&self, tld: &Name) -> Result<IcannReferral, IcannError> {
         let ns_lookup = self.resolve(tld, RecordType::NS).await?;
         let name_servers = ns_lookup
-            .record_iter()
-            .filter(|record| record.name() == tld && record.record_type() == RecordType::NS)
+            .answers
+            .iter()
+            .filter(|record| record.name == *tld && record.record_type() == RecordType::NS)
             .cloned()
             .collect::<Vec<_>>();
         if name_servers.is_empty() || name_servers.len() > MAX_NAME_SERVERS {
@@ -167,7 +174,7 @@ impl ValidatingIcann {
         }
         if name_servers
             .iter()
-            .any(|record| matches!(record.proof(), Proof::Bogus | Proof::Indeterminate))
+            .any(|record| matches!(record.proof, Proof::Bogus | Proof::Indeterminate))
         {
             return Err(IcannError::Invalid("TLD NS RRset was not validated"));
         }
@@ -183,8 +190,9 @@ impl ValidatingIcann {
         {
             Ok(lookup) => {
                 let records = lookup
-                    .record_iter()
-                    .filter(|record| record.name() == tld && record.record_type() == RecordType::DS)
+                    .answers
+                    .iter()
+                    .filter(|record| record.name == *tld && record.record_type() == RecordType::DS)
                     .cloned()
                     .collect::<Vec<_>>();
                 if records.is_empty() {
@@ -200,13 +208,17 @@ impl ValidatingIcann {
             Err(error) => return Err(IcannError::Query(error.to_string())),
         };
 
-        let targets = name_servers
+        let mut targets = name_servers
             .iter()
-            .filter_map(|record| match record.data() {
+            .filter_map(|record| match &record.data {
                 RData::NS(target) => Some(target.0.clone()),
                 _ => None,
             })
-            .collect::<HashSet<_>>();
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        targets.truncate(MAX_GLUE_NAME_SERVERS);
         let mut lookups = JoinSet::new();
         for target in targets {
             for record_type in [RecordType::A, RecordType::AAAA] {
@@ -224,7 +236,8 @@ impl ValidatingIcann {
             if let Ok(Ok(lookup)) = result {
                 glue.extend(
                     lookup
-                        .record_iter()
+                        .answers
+                        .iter()
                         .filter(|record| {
                             matches!(record.record_type(), RecordType::A | RecordType::AAAA)
                         })
@@ -242,11 +255,7 @@ impl ValidatingIcann {
         )
     }
 
-    async fn resolve(
-        &self,
-        name: &Name,
-        record_type: RecordType,
-    ) -> Result<hickory_server::resolver::lookup::Lookup, IcannError> {
+    async fn resolve(&self, name: &Name, record_type: RecordType) -> Result<Message, IcannError> {
         self.recursor
             .resolve(
                 Query::query(name.clone(), record_type),
@@ -272,16 +281,16 @@ fn validate_referral(
 
     let mut targets = HashSet::new();
     for record in &name_servers {
-        if record.name() != tld || record.record_type() != RecordType::NS {
+        if record.name != *tld || record.record_type() != RecordType::NS {
             return Err(IcannError::Invalid(
                 "referral NS owner does not match the TLD",
             ));
         }
-        let RData::NS(target) = record.data() else {
+        let RData::NS(target) = &record.data else {
             return Err(IcannError::Invalid("referral contains malformed NS data"));
         };
         targets.insert(target.0.clone());
-        if matches!(record.proof(), Proof::Bogus | Proof::Indeterminate) {
+        if matches!(record.proof, Proof::Bogus | Proof::Indeterminate) {
             return Err(IcannError::Invalid("TLD NS RRset was not validated"));
         }
     }
@@ -296,9 +305,9 @@ fn validate_referral(
             ));
         }
     } else if delegation_signers.iter().any(|record| {
-        record.name() != tld
+        record.name != *tld
             || record.record_type() != RecordType::DS
-            || record.proof() != Proof::Secure
+            || record.proof != Proof::Secure
     }) {
         return Err(IcannError::Invalid("delegation DS RRset is not secure"));
     }
@@ -306,9 +315,9 @@ fn validate_referral(
     let glue = glue
         .into_iter()
         .filter(|record| {
-            targets.contains(record.name())
+            targets.contains(&record.name)
                 && matches!(record.record_type(), RecordType::A | RecordType::AAAA)
-                && matches!(record.proof(), Proof::Secure | Proof::Insecure)
+                && matches!(record.proof, Proof::Secure | Proof::Insecure)
         })
         .collect();
 
@@ -331,9 +340,9 @@ mod tests {
         let owner = Name::from_ascii("com.").expect("owner");
         let target = Name::from_ascii("a.gtld-servers.net.").expect("target");
         let mut ns = Record::from_rdata(owner.clone(), 86_400, RData::NS(NS(target.clone())));
-        ns.set_proof(Proof::Secure);
+        ns.proof = Proof::Secure;
         let mut glue = Record::from_rdata(target, 86_400, RData::A(A::new(192, 5, 6, 30)));
-        glue.set_proof(Proof::Secure);
+        glue.proof = Proof::Secure;
         (owner, vec![ns], vec![glue])
     }
 
@@ -380,7 +389,7 @@ mod tests {
                 vec![7; 32],
             ))),
         );
-        ds.set_proof(Proof::Bogus);
+        ds.proof = Proof::Bogus;
         assert!(matches!(
             validate_referral(&owner, ns, vec![ds], glue, false),
             Err(IcannError::Invalid("delegation DS RRset is not secure"))
