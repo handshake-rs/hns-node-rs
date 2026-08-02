@@ -1961,6 +1961,7 @@ pub struct NodeService {
     state: NodeState,
     mining_events: MiningEventHub,
     mining_engine_templates: Arc<Mutex<TemplateCoordinator>>,
+    mempool_name_context: Mutex<mining_engine::ActiveMempoolNameCache>,
     claim_dnssec: OpenSslDnssecVerifier,
     airdrop_signatures: NativeAirdropSignatureVerifier,
 }
@@ -3657,6 +3658,7 @@ impl NodeService {
             state,
             mining_events,
             mining_engine_templates,
+            mempool_name_context: Mutex::new(mining_engine::ActiveMempoolNameCache::default()),
             claim_dnssec: OpenSslDnssecVerifier,
             airdrop_signatures,
         })

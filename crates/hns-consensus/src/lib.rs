@@ -46,13 +46,15 @@ pub use name::{
     verify_renewal_commitment, NameContext, NameFlags, NameMutation, NameParams, ReservedName,
 };
 pub use script::{
-    count_script_sigops, transaction_sigops, verify_witness_program, witness_program_sigops,
-    NativeSignatureVerifier, ScriptError, ScriptFlags, SignatureVerifier,
-    UnavailableSignatureVerifier, WitnessProgramVerifier,
+    count_script_sigops, transaction_sigops, verify_witness_program,
+    verify_witness_program_with_cache, witness_program_sigops, NativeSignatureVerifier,
+    ScriptError, ScriptFlags, SignatureVerifier, UnavailableSignatureVerifier,
+    WitnessProgramVerifier,
 };
 pub use sighash::{
-    is_valid_signature_hash_type, signature_hash, SIGHASH_ALL, SIGHASH_ANYONE_CAN_PAY,
-    SIGHASH_BASE_MASK, SIGHASH_NOINPUT, SIGHASH_NONE, SIGHASH_SINGLE, SIGHASH_SINGLE_REVERSE,
+    is_valid_signature_hash_type, signature_hash, SignatureHashCache, SIGHASH_ALL,
+    SIGHASH_ANYONE_CAN_PAY, SIGHASH_BASE_MASK, SIGHASH_NOINPUT, SIGHASH_NONE, SIGHASH_SINGLE,
+    SIGHASH_SINGLE_REVERSE,
 };
 
 pub const COIN: Amount = 1_000_000;
@@ -580,6 +582,18 @@ pub trait TransactionInputVerifier: Send + Sync {
         input_index: usize,
         coin: &Coin,
     ) -> Result<(), ConsensusError>;
+
+    /// Verify one input while sharing transaction-wide signature-hash
+    /// aggregates across every input and sigop in the transaction. Custom
+    /// verifiers retain source compatibility through the one-input fallback.
+    fn verify_input_with_cache(
+        &self,
+        cache: &SignatureHashCache<'_>,
+        input_index: usize,
+        coin: &Coin,
+    ) -> Result<(), ConsensusError> {
+        self.verify_input(cache.transaction(), input_index, coin)
+    }
 
     /// Whether this verifier represents a complete production consensus path.
     /// Fail-closed placeholders and test doubles must retain the default `false`.

@@ -29,13 +29,13 @@ pub use segment::{
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt,
     marker::PhantomData,
     path::{Path, PathBuf},
     rc::Rc,
     str::FromStr,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -466,7 +466,7 @@ fn accumulate_filesystem_tree_usage(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum ColumnFamily {
     Meta,
     Headers,
@@ -703,7 +703,7 @@ pub trait Store {
 /// Read-your-writes overlay for staging one atomic multi-step mutation against
 /// a single immutable base snapshot. The wrapped batch is committed only after
 /// every staged operation has validated successfully.
-type StagedChanges = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
+type StagedChanges = HashMap<ColumnFamily, BTreeMap<Vec<u8>, Option<Vec<u8>>>>;
 type SharedStagedChanges = Rc<RefCell<StagedChanges>>;
 type NameNodeReadCache = HashMap<Vec<u8>, Vec<u8>>;
 type StatePointReadCache = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
@@ -965,6 +965,95 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
         }
 
         Ok(entries.into_iter().collect())
+    }
+
+    fn scan_prefix_page(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        budget: PrefixScanBudget,
+    ) -> Result<PrefixScanPage, StoreError> {
+        let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
+        let changes = self.changes.borrow();
+        let Some(changes) = changes.get(&family) else {
+            return self
+                .base
+                .scan_prefix_page(family, prefix, start_after, budget);
+        };
+
+        let start = start_after.unwrap_or(prefix).to_vec();
+        let mut staged = changes
+            .range(start..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .filter(|(key, _)| start_after.is_none_or(|cursor| key.as_slice() > cursor))
+            .peekable();
+        let mut base_entries = VecDeque::<ScanEntry>::new();
+        let mut base_cursor = start_after.map(<[u8]>::to_vec);
+        let mut base_complete = false;
+        let base_budget = PrefixScanBudget {
+            // One merge lookahead never needs to materialize more base keys
+            // than the caller could return in this page. Keep the maximum byte
+            // allowance so a staged delete can suppress an oversized base
+            // value without producing a false page-budget rejection.
+            max_entries: budget.max_entries,
+            max_bytes: PREFIX_SCAN_MAX_BYTES,
+        };
+        let mut page = PrefixScanPage::default();
+
+        loop {
+            if base_entries.is_empty() && !base_complete {
+                let raw = self.base.scan_prefix_page(
+                    family,
+                    prefix,
+                    base_cursor.as_deref(),
+                    base_budget,
+                )?;
+                if raw.entries.is_empty() && raw.continuation.is_some() {
+                    return Err(StoreError::Backend(
+                        "prefix page continuation did not advance".to_owned(),
+                    ));
+                }
+                base_cursor = raw.continuation.clone();
+                base_complete = raw.continuation.is_none();
+                base_entries = raw.entries.into();
+                if base_entries.is_empty() && !base_complete {
+                    continue;
+                }
+            }
+
+            let ordering = match (base_entries.front(), staged.peek()) {
+                (Some((base_key, _)), Some((staged_key, _))) => {
+                    Some(base_key.as_slice().cmp(staged_key.as_slice()))
+                }
+                (Some(_), None) => Some(std::cmp::Ordering::Less),
+                (None, Some(_)) => Some(std::cmp::Ordering::Greater),
+                (None, None) if base_complete => None,
+                (None, None) => continue,
+            };
+            let Some(ordering) = ordering else {
+                return Ok(page);
+            };
+
+            let candidate = match ordering {
+                std::cmp::Ordering::Less => base_entries.pop_front(),
+                std::cmp::Ordering::Equal => {
+                    base_entries.pop_front();
+                    staged.next().and_then(|(key, value)| {
+                        value.as_ref().map(|value| (key.clone(), value.clone()))
+                    })
+                }
+                std::cmp::Ordering::Greater => staged.next().and_then(|(key, value)| {
+                    value.as_ref().map(|value| (key.clone(), value.clone()))
+                }),
+            };
+            let Some((key, value)) = candidate else {
+                continue;
+            };
+            if !push_bounded_scan_entry(&mut page, &key, &value, budget)? {
+                return Ok(page);
+            }
+        }
     }
 
     fn prefetch_name_tree_paths(
@@ -3420,7 +3509,7 @@ impl WriteBatch for StoreHandleBatch {
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
-    inner: Arc<RwLock<HashMap<StoreKey, Vec<u8>>>>,
+    inner: Arc<RwLock<MemoryStoreState>>,
 }
 
 impl MemoryStore {
@@ -3434,13 +3523,24 @@ impl Store for MemoryStore {
     type Batch = MemoryBatch;
 
     fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
-        let data = self
-            .inner
-            .read()
-            .map_err(|_| StoreError::Io("memory store read lock poisoned".to_owned()))?
-            .clone();
-
-        Ok(MemorySnapshot { data })
+        let generation = {
+            let mut state = self
+                .inner
+                .write()
+                .map_err(|_| StoreError::Io("memory store write lock poisoned".to_owned()))?;
+            let generation = state.generation;
+            let active = state.active_snapshots.entry(generation).or_default();
+            *active = active.saturating_add(1);
+            generation
+        };
+        Ok(MemorySnapshot {
+            inner: Arc::clone(&self.inner),
+            generation,
+            lease: Arc::new(MemorySnapshotLease {
+                generation,
+                inner: Arc::downgrade(&self.inner),
+            }),
+        })
     }
 
     fn batch(&self) -> Self::Batch {
@@ -3448,34 +3548,125 @@ impl Store for MemoryStore {
     }
 
     fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
-        let mut data = self
-            .inner
-            .write()
-            .map_err(|_| StoreError::Io("memory store write lock poisoned".to_owned()))?;
-
+        let mut changes = BTreeMap::<StoreKey, Option<Vec<u8>>>::new();
         for operation in batch.operations {
             match operation {
                 MemoryOperation::Put { key, value } => {
-                    data.insert(key, value);
+                    changes.insert(key, Some(value));
                 }
                 MemoryOperation::Delete { key } => {
-                    data.remove(&key);
+                    changes.insert(key, None);
                 }
             }
         }
+        if changes.is_empty() {
+            return Ok(());
+        }
 
+        let mut state = self
+            .inner
+            .write()
+            .map_err(|_| StoreError::Io("memory store write lock poisoned".to_owned()))?;
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Schema("memory store generation exhausted".to_owned()))?;
+        let oldest_snapshot = state
+            .active_snapshots
+            .first_key_value()
+            .map(|(value, _)| *value);
+        let change_count = changes.len();
+        let mut gc_candidates = Vec::with_capacity(change_count);
+
+        for (key, value) in changes {
+            if oldest_snapshot.is_none() {
+                match value {
+                    Some(value) => {
+                        state.data.insert(
+                            key,
+                            vec![MemoryVersion {
+                                generation,
+                                value: Some(value),
+                            }],
+                        );
+                    }
+                    None => {
+                        state.data.remove(&key);
+                    }
+                }
+                continue;
+            }
+            let history = state.data.entry(key.clone()).or_default();
+            compact_memory_history(history, oldest_snapshot);
+            history.push(MemoryVersion { generation, value });
+            gc_candidates.push(key);
+        }
+        state.generation = generation;
+        state.gc_candidates.extend(gc_candidates);
+        let gc_budget = change_count.saturating_add(64);
+        let pending_gc = (0..gc_budget)
+            .filter_map(|_| state.gc_candidates.pop_first())
+            .collect::<Vec<_>>();
+        for key in pending_gc {
+            let remove = state.data.get_mut(&key).is_some_and(|history| {
+                compact_memory_history(history, oldest_snapshot);
+                history.is_empty()
+            });
+            if remove {
+                state.data.remove(&key);
+            } else if state.data.get(&key).is_some_and(|history| {
+                history.len() > 1
+                    || history
+                        .last()
+                        .is_some_and(|version| version.value.is_none())
+            }) {
+                state.gc_candidates.insert(key);
+            }
+        }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MemorySnapshot {
-    data: HashMap<StoreKey, Vec<u8>>,
+    inner: Arc<RwLock<MemoryStoreState>>,
+    generation: u64,
+    #[allow(dead_code)]
+    lease: Arc<MemorySnapshotLease>,
 }
 
 impl ReadSnapshot for MemorySnapshot {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        Ok(self.data.get(&StoreKey::new(family, key)).cloned())
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| StoreError::Io("memory store read lock poisoned".to_owned()))?;
+        Ok(state
+            .data
+            .get(&StoreKey::new(family, key))
+            .and_then(|history| memory_value_at(history, self.generation))
+            .cloned())
+    }
+
+    fn get_many(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| StoreError::Io("memory store read lock poisoned".to_owned()))?;
+        Ok(keys
+            .iter()
+            .map(|key| {
+                state
+                    .data
+                    .get(&StoreKey::new(family, key))
+                    .and_then(|history| memory_value_at(history, self.generation))
+                    .cloned()
+            })
+            .collect())
     }
 
     fn scan_prefix(
@@ -3483,14 +3674,155 @@ impl ReadSnapshot for MemorySnapshot {
         family: ColumnFamily,
         prefix: &[u8],
     ) -> Result<Vec<ScanEntry>, StoreError> {
-        let mut entries = self
-            .data
-            .iter()
-            .filter(|(key, _)| key.family == family && key.key.starts_with(prefix))
-            .map(|(key, value)| (key.key.clone(), value.clone()))
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| StoreError::Io("memory store read lock poisoned".to_owned()))?;
+        let mut entries = Vec::new();
+        for (key, history) in state.data.range(StoreKey::new(family, prefix)..) {
+            if key.family != family || !key.key.starts_with(prefix) {
+                break;
+            }
+            if let Some(value) = memory_value_at(history, self.generation) {
+                entries.push((key.key.clone(), value.clone()));
+            }
+        }
         Ok(entries)
+    }
+
+    fn scan_prefix_page(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        budget: PrefixScanBudget,
+    ) -> Result<PrefixScanPage, StoreError> {
+        let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
+        let state = self
+            .inner
+            .read()
+            .map_err(|_| StoreError::Io("memory store read lock poisoned".to_owned()))?;
+        let start = start_after.unwrap_or(prefix);
+        let mut page = PrefixScanPage::default();
+        for (key, history) in state.data.range(StoreKey::new(family, start)..) {
+            if key.family != family || !key.key.starts_with(prefix) {
+                break;
+            }
+            if start_after.is_some_and(|cursor| key.key.as_slice() <= cursor) {
+                continue;
+            }
+            let Some(value) = memory_value_at(history, self.generation) else {
+                continue;
+            };
+            if !push_bounded_scan_entry(&mut page, &key.key, value, budget)? {
+                break;
+            }
+        }
+        Ok(page)
+    }
+
+    fn visit_prefix(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        visitor: &mut PrefixVisitor<'_>,
+    ) -> Result<(), StoreError> {
+        // A visitor may commit bounded work back to the same store. Copy one
+        // bounded immutable page at a time so no callback executes while the
+        // memory store's read lock is held.
+        let budget = PrefixScanBudget {
+            max_entries: PREFIX_SCAN_MAX_ENTRIES,
+            max_bytes: PREFIX_SCAN_MAX_BYTES,
+        };
+        let mut continuation = None::<Vec<u8>>;
+        loop {
+            let page = self.scan_prefix_page(family, prefix, continuation.as_deref(), budget)?;
+            for (key, value) in page.entries {
+                visitor(&key, &value)?;
+            }
+            let Some(next) = page.continuation else {
+                break;
+            };
+            if continuation
+                .as_ref()
+                .is_some_and(|current| current.as_slice() >= next.as_slice())
+            {
+                return Err(StoreError::Backend(
+                    "prefix page continuation did not advance".to_owned(),
+                ));
+            }
+            continuation = Some(next);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MemoryVersion {
+    generation: u64,
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryStoreState {
+    generation: u64,
+    data: BTreeMap<StoreKey, Vec<MemoryVersion>>,
+    active_snapshots: BTreeMap<u64, usize>,
+    gc_candidates: BTreeSet<StoreKey>,
+}
+
+#[derive(Debug)]
+struct MemorySnapshotLease {
+    generation: u64,
+    inner: Weak<RwLock<MemoryStoreState>>,
+}
+
+impl Drop for MemorySnapshotLease {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let mut state = inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = state
+            .active_snapshots
+            .get_mut(&self.generation)
+            .is_some_and(|active| {
+                *active = active.saturating_sub(1);
+                *active == 0
+            });
+        if remove {
+            state.active_snapshots.remove(&self.generation);
+        }
+    }
+}
+
+fn memory_value_at(history: &[MemoryVersion], generation: u64) -> Option<&Vec<u8>> {
+    let end = history.partition_point(|version| version.generation <= generation);
+    end.checked_sub(1)
+        .and_then(|index| history.get(index))
+        .and_then(|version| version.value.as_ref())
+}
+
+fn compact_memory_history(history: &mut Vec<MemoryVersion>, oldest_snapshot: Option<u64>) {
+    let Some(oldest_snapshot) = oldest_snapshot else {
+        let latest = history.pop();
+        history.clear();
+        if let Some(latest) = latest.filter(|version| version.value.is_some()) {
+            history.push(latest);
+        }
+        return;
+    };
+    let baseline_end = history.partition_point(|version| version.generation <= oldest_snapshot);
+    if baseline_end > 1 {
+        history.drain(..baseline_end - 1);
+    }
+    if history
+        .last()
+        .is_some_and(|version| version.generation <= oldest_snapshot && version.value.is_none())
+    {
+        history.clear();
     }
 }
 
@@ -3526,7 +3858,7 @@ impl WriteBatch for MemoryBatch {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct StoreKey {
     family: ColumnFamily,
     key: Vec<u8>,
@@ -4100,6 +4432,67 @@ mod tests {
     }
 
     #[test]
+    fn memory_snapshots_share_versioned_storage_and_collect_old_values() {
+        let store = MemoryStore::new();
+        let mut first = store.batch();
+        first
+            .put(ColumnFamily::Meta, b"versioned", b"one")
+            .expect("first put");
+        store.commit(first).expect("first commit");
+
+        let old = store.snapshot().expect("old snapshot");
+        let mut second = store.batch();
+        second
+            .put(ColumnFamily::Meta, b"versioned", b"two")
+            .expect("second put");
+        store.commit(second).expect("second commit");
+        let current = store.snapshot().expect("current snapshot");
+
+        assert!(Arc::ptr_eq(&old.inner, &current.inner));
+        assert_eq!(
+            old.get(ColumnFamily::Meta, b"versioned").expect("old get"),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            current
+                .get(ColumnFamily::Meta, b"versioned")
+                .expect("current get"),
+            Some(b"two".to_vec())
+        );
+        assert_eq!(
+            store
+                .inner
+                .read()
+                .expect("state")
+                .data
+                .get(&StoreKey::new(ColumnFamily::Meta, b"versioned"))
+                .expect("history")
+                .len(),
+            2
+        );
+
+        drop(old);
+        drop(current);
+        let mut third = store.batch();
+        third
+            .put(ColumnFamily::Meta, b"versioned", b"three")
+            .expect("third put");
+        store.commit(third).expect("third commit");
+        assert_eq!(
+            store
+                .inner
+                .read()
+                .expect("state")
+                .data
+                .get(&StoreKey::new(ColumnFamily::Meta, b"versioned"))
+                .expect("compacted history")
+                .len(),
+            1,
+            "without live snapshots a commit retains only the current value"
+        );
+    }
+
+    #[test]
     fn memory_store_delete_overrides_existing_value() {
         let store = MemoryStore::new();
         let mut batch = store.batch();
@@ -4241,6 +4634,41 @@ mod tests {
     }
 
     #[test]
+    fn memory_snapshot_prefix_visitor_can_commit_to_the_same_store() {
+        let store = MemoryStore::new();
+        let mut initial = store.batch();
+        initial
+            .put(ColumnFamily::Headers, b"p/1", b"one")
+            .expect("put one");
+        initial
+            .put(ColumnFamily::Headers, b"p/2", b"two")
+            .expect("put two");
+        store.commit(initial).expect("commit initial");
+
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut visited = Vec::new();
+        snapshot
+            .visit_prefix(ColumnFamily::Headers, b"p/", &mut |key, _| {
+                visited.push(key.to_vec());
+                let mut deletion = store.batch();
+                deletion
+                    .delete(ColumnFamily::Headers, key)
+                    .expect("stage deletion");
+                store.commit(deletion).expect("commit from visitor");
+                Ok(())
+            })
+            .expect("visit while committing");
+        assert_eq!(visited, vec![b"p/1".to_vec(), b"p/2".to_vec()]);
+        drop(snapshot);
+        assert!(store
+            .snapshot()
+            .expect("current snapshot")
+            .scan_prefix(ColumnFamily::Headers, b"p/")
+            .expect("current prefix")
+            .is_empty());
+    }
+
+    #[test]
     fn staging_overlay_reads_its_own_writes_without_committing() {
         let store = MemoryStore::new();
         let mut initial = store.batch();
@@ -4250,9 +4678,12 @@ mod tests {
         initial
             .put(ColumnFamily::Headers, b"b/0", b"base")
             .expect("put base value");
+        initial
+            .put(ColumnFamily::Headers, b"b/3", b"deleted")
+            .expect("put deleted value");
         store.commit(initial).expect("commit initial");
 
-        let base = store.snapshot().expect("base snapshot");
+        let base = CountingSnapshot::new(store.snapshot().expect("base snapshot"));
         let overlay = StagingOverlay::new();
         let staged_snapshot = overlay.snapshot(&base);
         let mut staged_batch = overlay.batch(store.batch());
@@ -4283,6 +4714,36 @@ mod tests {
                 None,
             ]
         );
+        let mut continuation = None::<Vec<u8>>;
+        let mut paged = Vec::new();
+        loop {
+            let page = staged_snapshot
+                .scan_prefix_page(
+                    ColumnFamily::Headers,
+                    b"b/",
+                    continuation.as_deref(),
+                    PrefixScanBudget {
+                        max_entries: 1,
+                        max_bytes: 64,
+                    },
+                )
+                .expect("staged page");
+            paged.extend(page.entries);
+            let Some(next) = page.continuation else {
+                break;
+            };
+            continuation = Some(next);
+        }
+        assert_eq!(
+            paged,
+            vec![
+                (b"b/0".to_vec(), b"base".to_vec()),
+                (b"b/1".to_vec(), b"new".to_vec()),
+                (b"b/2".to_vec(), b"two".to_vec())
+            ]
+        );
+        assert_eq!(base.full_scans.get(), 0);
+        assert_eq!(base.maximum_page_entries.get(), 1);
         assert_eq!(
             staged_snapshot
                 .scan_prefix(ColumnFamily::Headers, b"b/")

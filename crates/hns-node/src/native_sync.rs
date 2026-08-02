@@ -1520,6 +1520,9 @@ struct BoundedAddressBook {
     durable_sequence: u64,
     dirty: bool,
     entries: BTreeMap<SocketAddr, KnownPeerAddress>,
+    /// Exact eviction rank for every non-configured entry. Saturated insertion
+    /// removes the first key in O(log N) instead of rescanning the address book.
+    eviction_order: BTreeSet<(u64, u64, SocketAddr)>,
 }
 
 impl BoundedAddressBook {
@@ -1537,6 +1540,7 @@ impl BoundedAddressBook {
             durable_sequence: 0,
             dirty: false,
             entries: BTreeMap::new(),
+            eviction_order: BTreeSet::new(),
         })
     }
 
@@ -1554,6 +1558,12 @@ impl BoundedAddressBook {
             anyhow::bail!("configured outbound peers exceed the bounded address book");
         }
         self.sequence = self.sequence.saturating_add(1);
+        if let Some(existing) = self.entries.get(&address) {
+            if !existing.configured {
+                self.eviction_order
+                    .remove(&(existing.wire.time, existing.sequence, address));
+            }
+        }
         let replaced = self.entries.insert(
             address,
             KnownPeerAddress {
@@ -1599,6 +1609,7 @@ impl BoundedAddressBook {
             if existing.configured {
                 return AddressAdmission::Updated;
             }
+            let old_eviction = (existing.wire.time, existing.sequence, address);
             let old_services = existing.wire.services;
             let old_time = existing.wire.time;
             let old_key = existing.wire.key;
@@ -1613,36 +1624,39 @@ impl BoundedAddressBook {
             {
                 self.dirty = true;
             }
+            let new_eviction = (existing.wire.time, existing.sequence, address);
+            if old_eviction != new_eviction {
+                let removed = self.eviction_order.remove(&old_eviction);
+                debug_assert!(removed, "updated address has an eviction-order key");
+                self.eviction_order.insert(new_eviction);
+            }
             return AddressAdmission::Updated;
         }
 
         if self.entries.len() >= self.maximum {
-            let eviction = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| !entry.configured)
-                .min_by_key(|(address, entry)| (entry.wire.time, entry.sequence, **address))
-                .map(|(address, _)| *address);
-            let Some(eviction) = eviction else {
+            let Some(eviction_key) = self.eviction_order.first().copied() else {
                 return AddressAdmission::Rejected;
             };
+            let removed = self.eviction_order.remove(&eviction_key);
+            debug_assert!(removed, "selected eviction key exists");
+            let eviction = eviction_key.2;
             self.entries.remove(&eviction);
             self.dirty = true;
         }
 
         self.sequence = self.sequence.saturating_add(1);
-        self.entries.insert(
-            address,
-            KnownPeerAddress {
-                wire,
-                configured: false,
-                failures: 0,
-                last_success: 0,
-                last_attempt: 0,
-                eligible_at: now,
-                sequence: self.sequence,
-            },
-        );
+        let entry = KnownPeerAddress {
+            wire,
+            configured: false,
+            failures: 0,
+            last_success: 0,
+            last_attempt: 0,
+            eligible_at: now,
+            sequence: self.sequence,
+        };
+        self.eviction_order
+            .insert((entry.wire.time, entry.sequence, address));
+        self.entries.insert(address, entry);
         self.dirty = true;
         AddressAdmission::Added
     }
@@ -1706,11 +1720,20 @@ impl BoundedAddressBook {
 
     fn remove_discovered_ip(&mut self, address: IpAddr) -> usize {
         let address = normalize_peer_ip(address);
-        let before = self.entries.len();
-        self.entries.retain(|candidate, entry| {
-            entry.configured || normalize_peer_ip(candidate.ip()) != address
-        });
-        let removed = before.saturating_sub(self.entries.len());
+        let removals = self
+            .entries
+            .iter()
+            .filter(|(candidate, entry)| {
+                !entry.configured && normalize_peer_ip(candidate.ip()) == address
+            })
+            .map(|(candidate, entry)| (*candidate, (entry.wire.time, entry.sequence, *candidate)))
+            .collect::<Vec<_>>();
+        for (candidate, eviction_key) in &removals {
+            self.entries.remove(candidate);
+            let removed = self.eviction_order.remove(eviction_key);
+            debug_assert!(removed, "removed address has an eviction-order key");
+        }
+        let removed = removals.len();
         self.dirty |= removed > 0;
         removed
     }
@@ -1732,8 +1755,16 @@ impl BoundedAddressBook {
             return;
         };
         if timestamp.saturating_sub(entry.wire.time) > HSD_ADDRESS_TIMESTAMP_REFRESH_SECONDS {
+            let old_eviction =
+                (!entry.configured).then_some((entry.wire.time, entry.sequence, address));
             entry.wire.time = timestamp;
             if !entry.configured {
+                let removed = self
+                    .eviction_order
+                    .remove(&old_eviction.expect("non-configured eviction key"));
+                debug_assert!(removed, "refreshed address has an eviction-order key");
+                self.eviction_order
+                    .insert((entry.wire.time, entry.sequence, address));
                 self.dirty = true;
             }
         }
@@ -1847,26 +1878,27 @@ impl BoundedAddressBook {
                 .saturating_sub(timestamp)
                 .min(MAX_RECONNECT_DELAY_SECONDS);
             self.sequence = self.sequence.max(entry.sequence);
-            self.entries.insert(
-                entry.address,
-                KnownPeerAddress {
-                    wire: {
-                        let mut wire = hns_p2p::NetAddress::from_socket_addr(
-                            entry.address,
-                            entry.time,
-                            entry.services,
-                        );
-                        wire.key = entry.key;
-                        wire
-                    },
-                    configured: false,
-                    failures: entry.failures,
-                    last_success: entry.last_success,
-                    last_attempt: entry.last_attempt,
-                    eligible_at: now + Duration::from_secs(delay),
-                    sequence: entry.sequence,
+            let address = entry.address;
+            let known = KnownPeerAddress {
+                wire: {
+                    let mut wire = hns_p2p::NetAddress::from_socket_addr(
+                        entry.address,
+                        entry.time,
+                        entry.services,
+                    );
+                    wire.key = entry.key;
+                    wire
                 },
-            );
+                configured: false,
+                failures: entry.failures,
+                last_success: entry.last_success,
+                last_attempt: entry.last_attempt,
+                eligible_at: now + Duration::from_secs(delay),
+                sequence: entry.sequence,
+            };
+            self.eviction_order
+                .insert((known.wire.time, known.sequence, address));
+            self.entries.insert(address, known);
             loaded = loaded.saturating_add(1);
         }
         self.durable_sequence = record.generation;
@@ -9667,7 +9699,7 @@ mod tests {
             _transaction: &Transaction,
             _input_coins: &[Coin],
             _context: &MempoolContext,
-            _accepted_name_transactions: &[&Transaction],
+            _accepted_name_transactions: &hns_mempool::AcceptedNameTransactions<'_>,
         ) -> std::result::Result<(), ConsensusError> {
             Ok(())
         }
@@ -10758,6 +10790,42 @@ mod tests {
         assert_eq!(compacted.generation, 2);
         assert_eq!(compacted.entries.len(), 1);
         assert_eq!(compacted.entries[0].address, valid);
+    }
+
+    #[test]
+    fn saturated_address_book_keeps_an_exact_logarithmic_eviction_index() {
+        const CAPACITY: usize = 64;
+        const INSERTIONS: usize = 512;
+        let now = Instant::now();
+        let timestamp = 1_800_000_000u64;
+        let mut addresses =
+            BoundedAddressBook::new(Network::Mainnet, None, CAPACITY).expect("address book");
+
+        for index in 0..INSERTIONS {
+            let second = u8::try_from(index / (254 * 254)).expect("second octet");
+            let third = u8::try_from(index / 254 % 254).expect("third octet");
+            let fourth = u8::try_from(index % 254 + 1).expect("fourth octet");
+            let address = SocketAddr::from(([23, second, third, fourth], 12_038));
+            let wire = keyed_net_address(
+                address,
+                timestamp.saturating_sub(u64::try_from(index % 32).expect("timestamp delta")),
+                SERVICE_NETWORK,
+            );
+            assert_eq!(
+                addresses.insert_discovered(wire, now, timestamp),
+                AddressAdmission::Added
+            );
+            assert_eq!(addresses.len(), (index + 1).min(CAPACITY));
+            assert_eq!(addresses.eviction_order.len(), addresses.len());
+        }
+
+        let expected = addresses
+            .entries
+            .iter()
+            .map(|(address, entry)| (entry.wire.time, entry.sequence, *address))
+            .min()
+            .expect("retained eviction candidate");
+        assert_eq!(addresses.eviction_order.first().copied(), Some(expected));
     }
 
     #[cfg(feature = "rocksdb-backend")]

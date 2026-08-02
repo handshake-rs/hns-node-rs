@@ -157,6 +157,36 @@ struct NameStateChanges {
     changed: HashSet<NameHash>,
 }
 
+/// Incremental, storage-free view of name states changed by accepted mempool
+/// transactions. The durable snapshot remains authoritative for names absent
+/// from this map.
+#[derive(Clone, Debug, Default)]
+pub struct MempoolNameOverlay {
+    current: BTreeMap<NameHash, NameState>,
+}
+
+/// Candidate-local name-state updates prepared against a
+/// [`MempoolNameOverlay`]. The caller commits this delta only after the
+/// transaction has actually entered the mempool.
+#[derive(Clone, Debug, Default)]
+pub struct MempoolNameDelta {
+    current: BTreeMap<NameHash, NameState>,
+}
+
+impl MempoolNameOverlay {
+    pub fn commit(&mut self, delta: MempoolNameDelta) {
+        self.current.extend(delta.current);
+    }
+
+    pub fn clear(&mut self) {
+        self.current.clear();
+    }
+
+    pub fn changed_name_count(&self) -> usize {
+        self.current.len()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectBlock<'a> {
     pub block_hash: BlockHash,
@@ -2486,9 +2516,10 @@ fn verify_transaction_inputs(
             "resolved input count does not match transaction inputs".to_owned(),
         ));
     }
+    let sighash_cache = hns_consensus::SignatureHashCache::new(transaction);
     for (input_index, coin) in coins.iter().enumerate() {
         verifier
-            .verify_input(transaction, input_index, coin)
+            .verify_input_with_cache(&sighash_cache, input_index, coin)
             .map_err(|error| StateError::InputAuthorization {
                 input_index,
                 reason: error.to_string(),
@@ -2632,18 +2663,20 @@ fn apply_verified_claims<T: ReadSnapshot>(
     Ok(())
 }
 
-/// Validate an ordinary mempool candidate against the durable active name
-/// state plus all previously accepted name-covenant transactions. The overlay
-/// is replayed in caller-supplied admission order and never mutates storage.
-/// Claims remain restricted to the dedicated coinbase issuance path.
-pub fn verify_mempool_name_context<T: ReadSnapshot>(
+/// Rebuild an incremental mempool overlay in deterministic admission order.
+/// Production uses this only when the active-chain identity or the mempool's
+/// name revision changes unexpectedly (removal, trim, or reorganization).
+pub fn rebuild_mempool_name_overlay<'a, T, I>(
     snapshot: &T,
-    accepted_name_transactions: &[&Transaction],
-    candidate: &Transaction,
+    accepted_name_transactions: I,
     height: Height,
     network: Network,
     name_flags: NameFlags,
-) -> Result<(), StateError> {
+) -> Result<MempoolNameOverlay, StateError>
+where
+    T: ReadSnapshot,
+    I: IntoIterator<Item = &'a Transaction>,
+{
     let input_verifier = RejectUnverifiedInputs;
     let issuance_verifier = RejectSpecialCoinbaseIssuance;
     let services = StateServices {
@@ -2667,6 +2700,53 @@ pub fn verify_mempool_name_context<T: ReadSnapshot>(
             false,
         )?;
     }
+    Ok(MempoolNameOverlay {
+        current: changes.current,
+    })
+}
+
+/// Prepare only the candidate's changed names against an already synchronized
+/// overlay. Work is proportional to the candidate's outputs/name actions and
+/// does not replay the accepted mempool prefix.
+pub fn prepare_mempool_name_delta<T: ReadSnapshot>(
+    snapshot: &T,
+    overlay: &MempoolNameOverlay,
+    candidate: &Transaction,
+    height: Height,
+    network: Network,
+    name_flags: NameFlags,
+) -> Result<MempoolNameDelta, StateError> {
+    let input_verifier = RejectUnverifiedInputs;
+    let issuance_verifier = RejectSpecialCoinbaseIssuance;
+    let services = StateServices {
+        network,
+        name_flags,
+        name_flags_valid: true,
+        historical_validation: HistoricalValidationPlan::full(),
+        input_verifier: &input_verifier,
+        issuance_verifier: &issuance_verifier,
+    };
+    let context = SnapshotChainContext::new(snapshot, height, HistoricalValidationPlan::full());
+    let mut changes = NameStateChanges::default();
+    for output in &candidate.outputs {
+        if !output.covenant.kind.is_name() {
+            continue;
+        }
+        let Some(name_hash) = output
+            .covenant
+            .item(0)
+            .and_then(|item| <[u8; 32]>::try_from(item).ok())
+            .map(NameHash::new)
+        else {
+            continue;
+        };
+        if let Some(state) = overlay.current.get(&name_hash) {
+            changes
+                .current
+                .entry(name_hash)
+                .or_insert_with(|| state.clone());
+        }
+    }
     apply_transaction_name_covenants(
         snapshot,
         candidate,
@@ -2675,7 +2755,31 @@ pub fn verify_mempool_name_context<T: ReadSnapshot>(
         &context,
         &mut changes,
         false,
-    )
+    )?;
+    Ok(MempoolNameDelta {
+        current: changes.current,
+    })
+}
+
+/// Compatibility helper for callers that do not retain an incremental overlay.
+/// Production node admission uses [`rebuild_mempool_name_overlay`] plus
+/// [`prepare_mempool_name_delta`] instead.
+pub fn verify_mempool_name_context<T: ReadSnapshot>(
+    snapshot: &T,
+    accepted_name_transactions: &[&Transaction],
+    candidate: &Transaction,
+    height: Height,
+    network: Network,
+    name_flags: NameFlags,
+) -> Result<(), StateError> {
+    let overlay = rebuild_mempool_name_overlay(
+        snapshot,
+        accepted_name_transactions.iter().copied(),
+        height,
+        network,
+        name_flags,
+    )?;
+    prepare_mempool_name_delta(snapshot, &overlay, candidate, height, network, name_flags).map(drop)
 }
 
 /// Validate one authenticated DNSSEC claim against the immutable active-chain

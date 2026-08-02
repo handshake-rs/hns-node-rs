@@ -8,7 +8,7 @@
 //! remains fail closed.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hns_consensus::{
@@ -350,16 +350,47 @@ impl MempoolContext {
 /// Storage-independent contextual validation boundary. Complete production
 /// implementations must verify deployment flags, name state, claims, airdrops,
 /// and every policy which is intentionally outside transaction syntax.
+pub struct AcceptedNameTransactions<'a> {
+    revision: u64,
+    transactions: &'a BTreeMap<(u64, Txid), Arc<Transaction>>,
+}
+
+impl AcceptedNameTransactions<'_> {
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn len(&self) -> usize {
+        self.transactions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.transactions.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Transaction> {
+        self.transactions.values().map(Arc::as_ref)
+    }
+}
+
 pub trait ContextualTransactionVerifier: Send + Sync {
     fn verify(
         &self,
         transaction: &Transaction,
         input_coins: &[Coin],
         context: &MempoolContext,
-        // Already accepted name-covenant transactions in deterministic
-        // admission order. Contextual name validation replays this overlay.
-        accepted_name_transactions: &[&Transaction],
+        accepted_name_transactions: &AcceptedNameTransactions<'_>,
     ) -> Result<(), ConsensusError>;
+
+    /// Publish a successfully admitted transaction to an implementation's
+    /// incremental contextual cache. The supplied view reflects any trim or
+    /// expiry removals performed by the same atomic admission.
+    fn transaction_accepted(
+        &self,
+        _transaction: &Transaction,
+        _accepted_name_transactions: &AcceptedNameTransactions<'_>,
+    ) {
+    }
 
     fn is_consensus_complete(&self) -> bool {
         false
@@ -375,7 +406,7 @@ impl ContextualTransactionVerifier for RejectUnverifiedContext {
         _transaction: &Transaction,
         _input_coins: &[Coin],
         _context: &MempoolContext,
-        _accepted_name_transactions: &[&Transaction],
+        _accepted_name_transactions: &AcceptedNameTransactions<'_>,
     ) -> Result<(), ConsensusError> {
         Err(ConsensusError::Authorization(
             "contextual mempool verifier is not configured".to_owned(),
@@ -1603,7 +1634,14 @@ pub struct MemoryMempool {
     /// Cached minimum of `expiry_roots`, making the common not-due check O(1).
     next_expiry_root: Option<(u64, Txid)>,
     transactions: HashMap<Txid, Arc<Transaction>>,
+    /// Name-covenant transactions keyed by immutable admission order. The
+    /// contextual verifier borrows this index in O(1) and only iterates it when
+    /// rebuilding after a name-set change it did not incrementally observe.
+    name_transactions: BTreeMap<(u64, Txid), Arc<Transaction>>,
+    name_revision: u64,
     orphans: HashMap<Txid, OrphanEntry>,
+    orphan_order: BTreeSet<(u64, Txid)>,
+    orphans_by_parent: HashMap<Txid, BTreeSet<(u64, Txid)>>,
     spent_outpoints: HashMap<Outpoint, Txid>,
     parents: HashMap<Txid, Arc<BTreeSet<Txid>>>,
     children: HashMap<Txid, Arc<BTreeSet<Txid>>>,
@@ -1627,6 +1665,8 @@ pub struct MemoryMempool {
     next_sequence: u64,
     #[cfg(test)]
     expiry_root_checks: usize,
+    #[cfg(test)]
+    orphan_promotion_attempts: usize,
 }
 
 impl Default for MemoryMempool {
@@ -1649,7 +1689,11 @@ impl MemoryMempool {
             expiry_roots: BTreeSet::new(),
             next_expiry_root: None,
             transactions: HashMap::new(),
+            name_transactions: BTreeMap::new(),
+            name_revision: 0,
             orphans: HashMap::new(),
+            orphan_order: BTreeSet::new(),
+            orphans_by_parent: HashMap::new(),
             spent_outpoints: HashMap::new(),
             parents: HashMap::new(),
             children: HashMap::new(),
@@ -1669,6 +1713,8 @@ impl MemoryMempool {
             next_sequence: 1,
             #[cfg(test)]
             expiry_root_checks: 0,
+            #[cfg(test)]
+            orphan_promotion_attempts: 0,
         })
     }
 
@@ -2250,8 +2296,8 @@ impl MemoryMempool {
             input_verifier,
             contextual_verifier,
         )?;
-        if matches!(admission, Admission::Accepted(_)) {
-            self.promote_orphans(context, view, input_verifier, contextual_verifier)?;
+        if let Admission::Accepted(txid) = &admission {
+            self.promote_orphans_from([*txid], context, view, input_verifier, contextual_verifier)?;
         }
         Ok(admission)
     }
@@ -2396,6 +2442,9 @@ impl MemoryMempool {
                 total.saturating_add(u128::from(entry.fee))
             }));
         rebuilt.next_sequence = self.next_sequence;
+        // A rebuild is a distinct contextual prefix even when it happens to
+        // retain the same number of name transactions at the same chain tip.
+        rebuilt.name_revision = self.name_revision.saturating_add(1).max(1);
         for (transaction, allow_orphan, admitted_at, charge_free_relay) in candidates {
             let txid = transaction.txid();
             if !seen.insert(txid) {
@@ -2455,7 +2504,19 @@ impl MemoryMempool {
                 invalidated_transactions.insert(txid);
             }
         }
-        rebuilt.promote_orphans(context, view, input_verifier, contextual_verifier)?;
+        let promotion_roots = rebuilt
+            .entries
+            .keys()
+            .copied()
+            .chain(connected_txids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        rebuilt.promote_orphans_from(
+            promotion_roots,
+            context,
+            view,
+            input_verifier,
+            contextual_verifier,
+        )?;
         invalidated_transactions.extend(
             candidate_txids
                 .difference(&connected_txids)
@@ -2657,8 +2718,10 @@ impl MemoryMempool {
             return Ok(rejected("bad-txns-too-many-sigops"));
         }
 
+        let sighash_cache = hns_consensus::SignatureHashCache::new(&transaction);
         for (index, coin) in input_coins.iter().enumerate() {
-            if let Err(error) = input_verifier.verify_input(&transaction, index, coin) {
+            if let Err(error) = input_verifier.verify_input_with_cache(&sighash_cache, index, coin)
+            {
                 return Ok(rejected(error.to_string()));
             }
         }
@@ -2821,6 +2884,10 @@ impl MemoryMempool {
         for name in &exclusive_names {
             self.exclusive_name_owners.insert(*name, txid);
         }
+        let has_name_covenants = transaction
+            .outputs
+            .iter()
+            .any(|output| output.covenant.kind.is_name());
         let exclusive_names = Arc::new(exclusive_names);
         let previous = self.exclusive_names.insert(txid, exclusive_names.clone());
         debug_assert!(previous.is_none(), "accepted exclusive-name set is unique");
@@ -2843,12 +2910,22 @@ impl MemoryMempool {
         debug_assert!(previous.is_none(), "accepted snapshot entry is unique");
         let previous = self.transactions.insert(txid, transaction.clone());
         debug_assert!(previous.is_none(), "accepted mempool transaction is unique");
-        let previous =
-            persistent_map_replace(&mut self.snapshot_state.transactions, txid, transaction);
+        let previous = persistent_map_replace(
+            &mut self.snapshot_state.transactions,
+            txid,
+            transaction.clone(),
+        );
         debug_assert!(
             previous.is_none(),
             "accepted snapshot transaction is unique"
         );
+        if has_name_covenants {
+            let previous = self
+                .name_transactions
+                .insert((sequence, txid), transaction.clone());
+            debug_assert!(previous.is_none(), "accepted name transaction is unique");
+            self.advance_name_revision();
+        }
         if self
             .parents
             .get(&txid)
@@ -2860,6 +2937,8 @@ impl MemoryMempool {
         if !self.limit_size(txid, context.current_time) {
             return Ok(rejected("mempool-full"));
         }
+        let accepted_name_transactions = self.accepted_name_transactions();
+        contextual_verifier.transaction_accepted(&transaction, &accepted_name_transactions);
         Ok(Admission::Accepted(txid))
     }
 
@@ -3079,39 +3158,52 @@ impl MemoryMempool {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn promote_orphans<V: MempoolView>(
+    fn promote_orphans_from<V, I>(
         &mut self,
+        accepted_parents: I,
         context: &MempoolContext,
         view: &V,
         input_verifier: &dyn TransactionInputVerifier,
         contextual_verifier: &dyn ContextualTransactionVerifier,
-    ) -> Result<(), MempoolError> {
-        loop {
-            let ordered = self
-                .orphans
-                .iter()
-                .map(|(txid, entry)| (entry.sequence, *txid))
-                .collect::<BTreeSet<_>>();
-            let mut promoted = false;
-            for (_, txid) in ordered {
-                let Some(orphan) = self.remove_orphan(&txid) else {
-                    continue;
-                };
-                match self.submit_checked(
-                    orphan.transaction,
-                    context,
-                    view,
-                    input_verifier,
-                    contextual_verifier,
-                )? {
-                    Admission::Accepted(_) => promoted = true,
-                    Admission::Orphan(_) | Admission::Rejected { .. } => {}
-                }
-            }
-            if !promoted {
-                return Ok(());
+    ) -> Result<(), MempoolError>
+    where
+        V: MempoolView,
+        I: IntoIterator<Item = Txid>,
+    {
+        let mut ready = BTreeSet::new();
+        for parent in accepted_parents {
+            if let Some(children) = self.orphans_by_parent.get(&parent) {
+                ready.extend(children.iter().copied());
             }
         }
+        while let Some((sequence, txid)) = ready.pop_first() {
+            if self
+                .orphans
+                .get(&txid)
+                .is_none_or(|orphan| orphan.sequence != sequence)
+            {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                self.orphan_promotion_attempts = self.orphan_promotion_attempts.saturating_add(1);
+            }
+            let Some(orphan) = self.remove_orphan(&txid) else {
+                continue;
+            };
+            if let Admission::Accepted(promoted) = self.submit_checked(
+                orphan.transaction,
+                context,
+                view,
+                input_verifier,
+                contextual_verifier,
+            )? {
+                if let Some(children) = self.orphans_by_parent.get(&promoted) {
+                    ready.extend(children.iter().copied());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove every accepted and orphan transaction while retaining the
@@ -3135,7 +3227,13 @@ impl MemoryMempool {
         self.expiry_roots.clear();
         self.next_expiry_root = None;
         self.transactions.clear();
+        if !self.name_transactions.is_empty() {
+            self.name_transactions.clear();
+            self.advance_name_revision();
+        }
         self.orphans.clear();
+        self.orphan_order.clear();
+        self.orphans_by_parent.clear();
         self.spent_outpoints.clear();
         self.parents.clear();
         self.children.clear();
@@ -3371,11 +3469,7 @@ impl MemoryMempool {
         while self.orphans.len() >= self.limits.maximum_orphans
             || self.orphan_bytes.saturating_add(bytes) > self.limits.maximum_orphan_bytes
         {
-            let oldest = self
-                .orphans
-                .iter()
-                .min_by_key(|(_, entry)| entry.sequence)
-                .map(|(txid, _)| *txid);
+            let oldest = self.orphan_order.first().map(|(_, txid)| *txid);
             let Some(oldest) = oldest else {
                 break;
             };
@@ -3387,6 +3481,11 @@ impl MemoryMempool {
             return Ok(false);
         }
         let sequence = self.take_sequence();
+        let parents = transaction
+            .inputs
+            .iter()
+            .map(|input| input.previous_output.txid)
+            .collect::<BTreeSet<_>>();
         self.orphan_bytes = self.orphan_bytes.saturating_add(bytes);
         self.orphans.insert(
             txid,
@@ -3396,12 +3495,40 @@ impl MemoryMempool {
                 sequence,
             },
         );
+        let inserted = self.orphan_order.insert((sequence, txid));
+        debug_assert!(inserted, "orphan admission-order key is unique");
+        for parent in parents {
+            self.orphans_by_parent
+                .entry(parent)
+                .or_default()
+                .insert((sequence, txid));
+        }
         Ok(true)
     }
 
     fn remove_orphan(&mut self, txid: &Txid) -> Option<OrphanEntry> {
         let orphan = self.orphans.remove(txid)?;
         self.orphan_bytes = self.orphan_bytes.saturating_sub(orphan.bytes);
+        let removed = self.orphan_order.remove(&(orphan.sequence, *txid));
+        debug_assert!(removed, "removed orphan has an admission-order key");
+        let parents = orphan
+            .transaction
+            .inputs
+            .iter()
+            .map(|input| input.previous_output.txid)
+            .collect::<BTreeSet<_>>();
+        for parent in parents {
+            let remove_parent = self
+                .orphans_by_parent
+                .get_mut(&parent)
+                .is_some_and(|children| {
+                    children.remove(&(orphan.sequence, *txid));
+                    children.is_empty()
+                });
+            if remove_parent {
+                self.orphans_by_parent.remove(&parent);
+            }
+        }
         Some(orphan)
     }
 
@@ -3413,24 +3540,11 @@ impl MemoryMempool {
         })
     }
 
-    fn accepted_name_transactions(&self) -> Vec<&Transaction> {
-        let mut ordered = self
-            .entries
-            .iter()
-            .filter_map(|(txid, entry)| {
-                let transaction = self.transactions.get(txid)?;
-                transaction
-                    .outputs
-                    .iter()
-                    .any(|output| output.covenant.kind.is_name())
-                    .then_some((entry.sequence, *txid, transaction.as_ref()))
-            })
-            .collect::<Vec<_>>();
-        ordered.sort_by_key(|(sequence, txid, _)| (*sequence, *txid));
-        ordered
-            .into_iter()
-            .map(|(_, _, transaction)| transaction)
-            .collect()
+    fn accepted_name_transactions(&self) -> AcceptedNameTransactions<'_> {
+        AcceptedNameTransactions {
+            revision: self.name_revision,
+            transactions: &self.name_transactions,
+        }
     }
 
     fn collect_ancestors(
@@ -3520,6 +3634,13 @@ impl MemoryMempool {
         let (ordered_txids, removed) = self.ordered_txids.remove(&(entry.sequence, txid));
         debug_assert!(removed, "removed mempool txid has an ordered index entry");
         self.ordered_txids = ordered_txids;
+        if self
+            .name_transactions
+            .remove(&(entry.sequence, txid))
+            .is_some()
+        {
+            self.advance_name_revision();
+        }
         for input in &transaction.inputs {
             if self.spent_outpoints.get(&input.previous_output) == Some(&txid) {
                 self.spent_outpoints.remove(&input.previous_output);
@@ -3670,6 +3791,10 @@ impl MemoryMempool {
 
     fn advance_generation(&mut self) {
         self.set_generation(self.generation.saturating_add(1).max(1));
+    }
+
+    fn advance_name_revision(&mut self) {
+        self.name_revision = self.name_revision.saturating_add(1).max(1);
     }
 
     fn set_generation(&mut self, generation: u64) {
@@ -3951,6 +4076,8 @@ pub enum MempoolError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+
     use hns_primitives::MAX_BLOCK_WEIGHT;
 
     use super::*;
@@ -4882,7 +5009,7 @@ mod tests {
             _transaction: &Transaction,
             _input_coins: &[Coin],
             _context: &MempoolContext,
-            _accepted_name_transactions: &[&Transaction],
+            _accepted_name_transactions: &AcceptedNameTransactions<'_>,
         ) -> Result<(), ConsensusError> {
             Ok(())
         }
@@ -4896,7 +5023,7 @@ mod tests {
             transaction: &Transaction,
             _input_coins: &[Coin],
             _context: &MempoolContext,
-            accepted_name_transactions: &[&Transaction],
+            accepted_name_transactions: &AcceptedNameTransactions<'_>,
         ) -> Result<(), ConsensusError> {
             let name = transaction
                 .outputs
@@ -4914,6 +5041,52 @@ mod tests {
         }
     }
 
+    struct IncrementalNameOverlayProbe {
+        cached_revision: AtomicU64,
+        rebuilds: AtomicUsize,
+        replayed_transactions: AtomicUsize,
+    }
+
+    impl Default for IncrementalNameOverlayProbe {
+        fn default() -> Self {
+            Self {
+                cached_revision: AtomicU64::new(u64::MAX),
+                rebuilds: AtomicUsize::new(0),
+                replayed_transactions: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ContextualTransactionVerifier for IncrementalNameOverlayProbe {
+        fn verify(
+            &self,
+            _transaction: &Transaction,
+            _input_coins: &[Coin],
+            _context: &MempoolContext,
+            accepted: &AcceptedNameTransactions<'_>,
+        ) -> Result<(), ConsensusError> {
+            if self
+                .cached_revision
+                .swap(accepted.revision(), AtomicOrdering::Relaxed)
+                != accepted.revision()
+            {
+                self.rebuilds.fetch_add(1, AtomicOrdering::Relaxed);
+                self.replayed_transactions
+                    .fetch_add(accepted.iter().count(), AtomicOrdering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn transaction_accepted(
+            &self,
+            _transaction: &Transaction,
+            accepted: &AcceptedNameTransactions<'_>,
+        ) {
+            self.cached_revision
+                .store(accepted.revision(), AtomicOrdering::Relaxed);
+        }
+    }
+
     struct RejectName(&'static [u8]);
 
     impl ContextualTransactionVerifier for RejectName {
@@ -4922,7 +5095,7 @@ mod tests {
             transaction: &Transaction,
             _input_coins: &[Coin],
             _context: &MempoolContext,
-            _accepted_name_transactions: &[&Transaction],
+            _accepted_name_transactions: &AcceptedNameTransactions<'_>,
         ) -> Result<(), ConsensusError> {
             let rejected = transaction
                 .outputs
@@ -5294,6 +5467,69 @@ mod tests {
     }
 
     #[test]
+    fn incremental_name_context_does_not_replay_the_growing_prefix() {
+        const ADMISSIONS: usize = 64;
+        let mut view = FixedView::default();
+        let mut candidates = Vec::with_capacity(ADMISSIONS + 1);
+        for index in 0..=ADMISSIONS {
+            let byte = u8::try_from(index + 0x20).expect("fixture byte");
+            let input = outpoint(byte, 0);
+            view.coins.insert(
+                input.clone(),
+                Coin {
+                    outpoint: input.clone(),
+                    value: 20,
+                    height: 1,
+                    coinbase: false,
+                    address: Address::new(0, vec![3; 20]).expect("address"),
+                    covenant: covenant(),
+                },
+            );
+            candidates.push(open_transaction(
+                input,
+                15,
+                format!("incremental-{index}").as_bytes(),
+            ));
+        }
+
+        let verifier = IncrementalNameOverlayProbe::default();
+        let context = MempoolContext::testing(2, 2);
+        let mut pool = MemoryMempool::new();
+        for candidate in candidates.iter().take(ADMISSIONS).cloned() {
+            assert!(matches!(
+                pool.submit_with_context(candidate, &context, &view, &AllowInputs, &verifier,)
+                    .expect("name admission"),
+                Admission::Accepted(_)
+            ));
+        }
+        assert_eq!(verifier.rebuilds.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            verifier.replayed_transactions.load(AtomicOrdering::Relaxed),
+            0,
+            "incremental acceptance must not replay an expanding prefix"
+        );
+
+        assert_eq!(pool.remove_transaction(candidates[0].txid(), false), 1);
+        assert!(matches!(
+            pool.submit_with_context(
+                candidates[ADMISSIONS].clone(),
+                &context,
+                &view,
+                &AllowInputs,
+                &verifier,
+            )
+            .expect("post-removal admission"),
+            Admission::Accepted(_)
+        ));
+        assert_eq!(verifier.rebuilds.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(
+            verifier.replayed_transactions.load(AtomicOrdering::Relaxed),
+            ADMISSIONS - 1,
+            "a removal rebuilds the retained prefix exactly once"
+        );
+    }
+
+    #[test]
     fn exclusive_name_index_releases_when_transaction_is_removed() {
         let first_input = outpoint(0xe1, 0);
         let replacement_input = outpoint(0xe2, 0);
@@ -5652,6 +5888,69 @@ mod tests {
         assert_eq!(
             snapshot.entry(&child_txid).expect("entry").ancestor_count,
             1
+        );
+    }
+
+    #[test]
+    fn reverse_orphan_chain_promotes_only_parent_indexed_descendants() {
+        const DEPTH: usize = 20;
+        const UNRELATED: usize = 128;
+
+        let root_input = outpoint(0x71, 0);
+        let view = FixedView::with_coin(root_input.clone(), 10_000);
+        let root = transaction(root_input, 9_999);
+        let mut chain = vec![root];
+        for depth in 0..DEPTH {
+            let parent = chain.last().expect("parent").txid();
+            chain.push(transaction(
+                Outpoint {
+                    txid: parent,
+                    index: 0,
+                },
+                9_998 - u64::try_from(depth).expect("depth"),
+            ));
+        }
+
+        let mut pool = MemoryMempool::new();
+        for transaction in chain.iter().skip(1).rev().cloned() {
+            assert!(matches!(
+                submit(&mut pool, transaction, &view),
+                Admission::Orphan(_)
+            ));
+        }
+        for index in 0..UNRELATED {
+            let mut raw = [0x91; 32];
+            raw[..8].copy_from_slice(&u64::try_from(index).expect("index").to_le_bytes());
+            assert!(matches!(
+                submit(
+                    &mut pool,
+                    transaction(
+                        Outpoint {
+                            txid: Txid::new(raw),
+                            index: 0,
+                        },
+                        1,
+                    ),
+                    &view,
+                ),
+                Admission::Orphan(_)
+            ));
+        }
+
+        assert!(matches!(
+            submit(&mut pool, chain[0].clone(), &view),
+            Admission::Accepted(_)
+        ));
+        assert_eq!(pool.orphan_promotion_attempts, DEPTH);
+        assert_eq!(pool.info().transaction_count, DEPTH + 1);
+        assert_eq!(pool.info().orphan_count, UNRELATED);
+        assert_eq!(pool.orphan_order.len(), UNRELATED);
+        assert_eq!(
+            pool.orphans_by_parent
+                .values()
+                .map(BTreeSet::len)
+                .sum::<usize>(),
+            UNRELATED
         );
     }
 

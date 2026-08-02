@@ -1538,7 +1538,7 @@ mod tests {
             _transaction: &Transaction,
             _input_coins: &[Coin],
             _context: &MempoolContext,
-            _accepted_name_transactions: &[&Transaction],
+            _accepted_name_transactions: &hns_mempool::AcceptedNameTransactions<'_>,
         ) -> Result<(), ConsensusError> {
             Ok(())
         }

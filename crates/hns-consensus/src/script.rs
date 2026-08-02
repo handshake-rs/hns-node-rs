@@ -5,8 +5,8 @@ use hns_primitives::{
 use hns_secp256k1::{Secp256k1Verifier, SecpError};
 
 use crate::{
-    is_valid_signature_hash_type, signature_hash, verify_locktime_predicate,
-    verify_sequence_predicate, ConsensusError, TransactionInputVerifier, MAX_MULTISIG_PUBKEYS,
+    is_valid_signature_hash_type, verify_locktime_predicate, verify_sequence_predicate,
+    ConsensusError, SignatureHashCache, TransactionInputVerifier, MAX_MULTISIG_PUBKEYS,
     MAX_SCRIPT_OPS, MAX_SCRIPT_PUSH, MAX_SCRIPT_SIZE,
 };
 
@@ -377,6 +377,16 @@ impl<V: SignatureVerifier> TransactionInputVerifier for WitnessProgramVerifier<V
             .map_err(|error| ConsensusError::Authorization(error.to_string()))
     }
 
+    fn verify_input_with_cache(
+        &self,
+        cache: &SignatureHashCache<'_>,
+        input_index: usize,
+        coin: &Coin,
+    ) -> Result<(), ConsensusError> {
+        verify_witness_program_with_cache(cache, input_index, coin, self.flags, &self.signatures)
+            .map_err(|error| ConsensusError::Authorization(error.to_string()))
+    }
+
     fn is_consensus_complete(&self) -> bool {
         self.flags.contains(ScriptFlags::MANDATORY) && self.signatures.is_consensus_complete()
     }
@@ -389,6 +399,18 @@ pub fn verify_witness_program(
     flags: ScriptFlags,
     signatures: &dyn SignatureVerifier,
 ) -> Result<(), ScriptError> {
+    let cache = SignatureHashCache::new(transaction);
+    verify_witness_program_with_cache(&cache, input_index, coin, flags, signatures)
+}
+
+pub fn verify_witness_program_with_cache(
+    cache: &SignatureHashCache<'_>,
+    input_index: usize,
+    coin: &Coin,
+    flags: ScriptFlags,
+    signatures: &dyn SignatureVerifier,
+) -> Result<(), ScriptError> {
+    let transaction = cache.transaction();
     let input = transaction
         .inputs
         .get(input_index)
@@ -437,7 +459,7 @@ pub fn verify_witness_program(
     execute_script(
         &redeem,
         &mut stack,
-        transaction,
+        cache,
         input_index,
         coin.value,
         flags,
@@ -461,12 +483,13 @@ fn pubkey_hash_script(hash: &[u8]) -> Vec<u8> {
 fn execute_script(
     script: &[u8],
     stack: &mut Vec<Vec<u8>>,
-    transaction: &Transaction,
+    cache: &SignatureHashCache<'_>,
     input_index: usize,
     previous_value: u64,
     flags: ScriptFlags,
     signatures: &dyn SignatureVerifier,
 ) -> Result<(), ScriptError> {
+    let transaction = cache.transaction();
     if script.len() > MAX_SCRIPT_SIZE {
         return Err(ScriptError::ScriptSize);
     }
@@ -791,7 +814,7 @@ fn execute_script(
                 let signature = pop(stack)?;
                 let subscript = &script[last_separator..];
                 let valid = check_signature(
-                    transaction,
+                    cache,
                     input_index,
                     previous_value,
                     subscript,
@@ -813,7 +836,7 @@ fn execute_script(
             OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
                 let valid = check_multisig(
                     stack,
-                    transaction,
+                    cache,
                     input_index,
                     previous_value,
                     &script[last_separator..],
@@ -844,7 +867,7 @@ fn execute_script(
 }
 
 fn check_signature(
-    transaction: &Transaction,
+    cache: &SignatureHashCache<'_>,
     input_index: usize,
     previous_value: u64,
     subscript: &[u8],
@@ -873,21 +896,21 @@ fn check_signature(
     let Some(compact) = compact else {
         return Ok(false);
     };
-    let message = signature_hash(
-        transaction,
-        input_index,
-        subscript,
-        previous_value,
-        u32::from(signature[64]),
-    )
-    .map_err(|error| ScriptError::Sighash(error.to_string()))?;
+    let message = cache
+        .signature_hash(
+            input_index,
+            subscript,
+            previous_value,
+            u32::from(signature[64]),
+        )
+        .map_err(|error| ScriptError::Sighash(error.to_string()))?;
     signatures.verify(&message, compact, public_key)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn check_multisig(
     stack: &mut Vec<Vec<u8>>,
-    transaction: &Transaction,
+    cache: &SignatureHashCache<'_>,
     input_index: usize,
     previous_value: u64,
     subscript: &[u8],
@@ -934,7 +957,7 @@ fn check_multisig(
         let signature = &candidate_signatures[remaining_signatures - 1];
         let key = &keys[remaining_keys - 1];
         if check_signature(
-            transaction,
+            cache,
             input_index,
             previous_value,
             subscript,

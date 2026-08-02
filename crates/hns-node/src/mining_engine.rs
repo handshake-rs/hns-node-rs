@@ -12,10 +12,10 @@ use hns_consensus::{
     VerifiedClaim, WitnessProgramVerifier, MEDIAN_TIMESPAN,
 };
 use hns_mempool::{
-    AirdropAdmission, AirdropMempoolContext, AirdropMempoolView, ClaimAdmission,
-    ClaimContextValidation, ClaimMempoolContext, ClaimMempoolView, ContextualTransactionVerifier,
-    Mempool, MempoolContext, MempoolInfo, MempoolLimits, MempoolSnapshot, MempoolView,
-    HSD_MINIMUM_RELAY_FEE_RATE,
+    AcceptedNameTransactions, AirdropAdmission, AirdropMempoolContext, AirdropMempoolView,
+    ClaimAdmission, ClaimContextValidation, ClaimMempoolContext, ClaimMempoolView,
+    ContextualTransactionVerifier, Mempool, MempoolContext, MempoolInfo, MempoolLimits,
+    MempoolSnapshot, MempoolView, HSD_MINIMUM_RELAY_FEE_RATE,
 };
 use hns_mining::{
     estimate_template_selection_workspace_bytes, MiningSnapshot, MiningTemplate, PreparedMiningJob,
@@ -30,8 +30,9 @@ use hns_primitives::{
     Reader, Transaction, Writer, MAX_BLOCK_WEIGHT,
 };
 use hns_state::{
-    airdrop_position_spent, decode_coin, encode_outpoint_key, verify_mempool_claim_context,
-    verify_mempool_name_context,
+    airdrop_position_spent, decode_coin, encode_outpoint_key, prepare_mempool_name_delta,
+    rebuild_mempool_name_overlay, verify_mempool_claim_context, MempoolNameDelta,
+    MempoolNameOverlay,
 };
 use hns_store::{
     ColumnFamily, PrefixScanBudget, ReadSnapshot, Store, StoreHandle, WriteBatch,
@@ -241,6 +242,33 @@ struct ActiveContextualTransactionVerifier<'a, T> {
     snapshot: &'a T,
     network: Network,
     name_flags: NameFlags,
+    chain_tip: BlockHash,
+    name_context: &'a Mutex<ActiveMempoolNameCache>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveMempoolNameIdentity {
+    chain_tip: BlockHash,
+    height: Height,
+    network: Network,
+    name_flags: NameFlags,
+}
+
+#[derive(Debug)]
+struct StagedMempoolNameDelta {
+    txid: hns_primitives::Txid,
+    base_revision: u64,
+    delta: MempoolNameDelta,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ActiveMempoolNameCache {
+    identity: Option<ActiveMempoolNameIdentity>,
+    revision: u64,
+    overlay: MempoolNameOverlay,
+    staged: Option<StagedMempoolNameDelta>,
+    #[cfg(test)]
+    rebuilds: usize,
 }
 
 impl<T: ReadSnapshot + Sync> ContextualTransactionVerifier
@@ -251,17 +279,90 @@ impl<T: ReadSnapshot + Sync> ContextualTransactionVerifier
         transaction: &Transaction,
         _input_coins: &[Coin],
         context: &MempoolContext,
-        accepted_name_transactions: &[&Transaction],
+        accepted_name_transactions: &AcceptedNameTransactions<'_>,
     ) -> Result<(), ConsensusError> {
-        verify_mempool_name_context(
+        if !transaction
+            .outputs
+            .iter()
+            .any(|output| output.covenant.kind.is_name())
+        {
+            return Ok(());
+        }
+        let identity = ActiveMempoolNameIdentity {
+            chain_tip: self.chain_tip,
+            height: context.next_height,
+            network: self.network,
+            name_flags: self.name_flags,
+        };
+        let mut cache = self
+            .name_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.staged = None;
+        if cache.identity != Some(identity)
+            || cache.revision != accepted_name_transactions.revision()
+        {
+            cache.overlay = rebuild_mempool_name_overlay(
+                self.snapshot,
+                accepted_name_transactions.iter(),
+                context.next_height,
+                self.network,
+                self.name_flags,
+            )
+            .map_err(|error| ConsensusError::ContextualCovenant(error.to_string()))?;
+            cache.identity = Some(identity);
+            cache.revision = accepted_name_transactions.revision();
+            #[cfg(test)]
+            {
+                cache.rebuilds = cache.rebuilds.saturating_add(1);
+            }
+        }
+        let delta = prepare_mempool_name_delta(
             self.snapshot,
-            accepted_name_transactions,
+            &cache.overlay,
             transaction,
             context.next_height,
             self.network,
             self.name_flags,
         )
-        .map_err(|error| ConsensusError::ContextualCovenant(error.to_string()))
+        .map_err(|error| ConsensusError::ContextualCovenant(error.to_string()))?;
+        cache.staged = Some(StagedMempoolNameDelta {
+            txid: transaction.txid(),
+            base_revision: accepted_name_transactions.revision(),
+            delta,
+        });
+        Ok(())
+    }
+
+    fn transaction_accepted(
+        &self,
+        transaction: &Transaction,
+        accepted_name_transactions: &AcceptedNameTransactions<'_>,
+    ) {
+        if !transaction
+            .outputs
+            .iter()
+            .any(|output| output.covenant.kind.is_name())
+        {
+            return;
+        }
+        let mut cache = self
+            .name_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(staged) = cache.staged.take() else {
+            cache.identity = None;
+            return;
+        };
+        if staged.txid == transaction.txid()
+            && cache.revision == staged.base_revision
+            && accepted_name_transactions.revision() == staged.base_revision.saturating_add(1)
+        {
+            cache.overlay.commit(staged.delta);
+            cache.revision = accepted_name_transactions.revision();
+        } else {
+            cache.identity = None;
+        }
     }
 
     fn is_consensus_complete(&self) -> bool {
@@ -273,7 +374,7 @@ fn active_mempool_parameters<T: ReadSnapshot>(
     state: &super::NodeState,
     network: Network,
     snapshot: &T,
-) -> Result<Option<(MempoolContext, NameFlags)>> {
+) -> Result<Option<(MempoolContext, NameFlags, BlockHash)>> {
     let Some(tip) = super::best_block_tip_from_snapshot(snapshot)? else {
         return Ok(None);
     };
@@ -307,6 +408,7 @@ fn active_mempool_parameters<T: ReadSnapshot>(
             require_complete_verifiers: true,
         },
         deployments.name_flags,
+        tip.hash,
     )))
 }
 
@@ -1773,7 +1875,7 @@ impl NodeService {
                 .store
                 .snapshot()
                 .context("failed to open post-connect mempool context")?;
-            let (context, name_flags) =
+            let (context, name_flags, chain_tip) =
                 active_mempool_parameters(&self.state, self.config.network, &snapshot)?
                     .ok_or_else(|| {
                         anyhow::anyhow!("connected chain has no active mempool context")
@@ -1783,6 +1885,8 @@ impl NodeService {
                 snapshot: &snapshot,
                 network: self.config.network,
                 name_flags,
+                chain_tip,
+                name_context: &self.mempool_name_context,
             };
             let input_verifier = active_mempool_input_verifier()?;
             let claim_context =
@@ -1975,7 +2079,7 @@ impl NodeService {
             .store
             .snapshot()
             .context("failed to open active mempool context")?;
-        let Some((context, name_flags)) =
+        let Some((context, name_flags, chain_tip)) =
             active_mempool_parameters(&self.state, self.config.network, &snapshot)?
         else {
             return Ok(hns_mempool::Admission::Rejected {
@@ -1987,6 +2091,8 @@ impl NodeService {
             snapshot: &snapshot,
             network: self.config.network,
             name_flags,
+            chain_tip,
+            name_context: &self.mempool_name_context,
         };
         let input_verifier = active_mempool_input_verifier()?;
         let admission = self

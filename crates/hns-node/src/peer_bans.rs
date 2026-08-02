@@ -54,6 +54,9 @@ pub(crate) struct PeerBanBook {
     durable_sequence: u64,
     dirty: bool,
     entries: BTreeMap<IpAddr, PeerBanEntry>,
+    /// Exact saturation/expiry rank, avoiding a peer-controlled full-map scan
+    /// whenever the bounded ban list receives another entry.
+    eviction_order: BTreeSet<(u64, u64, IpAddr)>,
 }
 
 #[derive(Debug)]
@@ -76,6 +79,7 @@ impl PeerBanBook {
             durable_sequence: 0,
             dirty: false,
             entries: BTreeMap::new(),
+            eviction_order: BTreeSet::new(),
         })
     }
 
@@ -123,38 +127,50 @@ impl PeerBanBook {
 
         self.sequence = self.sequence.saturating_add(1);
         if let Some(entry) = self.entries.get_mut(&address) {
+            let old_eviction = (entry.ban_until, entry.sequence, address);
             entry.banned_at = ban.banned_at;
             entry.ban_until = ban.ban_until;
             entry.sequence = self.sequence;
+            let removed = self.eviction_order.remove(&old_eviction);
+            debug_assert!(removed, "updated peer ban has an eviction-order key");
+            self.eviction_order
+                .insert((entry.ban_until, entry.sequence, address));
             self.dirty = true;
             return Ok(true);
         }
 
         if self.entries.len() >= self.maximum {
             let eviction = self
-                .entries
-                .iter()
-                .min_by_key(|(address, entry)| (entry.ban_until, entry.sequence, **address))
-                .map(|(address, _)| *address)
+                .eviction_order
+                .pop_first()
+                .map(|(_, _, address)| address)
                 .expect("a full nonzero ban list has an eviction candidate");
-            self.entries.remove(&eviction);
+            let removed = self.entries.remove(&eviction);
+            debug_assert!(removed.is_some(), "eviction key references a peer ban");
         }
-        self.entries.insert(
-            address,
-            PeerBanEntry {
-                banned_at: ban.banned_at,
-                ban_until: ban.ban_until,
-                sequence: self.sequence,
-            },
-        );
+        let entry = PeerBanEntry {
+            banned_at: ban.banned_at,
+            ban_until: ban.ban_until,
+            sequence: self.sequence,
+        };
+        self.eviction_order
+            .insert((entry.ban_until, entry.sequence, address));
+        self.entries.insert(address, entry);
         self.dirty = true;
         Ok(true)
     }
 
     pub fn remove_expired(&mut self, now: u64) -> usize {
-        let before = self.entries.len();
-        self.entries.retain(|_, entry| now <= entry.ban_until);
-        let removed = before.saturating_sub(self.entries.len());
+        let mut removed = 0usize;
+        while let Some((ban_until, _, address)) = self.eviction_order.first().copied() {
+            if now <= ban_until {
+                break;
+            }
+            self.eviction_order.pop_first();
+            let entry = self.entries.remove(&address);
+            debug_assert!(entry.is_some(), "expiry key references a peer ban");
+            removed = removed.saturating_add(usize::from(entry.is_some()));
+        }
         self.dirty |= removed > 0;
         removed
     }
@@ -195,16 +211,23 @@ impl PeerBanBook {
         });
 
         let mut loaded = 0usize;
-        for entry in record.entries.into_iter().take(self.maximum) {
+        for entry in record.entries {
+            if loaded == self.maximum {
+                break;
+            }
+            let address = normalize_peer_ip(entry.address);
+            if self.entries.contains_key(&address) {
+                continue;
+            }
             self.sequence = self.sequence.max(entry.sequence);
-            self.entries.insert(
-                normalize_peer_ip(entry.address),
-                PeerBanEntry {
-                    banned_at: entry.banned_at,
-                    ban_until: entry.ban_until,
-                    sequence: entry.sequence,
-                },
-            );
+            let restored = PeerBanEntry {
+                banned_at: entry.banned_at,
+                ban_until: entry.ban_until,
+                sequence: entry.sequence,
+            };
+            self.eviction_order
+                .insert((restored.ban_until, restored.sequence, address));
+            self.entries.insert(address, restored);
             loaded = loaded.saturating_add(1);
         }
         self.durable_sequence = record.generation;
@@ -505,6 +528,50 @@ mod tests {
         assert!(!loaded
             .book
             .is_banned("1.1.1.1".parse().expect("IP"), now + 250));
+    }
+
+    #[test]
+    fn saturated_peer_bans_keep_an_exact_logarithmic_eviction_index() {
+        const CAPACITY: usize = 64;
+        const INSERTIONS: usize = 512;
+        let now = 1_800_000_000;
+        let mut bans = PeerBanBook::new(Network::Mainnet, CAPACITY).expect("book");
+
+        for index in 0..INSERTIONS {
+            let third = u8::try_from(index / 254).expect("third octet");
+            let fourth = u8::try_from(index % 254 + 1).expect("fourth octet");
+            let address = IpAddr::V4(Ipv4Addr::new(23, 1, third, fourth));
+            bans.ban(&PeerBan {
+                address,
+                banned_at: now,
+                ban_until: now + 100 + u64::try_from(index % 17).expect("expiry delta"),
+                score: i32::try_from(HSD_BAN_SCORE).expect("ban score"),
+            })
+            .expect("ban");
+            assert_eq!(bans.len(), (index + 1).min(CAPACITY));
+            assert_eq!(bans.eviction_order.len(), bans.len());
+        }
+
+        let expected = bans
+            .entries
+            .iter()
+            .map(|(address, entry)| (entry.ban_until, entry.sequence, *address))
+            .min()
+            .expect("eviction candidate");
+        assert_eq!(bans.eviction_order.first().copied(), Some(expected));
+
+        let expected_expired = bans
+            .entries
+            .values()
+            .filter(|entry| now + 116 > entry.ban_until)
+            .count();
+        assert_eq!(bans.remove_expired(now + 116), expected_expired);
+        assert_eq!(bans.eviction_order.len(), bans.len());
+        assert!(bans.eviction_order.iter().all(|(ban_until, _, address)| {
+            bans.entries
+                .get(address)
+                .is_some_and(|entry| entry.ban_until == *ban_until)
+        }));
     }
 
     #[cfg(feature = "rocksdb-backend")]
