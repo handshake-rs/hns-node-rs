@@ -115,22 +115,28 @@ Implemented:
   unpublished page/frame tails, and reject locator/manifest disagreement.
 - Optional `--transaction-index` historical lookup. The mining profile omits
   the redundant per-transaction LSM write by default.
-- Optional `--script-history-index`, `--spender-index`, and complete
+- Optional `--script-history-index`, `--spender-index`, and combined
   `--wallet-index` active-chain profiles, staged atomically with UTXO/name
   state and exactly reversed on disconnect/reorganization. The typed
   noncustodial backend, bounded fee estimator, current name proof/owner lookup,
   contextual transaction admission/P2P fanout, one-pass bounded multi-script
   mempool reconciliation, chain-epoch-bound global confirmed history/UTXO
   restoration, active-height hash reads, atomically bundled transaction/name
-  evidence, and generation-bound pagination are implemented in source; all
-  remain disabled by default. Immutable public Shakedex-v2 and
-  HNS-HTLC-v1 registrations drive restart-durable funding, fulfillment,
-  recovery, redemption, refund, and revealed-preimage events in the canonical
+  evidence, collection-admitted/256-examination confirmed pagination, and
+  process-instance- plus generation-bound mempool pagination are implemented in
+  source; all remain disabled by default. Immutable public Shakedex-v2 and
+  HNS-HTLC-v1 registrations drive restart-durable funding, seller-signed
+  TRANSFER fulfillment (`0x84`) and recovery (`0x83`), redemption, refund, and
+  internally raw/publicly redacted revealed-preimage events in the canonical
   block/reorg batch. Consensus-valid spends outside the pinned wallet profile
   are recorded as `Unrecognized` rather than rejected. Contract IDs use an
   explicit versioned canonical binary encoding, while bounded one-to-many
   address candidates preserve valid key reuse and match exact output terms.
-  Contract pages bind their contract and chain epoch. The new tranche is awaiting
+  Contract pages bind their contract and chain epoch. Connect indexing reads the
+  authenticated pre-current-block UTXO view plus the complete same-block output
+  map before state-overlay mutation. The append-only contract registry has no
+  safe retirement or capacity reclamation; its lifetime caps are an explicit
+  production-availability blocker. This implementation is awaiting
   the repository's full gate, a published and pinned canonical `hns-swap`
   commit, and cross-repository adapter qualification; local script duplication
   and frozen vectors are not protocol authority and no release-readiness claim

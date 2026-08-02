@@ -44,14 +44,20 @@ pub const MAX_WALLET_MEMPOOL_ITEMS: usize = 4_096;
 pub const MAX_WALLET_RESTORE_SCRIPTS: usize = 10_000;
 /// Maximum confirmed rows returned by one global restoration page.
 pub const MAX_WALLET_CONFIRMED_PAGE_ITEMS: usize = MAX_QUERY_ENTRIES;
+/// Maximum script-prefix pages examined by one confirmed restoration call.
+pub const MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS: usize = 256;
 
 const CONFIRMED_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-confirmed-script-set/v1";
 const MEMPOOL_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-mempool-script-set/v1";
 const MEMPOOL_CONTRACT_DOMAIN: &[u8] = b"hns-node/wallet-mempool-contract/v1";
+const CONFIRMED_CURSOR_VERSION: u8 = 1;
+const MEMPOOL_CURSOR_VERSION: u8 = 1;
 
 /// Opaque query-bound cursor for a single immutable mempool generation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WalletMempoolCursor {
+    binding_version: u8,
+    instance_nonce: [u8; 32],
     generation: u64,
     query_id: [u8; 32],
     after_txid: Txid,
@@ -72,6 +78,7 @@ enum ConfirmedScriptsPosition {
 /// Opaque continuation for a durable-chain-epoch-bound confirmed restore.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ConfirmedScriptsCursor {
+    binding_version: u8,
     chain_epoch: u64,
     script_set_id: [u8; 32],
     position: ConfirmedScriptsPosition,
@@ -106,6 +113,8 @@ pub struct ConfirmedScriptsPage {
     pub history: Vec<ConfirmedScriptHistory>,
     /// UTXO rows for one traversed script, in outpoint order.
     pub utxos: Vec<ConfirmedScriptUtxo>,
+    /// Script-prefix pages examined during this bounded call.
+    pub script_examinations: usize,
     /// Exclusive continuation, rejected after a chain-generation change.
     pub continuation: Option<ConfirmedScriptsCursor>,
 }
@@ -144,6 +153,8 @@ pub struct MempoolScriptActivity {
 /// One bounded global-scan page of script-relevant mempool activity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolScriptPage {
+    /// Random non-persisted identity of the in-memory mempool instance.
+    pub instance_nonce: [u8; 32],
     /// Exact immutable mempool generation used for the page.
     pub generation: u64,
     /// Relevant transactions in deterministic txid order.
@@ -185,6 +196,8 @@ pub struct MempoolContractActivity {
 /// One bounded global-scan page of registered-contract mempool activity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolContractPage {
+    /// Random non-persisted identity of the in-memory mempool instance.
+    pub instance_nonce: [u8; 32],
     /// Exact immutable mempool generation used for the page.
     pub generation: u64,
     /// Relevant transactions in deterministic txid order.
@@ -406,6 +419,9 @@ pub enum WalletBackendError {
     /// A continuation belongs to an older immutable mempool generation.
     #[error("wallet mempool generation changed from {expected} to {actual}")]
     StaleMempoolGeneration { expected: u64, actual: u64 },
+    /// A continuation belongs to another process-local mempool instance.
+    #[error("wallet mempool instance changed; restart reconciliation")]
+    StaleMempoolInstance,
     /// A mempool continuation belongs to another script set or contract.
     #[error("wallet mempool continuation belongs to another query")]
     InvalidMempoolCursor,
@@ -662,11 +678,14 @@ impl WalletBackend {
         }
         let script_set_id = confirmed_script_set_id(&scripts)?;
         let read = self.read.clone();
-        blocking_chain_read(read, move |_, snapshot| {
+        blocking_chain_collection_read(read, move |_, snapshot| {
             let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
             let tip = wallet_chain_tip(snapshot)?;
             let mut position = match cursor {
                 Some(cursor) => {
+                    if cursor.binding_version != CONFIRMED_CURSOR_VERSION {
+                        return Err(WalletBackendError::InvalidConfirmedCursor);
+                    }
                     if cursor.chain_epoch != chain_epoch {
                         return Err(WalletBackendError::StaleChainEpoch {
                             expected: cursor.chain_epoch,
@@ -683,8 +702,25 @@ impl WalletBackend {
                     cursor: None,
                 },
             };
+            let mut script_examinations = 0usize;
 
             loop {
+                if script_examinations == MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS {
+                    return Ok(ConfirmedScriptsPage {
+                        chain_epoch,
+                        tip,
+                        history: Vec::new(),
+                        utxos: Vec::new(),
+                        script_examinations,
+                        continuation: Some(ConfirmedScriptsCursor {
+                            binding_version: CONFIRMED_CURSOR_VERSION,
+                            chain_epoch,
+                            script_set_id,
+                            position,
+                        }),
+                    });
+                }
+                script_examinations = script_examinations.saturating_add(1);
                 match position {
                     ConfirmedScriptsPosition::History {
                         script_index,
@@ -735,7 +771,9 @@ impl WalletBackend {
                             tip,
                             history,
                             utxos: Vec::new(),
+                            script_examinations,
                             continuation: Some(ConfirmedScriptsCursor {
+                                binding_version: CONFIRMED_CURSOR_VERSION,
                                 chain_epoch,
                                 script_set_id,
                                 position: next_position,
@@ -786,6 +824,7 @@ impl WalletBackend {
                                     tip,
                                     history: Vec::new(),
                                     utxos,
+                                    script_examinations,
                                     continuation: None,
                                 });
                             };
@@ -797,7 +836,9 @@ impl WalletBackend {
                             tip,
                             history: Vec::new(),
                             utxos,
+                            script_examinations,
                             continuation: next_position.map(|position| ConfirmedScriptsCursor {
+                                binding_version: CONFIRMED_CURSOR_VERSION,
                                 chain_epoch,
                                 script_set_id,
                                 position,
@@ -1047,6 +1088,7 @@ impl WalletBackend {
                 }
             }
             Ok(MempoolScriptPage {
+                instance_nonce: *mempool.instance_nonce(),
                 generation: mempool.generation(),
                 entries,
                 continuation,
@@ -1159,6 +1201,7 @@ impl WalletBackend {
                 }
             }
             Ok(MempoolContractPage {
+                instance_nonce: *mempool.instance_nonce(),
                 generation: mempool.generation(),
                 entries,
                 continuation,
@@ -1450,8 +1493,46 @@ where
         + Send
         + 'static,
 {
+    blocking_chain_read_with_admission(read, false, operation).await
+}
+
+async fn blocking_chain_collection_read<T, F>(
+    read: NodeReadHandle,
+    operation: F,
+) -> Result<T, WalletBackendError>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &NodeReadHandle,
+            &hns_store::StoreHandleSnapshot<'_>,
+        ) -> Result<T, WalletBackendError>
+        + Send
+        + 'static,
+{
+    blocking_chain_read_with_admission(read, true, operation).await
+}
+
+async fn blocking_chain_read_with_admission<T, F>(
+    read: NodeReadHandle,
+    collection: bool,
+    operation: F,
+) -> Result<T, WalletBackendError>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            &NodeReadHandle,
+            &hns_store::StoreHandleSnapshot<'_>,
+        ) -> Result<T, WalletBackendError>
+        + Send
+        + 'static,
+{
     read.ensure_storage_operational().map_err(node_error)?;
-    let permit = Arc::clone(&read.point_read_concurrency)
+    let concurrency = if collection {
+        &read.collection_concurrency
+    } else {
+        &read.point_read_concurrency
+    };
+    let permit = Arc::clone(concurrency)
         .try_acquire_owned()
         .map_err(|_| WalletBackendError::Node("wallet read concurrency exhausted".to_owned()))?;
     tokio::task::spawn_blocking(move || {
@@ -1573,6 +1654,12 @@ fn mempool_scan_page(
     query_id: [u8; 32],
 ) -> Result<(Vec<Txid>, Option<WalletMempoolCursor>), WalletBackendError> {
     if let Some(cursor) = cursor {
+        if cursor.binding_version != MEMPOOL_CURSOR_VERSION {
+            return Err(WalletBackendError::InvalidMempoolCursor);
+        }
+        if cursor.instance_nonce != *mempool.instance_nonce() {
+            return Err(WalletBackendError::StaleMempoolInstance);
+        }
         if cursor.generation != mempool.generation() {
             return Err(WalletBackendError::StaleMempoolGeneration {
                 expected: cursor.generation,
@@ -1594,6 +1681,8 @@ fn mempool_scan_page(
     }
     let continuation = if has_more {
         txids.last().copied().map(|after_txid| WalletMempoolCursor {
+            binding_version: MEMPOOL_CURSOR_VERSION,
+            instance_nonce: *mempool.instance_nonce(),
             generation: mempool.generation(),
             query_id,
             after_txid,
@@ -1736,6 +1825,7 @@ fn wallet_writer_error(error: anyhow::Error) -> WalletBackendError {
 mod tests {
     use super::*;
     use hns_consensus::Network;
+    use hns_mempool::MemoryMempool;
     use hns_p2p::LivePeerConfig;
     use hns_primitives::{Input, Outpoint, Witness};
 
@@ -1809,6 +1899,7 @@ mod tests {
             .get_mempool_scripts_activity(scripts.clone(), None, 128)
             .await
             .unwrap();
+        assert_ne!(mempool_page.instance_nonce, [0; 32]);
         assert!(mempool_page.entries.is_empty());
         assert!(mempool_page.continuation.is_none());
         let confirmed_page = backend
@@ -1819,11 +1910,13 @@ mod tests {
         assert!(confirmed_page.utxos.is_empty());
         assert!(confirmed_page.continuation.is_none());
         assert_eq!(confirmed_page.tip, None);
+        assert_eq!(confirmed_page.script_examinations, 4);
         assert!(matches!(
             backend
                 .get_confirmed_scripts_page(
                     scripts.clone(),
                     Some(ConfirmedScriptsCursor {
+                        binding_version: CONFIRMED_CURSOR_VERSION,
                         chain_epoch: confirmed_page.chain_epoch.saturating_add(1),
                         script_set_id: confirmed_script_set_id(&scripts).unwrap(),
                         position: ConfirmedScriptsPosition::History {
@@ -1842,6 +1935,36 @@ mod tests {
                 .await,
             Err(WalletBackendError::InvalidScriptSet)
         ));
+
+        let mut empty_scripts = (0..=MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS / 2)
+            .map(|index| ScriptId::from_descriptor(&index.to_be_bytes()))
+            .collect::<Vec<_>>();
+        empty_scripts.sort_unstable();
+        let bounded_empty_page = backend
+            .get_confirmed_scripts_page(empty_scripts.clone(), None, 128)
+            .await
+            .unwrap();
+        assert!(bounded_empty_page.history.is_empty());
+        assert!(bounded_empty_page.utxos.is_empty());
+        assert_eq!(
+            bounded_empty_page.script_examinations,
+            MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS
+        );
+        let bounded_empty_continuation = bounded_empty_page
+            .continuation
+            .expect("empty traversal must yield resumable progress at its work bound");
+        let bounded_empty_completion = backend
+            .get_confirmed_scripts_page(
+                empty_scripts,
+                Some(bounded_empty_continuation),
+                128,
+            )
+            .await
+            .unwrap();
+        assert!(bounded_empty_completion.history.is_empty());
+        assert!(bounded_empty_completion.utxos.is_empty());
+        assert_eq!(bounded_empty_completion.script_examinations, 2);
+        assert!(bounded_empty_completion.continuation.is_none());
 
         let registration = ContractRegistration::shakedex_v2(
             hns_wallet_index::ShakedexV2Descriptor {
@@ -1906,5 +2029,31 @@ mod tests {
 
         drop(backend);
         runtime.shutdown_unclean().await.unwrap();
+    }
+
+    #[test]
+    fn mempool_cursor_rejects_another_process_local_instance() {
+        let first = MemoryMempool::new()
+            .expect("first mempool initialization")
+            .snapshot();
+        let second = MemoryMempool::new()
+            .expect("second mempool initialization")
+            .snapshot();
+        assert_ne!(first.instance_nonce(), &[0; 32]);
+        assert_ne!(second.instance_nonce(), &[0; 32]);
+        assert_ne!(first.instance_nonce(), second.instance_nonce());
+
+        let query_id = [0x42; 32];
+        let cursor = WalletMempoolCursor {
+            binding_version: MEMPOOL_CURSOR_VERSION,
+            instance_nonce: *first.instance_nonce(),
+            generation: first.generation(),
+            query_id,
+            after_txid: Txid::ZERO,
+        };
+        assert!(matches!(
+            mempool_scan_page(&second, Some(&cursor), 1, query_id),
+            Err(WalletBackendError::StaleMempoolInstance)
+        ));
     }
 }

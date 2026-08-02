@@ -140,9 +140,12 @@ Implemented in source:
 
 - optional transaction, script-history, spender, and restoration UTXO indexes;
 - chain-epoch- and script-set-bound global confirmed restoration pages across
-  history and UTXOs, rejecting continuations after a reorganization;
+  history and UTXOs, rejecting continuations after a reorganization, with
+  collection-read admission, a 256-prefix-examination work bound, and resumable
+  empty progress;
 - bounded one-pass reconciliation of up to 10,000 sorted-unique wallet scripts
-  against generation-bound immutable mempool pages, with result indexes
+  against process-instance- and generation-bound immutable mempool pages, with
+  fallible OS-random nonzero instance initialization and result indexes
   explicitly defined against sorted request order for adapter reverse mapping;
 - active-height block hash reads, tree-root-bearing tips, combined
   generation-stable transaction evidence, and tip/root-bound current-versus-
@@ -154,16 +157,21 @@ Implemented in source:
 - checksummed, key-bound active funding and confirmed fulfillment, recovery,
   redemption, refund, and revealed-preimage events committed and disconnected
   in the canonical chain batch, with consensus-valid out-of-profile spends
-  preserved as `Unrecognized` rather than rejected;
+  preserved as `Unrecognized` rather than rejected; Shakedex fulfillment and
+  recovery are the exact seller-signed TRANSFER shapes (`0x84`/`0x83`), and
+  public serde redacts rather than exports persisted raw preimages;
 - bounded startup topology validation, query pagination, typed
   disabled/corrupt/pruned failures, and explicit preimage redaction.
 
-This tranche is not release-qualified until the full repository gate, a
+This implementation is not release-qualified until the full repository gate, a
 published and pinned canonical `hns-swap` commit, and cross-repository wallet
 adapter/restart/reorg qualification pass on its final commit. Local script
-duplication and frozen vectors are temporary cross-boundary checks, not
+duplication and frozen vectors are cross-boundary qualification checks, not
 protocol authority. It stores no wallet key or unrevealed preimage and remains
-disabled by default. Live marketplace wire advertisement separately awaits the
+disabled by default. Its immutable registry is append-only: no safe retirement
+or capacity-reclamation lifecycle exists, making the global/per-address
+lifetime caps a separate production-availability blocker. Live marketplace wire
+advertisement separately awaits the
 published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
 adapter gate.
 

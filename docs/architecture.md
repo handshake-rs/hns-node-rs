@@ -129,17 +129,32 @@ transaction status/inclusion/payload with one chain/mempool generation, and
 bundles current versus interval-root-authenticated name state, proof, and owner
 evidence in one snapshot. Confirmed history/UTXO restoration uses a global
 script-set- and chain-epoch-bound cursor so a reorganization cannot tear a
-multi-page scan. Multi-script result positions refer to the sorted request, so
-the wallet adapter owns the reverse map to derivation order.
+multi-page scan. Collection admission and a 256-script-prefix-page work bound
+permit resumable empty progress without monopolizing the point-read lane.
+Mempool continuations additionally bind a fallibly initialized, random,
+nonzero, process-local instance nonce, so a restart cannot reuse generation
+numbers as cursor authority. Multi-script result positions refer to the sorted
+request, so the wallet adapter owns the reverse map to derivation order.
 
 Public Shakedex/HTLC registrations and confirmed events share the canonical
-block/reorg batch, but never participate in consensus validity. An accepted
-spend outside the pinned wallet profile becomes `Unrecognized`; it cannot make
-the optional index reject a block. Bounded address candidate sets preserve
-descriptors that share a script while matching their exact output terms; key
-uniqueness is not a protocol assumption. Local profile duplication and frozen vectors
-are not protocol authority. Release qualification requires a published and
-pinned canonical `hns-swap` commit and qualified adapter. Wallet secrets,
+block/reorg batch, but never participate in consensus validity. Connect staging
+reads the authenticated pre-current-block UTXO view before the state connector
+mutates any live/reorg overlay, plus a complete same-block output map. An
+accepted spend outside the pinned wallet profile becomes `Unrecognized`; it
+cannot make the optional index reject a block. Shakedex fulfillment and recovery
+are the seller-signed TRANSFER shapes with exact `0x84` and `0x83` hash types;
+an invented direct FINALIZE shape is not recognized. Bounded address candidate
+sets preserve descriptors that share a script while matching their exact output
+terms; key uniqueness is not a protocol assumption. Revealed preimages remain
+raw only in internal durable events; public debug/serde surfaces redact them and
+raw access is explicit.
+
+The immutable registry is append-only and has no authenticated retirement or
+capacity-reclamation lifecycle. Its global and per-address caps are therefore
+lifetime data-directory limits and an explicit production-availability blocker.
+Local profile duplication and frozen vectors are not protocol authority.
+Release qualification requires safe registry lifecycle work, a published and
+pinned canonical `hns-swap` commit, and a qualified adapter. Wallet secrets,
 signing, workflow decisions, and unrevealed preimages remain outside the node.
 
 ## Compatibility boundary

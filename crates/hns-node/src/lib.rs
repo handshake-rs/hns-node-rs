@@ -38,6 +38,7 @@ pub use wallet_backend::{
     WalletBackend, WalletBackendError, WalletChainTip, WalletContractEventCursor,
     WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
     WalletMempoolCursor, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
+    MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS,
 };
 
 use std::{
@@ -8674,7 +8675,8 @@ impl NodeState {
             chain,
             blocks,
             state_engine,
-            mempool: MemoryMempool::new(),
+            mempool: MemoryMempool::new()
+                .map_err(|error| anyhow::anyhow!("failed to initialize mempool: {error}"))?,
             name_pages,
             transaction_index: true,
             wallet_index_profile: WalletIndexProfile::default(),
@@ -10735,6 +10737,22 @@ impl NodeState {
             issuance_verifier: &issuance,
         };
 
+        // Derivative indexes require the authenticated UTXO view immediately
+        // before this block. In a reorg, `snapshot` already includes every
+        // earlier staged disconnect/connect, but not this block's state writes.
+        // Stage index writes first so the live overlay cannot hide inputs that
+        // the state connector is about to spend. A later validation failure
+        // discards the shared batch, so no derivative write is published alone.
+        stage_wallet_index_connect(
+            snapshot,
+            batch,
+            &request.block,
+            request.height,
+            self.wallet_index_profile,
+        )
+        .map_err(anyhow::Error::new)
+        .context("failed to stage wallet indexes")?;
+
         let state_summary = connect_block_to_batch_with_services(
             snapshot,
             batch,
@@ -10796,15 +10814,6 @@ impl NodeState {
                 .map_err(anyhow::Error::new)
                 .context("failed to stage tx index")?;
         }
-        stage_wallet_index_connect(
-            snapshot,
-            batch,
-            &request.block,
-            request.height,
-            self.wallet_index_profile,
-        )
-        .map_err(anyhow::Error::new)
-        .context("failed to stage wallet indexes")?;
         write_canonical_height_to_batch(batch, request.height, block_hash)
             .map_err(anyhow::Error::new)
             .context("failed to stage canonical height")?;
@@ -22506,7 +22515,9 @@ mod tests {
                 generation: 1,
                 ..MempoolInfo::default()
             },
-            MempoolSnapshot::default(),
+            MemoryMempool::new()
+                .expect("test mempool initialization")
+                .snapshot(),
             OrderedTxidSnapshot::default(),
             1,
         )
@@ -22517,7 +22528,9 @@ mod tests {
 
         let ordered_generation_error = PublishedMempoolView::new(
             MempoolInfo::default(),
-            MempoolSnapshot::default(),
+            MemoryMempool::new()
+                .expect("test mempool initialization")
+                .snapshot(),
             OrderedTxidSnapshot::default(),
             1,
         )
@@ -22531,7 +22544,9 @@ mod tests {
                 transaction_count: 1,
                 ..MempoolInfo::default()
             },
-            MempoolSnapshot::default(),
+            MemoryMempool::new()
+                .expect("test mempool initialization")
+                .snapshot(),
             OrderedTxidSnapshot::default(),
             0,
         )

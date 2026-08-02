@@ -282,14 +282,19 @@ Fixtures are evidence, not authority.
   the global 16,384 registration cap; exact output terms select the descriptor,
   so key reuse is not silently prohibited or treated as protocol authority.
 - Only public descriptors and already revealed, hashlock-validated on-chain
-  preimages enter the index. Preimage `Debug` output is redacted and raw access
-  requires an explicitly named settlement accessor. No unrevealed secret,
-  seed, password, or signing capability enters node storage.
+  preimages enter the index. Internal checksummed events retain the raw revealed
+  bytes for exact restart/disconnect behavior; public `Debug` and serde output
+  redact them, public serde input cannot reconstruct them, and raw access
+  requires an explicitly named settlement accessor. No unrevealed secret, seed,
+  password, or signing capability enters node storage.
 - Multi-script confirmed and mempool results use positions in the sorted
   request. Confirmed cursors bind the script-set digest and durable chain epoch;
-  mempool cursors bind the immutable mempool generation. Wallet adapters retain
-  an explicit reverse map to derivation-order records and discard partial scans
-  when either generation changes.
+  collection admission and a 256-prefix-page bound permit empty resumable
+  progress. Mempool cursors bind the immutable generation plus a fallibly
+  initialized, OS-random nonzero process-local nonce, rejecting continuations
+  after restart. Wallet adapters retain an explicit reverse map to
+  derivation-order records and discard partial scans when either binding
+  changes.
 - Combined transaction evidence binds status, inclusion, payload availability,
   chain epoch, tip, and mempool generation. Combined name evidence labels both
   pending current state and interval-root-authenticated state and resolves
@@ -299,9 +304,15 @@ Fixtures are evidence, not authority.
   including for a terminal restoration page; a completed mempool-only
   publication does not stale a durable-chain result.
 - Local Shakedex/HTLC script and branch duplication is not protocol authority.
-  Frozen vectors are temporary cross-boundary evidence; release qualification
+  The local tracker recognizes only seller-signed Shakedex TRANSFER fulfillment
+  (`0x84`) and recovery (`0x83`) shapes; a direct FINALIZE shape is
+  `Unrecognized`.
+  Frozen vectors are cross-boundary qualification evidence; release qualification
   requires a published canonical `hns-swap` commit plus a pinned, qualified
   adapter.
+- The contract registry is append-only. Its global and per-address caps cannot
+  be safely reclaimed in this schema, so exhaustion is a production-availability
+  threat and untrusted registration must remain unavailable.
 
 ## Failure policy
 

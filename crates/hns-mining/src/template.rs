@@ -1481,6 +1481,10 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    fn test_mempool() -> MemoryMempool {
+        MemoryMempool::new().expect("test mempool initialization")
+    }
+
     #[derive(Default)]
     struct View {
         coins: HashMap<Outpoint, Coin>,
@@ -1784,7 +1788,7 @@ mod tests {
         let mut mining_snapshot = snapshot();
         mining_snapshot.tip.time = 200;
         mining_snapshot.parent_median_time = 100;
-        let pool = MemoryMempool::new();
+        let pool = test_mempool();
         let pool_snapshot = pool.snapshot();
         let request = TemplateBuildRequest {
             snapshot: &mining_snapshot,
@@ -1985,7 +1989,7 @@ mod tests {
         let parent_time = special_claim["parentTime"]
             .as_u64()
             .expect("claim parent time");
-        let mut claim_pool = MemoryMempool::new();
+        let mut claim_pool = test_mempool();
         assert!(matches!(
             claim_pool
                 .submit_claim_with_context(
@@ -2095,7 +2099,7 @@ mod tests {
             proof_vector["raw"].as_str().expect("airdrop proof raw"),
         ))
         .expect("airdrop proof");
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             pool.submit_airdrop_with_context(
                 proof,
@@ -2176,7 +2180,7 @@ mod tests {
         let mut view = View::default();
         view.coins.insert(first_prev, first_coin);
         view.coins.insert(second_prev, second_coin);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         for transaction in [first, second] {
             assert!(matches!(
                 pool.submit_with_context(
@@ -2234,7 +2238,7 @@ mod tests {
         let mut view = View::default();
         view.coins.insert(heavy_prev, heavy_coin);
         view.coins.insert(normal_prev, normal_coin);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         for transaction in [heavy.clone(), normal.clone()] {
             assert!(matches!(
                 pool.submit_with_context(
@@ -2290,7 +2294,7 @@ mod tests {
 
     #[test]
     fn dependency_frontier_matches_reference_for_chain_star_and_random_dags() {
-        let mut chain_pool = MemoryMempool::new();
+        let mut chain_pool = test_mempool();
         let mut chain_view = View::default();
         let root = admit_graph_root(
             &mut chain_pool,
@@ -2323,7 +2327,7 @@ mod tests {
         }
         assert_frontier_matches_reference(&chain_pool, TemplatePolicy::default(), 11);
 
-        let mut star_pool = MemoryMempool::new();
+        let mut star_pool = test_mempool();
         let mut star_view = View::default();
         let root_outputs = (0..20).map(|_| 20_000u64).collect::<Vec<_>>();
         let root = admit_graph_root(
@@ -2355,7 +2359,7 @@ mod tests {
         assert_frontier_matches_reference(&star_pool, constrained, 12);
 
         for case in 0..8u64 {
-            let mut pool = MemoryMempool::new();
+            let mut pool = test_mempool();
             let mut view = View::default();
             let mut available = Vec::new();
             for root_index in 0..4u64 {
@@ -2710,7 +2714,7 @@ mod tests {
     #[test]
     fn template_cache_rejects_stale_generation() {
         let snapshot = snapshot();
-        let pool = MemoryMempool::new();
+        let pool = test_mempool();
         let pool_snapshot = pool.snapshot();
         let template = TemplateAssembler
             .assemble(TemplateBuildRequest {
@@ -2745,7 +2749,7 @@ mod tests {
     #[test]
     fn coordinator_rebuild_is_atomic_and_generation_bound() {
         let snapshot = snapshot();
-        let pool = MemoryMempool::new();
+        let pool = test_mempool();
         let pool_snapshot = pool.snapshot();
         let mut coordinator = TemplateCoordinator::new(2).expect("coordinator");
         let variants = [0u32, 1u32].map(|variant| TemplateVariant {
@@ -2794,7 +2798,7 @@ mod tests {
     #[test]
     fn prebuilt_install_authenticates_every_field_and_is_atomic() {
         let mining_snapshot = snapshot();
-        let pool = MemoryMempool::new();
+        let pool = test_mempool();
         let mempool = pool.snapshot();
         let generation = mempool.generation();
         let mut coordinator = TemplateCoordinator::new(2).expect("coordinator");
@@ -2985,7 +2989,7 @@ mod tests {
     #[test]
     fn prebuilt_install_returns_variant_order_and_activates_exact_templates() {
         let mining_snapshot = snapshot();
-        let pool = MemoryMempool::new();
+        let pool = test_mempool();
         let mempool = pool.snapshot();
         let generation = mempool.generation();
         let low_variant = empty_template(&mining_snapshot, &mempool, 3);

@@ -12,12 +12,13 @@ repository also contains the separately deployed, bounded
 [`hns-resolverd`](docs/hns-resolverd.md) companion for applications that need
 ordinary HNS DNS without an `hsd` runtime.
 
-The complete wallet profile includes chain-epoch-bound confirmed multi-script
-restoration, generation-bound multi-script mempool reconciliation, atomic
-transaction/name evidence, active-chain height/root reads, and
-restart/reorg-durable public Shakedex-v2/HNS-HTLC-v1 event tracking.
-This new source tranche is disabled by default and awaits its final repository,
-canonical `hns-swap` pin, and cross-project qualification; see the
+The wallet-index source implementation includes bounded chain-epoch-bound
+confirmed restoration, process-instance- and generation-bound mempool
+reconciliation, atomic transaction/name evidence, active-chain height/root
+reads, and restart/reorg-durable public Shakedex-v2/HNS-HTLC-v1 event tracking.
+It is disabled by default and is not release-qualified: the immutable contract
+registry has no safe capacity-reclamation lifecycle, and the repository still
+awaits its canonical `hns-swap` pin and cross-project qualification. See the
 [wallet-index status](docs/HNS_NODE_WALLET_INDEX.md).
 
 > [!IMPORTANT]

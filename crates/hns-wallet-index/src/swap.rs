@@ -14,14 +14,16 @@ use hns_primitives::{
 use hns_state::{decode_coin, encode_outpoint_key, BlockUndo};
 use hns_secp256k1::Secp256k1Verifier;
 use hns_store::{ColumnFamily, PrefixScanBudget, ReadSnapshot, WriteBatch};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::{IndexError, WalletIndexProfile, MAX_QUERY_BYTES, MAX_QUERY_ENTRIES};
 
 /// Maximum immutable public contract registrations in one node store.
+/// Registrations are append-only in this schema and capacity is not reclaimed.
 pub const MAX_TRACKED_CONTRACTS: u32 = 16_384;
 /// Maximum distinct public descriptors sharing one script address.
+/// Address bindings are append-only in this schema and capacity is not reclaimed.
 pub const MAX_TRACKED_CONTRACTS_PER_ADDRESS: usize = 256;
 
 const REGISTRATION_PREFIX: &[u8] = b"wallet-index/v1/contract/registration/";
@@ -36,7 +38,8 @@ const HNS_HTLC_PREIMAGE_BYTES: usize = 32;
 const HNS_HTLC_MAX_SCRIPT_BYTES: usize = 192;
 const LOCKTIME_MASK: u32 = 0x7fff_ffff;
 const HNS_HTLC_SIGHASH_ALL: u8 = 0x01;
-const HIP1_SELLER_SIGHASH: u8 = 0x84;
+const HIP1_SELLER_FULFILLMENT_SIGHASH: u8 = 0x84;
+const HIP1_SELLER_RECOVERY_SIGHASH: u8 = 0x83;
 const CONTRACT_ID_DOMAIN: &[u8] = b"hns-wallet-index/contract-id";
 const CONTRACT_ID_ENCODING_VERSION: u8 = 1;
 const SHAKEDEX_V2_CONTRACT_TAG: u8 = 1;
@@ -196,12 +199,15 @@ impl ContractRegistration {
                 };
                 match (output.covenant.kind, input.witness.items.as_slice()) {
                     (CovenantKind::Transfer, [signature, witness_script])
-                        if canonical_signature(signature, HIP1_SELLER_SIGHASH)
+                        if canonical_signature(signature, HIP1_SELLER_FULFILLMENT_SIGHASH)
                             && witness_script == &script =>
                     {
                         Ok(TrackedContractSpendKind::ShakedexFulfillment)
                     }
-                    (CovenantKind::Finalize, [witness_script]) if witness_script == &script => {
+                    (CovenantKind::Transfer, [signature, witness_script])
+                        if canonical_signature(signature, HIP1_SELLER_RECOVERY_SIGHASH)
+                            && witness_script == &script =>
+                    {
                         Ok(TrackedContractSpendKind::ShakedexRecovery)
                     }
                     _ => Ok(TrackedContractSpendKind::Unrecognized),
@@ -297,7 +303,7 @@ pub enum ContractRegistrationOutcome {
 }
 
 /// A revealed on-chain preimage. Debug output is deliberately redacted.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct RevealedPreimage([u8; HNS_HTLC_PREIMAGE_BYTES]);
 
 impl RevealedPreimage {
@@ -314,6 +320,27 @@ impl std::fmt::Debug for RevealedPreimage {
     }
 }
 
+impl Serialize for RevealedPreimage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str("[REDACTED]")
+    }
+}
+
+impl<'de> Deserialize<'de> for RevealedPreimage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+        Err(serde::de::Error::custom(
+            "revealed preimages cannot be reconstructed through public serde",
+        ))
+    }
+}
+
 /// Authoritative confirmed spend classification.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TrackedContractSpendKind {
@@ -322,7 +349,7 @@ pub enum TrackedContractSpendKind {
     Unrecognized,
     /// Shakedex seller-authorized TRANSFER branch.
     ShakedexFulfillment,
-    /// Shakedex FINALIZE recovery branch.
+    /// Shakedex seller-signed TRANSFER recovery branch.
     ShakedexRecovery,
     /// HNS HTLC receiver branch with a validated revealed preimage.
     HtlcRedemption { preimage: RevealedPreimage },
@@ -371,6 +398,114 @@ pub enum TrackedContractEvent {
         /// Verified protocol branch.
         kind: TrackedContractSpendKind,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredTrackedContractSpendKind {
+    Unrecognized,
+    ShakedexFulfillment,
+    ShakedexRecovery,
+    HtlcRedemption {
+        preimage: [u8; HNS_HTLC_PREIMAGE_BYTES],
+    },
+    HtlcRefund,
+}
+
+impl From<&TrackedContractSpendKind> for StoredTrackedContractSpendKind {
+    fn from(kind: &TrackedContractSpendKind) -> Self {
+        match kind {
+            TrackedContractSpendKind::Unrecognized => Self::Unrecognized,
+            TrackedContractSpendKind::ShakedexFulfillment => Self::ShakedexFulfillment,
+            TrackedContractSpendKind::ShakedexRecovery => Self::ShakedexRecovery,
+            TrackedContractSpendKind::HtlcRedemption { preimage } => Self::HtlcRedemption {
+                preimage: *preimage.expose_for_settlement(),
+            },
+            TrackedContractSpendKind::HtlcRefund => Self::HtlcRefund,
+        }
+    }
+}
+
+impl From<StoredTrackedContractSpendKind> for TrackedContractSpendKind {
+    fn from(kind: StoredTrackedContractSpendKind) -> Self {
+        match kind {
+            StoredTrackedContractSpendKind::Unrecognized => Self::Unrecognized,
+            StoredTrackedContractSpendKind::ShakedexFulfillment => Self::ShakedexFulfillment,
+            StoredTrackedContractSpendKind::ShakedexRecovery => Self::ShakedexRecovery,
+            StoredTrackedContractSpendKind::HtlcRedemption { preimage } => Self::HtlcRedemption {
+                preimage: RevealedPreimage(preimage),
+            },
+            StoredTrackedContractSpendKind::HtlcRefund => Self::HtlcRefund,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum StoredTrackedContractEvent {
+    Funding(TrackedContractFunding),
+    Spend {
+        contract_id: ContractId,
+        funding: TrackedContractFunding,
+        spending_txid: Txid,
+        block_hash: BlockHash,
+        height: Height,
+        transaction_position: u32,
+        input_position: u32,
+        kind: StoredTrackedContractSpendKind,
+    },
+}
+
+impl From<&TrackedContractEvent> for StoredTrackedContractEvent {
+    fn from(event: &TrackedContractEvent) -> Self {
+        match event {
+            TrackedContractEvent::Funding(funding) => Self::Funding(funding.clone()),
+            TrackedContractEvent::Spend {
+                contract_id,
+                funding,
+                spending_txid,
+                block_hash,
+                height,
+                transaction_position,
+                input_position,
+                kind,
+            } => Self::Spend {
+                contract_id: *contract_id,
+                funding: funding.clone(),
+                spending_txid: *spending_txid,
+                block_hash: *block_hash,
+                height: *height,
+                transaction_position: *transaction_position,
+                input_position: *input_position,
+                kind: kind.into(),
+            },
+        }
+    }
+}
+
+impl From<StoredTrackedContractEvent> for TrackedContractEvent {
+    fn from(event: StoredTrackedContractEvent) -> Self {
+        match event {
+            StoredTrackedContractEvent::Funding(funding) => Self::Funding(funding),
+            StoredTrackedContractEvent::Spend {
+                contract_id,
+                funding,
+                spending_txid,
+                block_hash,
+                height,
+                transaction_position,
+                input_position,
+                kind,
+            } => Self::Spend {
+                contract_id,
+                funding,
+                spending_txid,
+                block_hash,
+                height,
+                transaction_position,
+                input_position,
+                kind: kind.into(),
+            },
+        }
+    }
 }
 
 impl TrackedContractEvent {
@@ -677,8 +812,9 @@ pub fn tracked_contract_events<S: ReadSnapshot>(
         .entries
         .iter()
         .map(|(key, raw)| {
-            let event: TrackedContractEvent =
+            let event: StoredTrackedContractEvent =
                 decode_record(b"contract-event-v1", key, raw)?;
+            let event = TrackedContractEvent::from(event);
             if event.contract_id() != id || event.key() != *key {
                 return Err(IndexError::Corrupt(
                     "tracked contract event key/value binding mismatch",
@@ -754,30 +890,42 @@ pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
             if input.previous_output.is_null() {
                 continue;
             }
-            let tracked = if let Some((registration, funding)) =
+            let coin = match created.get(&input.previous_output) {
+                Some(coin) => coin.clone(),
+                None => load_coin(snapshot, &input.previous_output)?.ok_or_else(|| {
+                    IndexError::MissingInputCoin(input.previous_output.clone())
+                })?,
+            };
+            let Some(registration) = matching_contract_for_output(
+                snapshot,
+                &Output {
+                    value: coin.value,
+                    address: coin.address.clone(),
+                    covenant: coin.covenant.clone(),
+                },
+            )?
+            else {
+                continue;
+            };
+            let funding = if let Some((created_registration, funding)) =
                 tracked_created.get(&input.previous_output)
             {
-                Some((registration.clone(), funding.clone()))
+                if created_registration.id != registration.id || funding.coin != coin {
+                    return Err(IndexError::Corrupt(
+                        "same-block tracked funding disagrees with descriptor selection",
+                    ));
+                }
+                funding.clone()
             } else {
-                let coin = load_coin(snapshot, &input.previous_output)?.ok_or_else(|| {
-                    IndexError::MissingInputCoin(input.previous_output.clone())
-                })?;
-                let Some(registration) = matching_contract_for_output(
+                let Some(funding) = load_funding(
                     snapshot,
-                    &Output {
-                        value: coin.value,
-                        address: coin.address.clone(),
-                        covenant: coin.covenant.clone(),
-                    },
+                    registration.id,
+                    &input.previous_output,
                 )?
                 else {
                     continue;
                 };
-                load_funding(snapshot, registration.id, &input.previous_output)?
-                    .map(|funding| (registration, funding))
-            };
-            let Some((registration, funding)) = tracked else {
-                continue;
+                funding
             };
             let kind = registration.classify_spend(transaction, input_position, &funding.coin)?;
             let input_position =
@@ -858,8 +1006,9 @@ pub(crate) fn stage_disconnect<S: ReadSnapshot, B: WriteBatch>(
             let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
                 continue;
             };
-            let stored: TrackedContractEvent =
+            let stored: StoredTrackedContractEvent =
                 decode_record(b"contract-event-v1", &key, &raw)?;
+            let stored = TrackedContractEvent::from(stored);
             let kind = registration.classify_spend(transaction, input_position, coin)?;
             let TrackedContractEvent::Spend {
                 funding: prior_funding,
@@ -925,8 +1074,9 @@ pub(crate) fn stage_disconnect<S: ReadSnapshot, B: WriteBatch>(
             let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
                 continue;
             };
-            let stored: TrackedContractEvent =
+            let stored: StoredTrackedContractEvent =
                 decode_record(b"contract-event-v1", &key, &raw)?;
+            let stored = TrackedContractEvent::from(stored);
             let funding = TrackedContractFunding {
                 contract_id: registration.id,
                 coin: created
@@ -1241,10 +1391,11 @@ fn put_event<B: WriteBatch>(
     event: &TrackedContractEvent,
 ) -> Result<(), IndexError> {
     let key = event.key();
+    let stored = StoredTrackedContractEvent::from(event);
     batch.put(
         ColumnFamily::TxIndex,
         &key,
-        &encode_record(b"contract-event-v1", &key, event)?,
+        &encode_record(b"contract-event-v1", &key, &stored)?,
     )?;
     Ok(())
 }
@@ -1705,7 +1856,7 @@ mod tests {
                 sequence: u32::MAX,
                 witness: Witness {
                     items: vec![
-                        low_s_signature(HIP1_SELLER_SIGHASH),
+                        low_s_signature(HIP1_SELLER_FULFILLMENT_SIGHASH),
                         preimage.to_vec(),
                         vec![1],
                         registration.lock_script().expect("script"),
@@ -1741,10 +1892,67 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_same_block_children_do_not_make_the_optional_index_reject_a_block() {
+        let store = MemoryStore::new();
+        let parent = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 25,
+                address: Address::new(0, vec![7; 20]).expect("ordinary address"),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: 0,
+        };
+        let child = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    txid: parent.txid(),
+                    index: 0,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: Vec::new(),
+            locktime: 0,
+        };
+        let snapshot = store.snapshot().expect("pre-block snapshot");
+        let mut batch = store.batch();
+        stage_connect(&snapshot, &mut batch, &block(vec![parent, child]), 1, profile())
+            .expect("an untracked same-block child cannot strengthen consensus");
+    }
+
+    #[test]
     fn preimage_debug_and_cross_contract_cursor_do_not_disclose_or_cross_queries() {
         let secret = RevealedPreimage([0x5a; 32]);
         assert_eq!(format!("{secret:?}"), "RevealedPreimage([REDACTED])");
         assert!(!format!("{secret:?}").contains("5a"));
+        let public_kind = TrackedContractSpendKind::HtlcRedemption {
+            preimage: secret.clone(),
+        };
+        let public_json = serde_json::to_string(&public_kind).expect("public serialization");
+        assert!(public_json.contains("[REDACTED]"));
+        assert!(!public_json.contains("90"));
+        assert!(serde_json::from_str::<TrackedContractSpendKind>(&public_json).is_err());
+
+        let stored_kind = StoredTrackedContractSpendKind::from(&public_kind);
+        let stored_json = serde_json::to_string(&stored_kind).expect("internal serialization");
+        let restored_kind: TrackedContractSpendKind =
+            serde_json::from_str::<StoredTrackedContractSpendKind>(&stored_json)
+                .expect("internal deserialization")
+                .into();
+        let TrackedContractSpendKind::HtlcRedemption { preimage } = restored_kind else {
+            panic!("internal stored branch changed");
+        };
+        assert_eq!(preimage.expose_for_settlement(), &[0x5a; 32]);
 
         let first = htlc([1; 32]);
         let second = htlc([2; 32]);
@@ -1937,7 +2145,7 @@ mod tests {
                 sequence: u32::MAX,
                 witness: Witness {
                     items: vec![
-                        low_s_signature(HIP1_SELLER_SIGHASH),
+                        low_s_signature(HIP1_SELLER_FULFILLMENT_SIGHASH),
                         shakedex_script.clone(),
                     ],
                 },
@@ -1960,13 +2168,23 @@ mod tests {
         );
 
         let mut recovery = fulfillment.clone();
-        recovery.inputs[0].witness.items = vec![shakedex_script];
-        recovery.outputs[0].covenant.kind = CovenantKind::Finalize;
+        recovery.inputs[0].witness.items[0] =
+            low_s_signature(HIP1_SELLER_RECOVERY_SIGHASH);
         assert_eq!(
             shakedex
                 .classify_spend(&recovery, 0, &shakedex_coin)
                 .expect("recovery"),
             TrackedContractSpendKind::ShakedexRecovery
+        );
+
+        let mut invented_direct_finalize = fulfillment.clone();
+        invented_direct_finalize.inputs[0].witness.items = vec![shakedex_script];
+        invented_direct_finalize.outputs[0].covenant.kind = CovenantKind::Finalize;
+        assert_eq!(
+            shakedex
+                .classify_spend(&invented_direct_finalize, 0, &shakedex_coin)
+                .expect("direct FINALIZE shape"),
+            TrackedContractSpendKind::Unrecognized
         );
 
         let htlc = htlc([5; 32]);
@@ -2083,12 +2301,17 @@ mod tests {
         ));
         assert!(!canonical_signature(
             &htlc_signature,
-            HIP1_SELLER_SIGHASH
+            HIP1_SELLER_FULFILLMENT_SIGHASH
         ));
-        let shakedex_signature = low_s_signature(HIP1_SELLER_SIGHASH);
+        let shakedex_signature = low_s_signature(HIP1_SELLER_FULFILLMENT_SIGHASH);
         assert!(canonical_signature(
             &shakedex_signature,
-            HIP1_SELLER_SIGHASH
+            HIP1_SELLER_FULFILLMENT_SIGHASH
+        ));
+        let recovery_signature = low_s_signature(HIP1_SELLER_RECOVERY_SIGHASH);
+        assert!(canonical_signature(
+            &recovery_signature,
+            HIP1_SELLER_RECOVERY_SIGHASH
         ));
         let mut malformed = vec![0xff; 65];
         malformed[64] = HNS_HTLC_SIGHASH_ALL;

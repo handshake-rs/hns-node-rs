@@ -371,17 +371,23 @@ Tests must cover:
 - failure before commit leaving every durable key unchanged;
 - true snapshot consistency during concurrent writes;
 - wallet index registration restart reads, checksum/key relocation failure,
-  bounded cursors, funding/spend disconnect restoration, and same-block
-  create/spend reversal;
+  bounded cursors, funding/spend disconnect restoration, authenticated
+  pre-current-block input resolution, ordinary same-block child handling, and
+  same-block tracked create/spend reversal;
 - same-address/different-term contract registrations, per-address candidate
   caps, exact output selection, and startup topology/count validation;
 - contract-ID- and chain-epoch-bound funding/event continuations plus terminal-
   page canonical-generation overlap rejection;
 - global sorted-script confirmed history/UTXO traversal, reverse index mapping,
-  script-set cursor binding, and stale-chain-epoch rejection;
+  script-set cursor binding, stale-chain-epoch rejection, collection admission,
+  256-prefix-examination empty-page continuation, and corrupt-cursor rejection;
 - frozen canonical-binary contract identities and Shakedex/HTLC script/address
-  vectors, supported fulfillment/recovery/redemption/refund branches, preimage
-  redaction, and malformed key/signature/witness rejection;
+  vectors, exact Shakedex TRANSFER `0x84` fulfillment and `0x83` recovery,
+  direct-FINALIZE rejection, supported HTLC redemption/refund branches, public
+  serde preimage redaction with internal raw round-trip, and malformed
+  key/signature/witness rejection;
+- nonzero process-local mempool nonces, nonce preservation across clear/rebuild,
+  and restart-instance cursor rejection even when generation numbers coincide;
 - proof that a consensus-accepted but wallet-profile-unrecognized contract
   spend is durably classified and never rejects optional-index block staging;
 - generation-stable combined transaction evidence, tree-root-bearing tips,

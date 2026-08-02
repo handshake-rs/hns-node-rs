@@ -27,14 +27,23 @@ string and not an explorer heuristic.
 ## Atomicity and reorganization behavior
 
 `hns-wallet-index` stages its writes in the same store batch used for active
-UTXO/name-state connection:
+UTXO/name-state connection. Connect staging runs before that block's state
+connector mutates a live or reorganization overlay, so every derivative input
+lookup sees the authenticated state immediately before the current block:
 
 1. resolve every non-coinbase input against the immutable pre-connect UTXO
-   snapshot or an earlier output in the same block;
+   snapshot or the complete block-local map of spendable outputs;
 2. add consolidated received/spent history rows;
 3. add spender mappings and script UTXOs;
-4. commit those writes atomically with canonical height, best block, UTXO,
+4. run the authoritative state connector, which still enforces transaction
+   ordering and every consensus rule; and
+5. commit the shared batch atomically with canonical height, best block, UTXO,
    name state, undo, and transaction-index changes.
+
+Any authoritative connection failure discards the derivative writes with the
+batch. The full block-local map prevents an ordinary same-block child from
+making the optional tracker reject an otherwise valid block; it does not make
+the tracker an admission authority.
 
 Disconnect uses the already validated `BlockUndo`. It deletes rows created by
 the disconnected block, removes its spender mappings, and restores prior
@@ -107,6 +116,16 @@ connection never scans the registry. Contract funding and event pages share the
 4,096-entry/16-MiB limits. Startup walks the bounded registration and address
 topology, verifies the checksummed count and every reverse binding, and fails
 closed on missing, duplicate, or malformed state.
+
+The registry is append-only in this schema. There is no unregister, tombstone,
+retirement proof, or qualified capacity-reclamation path, so the 16,384 global
+cap and 256-per-address cap are lifetime limits for a data directory. Exhausting
+either cap prevents new registrations even after every related funding is spent.
+A new data directory and trusted replay is the only currently qualified reset;
+manual key deletion is corruption, not reclamation. Until authenticated safe
+retirement and its restart/reorg lifecycle are implemented and qualified, this
+is an explicit production-availability blocker. Operators must not expose
+untrusted registration and must enforce tighter caller quotas below both caps.
 
 ## Pruning
 
@@ -244,10 +263,13 @@ restarts from the first page. An overlap during the current page returns
 `StaleCanonicalRead`, including on the terminal page.
 
 Each response contains at most 4,096 rows from one underlying key-bound page
-and inherits the 16 MiB index-page envelope. Empty scripts are skipped within
-the bounded 10,000-script request. The page includes the active tip captured in
-the same store snapshot. As with mempool results, the adapter must preserve a
-reverse mapping from sorted request position to wallet derivation order.
+and inherits the 16 MiB index-page envelope. Confirmed restore is admitted
+through the collection-read lane and examines at most 256 underlying
+script-prefix pages per call. It can therefore return an empty result with a
+nonterminal continuation; `script_examinations` reports the work consumed and
+the caller must resume it. The page includes the active tip captured in the same
+store snapshot. As with mempool results, the adapter must preserve a reverse
+mapping from sorted request position to wallet derivation order.
 
 ## Mempool reconciliation
 
@@ -258,20 +280,25 @@ index in that sorted request, not the wallet's derivation-order index. An
 adapter must retain a reverse mapping from each sorted request position to the
 original derivation path/address record before applying results. This avoids
 an address-by-address rescan without silently reassigning activity.
-Continuations bind the exact
-published mempool generation; a generation change returns
-`StaleMempoolGeneration` and the wallet restarts reconciliation from the first
-page. A page returns at most 4,096 relevant inputs/outputs.
+Continuations bind the exact published mempool generation and a cryptographically
+random, nonzero, non-persisted mempool-instance nonce. Initialization obtains
+that nonce through the fallible operating-system RNG and fails startup on RNG
+failure or the reserved zero value. Clear and in-process revalidation preserve
+the nonce; process restart creates a new one. A generation change returns
+`StaleMempoolGeneration`, while a restart/instance mismatch returns
+`StaleMempoolInstance`; either result makes the wallet restart reconciliation
+from the first page. Pages expose the nonce and generation and return at most
+4,096 relevant inputs/outputs.
 
 `get_mempool_tracked_contract_activity` applies the same cursor and scan bounds
 to one registered contract. It recognizes exact unconfirmed funding terms,
 confirmed tracked fundings, and mempool-parent fundings, then classifies the
 spend against the registered public descriptor. Mempool cursors bind the
-script-set digest or exact contract identity as well as the generation, so a
-continuation cannot be reused to skip another query. Mempool overlays are not
-durable truth: after restart, the wallet reconciles its persisted workflow and
-rebroadcast journal against the node's newly admitted mempool and durable
-confirmed events.
+script-set digest or exact contract identity as well as the instance nonce and
+generation, so a continuation cannot be reused across a query or restart.
+Mempool overlays are not durable truth: after restart, the wallet reconciles its
+persisted workflow and rebroadcast journal against the node's newly admitted
+mempool and durable confirmed events.
 
 ## Shakedex and HNS HTLC tracking
 
@@ -279,21 +306,27 @@ Supported immutable registrations are deliberately narrow:
 
 - Shakedex v2: exact HIP-0001 seller key, name hash, funding value, canonical
   44-byte lock script, FINALIZE funding coin, seller-authorized TRANSFER
-  fulfillment branch, and FINALIZE recovery branch;
+  fulfillment witness using hash type `0x84`, and seller-signed TRANSFER
+  recovery witness using hash type `0x83`; the later spend that FINALIZEs the
+  resulting TRANSFER coin is not a direct spend of the registered lock;
 - HNS HTLC v1: exact value, SHA-256 hashlock, distinct receiver/refund public
   keys, absolute CLTV locktime, canonical script, canonical redeem/refund
   witness layouts, and `SIGHASH_ALL`.
 
 Public keys are parsed by the pinned HSD/libsecp256k1 verifier. Marketplace
 signatures must be valid compact low-S encodings and use the exact profile hash
-type (`0x84` for the Shakedex seller branch and `0x01` for HNS HTLC branches).
+type (`0x84` for Shakedex fulfillment, `0x83` for Shakedex recovery, and `0x01`
+for HNS HTLC branches). Consensus admission authenticates the signature; the
+tracker additionally requires the exact hash type, witness script, and TRANSFER
+output shape. The previously invented direct FINALIZE/one-script shape is
+`Unrecognized`.
 If consensus accepts a spend outside those pinned wallet shapes, the optional
 index records `Unrecognized` and removes the funding normally; it never rejects
 the canonical block or exposes a guessed preimage. This keeps the derivative
 index from strengthening consensus.
 
 Frozen script, script-hash, canonical-binary descriptor-identity, and branch
-vectors are a temporary cross-boundary check against the current `hns-rs`
+vectors are cross-boundary qualification evidence against the current `hns-rs`
 implementation. Local duplicated script/profile logic is not protocol
 authority and is not a substitute for a published canonical `hns-swap` commit.
 This tracker cannot be release-qualified until the node pins that canonical
@@ -302,19 +335,23 @@ commit and qualifies an adapter against it.
 The index stores no private key, seed, password, capability token, or unrevealed
 preimage. A preimage is persisted only after it appears in a consensus-confirmed
 canonical HTLC redeem witness and matches the registered SHA-256 hashlock. Its
-Rust `Debug` representation is redacted and bytes require the explicit
-`expose_for_settlement` accessor. The chain value is already public at that
-point; wallet code must still keep it out of logs.
+Rust `Debug` and public serde serialization are redacted, and public serde
+deserialization refuses to reconstruct a preimage. Internal checksummed event
+persistence retains the raw 32 bytes so restart and disconnect remain exact;
+callers can obtain them only through the explicit `expose_for_settlement`
+accessor. The chain value is already public at that point; wallet code must
+still keep it out of logs.
 
 ## Remaining integration work
 
-This source tranche still needs the repository's full qualification gate and
-cross-repository wallet adapter qualification, including the canonical
-`hns-swap` pin described above, before its status can move from
-implemented-in-source to release-qualified. Live subscription delivery remains
-outside this typed pull API. Durable encrypted workflow state, rebroadcast
-journals, matching decisions, transaction construction/signing, and secret
-preimages remain wallet responsibilities.
+This source implementation still needs the repository's full qualification
+gate and cross-repository wallet adapter qualification, including the canonical
+`hns-swap` pin described above, before it is release-qualified. Safe immutable
+registry retirement and capacity reclamation are also unavailable and remain a
+production-availability blocker. Live subscription delivery remains outside
+this typed pull API. Durable encrypted workflow state, rebroadcast journals,
+matching decisions, transaction construction/signing, and secret preimages
+remain wallet responsibilities.
 
 The separate Denuo cache remains wire-disabled. Live marketplace advertisement
 requires a canonical dependency re-pin to the currently unpublished `hns-rs`

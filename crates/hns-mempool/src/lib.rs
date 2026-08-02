@@ -23,6 +23,7 @@ use hns_primitives::{
     CovenantKind, DnssecVerifier, Height, Outpoint, Output, OwnershipProof, Transaction, Txid,
     MAX_BLOCK_WEIGHT,
 };
+use rand::{rngs::OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MAX_TRANSACTIONS: usize = 50_000;
@@ -1110,8 +1111,9 @@ type SpecialPoolKey = (u64, [u8; 32]);
 
 /// Immutable, structurally shared view used by template and bounded read
 /// workers. Every field is one persistent root, so capture and clone are O(1).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MempoolSnapshot {
+    instance_nonce: [u8; 32],
     generation: u64,
     entries: PersistentMap<Txid, Arc<MempoolEntry>>,
     transactions: PersistentMap<Txid, Arc<Transaction>>,
@@ -1125,6 +1127,28 @@ pub struct MempoolSnapshot {
 }
 
 impl MempoolSnapshot {
+    fn empty(instance_nonce: [u8; 32]) -> Self {
+        Self {
+            instance_nonce,
+            generation: 0,
+            entries: PersistentMap::default(),
+            transactions: PersistentMap::default(),
+            parents: PersistentMap::default(),
+            children: PersistentMap::default(),
+            exclusive_names: PersistentMap::default(),
+            claims: PersistentMap::default(),
+            claims_by_sequence: PersistentMap::default(),
+            airdrops: PersistentMap::default(),
+            airdrops_by_sequence: PersistentMap::default(),
+        }
+    }
+
+    /// Cryptographically random, nonzero identity for this in-memory mempool
+    /// instance. It is intentionally not persisted across process restarts.
+    pub const fn instance_nonce(&self) -> &[u8; 32] {
+        &self.instance_nonce
+    }
+
     pub const fn generation(&self) -> u64 {
         self.generation
     }
@@ -1311,6 +1335,19 @@ impl MempoolSnapshot {
         ordered.push(txid);
         Ok(())
     }
+}
+
+fn random_mempool_instance_nonce() -> Result<[u8; 32], MempoolError> {
+    let mut nonce = [0; 32];
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|error| MempoolError::InstanceNonce(error.to_string()))?;
+    if nonce == [0; 32] {
+        return Err(MempoolError::InstanceNonce(
+            "operating-system randomness returned the reserved zero value".to_owned(),
+        ));
+    }
+    Ok(nonce)
 }
 
 #[derive(Clone, Debug)]
@@ -1669,19 +1706,34 @@ pub struct MemoryMempool {
     orphan_promotion_attempts: usize,
 }
 
-impl Default for MemoryMempool {
-    fn default() -> Self {
-        Self::with_limits(MempoolLimits::default()).expect("default mempool limits are valid")
-    }
-}
-
 impl MemoryMempool {
-    pub fn new() -> Self {
-        Self::default()
+    /// Construct an empty pool with a fallibly acquired nonzero OS-random
+    /// process-local instance nonce.
+    pub fn new() -> Result<Self, MempoolError> {
+        Self::with_limits(MempoolLimits::default())
+    }
+
+    #[cfg(test)]
+    fn new_for_test() -> Self {
+        Self::with_validated_limits_and_instance_nonce(MempoolLimits::default(), [0xa5; 32])
+            .expect("deterministic test mempool configuration")
     }
 
     pub fn with_limits(limits: MempoolLimits) -> Result<Self, MempoolError> {
         limits.validate()?;
+        let instance_nonce = random_mempool_instance_nonce()?;
+        Self::with_validated_limits_and_instance_nonce(limits, instance_nonce)
+    }
+
+    fn with_validated_limits_and_instance_nonce(
+        limits: MempoolLimits,
+        instance_nonce: [u8; 32],
+    ) -> Result<Self, MempoolError> {
+        if instance_nonce == [0; 32] {
+            return Err(MempoolError::InstanceNonce(
+                "mempool instance nonce used the reserved zero value".to_owned(),
+            ));
+        }
         Ok(Self {
             limits,
             entries: HashMap::new(),
@@ -1703,7 +1755,7 @@ impl MemoryMempool {
             claim_names: HashMap::new(),
             airdrops: HashMap::new(),
             airdrop_positions: HashMap::new(),
-            snapshot_state: MempoolSnapshot::default(),
+            snapshot_state: MempoolSnapshot::empty(instance_nonce),
             bytes: 0,
             total_fee: 0,
             orphan_bytes: 0,
@@ -2409,7 +2461,10 @@ impl MemoryMempool {
             .collect::<HashSet<_>>();
         let mut candidate_txids = BTreeSet::new();
         let mut seen = HashSet::new();
-        let mut rebuilt = Self::with_limits(self.limits.clone())?;
+        let mut rebuilt = Self::with_validated_limits_and_instance_nonce(
+            self.limits.clone(),
+            source.snapshot_state.instance_nonce,
+        )?;
         rebuilt.free_count = self.free_count;
         rebuilt.last_free_time = self.last_free_time;
         rebuilt.claims = source.claims.clone();
@@ -3243,7 +3298,7 @@ impl MemoryMempool {
         self.claim_names.clear();
         self.airdrops.clear();
         self.airdrop_positions.clear();
-        self.snapshot_state = MempoolSnapshot::default();
+        self.snapshot_state = MempoolSnapshot::empty(self.snapshot_state.instance_nonce);
         self.bytes = 0;
         self.total_fee = 0;
         self.orphan_bytes = 0;
@@ -4058,6 +4113,8 @@ pub enum MempoolError {
     DependencyCycle(Txid),
     #[error("mempool fee arithmetic overflow")]
     FeeOverflow,
+    #[error("mempool instance nonce initialization failed: {0}")]
+    InstanceNonce(String),
     #[error("{context} limit exceeded: limit {limit}, actual {actual}")]
     LimitExceeded {
         context: &'static str,
@@ -4086,6 +4143,21 @@ mod tests {
         sha3_256, Address, Block, Covenant, Input, Output, UnavailableAirdropSignatureVerifier,
         Witness,
     };
+
+    fn test_mempool() -> MemoryMempool {
+        MemoryMempool::new_for_test()
+    }
+
+    #[test]
+    fn reserved_zero_instance_nonce_fails_closed() {
+        assert!(matches!(
+            MemoryMempool::with_validated_limits_and_instance_nonce(
+                MempoolLimits::default(),
+                [0; 32],
+            ),
+            Err(MempoolError::InstanceNonce(_))
+        ));
+    }
 
     fn decode_fixture_hex(raw: &str) -> Vec<u8> {
         raw.as_bytes()
@@ -4629,7 +4701,7 @@ mod tests {
             vec![txids[1], txids[2]],
             vec![txids[3], txids[4]],
         ];
-        let mut snapshot = MempoolSnapshot::default();
+        let mut snapshot = MempoolSnapshot::empty([0xa5; 32]);
         for (sequence, (txid, parents)) in txids.iter().zip(dependencies.iter()).enumerate() {
             let entry = Arc::new(MempoolEntry {
                 txid: *txid,
@@ -4766,7 +4838,7 @@ mod tests {
         let context = claim_context(&fixture);
         let view = FixedView::default();
         let dnssec = OpenSslDnssecVerifier;
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert_eq!(
             pool.submit_claim_with_context(claim.clone(), &context, &view, &dnssec)
                 .expect("claim admission"),
@@ -4828,7 +4900,7 @@ mod tests {
         let hash = proof.hash().expect("proof hash");
         let position = proof.position().expect("proof position");
         let raw_size = proof.encode().expect("proof raw").len();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         let view = FixedView::default();
         assert_eq!(
             pool.submit_airdrop_with_context(
@@ -5143,7 +5215,7 @@ mod tests {
 
     #[test]
     fn compatibility_submit_is_fail_closed() {
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             pool.submit(transaction(outpoint(1, 0), 9)).expect("submit"),
             Admission::Rejected { reason } if reason == "verified-mempool-context-required"
@@ -5170,7 +5242,7 @@ mod tests {
         let first_txid = first.txid();
         let second = transaction(second_input, 14);
         let second_txid = second.txid();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, first, &view),
             Admission::Accepted(_)
@@ -5238,7 +5310,7 @@ mod tests {
         let first_txid = first.txid();
         let second = transaction(second_input, 14);
         let second_txid = second.txid();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, first.clone(), &view),
             Admission::Accepted(id) if id == first_txid
@@ -5285,7 +5357,7 @@ mod tests {
     fn parent_removal_path_copies_only_logarithmic_paths_per_affected_descendant() {
         const MEMBERS: usize = 16;
         let root_input = outpoint(0xb3, 0);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         let root = transaction(root_input.clone(), 1_000);
         assert!(matches!(
             submit(&mut pool, root, &FixedView::with_coin(root_input, 1_001)),
@@ -5372,7 +5444,7 @@ mod tests {
             candidates.push(transaction(input, 90));
         }
 
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         let mut expected = BTreeSet::new();
         let mut state = 0x4d59_5df4_d0f3_3173u64;
         for operation in 0..OPERATIONS {
@@ -5440,7 +5512,7 @@ mod tests {
             covenant: covenant(),
         };
         view.coins.insert(second_input.clone(), second_coin);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         let context = MempoolContext::testing(2, 2);
         assert!(matches!(
             pool.submit_with_context(
@@ -5494,7 +5566,7 @@ mod tests {
 
         let verifier = IncrementalNameOverlayProbe::default();
         let context = MempoolContext::testing(2, 2);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         for candidate in candidates.iter().take(ADMISSIONS).cloned() {
             assert!(matches!(
                 pool.submit_with_context(candidate, &context, &view, &AllowInputs, &verifier,)
@@ -5548,7 +5620,7 @@ mod tests {
         let first = open_transaction(first_input, 15, b"exclusive-name");
         let first_txid = first.txid();
         let replacement = open_transaction(replacement_input, 15, b"exclusive-name");
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, first, &view),
             Admission::Accepted(txid) if txid == first_txid
@@ -5584,7 +5656,7 @@ mod tests {
         let stale_txid = stale.txid();
         let retained = open_transaction(retained_input, 15, b"retained-context");
         let retained_txid = retained.txid();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, stale, &view),
             Admission::Accepted(_)
@@ -5594,6 +5666,7 @@ mod tests {
             Admission::Accepted(_)
         ));
         assert_cached_info_exact(&pool);
+        let instance_nonce = *pool.snapshot().instance_nonce();
         let previous_generation = pool.info().generation;
         let summary = pool
             .reconcile_connected_with_context(
@@ -5611,6 +5684,7 @@ mod tests {
         assert_eq!(summary.generation, previous_generation + 1);
         assert!(pool.transaction(&stale_txid).is_none());
         assert!(pool.transaction(&retained_txid).is_some());
+        assert_eq!(pool.snapshot().instance_nonce(), &instance_nonce);
         assert_cached_info_exact(&pool);
 
         let stable = pool
@@ -5633,7 +5707,7 @@ mod tests {
         let transaction = transaction(input.clone(), 9);
         let txid = transaction.txid();
         let mut view = FixedView::default();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert_eq!(
             submit(&mut pool, transaction, &view),
             Admission::Orphan(txid)
@@ -5697,7 +5771,7 @@ mod tests {
         );
         let orphan_descendant_txid = orphan_descendant.txid();
         let conflicting_block_transaction = transaction(parent_input, 14);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, parent, &view),
             Admission::Accepted(_)
@@ -5744,7 +5818,7 @@ mod tests {
         let child_txid = child.txid();
         let old_view = FixedView::with_coin(parent_output, 15);
         let final_view = FixedView::with_coin(parent_input, 20);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, child, &old_view),
             Admission::Accepted(_)
@@ -5796,7 +5870,7 @@ mod tests {
         let existing_txid = existing.txid();
         let disconnected = open_transaction(disconnected_input, 14, b"older-wins");
         let disconnected_txid = disconnected.txid();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, existing, &view),
             Admission::Accepted(_)
@@ -5828,7 +5902,7 @@ mod tests {
         let view = FixedView::with_coin(input.clone(), 20);
         let transaction = transaction(input, 9);
         let txid = transaction.txid();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, transaction, &view),
             Admission::Accepted(_)
@@ -5862,7 +5936,7 @@ mod tests {
             10,
         );
         let child_txid = child.txid();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
 
         assert_eq!(
             submit(&mut pool, child, &view),
@@ -5911,7 +5985,7 @@ mod tests {
             ));
         }
 
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         for transaction in chain.iter().skip(1).rev().cloned() {
             assert!(matches!(
                 submit(&mut pool, transaction, &view),
@@ -5967,7 +6041,7 @@ mod tests {
         oversized.inputs[0].witness = Witness {
             items: vec![oversized_script],
         };
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, oversized, &view),
             Admission::Rejected { reason } if reason == "bad-txns-too-many-sigops"
@@ -6017,7 +6091,7 @@ mod tests {
         };
         let sigops = 4_000;
         assert_eq!(sigop_adjusted_virtual_size(&underpaying, sigops), 20_000);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             pool.submit_with_context(underpaying, &context, &view, &AllowInputs, &AllowContext)
                 .expect("underpaying admission"),
@@ -6053,7 +6127,7 @@ mod tests {
         for (priority, accepted) in [(HSD_FREE_THRESHOLD, false), (HSD_FREE_THRESHOLD + 1, true)] {
             let value = priority.saturating_mul(policy_size as u64);
             let candidate = transaction(input.clone(), value);
-            let admission = MemoryMempool::new()
+            let admission = test_mempool()
                 .submit_with_context(
                     candidate,
                     &context,
@@ -6074,7 +6148,7 @@ mod tests {
 
     #[test]
     fn hsd_free_relay_limiter_uses_strict_threshold_and_ten_minute_decay() {
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         let threshold = HSD_LIMIT_FREE_RELAY.saturating_mul(HSD_FREE_RELAY_MULTIPLIER);
         pool.free_count = threshold as f64;
         pool.last_free_time = 100;
@@ -6095,7 +6169,7 @@ mod tests {
         };
         let first_input = outpoint(0xee, 0);
         let first = transaction(first_input.clone(), 1_000);
-        let mut admissions = MemoryMempool::new();
+        let mut admissions = test_mempool();
         assert!(matches!(
             admissions
                 .submit_with_context(
@@ -6125,7 +6199,7 @@ mod tests {
 
     #[test]
     fn hsd_revalidation_does_not_recharge_retained_free_transactions() {
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         let input = outpoint(0xf0, 0);
         let view = FixedView::with_coin(input.clone(), 1_000);
         let context = MempoolContext {
@@ -6172,7 +6246,7 @@ mod tests {
         };
         let mut candidate = transaction(input, 3_000);
         assert!(matches!(
-            MemoryMempool::new()
+            test_mempool()
                 .submit_with_context(
                     candidate.clone(),
                     &standard_context,
@@ -6187,7 +6261,7 @@ mod tests {
         candidate.version = 0;
         candidate.outputs[0].address = Address::new(1, vec![3; 20]).expect("unknown address");
         assert!(matches!(
-            MemoryMempool::new()
+            test_mempool()
                 .submit_with_context(
                     candidate.clone(),
                     &standard_context,
@@ -6202,7 +6276,7 @@ mod tests {
         candidate.outputs[0].address = Address::new(0, vec![3; 20]).expect("address");
         candidate.outputs[0].value = 1;
         assert!(matches!(
-            MemoryMempool::new()
+            test_mempool()
                 .submit_with_context(
                     candidate.clone(),
                     &standard_context,
@@ -6227,7 +6301,7 @@ mod tests {
             },
         ];
         assert!(matches!(
-            MemoryMempool::new()
+            test_mempool()
                 .submit_with_context(
                     candidate.clone(),
                     &standard_context,
@@ -6242,7 +6316,7 @@ mod tests {
         candidate.outputs = vec![output(3_000)];
         candidate.inputs[0].witness.items = vec![vec![0; 65]];
         assert!(matches!(
-            MemoryMempool::new()
+            test_mempool()
                 .submit_with_context(
                     candidate.clone(),
                     &standard_context,
@@ -6256,7 +6330,7 @@ mod tests {
 
         candidate.inputs[0].witness.items = vec![vec![0; 65], vec![2; 33]];
         assert!(matches!(
-            MemoryMempool::new()
+            test_mempool()
                 .submit_with_context(
                     candidate.clone(),
                     &standard_context,
@@ -6274,7 +6348,7 @@ mod tests {
             ..standard_context
         };
         assert!(matches!(
-            MemoryMempool::new()
+            test_mempool()
                 .submit_with_context(
                     candidate,
                     &absurd_context,
@@ -6642,7 +6716,7 @@ mod tests {
             7,
         );
         let grandchild_txid = grandchild.txid();
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         assert!(matches!(
             submit(&mut pool, parent.clone(), &view),
             Admission::Accepted(_)
@@ -6702,7 +6776,8 @@ mod tests {
     fn clear_is_single_generation_fail_closed_reconciliation() {
         let input = outpoint(10, 0);
         let view = FixedView::with_coin(input.clone(), 20);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
+        let instance_nonce = *pool.snapshot().instance_nonce();
         assert!(matches!(
             submit(&mut pool, transaction(input, 10), &view),
             Admission::Accepted(_)
@@ -6720,13 +6795,14 @@ mod tests {
         assert_eq!(pool.clear(), 0);
         assert_eq!(pool.info().generation, generation_before + 1);
         assert!(pool.snapshot().is_empty());
+        assert_eq!(pool.snapshot().instance_nonce(), &instance_nonce);
     }
 
     #[test]
     fn complete_verifier_gate_is_explicit() {
         let input = outpoint(5, 0);
         let view = FixedView::with_coin(input.clone(), 20);
-        let mut pool = MemoryMempool::new();
+        let mut pool = test_mempool();
         let context = MempoolContext {
             require_complete_verifiers: true,
             ..MempoolContext::testing(2, 2)

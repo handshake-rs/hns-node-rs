@@ -799,6 +799,7 @@ version = "0.3.3"
 dependencies = [
  "hns-consensus",
  "hns-primitives 0.3.3",
+ "rand",
  "serde",
  "serde_json",
  "thiserror",

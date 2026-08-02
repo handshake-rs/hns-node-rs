@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 hns-consensus = { path = "../hns-consensus" }
 hns-primitives = { path = "../hns-primitives" }
+rand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

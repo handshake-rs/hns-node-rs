@@ -330,8 +330,13 @@ cannot promote a block or grant authority.
   term; the global registry remains capped at 16,384 and output matching checks
   complete descriptor terms. Consensus-valid spends outside the pinned wallet
   branch profile are durably classified `Unrecognized` and reversed normally,
-  so this optional
-  derivative index cannot reject an active-chain transition. The checksummed
+  so the optional tracker does not strengthen consensus based on local branch
+  shape; storage corruption still fails the node closed.
+  Confirmed HTLC events retain raw revealed preimages in their internal durable
+  representation, while public DTO serde is redacted and non-round-trippable.
+  Registrations have no delete/tombstone/retirement record: the global and
+  per-address caps are unreclaimable lifetime data-directory limits in this
+  schema and remain a production-availability blocker. The checksummed
   `wallet-index-profile/v1` snapshot record prevents partially
   indexed history
   from being enabled after startup; see
