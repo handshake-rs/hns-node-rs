@@ -331,6 +331,16 @@ Fixtures are evidence, not authority.
   reflected. The only mutation accepts a canonical already-signed transaction,
   passes contextual mempool admission, and performs peer inventory fanout; no
   signing or secret service exists.
+- Transaction-bound fee quotes require the exact caller-expected chain epoch
+  and mempool process nonce/generation. One stable capture resolves input coins
+  from current mempool parents or the active UTXO set and derives weight,
+  input-aware sigops, HSD policy size, a same-generation bounded rate sample,
+  minimum fee, and a checked actual-fee/shortfall comparison. The caller cannot
+  inject coins or derived sizing evidence;
+  malformed/coinbase transactions, absent inputs, stale bindings, and stored
+  outpoint mismatches remain distinct fail-closed classes. A quote is exact only
+  for its serialized witness bytes and grants neither signing nor admission;
+  the wallet must requote the final signed transaction before broadcast.
 - Current and proof-root NameState/owner views remain distinct on the wire.
   Canonical encoded state bytes are explicit; projected resource data is
   labeled semantically opaque. Contract registration and raw

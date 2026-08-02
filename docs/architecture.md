@@ -157,6 +157,18 @@ do not install the route. The listener's body, concurrency, and
 timeout middleware remains outside the handler, and the
 backend's separate point/collection admission remains inside it.
 
+The transaction-bound fee-quote read is also a projection of canonical node
+policy. One stable active-state snapshot plus one immutable mempool generation
+resolve every input coin and supply the bounded rate sample. Node internals then
+derive transaction weight, input-aware sigops, HSD sigop-adjusted policy virtual
+bytes, the minimum fee in atomic units per 1,000 policy virtual bytes, and the
+actual node-resolved fee/shortfall comparison. The
+request must bind the exact chain epoch and mempool instance/generation and can
+supply only canonical raw transaction bytes, never coins or derived policy
+values. The result is exact for those serialized witness bytes only, so the
+wallet must requote the final signed artifact before broadcast; this read does
+not sign, relay, or promise admission.
+
 Wire continuations encode typed cursors as bounded behaviorally opaque tokens,
 not secrets or authenticated capabilities. Binary identities and payloads are
 canonical hexadecimal strings, so an independent wallet process need not link

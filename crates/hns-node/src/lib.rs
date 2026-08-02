@@ -36,11 +36,12 @@ pub use wallet_backend::{
     MempoolContractActivity, MempoolContractEvent, MempoolContractPage, MempoolScriptActivity,
     MempoolScriptOutput, MempoolScriptPage, MempoolScriptSpend, NameEvidence,
     NameOwnerTransaction, NameProofResult, OutpointSpendingEntry, OutpointSpendingEvidence,
-    TransactionEvidence, TransactionInclusion, TransactionPayload, TransactionStatus,
-    WalletBackend, WalletBackendError, WalletChainTip, WalletContractEventCursor,
+    TransactionEvidence, TransactionFeeQuote, TransactionInclusion, TransactionPayload,
+    TransactionStatus, WalletBackend, WalletBackendError, WalletChainTip, WalletContractEventCursor,
     WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
     WalletMempoolCursor, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
-    MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS, MAX_WALLET_OUTPOINT_SPEND_BATCH,
+    MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS, MAX_WALLET_FEE_QUOTE_INPUTS,
+    MAX_WALLET_OUTPOINT_SPEND_BATCH,
 };
 pub use wallet_rpc::WALLET_RPC_API_VERSION;
 

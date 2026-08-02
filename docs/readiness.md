@@ -170,7 +170,10 @@ Implemented in source:
   complete wallet profile,
   with canonical hex payloads, bounded opaque cursors, stable redacted errors,
   exact encoded current/proof name views, snapshot-bound block/spender/mempool
-  evidence, signed-transaction contextual admission,
+  evidence, signed-transaction contextual admission, and transaction-bound
+  fee quotes that resolve input coins and derive exact HSD policy size/minimum
+  fee plus checked actual-fee/shortfall evidence from one caller-bound
+  chain/mempool capture,
   stricter 256-row/1,024-scan wire limits, an 8 MiB measured JSON-result
   ceiling, and node-local tracked-contract evidence that keeps descriptor
   registration and raw preimages unavailable.
@@ -187,6 +190,13 @@ lifetime caps a separate production-availability blocker. Live marketplace wire
 advertisement separately awaits the
 published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
 adapter gate.
+
+Fee-quote source tests and documentation are present but were not executed in
+the source-only tranche that introduced the method. A quote is exact only for
+the supplied serialized witness bytes; production wallet qualification must
+demonstrate a final-signed-artifact requote and rebuild-on-underpayment loop
+before broadcast. Existing readiness or parity evidence does not qualify this
+new method by inheritance.
 
 ## Live P2P and synchronization — native path implemented and qualified
 

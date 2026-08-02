@@ -3,7 +3,13 @@
 use std::{collections::HashMap, sync::Arc};
 
 use hns_chain::{HeaderRecord, TxIndexEntry};
-use hns_mempool::{Admission, MempoolSnapshot, HSD_MINIMUM_RELAY_FEE_RATE};
+use hns_consensus::{
+    is_coinbase, transaction_sigops, transaction_weight, validate_transaction_sanity,
+};
+use hns_mempool::{
+    minimum_policy_fee, sigop_adjusted_virtual_size, Admission, MempoolSnapshot,
+    HSD_MINIMUM_RELAY_FEE_RATE,
+};
 use hns_p2p::{Inventory, LivePeerManager, OutboundPriority, Packet};
 use hns_primitives::{
     blake2b_256, BlockHash, Coin, Height, NameHash, NameState, Outpoint, Output, Transaction,
@@ -48,6 +54,8 @@ pub const MAX_WALLET_CONFIRMED_PAGE_ITEMS: usize = MAX_QUERY_ENTRIES;
 pub const MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS: usize = 256;
 /// Maximum outpoints inspected by one immutable spending-evidence capture.
 pub const MAX_WALLET_OUTPOINT_SPEND_BATCH: usize = 4_096;
+/// Maximum input coins resolved by one transaction-bound fee quote.
+pub const MAX_WALLET_FEE_QUOTE_INPUTS: usize = 4_096;
 
 const CONFIRMED_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-confirmed-script-set/v1";
 const MEMPOOL_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-mempool-script-set/v1";
@@ -387,6 +395,45 @@ pub struct FeeEstimate {
     pub source: FeeEstimateSource,
 }
 
+/// Exact HSD fee-policy quote for one caller-supplied canonical transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransactionFeeQuote {
+    /// Canonical transaction ID of the quoted raw transaction.
+    pub txid: Txid,
+    /// Durable chain generation used to resolve every input coin.
+    pub chain_epoch: u64,
+    /// Active tip captured with the chain snapshot.
+    pub tip: Option<WalletChainTip>,
+    /// Random non-persisted identity of the captured mempool instance.
+    pub mempool_instance_nonce: [u8; 32],
+    /// Exact immutable contextual-mempool generation used for input resolution
+    /// and rate sampling.
+    pub mempool_generation: u64,
+    /// Requested confirmation target.
+    pub target_blocks: u32,
+    /// Estimated rate in atomic units per 1,000 HSD policy virtual bytes.
+    pub rate_atomic_units_per_1000_policy_vbytes: u64,
+    /// Number of mempool entries in the bounded rate sample.
+    pub rate_sample_count: usize,
+    /// Evidence source for the sampled rate.
+    pub rate_source: FeeEstimateSource,
+    /// Exact consensus transaction weight.
+    pub transaction_weight: usize,
+    /// Exact sigop count using node-resolved input coins.
+    pub transaction_sigops: u32,
+    /// HSD sigop-adjusted policy virtual size.
+    pub sigop_adjusted_policy_vbytes: usize,
+    /// HSD minimum policy fee at the sampled rate, in atomic units.
+    pub minimum_policy_fee_atomic_units: u64,
+    /// Fee paid by the supplied transaction from node-resolved input values,
+    /// in atomic units.
+    pub actual_fee_atomic_units: u64,
+    /// Whether the supplied transaction pays at least this quote's minimum.
+    pub meets_minimum_policy_fee: bool,
+    /// Additional atomic units needed to meet this quote's minimum.
+    pub minimum_policy_fee_shortfall_atomic_units: u64,
+}
+
 /// Current name proof bound to the active durable tree root.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NameProofResult {
@@ -518,6 +565,15 @@ pub enum WalletBackendError {
     /// Fee target is outside its bounded range.
     #[error("fee target must be between 1 and {MAX_FEE_ESTIMATE_TARGET_BLOCKS}")]
     InvalidFeeTarget,
+    /// A transaction cannot be quoted because it is structurally or
+    /// economically invalid, or is a coinbase transaction rather than an
+    /// ordinary wallet transaction.
+    #[error("transaction is not eligible for a wallet fee quote")]
+    InvalidFeeQuoteTransaction,
+    /// A transaction input cannot be resolved from the bound active UTXO set
+    /// or immutable mempool generation.
+    #[error("transaction fee quote input coin is unavailable")]
+    FeeQuoteInputUnavailable,
     /// Requested name has no current owner outpoint.
     #[error("current name state has no owner")]
     NameHasNoOwner,
@@ -1426,43 +1482,67 @@ impl WalletBackend {
             return Err(WalletBackendError::InvalidFeeTarget);
         }
         let snapshot = self.read.published_mempool_snapshot().map_err(node_error)?;
-        let mut rates = snapshot
-            .txids()
-            .take(MAX_FEE_ESTIMATE_SAMPLES)
-            .filter_map(|txid| snapshot.entry(&txid))
-            .map(|entry| {
-                entry
-                    .fee
-                    .saturating_mul(1_000)
-                    .checked_div(u64::try_from(entry.policy_size.max(1)).unwrap_or(u64::MAX))
-                    .unwrap_or(u64::MAX)
-                    .max(HSD_MINIMUM_RELAY_FEE_RATE)
-            })
-            .collect::<Vec<_>>();
-        if rates.is_empty() {
-            return Ok(FeeEstimate {
-                target_blocks,
-                atomic_units_per_kvb: HSD_MINIMUM_RELAY_FEE_RATE,
-                sampled_transactions: 0,
-                source: FeeEstimateSource::MinimumRelay,
-            });
+        Ok(estimate_fee_rate_from_snapshot(&snapshot, target_blocks))
+    }
+
+    /// Quote the exact HSD minimum policy fee for one canonical raw
+    /// transaction against a caller-bound chain and mempool snapshot.
+    ///
+    /// Input coins are resolved only by the node from the captured active UTXO
+    /// set or captured mempool parents. The caller cannot supply coin, sigop,
+    /// weight, policy-size, or fee evidence through this boundary. The result
+    /// is exact only for these serialized transaction and witness bytes; a
+    /// wallet must quote the final signed artifact again before broadcast.
+    pub async fn quote_transaction_fee(
+        &self,
+        transaction: Transaction,
+        target_blocks: u32,
+        expected_chain_epoch: u64,
+        expected_mempool_instance_nonce: [u8; 32],
+        expected_mempool_generation: u64,
+    ) -> Result<TransactionFeeQuote, WalletBackendError> {
+        if !(1..=MAX_FEE_ESTIMATE_TARGET_BLOCKS).contains(&target_blocks) {
+            return Err(WalletBackendError::InvalidFeeTarget);
         }
-        rates.sort_unstable_by(|left, right| right.cmp(left));
-        let relaxed_target = usize::try_from(target_blocks.saturating_sub(1)).unwrap_or(usize::MAX);
-        let denominator = usize::try_from(MAX_FEE_ESTIMATE_TARGET_BLOCKS).unwrap_or(usize::MAX);
-        let index = rates
-            .len()
-            .saturating_sub(1)
-            .saturating_mul(relaxed_target)
-            .checked_div(denominator)
-            .unwrap_or(0)
-            .min(rates.len().saturating_sub(1));
-        Ok(FeeEstimate {
-            target_blocks,
-            atomic_units_per_kvb: rates[index],
-            sampled_transactions: rates.len(),
-            source: FeeEstimateSource::Mempool,
+        validate_transaction_sanity(&transaction)
+            .map_err(|_| WalletBackendError::InvalidFeeQuoteTransaction)?;
+        if is_coinbase(&transaction) || transaction.inputs.len() > MAX_WALLET_FEE_QUOTE_INPUTS {
+            return Err(WalletBackendError::InvalidFeeQuoteTransaction);
+        }
+
+        let read = self.read.clone();
+        blocking_mempool_read(read, move |_, snapshot, mempool, epoch| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != epoch.chain_epoch {
+                return Err(WalletBackendError::Corrupt(
+                    "published and durable chain generations disagree",
+                ));
+            }
+            if chain_epoch != expected_chain_epoch {
+                return Err(WalletBackendError::StaleChainEpoch {
+                    expected: expected_chain_epoch,
+                    actual: chain_epoch,
+                });
+            }
+            if mempool.instance_nonce() != &expected_mempool_instance_nonce {
+                return Err(WalletBackendError::StaleMempoolInstance);
+            }
+            if mempool.generation() != expected_mempool_generation {
+                return Err(WalletBackendError::StaleMempoolGeneration {
+                    expected: expected_mempool_generation,
+                    actual: mempool.generation(),
+                });
+            }
+            transaction_fee_quote_from_snapshot(
+                snapshot,
+                mempool,
+                &transaction,
+                target_blocks,
+                chain_epoch,
+                wallet_chain_tip(snapshot)?,
+            )
         })
+        .await
     }
 
     /// Read current active name state by canonical name hash.
@@ -1884,6 +1964,142 @@ fn mempool_scan_page(
     Ok((txids, continuation))
 }
 
+fn estimate_fee_rate_from_snapshot(
+    snapshot: &MempoolSnapshot,
+    target_blocks: u32,
+) -> FeeEstimate {
+    let mut rates = snapshot
+        .txids()
+        .take(MAX_FEE_ESTIMATE_SAMPLES)
+        .filter_map(|txid| snapshot.entry(&txid))
+        .map(|entry| {
+            entry
+                .fee
+                .saturating_mul(1_000)
+                .checked_div(u64::try_from(entry.policy_size.max(1)).unwrap_or(u64::MAX))
+                .unwrap_or(u64::MAX)
+                .max(HSD_MINIMUM_RELAY_FEE_RATE)
+        })
+        .collect::<Vec<_>>();
+    if rates.is_empty() {
+        return FeeEstimate {
+            target_blocks,
+            atomic_units_per_kvb: HSD_MINIMUM_RELAY_FEE_RATE,
+            sampled_transactions: 0,
+            source: FeeEstimateSource::MinimumRelay,
+        };
+    }
+    rates.sort_unstable_by(|left, right| right.cmp(left));
+    let relaxed_target = usize::try_from(target_blocks.saturating_sub(1)).unwrap_or(usize::MAX);
+    let denominator = usize::try_from(MAX_FEE_ESTIMATE_TARGET_BLOCKS).unwrap_or(usize::MAX);
+    let index = rates
+        .len()
+        .saturating_sub(1)
+        .saturating_mul(relaxed_target)
+        .checked_div(denominator)
+        .unwrap_or(0)
+        .min(rates.len().saturating_sub(1));
+    FeeEstimate {
+        target_blocks,
+        atomic_units_per_kvb: rates[index],
+        sampled_transactions: rates.len(),
+        source: FeeEstimateSource::Mempool,
+    }
+}
+
+fn transaction_fee_quote_from_snapshot<S: ReadSnapshot>(
+    snapshot: &S,
+    mempool: &MempoolSnapshot,
+    transaction: &Transaction,
+    target_blocks: u32,
+    chain_epoch: u64,
+    tip: Option<WalletChainTip>,
+) -> Result<TransactionFeeQuote, WalletBackendError> {
+    let mut input_coins = Vec::with_capacity(transaction.inputs.len());
+    for input in &transaction.inputs {
+        if input.previous_output.is_null() {
+            return Err(WalletBackendError::InvalidFeeQuoteTransaction);
+        }
+        input_coins.push(resolve_fee_quote_input_coin(
+            snapshot,
+            mempool,
+            &input.previous_output,
+        )?);
+    }
+    let sigops = transaction_sigops(transaction, &input_coins).map_err(|_| {
+        WalletBackendError::Corrupt("resolved fee-quote inputs cannot produce a sigop count")
+    })?;
+    let input_value = input_coins.iter().try_fold(0u64, |total, coin| {
+        total
+            .checked_add(coin.value)
+            .ok_or(WalletBackendError::InvalidFeeQuoteTransaction)
+    })?;
+    let output_value = transaction.outputs.iter().try_fold(0u64, |total, output| {
+        total
+            .checked_add(output.value)
+            .ok_or(WalletBackendError::InvalidFeeQuoteTransaction)
+    })?;
+    let actual_fee = input_value
+        .checked_sub(output_value)
+        .ok_or(WalletBackendError::InvalidFeeQuoteTransaction)?;
+    let weight = transaction_weight(transaction);
+    let policy_size = sigop_adjusted_virtual_size(transaction, sigops);
+    let estimate = estimate_fee_rate_from_snapshot(mempool, target_blocks);
+    let minimum_fee = minimum_policy_fee(policy_size, estimate.atomic_units_per_kvb);
+    Ok(TransactionFeeQuote {
+        txid: transaction.txid(),
+        chain_epoch,
+        tip,
+        mempool_instance_nonce: *mempool.instance_nonce(),
+        mempool_generation: mempool.generation(),
+        target_blocks,
+        rate_atomic_units_per_1000_policy_vbytes: estimate.atomic_units_per_kvb,
+        rate_sample_count: estimate.sampled_transactions,
+        rate_source: estimate.source,
+        transaction_weight: weight,
+        transaction_sigops: sigops,
+        sigop_adjusted_policy_vbytes: policy_size,
+        minimum_policy_fee_atomic_units: minimum_fee,
+        actual_fee_atomic_units: actual_fee,
+        meets_minimum_policy_fee: actual_fee >= minimum_fee,
+        minimum_policy_fee_shortfall_atomic_units: minimum_fee.saturating_sub(actual_fee),
+    })
+}
+
+fn resolve_fee_quote_input_coin<S: ReadSnapshot>(
+    snapshot: &S,
+    mempool: &MempoolSnapshot,
+    outpoint: &Outpoint,
+) -> Result<Coin, WalletBackendError> {
+    if let Some(parent) = mempool.transaction(&outpoint.txid) {
+        let output = usize::try_from(outpoint.index)
+            .ok()
+            .and_then(|index| parent.outputs.get(index))
+            .ok_or(WalletBackendError::FeeQuoteInputUnavailable)?;
+        return Ok(Coin {
+            outpoint: outpoint.clone(),
+            value: output.value,
+            height: 0,
+            coinbase: false,
+            address: output.address.clone(),
+            covenant: output.covenant.clone(),
+        });
+    }
+    let raw = snapshot
+        .get(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::FeeQuoteInputUnavailable)?;
+    let coin = decode_coin(&raw).map_err(|_| {
+        WalletBackendError::Corrupt("active UTXO coin cannot be decoded for a fee quote")
+    })?;
+    if coin.outpoint != *outpoint {
+        return Err(WalletBackendError::Corrupt(
+            "UTXO payload disagrees with requested fee-quote input",
+        ));
+    }
+    Ok(coin)
+}
+
 fn resolve_mempool_coin<S: ReadSnapshot>(
     snapshot: &S,
     mempool: &MempoolSnapshot,
@@ -2023,7 +2239,9 @@ mod tests {
     use hns_consensus::Network;
     use hns_mempool::MemoryMempool;
     use hns_p2p::LivePeerConfig;
-    use hns_primitives::{Input, Outpoint, Witness};
+    use hns_primitives::{Address, CovenantKind, Input, Outpoint, Witness};
+    use hns_state::encode_coin;
+    use hns_store::{MemoryStore, Store, WriteBatch};
 
     use crate::{NodeConfig, NodeService, DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY};
 
@@ -2069,6 +2287,51 @@ mod tests {
         assert_eq!(unknown.inclusion, None);
         assert_eq!(unknown.payload, TransactionPayload::Absent);
         assert_eq!(unknown.tip, None);
+
+        let quote_candidate = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    txid: Txid::new([0x51; 32]),
+                    index: 0,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 1,
+                address: Address::new(0, vec![0x52; 20]).unwrap(),
+                covenant: hns_primitives::Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: 0,
+        };
+        assert!(matches!(
+            backend
+                .quote_transaction_fee(
+                    quote_candidate.clone(),
+                    6,
+                    unknown.chain_epoch,
+                    [0; 32],
+                    unknown.mempool_generation,
+                )
+                .await,
+            Err(WalletBackendError::StaleMempoolInstance)
+        ));
+        assert!(matches!(
+            backend
+                .quote_transaction_fee(
+                    quote_candidate,
+                    6,
+                    unknown.chain_epoch,
+                    unknown.mempool_instance_nonce,
+                    unknown.mempool_generation,
+                )
+                .await,
+            Err(WalletBackendError::FeeQuoteInputUnavailable)
+        ));
 
         let name = backend
             .get_name_evidence(NameHash::new([8; 32]))
@@ -2225,6 +2488,124 @@ mod tests {
 
         drop(backend);
         runtime.shutdown_unclean().await.unwrap();
+    }
+
+    #[test]
+    fn fee_quote_uses_node_resolved_coin_and_exact_hsd_policy_units() {
+        let outpoint = Outpoint {
+            txid: Txid::new([0x61; 32]),
+            index: 7,
+        };
+        let coin = Coin {
+            outpoint: outpoint.clone(),
+            value: 50_000,
+            height: 10,
+            coinbase: false,
+            address: Address::new(0, vec![0x62; 20]).unwrap(),
+            covenant: hns_primitives::Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        };
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Utxo,
+                &encode_outpoint_key(&outpoint),
+                &encode_coin(&coin),
+            )
+            .unwrap();
+        store.commit(batch).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let mempool = MemoryMempool::new().unwrap().snapshot();
+        let transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: outpoint,
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 49_000,
+                address: Address::new(0, vec![0x63; 20]).unwrap(),
+                covenant: hns_primitives::Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: 0,
+        };
+
+        let quote = transaction_fee_quote_from_snapshot(
+            &snapshot,
+            &mempool,
+            &transaction,
+            6,
+            9,
+            None,
+        )
+        .unwrap();
+        assert_eq!(quote.txid, transaction.txid());
+        assert_eq!(quote.chain_epoch, 9);
+        assert_eq!(quote.mempool_instance_nonce, *mempool.instance_nonce());
+        assert_eq!(quote.mempool_generation, mempool.generation());
+        assert_eq!(quote.transaction_sigops, 1);
+        assert_eq!(quote.transaction_weight, transaction_weight(&transaction));
+        assert_eq!(
+            quote.sigop_adjusted_policy_vbytes,
+            sigop_adjusted_virtual_size(&transaction, 1)
+        );
+        assert_eq!(
+            quote.rate_atomic_units_per_1000_policy_vbytes,
+            HSD_MINIMUM_RELAY_FEE_RATE
+        );
+        assert_eq!(quote.rate_sample_count, 0);
+        assert_eq!(quote.rate_source, FeeEstimateSource::MinimumRelay);
+        assert_eq!(
+            quote.minimum_policy_fee_atomic_units,
+            minimum_policy_fee(
+                quote.sigop_adjusted_policy_vbytes,
+                HSD_MINIMUM_RELAY_FEE_RATE,
+            )
+        );
+        assert_eq!(quote.actual_fee_atomic_units, 1_000);
+        assert!(quote.meets_minimum_policy_fee);
+        assert_eq!(quote.minimum_policy_fee_shortfall_atomic_units, 0);
+
+        let mut underpaid = transaction;
+        underpaid.outputs[0].value = 49_999;
+        let underpaid_quote = transaction_fee_quote_from_snapshot(
+            &snapshot,
+            &mempool,
+            &underpaid,
+            6,
+            9,
+            None,
+        )
+        .unwrap();
+        assert_eq!(underpaid_quote.actual_fee_atomic_units, 1);
+        assert!(!underpaid_quote.meets_minimum_policy_fee);
+        assert_eq!(
+            underpaid_quote.minimum_policy_fee_shortfall_atomic_units,
+            underpaid_quote
+                .minimum_policy_fee_atomic_units
+                .saturating_sub(1)
+        );
+
+        let mut overspend = underpaid;
+        overspend.outputs[0].value = 50_001;
+        assert!(matches!(
+            transaction_fee_quote_from_snapshot(
+                &snapshot,
+                &mempool,
+                &overspend,
+                6,
+                9,
+                None,
+            ),
+            Err(WalletBackendError::InvalidFeeQuoteTransaction)
+        ));
     }
 
     #[test]

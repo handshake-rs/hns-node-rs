@@ -21,11 +21,11 @@ use super::wallet_backend::{
     BlockHashEvidence, BroadcastResult, ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate,
     FeeEstimateSource, MempoolContractEvent, MempoolContractPage, MempoolScriptPage,
     NameEvidence, NameOwnerTransaction, OutpointSpendingEvidence, TransactionEvidence,
-    TransactionPayload, TransactionStatus, WalletBackend, WalletBackendError,
+    TransactionFeeQuote, TransactionPayload, TransactionStatus, WalletBackend, WalletBackendError,
     WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
     WalletContractFundingPage, WalletMempoolCursor, MAX_FEE_ESTIMATE_TARGET_BLOCKS,
     MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_MEMPOOL_SCAN, MAX_WALLET_OUTPOINT_SPEND_BATCH,
-    MAX_WALLET_RESTORE_SCRIPTS,
+    MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_RESTORE_SCRIPTS,
 };
 
 pub const WALLET_RPC_API_VERSION: u16 = 1;
@@ -102,6 +102,12 @@ enum WalletRpcCall {
     },
     EstimateFeeRate {
         target_blocks: u32,
+    },
+    QuoteTransactionFee {
+        transaction_hex: String,
+        target_blocks: u32,
+        expected_chain_epoch: u64,
+        expected_mempool: WireExpectedMempool,
     },
     TrackedContractKnown {
         contract_id: String,
@@ -298,6 +304,7 @@ async fn dispatch_call(
             "maximum_wire_result_bytes": MAX_WALLET_RPC_RESULT_BYTES,
             "maximum_opaque_cursor_bytes": MAX_OPAQUE_CURSOR_BYTES,
             "maximum_fee_target_blocks": MAX_FEE_ESTIMATE_TARGET_BLOCKS,
+            "maximum_fee_quote_inputs": MAX_WALLET_FEE_QUOTE_INPUTS,
             "consensus_maximum_transaction_bytes": MAX_TX_SIZE,
             "transaction_request_also_bound_by_hex_envelope_and_listener_body_limit": true,
             "confirmed_cursor_binding": "chain_epoch_and_script_set",
@@ -305,6 +312,11 @@ async fn dispatch_call(
             "mempool_cursor_binding": "chain_epoch_process_instance_nonce_generation_and_query",
             "mempool_page_binding": "chain_epoch_tip_instance_nonce_and_generation",
             "transaction_evidence_binding": "mandatory_chain_epoch_optional_exact_mempool_instance_and_generation",
+            "transaction_fee_quote_binding": "mandatory_chain_epoch_and_exact_mempool_instance_and_generation",
+            "transaction_fee_quote_units": "atomic_units_per_1000_hsd_policy_virtual_bytes",
+            "transaction_fee_quote_caller_evidence": "raw_transaction_only_node_resolves_input_coins_weight_sigops_policy_size_and_rate",
+            "transaction_fee_quote_artifact": "exact_supplied_serialized_bytes_requote_final_signed_transaction_before_broadcast",
+            "transaction_fee_quote_payment_evidence": "node_resolved_actual_fee_minimum_shortfall_and_meets_minimum_boolean",
             "outpoint_spend_evidence": "ordered_single_immutable_chain_snapshot",
             "transaction_position": "exact_when_block_payload_retained_null_when_pruned",
             "name_views": ["current_state", "proof_state", "current_owner", "proof_owner"],
@@ -441,6 +453,33 @@ async fn dispatch_call(
         WalletRpcCall::EstimateFeeRate { target_blocks } => {
             value(&WireFeeEstimate::from(
                 &backend.estimate_fee_rate(target_blocks).await?,
+            ))?
+        }
+        WalletRpcCall::QuoteTransactionFee {
+            transaction_hex,
+            target_blocks,
+            expected_chain_epoch,
+            expected_mempool,
+        } => {
+            let raw = decode_hex_bounded(
+                &transaction_hex,
+                MAX_TX_SIZE,
+                "raw transaction",
+            )?;
+            let transaction = Transaction::decode(&raw)
+                .map_err(|_| DispatchError::Invalid("raw transaction is not canonical"))?;
+            let expected_mempool = decode_expected_mempool(Some(expected_mempool))?
+                .ok_or(DispatchError::Invalid("expected mempool binding is required"))?;
+            value(&WireTransactionFeeQuote::from(
+                &backend
+                    .quote_transaction_fee(
+                        transaction,
+                        target_blocks,
+                        expected_chain_epoch,
+                        expected_mempool.instance_nonce,
+                        expected_mempool.generation,
+                    )
+                    .await?,
             ))?
         }
         WalletRpcCall::TrackedContractKnown { contract_id } => {
@@ -605,6 +644,20 @@ fn map_backend_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "result_limit",
             "the bounded mempool result contains too many relevant items",
+            true,
+        ),
+        WalletBackendError::InvalidFeeQuoteTransaction => wallet_rpc_failure(
+            request_id,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_fee_quote_transaction",
+            "the raw transaction is not eligible for a Handshake fee quote",
+            false,
+        ),
+        WalletBackendError::FeeQuoteInputUnavailable => wallet_rpc_failure(
+            request_id,
+            StatusCode::CONFLICT,
+            "fee_quote_input_unavailable",
+            "an input coin is unavailable in the bound active chain and mempool snapshot",
             true,
         ),
         WalletBackendError::Rejected(reason) => wallet_rpc_failure(
@@ -1202,6 +1255,54 @@ impl From<&FeeEstimate> for WireFeeEstimate {
                 FeeEstimateSource::MinimumRelay => "minimum_relay",
                 FeeEstimateSource::Mempool => "mempool",
             },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireTransactionFeeQuote {
+    txid: String,
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    mempool_instance_nonce: String,
+    mempool_generation: u64,
+    target_blocks: u32,
+    rate_atomic_units_per_1000_policy_vbytes: u64,
+    rate_sample_count: usize,
+    rate_source: &'static str,
+    transaction_weight: usize,
+    transaction_sigops: u32,
+    sigop_adjusted_policy_vbytes: usize,
+    minimum_policy_fee_atomic_units: u64,
+    actual_fee_atomic_units: u64,
+    meets_minimum_policy_fee: bool,
+    minimum_policy_fee_shortfall_atomic_units: u64,
+}
+
+impl From<&TransactionFeeQuote> for WireTransactionFeeQuote {
+    fn from(quote: &TransactionFeeQuote) -> Self {
+        Self {
+            txid: quote.txid.to_hex(),
+            chain_epoch: quote.chain_epoch,
+            tip: wire_tip(quote.tip.clone()),
+            mempool_instance_nonce: hex_encode(&quote.mempool_instance_nonce),
+            mempool_generation: quote.mempool_generation,
+            target_blocks: quote.target_blocks,
+            rate_atomic_units_per_1000_policy_vbytes: quote
+                .rate_atomic_units_per_1000_policy_vbytes,
+            rate_sample_count: quote.rate_sample_count,
+            rate_source: match quote.rate_source {
+                FeeEstimateSource::MinimumRelay => "minimum_relay",
+                FeeEstimateSource::Mempool => "mempool",
+            },
+            transaction_weight: quote.transaction_weight,
+            transaction_sigops: quote.transaction_sigops,
+            sigop_adjusted_policy_vbytes: quote.sigop_adjusted_policy_vbytes,
+            minimum_policy_fee_atomic_units: quote.minimum_policy_fee_atomic_units,
+            actual_fee_atomic_units: quote.actual_fee_atomic_units,
+            meets_minimum_policy_fee: quote.meets_minimum_policy_fee,
+            minimum_policy_fee_shortfall_atomic_units: quote
+                .minimum_policy_fee_shortfall_atomic_units,
         }
     }
 }

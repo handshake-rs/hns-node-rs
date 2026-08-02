@@ -133,9 +133,17 @@ Implemented:
   explicit chain/tip and mempool instance nonce/generation, optional exact
   transaction position and block time without zero sentinels, canonical encoded
   current/proof NameState bytes and separate owner views, contextual
-  signed-transaction broadcast, and stable redacted
-  errors under the existing HTTP/backend resource bounds plus stricter
+  signed-transaction broadcast, transaction-bound HSD policy fee quotes, and
+  stable redacted errors under the existing HTTP/backend resource bounds plus stricter
   256-row/1,024-scan wire limits and an 8 MiB measured JSON-result ceiling.
+  Each fee quote requires an exact chain epoch and mempool instance/generation,
+  resolves input coins from that stable capture, and reports same-generation
+  rate evidence, transaction weight, input-aware sigops, sigop-adjusted policy
+  virtual bytes, minimum fee, and checked actual-fee/shortfall evidence in
+  explicit atomic units. It accepts no
+  caller-derived coin or sizing evidence and neither signs nor broadcasts. The
+  result is exact only for the supplied serialized witness bytes, requiring a
+  final-signed-artifact requote before broadcast.
   Contract registration,
   canonical name/resource interpretation, and raw revealed-preimage transport
   remain unavailable across this wire boundary. Immutable public Shakedex-v2 and
@@ -155,7 +163,8 @@ Implemented:
   and pinned canonical `hns-swap` commit, and cross-repository adapter
   qualification; local script duplication and frozen vectors are not protocol
   authority and no release-readiness claim is made by this source status
-  update.
+  update. Fee-quote source tests were added but not executed in this source-only
+  tranche and inherit no qualification result from an earlier commit.
 - A bounded hash-first Denuo marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live
