@@ -4,8 +4,11 @@
 consensus, authenticated chain state, native P2P synchronization, a bounded
 mempool, mining templates, and block relay without an `hsd` runtime dependency.
 
-The project is intentionally focused on the node and mining path. It is not a
-wallet, desktop application, domain manager, DNS server, or explorer.
+The `hsrd` process is intentionally focused on the node and mining path. It is
+not a wallet, desktop application, domain manager, DNS server, or explorer. The
+repository also contains the separately deployed, bounded
+[`hns-resolverd`](docs/hns-resolverd.md) companion for applications that need
+ordinary HNS DNS without an `hsd` runtime.
 
 > [!IMPORTANT]
 > Functional consensus readiness is complete, but production hardening is
@@ -121,6 +124,7 @@ documented in [Storage rollout](docs/storage-rollout.md).
 - [Architecture](docs/architecture.md)
 - [P2P and synchronization](docs/p2p-sync.md)
 - [Control and diagnostic API](docs/rpc-compat.md)
+- [Native Handshake DNS resolver](docs/hns-resolverd.md)
 - [Mining engine](docs/mining-engine.md)
 - [Security model](docs/security-model.md)
 - [Readiness status](docs/readiness.md)

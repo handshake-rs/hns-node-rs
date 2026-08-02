@@ -21,6 +21,12 @@ database into a process-wide RPC snapshot.
   transition. The native-sync handler uses keyed store reads under the chain
   coordinator lock; periodic Core requalification does not scan the UTXO,
   name-state, header, or block collections.
+- `getdnsresource`, a resolver-specific point read that returns one name's
+  canonical resource hex together with the network, active height, best-header
+  height, active resulting name-tree root, chain epoch, and synchronized flag
+  from the same immutable store snapshot. The separately deployed
+  `hns-resolverd` therefore never binds bytes from one tip to status from
+  another tip during a block connection or reorganization.
 - Native-sync `getblockhash` and `getblockheader` select a complete canonical
   header record from one locked generation of the shared in-memory header
   index. The immutable store snapshot is acquired while that read lock is still
@@ -35,8 +41,9 @@ database into a process-wide RPC snapshot.
   before a node lock, store snapshot, or collection read is attempted. Unknown
   methods, `sendrawtransaction`, and `getpeerinfo` reject immediately.
 - `getblockhash`, `getblockheader`, `getblock`, `getrawtransaction`,
-  `gettxout`, `getnameinfo`, `getnameresource`, and `getnamebyhash` use keyed
-  reads. Confirmed `getrawtransaction` lookup requires `--transaction-index`;
+  `gettxout`, `getnameinfo`, `getnameresource`, `getdnsresource`, and
+  `getnamebyhash` use keyed reads. Confirmed `getrawtransaction` lookup
+  requires `--transaction-index`;
   a mempool transaction remains a keyed in-memory read without that option.
   The implementation never falls back to scanning retained blocks.
 - `getmempoolinfo` reads exact transaction/claim/airdrop counts, bytes, and
@@ -144,6 +151,7 @@ mutation, and strict startup reconstruction refuses an over-budget graph.
 | `getblock` | block-index and payload point reads | `O(log N + B)` | `O(B)` |
 | confirmed `getrawtransaction` | tx index, canonical index, and one block point read | `O(log N + T(B))` | `O(B)` |
 | `gettxout`, name methods | UTXO/name-state point read | `O(log N)` | `O(1)` plus result |
+| `getdnsresource` | one name-state read plus fixed chain-generation metadata from one snapshot | `O(log N)` | `O(R)`, with resource `R <= 512` bytes |
 | `getmempoolinfo` | exact cached aggregate | `O(1)` | `O(1)` |
 | `getrawmempool` | `O(1)` persistent-AVL generation capture, then bounded immutable ID walk after coordinator release | `O(M)` response (`O(log M)` concurrent pool mutation) | `O(M)` response; retained generations share untouched subtrees |
 | `getparentauthority` | fixed metadata/header keys under one coordinator epoch | `O(log N)` | `O(1)` |
@@ -192,5 +200,7 @@ hsrd --network mainnet --data-dir /path/to/hsrd \
 - add/remove an operator-pinned peer;
 - initiate graceful shutdown or a bounded diagnostic snapshot.
 
-Wallet, signing, domain actions, DNS, explorer/address queries, public mining
-RPC, and broad hsd tooling compatibility are deliberately unsupported.
+Wallet, signing, domain actions, an embedded DNS listener, explorer/address
+queries, public mining RPC, and broad hsd tooling compatibility are
+deliberately unsupported. The narrow `getdnsresource` read exists only for the
+separate resolver boundary.

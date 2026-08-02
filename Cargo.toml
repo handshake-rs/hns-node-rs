@@ -15,6 +15,7 @@ members = [
     "crates/hns-node",
     "crates/hns-testkit",
     "crates/hns-urkel",
+    "crates/hns-resolver",
 ]
 exclude = ["fuzz"]
 resolver = "2"

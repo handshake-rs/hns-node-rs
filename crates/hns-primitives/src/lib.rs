@@ -997,12 +997,117 @@ impl Resource {
     pub fn encode(&self) -> Vec<u8> {
         self.raw.clone()
     }
+
+    /// Decode resource records into typed values while preserving the exact
+    /// canonical bytes in [`Resource::raw`]. DNS compression pointers are
+    /// resolved against the complete resource rather than an isolated record
+    /// payload.
+    pub fn decoded_records(&self) -> Result<Vec<DecodedResourceRecord>, PrimitiveError> {
+        let mut reader = Reader::new(&self.raw, MAX_RESOURCE_SIZE)?;
+        if reader.read_u8()? != 0 {
+            return Err(PrimitiveError::InvalidResource("unknown resource version"));
+        }
+
+        let mut records = Vec::new();
+        while reader.remaining() > 0 {
+            let kind = ResourceRecordKind::from_u8(reader.read_u8()?);
+            let record = match kind {
+                ResourceRecordKind::Ds => {
+                    let key_tag = reader.read_u16_be()?;
+                    let algorithm = reader.read_u8()?;
+                    let digest_type = reader.read_u8()?;
+                    let digest_len = usize::from(reader.read_u8()?);
+                    DecodedResourceRecord::Ds {
+                        key_tag,
+                        algorithm,
+                        digest_type,
+                        digest: reader.read_vec(digest_len)?,
+                    }
+                }
+                ResourceRecordKind::Ns => DecodedResourceRecord::Ns {
+                    ns: read_dns_name(&mut reader)?,
+                },
+                ResourceRecordKind::Glue4 => {
+                    let ns = read_dns_name(&mut reader)?;
+                    DecodedResourceRecord::Glue4 {
+                        ns,
+                        address: reader.read_array::<4>()?,
+                    }
+                }
+                ResourceRecordKind::Glue6 => {
+                    let ns = read_dns_name(&mut reader)?;
+                    DecodedResourceRecord::Glue6 {
+                        ns,
+                        address: reader.read_array::<16>()?,
+                    }
+                }
+                ResourceRecordKind::Synth4 => DecodedResourceRecord::Synth4 {
+                    address: reader.read_array::<4>()?,
+                },
+                ResourceRecordKind::Synth6 => DecodedResourceRecord::Synth6 {
+                    address: reader.read_array::<16>()?,
+                },
+                ResourceRecordKind::Txt => {
+                    let count = usize::from(reader.read_u8()?);
+                    let mut txt = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let len = usize::from(reader.read_u8()?);
+                        txt.push(reader.read_vec(len)?);
+                    }
+                    DecodedResourceRecord::Txt { txt }
+                }
+                ResourceRecordKind::Unknown(kind) => DecodedResourceRecord::Unknown {
+                    kind,
+                    payload: reader.read_vec(reader.remaining())?,
+                },
+            };
+            records.push(record);
+        }
+        Ok(records)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResourceRecord {
     pub kind: ResourceRecordKind,
     pub payload: Vec<u8>,
+}
+
+/// Lossless typed view of one Handshake resource record. DNS names use an
+/// escaped, fully-qualified presentation form accepted by standard DNS
+/// parsers; TXT chunks retain arbitrary bytes rather than assuming UTF-8.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DecodedResourceRecord {
+    Ds {
+        key_tag: u16,
+        algorithm: u8,
+        digest_type: u8,
+        digest: Vec<u8>,
+    },
+    Ns {
+        ns: String,
+    },
+    Glue4 {
+        ns: String,
+        address: [u8; 4],
+    },
+    Glue6 {
+        ns: String,
+        address: [u8; 16],
+    },
+    Synth4 {
+        address: [u8; 4],
+    },
+    Synth6 {
+        address: [u8; 16],
+    },
+    Txt {
+        txt: Vec<Vec<u8>>,
+    },
+    Unknown {
+        kind: u8,
+        payload: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -1644,6 +1749,109 @@ fn read_dns_name_payload(reader: &mut Reader<'_>) -> Result<(), PrimitiveError> 
     }
 }
 
+fn read_dns_name(reader: &mut Reader<'_>) -> Result<String, PrimitiveError> {
+    let mut labels = Vec::new();
+    let mut followed_offsets = [false; MAX_RESOURCE_SIZE];
+    let mut pointer_count = 0usize;
+    let mut wire_len = 1usize;
+    read_dns_name_labels(
+        reader,
+        &mut labels,
+        &mut followed_offsets,
+        &mut pointer_count,
+        &mut wire_len,
+    )?;
+
+    if labels.is_empty() {
+        return Ok(".".to_owned());
+    }
+
+    let mut name = String::new();
+    for label in labels {
+        for byte in label {
+            match byte {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => {
+                    name.push(char::from(byte));
+                }
+                other => {
+                    use std::fmt::Write as _;
+                    write!(&mut name, "\\{other:03}").expect("writing to String cannot fail");
+                }
+            }
+        }
+        name.push('.');
+    }
+    Ok(name)
+}
+
+fn read_dns_name_labels(
+    reader: &mut Reader<'_>,
+    labels: &mut Vec<Vec<u8>>,
+    followed_offsets: &mut [bool; MAX_RESOURCE_SIZE],
+    pointer_count: &mut usize,
+    wire_len: &mut usize,
+) -> Result<(), PrimitiveError> {
+    loop {
+        if labels.len() >= 128 {
+            return Err(PrimitiveError::InvalidResource(
+                "dns name has too many labels",
+            ));
+        }
+
+        let len = reader.read_u8()?;
+        if len & 0xc0 == 0xc0 {
+            let low = reader.read_u8()?;
+            let offset = (usize::from(len & 0x3f) << 8) | usize::from(low);
+            let pointer_position = reader.position().saturating_sub(2);
+            if offset >= pointer_position || offset >= reader.bytes.len() {
+                return Err(PrimitiveError::InvalidResource(
+                    "dns compression pointer is not backward",
+                ));
+            }
+            if followed_offsets[offset] || *pointer_count >= 128 {
+                return Err(PrimitiveError::InvalidResource(
+                    "dns compression pointer loop",
+                ));
+            }
+            followed_offsets[offset] = true;
+            *pointer_count += 1;
+            let mut pointed = Reader {
+                bytes: reader.bytes,
+                offset,
+            };
+            read_dns_name_labels(
+                &mut pointed,
+                labels,
+                followed_offsets,
+                pointer_count,
+                wire_len,
+            )?;
+            return Ok(());
+        }
+        if len & 0xc0 != 0 {
+            return Err(PrimitiveError::InvalidResource("invalid dns label prefix"));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        if len > 63 {
+            return Err(PrimitiveError::InvalidResource(
+                "dns label exceeds 63 bytes",
+            ));
+        }
+        let label = reader.read_vec(usize::from(len))?;
+        *wire_len = wire_len
+            .checked_add(label.len() + 1)
+            .ok_or(PrimitiveError::IntegerOverflow)?;
+        if *wire_len > 255 {
+            return Err(PrimitiveError::InvalidResource(
+                "dns name exceeds 255 bytes",
+            ));
+        }
+        labels.push(label);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Writer {
     bytes: Vec<u8>,
@@ -2070,5 +2278,37 @@ mod tests {
         assert_eq!(resource.records[0].kind, ResourceRecordKind::Synth6);
         assert_eq!(resource.records[1].kind, ResourceRecordKind::Txt);
         assert_eq!(resource.encode(), raw);
+    }
+
+    #[test]
+    fn resource_typed_view_resolves_compressed_names() {
+        let raw = [
+            0, 1, 2, b'n', b's', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0, 2, 0xc0, 0x02,
+            127, 0, 0, 1,
+        ];
+        let resource = Resource::decode(&raw).expect("resource parses");
+        assert_eq!(
+            resource.decoded_records().expect("typed records"),
+            vec![
+                DecodedResourceRecord::Ns {
+                    ns: "ns.example.".to_owned(),
+                },
+                DecodedResourceRecord::Glue4 {
+                    ns: "ns.example.".to_owned(),
+                    address: [127, 0, 0, 1],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_typed_view_rejects_non_backward_compression_pointers() {
+        let resource = Resource::decode(&[0, 1, 0xc0, 0x02]).expect("scanner accepts pointer");
+        assert!(matches!(
+            resource.decoded_records(),
+            Err(PrimitiveError::InvalidResource(
+                "dns compression pointer is not backward"
+            ))
+        ));
     }
 }

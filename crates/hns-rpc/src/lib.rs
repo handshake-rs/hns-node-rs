@@ -55,6 +55,7 @@ pub enum RpcMethod {
     GetConnectionCount,
     GetNameInfo,
     GetNameResource,
+    GetDnsResource,
     GetNameByHash,
     GetHsrdStatus,
     GetAuthorityInfo,
@@ -82,6 +83,7 @@ impl RpcMethod {
             "getconnectioncount" => Some(Self::GetConnectionCount),
             "getnameinfo" => Some(Self::GetNameInfo),
             "getnameresource" => Some(Self::GetNameResource),
+            "getdnsresource" => Some(Self::GetDnsResource),
             "getnamebyhash" => Some(Self::GetNameByHash),
             "gethsrdstatus" => Some(Self::GetHsrdStatus),
             "getauthorityinfo" => Some(Self::GetAuthorityInfo),
@@ -379,6 +381,28 @@ pub struct RpcNodeStatus {
     pub parity: RpcParityInfo,
 }
 
+/// Chain generation bound to a DNS resource point read. Unlike composing
+/// `gethsrdstatus` and `getnameinfo`, this context cannot straddle a block
+/// connection or reorganization.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcDnsContext {
+    pub network: String,
+    pub active_height: Option<Height>,
+    pub best_header_height: Option<Height>,
+    pub active_state_root: Option<String>,
+    pub chain_epoch: u64,
+    pub synchronized: bool,
+}
+
+/// Resolver-oriented response carrying canonical resource bytes and the exact
+/// active-chain generation from which they were read.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcDnsResource {
+    pub name: String,
+    pub resource: Option<String>,
+    pub context: RpcDnsContext,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcSnapshot {
     pub network: String,
@@ -394,6 +418,7 @@ pub struct RpcSnapshot {
     pub peer_count: usize,
     pub mining_engine: RpcMiningEngineInfo,
     pub node_status: RpcNodeStatus,
+    pub dns_context: Option<RpcDnsContext>,
 }
 
 impl RpcSnapshot {
@@ -641,6 +666,7 @@ impl BasicRpcService {
             RpcMethod::GetConnectionCount => Ok(json!(self.snapshot.peer_count)),
             RpcMethod::GetNameInfo => self.get_name_info(params),
             RpcMethod::GetNameResource => self.get_name_resource(params),
+            RpcMethod::GetDnsResource => self.get_dns_resource(params),
             RpcMethod::GetNameByHash => self.get_name_by_hash(params),
             RpcMethod::GetHsrdStatus => serde_json::to_value(&self.snapshot.node_status)
                 .map_err(|error| RpcCallError::new(-32603, error.to_string())),
@@ -798,6 +824,30 @@ impl BasicRpcService {
         }
 
         Ok(Value::Null)
+    }
+
+    fn get_dns_resource(&self, params: &[Value]) -> Result<Value, RpcCallError> {
+        let name = required_string(params, 0, "name")?;
+        if !hns_primitives::verify_name(&name) {
+            return Err(RpcCallError::new(-3, "invalid Handshake name"));
+        }
+        let context = self
+            .snapshot
+            .dns_context
+            .clone()
+            .ok_or_else(|| RpcCallError::new(-32603, "DNS read context unavailable"))?;
+        let resource = self
+            .snapshot
+            .name_by_name(&name)
+            .filter(|state| !state.data.is_empty())
+            .map(|state| hex_encode(&state.data));
+
+        serde_json::to_value(RpcDnsResource {
+            name,
+            resource,
+            context,
+        })
+        .map_err(|error| RpcCallError::new(-32603, error.to_string()))
     }
 
     fn get_name_by_hash(&self, params: &[Value]) -> Result<Value, RpcCallError> {
@@ -1169,6 +1219,7 @@ mod tests {
             peer_count: 0,
             mining_engine: RpcMiningEngineInfo::default(),
             node_status: RpcNodeStatus::default(),
+            dns_context: None,
         }
     }
 
@@ -1256,6 +1307,35 @@ mod tests {
         let info = info.result.expect("info");
         assert_eq!(info["name"], "handshake");
         assert_eq!(info["registered"], true);
+    }
+
+    #[test]
+    fn dns_resource_binds_bytes_to_one_chain_context() {
+        let mut snapshot = rpc_snapshot_with_block();
+        snapshot.names[0].data = vec![0, 4, 127, 0, 0, 1];
+        snapshot.dns_context = Some(RpcDnsContext {
+            network: "regtest".to_owned(),
+            active_height: Some(7),
+            best_header_height: Some(7),
+            active_state_root: Some("ab".repeat(32)),
+            chain_epoch: 11,
+            synchronized: true,
+        });
+        let result = BasicRpcService::new(snapshot)
+            .handle(JsonRpcRequest {
+                jsonrpc: Some("2.0".to_owned()),
+                method: "getdnsresource".to_owned(),
+                params: json!(["handshake"]),
+                id: Some(json!(3)),
+            })
+            .expect("DNS resource response")
+            .result
+            .expect("DNS resource result");
+
+        assert_eq!(result["name"], "handshake");
+        assert_eq!(result["resource"], "00047f000001");
+        assert_eq!(result["context"]["chain_epoch"], 11);
+        assert_eq!(result["context"]["synchronized"], true);
     }
 
     #[test]

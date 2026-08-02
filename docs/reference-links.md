@@ -20,6 +20,8 @@
 - [Pinned HSD primitives](https://github.com/handshake-org/hsd/tree/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/primitives)
 - [Pinned HSD covenant rules](https://github.com/handshake-org/hsd/blob/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/covenants/rules.js)
 - [Pinned HSD name state](https://github.com/handshake-org/hsd/blob/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/covenants/namestate.js)
+- [Pinned HSD DNS resource projection](https://github.com/handshake-org/hsd/blob/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/dns/resource.js)
+- [Pinned HSD root server behavior](https://github.com/handshake-org/hsd/blob/698e252ebc7b5c1dd0a9587e342fdd153d020ae4/lib/dns/server.js)
 
 ## Runtime, storage, and assurance
 

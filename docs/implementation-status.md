@@ -9,10 +9,12 @@ product boundary is the smallest complete consensus, state, synchronization,
 template, and relay path required to mine valid HNS blocks with predictable
 latency.
 
-It is deliberately not a wallet, desktop application, domain manager, DNS
-server, explorer, or general `hsd` compatibility distribution. MeshMine uses
-native in-process Rust interfaces for mining; the bounded HTTP control surface
-exists for diagnostics, operations, and differential testing.
+The `hsrd` process is deliberately not a wallet, desktop application, domain
+manager, DNS server, explorer, or general `hsd` compatibility distribution.
+The separately deployed [native resolver companion](hns-resolverd.md) consumes
+one narrow atomic state read without expanding `hsrd`'s authority. MeshMine
+uses native in-process Rust interfaces for mining; the bounded HTTP control
+surface exists for diagnostics, operations, and differential testing.
 
 ## Standalone extraction
 

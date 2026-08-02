@@ -4357,6 +4357,7 @@ impl NodeService {
             peer_count: 0,
             mining_engine: rpc_mining_engine_info(self.mining_engine_diagnostics()?),
             node_status,
+            dns_context: None,
         })
     }
 }
@@ -4639,7 +4640,7 @@ impl RpcReadContext {
                     }
                 }
             }
-            RpcMethod::GetNameInfo | RpcMethod::GetNameResource => {
+            RpcMethod::GetNameInfo | RpcMethod::GetNameResource | RpcMethod::GetDnsResource => {
                 if let Some(name) = rpc_string_param(request, 0) {
                     let name_hash = NameHash::new(sha3_256(name.as_bytes()));
                     if let Some(state) = load_rpc_name_state(&snapshot, name_hash)? {
@@ -4647,6 +4648,36 @@ impl RpcReadContext {
                             rpc.names.push(state);
                         }
                     }
+                }
+
+                if method == RpcMethod::GetDnsResource {
+                    let best_header = best_header_tip_from_snapshot(&snapshot)?;
+                    let active_height = rpc.chain_tip.as_ref().map(|tip| tip.height);
+                    let synchronized = match (best_header.as_ref(), rpc.chain_tip.as_ref()) {
+                        (Some(header), Some(active)) => {
+                            header.hash == active.hash
+                                && header.height == active.height
+                                && header.chainwork == active.chainwork
+                        }
+                        _ => false,
+                    };
+                    let active_state_root = rpc
+                        .chain_tip
+                        .as_ref()
+                        .map(|_| load_stored_name_tree_root(&snapshot))
+                        .transpose()
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to read active DNS name-tree root: {error}")
+                        })?
+                        .map(|root| hex_encode(root.as_bytes()));
+                    rpc.dns_context = Some(hns_rpc::RpcDnsContext {
+                        network: self.network.to_string(),
+                        active_height,
+                        best_header_height: best_header.as_ref().map(|tip| tip.height),
+                        active_state_root,
+                        chain_epoch: chain_epoch_from_snapshot(&snapshot)?,
+                        synchronized,
+                    });
                 }
             }
             RpcMethod::GetNameByHash => {
@@ -5186,6 +5217,7 @@ pub(crate) const fn rpc_point_read_method(method: RpcMethod) -> bool {
             | RpcMethod::GetTxOut
             | RpcMethod::GetNameInfo
             | RpcMethod::GetNameResource
+            | RpcMethod::GetDnsResource
             | RpcMethod::GetNameByHash
             | RpcMethod::GetParentAuthority
     )
@@ -19079,6 +19111,7 @@ mod tests {
                 (0, 0, 1, 0),
             ),
             (RpcMethod::GetTxOut, json!([txid.to_hex(), 0]), (0, 0, 0, 1)),
+            (RpcMethod::GetDnsResource, json!(["missing"]), (0, 0, 0, 0)),
         ] {
             let request = JsonRpcRequest {
                 jsonrpc: Some("2.0".to_owned()),
@@ -19087,6 +19120,7 @@ mod tests {
                     RpcMethod::GetBlock => "getblock",
                     RpcMethod::GetRawTransaction => "getrawtransaction",
                     RpcMethod::GetTxOut => "gettxout",
+                    RpcMethod::GetDnsResource => "getdnsresource",
                     _ => unreachable!(),
                 }
                 .to_owned(),
@@ -19106,8 +19140,20 @@ mod tests {
                 ),
                 expected_collection
             );
+            assert_eq!(
+                snapshot.dns_context.is_some(),
+                method == RpcMethod::GetDnsResource
+            );
             let response = service.handle(request).expect("RPC response");
             assert!(response.error.is_none(), "{response:?}");
+            if method == RpcMethod::GetDnsResource {
+                let result = response.result.expect("DNS resource result");
+                assert_eq!(result["name"], "missing");
+                assert!(result["resource"].is_null());
+                assert_eq!(result["context"]["active_height"], 0);
+                assert_eq!(result["context"]["best_header_height"], 0);
+                assert_eq!(result["context"]["synchronized"], true);
+            }
         }
     }
 
