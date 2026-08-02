@@ -1,6 +1,7 @@
 .git
 .github
 .agent
+.cargo
 
 target
 fuzz/target

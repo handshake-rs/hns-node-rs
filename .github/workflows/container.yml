@@ -16,6 +16,7 @@ on:
       - crates/**
       - docker/**
       - docs/docker.md
+      - docs/hns-resolverd.md
       - fixtures/**
       - fuzz/Cargo.lock
       - rust-toolchain.toml
@@ -34,6 +35,7 @@ on:
       - crates/**
       - docker/**
       - docs/docker.md
+      - docs/hns-resolverd.md
       - fixtures/**
       - fuzz/Cargo.lock
       - rust-toolchain.toml
@@ -58,23 +60,38 @@ concurrency:
   group: container-${{ github.workflow }}-${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'release' && inputs.release_tag == '' }}
 
-env:
-  REGISTRY_IMAGE: ghcr.io/handshake-rs/hns-node-rs
-
 jobs:
   verify:
-    name: Verify ${{ matrix.platform }} image
+    name: Verify ${{ matrix.component }} ${{ matrix.platform }} image
     if: github.event_name != 'release' && inputs.release_tag == '' && inputs.release_run_id == ''
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: linux/amd64
+          - component: hsrd
+            image: hsrd:verify-amd64
+            platform: linux/amd64
             runner: ubuntu-24.04
             suffix: amd64
-          - platform: linux/arm64
+            target: hsrd-runtime
+          - component: hsrd
+            image: hsrd:verify-arm64
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
             suffix: arm64
+            target: hsrd-runtime
+          - component: hns-resolverd
+            image: hns-resolverd:verify-amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            suffix: amd64
+            target: hns-resolverd-runtime
+          - component: hns-resolverd
+            image: hns-resolverd:verify-arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+            target: hns-resolverd-runtime
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -92,26 +109,44 @@ jobs:
           build-args: |
             VCS_REF=${{ github.sha }}
             VERSION=ci-${{ github.sha }}
-          cache-from: type=gha,scope=hsrd-${{ matrix.suffix }}
-          cache-to: type=gha,mode=max,scope=hsrd-${{ matrix.suffix }}
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.suffix }}
           context: .
           load: true
           platforms: ${{ matrix.platform }}
-          tags: hsrd:verify-${{ matrix.suffix }}
+          tags: ${{ matrix.image }}
+          target: ${{ matrix.target }}
 
       - name: Verify image runtime and configuration
         env:
-          VERIFY_IMAGE: hsrd:verify-${{ matrix.suffix }}
+          COMPONENT: ${{ matrix.component }}
+          VERIFY_IMAGE: ${{ matrix.image }}
         run: |
+          set -euo pipefail
           test "$(docker image inspect "$VERIFY_IMAGE" --format '{{.Architecture}}')" = "${{ matrix.suffix == 'amd64' && 'amd64' || 'arm64' }}"
           docker run --rm "$VERIFY_IMAGE" --version
-          docker run --rm "$VERIFY_IMAGE" \
-            --network mainnet \
-            --data-dir /var/lib/hsrd \
-            --rpc-bind 127.0.0.1:12037 \
-            --native-sync \
-            --p2p-discovery \
-            --check-config
+          if [[ "$COMPONENT" == hsrd ]]; then
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/hsrd-container-entrypoint"]'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{json .Config.Cmd}}')" = '["--network","mainnet","--data-dir","/var/lib/hsrd","--rpc-bind","127.0.0.1:12037","--native-sync","--p2p-discovery"]'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{.Config.User}}')" = '10001:10001'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{.Config.WorkingDir}}')" = '/var/lib/hsrd'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{.Config.StopSignal}}')" = 'SIGTERM'
+            docker run --rm "$VERIFY_IMAGE" \
+              --network mainnet \
+              --data-dir /var/lib/hsrd \
+              --rpc-bind 127.0.0.1:12037 \
+              --native-sync \
+              --p2p-discovery \
+              --check-config
+          else
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{json .Config.Entrypoint}}')" = '["/usr/local/bin/hns-resolverd-container-entrypoint"]'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{json .Config.Cmd}}')" = '["--listen","0.0.0.0:5350","--allow-non-loopback-listen","--hsrd-rpc-url","http://127.0.0.1:12037/"]'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{.Config.User}}')" = '10001:10001'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{.Config.WorkingDir}}')" = '/var/lib/hns-resolverd'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{.Config.StopSignal}}')" = 'SIGTERM'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{with index .Config.ExposedPorts "5350/tcp"}}{{.}}{{end}}')" = '{}'
+            test "$(docker image inspect "$VERIFY_IMAGE" --format '{{with index .Config.ExposedPorts "5350/udp"}}{{.}}{{end}}')" = '{}'
+          fi
           test "$(docker run --rm --entrypoint /usr/bin/id "$VERIFY_IMAGE" -u)" = 10001
 
   release-preflight:
@@ -246,7 +281,13 @@ jobs:
               echo "more than 100 jobs exist in recovery run $RELEASE_RUN_ID" >&2
               exit 1
             fi
-            for recovery_job in 'Release linux/amd64 image' 'Release linux/arm64 image'; do
+            recovery_jobs=(
+              'Release hsrd linux/amd64 image'
+              'Release hsrd linux/arm64 image'
+              'Release hns-resolverd linux/amd64 image'
+              'Release hns-resolverd linux/arm64 image'
+            )
+            for recovery_job in "${recovery_jobs[@]}"; do
               if ! jq -e --arg commit "$tag_commit" --arg name "$recovery_job" '
                 [.jobs[]
                   | select(.name == $name
@@ -272,8 +313,15 @@ jobs:
                 . as $root
                 | $root.total_count == ($root.artifacts | length)
                 and ([$root.artifacts[]
-                  | select(.name | startswith("hsrd-digest-"))] | length == 2)
-                and all("hsrd-digest-amd64", "hsrd-digest-arm64"; . as $name
+                  | select(.name
+                      | test("^(hsrd|hns-resolverd)-digest-(amd64|arm64)$"))]
+                    | length == 4)
+                and all(
+                  "hsrd-digest-amd64",
+                  "hsrd-digest-arm64",
+                  "hns-resolverd-digest-amd64",
+                  "hns-resolverd-digest-arm64";
+                  . as $name
                   | [$root.artifacts[]
                       | select(.name == $name
                           and .expired == false
@@ -300,8 +348,10 @@ jobs:
           required_checks=(
             'Node and fuzz qualification'
             'RustSec'
-            'Verify linux/amd64 image'
-            'Verify linux/arm64 image'
+            'Verify hsrd linux/amd64 image'
+            'Verify hsrd linux/arm64 image'
+            'Verify hns-resolverd linux/amd64 image'
+            'Verify hns-resolverd linux/arm64 image'
           )
           for check_name in "${required_checks[@]}"; do
             check_result=$(jq --raw-output --arg name "$check_name" '
@@ -469,7 +519,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   release-platforms:
-    name: Release ${{ matrix.platform }} image
+    name: Release ${{ matrix.component }} ${{ matrix.platform }} image
     if: (github.event_name == 'release' || inputs.release_tag != '') && inputs.release_run_id == ''
     needs: release-preflight
     permissions:
@@ -479,12 +529,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux/amd64
+          - component: hsrd
+            platform: linux/amd64
+            registry_image: ghcr.io/handshake-rs/hns-node-rs
             runner: ubuntu-24.04
             suffix: amd64
-          - platform: linux/arm64
+            target: hsrd-runtime
+          - component: hsrd
+            platform: linux/arm64
+            registry_image: ghcr.io/handshake-rs/hns-node-rs
             runner: ubuntu-24.04-arm
             suffix: arm64
+            target: hsrd-runtime
+          - component: hns-resolverd
+            platform: linux/amd64
+            registry_image: ghcr.io/handshake-rs/hns-resolverd
+            runner: ubuntu-24.04
+            suffix: amd64
+            target: hns-resolverd-runtime
+          - component: hns-resolverd
+            platform: linux/arm64
+            registry_image: ghcr.io/handshake-rs/hns-resolverd
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+            target: hns-resolverd-runtime
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -509,7 +577,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.REGISTRY_IMAGE }}
+          images: ${{ matrix.registry_image }}
           labels: |
             org.opencontainers.image.source=https://github.com/handshake-rs/hns-node-rs
 
@@ -520,54 +588,75 @@ jobs:
           build-args: |
             VCS_REF=${{ needs.release-preflight.outputs.commit }}
             VERSION=${{ needs.release-preflight.outputs.version }}
-          cache-from: type=gha,scope=hsrd-${{ matrix.suffix }}
-          cache-to: type=gha,mode=max,scope=hsrd-${{ matrix.suffix }}
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.suffix }}
           context: .
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ matrix.registry_image }},push-by-digest=true,name-canonical=true,push=true
           platforms: ${{ matrix.platform }}
           provenance: mode=max
           sbom: true
+          target: ${{ matrix.target }}
 
       - name: Verify published platform image
         env:
+          COMPONENT: ${{ matrix.component }}
           PLATFORM_DIGEST: ${{ steps.build.outputs.digest }}
+          REGISTRY_IMAGE: ${{ matrix.registry_image }}
         run: |
+          set -euo pipefail
           docker pull "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}"
           test "$(docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --format '{{.Architecture}}')" = "${{ matrix.suffix == 'amd64' && 'amd64' || 'arm64' }}"
           docker run --rm "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --version
-          docker run --rm "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" \
-            --network mainnet \
-            --data-dir /var/lib/hsrd \
-            --rpc-bind 127.0.0.1:12037 \
-            --native-sync \
-            --p2p-discovery \
-            --check-config
+          if [[ "$COMPONENT" == hsrd ]]; then
+            docker run --rm "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" \
+              --network mainnet \
+              --data-dir /var/lib/hsrd \
+              --rpc-bind 127.0.0.1:12037 \
+              --native-sync \
+              --p2p-discovery \
+              --check-config
+          else
+            test "$(docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --format '{{with index .Config.ExposedPorts "5350/tcp"}}{{.}}{{end}}')" = '{}'
+            test "$(docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --format '{{with index .Config.ExposedPorts "5350/udp"}}{{.}}{{end}}')" = '{}'
+          fi
+          test "$(docker run --rm --entrypoint /usr/bin/id "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" -u)" = 10001
 
       - name: Export platform digest
         env:
+          COMPONENT: ${{ matrix.component }}
           PLATFORM_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          mkdir -p /tmp/hsrd-digests
-          touch "/tmp/hsrd-digests/${PLATFORM_DIGEST#sha256:}"
+          mkdir -p "/tmp/${COMPONENT}-digests"
+          touch "/tmp/${COMPONENT}-digests/${PLATFORM_DIGEST#sha256:}"
 
       - name: Upload platform digest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hsrd-digest-${{ matrix.suffix }}
-          path: /tmp/hsrd-digests/*
+          name: ${{ matrix.component }}-digest-${{ matrix.suffix }}
+          path: /tmp/${{ matrix.component }}-digests/*
           if-no-files-found: error
           retention-days: 1
 
   release-manifest:
-    name: Publish multi-platform release manifest
+    name: Publish ${{ matrix.component }} multi-platform release manifest
     if: >-
       !cancelled() &&
       needs.release-preflight.result == 'success' &&
       (needs.release-platforms.result == 'success' || inputs.release_run_id != '')
     needs: [release-preflight, release-platforms]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: hsrd
+            registry_image: ghcr.io/handshake-rs/hns-node-rs
+          - component: hns-resolverd
+            registry_image: ghcr.io/handshake-rs/hns-resolverd
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      REGISTRY_IMAGE: ${{ matrix.registry_image }}
     permissions:
       actions: read
       attestations: write
@@ -578,8 +667,8 @@ jobs:
       - name: Download platform digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: /tmp/hsrd-digests
-          pattern: hsrd-digest-*
+          path: /tmp/${{ matrix.component }}-digests
+          pattern: ${{ matrix.component }}-digest-*
           merge-multiple: true
           github-token: ${{ github.token }}
           run-id: ${{ inputs.release_run_id || github.run_id }}
@@ -612,7 +701,7 @@ jobs:
           RELEASE_PRERELEASE: ${{ needs.release-preflight.outputs.prerelease }}
           RELEASE_TAGS_JSON: ${{ steps.meta.outputs.json }}
           RELEASE_VERSION: ${{ needs.release-preflight.outputs.version }}
-        working-directory: /tmp/hsrd-digests
+        working-directory: /tmp/${{ matrix.component }}-digests
         run: |
           set -euo pipefail
 
@@ -840,6 +929,7 @@ jobs:
 
       - name: Write release summary
         env:
+          COMPONENT: ${{ matrix.component }}
           PUBLISHED_DIGEST: ${{ steps.manifest.outputs.digest }}
           PUBLISHED_TAGS_JSON: ${{ steps.manifest.outputs.public-tags-json }}
           RELEASE_COMMIT: ${{ needs.release-preflight.outputs.commit }}
@@ -847,7 +937,7 @@ jobs:
           SOURCE_ASSET_URL: ${{ needs.release-preflight.outputs.source-asset-url }}
         run: |
           {
-            echo '### Published hsrd container'
+            echo "### Published $COMPONENT container"
             echo
             echo "- Commit: \`$RELEASE_COMMIT\`"
             echo "- Digest: \`$PUBLISHED_DIGEST\`"

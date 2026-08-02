@@ -8,16 +8,37 @@
 use std::collections::HashMap;
 
 use hns_primitives::{
-    blake2b_256, sha3_256, Address, Block, BlockHash, Coin, CovenantKind, Height, Outpoint,
-    Output, Transaction, Txid, Writer,
+    blake2b_256, sha3_256, Address, Block, BlockHash, Coin, CovenantKind, Height, Outpoint, Output,
+    Transaction, Txid, Writer,
 };
-use hns_state::{decode_coin, encode_outpoint_key, BlockUndo};
 use hns_secp256k1::Secp256k1Verifier;
+use hns_state::{decode_coin, encode_outpoint_key, BlockUndo};
 use hns_store::{ColumnFamily, PrefixScanBudget, ReadSnapshot, WriteBatch};
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::{IndexError, WalletIndexProfile, MAX_QUERY_BYTES, MAX_QUERY_ENTRIES};
+
+mod serde_compressed_public_key {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(key: &[u8; 33], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        key.as_slice().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 33], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        bytes
+            .try_into()
+            .map_err(|bytes: Vec<u8>| D::Error::invalid_length(bytes.len(), &"33 bytes"))
+    }
+}
 
 /// Maximum immutable public contract registrations in one node store.
 /// Registrations are append-only in this schema and capacity is not reclaimed.
@@ -48,7 +69,6 @@ const HNS_HTLC_V1_CONTRACT_TAG: u8 = 2;
 // The exact script opcodes used by hns-rs Shakedex-v2 and HNS-HTLC-v1.
 const OP_0: u8 = 0x00;
 const OP_1: u8 = 0x51;
-const OP_16: u8 = 0x60;
 const OP_IF: u8 = 0x63;
 const OP_ELSE: u8 = 0x67;
 const OP_ENDIF: u8 = 0x68;
@@ -92,6 +112,7 @@ pub struct ShakedexV2Descriptor {
     /// Canonical Handshake name hash committed by the FINALIZE locking coin.
     pub name_hash: [u8; 32],
     /// Seller public key committed by the canonical HIP-0001 lock script.
+    #[serde(with = "serde_compressed_public_key")]
     pub seller_public_key: [u8; 33],
     /// Exact name coin value expected at the locking script.
     pub value: u64,
@@ -105,8 +126,10 @@ pub struct HnsHtlcDescriptor {
     /// SHA-256 commitment to the 32-byte settlement preimage.
     pub hashlock: [u8; 32],
     /// Receiver key for the preimage branch.
+    #[serde(with = "serde_compressed_public_key")]
     pub receiver_public_key: [u8; 33],
     /// Refund key for the absolute-timelock branch.
+    #[serde(with = "serde_compressed_public_key")]
     pub refund_public_key: [u8; 33],
     /// Exact HSD absolute locktime encoding.
     pub refund_locktime: u32,
@@ -183,9 +206,12 @@ impl ContractRegistration {
         input_position: usize,
         funding_coin: &Coin,
     ) -> Result<TrackedContractSpendKind, IndexError> {
-        let input = transaction.inputs.get(input_position).ok_or(IndexError::Corrupt(
-            "tracked contract spend input is absent",
-        ))?;
+        let input = transaction
+            .inputs
+            .get(input_position)
+            .ok_or(IndexError::Corrupt(
+                "tracked contract spend input is absent",
+            ))?;
         if input.previous_output != funding_coin.outpoint
             || !self.matches_funding_output(&Output {
                 value: funding_coin.value,
@@ -219,37 +245,35 @@ impl ContractRegistration {
                     _ => Ok(TrackedContractSpendKind::Unrecognized),
                 }
             }
-            TrackedContractKind::HnsHtlcV1(descriptor) => {
-                match input.witness.items.as_slice() {
-                    [signature, preimage, selector, witness_script]
-                        if canonical_signature(signature, HNS_HTLC_SIGHASH_ALL)
-                            && preimage.len() == HNS_HTLC_PREIMAGE_BYTES
-                            && selector.as_slice() == [1]
-                            && witness_script == &script =>
-                    {
-                        let Ok(preimage): Result<[u8; HNS_HTLC_PREIMAGE_BYTES], _> =
-                            preimage.as_slice().try_into()
-                        else {
-                            return Ok(TrackedContractSpendKind::Unrecognized);
-                        };
-                        let observed_hash: [u8; 32] = Sha256::digest(preimage).into();
-                        if observed_hash != descriptor.hashlock {
-                            return Ok(TrackedContractSpendKind::Unrecognized);
-                        }
-                        Ok(TrackedContractSpendKind::HtlcRedemption {
-                            preimage: RevealedPreimage(preimage),
-                        })
+            TrackedContractKind::HnsHtlcV1(descriptor) => match input.witness.items.as_slice() {
+                [signature, preimage, selector, witness_script]
+                    if canonical_signature(signature, HNS_HTLC_SIGHASH_ALL)
+                        && preimage.len() == HNS_HTLC_PREIMAGE_BYTES
+                        && selector.as_slice() == [1]
+                        && witness_script == &script =>
+                {
+                    let Ok(preimage): Result<[u8; HNS_HTLC_PREIMAGE_BYTES], _> =
+                        preimage.as_slice().try_into()
+                    else {
+                        return Ok(TrackedContractSpendKind::Unrecognized);
+                    };
+                    let observed_hash: [u8; 32] = Sha256::digest(preimage).into();
+                    if observed_hash != descriptor.hashlock {
+                        return Ok(TrackedContractSpendKind::Unrecognized);
                     }
-                    [signature, selector, witness_script]
-                        if canonical_signature(signature, HNS_HTLC_SIGHASH_ALL)
-                            && selector.is_empty()
-                            && witness_script == &script =>
-                    {
-                        Ok(TrackedContractSpendKind::HtlcRefund)
-                    }
-                    _ => Ok(TrackedContractSpendKind::Unrecognized),
+                    Ok(TrackedContractSpendKind::HtlcRedemption {
+                        preimage: RevealedPreimage(preimage),
+                    })
                 }
-            }
+                [signature, selector, witness_script]
+                    if canonical_signature(signature, HNS_HTLC_SIGHASH_ALL)
+                        && selector.is_empty()
+                        && witness_script == &script =>
+                {
+                    Ok(TrackedContractSpendKind::HtlcRefund)
+                }
+                _ => Ok(TrackedContractSpendKind::Unrecognized),
+            },
         }
     }
 
@@ -593,11 +617,12 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
             ));
         }
         let binding_key = address_key(&registration.funding_address()?);
-        let binding = snapshot
-            .get(ColumnFamily::TxIndex, &binding_key)?
-            .ok_or(IndexError::Corrupt(
-                "tracked contract registration has no address binding",
-            ))?;
+        let binding =
+            snapshot
+                .get(ColumnFamily::TxIndex, &binding_key)?
+                .ok_or(IndexError::Corrupt(
+                    "tracked contract registration has no address binding",
+                ))?;
         if decode_address_bindings(&binding_key, &binding)?
             .binary_search(&registration.id)
             .is_err()
@@ -696,11 +721,12 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
             ));
         }
         let binding_key = address_key(&registration.funding_address()?);
-        let binding = snapshot
-            .get(ColumnFamily::TxIndex, &binding_key)?
-            .ok_or(IndexError::Corrupt(
-                "tracked contract registration has no address binding",
-            ))?;
+        let binding =
+            snapshot
+                .get(ColumnFamily::TxIndex, &binding_key)?
+                .ok_or(IndexError::Corrupt(
+                    "tracked contract registration has no address binding",
+                ))?;
         if decode_address_bindings(&binding_key, &binding)?
             .binary_search(&registration.id)
             .is_err()
@@ -734,10 +760,7 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
         }
         Ok(())
     })?;
-    if registrations != expected
-        || binding_total != expected
-        || (expected != 0 && addresses == 0)
-    {
+    if registrations != expected || binding_total != expected || (expected != 0 && addresses == 0) {
         return Err(IndexError::Corrupt(
             "tracked contract registry count/topology mismatch",
         ));
@@ -774,9 +797,7 @@ pub fn tracked_contract_fundings<S: ReadSnapshot>(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(TrackedContractFundingPage {
         entries,
-        continuation: page
-            .continuation
-            .map(|key| TrackedContractCursor { key }),
+        continuation: page.continuation.map(|key| TrackedContractCursor { key }),
     })
 }
 
@@ -818,8 +839,7 @@ pub fn tracked_contract_events<S: ReadSnapshot>(
         .entries
         .iter()
         .map(|(key, raw)| {
-            let event: StoredTrackedContractEvent =
-                decode_record(b"contract-event-v1", key, raw)?;
+            let event: StoredTrackedContractEvent = decode_record(b"contract-event-v1", key, raw)?;
             let event = TrackedContractEvent::from(event);
             if event.contract_id() != id || event.key() != *key {
                 return Err(IndexError::Corrupt(
@@ -831,9 +851,7 @@ pub fn tracked_contract_events<S: ReadSnapshot>(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(TrackedContractEventPage {
         entries,
-        continuation: page
-            .continuation
-            .map(|key| TrackedContractCursor { key }),
+        continuation: page.continuation.map(|key| TrackedContractCursor { key }),
     })
 }
 
@@ -849,7 +867,8 @@ pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
     }
     let block_hash = block.hash();
     let created = block_created_coins(block, height)?;
-    let mut tracked_created = HashMap::<Outpoint, (ContractRegistration, TrackedContractFunding)>::new();
+    let mut tracked_created =
+        HashMap::<Outpoint, (ContractRegistration, TrackedContractFunding)>::new();
 
     for (transaction_position, transaction) in block.transactions.iter().enumerate() {
         let transaction_position =
@@ -871,10 +890,9 @@ pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
                 txid,
                 index: output_position,
             };
-            let coin = created
-                .get(&outpoint)
-                .cloned()
-                .ok_or(IndexError::Corrupt("tracked funding coin was not constructed"))?;
+            let coin = created.get(&outpoint).cloned().ok_or(IndexError::Corrupt(
+                "tracked funding coin was not constructed",
+            ))?;
             let funding = TrackedContractFunding {
                 contract_id: registration.id,
                 coin,
@@ -898,9 +916,8 @@ pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
             }
             let coin = match created.get(&input.previous_output) {
                 Some(coin) => coin.clone(),
-                None => load_coin(snapshot, &input.previous_output)?.ok_or_else(|| {
-                    IndexError::MissingInputCoin(input.previous_output.clone())
-                })?,
+                None => load_coin(snapshot, &input.previous_output)?
+                    .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?,
             };
             let Some(registration) = matching_contract_for_output(
                 snapshot,
@@ -923,11 +940,8 @@ pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
                 }
                 funding.clone()
             } else {
-                let Some(funding) = load_funding(
-                    snapshot,
-                    registration.id,
-                    &input.previous_output,
-                )?
+                let Some(funding) =
+                    load_funding(snapshot, registration.id, &input.previous_output)?
                 else {
                     continue;
                 };
@@ -1140,9 +1154,7 @@ fn validate_kind(kind: &TrackedContractKind) -> Result<(), IndexError> {
 }
 
 fn valid_compressed_key(key: &[u8; 33]) -> bool {
-    Secp256k1Verifier
-        .validate_public_key(key)
-        .is_ok()
+    Secp256k1Verifier.validate_public_key(key).is_ok()
 }
 
 fn canonical_signature(signature: &[u8], expected_hash_type: u8) -> bool {
@@ -1392,10 +1404,7 @@ fn decode_funding(
     Ok(funding)
 }
 
-fn put_event<B: WriteBatch>(
-    batch: &mut B,
-    event: &TrackedContractEvent,
-) -> Result<(), IndexError> {
+fn put_event<B: WriteBatch>(batch: &mut B, event: &TrackedContractEvent) -> Result<(), IndexError> {
     let key = event.key();
     let stored = StoredTrackedContractEvent::from(event);
     batch.put(
@@ -1598,7 +1607,7 @@ fn decode_address_bindings(key: &[u8], raw: &[u8]) -> Result<Vec<ContractId>, In
         .get(ADDRESS_BINDING_HEADER_BYTES..)
         .ok_or(IndexError::Corrupt("invalid contract address binding"))?
         .chunks_exact(32)
-        .map(|bytes| {
+        .map(|bytes| -> Result<ContractId, IndexError> {
             let id: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| IndexError::Corrupt("invalid contract address identity"))?;
@@ -1630,9 +1639,7 @@ fn decode_registration_count(raw: &[u8]) -> Result<u32, IndexError> {
         return Err(IndexError::Corrupt("invalid tracked contract count"));
     }
     let (body, checksum) = raw.split_at(5);
-    if checksum
-        != bound_checksum(b"contract-count-v1", REGISTRATION_COUNT_KEY, body).as_slice()
-    {
+    if checksum != bound_checksum(b"contract-count-v1", REGISTRATION_COUNT_KEY, body).as_slice() {
         return Err(IndexError::Corrupt(
             "invalid tracked contract count checksum",
         ));
@@ -1660,9 +1667,9 @@ mod tests {
     use hns_store::{MemoryStore, Store};
 
     const GENERATOR_KEY: [u8; 33] = [
-        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
-        0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
-        0x5b, 0x16, 0xf8, 0x17, 0x98,
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+        0xf8, 0x17, 0x98,
     ];
 
     fn alternate_generator_key() -> [u8; 33] {
@@ -1809,10 +1816,12 @@ mod tests {
             tracked_contract(&snapshot, profile(), registration.id).expect("contract"),
             Some(registration.clone())
         );
-        assert!(tracked_contract_fundings(&snapshot, profile(), registration.id, None, 8)
-            .expect("fundings")
-            .entries
-            .is_empty());
+        assert!(
+            tracked_contract_fundings(&snapshot, profile(), registration.id, None, 8)
+                .expect("fundings")
+                .entries
+                .is_empty()
+        );
         let events = tracked_contract_events(&snapshot, profile(), registration.id, None, 8)
             .expect("events");
         assert_eq!(events.entries.len(), 2);
@@ -1932,8 +1941,14 @@ mod tests {
         };
         let snapshot = store.snapshot().expect("pre-block snapshot");
         let mut batch = store.batch();
-        stage_connect(&snapshot, &mut batch, &block(vec![parent, child]), 1, profile())
-            .expect("an untracked same-block child cannot strengthen consensus");
+        stage_connect(
+            &snapshot,
+            &mut batch,
+            &block(vec![parent, child]),
+            1,
+            profile(),
+        )
+        .expect("an untracked same-block child cannot strengthen consensus");
     }
 
     #[test]
@@ -1977,13 +1992,8 @@ mod tests {
         let registration = htlc([3; 32]);
         let snapshot = store.snapshot().expect("snapshot");
         let mut registration_batch = store.batch();
-        register_tracked_contract(
-            &snapshot,
-            &mut registration_batch,
-            profile(),
-            &registration,
-        )
-        .expect("registration");
+        register_tracked_contract(&snapshot, &mut registration_batch, profile(), &registration)
+            .expect("registration");
         drop(snapshot);
         store
             .commit(registration_batch)
@@ -2022,8 +2032,8 @@ mod tests {
             panic!("HTLC fixture kind");
         };
         second_descriptor.value = 75;
-        let second = ContractRegistration::hns_htlc_v1(second_descriptor)
-            .expect("second registration");
+        let second =
+            ContractRegistration::hns_htlc_v1(second_descriptor).expect("second registration");
         assert_ne!(first.id, second.id);
         assert_eq!(
             first.funding_address().expect("first address"),
@@ -2078,10 +2088,12 @@ mod tests {
         drop(snapshot);
         store.commit(batch).expect("funding commit");
         let snapshot = store.snapshot().expect("funding snapshot");
-        assert!(tracked_contract_events(&snapshot, profile(), first.id, None, 8)
-            .expect("first events")
-            .entries
-            .is_empty());
+        assert!(
+            tracked_contract_events(&snapshot, profile(), first.id, None, 8)
+                .expect("first events")
+                .entries
+                .is_empty()
+        );
         assert_eq!(
             tracked_contract_events(&snapshot, profile(), second.id, None, 8)
                 .expect("second events")
@@ -2100,7 +2112,9 @@ mod tests {
             .map(|index| {
                 let mut id = [0_u8; 32];
                 id[30..].copy_from_slice(
-                    &u16::try_from(index).expect("bounded candidate index").to_be_bytes(),
+                    &u16::try_from(index)
+                        .expect("bounded candidate index")
+                        .to_be_bytes(),
                 );
                 ContractId(id)
             })
@@ -2174,8 +2188,7 @@ mod tests {
         );
 
         let mut recovery = fulfillment.clone();
-        recovery.inputs[0].witness.items[0] =
-            low_s_signature(HIP1_SELLER_RECOVERY_SIGHASH);
+        recovery.inputs[0].witness.items[0] = low_s_signature(HIP1_SELLER_RECOVERY_SIGHASH);
         assert_eq!(
             shakedex
                 .classify_spend(&recovery, 0, &shakedex_coin)
@@ -2225,8 +2238,7 @@ mod tests {
             locktime: 500,
         };
         assert_eq!(
-            htlc.classify_spend(&refund, 0, &htlc_coin)
-                .expect("refund"),
+            htlc.classify_spend(&refund, 0, &htlc_coin).expect("refund"),
             TrackedContractSpendKind::HtlcRefund
         );
     }
@@ -2301,10 +2313,7 @@ mod tests {
         ));
 
         let htlc_signature = low_s_signature(HNS_HTLC_SIGHASH_ALL);
-        assert!(canonical_signature(
-            &htlc_signature,
-            HNS_HTLC_SIGHASH_ALL
-        ));
+        assert!(canonical_signature(&htlc_signature, HNS_HTLC_SIGHASH_ALL));
         assert!(!canonical_signature(
             &htlc_signature,
             HIP1_SELLER_FULFILLMENT_SIGHASH
@@ -2321,9 +2330,6 @@ mod tests {
         ));
         let mut malformed = vec![0xff; 65];
         malformed[64] = HNS_HTLC_SIGHASH_ALL;
-        assert!(!canonical_signature(
-            &malformed,
-            HNS_HTLC_SIGHASH_ALL
-        ));
+        assert!(!canonical_signature(&malformed, HNS_HTLC_SIGHASH_ALL));
     }
 }

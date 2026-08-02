@@ -58,6 +58,15 @@ cargo build --locked --release -p hns-node --bin hsrd
 The binary is written to `target/release/hsrd`.
 The first release build compiles RocksDB and can take several minutes.
 
+To run both the node and ordinary DNS resolver from published containers, use:
+
+```bash
+docker compose up --detach
+dig @127.0.0.1 -p 5350 example. A
+```
+
+See [Docker and GHCR](docs/docker.md) for Pinner and container-network wiring.
+
 ## Run a mainnet node
 
 The following starts an outbound mainnet node, discovers Handshake peers, and

@@ -19,13 +19,13 @@ use serde_json::Value;
 
 use super::wallet_backend::{
     BlockHashEvidence, BroadcastResult, ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate,
-    FeeEstimateSource, MempoolContractEvent, MempoolContractPage, MempoolScriptPage,
-    NameEvidence, NameOwnerTransaction, OutpointSpendingEvidence, TransactionEvidence,
-    TransactionFeeQuote, TransactionPayload, TransactionStatus, WalletBackend, WalletBackendError,
+    FeeEstimateSource, MempoolContractEvent, MempoolContractPage, MempoolScriptPage, NameEvidence,
+    NameOwnerTransaction, OutpointSpendingEvidence, TransactionEvidence, TransactionFeeQuote,
+    TransactionPayload, TransactionStatus, WalletBackend, WalletBackendError,
     WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
     WalletContractFundingPage, WalletMempoolCursor, MAX_FEE_ESTIMATE_TARGET_BLOCKS,
-    MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_MEMPOOL_SCAN, MAX_WALLET_OUTPOINT_SPEND_BATCH,
-    MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_RESTORE_SCRIPTS,
+    MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_MEMPOOL_SCAN,
+    MAX_WALLET_OUTPOINT_SPEND_BATCH, MAX_WALLET_RESTORE_SCRIPTS,
 };
 
 pub const WALLET_RPC_API_VERSION: u16 = 1;
@@ -439,37 +439,28 @@ async fn dispatch_call(
             value(&wire_name_evidence(evidence)?)?
         }
         WalletRpcCall::BroadcastTransaction { transaction_hex } => {
-            let raw = decode_hex_bounded(
-                &transaction_hex,
-                MAX_TX_SIZE,
-                "raw transaction",
-            )?;
+            let raw = decode_hex_bounded(&transaction_hex, MAX_TX_SIZE, "raw transaction")?;
             let transaction = Transaction::decode(&raw)
                 .map_err(|_| DispatchError::Invalid("raw transaction is not canonical"))?;
             value(&WireBroadcastResult::from(
                 &backend.broadcast_transaction(transaction).await?,
             ))?
         }
-        WalletRpcCall::EstimateFeeRate { target_blocks } => {
-            value(&WireFeeEstimate::from(
-                &backend.estimate_fee_rate(target_blocks).await?,
-            ))?
-        }
+        WalletRpcCall::EstimateFeeRate { target_blocks } => value(&WireFeeEstimate::from(
+            &backend.estimate_fee_rate(target_blocks).await?,
+        ))?,
         WalletRpcCall::QuoteTransactionFee {
             transaction_hex,
             target_blocks,
             expected_chain_epoch,
             expected_mempool,
         } => {
-            let raw = decode_hex_bounded(
-                &transaction_hex,
-                MAX_TX_SIZE,
-                "raw transaction",
-            )?;
+            let raw = decode_hex_bounded(&transaction_hex, MAX_TX_SIZE, "raw transaction")?;
             let transaction = Transaction::decode(&raw)
                 .map_err(|_| DispatchError::Invalid("raw transaction is not canonical"))?;
-            let expected_mempool = decode_expected_mempool(Some(expected_mempool))?
-                .ok_or(DispatchError::Invalid("expected mempool binding is required"))?;
+            let expected_mempool = decode_expected_mempool(Some(expected_mempool))?.ok_or(
+                DispatchError::Invalid("expected mempool binding is required"),
+            )?;
             value(&WireTransactionFeeQuote::from(
                 &backend
                     .quote_transaction_fee(
@@ -619,14 +610,15 @@ fn map_backend_error(
             "the bound chain or mempool generation changed; restart this reconciliation",
             true,
         ),
-        WalletBackendError::InvalidMempoolCursor
-        | WalletBackendError::InvalidConfirmedCursor => wallet_rpc_failure(
-            request_id,
-            StatusCode::BAD_REQUEST,
-            "invalid_cursor",
-            "the opaque continuation does not belong to this query",
-            false,
-        ),
+        WalletBackendError::InvalidMempoolCursor | WalletBackendError::InvalidConfirmedCursor => {
+            wallet_rpc_failure(
+                request_id,
+                StatusCode::BAD_REQUEST,
+                "invalid_cursor",
+                "the opaque continuation does not belong to this query",
+                false,
+            )
+        }
         WalletBackendError::InvalidConfirmedPageLimit
         | WalletBackendError::InvalidIndexPageLimit
         | WalletBackendError::InvalidMempoolScanLimit
@@ -771,10 +763,7 @@ fn decode_expected_mempool(
     expected
         .map(|expected| {
             Ok(ExpectedMempoolBinding {
-                instance_nonce: decode_hex_32(
-                    &expected.instance_nonce,
-                    "mempool instance nonce",
-                )?,
+                instance_nonce: decode_hex_32(&expected.instance_nonce, "mempool instance nonce")?,
                 generation: expected.generation,
             })
         })
@@ -811,10 +800,7 @@ fn decode_script_ids(encoded: Vec<String>) -> Result<Vec<ScriptId>, DispatchErro
     }
     encoded
         .into_iter()
-        .map(|value| {
-            decode_hex_32(&value, "script ID")
-                .map(ScriptId::from_bytes)
-        })
+        .map(|value| decode_hex_32(&value, "script ID").map(ScriptId::from_bytes))
         .collect()
 }
 
@@ -829,7 +815,7 @@ fn decode_hex_bounded(
     maximum_bytes: usize,
     label: &'static str,
 ) -> Result<Vec<u8>, DispatchError> {
-    if encoded.len() % 2 != 0 || encoded.len() > maximum_bytes.saturating_mul(2) {
+    if !encoded.len().is_multiple_of(2) || encoded.len() > maximum_bytes.saturating_mul(2) {
         return Err(DispatchError::Invalid(match label {
             "raw transaction" => "raw transaction hexadecimal length is invalid",
             "opaque cursor" => "opaque cursor hexadecimal length is invalid",
@@ -958,11 +944,7 @@ impl From<&Covenant> for WireCovenant {
     fn from(covenant: &Covenant) -> Self {
         Self {
             kind: covenant.kind.as_u8(),
-            items: covenant
-                .items
-                .iter()
-                .map(|item| hex_encode(item))
-                .collect(),
+            items: covenant.items.iter().map(|item| hex_encode(item)).collect(),
         }
     }
 }
@@ -1506,9 +1488,7 @@ fn wire_spend_kind(kind: &TrackedContractSpendKind) -> &'static str {
         TrackedContractSpendKind::Unrecognized => "unrecognized",
         TrackedContractSpendKind::ShakedexFulfillment => "shakedex_fulfillment",
         TrackedContractSpendKind::ShakedexRecovery => "shakedex_recovery",
-        TrackedContractSpendKind::HtlcRedemption { .. } => {
-            "hns_htlc_redemption_preimage_opaque"
-        }
+        TrackedContractSpendKind::HtlcRedemption { .. } => "hns_htlc_redemption_preimage_opaque",
         TrackedContractSpendKind::HtlcRefund => "hns_htlc_refund",
     }
 }
@@ -1572,11 +1552,7 @@ fn wire_contract_funding_page(
     Ok(WireContractFundingPage {
         chain_epoch: page.chain_epoch,
         tip: wire_tip(page.tip),
-        entries: page
-            .entries
-            .iter()
-            .map(WireTrackedFunding::from)
-            .collect(),
+        entries: page.entries.iter().map(WireTrackedFunding::from).collect(),
         continuation: encode_cursor(page.continuation.as_ref())?,
     })
 }

@@ -1,19 +1,23 @@
 # Docker and GHCR
 
-The release image is published as a multi-platform OCI image for
-`linux/amd64` (x86_64) and `linux/arm64` (AArch64):
+Each release publishes two multi-platform OCI images for `linux/amd64`
+(x86_64) and `linux/arm64` (AArch64):
 
 ```sh
-docker pull ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.3
+docker pull ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.4
+docker pull ghcr.io/handshake-rs/hns-resolverd:canary-v0.3.4
 ```
 
-Docker selects the matching platform automatically. The v0.3.3 prerelease
-publishes only the exact `canary-v0.3.3` tag. Stable releases publish the exact
-version, minor-version, and `latest` tags. Production deployments should pin
-the manifest digest recorded by the release workflow:
+The first image runs the `hsrd` consensus node. The second runs the ordinary
+UDP/TCP DNS companion backed by that node. Docker selects the matching platform
+automatically. The v0.3.4 prerelease publishes only each exact
+`canary-v0.3.4` tag. Stable releases publish the exact version, minor-version,
+and `latest` tags. Production deployments should pin both manifest digests
+recorded by the release workflow:
 
 ```yaml
-image: ghcr.io/handshake-rs/hns-node-rs@sha256:MANIFEST_DIGEST
+HSRD_IMAGE: ghcr.io/handshake-rs/hns-node-rs@sha256:NODE_MANIFEST_DIGEST
+HNS_RESOLVERD_IMAGE: ghcr.io/handshake-rs/hns-resolverd@sha256:RESOLVER_MANIFEST_DIGEST
 ```
 
 The same image runs ordinary nodes and the explicitly gated mainnet mining
@@ -22,22 +26,24 @@ not enable mining, publish RPC, or accept inbound P2P connections by default.
 
 ## Run with Compose
 
-Start the default node with durable named-volume storage:
+Start the default node and DNS sidecar with durable named-volume storage:
 
 ```sh
 docker compose up --detach
-docker compose logs --follow hsrd
+docker compose logs --follow hsrd hns-resolverd
 ```
 
-The checked-in Compose configuration defaults to
-`ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.3` for this prerelease. Override
-`HSRD_IMAGE` with an immutable manifest digest for a pinned deployment.
+The checked-in Compose configuration defaults to the two v0.3.4 canary images.
+Override `HSRD_IMAGE` and `HNS_RESOLVERD_IMAGE` with immutable manifest digests
+for a pinned deployment.
 
-The Compose service runs as UID/GID 10001, drops every Linux capability, uses
-a read-only root filesystem, and gives RocksDB two minutes to checkpoint after
-SIGTERM. The health check reports local RPC availability; it does not mean the
-node has finished synchronizing. Inspect synchronization without publishing
-RPC to the host:
+Both services run as UID/GID 10001, drop every Linux capability, and use a
+read-only root filesystem. The resolver shares only the node's network
+namespace and reaches RPC at `127.0.0.1:12037`; Compose never publishes the
+RPC port or binds it to the bridge. The node receives two minutes to checkpoint
+RocksDB after SIGTERM. Its health check reports local RPC availability; it does
+not mean synchronization is complete. Inspect synchronization without
+publishing RPC:
 
 ```sh
 docker compose exec hsrd \
@@ -47,11 +53,27 @@ docker compose exec hsrd \
 Back up or inspect the `hns-node-rs_hsrd-mainnet` volume with the node stopped.
 Never attach two node processes to the same data volume.
 
-To use an immutable image, set `HSRD_IMAGE` to the release digest before
-starting Compose:
+The DNS listener is published only on host loopback as UDP and TCP port 5350.
+A host-native Pinner instance should use:
+
+```text
+hns_resolver=127.0.0.1:5350
+```
+
+A containerized Pinner instance can join the `hns-node-rs_default` Compose
+network and use the `hns-resolverd:5350` alias. That alias reaches port 5350 in
+the shared node/resolver network namespace without making hsrd RPC reachable
+on the bridge. The resolver remains fail closed until hsrd is synchronized.
+
+Do not change the loopback publication to `0.0.0.0:5350` on an Internet-facing
+host. This image is a private application sidecar, not a public open resolver.
+Set `HNS_RESOLVER_PORT` only when another local service already owns port 5350.
+
+To use immutable images, set both variables before starting Compose:
 
 ```sh
 HSRD_IMAGE='ghcr.io/handshake-rs/hns-node-rs@sha256:MANIFEST_DIGEST' \
+HNS_RESOLVERD_IMAGE='ghcr.io/handshake-rs/hns-resolverd@sha256:MANIFEST_DIGEST' \
   docker compose up --detach
 ```
 
@@ -87,7 +109,9 @@ Build the native architecture:
 
 ```sh
 docker build --tag hsrd:local .
+docker build --target hns-resolverd-runtime --tag hns-resolverd:local .
 docker run --rm hsrd:local --version
+docker run --rm hns-resolverd:local --version
 ```
 
 Build both release architectures into an OCI layout with Buildx:
@@ -96,6 +120,13 @@ Build both release architectures into an OCI layout with Buildx:
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   --output type=oci,dest=hsrd.oci.tar \
+  --target hsrd-runtime \
+  .
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --output type=oci,dest=hns-resolverd.oci.tar \
+  --target hns-resolverd-runtime \
   .
 ```
 
@@ -106,26 +137,30 @@ toolchain.
 
 ## Release publication
 
-Pull requests and `main` changes build and execute the image independently on
+Pull requests and `main` changes build and execute both images independently on
 native amd64 and arm64 GitHub-hosted runners. Publishing occurs only for a
 published GitHub Release whose tag is valid semantic versioning. Before the
-GHCR release event proceeds, it verifies the uploaded binary archive, separate
-relinking/source archive, `SHA256SUMS`, and `BUILD-PROVENANCE.json`. Each native
-runner pushes an untagged platform image by digest; the final job creates one
-multi-platform GHCR manifest and applies only the prerelease canary tag, or the
-stable version, minor-version, and `latest` tags, after both platform checks
-pass.
+GHCR release event proceeds, it verifies the uploaded hsrd binary archive,
+separate relinking/source archive, `SHA256SUMS`, and `BUILD-PROVENANCE.json`.
+Each native runner pushes an untagged platform image by digest; the final jobs
+create separate multi-platform node and resolver manifests and apply only the
+prerelease canary tag, or the stable version, minor-version, and `latest` tags,
+after all four platform builds pass.
 
 The release workflow publishes BuildKit SBOM/provenance attestations and a
 GitHub artifact attestation for the final manifest. Verify the latter with:
 
 ```sh
 gh attestation verify \
-  oci://ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.3 \
+  oci://ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.4 \
+  --repo handshake-rs/hns-node-rs
+
+gh attestation verify \
+  oci://ghcr.io/handshake-rs/hns-resolverd:canary-v0.3.4 \
   --repo handshake-rs/hns-node-rs
 ```
 
 GHCR package visibility is separate from repository visibility. An
-organization administrator must make the package public after its first
-publication. The image's OCI source label links it to this repository so it
-can inherit repository access.
+organization administrator must make each package public after its first
+publication. Both images' OCI source labels link them to this repository so
+they can inherit repository access.

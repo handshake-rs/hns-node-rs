@@ -27,13 +27,12 @@ use thiserror::Error;
 mod swap;
 
 pub use swap::{
-    register_tracked_contract, tracked_contract, tracked_contract_events,
-    tracked_contract_funding, tracked_contract_fundings, validate_tracked_contract_registry,
-    ContractId, ContractRegistration, ContractRegistrationOutcome,
-    HnsHtlcDescriptor, RevealedPreimage, ShakedexV2Descriptor, TrackedContractCursor,
-    TrackedContractEvent, TrackedContractEventPage, TrackedContractFunding,
-    TrackedContractFundingPage, TrackedContractKind, TrackedContractSpendKind,
-    MAX_TRACKED_CONTRACTS, MAX_TRACKED_CONTRACTS_PER_ADDRESS,
+    register_tracked_contract, tracked_contract, tracked_contract_events, tracked_contract_funding,
+    tracked_contract_fundings, validate_tracked_contract_registry, ContractId,
+    ContractRegistration, ContractRegistrationOutcome, HnsHtlcDescriptor, RevealedPreimage,
+    ShakedexV2Descriptor, TrackedContractCursor, TrackedContractEvent, TrackedContractEventPage,
+    TrackedContractFunding, TrackedContractFundingPage, TrackedContractKind,
+    TrackedContractSpendKind, MAX_TRACKED_CONTRACTS, MAX_TRACKED_CONTRACTS_PER_ADDRESS,
 };
 
 /// Persistent profile key. Changing a non-empty chain's profile requires an

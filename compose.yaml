@@ -2,7 +2,7 @@ name: hns-node-rs
 
 services:
   hsrd:
-    image: ${HSRD_IMAGE:-ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.3}
+    image: ${HSRD_IMAGE:-ghcr.io/handshake-rs/hns-node-rs:canary-v0.3.4}
     restart: unless-stopped
     stop_grace_period: 2m
     read_only: true
@@ -19,6 +19,13 @@ services:
         hard: 65536
     volumes:
       - hsrd-mainnet:/var/lib/hsrd
+    ports:
+      - 127.0.0.1:${HNS_RESOLVER_PORT:-5350}:5350/udp
+      - 127.0.0.1:${HNS_RESOLVER_PORT:-5350}:5350/tcp
+    networks:
+      default:
+        aliases:
+          - hns-resolverd
     healthcheck:
       test:
         - CMD
@@ -31,6 +38,28 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 20m
+
+  hns-resolverd:
+    image: ${HNS_RESOLVERD_IMAGE:-ghcr.io/handshake-rs/hns-resolverd:canary-v0.3.4}
+    restart: unless-stopped
+    network_mode: service:hsrd
+    depends_on:
+      hsrd:
+        condition: service_healthy
+        restart: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
     logging:
       driver: json-file
       options:

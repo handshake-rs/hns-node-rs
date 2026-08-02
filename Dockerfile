@@ -2,7 +2,7 @@
 
 # Keep the compiler and runtime distributions on the same glibc generation.
 # Both references pin multi-platform OCI indexes that contain amd64 and arm64.
-FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS builder
+FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS build-base
 
 # Use the compiler already installed in the builder image. This override keeps
 # rustup from installing the repository's lint-only components in this stage.
@@ -20,6 +20,8 @@ RUN apt-get update \
 WORKDIR /workspace
 COPY . .
 
+FROM build-base AS hsrd-builder
+
 ARG TARGETARCH
 RUN --mount=type=cache,id=hsrd-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=hsrd-cargo-git,target=/usr/local/cargo/git,sharing=locked \
@@ -27,7 +29,66 @@ RUN --mount=type=cache,id=hsrd-cargo-registry,target=/usr/local/cargo/registry,s
     cargo build --locked --release --package hns-node --bin hsrd \
     && install -D --mode=0755 target/release/hsrd /out/hsrd
 
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+FROM build-base AS hns-resolverd-builder
+
+ARG TARGETARCH
+RUN --mount=type=cache,id=hns-resolverd-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=hns-resolverd-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=hns-resolverd-target-${TARGETARCH},target=/workspace/target,sharing=locked \
+    cargo build --locked --release --package hns-resolver --bin hns-resolverd \
+    && install -D --mode=0755 target/release/hns-resolverd /out/hns-resolverd
+
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime-base
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 hsrd \
+    && useradd --uid 10001 --gid hsrd --no-create-home --home-dir /var/lib/hsrd \
+        --shell /usr/sbin/nologin hsrd \
+    && install -d --mode=0700 --owner=hsrd --group=hsrd \
+        /var/lib/hns-resolverd \
+        /var/lib/hsrd
+
+FROM runtime-base AS hsrd-runtime-base
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM runtime-base AS hns-resolverd-runtime
+
+ARG VERSION=dev
+ARG VCS_REF=unknown
+
+LABEL org.opencontainers.image.title="hns-resolverd" \
+      org.opencontainers.image.description="DNSSEC-validating Handshake recursive DNS resolver backed by hsrd" \
+      org.opencontainers.image.source="https://github.com/handshake-rs/hns-node-rs" \
+      org.opencontainers.image.url="https://github.com/handshake-rs/hns-node-rs" \
+      org.opencontainers.image.documentation="https://github.com/handshake-rs/hns-node-rs/blob/main/docs/hns-resolverd.md" \
+      org.opencontainers.image.licenses="ISC" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}"
+
+COPY --from=hns-resolverd-builder /out/hns-resolverd /usr/local/bin/hns-resolverd
+COPY --chmod=0755 docker/resolver-entrypoint.sh /usr/local/bin/hns-resolverd-container-entrypoint
+
+USER 10001:10001
+WORKDIR /var/lib/hns-resolverd
+
+EXPOSE 5350/tcp 5350/udp
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/hns-resolverd-container-entrypoint"]
+CMD ["--listen", "0.0.0.0:5350", "--allow-non-loopback-listen", "--hsrd-rpc-url", "http://127.0.0.1:12037/"]
+
+# Keep the node runtime last so an unqualified `docker build .` retains the
+# established hsrd-image behavior. The resolver image selects
+# `--target hns-resolverd-runtime` explicitly.
+FROM hsrd-runtime-base AS hsrd-runtime
 
 ARG VERSION=dev
 ARG VCS_REF=unknown
@@ -41,19 +102,7 @@ LABEL org.opencontainers.image.title="hns-node-rs" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}"
 
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends \
-        ca-certificates \
-        curl \
-        libssl3 \
-        libstdc++6 \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 hsrd \
-    && useradd --uid 10001 --gid hsrd --no-create-home --home-dir /var/lib/hsrd \
-        --shell /usr/sbin/nologin hsrd \
-    && install -d --mode=0700 --owner=hsrd --group=hsrd /var/lib/hsrd
-
-COPY --from=builder /out/hsrd /usr/local/bin/hsrd
+COPY --from=hsrd-builder /out/hsrd /usr/local/bin/hsrd
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/hsrd-container-entrypoint
 
 USER 10001:10001

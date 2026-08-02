@@ -12,8 +12,8 @@ use hns_mempool::{
 };
 use hns_p2p::{Inventory, LivePeerManager, OutboundPriority, Packet};
 use hns_primitives::{
-    blake2b_256, BlockHash, Coin, Height, NameHash, NameState, Outpoint, Output, Transaction,
-    Txid, Writer,
+    blake2b_256, BlockHash, Coin, Height, NameHash, NameState, Outpoint, Output, Transaction, Txid,
+    Writer,
 };
 use hns_state::{
     decode_coin, decode_name_state, encode_outpoint_key, load_stored_name_tree_root,
@@ -22,12 +22,12 @@ use hns_state::{
 use hns_store::{ColumnFamily, ReadSnapshot, Store};
 use hns_urkel::UrkelProof;
 use hns_wallet_index::{
-    script_history, script_utxos, spending_transaction, tracked_contract,
-    tracked_contract_events, tracked_contract_funding, tracked_contract_fundings, ContractId,
-    ContractRegistration, ContractRegistrationOutcome, IndexError, ScriptHistoryCursor,
-    ScriptHistoryEntry, ScriptHistoryPage, ScriptId, ScriptUtxo, ScriptUtxoCursor,
-    ScriptUtxoPage, SpendingTransaction, TrackedContractCursor, TrackedContractEvent,
-    TrackedContractFunding, TrackedContractSpendKind, MAX_QUERY_ENTRIES,
+    script_history, script_utxos, spending_transaction, tracked_contract, tracked_contract_events,
+    tracked_contract_funding, tracked_contract_fundings, ContractId, ContractRegistration,
+    ContractRegistrationOutcome, IndexError, ScriptHistoryCursor, ScriptHistoryEntry,
+    ScriptHistoryPage, ScriptId, ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage, SpendingTransaction,
+    TrackedContractCursor, TrackedContractEvent, TrackedContractFunding, TrackedContractSpendKind,
+    MAX_QUERY_ENTRIES,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -548,7 +548,9 @@ pub enum WalletBackendError {
     #[error("wallet mempool scan limit must be between 1 and {MAX_WALLET_MEMPOOL_SCAN}")]
     InvalidMempoolScanLimit,
     /// Outpoint-spend evidence batch is empty or oversized.
-    #[error("wallet outpoint-spend batch must contain 1..={MAX_WALLET_OUTPOINT_SPEND_BATCH} entries")]
+    #[error(
+        "wallet outpoint-spend batch must contain 1..={MAX_WALLET_OUTPOINT_SPEND_BATCH} entries"
+    )]
     InvalidOutpointBatch,
     /// Script restoration set is empty, oversized, unsorted, or duplicated.
     #[error("wallet restoration scripts must be sorted, unique, and contain 1..={MAX_WALLET_RESTORE_SCRIPTS} entries")]
@@ -721,9 +723,10 @@ impl WalletBackend {
                         .ok_or(WalletBackendError::Corrupt(
                             "indexed transaction is absent from its block",
                         ))?;
-                    inclusion.transaction_position = Some(u32::try_from(position).map_err(|_| {
-                        WalletBackendError::Corrupt("block transaction position exceeds u32")
-                    })?);
+                    inclusion.transaction_position =
+                        Some(u32::try_from(position).map_err(|_| {
+                            WalletBackendError::Corrupt("block transaction position exceeds u32")
+                        })?);
                     TransactionPayload::Retained(transaction)
                 }
                 None => TransactionPayload::Pruned,
@@ -869,23 +872,15 @@ impl WalletBackend {
                             .get(script_index)
                             .copied()
                             .ok_or(WalletBackendError::InvalidConfirmedCursor)?;
-                        let page = script_history(
-                            snapshot,
-                            profile,
-                            script,
-                            cursor.as_ref(),
-                            limit,
-                        )
-                        .map_err(wallet_index_error)?;
+                        let page =
+                            script_history(snapshot, profile, script, cursor.as_ref(), limit)
+                                .map_err(wallet_index_error)?;
                         let history = page
                             .entries
                             .into_iter()
                             .map(|entry| {
-                                let block_time = load_block_time(
-                                    snapshot,
-                                    &mut block_times,
-                                    entry.block_hash,
-                                )?;
+                                let block_time =
+                                    load_block_time(snapshot, &mut block_times, entry.block_hash)?;
                                 Ok(ConfirmedScriptHistory {
                                     script_index,
                                     entry,
@@ -935,14 +930,8 @@ impl WalletBackend {
                             .get(script_index)
                             .copied()
                             .ok_or(WalletBackendError::InvalidConfirmedCursor)?;
-                        let page = script_utxos(
-                            snapshot,
-                            profile,
-                            script,
-                            cursor.as_ref(),
-                            limit,
-                        )
-                        .map_err(wallet_index_error)?;
+                        let page = script_utxos(snapshot, profile, script, cursor.as_ref(), limit)
+                            .map_err(wallet_index_error)?;
                         let utxos = page
                             .entries
                             .into_iter()
@@ -1098,14 +1087,8 @@ impl WalletBackend {
                 }
                 None => None,
             };
-            let page = tracked_contract_fundings(
-                snapshot,
-                profile,
-                id,
-                inner.as_ref(),
-                limit,
-            )
-            .map_err(wallet_index_error)?;
+            let page = tracked_contract_fundings(snapshot, profile, id, inner.as_ref(), limit)
+                .map_err(wallet_index_error)?;
             Ok(WalletContractFundingPage {
                 chain_epoch,
                 tip: wallet_chain_tip(snapshot)?,
@@ -1146,14 +1129,8 @@ impl WalletBackend {
                 }
                 None => None,
             };
-            let page = tracked_contract_events(
-                snapshot,
-                profile,
-                id,
-                inner.as_ref(),
-                limit,
-            )
-            .map_err(wallet_index_error)?;
+            let page = tracked_contract_events(snapshot, profile, id, inner.as_ref(), limit)
+                .map_err(wallet_index_error)?;
             Ok(WalletContractEventPage {
                 chain_epoch,
                 tip: wallet_chain_tip(snapshot)?,
@@ -1215,11 +1192,11 @@ impl WalletBackend {
                         "published mempool references absent entry metadata",
                     ))?
                     .admitted_at;
-                let transaction = mempool.transaction(&txid).ok_or(
-                    WalletBackendError::Corrupt(
+                let transaction = mempool
+                    .transaction(&txid)
+                    .ok_or(WalletBackendError::Corrupt(
                         "published mempool references an absent transaction",
-                    ),
-                )?;
+                    ))?;
                 let mut received = Vec::new();
                 let mut spent = Vec::new();
                 for (output_position, output) in transaction.outputs.iter().enumerate() {
@@ -1238,9 +1215,7 @@ impl WalletBackend {
                         outpoint: Outpoint {
                             txid,
                             index: u32::try_from(output_position).map_err(|_| {
-                                WalletBackendError::Corrupt(
-                                    "mempool output position exceeds u32",
-                                )
+                                WalletBackendError::Corrupt("mempool output position exceeds u32")
                             })?,
                         },
                         value: output.value,
@@ -1250,7 +1225,8 @@ impl WalletBackend {
                     if input.previous_output.is_null() {
                         continue;
                     }
-                    let Some(coin) = resolve_mempool_coin(snapshot, mempool, &input.previous_output)?
+                    let Some(coin) =
+                        resolve_mempool_coin(snapshot, mempool, &input.previous_output)?
                     else {
                         return Err(WalletBackendError::Corrupt(
                             "contextual mempool input coin is unavailable",
@@ -1325,17 +1301,18 @@ impl WalletBackend {
                         "published mempool references absent entry metadata",
                     ))?
                     .admitted_at;
-                let transaction = mempool.transaction(&txid).ok_or(
-                    WalletBackendError::Corrupt(
+                let transaction = mempool
+                    .transaction(&txid)
+                    .ok_or(WalletBackendError::Corrupt(
                         "published mempool references an absent transaction",
-                    ),
-                )?;
+                    ))?;
                 let mut events = Vec::new();
                 for (input_position, input) in transaction.inputs.iter().enumerate() {
                     if input.previous_output.is_null() {
                         continue;
                     }
-                    let Some(coin) = resolve_mempool_coin(snapshot, mempool, &input.previous_output)?
+                    let Some(coin) =
+                        resolve_mempool_coin(snapshot, mempool, &input.previous_output)?
                     else {
                         return Err(WalletBackendError::Corrupt(
                             "contextual mempool input coin is unavailable",
@@ -1351,18 +1328,12 @@ impl WalletBackend {
                     {
                         continue;
                     }
-                    let parent_is_mempool = mempool
-                        .transaction(&input.previous_output.txid)
-                        .is_some();
+                    let parent_is_mempool =
+                        mempool.transaction(&input.previous_output.txid).is_some();
                     if !parent_is_mempool
-                        && tracked_contract_funding(
-                            snapshot,
-                            profile,
-                            id,
-                            &input.previous_output,
-                        )
-                        .map_err(wallet_index_error)?
-                        .is_none()
+                        && tracked_contract_funding(snapshot, profile, id, &input.previous_output)
+                            .map_err(wallet_index_error)?
+                            .is_none()
                     {
                         continue;
                     }
@@ -1396,9 +1367,7 @@ impl WalletBackend {
                         outpoint: Outpoint {
                             txid,
                             index: u32::try_from(output_position).map_err(|_| {
-                                WalletBackendError::Corrupt(
-                                    "mempool output position exceeds u32",
-                                )
+                                WalletBackendError::Corrupt("mempool output position exceeds u32")
                             })?,
                         },
                         value: output.value,
@@ -1582,10 +1551,7 @@ impl WalletBackend {
             let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
             let current_state = load_current_name_state(snapshot, name_hash)?;
             let proof = name_proof(snapshot, name_hash)?;
-            let proof_raw = proof
-                .proof
-                .verify_value(proof.root)
-                .map_err(node_error)?;
+            let proof_raw = proof.proof.verify_value(proof.root).map_err(node_error)?;
             let proof_state = proof_raw
                 .as_deref()
                 .map(|raw| decode_name_state(&name_hash, raw))
@@ -1698,10 +1664,7 @@ fn name_proof<S: ReadSnapshot>(
 ) -> Result<NameProofResult, WalletBackendError> {
     let tip = wallet_chain_tip(snapshot)?;
     let root = load_stored_name_tree_root(snapshot).map_err(node_error)?;
-    if tip
-        .as_ref()
-        .is_some_and(|tip| tip.tree_root != root)
-    {
+    if tip.as_ref().is_some_and(|tip| tip.tree_root != root) {
         return Err(WalletBackendError::Corrupt(
             "wallet tip and name proof roots disagree",
         ));
@@ -1729,9 +1692,7 @@ fn load_name_owner<S: ReadSnapshot>(
     };
     let owner_output = transaction
         .outputs
-        .get(
-            usize::try_from(owner.index).map_err(|_| WalletBackendError::OwnerOutputMissing)?,
-        )
+        .get(usize::try_from(owner.index).map_err(|_| WalletBackendError::OwnerOutputMissing)?)
         .cloned()
         .ok_or(WalletBackendError::OwnerOutputMissing)?;
     Ok(Some(NameOwnerTransaction {
@@ -1886,15 +1847,9 @@ fn confirmed_script_set_id(scripts: &[ScriptId]) -> Result<[u8; 32], WalletBacke
     script_set_id(CONFIRMED_SCRIPT_SET_DOMAIN, scripts)
 }
 
-fn script_set_id(
-    domain: &[u8],
-    scripts: &[ScriptId],
-) -> Result<[u8; 32], WalletBackendError> {
-    let count = u32::try_from(scripts.len())
-        .map_err(|_| WalletBackendError::InvalidScriptSet)?;
-    let mut identity = Writer::with_capacity(
-        domain.len() + 4 + scripts.len().saturating_mul(32),
-    );
+fn script_set_id(domain: &[u8], scripts: &[ScriptId]) -> Result<[u8; 32], WalletBackendError> {
+    let count = u32::try_from(scripts.len()).map_err(|_| WalletBackendError::InvalidScriptSet)?;
+    let mut identity = Writer::with_capacity(domain.len() + 4 + scripts.len().saturating_mul(32));
     identity.write_bytes(domain);
     identity.write_u32_be(count);
     for script in scripts {
@@ -1964,10 +1919,7 @@ fn mempool_scan_page(
     Ok((txids, continuation))
 }
 
-fn estimate_fee_rate_from_snapshot(
-    snapshot: &MempoolSnapshot,
-    target_blocks: u32,
-) -> FeeEstimate {
+fn estimate_fee_rate_from_snapshot(snapshot: &MempoolSnapshot, target_blocks: u32) -> FeeEstimate {
     let mut rates = snapshot
         .txids()
         .take(MAX_FEE_ESTIMATE_SAMPLES)
@@ -2150,9 +2102,10 @@ fn load_confirmed_transaction<S: ReadSnapshot>(
         .ok_or(WalletBackendError::Corrupt(
             "indexed transaction is absent from its block",
         ))?;
-    inclusion.transaction_position = Some(u32::try_from(position).map_err(|_| {
-        WalletBackendError::Corrupt("block transaction position exceeds u32")
-    })?);
+    inclusion.transaction_position = Some(
+        u32::try_from(position)
+            .map_err(|_| WalletBackendError::Corrupt("block transaction position exceeds u32"))?,
+    );
     Ok(Some((transaction, inclusion)))
 }
 
@@ -2246,9 +2199,9 @@ mod tests {
     use crate::{NodeConfig, NodeService, DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY};
 
     const GENERATOR_KEY: [u8; 33] = [
-        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
-        0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
-        0x5b, 0x16, 0xf8, 0x17, 0x98,
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+        0xf8, 0x17, 0x98,
     ];
 
     #[tokio::test]
@@ -2413,11 +2366,7 @@ mod tests {
             .continuation
             .expect("empty traversal must yield resumable progress at its work bound");
         let bounded_empty_completion = backend
-            .get_confirmed_scripts_page(
-                empty_scripts,
-                Some(bounded_empty_continuation),
-                128,
-            )
+            .get_confirmed_scripts_page(empty_scripts, Some(bounded_empty_continuation), 128)
             .await
             .unwrap();
         assert!(bounded_empty_completion.history.is_empty());
@@ -2425,14 +2374,13 @@ mod tests {
         assert_eq!(bounded_empty_completion.script_examinations, 2);
         assert!(bounded_empty_completion.continuation.is_none());
 
-        let registration = ContractRegistration::shakedex_v2(
-            hns_wallet_index::ShakedexV2Descriptor {
+        let registration =
+            ContractRegistration::shakedex_v2(hns_wallet_index::ShakedexV2Descriptor {
                 name_hash: [3; 32],
                 seller_public_key: GENERATOR_KEY,
                 value: 1_000,
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(
             backend
                 .register_tracked_contract(registration.clone())
@@ -2448,10 +2396,7 @@ mod tests {
             ContractRegistrationOutcome::AlreadyRegistered
         );
         assert_eq!(
-            backend
-                .get_tracked_contract(registration.id)
-                .await
-                .unwrap(),
+            backend.get_tracked_contract(registration.id).await.unwrap(),
             Some(registration.clone())
         );
         assert!(backend
@@ -2537,15 +2482,9 @@ mod tests {
             locktime: 0,
         };
 
-        let quote = transaction_fee_quote_from_snapshot(
-            &snapshot,
-            &mempool,
-            &transaction,
-            6,
-            9,
-            None,
-        )
-        .unwrap();
+        let quote =
+            transaction_fee_quote_from_snapshot(&snapshot, &mempool, &transaction, 6, 9, None)
+                .unwrap();
         assert_eq!(quote.txid, transaction.txid());
         assert_eq!(quote.chain_epoch, 9);
         assert_eq!(quote.mempool_instance_nonce, *mempool.instance_nonce());
@@ -2575,15 +2514,9 @@ mod tests {
 
         let mut underpaid = transaction;
         underpaid.outputs[0].value = 49_999;
-        let underpaid_quote = transaction_fee_quote_from_snapshot(
-            &snapshot,
-            &mempool,
-            &underpaid,
-            6,
-            9,
-            None,
-        )
-        .unwrap();
+        let underpaid_quote =
+            transaction_fee_quote_from_snapshot(&snapshot, &mempool, &underpaid, 6, 9, None)
+                .unwrap();
         assert_eq!(underpaid_quote.actual_fee_atomic_units, 1);
         assert!(!underpaid_quote.meets_minimum_policy_fee);
         assert_eq!(
@@ -2596,14 +2529,7 @@ mod tests {
         let mut overspend = underpaid;
         overspend.outputs[0].value = 50_001;
         assert!(matches!(
-            transaction_fee_quote_from_snapshot(
-                &snapshot,
-                &mempool,
-                &overspend,
-                6,
-                9,
-                None,
-            ),
+            transaction_fee_quote_from_snapshot(&snapshot, &mempool, &overspend, 6, 9, None,),
             Err(WalletBackendError::InvalidFeeQuoteTransaction)
         ));
     }

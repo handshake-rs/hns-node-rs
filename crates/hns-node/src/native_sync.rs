@@ -2717,8 +2717,8 @@ impl NodeService {
         let diagnostic_rpc = initialize_cached_diagnostic_rpc(&node, &diagnostics).await?;
         let wallet_rpc_authenticated = rpc_authorization.is_some();
         let wallet_rpc_profile_enabled = node.wallet_index_profile().wallet;
-        let wallet_rpc_active_state_enabled = native_sync_config.connect_active_state
-            && !native_sync_config.headers_only;
+        let wallet_rpc_active_state_enabled =
+            native_sync_config.connect_active_state && !native_sync_config.headers_only;
         let wallet_backend = (wallet_rpc_authenticated
             && wallet_rpc_profile_enabled
             && wallet_rpc_active_state_enabled)

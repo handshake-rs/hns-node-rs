@@ -84,6 +84,13 @@ absolute, mode-0600 file into the resolver and pass:
 --hsrd-authorization-header-file /absolute/private/hsrd-authorization-header
 ```
 
+The authorization header grants access to the entire authenticated RPC
+listener, not just resolver methods. Do not give that credential to the
+resolver when the same listener exposes a wallet-enabled profile unless the
+resolver is intentionally trusted as a full RPC principal, including wallet
+broadcast authority. Prefer an hsrd instance and listener whose enabled profile
+excludes wallet RPC routes for the resolver boundary.
+
 The current RPC transport accepts `http://` only and deliberately ignores
 ambient HTTP proxies and redirects. Keep it on loopback or an isolated sidecar
 network; TLS support must arrive as an explicit, tested transport feature.
@@ -106,15 +113,37 @@ repeated; `--disable-icann-fallback` produces an HNS-only resolver.
 The compiled addresses come from InterNIC's
 [`named.root`](https://www.internic.net/domain/named.root), and the validation
 keys come from IANA's [DNSSEC trust-anchor publication](https://www.iana.org/dnssec/files).
-Release qualification must recheck both sources. Hickory 0.25.2 includes the
+Release qualification must recheck both sources. Hickory 0.26.1 includes the
 active KSK-2017 and pre-published KSK-2024; IANA currently schedules the active
 rollover for October 11, 2026, so anchor rollover remains an explicit operator
 and dependency-update obligation rather than an assumption.
 
-## Pinner sidecar
+## Docker and Pinner
 
-For two containers on a private, ACL-controlled network, bind the resolver to
-the container interface explicitly:
+The release publishes the resolver separately from the node:
+
+```bash
+docker pull ghcr.io/handshake-rs/hns-resolverd:canary-v0.3.4
+```
+
+The checked-in Compose stack is the preferred deployment. It shares the node's
+network namespace with the resolver, keeping hsrd RPC on loopback, and publishes
+DNS only on host loopback:
+
+```bash
+docker compose up --detach
+dig @127.0.0.1 -p 5350 example. A
+```
+
+Use `hns_resolver=127.0.0.1:5350` when Pinner runs on the host. When Pinner is a
+container, attach it to the `hns-node-rs_default` network and use:
+
+```text
+hns_resolver=hns-resolverd:5350
+```
+
+For an independently managed, ACL-controlled sidecar network, override the
+image's default RPC URL and bind the resolver to its container interface:
 
 ```bash
 hns-resolverd \
@@ -130,7 +159,12 @@ hns_resolver=hns-resolverd:5350
 ```
 
 Do not publish port 5350 to the Internet. The flag is an acknowledgement, not
-an access-control mechanism; use a container network policy or firewall.
+an access-control mechanism; use a container network policy or firewall. A
+separate bridge also requires hsrd RPC to bind outside loopback; authenticate
+that listener and ensure only the resolver can reach it. Do not reuse a
+wallet-enabled listener credential unless the resolver is intentionally trusted
+with every route on that listener. The checked-in Compose topology avoids that
+additional RPC exposure.
 
 ## State and request flow
 
