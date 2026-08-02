@@ -16,6 +16,8 @@ members = [
     "crates/hns-testkit",
     "crates/hns-urkel",
     "crates/hns-resolver",
+    "crates/hns-wallet-index",
+    "crates/hns-denuo-market-relay",
 ]
 exclude = ["fuzz"]
 resolver = "2"

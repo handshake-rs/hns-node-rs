@@ -761,6 +761,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-denuo-market-relay"
+version = "0.3.3"
+dependencies = [
+ "hns-primitives 0.3.3",
+ "thiserror",
+]
+
+[[package]]
 name = "hns-dns-relay-protocol"
 version = "0.1.0"
 source = "git+https://github.com/handshake-rs/hns-rs.git?rev=dde2da81f29df935f043978a6d517c1d60ceff31#dde2da81f29df935f043978a6d517c1d60ceff31"
@@ -819,6 +827,7 @@ dependencies = [
  "hex",
  "hns-chain",
  "hns-consensus",
+ "hns-denuo-market-relay",
  "hns-mempool",
  "hns-mining",
  "hns-p2p",
@@ -828,9 +837,11 @@ dependencies = [
  "hns-store",
  "hns-sync",
  "hns-urkel",
+ "hns-wallet-index",
  "libc",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -989,6 +1000,17 @@ dependencies = [
  "hns-primitives 0.3.3",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "hns-wallet-index"
+version = "0.3.3"
+dependencies = [
+ "hns-primitives 0.3.3",
+ "hns-state",
+ "hns-store",
+ "serde",
  "thiserror",
 ]
 

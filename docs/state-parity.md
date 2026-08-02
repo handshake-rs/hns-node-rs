@@ -30,11 +30,13 @@ state, but the outputs never become UTXOs or undo-created coins. hsrd applies
 that same rule because it changes the state a miner validates, not because it
 copies HSD's storage shape.
 
-This rule is general: a field belongs in hsrd when it can affect admission,
-state transition, authenticated roots, rollback, template construction,
-candidate validation, or publication. Wallet indexes, convenience RPC fields,
-and redundant archival metadata do not belong in the mining authority unless a
-separate compatibility requirement explicitly adds them.
+This rule is general: a field belongs in mining authority when it can affect
+admission, state transition, authenticated roots, rollback, template
+construction, candidate validation, or publication. Optional wallet indexes
+are a separately required compatibility backend: they share atomic batches but
+are never read by consensus, mining, or authenticated state. Seed/key storage,
+convenience RPC fields, and redundant archival metadata remain outside mining
+authority.
 
 ## Constant-space manifests
 

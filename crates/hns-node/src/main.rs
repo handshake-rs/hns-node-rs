@@ -18,9 +18,9 @@ use hns_consensus::Network;
 use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
     init_logging, recommended_template_build_limits, validate_node_config, AuthorityMode,
-    MiningEngineConfig, NameTreeCompactionConfig, NativeSyncConfig, NodeConfig, NodeService,
-    RpcAuthorizationHeader, RpcLimits, ShutdownSignal, StorageMode, UndoRetentionConfig,
-    DEFAULT_NAME_TREE_COMPACTION_INTERVAL, DEFAULT_RPC_MAX_COLLECTION_ENTRIES,
+    DenuoRelayRoles, MiningEngineConfig, NameTreeCompactionConfig, NativeSyncConfig, NodeConfig,
+    NodeService, RpcAuthorizationHeader, RpcLimits, ShutdownSignal, StorageMode,
+    UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL, DEFAULT_RPC_MAX_COLLECTION_ENTRIES,
     DEFAULT_RPC_MAX_CONCURRENT_REQUESTS, DEFAULT_RPC_MAX_REQUEST_BYTES,
     MAX_RPC_AUTHORIZATION_BYTES,
 };
@@ -83,6 +83,39 @@ struct Cli {
     /// Maintain active-chain transaction-to-block history for diagnostics.
     #[arg(long = "transaction-index", alias = "index-tx")]
     transaction_index: bool,
+
+    /// Maintain active-chain history keyed by canonical output script.
+    #[arg(long = "script-history-index")]
+    script_history_index: bool,
+
+    /// Maintain active-chain output-to-spending-transaction mappings.
+    #[arg(long = "spender-index")]
+    spender_index: bool,
+
+    /// Maintain the complete restoration profile; this also enables the
+    /// transaction, script-history, spender, and script-UTXO indexes.
+    #[arg(long = "wallet-index")]
+    wallet_index: bool,
+
+    /// Enable the local name-market relay core for an installed native adapter.
+    #[arg(long = "denuo-name-market-relay")]
+    denuo_name_market_relay: bool,
+
+    /// Enable the local cross-chain relay core for an installed native adapter.
+    #[arg(long = "denuo-cross-chain-relay")]
+    denuo_cross_chain_relay: bool,
+
+    /// Enable the local price relay core for an installed native adapter.
+    #[arg(long = "denuo-price-relay")]
+    denuo_price_relay: bool,
+
+    /// Enable the local rendezvous relay core for an installed native adapter.
+    #[arg(long = "denuo-rendezvous-relay")]
+    denuo_rendezvous_relay: bool,
+
+    /// Enable the local swap-status relay core for an installed native adapter.
+    #[arg(long = "denuo-swap-status-relay")]
+    denuo_swap_status_relay: bool,
 
     /// Compact retained durable name-tree nodes when the startup height is due.
     #[arg(long)]
@@ -264,6 +297,16 @@ impl Cli {
             acknowledge_incomplete_consensus: self.acknowledge_incomplete_consensus,
             storage_durability: self.storage_durability,
             transaction_index: self.transaction_index,
+            script_history_index: self.script_history_index,
+            spender_index: self.spender_index,
+            wallet_index: self.wallet_index,
+            denuo_relay_roles: DenuoRelayRoles::new(
+                self.denuo_name_market_relay,
+                self.denuo_cross_chain_relay,
+                self.denuo_price_relay,
+                self.denuo_rendezvous_relay,
+                self.denuo_swap_status_relay,
+            ),
             name_tree_compaction: NameTreeCompactionConfig {
                 compact_on_startup: self.compact_name_tree_on_startup,
                 startup_interval: self.name_tree_compaction_interval,
@@ -422,6 +465,10 @@ async fn main() -> anyhow::Result<()> {
             mainnet_canary = config.mainnet_canary,
             storage_durability = %config.storage_durability,
             transaction_index = config.transaction_index,
+            script_history_index = config.script_history_index,
+            spender_index = config.spender_index,
+            wallet_index = config.wallet_index,
+            denuo_relay_roles = config.denuo_relay_roles.bits(),
             rpc_max_request_bytes = config.rpc_limits.maximum_request_bytes,
             rpc_max_concurrent_requests = config.rpc_limits.maximum_concurrent_requests,
             rpc_execution_timeout_ms = config.rpc_limits.execution_timeout.as_millis(),

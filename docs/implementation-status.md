@@ -115,6 +115,19 @@ Implemented:
   unpublished page/frame tails, and reject locator/manifest disagreement.
 - Optional `--transaction-index` historical lookup. The mining profile omits
   the redundant per-transaction LSM write by default.
+- Optional `--script-history-index`, `--spender-index`, and complete
+  `--wallet-index` active-chain profiles, staged atomically with UTXO/name
+  state and exactly reversed on disconnect/reorganization. The typed
+  noncustodial backend, bounded fee estimator, current name proof/owner lookup,
+  and contextual transaction admission/P2P fanout are implemented and tested;
+  all remain disabled by default. These are confirmed-chain indexes: wallet
+  mempool restoration/subscriptions and Shakedex/HTLC/preimage tracking remain
+  explicit gaps.
+- A bounded hash-first Denuo marketplace relay/cache core with five separate
+  roles is implemented with pre-validation peer charging, automatic malformed
+  strikes, consequential bounded scores/bans, and indexed expiry. Live
+  marketplace wire advertisement remains disabled until the generated Denuo V2
+  registry crate is pinned by revision; no live swap engine is claimed.
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
   block/header undo status and advances a checksummed checkpoint; startup

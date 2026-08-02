@@ -1,16 +1,35 @@
 #![forbid(unsafe_code)]
 
+mod denuo_market;
 mod mining_engine;
 mod native_sync;
 mod peer_bans;
+mod wallet_backend;
 
+pub use denuo_market::{DenuoRelayHandle, DenuoRelayHandleError};
+pub use hns_denuo_market_relay::{
+    Announcement as DenuoAnnouncement, AnnouncementAdmission as DenuoAnnouncementAdmission,
+    ObjectAdmission as DenuoObjectAdmission, ObjectHash as DenuoObjectHash,
+    RelayError as DenuoRelayError, RelayKind as DenuoRelayKind, RelayLimits as DenuoRelayLimits,
+    RelayObject as DenuoRelayObject, RelayRoles as DenuoRelayRoles,
+    RelayStatus as DenuoRelayStatus, RelayStore as DenuoRelayStore,
+    SignerPolicy as DenuoSignerPolicy,
+};
 pub use hns_p2p::LivePeerManager;
+pub use hns_wallet_index::{
+    ScriptHistoryCursor, ScriptHistoryDirection, ScriptHistoryEntry, ScriptHistoryPage, ScriptId,
+    ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage, SpendingTransaction, WalletIndexProfile,
+};
 pub use mining_engine::{
     recommended_template_build_limits, MiningEngineConfig, MiningEngineDiagnostics,
     MiningPublicationAttempt, MiningPublicationResult, MiningTemplateRequest, NativeMiningJob,
     NativeMiningJobRequest,
 };
 pub use native_sync::{NativeSyncConfig, NativeSyncDiagnostics};
+pub use wallet_backend::{
+    BroadcastResult, FeeEstimate, FeeEstimateSource, NameOwnerTransaction, NameProofResult,
+    TransactionInclusion, TransactionStatus, WalletBackend, WalletBackendError, WalletChainTip,
+};
 
 use std::{
     any::Any,
@@ -109,6 +128,10 @@ use hns_store::{
     WriteBatch, SCHEMA_VERSION, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES,
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS,
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, STORAGE_PROFILE,
+};
+use hns_wallet_index::{
+    decode_index_profile, encode_index_profile, stage_connect as stage_wallet_index_connect,
+    stage_disconnect as stage_wallet_index_disconnect, INDEX_PROFILE_MODE_KEY,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -1432,6 +1455,15 @@ pub struct NodeConfig {
     /// diagnostics. Consensus, mining, block relay, and UTXO validation do not
     /// depend on this index.
     pub transaction_index: bool,
+    /// Maintain active-chain transaction history by canonical output script.
+    pub script_history_index: bool,
+    /// Maintain active-chain outpoint-to-spending-transaction mappings.
+    pub spender_index: bool,
+    /// Maintain the complete wallet restoration profile (script history,
+    /// spender lookup, and script UTXOs).
+    pub wallet_index: bool,
+    /// Explicit Denuo marketplace relay roles. Empty is requester-only.
+    pub denuo_relay_roles: DenuoRelayRoles,
     pub name_tree_compaction: NameTreeCompactionConfig,
     pub undo_retention: UndoRetentionConfig,
     pub native_sync: NativeSyncConfig,
@@ -1452,10 +1484,26 @@ impl Default for NodeConfig {
             acknowledge_incomplete_consensus: false,
             storage_durability: DurabilityPolicy::Sync,
             transaction_index: false,
+            script_history_index: false,
+            spender_index: false,
+            wallet_index: false,
+            denuo_relay_roles: DenuoRelayRoles::NONE,
             name_tree_compaction: NameTreeCompactionConfig::default(),
             undo_retention: UndoRetentionConfig::default(),
             native_sync: NativeSyncConfig::default(),
             mining_engine: MiningEngineConfig::default(),
+        }
+    }
+}
+
+impl NodeConfig {
+    /// Effective optional wallet index profile.
+    #[must_use]
+    pub const fn wallet_index_profile(&self) -> WalletIndexProfile {
+        WalletIndexProfile {
+            script_history: self.script_history_index,
+            spender: self.spender_index,
+            wallet: self.wallet_index,
         }
     }
 }
@@ -1964,6 +2012,7 @@ pub struct NodeService {
     mempool_name_context: Mutex<mining_engine::ActiveMempoolNameCache>,
     claim_dnssec: OpenSslDnssecVerifier,
     airdrop_signatures: NativeAirdropSignatureVerifier,
+    denuo_relay: DenuoRelayHandle,
 }
 
 /// Maximum number of canonical-state commands that may wait behind the
@@ -2317,6 +2366,7 @@ pub struct NodeReadHandle {
     store: StoreHandle,
     headers: SharedHeaderIndex,
     transaction_index: bool,
+    wallet_index_profile: WalletIndexProfile,
     mining_events: MiningEventHub,
     mining_engine_templates: Arc<Mutex<TemplateCoordinator>>,
     state: Arc<NodeRuntimeState>,
@@ -2334,6 +2384,12 @@ impl NodeReadHandle {
 
     pub fn network(&self) -> Network {
         self.config.network
+    }
+
+    /// Effective durable wallet-index profile for this runtime.
+    #[must_use]
+    pub const fn wallet_index_profile(&self) -> WalletIndexProfile {
+        self.wallet_index_profile
     }
 
     /// Return the last immutable publication for observation. This remains
@@ -3021,6 +3077,7 @@ fn decode_canonical_response<T: Send + 'static>(
 pub struct NodeRuntime {
     inner: Arc<NodeRuntimeInner>,
     read: NodeReadHandle,
+    denuo_relay: DenuoRelayHandle,
 }
 
 impl std_fmt::Debug for NodeRuntime {
@@ -3051,6 +3108,8 @@ impl NodeRuntime {
         let store = node.state.store.clone();
         let headers = node.state.chain.clone();
         let transaction_index = node.state.transaction_index;
+        let wallet_index_profile = node.state.wallet_index_profile;
+        let denuo_relay = node.denuo_relay.clone();
         let mining_events = node.mining_events.clone();
         let mining_engine_templates = Arc::clone(&node.mining_engine_templates);
         let maximum_concurrent_requests = node.config.rpc_limits.maximum_concurrent_requests;
@@ -3082,6 +3141,7 @@ impl NodeRuntime {
             store,
             headers,
             transaction_index,
+            wallet_index_profile,
             mining_events,
             mining_engine_templates,
             state: Arc::clone(&inner.state),
@@ -3091,7 +3151,11 @@ impl NodeRuntime {
             template_build_admission: Arc::new(Semaphore::new(template_build_queue_capacity)),
             template_build_workers: Arc::new(Semaphore::new(template_build_workers)),
         };
-        Ok(Self { inner, read })
+        Ok(Self {
+            inner,
+            read,
+            denuo_relay,
+        })
     }
 
     pub fn read(&self) -> NodeReadHandle {
@@ -3102,6 +3166,12 @@ impl NodeRuntime {
         CanonicalStateWriter {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    /// Bounded Denuo marketplace relay capability for native adapters.
+    #[must_use]
+    pub fn denuo_relay(&self) -> DenuoRelayHandle {
+        self.denuo_relay.clone()
     }
 
     /// Authorize a clean marker only from the crate-owned runtime supervisor.
@@ -3541,7 +3611,8 @@ impl NodeService {
                 config.network
             );
         }
-        state.configure_transaction_index(config.transaction_index)?;
+        state.configure_transaction_index(config.transaction_index || config.wallet_index)?;
+        state.configure_wallet_indexes(config.wallet_index_profile())?;
         let pruning_checkpoint = {
             let snapshot = state.store.snapshot()?;
             load_undo_pruning_checkpoint(&snapshot)?
@@ -3653,6 +3724,10 @@ impl NodeService {
         let airdrop_signatures = NativeAirdropSignatureVerifier::new().map_err(|error| {
             anyhow::anyhow!("failed to initialize airdrop relay verifier: {error}")
         })?;
+        let denuo_relay =
+            DenuoRelayHandle::new(config.denuo_relay_roles, DenuoRelayLimits::default()).map_err(
+                |error| anyhow::anyhow!("failed to initialize Denuo market relay: {error}"),
+            )?;
         Ok(Self {
             config,
             state,
@@ -3661,6 +3736,7 @@ impl NodeService {
             mempool_name_context: Mutex::new(mining_engine::ActiveMempoolNameCache::default()),
             claim_dnssec: OpenSslDnssecVerifier,
             airdrop_signatures,
+            denuo_relay,
         })
     }
 
@@ -8256,6 +8332,7 @@ pub struct NodeState {
     pub mempool: MemoryMempool,
     name_pages: Option<NamePageStorage>,
     transaction_index: bool,
+    wallet_index_profile: WalletIndexProfile,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8539,6 +8616,7 @@ impl NodeState {
             mempool: MemoryMempool::new(),
             name_pages,
             transaction_index: true,
+            wallet_index_profile: WalletIndexProfile::default(),
         };
         let audit = state.validate_durable_chain_invariants(
             checkpoint,
@@ -9337,6 +9415,57 @@ impl NodeState {
             self.store.commit(batch)?;
         }
         self.transaction_index = enabled;
+        Ok(())
+    }
+
+    fn configure_wallet_indexes(&mut self, profile: WalletIndexProfile) -> Result<()> {
+        self.ensure_storage_operational()?;
+        let snapshot = self.store.snapshot()?;
+        let persisted = snapshot
+            .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+            .context("failed to read wallet-index profile")?
+            .map(|raw| decode_index_profile(&raw))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let adds_unbuilt_component = persisted.map_or(profile.enabled(), |available| {
+            !profile.is_satisfied_by(available)
+        });
+        let has_wallet_keys = !snapshot
+            .scan_prefix_page(
+                ColumnFamily::TxIndex,
+                b"wallet-index/v1/",
+                None,
+                PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: 4 * 1024,
+                },
+            )
+            .context("failed to inspect wallet indexes")?
+            .entries
+            .is_empty();
+        if adds_unbuilt_component
+            && (best_block_tip_from_snapshot(&snapshot)?.is_some() || has_wallet_keys)
+        {
+            anyhow::bail!(
+                "wallet index profile cannot add components after indexed chain history exists; run the documented offline reindex or use a new data directory"
+            );
+        }
+        if persisted.is_none() && !profile.enabled() && has_wallet_keys {
+            anyhow::bail!(
+                "wallet index keys exist without a persistent profile; run offline verification/reindex before startup"
+            );
+        }
+        drop(snapshot);
+        if persisted != Some(profile) {
+            let mut batch = self.store.batch();
+            batch.put(
+                ColumnFamily::Snapshots,
+                INDEX_PROFILE_MODE_KEY,
+                &encode_index_profile(profile),
+            )?;
+            self.store.commit(batch)?;
+        }
+        self.wallet_index_profile = profile;
         Ok(())
     }
 
@@ -10603,6 +10732,15 @@ impl NodeState {
                 .map_err(anyhow::Error::new)
                 .context("failed to stage tx index")?;
         }
+        stage_wallet_index_connect(
+            snapshot,
+            batch,
+            &request.block,
+            request.height,
+            self.wallet_index_profile,
+        )
+        .map_err(anyhow::Error::new)
+        .context("failed to stage wallet indexes")?;
         write_canonical_height_to_batch(batch, request.height, block_hash)
             .map_err(anyhow::Error::new)
             .context("failed to stage canonical height")?;
@@ -10894,6 +11032,9 @@ impl NodeState {
                 .map_err(anyhow::Error::new)
                 .context("failed to stage tx-index deletion")?;
         }
+        stage_wallet_index_disconnect(batch, &block, &undo, self.wallet_index_profile)
+            .map_err(anyhow::Error::new)
+            .context("failed to stage wallet-index disconnect")?;
         write_block_index_to_batch(batch, &record)
             .map_err(anyhow::Error::new)
             .context("failed to stage block index update")?;

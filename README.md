@@ -5,7 +5,9 @@ consensus, authenticated chain state, native P2P synchronization, a bounded
 mempool, mining templates, and block relay without an `hsd` runtime dependency.
 
 The `hsrd` process is intentionally focused on the node and mining path. It is
-not a wallet, desktop application, domain manager, DNS server, or explorer. The
+not a custodial wallet, desktop application, domain manager, DNS server, or
+explorer. Optional indexes and a typed noncustodial chain backend support a
+separate self-custodial wallet without storing or signing with wallet keys. The
 repository also contains the separately deployed, bounded
 [`hns-resolverd`](docs/hns-resolverd.md) companion for applications that need
 ordinary HNS DNS without an `hsd` runtime.
@@ -132,6 +134,8 @@ documented in [Storage rollout](docs/storage-rollout.md).
 - [Testing and qualification](docs/testing.md)
 - [Production assurance and external evidence](docs/production-assurance.md)
 - [Storage schema and complexity](docs/storage-schema.md)
+- [Wallet indexes and typed backend](docs/HNS_NODE_WALLET_INDEX.md)
+- [Bounded Denuo marketplace relay](docs/DENUO_MARKET_RELAY.md)
 - [Docker and GHCR](docs/docker.md)
 - [Native mainnet mining canary](docs/mainnet-canary.md)
 - [Extraction provenance](docs/extraction-provenance.md)

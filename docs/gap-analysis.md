@@ -293,9 +293,11 @@ production authority.
 
 ## Explicitly excluded product work
 
-Wallets, seed/key management, desktop/mobile UI, domain management, explorer
-indexes, and broad convenience RPC compatibility remain outside `hsrd`. DNS
-resolution remains outside the `hsrd` process and is composed through the
-separate `hns-resolverd` crate. Consensus parsing of name/resource bytes remains
-only where block validity requires it; typed DNS projection is a reusable
-non-consensus view.
+Custodial wallet state, seed/key management, transaction signing,
+desktop/mobile UI, domain-management UI, explorer indexes, and broad
+convenience RPC compatibility remain outside `hsrd`. Optional wallet-restoration
+indexes and the typed noncustodial chain backend are now implemented as
+non-authoritative node services. DNS resolution remains outside the `hsrd`
+process and is composed through the separate `hns-resolverd` crate. Consensus
+parsing of name/resource bytes remains only where block validity requires it;
+typed DNS projection is a reusable non-consensus view.

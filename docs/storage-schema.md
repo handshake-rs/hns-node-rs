@@ -313,6 +313,15 @@ cannot promote a block or grant authority.
   not read it. `--transaction-index` (alias `--index-tx`) opts in before the
   first indexed block. Enabling it after unindexed history exists fails closed
   until an offline rebuild or a new data directory is used.
+  Versioned `wallet-index/v1/` subspaces in the same column family optionally
+  store script history, outpoint spenders, and script UTXOs. Their keys cannot
+  collide with the fixed 32-byte transaction keys. History and spender values
+  checksum their exact key; UTXO reads reconstruct the script/outpoint key and
+  verify the decoded address identity, so relocated values fail closed. The
+  checksummed `wallet-index-profile/v1` snapshot record prevents partially
+  indexed history
+  from being enabled after startup; see
+  [Handshake wallet indexes](HNS_NODE_WALLET_INDEX.md).
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.
@@ -333,7 +342,8 @@ cannot promote a block or grant authority.
   `name-tree-compaction/v1` for the atomically published last compaction result,
   plus `undo-pruning/v1` for the atomically advanced undo-retirement boundary.
   `name-page-state/v1`, per-root page locators, block/undo segment manifests,
-  and `transaction-index-mode/v1` bind the optimized storage tiers.
+  `transaction-index-mode/v1`, and `wallet-index-profile/v1` bind the optimized
+  storage tiers.
   `startup-audit/v1` is an unkeyed checksummed consistency record binding the
   schema/profile, network/genesis, best header, active tip, chain epoch, mining
   generation, working and committed name roots, airdrop field, complete
