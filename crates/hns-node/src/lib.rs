@@ -959,6 +959,167 @@ impl<'a, S: ReadSnapshot> StartupPinCursor<'a, S> {
     }
 }
 
+fn startup_pin_minimum_root_heights(
+    snapshot: &impl ReadSnapshot,
+    network: Network,
+    retained_roots: &BTreeSet<TreeRoot>,
+) -> Result<BTreeMap<TreeRoot, Height>> {
+    let mut pins = StartupPinCursor::new(snapshot, network)?;
+    let mut heights = BTreeMap::<TreeRoot, Height>::new();
+    while let Some(pin) = pins.next_pin()? {
+        if pin.root == TreeRoot::ZERO || !retained_roots.contains(&pin.root) {
+            continue;
+        }
+        if let Some(height) = heights.get_mut(&pin.root) {
+            *height = (*height).min(pin.height);
+            continue;
+        }
+        let actual = u64::try_from(heights.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if actual > MAX_NAME_PAGE_ROOT_LOCATORS {
+            return Err(PageTreeError::ResourceLimit {
+                context: "startup snapshot-pin root locators",
+                limit: MAX_NAME_PAGE_ROOT_LOCATORS,
+                actual,
+            }
+            .into());
+        }
+        heights.insert(pin.root, pin.height);
+    }
+    Ok(heights)
+}
+
+fn plan_name_page_pin_height_repairs(
+    snapshot: &impl ReadSnapshot,
+    network: Network,
+) -> Result<Vec<NamePageRootRecord>> {
+    let mut pins = StartupPinCursor::new(snapshot, network)?;
+    let mut repairs = BTreeMap::<TreeRoot, NamePageRootRecord>::new();
+    while let Some(pin) = pins.next_pin()? {
+        if pin.root == TreeRoot::ZERO {
+            continue;
+        }
+        let Some(mut record) = load_name_page_root_record(snapshot, pin.root)? else {
+            continue;
+        };
+        if record.root != pin.root {
+            anyhow::bail!("name-page root locator key does not match its record");
+        }
+        if record.height <= pin.height {
+            continue;
+        }
+        record.height = pin.height;
+        if let Some(planned) = repairs.get_mut(&pin.root) {
+            planned.height = planned.height.min(record.height);
+            continue;
+        }
+        let actual = u64::try_from(repairs.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if actual > MAX_NAME_PAGE_ROOT_LOCATORS {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page pin-height repair records",
+                limit: MAX_NAME_PAGE_ROOT_LOCATORS,
+                actual,
+            }
+            .into());
+        }
+        repairs.insert(pin.root, record);
+    }
+
+    let mut publication_bytes = 0u64;
+    for record in repairs.values() {
+        let record_bytes = u64::try_from(name_page_root_key(record.root).len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(record.encode().len()).unwrap_or(u64::MAX));
+        publication_bytes = publication_bytes.saturating_add(record_bytes);
+        if publication_bytes > MAX_NAME_PAGE_PUBLICATION_BYTES {
+            return Err(PageTreeError::ResourceLimit {
+                context: "name-page pin-height repair publication bytes",
+                limit: MAX_NAME_PAGE_PUBLICATION_BYTES,
+                actual: publication_bytes,
+            }
+            .into());
+        }
+    }
+    Ok(repairs.into_values().collect())
+}
+
+fn validate_name_page_pin_height_repairs(
+    directory: &std::path::Path,
+    state: &NamePageState,
+    repairs: &[NamePageRootRecord],
+) -> Result<()> {
+    let Some(first) = repairs.first() else {
+        return Ok(());
+    };
+    let maximum_addresses = u64::try_from(repairs.len())
+        .unwrap_or(u64::MAX)
+        .checked_mul(3)
+        .ok_or_else(|| anyhow::anyhow!("name-page pin-height repair address limit overflow"))?;
+    let reader = NamePageTreeReader::open_generation(
+        directory,
+        state.manifest.generation,
+        state.manifest.active_segment,
+        first.root,
+        first.locator,
+    )
+    .context("failed to open name pages for pin-height repair validation")?;
+    for record in repairs {
+        reader
+            .insert_root_bounded(record.root, record.locator, maximum_addresses)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to seed pin-height repair root {:?}: {error}",
+                    record.root
+                )
+            })?;
+        if reader
+            .load_bounded(record.root, maximum_addresses)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "failed to validate pin-height repair root {:?}: {error}",
+                    record.root
+                )
+            })?
+            .is_none()
+        {
+            anyhow::bail!(
+                "pin-height repair root {:?} is absent from its authenticated page",
+                record.root
+            );
+        }
+    }
+    Ok(())
+}
+
+fn minimum_name_page_root_height(
+    snapshot: &impl ReadSnapshot,
+    network: Network,
+    root: TreeRoot,
+    proposed_height: Height,
+    staged_pins: &[NameTreeSnapshotPin],
+) -> Result<Height> {
+    let mut minimum = proposed_height;
+    if let Some(record) = load_name_page_root_record(snapshot, root)? {
+        if record.root != root {
+            anyhow::bail!("name-page root locator key does not match its record");
+        }
+        minimum = minimum.min(record.height);
+    }
+    let mut pins = StartupPinCursor::new(snapshot, network)?;
+    while let Some(pin) = pins.next_pin()? {
+        if pin.root == root {
+            minimum = minimum.min(pin.height);
+        }
+    }
+    for pin in staged_pins.iter().filter(|pin| pin.root == root) {
+        minimum = minimum.min(pin.height);
+    }
+    Ok(minimum)
+}
+
 fn seed_startup_pin_page_roots(
     snapshot: &impl ReadSnapshot,
     network: Network,
@@ -5617,6 +5778,7 @@ struct NodeReorgMutation {
 
 #[derive(Debug)]
 struct NamePageStorage {
+    network: Network,
     directory: PathBuf,
     file_path: PathBuf,
     state: NamePageState,
@@ -5955,7 +6117,11 @@ impl NamePageStorage {
         self.reopen_required = true;
     }
 
-    fn open_or_bootstrap(directory: PathBuf, store: &StoreHandle) -> Result<Self> {
+    fn open_or_bootstrap(
+        directory: PathBuf,
+        store: &StoreHandle,
+        network: Network,
+    ) -> Result<Self> {
         let filesystem_limits = production_name_page_filesystem_limits();
         ensure_name_page_filesystem_deadline(filesystem_limits, "name-page startup recovery")?;
         std::fs::create_dir_all(&directory)
@@ -5974,6 +6140,7 @@ impl NamePageStorage {
                 anyhow::bail!("name-page root does not match the durable committed name-tree root");
             }
             validate_name_page_root_record(&snapshot, &state)?;
+            let pin_height_repairs = plan_name_page_pin_height_repairs(&snapshot, network)?;
             let file_path = name_page_file_path(
                 &directory,
                 state.manifest.generation,
@@ -6016,7 +6183,26 @@ impl NamePageStorage {
                     "name-page generation contains {generation_bytes} bytes; production ceiling is {MAX_NAME_PAGE_GENERATION_BYTES}"
                 );
             }
+            validate_name_page_pin_height_repairs(&directory, &state, &pin_height_repairs)?;
+            if !pin_height_repairs.is_empty() {
+                let mut batch = store.batch();
+                for record in &pin_height_repairs {
+                    batch.put(
+                        ColumnFamily::Snapshots,
+                        &name_page_root_key(record.root),
+                        &record.encode(),
+                    )?;
+                }
+                store
+                    .commit(batch)
+                    .context("failed to publish validated name-page pin-height repairs")?;
+                tracing::warn!(
+                    repaired = pin_height_repairs.len(),
+                    "normalized name-page root locator heights to their earliest snapshot pins"
+                );
+            }
             return Ok(Self {
+                network,
                 directory,
                 file_path,
                 state,
@@ -6086,6 +6272,8 @@ impl NamePageStorage {
             &state.encode()?,
         )?;
         if let (Some(address), Some(height)) = (state.root_address, height) {
+            let height =
+                minimum_name_page_root_height(&snapshot, network, durable_root, height, &[])?;
             let record = NamePageRootRecord {
                 root: durable_root,
                 locator: NamePageRootLocator::new(generation, address),
@@ -6109,6 +6297,7 @@ impl NamePageStorage {
             );
         }
         Ok(Self {
+            network,
             directory,
             file_path,
             state,
@@ -6194,6 +6383,8 @@ impl NamePageStorage {
             &snapshot,
             production_name_page_root_locator_scan_limits(filesystem_limits.deadline),
         )?;
+        let pin_heights =
+            startup_pin_minimum_root_heights(&snapshot, self.network, &retained_roots)?;
         let file_path = name_page_file_path(&self.directory, generation, 0);
         let mut commit_attempted = false;
         let staged = (|| -> Result<StagedNamePageCompaction> {
@@ -6363,7 +6554,8 @@ impl NamePageStorage {
                     height: old_records
                         .get(&root)
                         .map(|record| record.height)
-                        .unwrap_or(fallback_height),
+                        .unwrap_or(fallback_height)
+                        .min(pin_heights.get(&root).copied().unwrap_or(fallback_height)),
                 };
                 batch.put(
                     ColumnFamily::Snapshots,
@@ -6521,6 +6713,13 @@ impl NamePageStorage {
                     let address = packed.address(root).ok_or_else(|| {
                         anyhow::anyhow!("restored legacy pack did not assign its root")
                     })?;
+                    let record_height = minimum_name_page_root_height(
+                        snapshot,
+                        self.network,
+                        root,
+                        height,
+                        snapshot_pins,
+                    )?;
                     let page_count = packed.page_count();
                     let next_generation_bytes = self.preflight_append_pages(page_count)?;
                     batch.charge_name_page_output(page_count)?;
@@ -6545,7 +6744,7 @@ impl NamePageStorage {
                     let record = NamePageRootRecord {
                         root,
                         locator: NamePageRootLocator::new(next.manifest.generation, address),
-                        height,
+                        height: record_height,
                     };
                     batch.put(
                         ColumnFamily::Snapshots,
@@ -6580,6 +6779,8 @@ impl NamePageStorage {
                 .ok_or_else(|| {
                     anyhow::anyhow!("name-page update did not resolve its resulting root")
                 })?;
+            let record_height =
+                minimum_name_page_root_height(snapshot, self.network, root, height, snapshot_pins)?;
             let mut published_pins = BTreeMap::<TreeRoot, Height>::new();
             for pin in snapshot_pins {
                 if pin.root != TreeRoot::ZERO && pin.root != root {
@@ -6634,7 +6835,7 @@ impl NamePageStorage {
             let record = NamePageRootRecord {
                 root,
                 locator: NamePageRootLocator::new(next.manifest.generation, address),
-                height,
+                height: record_height,
             };
             batch.put(
                 ColumnFamily::Snapshots,
@@ -7450,7 +7651,7 @@ pub fn clear_production_safety_fence_validated(
                     "name-page safety-fence recovery requires the canonical name-page directory"
                 )
             })?;
-            let pages = NamePageStorage::open_or_bootstrap(directory.to_path_buf(), store)
+            let pages = NamePageStorage::open_or_bootstrap(directory.to_path_buf(), store, network)
                 .context("failed to reopen name pages for safety-fence validation")?;
             let snapshot = store.snapshot()?;
             let required_roots = [
@@ -8192,6 +8393,7 @@ impl NodeState {
             Some(data_dir) => Some(NamePageStorage::open_or_bootstrap(
                 data_dir.join("name-pages"),
                 &store,
+                config.network,
             )?),
             None => None,
         };
@@ -13429,7 +13631,8 @@ mod tests {
             .expect("initialize seal rollback store");
         drop(initialized);
         let mut pages =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("open pages");
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("open pages");
         let state_before = pages.state.clone();
         let path_before = pages.file_path.clone();
         let store_before = complete_store_image(&store);
@@ -13500,7 +13703,8 @@ mod tests {
         let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
             .expect("initialize rollback fence store");
         state.name_pages = Some(
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("open pages"),
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("open pages"),
         );
         // Deterministically make truncate validation fail after the rollback
         // has surrendered its live appender. This models remove/truncate/reopen
@@ -13909,7 +14113,7 @@ mod tests {
         let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
             .expect("initialize page-fence store");
         drop(
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store)
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
                 .expect("bootstrap authoritative pages"),
         );
         state
@@ -15768,8 +15972,8 @@ mod tests {
             NodeState::from_store_for_network(store.clone(), Network::Regtest)
                 .expect("initialize page store"),
         );
-        let pages =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("open pages");
+        let pages = NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+            .expect("open pages");
         let locator = NamePageRootLocator::new(
             pages.state.manifest.generation,
             hns_store::NamePageAddress::new(0, 0, 0).expect("test locator"),
@@ -16029,6 +16233,133 @@ mod tests {
     }
 
     #[test]
+    fn name_page_bootstrap_and_reopen_use_earliest_reused_pin_height() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-node-name-page-reused-pin-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let tree = MemoryUrkel::from_entries([
+            (NameHash::new([0x21; 32]), b"reused-left".to_vec()),
+            (NameHash::new([0xa1; 32]), b"reused-right".to_vec()),
+        ])
+        .expect("reused pin tree");
+        let root = tree.root();
+        let tip_height = 3_205;
+        let tip_hash = BlockHash::new([0x72; 32]);
+        let tip = BlockIndexRecord {
+            hash: tip_hash,
+            height: tip_height,
+            prev_hash: BlockHash::ZERO,
+            chainwork: Uint256::ONE,
+            status: BlockStatus {
+                active_chain: true,
+                ..BlockStatus::default()
+            },
+            tx_count: 0,
+            validated_at: None,
+        };
+        let mut batch = store.batch();
+        for (node_root, raw) in tree.node_records().expect("reused pin records") {
+            batch
+                .put(ColumnFamily::NameTreeNodes, node_root.as_bytes(), &raw)
+                .expect("stage reused pin record");
+        }
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                root.as_bytes(),
+            )
+            .expect("stage working root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                root.as_bytes(),
+            )
+            .expect("stage committed root");
+        write_block_index_to_batch(&mut batch, &tip).expect("stage reused pin tip");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestBlockHash.as_bytes(),
+                tip_hash.as_bytes(),
+            )
+            .expect("bind reused pin tip");
+        for (height, tag) in [(2_952, 0x73), (3_204, 0x74)] {
+            batch
+                .put(
+                    ColumnFamily::Snapshots,
+                    &name_tree_snapshot_pin_key(height),
+                    &NameTreeSnapshotPin {
+                        height,
+                        block_hash: BlockHash::new([tag; 32]),
+                        root,
+                    }
+                    .encode(),
+                )
+                .expect("stage reused snapshot pin");
+        }
+        store.commit(batch).expect("publish reused pin fixture");
+
+        let pages = NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Mainnet)
+            .expect("bootstrap reused pin pages");
+        let snapshot = store.snapshot().expect("bootstrapped reused pin snapshot");
+        let record = load_name_page_root_record(&snapshot, root)
+            .expect("read bootstrap locator")
+            .expect("bootstrap locator");
+        assert_eq!(record.height, 2_952);
+        let locator = record.locator;
+        drop(snapshot);
+        drop(pages);
+
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                &name_page_root_key(root),
+                &NamePageRootRecord {
+                    root,
+                    locator,
+                    height: tip_height,
+                }
+                .encode(),
+            )
+            .expect("stage legacy inconsistent locator height");
+        store
+            .commit(batch)
+            .expect("publish legacy inconsistent locator height");
+
+        let pages = NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Mainnet)
+            .expect("repair reused pin locator height on reopen");
+        let snapshot = store.snapshot().expect("repaired reused pin snapshot");
+        let record = load_name_page_root_record(&snapshot, root)
+            .expect("read repaired locator")
+            .expect("repaired locator");
+        assert_eq!(record.height, 2_952);
+        let (reader, legacy_missing) = pages
+            .reader_for_roots(&snapshot, std::iter::empty(), false)
+            .expect("open repaired reused pin reader");
+        assert!(!legacy_missing);
+        assert!(
+            !seed_startup_pin_page_roots(&snapshot, Network::Mainnet, &reader)
+                .expect("seed reused pin roots after repair")
+        );
+
+        drop(reader);
+        drop(snapshot);
+        drop(pages);
+        std::fs::remove_dir_all(directory).expect("remove reused pin pages");
+    }
+
+    #[test]
     fn exhaustive_page_audit_seeds_more_than_4096_historical_pin_roots() {
         const PIN_COUNT: u32 = 4_097;
 
@@ -16235,7 +16566,8 @@ mod tests {
         store.commit(batch).expect("publish pre-page state");
 
         let mut pages =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("bootstrap pages");
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("bootstrap pages");
         let mut batch = store.batch();
         batch
             .put(
@@ -16361,9 +16693,12 @@ mod tests {
         let _rejected_state =
             NodeState::from_store_for_network(rejected_store.clone(), Network::Regtest)
                 .expect("initialize rejected store");
-        let mut rejected_pages =
-            NamePageStorage::open_or_bootstrap(rejected_directory.clone(), &rejected_store)
-                .expect("rejected pages");
+        let mut rejected_pages = NamePageStorage::open_or_bootstrap(
+            rejected_directory.clone(),
+            &rejected_store,
+            Network::Regtest,
+        )
+        .expect("rejected pages");
         let rejected_committed = rejected_pages.state.manifest.durable_bytes;
         let _ = append_synced_page(&mut rejected_pages, 0x41);
         let rejected_tail = std::fs::metadata(&rejected_pages.file_path)
@@ -16387,9 +16722,12 @@ mod tests {
             )
             .is_err());
         drop(rejected_pages);
-        let rejected_reopened =
-            NamePageStorage::open_or_bootstrap(rejected_directory.clone(), &rejected_store)
-                .expect("reopen rejected pages");
+        let rejected_reopened = NamePageStorage::open_or_bootstrap(
+            rejected_directory.clone(),
+            &rejected_store,
+            Network::Regtest,
+        )
+        .expect("reopen rejected pages");
         assert_eq!(
             std::fs::metadata(&rejected_reopened.file_path)
                 .expect("reopened rejected metadata")
@@ -16404,9 +16742,12 @@ mod tests {
         let _applied_state =
             NodeState::from_store_for_network(applied_store.clone(), Network::Regtest)
                 .expect("initialize applied store");
-        let mut applied_pages =
-            NamePageStorage::open_or_bootstrap(applied_directory.clone(), &applied_store)
-                .expect("applied pages");
+        let mut applied_pages = NamePageStorage::open_or_bootstrap(
+            applied_directory.clone(),
+            &applied_store,
+            Network::Regtest,
+        )
+        .expect("applied pages");
         let applied_manifest = append_synced_page(&mut applied_pages, 0x42);
         let applied_tail = std::fs::metadata(&applied_pages.file_path)
             .expect("applied tail metadata")
@@ -16432,9 +16773,12 @@ mod tests {
             applied_tail
         );
         drop(applied_pages);
-        let applied_reopened =
-            NamePageStorage::open_or_bootstrap(applied_directory.clone(), &applied_store)
-                .expect("reopen applied pages");
+        let applied_reopened = NamePageStorage::open_or_bootstrap(
+            applied_directory.clone(),
+            &applied_store,
+            Network::Regtest,
+        )
+        .expect("reopen applied pages");
         assert_eq!(applied_reopened.state.manifest, applied_manifest);
         assert_eq!(
             std::fs::metadata(&applied_reopened.file_path)
@@ -16463,8 +16807,10 @@ mod tests {
         let store = StoreHandle::memory();
         let mut state =
             NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        state.name_pages =
-            Some(NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages"));
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("pages"),
+        );
         let mut node = NodeService::try_with_state(
             NodeConfig {
                 network: Network::Regtest,
@@ -16566,8 +16912,10 @@ mod tests {
         let store = StoreHandle::memory();
         let mut state =
             NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        state.name_pages =
-            Some(NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages"));
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("pages"),
+        );
         state.state_engine = StoredStateEngine::with_services(
             store.clone(),
             Network::Regtest,
@@ -16786,8 +17134,8 @@ mod tests {
         drop(unpublished);
         drop(node);
 
-        let pages =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("reopen pages");
+        let pages = NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+            .expect("reopen pages");
         assert!(!unpublished_path.exists());
         let snapshot = store.snapshot().expect("sealed snapshot");
         let (reader, _) = pages
@@ -16828,7 +17176,8 @@ mod tests {
             NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
         drop(state);
         let mut pages =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages");
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("pages");
         let first = MemoryUrkel::from_entries([
             (NameHash::new([0x11; 32]), b"alpha".to_vec()),
             (NameHash::new([0x91; 32]), b"beta".to_vec()),
@@ -16885,7 +17234,7 @@ mod tests {
         pages.commit_prepared(prepared);
 
         let snapshot = store.snapshot().expect("published snapshot");
-        for (root, expected_height) in [(first_root, 5), (second_root, 12)] {
+        for (root, expected_height) in [(first_root, 5), (second_root, 10)] {
             let record = load_name_page_root_record(&snapshot, root)
                 .expect("load locator")
                 .expect("published locator");
@@ -16969,7 +17318,8 @@ mod tests {
         );
         drop(pages);
         let reopened =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("recover pages");
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("recover pages");
         assert!(!orphan_path.exists());
         assert!(!superseded_path.exists());
         assert_eq!(reopened.state.manifest.generation, 2);
@@ -20722,8 +21072,10 @@ mod tests {
         let store = StoreHandle::memory();
         let mut state =
             NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        state.name_pages =
-            Some(NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages"));
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("pages"),
+        );
         let mut node = NodeService::try_with_state(
             NodeConfig {
                 network: Network::Regtest,

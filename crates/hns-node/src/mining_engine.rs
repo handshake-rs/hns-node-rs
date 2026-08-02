@@ -4337,8 +4337,12 @@ mod tests {
             std::process::id()
         ));
         node.state.name_pages = Some(
-            crate::NamePageStorage::open_or_bootstrap(directory.clone(), &node.state.store)
-                .expect("test name-page storage"),
+            crate::NamePageStorage::open_or_bootstrap(
+                directory.clone(),
+                &node.state.store,
+                Network::Regtest,
+            )
+            .expect("test name-page storage"),
         );
         directory
     }

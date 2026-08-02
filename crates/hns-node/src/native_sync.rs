@@ -11697,8 +11697,10 @@ mod tests {
         let store = StoreHandle::memory();
         let mut state =
             NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        state.name_pages =
-            Some(NamePageStorage::open_or_bootstrap(directory.clone(), &store).expect("pages"));
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("pages"),
+        );
         let mut node = NodeService::try_with_state(
             NodeConfig {
                 network: Network::Regtest,
