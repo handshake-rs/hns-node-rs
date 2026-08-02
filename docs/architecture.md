@@ -125,16 +125,51 @@ to the mining lane's reserved storage budget.
 
 The optional wallet profile adds only derivative public indexes. The typed
 backend exposes active-height hashes and tree-root-bearing tips, combines
-transaction status/inclusion/payload with one chain/mempool generation, and
+transaction status/inclusion/payload with one chain epoch and mempool
+instance/generation, and
 bundles current versus interval-root-authenticated name state, proof, and owner
 evidence in one snapshot. Confirmed history/UTXO restoration uses a global
 script-set- and chain-epoch-bound cursor so a reorganization cannot tear a
 multi-page scan. Collection admission and a 256-script-prefix-page work bound
 permit resumable empty progress without monopolizing the point-read lane.
 Mempool continuations additionally bind a fallibly initialized, random,
-nonzero, process-local instance nonce, so a restart cannot reuse generation
-numbers as cursor authority. Multi-script result positions refer to the sorted
+nonzero, process-local instance nonce and the durable chain epoch, so neither a
+restart nor a confirmed-chain transition can reuse generation numbers as
+cursor authority. Mempool pages carry the complete chain tip and exact
+admission time. Multi-script result positions refer to the sorted
 request, so the wallet adapter owns the reverse map to derivation order.
+
+Active-height hash lookup and ordered, bounded outpoint-spend batches carry one
+immutable chain epoch/tip binding. Confirmed history carries optional canonical
+header time. Transaction position is exact when retained block bytes allow the
+node to enumerate it and explicitly unavailable after pruning; zero is never a
+sentinel. This avoids extending the durable transaction-index schema inside a
+transport change.
+
+The native-sync process exposes that backend through authenticated wallet RPC
+v1 at `POST /api/v1/wallet`. The transport is a projection layer, not a second
+chain implementation: native runtime reads, canonical writer admission, index
+page bounds, and peer fanout remain behind the existing typed backend. It is
+constructed only for a canonical active-state native runtime, an explicitly
+authenticated listener, and the durable complete wallet profile. Headers-only,
+observe-only, diagnostic-only, narrower-profile, or unauthenticated listeners
+do not install the route. The listener's body, concurrency, and
+timeout middleware remains outside the handler, and the
+backend's separate point/collection admission remains inside it.
+
+Wire continuations encode typed cursors as bounded behaviorally opaque tokens,
+not secrets or authenticated capabilities. Binary identities and payloads are
+canonical hexadecimal strings, so an independent wallet process need not link
+this workspace. Wire pages/scans are stricter than internal index bounds, and
+each JSON result is encoded and measured against an 8 MiB ceiling before
+publication. The response preserves explicit
+chain epoch/tip and mempool instance nonce/generation boundaries. Name current
+state and proof-root state, plus both owner views, remain separate. Complete
+canonical NameState values are transported as explicit encoded hex; projected
+resource data remains a non-authoritative hint. Name data,
+tracked-contract descriptors, and revealed-preimage settlement semantics stay
+opaque pending published canonical protocol dependencies; the transport never
+becomes their semantic authority.
 
 Public Shakedex/HTLC registrations and confirmed events share the canonical
 block/reorg batch, but never participate in consensus validity. Connect staging

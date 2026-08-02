@@ -186,6 +186,7 @@ and the live peer manager. It implements:
 
 - `get_chain_tip`
 - `get_block_hash`
+- `get_block_hash_evidence`
 - `get_raw_transaction`
 - `get_transaction_evidence`
 - `get_transaction_status`
@@ -194,6 +195,7 @@ and the live peer manager. It implements:
 - `get_script_utxos`
 - `get_confirmed_scripts_page`
 - `get_spending_transaction`
+- `get_outpoint_spending_evidence`
 - `register_tracked_contract`
 - `get_tracked_contract`
 - `get_tracked_contract_fundings`
@@ -211,11 +213,19 @@ and the live peer manager. It implements:
 `WalletChainTip` contains the active hash, height, and the exact authenticated
 name-tree root used for current persisted proofs. `get_transaction_evidence`
 captures status, inclusion, retained-or-pruned payload state, active tip,
-durable chain epoch, and immutable mempool generation together, then rejects
+durable chain epoch, and immutable mempool instance/generation together, then rejects
 the result if publication changes during the read. The compatibility status,
 inclusion, and raw-transaction calls are projections of that combined read;
 wallet adapters should consume the combined result when several fields must
 agree across a reorganization.
+
+Block-hash evidence and ordered outpoint-spend evidence return the durable
+chain epoch and complete tip from the same immutable snapshot. The spending
+batch contains exactly one result per requested outpoint in request order and
+is capped at 4,096 entries internally (256 on wallet RPC). Confirmed inclusion
+contains an exact optional transaction position: retained block bytes make the
+position derivable, while pruned legacy transaction-index rows retain valid
+inclusion without an ordinal. No layer substitutes zero.
 
 `get_name_evidence` returns one durable chain epoch containing the active tip,
 current NameState, interval-root-authenticated NameState, proof, and both
@@ -250,6 +260,51 @@ policy estimate, not a confirmation guarantee.
 The API exposes no signing operation, seed storage, arbitrary key access, or
 wallet database.
 
+## Authenticated process boundary
+
+The native-sync listener projects the safe subset above through versioned
+`POST /api/v1/wallet`. This is the consumable boundary for an independently
+built `hns-wallet-rs` adapter; it does not require a path or sibling Cargo
+dependency. The route is instantiated only when native sync owns the canonical
+active-state runtime and peer manager (not headers-only/observe-only), the
+durable complete `--wallet-index` profile is
+active, and an exact `--rpc-authorization-header-file` value was explicitly
+configured. Loopback alone never enables it. Diagnostic-only mode, a narrower
+index profile, or missing listener authentication leaves the route unrouted;
+no wallet request is parsed and no wallet read or write begins.
+
+The v1 request/response envelope uses canonical hexadecimal identities and raw
+transactions. Continuations are bounded behaviorally opaque hexadecimal
+tokens, not secrets or authenticated capabilities. Confirmed responses
+preserve chain epoch, tip, and script-set binding; mempool responses preserve
+the chain epoch/tip plus explicit process instance nonce, generation, and query
+binding. Mempool requests supply their confirmed restore epoch, and mempool
+cursors bind that epoch as well as the process-local generation.
+Transaction/raw point requests also require that chain epoch and optionally
+require the exact nonce/generation learned from a prior mempool page; omission
+means an explicitly independent current mempool capture.
+Block-hash, name, spender, and confirmed contract reads require the learned
+chain epoch as well. Their full returned tips remain available for exact adapter
+comparison.
+The listener's body limit, concurrency admission, timeout, Authorization
+middleware, backend collection permits, and canonical-writer queue all remain
+in force. Stable wire errors redact node/store internals and distinguish stale
+retry, unavailable index, invalid cursor/bound, pruned payload, rejected/orphan
+transaction, and inconsistent derivative evidence.
+Wire pages are capped at 256 rows, mempool scans at 1,024 transaction IDs, and
+every projected JSON result is encoded and measured against an 8 MiB ceiling
+before response publication. These limits are stricter than the typed index
+page envelope so hexadecimal and covenant expansion stays bounded.
+
+`name_evidence` carries separate current/proof states and owners plus complete
+canonical `encode_name_state` byte strings for both views. Projected
+`data_hex` is only the resource field and remains semantically opaque; an
+adapter never reconstructs consensus bytes from projected fields. The wire exposes existing tracked-contract
+funding/spend classifications by opaque content ID only: it does not expose
+descriptor registration or raw revealed-preimage transport while the canonical
+`hns-rs` 0.2 protocol boundary is unpublished. The exact wire contract is in
+[`WALLET_RPC_V1.md`](WALLET_RPC_V1.md).
+
 ## Confirmed restoration snapshot
 
 The one-script history and UTXO methods are point-query conveniences; looping
@@ -268,7 +323,9 @@ through the collection-read lane and examines at most 256 underlying
 script-prefix pages per call. It can therefore return an empty result with a
 nonterminal continuation; `script_examinations` reports the work consumed and
 the caller must resume it. The page includes the active tip captured in the same
-store snapshot. As with mempool results, the adapter must preserve a reverse
+store snapshot. Confirmed history includes optional canonical header
+`block_time`, cached by block hash within that snapshot, and never fabricates a
+timestamp when unavailable. As with mempool results, the adapter must preserve a reverse
 mapping from sorted request position to wallet derivation order.
 
 ## Mempool reconciliation
@@ -280,8 +337,10 @@ index in that sorted request, not the wallet's derivation-order index. An
 adapter must retain a reverse mapping from each sorted request position to the
 original derivation path/address record before applying results. This avoids
 an address-by-address rescan without silently reassigning activity.
-Continuations bind the exact published mempool generation and a cryptographically
-random, nonzero, non-persisted mempool-instance nonce. Initialization obtains
+Continuations bind the durable chain epoch, exact published mempool generation,
+query identity, and a cryptographically random, nonzero, non-persisted
+mempool-instance nonce. Pages return the same chain epoch and tip and each
+relevant activity carries the exact mempool `admitted_at` value. Initialization obtains
 that nonce through the fallible operating-system RNG and fails startup on RNG
 failure or the reserved zero value. Clear and in-process revalidation preserve
 the nonce; process restart creates a new one. A generation change returns
@@ -344,9 +403,10 @@ still keep it out of logs.
 
 ## Remaining integration work
 
-This source implementation still needs the repository's full qualification
-gate and cross-repository wallet adapter qualification, including the canonical
-`hns-swap` pin described above, before it is release-qualified. Safe immutable
+This source implementation now has a bounded authenticated process transport,
+but still needs the repository's full qualification gate and an independent
+cross-repository wallet adapter implementation/qualification, including the
+canonical `hns-swap` pin described above, before it is release-qualified. Safe immutable
 registry retirement and capacity reclamation are also unavailable and remain a
 production-availability blocker. Live subscription delivery remains outside
 this typed pull API. Durable encrypted workflow state, rebroadcast journals,

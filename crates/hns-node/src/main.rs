@@ -26,6 +26,8 @@ use hns_node::{
 };
 use hns_store::DurabilityPolicy;
 
+const MAX_RPC_AUTHORIZATION_FILE_BYTES: usize = MAX_RPC_AUTHORIZATION_BYTES + 2;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "hsrd",
@@ -371,7 +373,7 @@ fn read_rpc_authorization(path: &Path) -> anyhow::Result<RpcAuthorizationHeader>
     options.custom_flags(libc::O_NOFOLLOW);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_RPC_AUTHORIZATION_BYTES as u64 {
+    if !metadata.is_file() || metadata.len() > MAX_RPC_AUTHORIZATION_FILE_BYTES as u64 {
         anyhow::bail!("RPC authorization header must be a bounded mode-0600 regular file");
     }
     #[cfg(unix)]
@@ -383,13 +385,17 @@ fn read_rpc_authorization(path: &Path) -> anyhow::Result<RpcAuthorizationHeader>
         anyhow::bail!("RPC authorization header must not be a symbolic link");
     }
     let mut bytes = Vec::new();
-    file.take((MAX_RPC_AUTHORIZATION_BYTES + 1) as u64)
+    file.take((MAX_RPC_AUTHORIZATION_FILE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_RPC_AUTHORIZATION_BYTES {
+    if bytes.len() > MAX_RPC_AUTHORIZATION_FILE_BYTES {
         anyhow::bail!("RPC authorization header exceeds the hard byte limit");
     }
-    let value = String::from_utf8(bytes)?.trim().to_owned();
-    RpcAuthorizationHeader::new(value)
+    let value = String::from_utf8(bytes)?;
+    let value = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(&value);
+    RpcAuthorizationHeader::new(value.to_owned())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

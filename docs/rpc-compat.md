@@ -6,10 +6,11 @@ hsrd-specific read-only `getparentauthority` method as its authenticated
 runtime parent boundary; in-process mining continues to use native Rust types
 and bounded channels.
 
-The HTTP/JSON surface is retained only for operator diagnostics, health checks,
-and fixture comparison. It binds to loopback by default. Each durable lookup
-uses one immutable store snapshot; the live runtime does not materialize the
-database into a process-wide RPC snapshot.
+The HTTP/JSON surface is retained for operator diagnostics, health checks,
+fixture comparison, and one separately versioned noncustodial wallet process
+boundary. It binds to loopback by default. Each durable lookup uses one
+immutable store snapshot; the live runtime does not materialize the database
+into a process-wide RPC snapshot.
 
 ## Currently implemented
 
@@ -126,11 +127,26 @@ database into a process-wide RPC snapshot.
   runtime instance used to correlate restart evidence.
 - Optional whole-listener Authorization enforcement from
   `--rpc-authorization-header-file`. The absolute nonsymlink file must be
-  private and contain one bounded nonempty header value such as `Bearer ...`.
+  private and contain one 1..=4,096-byte visible-ASCII header value such as
+  `Bearer ...`, with no leading/trailing whitespace. One terminal LF or CRLF
+  is removed; other whitespace/control/Unicode input is not normalized.
   When configured, every JSON-RPC and diagnostic route rejects missing or
   unequal values with HTTP 401. Secrets are redacted from Debug output.
-- Unsupported mutations fail explicitly. No current control endpoint performs
-  a mutation.
+- Authenticated active-state native sync exposes `POST /api/v1/wallet` only
+  when both the exact Authorization header and durable `--wallet-index` profile
+  are configured. Headers-only/observe-only operation and loopback are not
+  sufficient. Its v1 envelope projects the typed
+  wallet backend without a Rust sibling dependency: chain/tip reads, global
+  confirmed restoration, chain-epoch/restart-bound mempool pages, transaction,
+  ordered batch spender, and canonical current/proof-name evidence, fee
+  estimation, signed-transaction broadcast, and opaque tracked
+  contract evidence. See [`WALLET_RPC_V1.md`](WALLET_RPC_V1.md).
+- `broadcast_transaction` is the sole wallet mutation. It accepts only a
+  canonical already-signed transaction, enters the same bounded contextual
+  mempool admission path as peer transactions, and reports actual inventory
+  fanout. Diagnostic-only mode and any listener without explicit
+  authentication leave the wallet route unrouted and cannot parse wallet
+  requests.
 
 ## Dispatch complexity and resource envelope
 
@@ -155,6 +171,9 @@ mutation, and strict startup reconstruction refuses an over-budget graph.
 | `getmempoolinfo` | exact cached aggregate | `O(1)` | `O(1)` |
 | `getrawmempool` | `O(1)` persistent-AVL generation capture, then bounded immutable ID walk after coordinator release | `O(M)` response (`O(log M)` concurrent pool mutation) | `O(M)` response; retained generations share untouched subtrees |
 | `getparentauthority` | fixed metadata/header keys under one coordinator epoch | `O(log N)` | `O(1)` |
+| wallet confirmed/script/contract pages | chain-epoch/query-bound wallet indexes under stricter wire limits | bounded by 256 script-prefix examinations or 256 returned rows | at most 8 MiB projected JSON plus opaque cursor |
+| wallet mempool pages/fee estimate | immutable chain-epoch/tip plus process-instance/generation capture | at most 1,024 inspected transactions per wire page; fee sample remains 4,096 | at most 8 MiB projected JSON |
+| wallet point/batch evidence | fixed metadata/index keys, at most one retained block transaction lookup, or up to 256 ordered spend-index reads | point/collection reads plus selected payload | selected bounded result under one chain epoch/tip |
 
 Both standalone and native-sync listeners enforce the same fail-closed limits:
 
@@ -174,6 +193,15 @@ construction, so an HTTP timeout cannot release point-read or collection
 capacity while its non-cancellable work is still finishing. Authorization
 middleware remains outside these resource layers, so an unauthenticated client
 is rejected before it can occupy RPC execution capacity.
+
+The wallet route strengthens that general policy: it is installed only when an
+Authorization header file was explicitly configured, even when the listener is
+loopback-only. It also requires the complete wallet profile and native runtime.
+Its opaque cursors and backend calls retain their additional script, page,
+prefix-examination, result, and process-generation bounds. Opaque cursors are
+behaviorally hidden/query-bound traversal hints, not secrets or authenticated
+capabilities. Every JSON result is encoded and measured before publication and
+fails with a stable error above the 8 MiB transport budget.
 
 Core requires authentication to be configured and rejects an otherwise valid
 authority snapshot whose `rpc_authentication_required` field is false. A
@@ -196,11 +224,15 @@ hsrd --network mainnet --data-dir /path/to/hsrd \
 
 ## Target mutations
 
+- submit one already-signed wallet transaction through canonical contextual
+  admission and live peer fanout (implemented only in authenticated wallet
+  RPC v1);
 - submit a test/raw block through the same consensus candidate path;
 - add/remove an operator-pinned peer;
 - initiate graceful shutdown or a bounded diagnostic snapshot.
 
-Wallet, signing, domain actions, an embedded DNS listener, explorer/address
-queries, public mining RPC, and broad hsd tooling compatibility are
-deliberately unsupported. The narrow `getdnsresource` read exists only for the
-separate resolver boundary.
+Wallet signing/custody, domain actions, contract registration through the wire,
+an embedded DNS listener, explorer/address queries, public mining RPC, and
+broad hsd tooling compatibility are deliberately unsupported. The narrow
+`getdnsresource` read exists only for the separate resolver boundary; wallet
+RPC v1 is a distinct authenticated API rather than hsd JSON-RPC compatibility.

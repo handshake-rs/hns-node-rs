@@ -296,8 +296,13 @@ production authority.
 Custodial wallet state, seed/key management, transaction signing,
 desktop/mobile UI, domain-management UI, explorer indexes, and broad
 convenience RPC compatibility remain outside `hsrd`. Optional wallet-restoration
-indexes and the typed noncustodial chain backend are now implemented as
-non-authoritative node services. DNS resolution remains outside the `hsrd`
+indexes, the typed noncustodial chain backend, and its explicitly authenticated
+native-sync wallet RPC v1 projection are now implemented as non-authoritative
+node services. The transport requires the durable complete wallet profile and
+binds block-hash, mempool, and ordered outpoint-spend evidence to immutable
+chain snapshots. It transports canonical current/proof NameState bytes without
+claiming resource semantics and does not expose contract registration or
+raw revealed preimages. DNS resolution remains outside the `hsrd`
 process and is composed through the separate `hns-resolverd` crate. Consensus
 parsing of name/resource bytes remains only where block validity requires it;
 typed DNS projection is a reusable non-consensus view.

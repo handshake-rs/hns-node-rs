@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use hns_chain::TxIndexEntry;
+use hns_chain::{HeaderRecord, TxIndexEntry};
 use hns_mempool::{Admission, MempoolSnapshot, HSD_MINIMUM_RELAY_FEE_RATE};
 use hns_p2p::{Inventory, LivePeerManager, OutboundPriority, Packet};
 use hns_primitives::{
@@ -46,6 +46,8 @@ pub const MAX_WALLET_RESTORE_SCRIPTS: usize = 10_000;
 pub const MAX_WALLET_CONFIRMED_PAGE_ITEMS: usize = MAX_QUERY_ENTRIES;
 /// Maximum script-prefix pages examined by one confirmed restoration call.
 pub const MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS: usize = 256;
+/// Maximum outpoints inspected by one immutable spending-evidence capture.
+pub const MAX_WALLET_OUTPOINT_SPEND_BATCH: usize = 4_096;
 
 const CONFIRMED_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-confirmed-script-set/v1";
 const MEMPOOL_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-mempool-script-set/v1";
@@ -57,6 +59,7 @@ const MEMPOOL_CURSOR_VERSION: u8 = 1;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WalletMempoolCursor {
     binding_version: u8,
+    chain_epoch: u64,
     instance_nonce: [u8; 32],
     generation: u64,
     query_id: [u8; 32],
@@ -91,6 +94,8 @@ pub struct ConfirmedScriptHistory {
     pub script_index: usize,
     /// Exact active-chain history row.
     pub entry: ScriptHistoryEntry,
+    /// Canonical block-header time, when available from the same snapshot.
+    pub block_time: Option<u64>,
 }
 
 /// One confirmed active UTXO tied to its sorted request position.
@@ -144,6 +149,8 @@ pub struct MempoolScriptSpend {
 pub struct MempoolScriptActivity {
     /// Canonical transaction ID.
     pub txid: Txid,
+    /// Exact contextual-mempool admission time supplied to policy admission.
+    pub admitted_at: u64,
     /// Outputs paying the requested script.
     pub received: Vec<MempoolScriptOutput>,
     /// Inputs spending confirmed or unconfirmed outputs of the requested script.
@@ -153,6 +160,10 @@ pub struct MempoolScriptActivity {
 /// One bounded global-scan page of script-relevant mempool activity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolScriptPage {
+    /// Durable chain generation captured with this mempool page.
+    pub chain_epoch: u64,
+    /// Active tip captured with this mempool page.
+    pub tip: Option<WalletChainTip>,
     /// Random non-persisted identity of the in-memory mempool instance.
     pub instance_nonce: [u8; 32],
     /// Exact immutable mempool generation used for the page.
@@ -189,6 +200,8 @@ pub enum MempoolContractEvent {
 pub struct MempoolContractActivity {
     /// Canonical transaction ID.
     pub txid: Txid,
+    /// Exact contextual-mempool admission time supplied to policy admission.
+    pub admitted_at: u64,
     /// Descriptor-verified events in transaction order.
     pub events: Vec<MempoolContractEvent>,
 }
@@ -196,6 +209,10 @@ pub struct MempoolContractActivity {
 /// One bounded global-scan page of registered-contract mempool activity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MempoolContractPage {
+    /// Durable chain generation captured with this mempool page.
+    pub chain_epoch: u64,
+    /// Active tip captured with this mempool page.
+    pub tip: Option<WalletChainTip>,
     /// Random non-persisted identity of the in-memory mempool instance.
     pub instance_nonce: [u8; 32],
     /// Exact immutable mempool generation used for the page.
@@ -259,6 +276,19 @@ pub struct WalletChainTip {
     pub tree_root: TreeRoot,
 }
 
+/// Active-chain hash lookup captured with its immutable chain binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlockHashEvidence {
+    /// Durable chain generation containing the lookup and tip.
+    pub chain_epoch: u64,
+    /// Active tip captured with the lookup.
+    pub tip: Option<WalletChainTip>,
+    /// Height requested by the caller.
+    pub height: Height,
+    /// Active-chain hash at `height`, when that height exists.
+    pub hash: Option<BlockHash>,
+}
+
 /// Confirmed transaction inclusion.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransactionInclusion {
@@ -266,8 +296,32 @@ pub struct TransactionInclusion {
     pub block_hash: BlockHash,
     /// Active-chain block height.
     pub height: Height,
+    /// Exact zero-based block transaction position when retained block bytes
+    /// make it derivable. Pruned legacy transaction-index rows do not persist
+    /// this ordinal, so callers must never substitute a fabricated value.
+    pub transaction_position: Option<u32>,
     /// Number of confirmations at the atomically read tip.
     pub confirmations: u32,
+}
+
+/// One queried outpoint and its active-chain spender, if any.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutpointSpendingEntry {
+    /// Outpoint supplied by the caller.
+    pub outpoint: Outpoint,
+    /// Active-chain spending transaction evidence.
+    pub spending: Option<SpendingTransaction>,
+}
+
+/// Ordered outpoint-spend evidence captured from one immutable chain snapshot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutpointSpendingEvidence {
+    /// Durable chain generation shared by every result.
+    pub chain_epoch: u64,
+    /// Active tip captured with every result.
+    pub tip: Option<WalletChainTip>,
+    /// Exactly one entry per requested outpoint, in request order.
+    pub entries: Vec<OutpointSpendingEntry>,
 }
 
 /// Wallet-facing transaction status.
@@ -297,6 +351,8 @@ pub enum TransactionPayload {
 pub struct TransactionEvidence {
     /// Durable chain generation read from the same store snapshot.
     pub chain_epoch: u64,
+    /// Random non-persisted identity of the captured mempool instance.
+    pub mempool_instance_nonce: [u8; 32],
     /// Exact immutable contextual-mempool generation.
     pub mempool_generation: u64,
     /// Active tip used for confirmation depth and canonical binding.
@@ -444,6 +500,9 @@ pub enum WalletBackendError {
     /// A mempool scan bound is invalid.
     #[error("wallet mempool scan limit must be between 1 and {MAX_WALLET_MEMPOOL_SCAN}")]
     InvalidMempoolScanLimit,
+    /// Outpoint-spend evidence batch is empty or oversized.
+    #[error("wallet outpoint-spend batch must contain 1..={MAX_WALLET_OUTPOINT_SPEND_BATCH} entries")]
+    InvalidOutpointBatch,
     /// Script restoration set is empty, oversized, unsorted, or duplicated.
     #[error("wallet restoration scripts must be sorted, unique, and contain 1..={MAX_WALLET_RESTORE_SCRIPTS} entries")]
     InvalidScriptSet,
@@ -513,9 +572,24 @@ impl WalletBackend {
         &self,
         height: Height,
     ) -> Result<Option<BlockHash>, WalletBackendError> {
+        self.get_block_hash_evidence(height)
+            .await
+            .map(|evidence| evidence.hash)
+    }
+
+    /// Read an active-chain hash together with the exact snapshot binding.
+    pub async fn get_block_hash_evidence(
+        &self,
+        height: Height,
+    ) -> Result<BlockHashEvidence, WalletBackendError> {
         let read = self.read.clone();
         blocking_chain_read(read, move |_, snapshot| {
-            read_canonical_hash(snapshot, height).map_err(node_error)
+            Ok(BlockHashEvidence {
+                chain_epoch: chain_epoch_from_snapshot(snapshot).map_err(node_error)?,
+                tip: wallet_chain_tip(snapshot)?,
+                height,
+                hash: read_canonical_hash(snapshot, height).map_err(node_error)?,
+            })
         })
         .await
     }
@@ -557,6 +631,7 @@ impl WalletBackend {
                 }
                 return Ok(TransactionEvidence {
                     chain_epoch,
+                    mempool_instance_nonce: *mempool.instance_nonce(),
                     mempool_generation: mempool.generation(),
                     tip,
                     status: TransactionStatus::Mempool,
@@ -567,11 +642,12 @@ impl WalletBackend {
             if !transaction_index {
                 return Err(WalletBackendError::IndexDisabled("transaction"));
             }
-            let Some((index, inclusion)) =
+            let Some((index, mut inclusion)) =
                 load_transaction_index_and_inclusion(snapshot, txid)?
             else {
                 return Ok(TransactionEvidence {
                     chain_epoch,
+                    mempool_instance_nonce: *mempool.instance_nonce(),
                     mempool_generation: mempool.generation(),
                     tip,
                     status: TransactionStatus::Unknown,
@@ -580,19 +656,25 @@ impl WalletBackend {
                 });
             };
             let payload = match load_block(snapshot, &index.block_hash).map_err(node_error)? {
-                Some(block) => TransactionPayload::Retained(
-                    block
+                Some(block) => {
+                    let (position, transaction) = block
                         .transactions
                         .into_iter()
-                        .find(|transaction| transaction.txid() == txid)
+                        .enumerate()
+                        .find(|(_, transaction)| transaction.txid() == txid)
                         .ok_or(WalletBackendError::Corrupt(
                             "indexed transaction is absent from its block",
-                        ))?,
-                ),
+                        ))?;
+                    inclusion.transaction_position = Some(u32::try_from(position).map_err(|_| {
+                        WalletBackendError::Corrupt("block transaction position exceeds u32")
+                    })?);
+                    TransactionPayload::Retained(transaction)
+                }
                 None => TransactionPayload::Pruned,
             };
             Ok(TransactionEvidence {
                 chain_epoch,
+                mempool_instance_nonce: *mempool.instance_nonce(),
                 mempool_generation: mempool.generation(),
                 tip,
                 status: TransactionStatus::Confirmed(inclusion.clone()),
@@ -703,6 +785,7 @@ impl WalletBackend {
                 },
             };
             let mut script_examinations = 0usize;
+            let mut block_times = HashMap::<BlockHash, Option<u64>>::new();
 
             loop {
                 if script_examinations == MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS {
@@ -741,11 +824,19 @@ impl WalletBackend {
                         let history = page
                             .entries
                             .into_iter()
-                            .map(|entry| ConfirmedScriptHistory {
-                                script_index,
-                                entry,
+                            .map(|entry| {
+                                let block_time = load_block_time(
+                                    snapshot,
+                                    &mut block_times,
+                                    entry.block_hash,
+                                )?;
+                                Ok(ConfirmedScriptHistory {
+                                    script_index,
+                                    entry,
+                                    block_time,
+                                })
                             })
-                            .collect::<Vec<_>>();
+                            .collect::<Result<Vec<_>, WalletBackendError>>()?;
                         let next_position = if let Some(cursor) = page.continuation {
                             ConfirmedScriptsPosition::History {
                                 script_index,
@@ -856,10 +947,42 @@ impl WalletBackend {
         &self,
         outpoint: Outpoint,
     ) -> Result<Option<SpendingTransaction>, WalletBackendError> {
+        let mut evidence = self.get_outpoint_spending_evidence(vec![outpoint]).await?;
+        evidence
+            .entries
+            .pop()
+            .map(|entry| entry.spending)
+            .ok_or(WalletBackendError::Corrupt(
+                "single-outpoint spending evidence omitted its result",
+            ))
+    }
+
+    /// Return one ordered result per outpoint from one immutable chain read.
+    pub async fn get_outpoint_spending_evidence(
+        &self,
+        outpoints: Vec<Outpoint>,
+    ) -> Result<OutpointSpendingEvidence, WalletBackendError> {
+        if outpoints.is_empty() || outpoints.len() > MAX_WALLET_OUTPOINT_SPEND_BATCH {
+            return Err(WalletBackendError::InvalidOutpointBatch);
+        }
         let profile = self.read.wallet_index_profile();
         let read = self.read.clone();
-        blocking_chain_read(read, move |_, snapshot| {
-            spending_transaction(snapshot, profile, &outpoint).map_err(wallet_index_error)
+        blocking_chain_collection_read(read, move |_, snapshot| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            let tip = wallet_chain_tip(snapshot)?;
+            let entries = outpoints
+                .into_iter()
+                .map(|outpoint| {
+                    let spending = spending_transaction(snapshot, profile, &outpoint)
+                        .map_err(wallet_index_error)?;
+                    Ok(OutpointSpendingEntry { outpoint, spending })
+                })
+                .collect::<Result<Vec<_>, WalletBackendError>>()?;
+            Ok(OutpointSpendingEvidence {
+                chain_epoch,
+                tip,
+                entries,
+            })
         })
         .await
     }
@@ -1011,7 +1134,14 @@ impl WalletBackend {
         validate_script_set(&scripts)?;
         let query_id = script_set_id(MEMPOOL_SCRIPT_SET_DOMAIN, &scripts)?;
         let read = self.read.clone();
-        blocking_mempool_read(read, move |_, snapshot, mempool, _| {
+        blocking_mempool_read(read, move |_, snapshot, mempool, epoch| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != epoch.chain_epoch {
+                return Err(WalletBackendError::Corrupt(
+                    "published and durable chain generations disagree",
+                ));
+            }
+            let tip = wallet_chain_tip(snapshot)?;
             let script_positions = scripts
                 .iter()
                 .copied()
@@ -1019,10 +1149,16 @@ impl WalletBackend {
                 .map(|(position, script)| (script, position))
                 .collect::<HashMap<_, _>>();
             let (txids, continuation) =
-                mempool_scan_page(mempool, cursor.as_ref(), scan_limit, query_id)?;
+                mempool_scan_page(mempool, cursor.as_ref(), scan_limit, query_id, chain_epoch)?;
             let mut entries = Vec::new();
             let mut relevant_items = 0usize;
             for txid in txids {
+                let admitted_at = mempool
+                    .entry(&txid)
+                    .ok_or(WalletBackendError::Corrupt(
+                        "published mempool references absent entry metadata",
+                    ))?
+                    .admitted_at;
                 let transaction = mempool.transaction(&txid).ok_or(
                     WalletBackendError::Corrupt(
                         "published mempool references an absent transaction",
@@ -1082,12 +1218,15 @@ impl WalletBackend {
                 if !received.is_empty() || !spent.is_empty() {
                     entries.push(MempoolScriptActivity {
                         txid,
+                        admitted_at,
                         received,
                         spent,
                     });
                 }
             }
             Ok(MempoolScriptPage {
+                chain_epoch,
+                tip,
                 instance_nonce: *mempool.instance_nonce(),
                 generation: mempool.generation(),
                 entries,
@@ -1108,15 +1247,28 @@ impl WalletBackend {
         let profile = self.read.wallet_index_profile();
         let query_id = mempool_contract_query_id(id);
         let read = self.read.clone();
-        blocking_mempool_read(read, move |_, snapshot, mempool, _| {
+        blocking_mempool_read(read, move |_, snapshot, mempool, epoch| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != epoch.chain_epoch {
+                return Err(WalletBackendError::Corrupt(
+                    "published and durable chain generations disagree",
+                ));
+            }
+            let tip = wallet_chain_tip(snapshot)?;
             let registration = tracked_contract(snapshot, profile, id)
                 .map_err(wallet_index_error)?
                 .ok_or(WalletBackendError::UnknownContract)?;
             let (txids, continuation) =
-                mempool_scan_page(mempool, cursor.as_ref(), scan_limit, query_id)?;
+                mempool_scan_page(mempool, cursor.as_ref(), scan_limit, query_id, chain_epoch)?;
             let mut entries = Vec::new();
             let mut relevant_items = 0usize;
             for txid in txids {
+                let admitted_at = mempool
+                    .entry(&txid)
+                    .ok_or(WalletBackendError::Corrupt(
+                        "published mempool references absent entry metadata",
+                    ))?
+                    .admitted_at;
                 let transaction = mempool.transaction(&txid).ok_or(
                     WalletBackendError::Corrupt(
                         "published mempool references an absent transaction",
@@ -1197,10 +1349,16 @@ impl WalletBackend {
                     });
                 }
                 if !events.is_empty() {
-                    entries.push(MempoolContractActivity { txid, events });
+                    entries.push(MempoolContractActivity {
+                        txid,
+                        admitted_at,
+                        events,
+                    });
                 }
             }
             Ok(MempoolContractPage {
+                chain_epoch,
+                tip,
                 instance_nonce: *mempool.instance_nonce(),
                 generation: mempool.generation(),
                 entries,
@@ -1414,6 +1572,31 @@ fn wallet_chain_tip<S: ReadSnapshot>(
         height: tip.height,
         tree_root,
     }))
+}
+
+fn load_block_time<S: ReadSnapshot>(
+    snapshot: &S,
+    cache: &mut HashMap<BlockHash, Option<u64>>,
+    block_hash: BlockHash,
+) -> Result<Option<u64>, WalletBackendError> {
+    if let Some(time) = cache.get(&block_hash) {
+        return Ok(*time);
+    }
+    let time = snapshot
+        .get(ColumnFamily::Headers, block_hash.as_bytes())
+        .map_err(node_error)?
+        .map(|raw| {
+            let record = HeaderRecord::decode(&raw).map_err(node_error)?;
+            if record.hash != block_hash || record.header.hash() != block_hash {
+                return Err(WalletBackendError::Corrupt(
+                    "wallet history header identity is inconsistent",
+                ));
+            }
+            Ok(record.header.time)
+        })
+        .transpose()?;
+    cache.insert(block_hash, time);
+    Ok(time)
 }
 
 fn load_current_name_state<S: ReadSnapshot>(
@@ -1652,10 +1835,17 @@ fn mempool_scan_page(
     cursor: Option<&WalletMempoolCursor>,
     scan_limit: usize,
     query_id: [u8; 32],
+    chain_epoch: u64,
 ) -> Result<(Vec<Txid>, Option<WalletMempoolCursor>), WalletBackendError> {
     if let Some(cursor) = cursor {
         if cursor.binding_version != MEMPOOL_CURSOR_VERSION {
             return Err(WalletBackendError::InvalidMempoolCursor);
+        }
+        if cursor.chain_epoch != chain_epoch {
+            return Err(WalletBackendError::StaleChainEpoch {
+                expected: cursor.chain_epoch,
+                actual: chain_epoch,
+            });
         }
         if cursor.instance_nonce != *mempool.instance_nonce() {
             return Err(WalletBackendError::StaleMempoolInstance);
@@ -1682,6 +1872,7 @@ fn mempool_scan_page(
     let continuation = if has_more {
         txids.last().copied().map(|after_txid| WalletMempoolCursor {
             binding_version: MEMPOOL_CURSOR_VERSION,
+            chain_epoch,
             instance_nonce: *mempool.instance_nonce(),
             generation: mempool.generation(),
             query_id,
@@ -1729,19 +1920,23 @@ fn load_confirmed_transaction<S: ReadSnapshot>(
     snapshot: &S,
     txid: Txid,
 ) -> Result<Option<(Transaction, TransactionInclusion)>, WalletBackendError> {
-    let Some((index, inclusion)) = load_transaction_index_and_inclusion(snapshot, txid)? else {
+    let Some((index, mut inclusion)) = load_transaction_index_and_inclusion(snapshot, txid)? else {
         return Ok(None);
     };
     let block = load_block(snapshot, &index.block_hash)
         .map_err(node_error)?
         .ok_or(WalletBackendError::PayloadPruned)?;
-    let transaction = block
+    let (position, transaction) = block
         .transactions
         .into_iter()
-        .find(|transaction| transaction.txid() == txid)
+        .enumerate()
+        .find(|(_, transaction)| transaction.txid() == txid)
         .ok_or(WalletBackendError::Corrupt(
             "indexed transaction is absent from its block",
         ))?;
+    inclusion.transaction_position = Some(u32::try_from(position).map_err(|_| {
+        WalletBackendError::Corrupt("block transaction position exceeds u32")
+    })?);
     Ok(Some((transaction, inclusion)))
 }
 
@@ -1781,6 +1976,7 @@ fn load_transaction_index_and_inclusion<S: ReadSnapshot>(
         TransactionInclusion {
             block_hash: index.block_hash,
             height: index.height,
+            transaction_position: None,
             confirmations,
         },
     )))
@@ -2046,13 +2242,14 @@ mod tests {
         let query_id = [0x42; 32];
         let cursor = WalletMempoolCursor {
             binding_version: MEMPOOL_CURSOR_VERSION,
+            chain_epoch: 1,
             instance_nonce: *first.instance_nonce(),
             generation: first.generation(),
             query_id,
             after_txid: Txid::ZERO,
         };
         assert!(matches!(
-            mempool_scan_page(&second, Some(&cursor), 1, query_id),
+            mempool_scan_page(&second, Some(&cursor), 1, query_id, 1),
             Err(WalletBackendError::StaleMempoolInstance)
         ));
     }

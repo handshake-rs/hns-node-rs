@@ -1,0 +1,1576 @@
+//! Versioned authenticated HTTP boundary for the noncustodial wallet backend.
+//!
+//! This module owns wire projection only. Consensus and optional wallet-index
+//! authority remain in the canonical runtime and [`WalletBackend`].
+
+use axum::{http::StatusCode, Json};
+use hns_primitives::{
+    hex_encode, Address, Coin, Covenant, NameHash, NameState, Outpoint, Output, Transaction, Txid,
+    MAX_TX_SIZE,
+};
+use hns_state::encode_name_state;
+use hns_urkel::ProofKind;
+use hns_wallet_index::{
+    ContractId, ScriptId, SpendingTransaction, TrackedContractEvent, TrackedContractFunding,
+    TrackedContractSpendKind, MAX_QUERY_ENTRIES,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+
+use super::wallet_backend::{
+    BlockHashEvidence, BroadcastResult, ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate,
+    FeeEstimateSource, MempoolContractEvent, MempoolContractPage, MempoolScriptPage,
+    NameEvidence, NameOwnerTransaction, OutpointSpendingEvidence, TransactionEvidence,
+    TransactionPayload, TransactionStatus, WalletBackend, WalletBackendError,
+    WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
+    WalletContractFundingPage, WalletMempoolCursor, MAX_FEE_ESTIMATE_TARGET_BLOCKS,
+    MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_MEMPOOL_SCAN, MAX_WALLET_OUTPOINT_SPEND_BATCH,
+    MAX_WALLET_RESTORE_SCRIPTS,
+};
+
+pub const WALLET_RPC_API_VERSION: u16 = 1;
+const MAX_REQUEST_ID_BYTES: usize = 128;
+const MAX_OPAQUE_CURSOR_BYTES: usize = 4_096;
+const MAX_WALLET_RPC_PAGE_ITEMS: usize = 256;
+const MAX_WALLET_RPC_MEMPOOL_SCAN: usize = 1_024;
+const MAX_WALLET_RPC_OUTPOINTS: usize = 256;
+const MAX_WALLET_RPC_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletRpcRequest {
+    api_version: u16,
+    #[serde(default)]
+    request_id: Option<String>,
+    call: WalletRpcCall,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "method",
+    content = "params",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum WalletRpcCall {
+    Capabilities,
+    ChainTip,
+    BlockHash {
+        height: u32,
+        expected_chain_epoch: u64,
+    },
+    ConfirmedScriptsPage {
+        script_ids: Vec<String>,
+        #[serde(default)]
+        cursor: Option<String>,
+        limit: usize,
+    },
+    MempoolScriptsPage {
+        script_ids: Vec<String>,
+        expected_chain_epoch: u64,
+        #[serde(default)]
+        cursor: Option<String>,
+        scan_limit: usize,
+    },
+    RawTransaction {
+        txid: String,
+        expected_chain_epoch: u64,
+        #[serde(default)]
+        expected_mempool: Option<WireExpectedMempool>,
+    },
+    TransactionEvidence {
+        txid: String,
+        expected_chain_epoch: u64,
+        #[serde(default)]
+        expected_mempool: Option<WireExpectedMempool>,
+    },
+    SpendingTransaction {
+        txid: String,
+        output_index: u32,
+        expected_chain_epoch: u64,
+    },
+    SpendingTransactions {
+        outpoints: Vec<WireOutpointParam>,
+        expected_chain_epoch: u64,
+    },
+    NameEvidence {
+        name_hash: String,
+        expected_chain_epoch: u64,
+    },
+    BroadcastTransaction {
+        transaction_hex: String,
+    },
+    EstimateFeeRate {
+        target_blocks: u32,
+    },
+    TrackedContractKnown {
+        contract_id: String,
+    },
+    TrackedContractFundings {
+        contract_id: String,
+        expected_chain_epoch: u64,
+        #[serde(default)]
+        cursor: Option<String>,
+        limit: usize,
+    },
+    TrackedContractEvents {
+        contract_id: String,
+        expected_chain_epoch: u64,
+        #[serde(default)]
+        cursor: Option<String>,
+        limit: usize,
+    },
+    MempoolTrackedContract {
+        contract_id: String,
+        expected_chain_epoch: u64,
+        #[serde(default)]
+        cursor: Option<String>,
+        scan_limit: usize,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireOutpointParam {
+    txid: String,
+    output_index: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireExpectedMempool {
+    instance_nonce: String,
+    generation: u64,
+}
+
+struct ExpectedMempoolBinding {
+    instance_nonce: [u8; 32],
+    generation: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WalletRpcResponse {
+    api_version: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<WalletRpcError>,
+}
+
+#[derive(Debug, Serialize)]
+struct WalletRpcError {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+impl WalletRpcResponse {
+    fn success(request_id: Option<String>, result: Value) -> Self {
+        Self {
+            api_version: WALLET_RPC_API_VERSION,
+            request_id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn failure(request_id: Option<String>, error: WalletRpcError) -> Self {
+        Self {
+            api_version: WALLET_RPC_API_VERSION,
+            request_id,
+            result: None,
+            error: Some(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DispatchError {
+    Invalid(&'static str),
+    ResponseLimit,
+    Backend(WalletBackendError),
+    Internal,
+}
+
+impl From<WalletBackendError> for DispatchError {
+    fn from(error: WalletBackendError) -> Self {
+        Self::Backend(error)
+    }
+}
+
+/// Dispatch one request only after the caller has established that the HTTP
+/// listener is protected by its exact authorization-header middleware.
+pub(crate) async fn dispatch_wallet_rpc(
+    backend: Option<&WalletBackend>,
+    authenticated_boundary: bool,
+    wallet_profile_enabled: bool,
+    body: &[u8],
+) -> (StatusCode, Json<WalletRpcResponse>) {
+    if !authenticated_boundary {
+        return wallet_rpc_failure(
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_required",
+            "wallet RPC is unavailable unless the listener has configured authentication",
+            false,
+        );
+    }
+    if !wallet_profile_enabled {
+        return wallet_rpc_failure(
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "wallet_profile_required",
+            "wallet RPC requires the durable wallet index profile",
+            false,
+        );
+    }
+    let Some(backend) = backend else {
+        return wallet_rpc_failure(
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime_unavailable",
+            "wallet RPC requires the canonical native-sync runtime",
+            true,
+        );
+    };
+    let request = match serde_json::from_slice::<WalletRpcRequest>(body) {
+        Ok(request) => request,
+        Err(_) => {
+            return wallet_rpc_failure(
+                None,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "wallet RPC request is malformed",
+                false,
+            )
+        }
+    };
+    let request_id = request.request_id;
+    if request_id
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_REQUEST_ID_BYTES)
+    {
+        return wallet_rpc_failure(
+            None,
+            StatusCode::BAD_REQUEST,
+            "invalid_request_id",
+            "wallet RPC request_id exceeds 128 bytes",
+            false,
+        );
+    }
+    if request.api_version != WALLET_RPC_API_VERSION {
+        return wallet_rpc_failure(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "unsupported_api_version",
+            "wallet RPC supports only api_version 1",
+            false,
+        );
+    }
+
+    match dispatch_call(backend, request.call).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(WalletRpcResponse::success(request_id, result)),
+        ),
+        Err(error) => map_dispatch_error(request_id, error),
+    }
+}
+
+async fn dispatch_call(
+    backend: &WalletBackend,
+    call: WalletRpcCall,
+) -> Result<Value, DispatchError> {
+    let result = match call {
+        WalletRpcCall::Capabilities => serde_json::json!({
+            "api_version": WALLET_RPC_API_VERSION,
+            "authenticated_listener_required": true,
+            "maximum_restore_scripts": MAX_WALLET_RESTORE_SCRIPTS,
+            "typed_backend_maximum_confirmed_page_items": MAX_WALLET_CONFIRMED_PAGE_ITEMS,
+            "typed_backend_maximum_mempool_scan": MAX_WALLET_MEMPOOL_SCAN,
+            "typed_backend_maximum_index_page_items": MAX_QUERY_ENTRIES,
+            "maximum_wire_page_items": MAX_WALLET_RPC_PAGE_ITEMS,
+            "maximum_wire_mempool_scan": MAX_WALLET_RPC_MEMPOOL_SCAN,
+            "maximum_wire_outpoint_spend_batch": MAX_WALLET_RPC_OUTPOINTS,
+            "typed_backend_maximum_outpoint_spend_batch": MAX_WALLET_OUTPOINT_SPEND_BATCH,
+            "maximum_wire_result_bytes": MAX_WALLET_RPC_RESULT_BYTES,
+            "maximum_opaque_cursor_bytes": MAX_OPAQUE_CURSOR_BYTES,
+            "maximum_fee_target_blocks": MAX_FEE_ESTIMATE_TARGET_BLOCKS,
+            "consensus_maximum_transaction_bytes": MAX_TX_SIZE,
+            "transaction_request_also_bound_by_hex_envelope_and_listener_body_limit": true,
+            "confirmed_cursor_binding": "chain_epoch_and_script_set",
+            "post_binding_reads_require_expected_chain_epoch": true,
+            "mempool_cursor_binding": "chain_epoch_process_instance_nonce_generation_and_query",
+            "mempool_page_binding": "chain_epoch_tip_instance_nonce_and_generation",
+            "transaction_evidence_binding": "mandatory_chain_epoch_optional_exact_mempool_instance_and_generation",
+            "outpoint_spend_evidence": "ordered_single_immutable_chain_snapshot",
+            "transaction_position": "exact_when_block_payload_retained_null_when_pruned",
+            "name_views": ["current_state", "proof_state", "current_owner", "proof_owner"],
+            "name_state_encoding": "canonical_current_state_hex_and_proof_state_hex",
+            "tracked_contract_descriptor_registration": "unavailable_unpublished_protocol_boundary",
+            "tracked_contract_preimage_transport": "opaque_unavailable",
+            "tracked_contract_evidence": "node_local_profile_only_not_protocol_authority"
+        }),
+        WalletRpcCall::ChainTip => value(&wire_tip(backend.get_chain_tip().await?))?,
+        WalletRpcCall::BlockHash {
+            height,
+            expected_chain_epoch,
+        } => {
+            let evidence = backend.get_block_hash_evidence(height).await?;
+            require_chain_epoch(expected_chain_epoch, evidence.chain_epoch)?;
+            value(&WireBlockHashEvidence::from(evidence))?
+        }
+        WalletRpcCall::ConfirmedScriptsPage {
+            script_ids,
+            cursor,
+            limit,
+        } => {
+            validate_wire_page_limit(limit)?;
+            let scripts = decode_script_ids(script_ids)?;
+            let cursor = decode_cursor::<ConfirmedScriptsCursor>(cursor)?;
+            let page = backend
+                .get_confirmed_scripts_page(scripts, cursor, limit)
+                .await?;
+            value(&wire_confirmed_page(page)?)?
+        }
+        WalletRpcCall::MempoolScriptsPage {
+            script_ids,
+            expected_chain_epoch,
+            cursor,
+            scan_limit,
+        } => {
+            validate_wire_mempool_scan(scan_limit)?;
+            let scripts = decode_script_ids(script_ids)?;
+            let cursor = decode_cursor::<WalletMempoolCursor>(cursor)?;
+            let page = backend
+                .get_mempool_scripts_activity(scripts, cursor, scan_limit)
+                .await?;
+            require_chain_epoch(expected_chain_epoch, page.chain_epoch)?;
+            value(&wire_mempool_script_page(page)?)?
+        }
+        WalletRpcCall::RawTransaction {
+            txid,
+            expected_chain_epoch,
+            expected_mempool,
+        } => {
+            let txid = Txid::new(decode_hex_32(&txid, "transaction ID")?);
+            let expected_mempool = decode_expected_mempool(expected_mempool)?;
+            let evidence = backend.get_transaction_evidence(txid).await?;
+            require_transaction_evidence_binding(
+                &evidence,
+                expected_chain_epoch,
+                expected_mempool.as_ref(),
+            )?;
+            value(&wire_raw_transaction_evidence(evidence)?)?
+        }
+        WalletRpcCall::TransactionEvidence {
+            txid,
+            expected_chain_epoch,
+            expected_mempool,
+        } => {
+            let txid = Txid::new(decode_hex_32(&txid, "transaction ID")?);
+            let expected_mempool = decode_expected_mempool(expected_mempool)?;
+            let evidence = backend.get_transaction_evidence(txid).await?;
+            require_transaction_evidence_binding(
+                &evidence,
+                expected_chain_epoch,
+                expected_mempool.as_ref(),
+            )?;
+            value(&wire_transaction_evidence(evidence))?
+        }
+        WalletRpcCall::SpendingTransaction {
+            txid,
+            output_index,
+            expected_chain_epoch,
+        } => {
+            let outpoint = Outpoint {
+                txid: Txid::new(decode_hex_32(&txid, "transaction ID")?),
+                index: output_index,
+            };
+            let evidence = backend
+                .get_outpoint_spending_evidence(vec![outpoint])
+                .await?;
+            require_chain_epoch(expected_chain_epoch, evidence.chain_epoch)?;
+            value(&wire_outpoint_spending_evidence(evidence))?
+        }
+        WalletRpcCall::SpendingTransactions {
+            outpoints,
+            expected_chain_epoch,
+        } => {
+            if outpoints.is_empty() || outpoints.len() > MAX_WALLET_RPC_OUTPOINTS {
+                return Err(DispatchError::Invalid(
+                    "outpoints must contain 1..=256 entries",
+                ));
+            }
+            let outpoints = outpoints
+                .into_iter()
+                .map(|outpoint| {
+                    Ok(Outpoint {
+                        txid: Txid::new(decode_hex_32(&outpoint.txid, "transaction ID")?),
+                        index: outpoint.output_index,
+                    })
+                })
+                .collect::<Result<Vec<_>, DispatchError>>()?;
+            let evidence = backend.get_outpoint_spending_evidence(outpoints).await?;
+            require_chain_epoch(expected_chain_epoch, evidence.chain_epoch)?;
+            value(&wire_outpoint_spending_evidence(evidence))?
+        }
+        WalletRpcCall::NameEvidence {
+            name_hash,
+            expected_chain_epoch,
+        } => {
+            let name_hash = NameHash::new(decode_hex_32(&name_hash, "name hash")?);
+            let evidence = backend.get_name_evidence(name_hash).await?;
+            require_chain_epoch(expected_chain_epoch, evidence.chain_epoch)?;
+            value(&wire_name_evidence(evidence)?)?
+        }
+        WalletRpcCall::BroadcastTransaction { transaction_hex } => {
+            let raw = decode_hex_bounded(
+                &transaction_hex,
+                MAX_TX_SIZE,
+                "raw transaction",
+            )?;
+            let transaction = Transaction::decode(&raw)
+                .map_err(|_| DispatchError::Invalid("raw transaction is not canonical"))?;
+            value(&WireBroadcastResult::from(
+                &backend.broadcast_transaction(transaction).await?,
+            ))?
+        }
+        WalletRpcCall::EstimateFeeRate { target_blocks } => {
+            value(&WireFeeEstimate::from(
+                &backend.estimate_fee_rate(target_blocks).await?,
+            ))?
+        }
+        WalletRpcCall::TrackedContractKnown { contract_id } => {
+            let id = ContractId::from_bytes(decode_hex_32(&contract_id, "contract ID")?);
+            serde_json::json!({
+                "contract_id": hex_encode(id.as_bytes()),
+                "known": backend.get_tracked_contract(id).await?.is_some(),
+                "descriptor": "opaque_unpublished_protocol_boundary"
+            })
+        }
+        WalletRpcCall::TrackedContractFundings {
+            contract_id,
+            expected_chain_epoch,
+            cursor,
+            limit,
+        } => {
+            validate_wire_page_limit(limit)?;
+            let id = ContractId::from_bytes(decode_hex_32(&contract_id, "contract ID")?);
+            let cursor = decode_cursor::<WalletContractFundingCursor>(cursor)?;
+            let page = backend
+                .get_tracked_contract_fundings(id, cursor, limit)
+                .await?;
+            require_chain_epoch(expected_chain_epoch, page.chain_epoch)?;
+            value(&wire_contract_funding_page(page)?)?
+        }
+        WalletRpcCall::TrackedContractEvents {
+            contract_id,
+            expected_chain_epoch,
+            cursor,
+            limit,
+        } => {
+            validate_wire_page_limit(limit)?;
+            let id = ContractId::from_bytes(decode_hex_32(&contract_id, "contract ID")?);
+            let cursor = decode_cursor::<WalletContractEventCursor>(cursor)?;
+            let page = backend
+                .get_tracked_contract_events(id, cursor, limit)
+                .await?;
+            require_chain_epoch(expected_chain_epoch, page.chain_epoch)?;
+            value(&wire_contract_event_page(page)?)?
+        }
+        WalletRpcCall::MempoolTrackedContract {
+            contract_id,
+            expected_chain_epoch,
+            cursor,
+            scan_limit,
+        } => {
+            validate_wire_mempool_scan(scan_limit)?;
+            let id = ContractId::from_bytes(decode_hex_32(&contract_id, "contract ID")?);
+            let cursor = decode_cursor::<WalletMempoolCursor>(cursor)?;
+            let page = backend
+                .get_mempool_tracked_contract_activity(id, cursor, scan_limit)
+                .await?;
+            require_chain_epoch(expected_chain_epoch, page.chain_epoch)?;
+            value(&wire_mempool_contract_page(page)?)?
+        }
+    };
+    Ok(result)
+}
+
+fn map_dispatch_error(
+    request_id: Option<String>,
+    error: DispatchError,
+) -> (StatusCode, Json<WalletRpcResponse>) {
+    match error {
+        DispatchError::Invalid(message) => wallet_rpc_failure(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_params",
+            message,
+            false,
+        ),
+        DispatchError::ResponseLimit => wallet_rpc_failure(
+            request_id,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "response_projection_limit",
+            "wallet RPC result exceeds the 8 MiB wire budget; use a smaller page where applicable",
+            true,
+        ),
+        DispatchError::Internal => wallet_rpc_failure(
+            request_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_projection_failure",
+            "wallet RPC could not encode its bounded response",
+            true,
+        ),
+        DispatchError::Backend(error) => map_backend_error(request_id, error),
+    }
+}
+
+fn map_backend_error(
+    request_id: Option<String>,
+    error: WalletBackendError,
+) -> (StatusCode, Json<WalletRpcResponse>) {
+    match error {
+        WalletBackendError::IndexDisabled(_) => wallet_rpc_failure(
+            request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "index_unavailable",
+            "the required optional wallet index is not enabled",
+            false,
+        ),
+        WalletBackendError::PayloadPruned => wallet_rpc_failure(
+            request_id,
+            StatusCode::GONE,
+            "payload_pruned",
+            "the confirmed transaction payload has been pruned",
+            false,
+        ),
+        WalletBackendError::UnknownContract => wallet_rpc_failure(
+            request_id,
+            StatusCode::NOT_FOUND,
+            "unknown_contract",
+            "the tracked-contract registration is unknown",
+            false,
+        ),
+        WalletBackendError::InvalidContract => wallet_rpc_failure(
+            request_id,
+            StatusCode::CONFLICT,
+            "invalid_contract",
+            "the tracked-contract registration is invalid or conflicts",
+            false,
+        ),
+        WalletBackendError::ContractCapacity => wallet_rpc_failure(
+            request_id,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "contract_registry_full",
+            "the append-only tracked-contract registry is full",
+            false,
+        ),
+        WalletBackendError::StaleMempoolGeneration { .. }
+        | WalletBackendError::StaleMempoolInstance
+        | WalletBackendError::StaleChainEpoch { .. }
+        | WalletBackendError::StaleCanonicalRead => wallet_rpc_failure(
+            request_id,
+            StatusCode::CONFLICT,
+            "stale_snapshot",
+            "the bound chain or mempool generation changed; restart this reconciliation",
+            true,
+        ),
+        WalletBackendError::InvalidMempoolCursor
+        | WalletBackendError::InvalidConfirmedCursor => wallet_rpc_failure(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "the opaque continuation does not belong to this query",
+            false,
+        ),
+        WalletBackendError::InvalidConfirmedPageLimit
+        | WalletBackendError::InvalidIndexPageLimit
+        | WalletBackendError::InvalidMempoolScanLimit
+        | WalletBackendError::InvalidOutpointBatch
+        | WalletBackendError::InvalidScriptSet
+        | WalletBackendError::InvalidFeeTarget => wallet_rpc_failure(
+            request_id,
+            StatusCode::BAD_REQUEST,
+            "invalid_bounds",
+            "the request violates a wallet RPC collection bound",
+            false,
+        ),
+        WalletBackendError::MempoolResultLimit => wallet_rpc_failure(
+            request_id,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "result_limit",
+            "the bounded mempool result contains too many relevant items",
+            true,
+        ),
+        WalletBackendError::Rejected(reason) => wallet_rpc_failure(
+            request_id,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "transaction_rejected",
+            &bounded_message(&reason),
+            false,
+        ),
+        WalletBackendError::Orphan(_) => wallet_rpc_failure(
+            request_id,
+            StatusCode::CONFLICT,
+            "transaction_orphan",
+            "the transaction has unresolved inputs and was not relayed as accepted",
+            true,
+        ),
+        WalletBackendError::NameHasNoOwner => wallet_rpc_failure(
+            request_id,
+            StatusCode::NOT_FOUND,
+            "name_has_no_owner",
+            "the current name state has no owner",
+            false,
+        ),
+        WalletBackendError::OwnerOutputMissing => wallet_rpc_failure(
+            request_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "owner_output_missing",
+            "the indexed owner transaction does not contain its selected output",
+            false,
+        ),
+        WalletBackendError::Corrupt(_) => wallet_rpc_failure(
+            request_id,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "backend_inconsistent",
+            "wallet index evidence is inconsistent with the active chain",
+            false,
+        ),
+        WalletBackendError::Node(_) => wallet_rpc_failure(
+            request_id,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend_unavailable",
+            "the canonical wallet backend is temporarily unavailable",
+            true,
+        ),
+    }
+}
+
+fn wallet_rpc_failure(
+    request_id: Option<String>,
+    status: StatusCode,
+    code: &'static str,
+    message: &str,
+    retryable: bool,
+) -> (StatusCode, Json<WalletRpcResponse>) {
+    (
+        status,
+        Json(WalletRpcResponse::failure(
+            request_id,
+            WalletRpcError {
+                code,
+                message: message.to_owned(),
+                retryable,
+            },
+        )),
+    )
+}
+
+fn bounded_message(message: &str) -> String {
+    message.chars().take(256).collect()
+}
+
+fn value<T: Serialize>(value: &T) -> Result<Value, DispatchError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| DispatchError::Internal)?;
+    if encoded.len() > MAX_WALLET_RPC_RESULT_BYTES {
+        return Err(DispatchError::ResponseLimit);
+    }
+    serde_json::from_slice(&encoded).map_err(|_| DispatchError::Internal)
+}
+
+fn validate_wire_page_limit(limit: usize) -> Result<(), DispatchError> {
+    if (1..=MAX_WALLET_RPC_PAGE_ITEMS).contains(&limit) {
+        Ok(())
+    } else {
+        Err(DispatchError::Invalid(
+            "wallet RPC page limit must be between 1 and 256",
+        ))
+    }
+}
+
+fn validate_wire_mempool_scan(scan_limit: usize) -> Result<(), DispatchError> {
+    if (1..=MAX_WALLET_RPC_MEMPOOL_SCAN).contains(&scan_limit) {
+        Ok(())
+    } else {
+        Err(DispatchError::Invalid(
+            "wallet RPC mempool scan_limit must be between 1 and 1024",
+        ))
+    }
+}
+
+fn require_chain_epoch(expected: u64, actual: u64) -> Result<(), DispatchError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(WalletBackendError::StaleChainEpoch { expected, actual }.into())
+    }
+}
+
+fn decode_expected_mempool(
+    expected: Option<WireExpectedMempool>,
+) -> Result<Option<ExpectedMempoolBinding>, DispatchError> {
+    expected
+        .map(|expected| {
+            Ok(ExpectedMempoolBinding {
+                instance_nonce: decode_hex_32(
+                    &expected.instance_nonce,
+                    "mempool instance nonce",
+                )?,
+                generation: expected.generation,
+            })
+        })
+        .transpose()
+}
+
+fn require_transaction_evidence_binding(
+    evidence: &TransactionEvidence,
+    expected_chain_epoch: u64,
+    expected_mempool: Option<&ExpectedMempoolBinding>,
+) -> Result<(), DispatchError> {
+    require_chain_epoch(expected_chain_epoch, evidence.chain_epoch)?;
+    let Some(expected_mempool) = expected_mempool else {
+        return Ok(());
+    };
+    if expected_mempool.instance_nonce != evidence.mempool_instance_nonce {
+        return Err(WalletBackendError::StaleMempoolInstance.into());
+    }
+    if expected_mempool.generation != evidence.mempool_generation {
+        return Err(WalletBackendError::StaleMempoolGeneration {
+            expected: expected_mempool.generation,
+            actual: evidence.mempool_generation,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn decode_script_ids(encoded: Vec<String>) -> Result<Vec<ScriptId>, DispatchError> {
+    if encoded.is_empty() || encoded.len() > MAX_WALLET_RESTORE_SCRIPTS {
+        return Err(DispatchError::Invalid(
+            "script_ids must contain 1..=10000 entries",
+        ));
+    }
+    encoded
+        .into_iter()
+        .map(|value| {
+            decode_hex_32(&value, "script ID")
+                .map(ScriptId::from_bytes)
+        })
+        .collect()
+}
+
+fn decode_hex_32(encoded: &str, label: &'static str) -> Result<[u8; 32], DispatchError> {
+    let raw = decode_hex_bounded(encoded, 32, label)?;
+    raw.try_into()
+        .map_err(|_| DispatchError::Invalid("identity must contain exactly 32 bytes"))
+}
+
+fn decode_hex_bounded(
+    encoded: &str,
+    maximum_bytes: usize,
+    label: &'static str,
+) -> Result<Vec<u8>, DispatchError> {
+    if encoded.len() % 2 != 0 || encoded.len() > maximum_bytes.saturating_mul(2) {
+        return Err(DispatchError::Invalid(match label {
+            "raw transaction" => "raw transaction hexadecimal length is invalid",
+            "opaque cursor" => "opaque cursor hexadecimal length is invalid",
+            _ => "identity must contain exactly 64 hexadecimal characters",
+        }));
+    }
+    let mut raw = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0]).ok_or(DispatchError::Invalid(match label {
+            "raw transaction" => "raw transaction is not hexadecimal",
+            "opaque cursor" => "opaque cursor is not hexadecimal",
+            _ => "identity is not hexadecimal",
+        }))?;
+        let low = hex_nibble(pair[1]).ok_or(DispatchError::Invalid(match label {
+            "raw transaction" => "raw transaction is not hexadecimal",
+            "opaque cursor" => "opaque cursor is not hexadecimal",
+            _ => "identity is not hexadecimal",
+        }))?;
+        raw.push((high << 4) | low);
+    }
+    Ok(raw)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_cursor<T: DeserializeOwned>(cursor: Option<String>) -> Result<Option<T>, DispatchError> {
+    cursor
+        .map(|cursor| {
+            let raw = decode_hex_bounded(&cursor, MAX_OPAQUE_CURSOR_BYTES, "opaque cursor")?;
+            serde_json::from_slice(&raw)
+                .map_err(|_| DispatchError::Invalid("opaque cursor is malformed"))
+        })
+        .transpose()
+}
+
+fn encode_cursor<T: Serialize>(cursor: Option<&T>) -> Result<Option<String>, DispatchError> {
+    cursor
+        .map(|cursor| {
+            let raw = serde_json::to_vec(cursor).map_err(|_| DispatchError::Internal)?;
+            if raw.len() > MAX_OPAQUE_CURSOR_BYTES {
+                return Err(DispatchError::Internal);
+            }
+            Ok(hex_encode(&raw))
+        })
+        .transpose()
+}
+
+#[derive(Serialize)]
+struct WireTip {
+    hash: String,
+    height: u32,
+    tree_root: String,
+}
+
+fn wire_tip(tip: Option<super::wallet_backend::WalletChainTip>) -> Option<WireTip> {
+    tip.map(|tip| WireTip {
+        hash: tip.hash.to_hex(),
+        height: tip.height,
+        tree_root: hex_encode(tip.tree_root.as_bytes()),
+    })
+}
+
+#[derive(Serialize)]
+struct WireBlockHashEvidence {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    height: u32,
+    hash: Option<String>,
+}
+
+impl From<BlockHashEvidence> for WireBlockHashEvidence {
+    fn from(evidence: BlockHashEvidence) -> Self {
+        Self {
+            chain_epoch: evidence.chain_epoch,
+            tip: wire_tip(evidence.tip),
+            height: evidence.height,
+            hash: evidence.hash.map(|hash| hash.to_hex()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireOutpoint {
+    txid: String,
+    index: u32,
+}
+
+impl From<&Outpoint> for WireOutpoint {
+    fn from(outpoint: &Outpoint) -> Self {
+        Self {
+            txid: outpoint.txid.to_hex(),
+            index: outpoint.index,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireAddress {
+    version: u8,
+    hash: String,
+}
+
+impl From<&Address> for WireAddress {
+    fn from(address: &Address) -> Self {
+        Self {
+            version: address.version,
+            hash: hex_encode(&address.hash),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireCovenant {
+    kind: u8,
+    items: Vec<String>,
+}
+
+impl From<&Covenant> for WireCovenant {
+    fn from(covenant: &Covenant) -> Self {
+        Self {
+            kind: covenant.kind.as_u8(),
+            items: covenant
+                .items
+                .iter()
+                .map(|item| hex_encode(item))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireOutput {
+    value: u64,
+    address: WireAddress,
+    covenant: WireCovenant,
+}
+
+impl From<&Output> for WireOutput {
+    fn from(output: &Output) -> Self {
+        Self {
+            value: output.value,
+            address: WireAddress::from(&output.address),
+            covenant: WireCovenant::from(&output.covenant),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireCoin {
+    outpoint: WireOutpoint,
+    value: u64,
+    height: u32,
+    coinbase: bool,
+    address: WireAddress,
+    covenant: WireCovenant,
+}
+
+impl From<&Coin> for WireCoin {
+    fn from(coin: &Coin) -> Self {
+        Self {
+            outpoint: WireOutpoint::from(&coin.outpoint),
+            value: coin.value,
+            height: coin.height,
+            coinbase: coin.coinbase,
+            address: WireAddress::from(&coin.address),
+            covenant: WireCovenant::from(&coin.covenant),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireInclusion {
+    block_hash: String,
+    height: u32,
+    transaction_index: Option<u32>,
+    confirmations: u32,
+}
+
+impl From<&super::wallet_backend::TransactionInclusion> for WireInclusion {
+    fn from(inclusion: &super::wallet_backend::TransactionInclusion) -> Self {
+        Self {
+            block_hash: inclusion.block_hash.to_hex(),
+            height: inclusion.height,
+            transaction_index: inclusion.transaction_position,
+            confirmations: inclusion.confirmations,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireConfirmedHistory {
+    script_index: usize,
+    txid: String,
+    block_hash: String,
+    height: u32,
+    transaction_position: u32,
+    block_time: Option<u64>,
+    received: bool,
+    spent: bool,
+}
+
+#[derive(Serialize)]
+struct WireConfirmedUtxo {
+    script_index: usize,
+    coin: WireCoin,
+}
+
+#[derive(Serialize)]
+struct WireConfirmedPage {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    history: Vec<WireConfirmedHistory>,
+    utxos: Vec<WireConfirmedUtxo>,
+    script_examinations: usize,
+    continuation: Option<String>,
+}
+
+fn wire_confirmed_page(page: ConfirmedScriptsPage) -> Result<WireConfirmedPage, DispatchError> {
+    Ok(WireConfirmedPage {
+        chain_epoch: page.chain_epoch,
+        tip: wire_tip(page.tip),
+        history: page
+            .history
+            .into_iter()
+            .map(|row| WireConfirmedHistory {
+                script_index: row.script_index,
+                txid: row.entry.txid.to_hex(),
+                block_hash: row.entry.block_hash.to_hex(),
+                height: row.entry.height,
+                transaction_position: row.entry.transaction_position,
+                block_time: row.block_time,
+                received: row.entry.direction.received,
+                spent: row.entry.direction.spent,
+            })
+            .collect(),
+        utxos: page
+            .utxos
+            .into_iter()
+            .map(|row| WireConfirmedUtxo {
+                script_index: row.script_index,
+                coin: WireCoin::from(&row.entry.coin),
+            })
+            .collect(),
+        script_examinations: page.script_examinations,
+        continuation: encode_cursor(page.continuation.as_ref())?,
+    })
+}
+
+#[derive(Serialize)]
+struct WireMempoolScriptOutput {
+    script_index: usize,
+    outpoint: WireOutpoint,
+    value: u64,
+}
+
+#[derive(Serialize)]
+struct WireMempoolScriptSpend {
+    script_index: usize,
+    outpoint: WireOutpoint,
+}
+
+#[derive(Serialize)]
+struct WireMempoolScriptActivity {
+    txid: String,
+    admitted_at: u64,
+    received: Vec<WireMempoolScriptOutput>,
+    spent: Vec<WireMempoolScriptSpend>,
+}
+
+#[derive(Serialize)]
+struct WireMempoolScriptPage {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    instance_nonce: String,
+    generation: u64,
+    entries: Vec<WireMempoolScriptActivity>,
+    continuation: Option<String>,
+}
+
+fn wire_mempool_script_page(
+    page: MempoolScriptPage,
+) -> Result<WireMempoolScriptPage, DispatchError> {
+    Ok(WireMempoolScriptPage {
+        chain_epoch: page.chain_epoch,
+        tip: wire_tip(page.tip),
+        instance_nonce: hex_encode(&page.instance_nonce),
+        generation: page.generation,
+        entries: page
+            .entries
+            .into_iter()
+            .map(|entry| WireMempoolScriptActivity {
+                txid: entry.txid.to_hex(),
+                admitted_at: entry.admitted_at,
+                received: entry
+                    .received
+                    .into_iter()
+                    .map(|output| WireMempoolScriptOutput {
+                        script_index: output.script_index,
+                        outpoint: WireOutpoint::from(&output.outpoint),
+                        value: output.value,
+                    })
+                    .collect(),
+                spent: entry
+                    .spent
+                    .into_iter()
+                    .map(|spend| WireMempoolScriptSpend {
+                        script_index: spend.script_index,
+                        outpoint: WireOutpoint::from(&spend.outpoint),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        continuation: encode_cursor(page.continuation.as_ref())?,
+    })
+}
+
+#[derive(Serialize)]
+struct WireTransactionEvidence {
+    chain_epoch: u64,
+    mempool_instance_nonce: String,
+    mempool_generation: u64,
+    tip: Option<WireTip>,
+    status: &'static str,
+    inclusion: Option<WireInclusion>,
+    payload: &'static str,
+    transaction_hex: Option<String>,
+}
+
+fn wire_transaction_evidence(evidence: TransactionEvidence) -> WireTransactionEvidence {
+    let status = match evidence.status {
+        TransactionStatus::Mempool => "mempool",
+        TransactionStatus::Confirmed(_) => "confirmed",
+        TransactionStatus::Unknown => "unknown",
+    };
+    let (payload, transaction_hex) = match evidence.payload {
+        TransactionPayload::Retained(transaction) => {
+            ("retained", Some(hex_encode(&transaction.encode())))
+        }
+        TransactionPayload::Pruned => ("pruned", None),
+        TransactionPayload::Absent => ("absent", None),
+    };
+    WireTransactionEvidence {
+        chain_epoch: evidence.chain_epoch,
+        mempool_instance_nonce: hex_encode(&evidence.mempool_instance_nonce),
+        mempool_generation: evidence.mempool_generation,
+        tip: wire_tip(evidence.tip),
+        status,
+        inclusion: evidence.inclusion.as_ref().map(WireInclusion::from),
+        payload,
+        transaction_hex,
+    }
+}
+
+#[derive(Serialize)]
+struct WireRawTransactionEvidence {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    mempool_instance_nonce: String,
+    mempool_generation: u64,
+    transaction_hex: Option<String>,
+}
+
+fn wire_raw_transaction_evidence(
+    evidence: TransactionEvidence,
+) -> Result<WireRawTransactionEvidence, DispatchError> {
+    let transaction_hex = match evidence.payload {
+        TransactionPayload::Retained(transaction) => Some(hex_encode(&transaction.encode())),
+        TransactionPayload::Pruned => return Err(WalletBackendError::PayloadPruned.into()),
+        TransactionPayload::Absent => None,
+    };
+    Ok(WireRawTransactionEvidence {
+        chain_epoch: evidence.chain_epoch,
+        tip: wire_tip(evidence.tip),
+        mempool_instance_nonce: hex_encode(&evidence.mempool_instance_nonce),
+        mempool_generation: evidence.mempool_generation,
+        transaction_hex,
+    })
+}
+
+#[derive(Serialize)]
+struct WireBroadcastResult {
+    txid: String,
+    newly_admitted: bool,
+    attempted_peers: usize,
+    queued_peers: usize,
+    failed_peers: usize,
+}
+
+impl From<&BroadcastResult> for WireBroadcastResult {
+    fn from(result: &BroadcastResult) -> Self {
+        Self {
+            txid: result.txid.to_hex(),
+            newly_admitted: result.newly_admitted,
+            attempted_peers: result.attempted_peers,
+            queued_peers: result.queued_peers,
+            failed_peers: result.failed_peers,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireFeeEstimate {
+    target_blocks: u32,
+    atomic_units_per_kvb: u64,
+    sampled_transactions: usize,
+    source: &'static str,
+}
+
+impl From<&FeeEstimate> for WireFeeEstimate {
+    fn from(estimate: &FeeEstimate) -> Self {
+        Self {
+            target_blocks: estimate.target_blocks,
+            atomic_units_per_kvb: estimate.atomic_units_per_kvb,
+            sampled_transactions: estimate.sampled_transactions,
+            source: match estimate.source {
+                FeeEstimateSource::MinimumRelay => "minimum_relay",
+                FeeEstimateSource::Mempool => "mempool",
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireSpendingTransaction {
+    txid: String,
+    input_position: u32,
+    block_hash: String,
+    height: u32,
+}
+
+impl From<&SpendingTransaction> for WireSpendingTransaction {
+    fn from(transaction: &SpendingTransaction) -> Self {
+        Self {
+            txid: transaction.txid.to_hex(),
+            input_position: transaction.input_position,
+            block_hash: transaction.block_hash.to_hex(),
+            height: transaction.height,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireOutpointSpendingEntry {
+    outpoint: WireOutpoint,
+    spending: Option<WireSpendingTransaction>,
+}
+
+#[derive(Serialize)]
+struct WireOutpointSpendingEvidence {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    entries: Vec<WireOutpointSpendingEntry>,
+}
+
+fn wire_outpoint_spending_evidence(
+    evidence: OutpointSpendingEvidence,
+) -> WireOutpointSpendingEvidence {
+    WireOutpointSpendingEvidence {
+        chain_epoch: evidence.chain_epoch,
+        tip: wire_tip(evidence.tip),
+        entries: evidence
+            .entries
+            .into_iter()
+            .map(|entry| WireOutpointSpendingEntry {
+                outpoint: WireOutpoint::from(&entry.outpoint),
+                spending: entry.spending.as_ref().map(WireSpendingTransaction::from),
+            })
+            .collect(),
+    }
+}
+
+#[derive(Serialize)]
+struct WireNameState {
+    name_hash: String,
+    name_hex: String,
+    height: u32,
+    renewal: u32,
+    owner: WireOutpoint,
+    value: u64,
+    highest: u64,
+    data_hex: String,
+    transfer: u32,
+    revoked: u32,
+    claimed: u32,
+    renewals: u32,
+    registered: bool,
+    expired: bool,
+    weak: bool,
+}
+
+impl From<&NameState> for WireNameState {
+    fn from(state: &NameState) -> Self {
+        Self {
+            name_hash: state.name_hash.to_hex(),
+            name_hex: hex_encode(&state.name),
+            height: state.height,
+            renewal: state.renewal,
+            owner: WireOutpoint::from(&state.owner),
+            value: state.value,
+            highest: state.highest,
+            data_hex: hex_encode(&state.data),
+            transfer: state.transfer,
+            revoked: state.revoked,
+            claimed: state.claimed,
+            renewals: state.renewals,
+            registered: state.registered,
+            expired: state.expired,
+            weak: state.weak,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireNameProof {
+    root: String,
+    name_hash: String,
+    kind: &'static str,
+    proof_hex: String,
+}
+
+#[derive(Serialize)]
+struct WireNameOwner {
+    name_state: WireNameState,
+    owner: WireOutpoint,
+    transaction_hex: String,
+    owner_output: WireOutput,
+    inclusion: WireInclusion,
+}
+
+impl From<&NameOwnerTransaction> for WireNameOwner {
+    fn from(owner: &NameOwnerTransaction) -> Self {
+        Self {
+            name_state: WireNameState::from(&owner.name_state),
+            owner: WireOutpoint::from(&owner.owner),
+            transaction_hex: hex_encode(&owner.transaction.encode()),
+            owner_output: WireOutput::from(&owner.owner_output),
+            inclusion: WireInclusion::from(&owner.inclusion),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireNameEvidence {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    current_state_hex: Option<String>,
+    proof_state_hex: Option<String>,
+    current_state: Option<WireNameState>,
+    proof_state: Option<WireNameState>,
+    proof: WireNameProof,
+    current_owner: Option<WireNameOwner>,
+    proof_owner: Option<WireNameOwner>,
+    data_semantics: &'static str,
+}
+
+fn wire_name_evidence(evidence: NameEvidence) -> Result<WireNameEvidence, DispatchError> {
+    let kind = match evidence.proof.proof.kind {
+        ProofKind::Inclusion => "inclusion",
+        ProofKind::NonInclusion => "non_inclusion",
+    };
+    let current_state_hex = evidence
+        .current_state
+        .as_ref()
+        .map(encode_name_state)
+        .transpose()
+        .map_err(|_| DispatchError::Internal)?
+        .map(|raw| hex_encode(&raw));
+    let proof_state_hex = evidence
+        .proof_state
+        .as_ref()
+        .map(encode_name_state)
+        .transpose()
+        .map_err(|_| DispatchError::Internal)?
+        .map(|raw| hex_encode(&raw));
+    Ok(WireNameEvidence {
+        chain_epoch: evidence.chain_epoch,
+        tip: wire_tip(evidence.tip),
+        current_state_hex,
+        proof_state_hex,
+        current_state: evidence.current_state.as_ref().map(WireNameState::from),
+        proof_state: evidence.proof_state.as_ref().map(WireNameState::from),
+        proof: WireNameProof {
+            root: hex_encode(evidence.proof.root.as_bytes()),
+            name_hash: evidence.proof.proof.name_hash.to_hex(),
+            kind,
+            proof_hex: hex_encode(&evidence.proof.proof.raw),
+        },
+        current_owner: evidence.current_owner.as_ref().map(WireNameOwner::from),
+        proof_owner: evidence.proof_owner.as_ref().map(WireNameOwner::from),
+        data_semantics: "projected_data_hex_is_resource_bytes_not_encoded_name_state",
+    })
+}
+
+#[derive(Serialize)]
+struct WireTrackedFunding {
+    contract_id: String,
+    coin: WireCoin,
+    block_hash: String,
+    height: u32,
+    transaction_position: u32,
+    output_position: u32,
+}
+
+impl From<&TrackedContractFunding> for WireTrackedFunding {
+    fn from(funding: &TrackedContractFunding) -> Self {
+        Self {
+            contract_id: hex_encode(funding.contract_id.as_bytes()),
+            coin: WireCoin::from(&funding.coin),
+            block_hash: funding.block_hash.to_hex(),
+            height: funding.height,
+            transaction_position: funding.transaction_position,
+            output_position: funding.output_position,
+        }
+    }
+}
+
+fn wire_spend_kind(kind: &TrackedContractSpendKind) -> &'static str {
+    match kind {
+        TrackedContractSpendKind::Unrecognized => "unrecognized",
+        TrackedContractSpendKind::ShakedexFulfillment => "shakedex_fulfillment",
+        TrackedContractSpendKind::ShakedexRecovery => "shakedex_recovery",
+        TrackedContractSpendKind::HtlcRedemption { .. } => {
+            "hns_htlc_redemption_preimage_opaque"
+        }
+        TrackedContractSpendKind::HtlcRefund => "hns_htlc_refund",
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum WireTrackedEvent {
+    Funding {
+        funding: WireTrackedFunding,
+    },
+    Spend {
+        contract_id: String,
+        funding: WireTrackedFunding,
+        spending_txid: String,
+        block_hash: String,
+        height: u32,
+        transaction_position: u32,
+        input_position: u32,
+        kind: &'static str,
+    },
+}
+
+fn wire_tracked_event(event: &TrackedContractEvent) -> WireTrackedEvent {
+    match event {
+        TrackedContractEvent::Funding(funding) => WireTrackedEvent::Funding {
+            funding: WireTrackedFunding::from(funding),
+        },
+        TrackedContractEvent::Spend {
+            contract_id,
+            funding,
+            spending_txid,
+            block_hash,
+            height,
+            transaction_position,
+            input_position,
+            kind,
+        } => WireTrackedEvent::Spend {
+            contract_id: hex_encode(contract_id.as_bytes()),
+            funding: WireTrackedFunding::from(funding),
+            spending_txid: spending_txid.to_hex(),
+            block_hash: block_hash.to_hex(),
+            height: *height,
+            transaction_position: *transaction_position,
+            input_position: *input_position,
+            kind: wire_spend_kind(kind),
+        },
+    }
+}
+
+#[derive(Serialize)]
+struct WireContractFundingPage {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    entries: Vec<WireTrackedFunding>,
+    continuation: Option<String>,
+}
+
+fn wire_contract_funding_page(
+    page: WalletContractFundingPage,
+) -> Result<WireContractFundingPage, DispatchError> {
+    Ok(WireContractFundingPage {
+        chain_epoch: page.chain_epoch,
+        tip: wire_tip(page.tip),
+        entries: page
+            .entries
+            .iter()
+            .map(WireTrackedFunding::from)
+            .collect(),
+        continuation: encode_cursor(page.continuation.as_ref())?,
+    })
+}
+
+#[derive(Serialize)]
+struct WireContractEventPage {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    entries: Vec<WireTrackedEvent>,
+    continuation: Option<String>,
+    preimage_transport: &'static str,
+}
+
+fn wire_contract_event_page(
+    page: WalletContractEventPage,
+) -> Result<WireContractEventPage, DispatchError> {
+    Ok(WireContractEventPage {
+        chain_epoch: page.chain_epoch,
+        tip: wire_tip(page.tip),
+        entries: page.entries.iter().map(wire_tracked_event).collect(),
+        continuation: encode_cursor(page.continuation.as_ref())?,
+        preimage_transport: "opaque_unavailable",
+    })
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum WireMempoolContractEvent {
+    Funding {
+        outpoint: WireOutpoint,
+        value: u64,
+    },
+    Spend {
+        funding_outpoint: WireOutpoint,
+        input_position: u32,
+        kind: &'static str,
+    },
+}
+
+#[derive(Serialize)]
+struct WireMempoolContractActivity {
+    txid: String,
+    admitted_at: u64,
+    events: Vec<WireMempoolContractEvent>,
+}
+
+#[derive(Serialize)]
+struct WireMempoolContractPage {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    instance_nonce: String,
+    generation: u64,
+    entries: Vec<WireMempoolContractActivity>,
+    continuation: Option<String>,
+    preimage_transport: &'static str,
+}
+
+fn wire_mempool_contract_page(
+    page: MempoolContractPage,
+) -> Result<WireMempoolContractPage, DispatchError> {
+    Ok(WireMempoolContractPage {
+        chain_epoch: page.chain_epoch,
+        tip: wire_tip(page.tip),
+        instance_nonce: hex_encode(&page.instance_nonce),
+        generation: page.generation,
+        entries: page
+            .entries
+            .into_iter()
+            .map(|activity| WireMempoolContractActivity {
+                txid: activity.txid.to_hex(),
+                admitted_at: activity.admitted_at,
+                events: activity
+                    .events
+                    .into_iter()
+                    .map(|event| match event {
+                        MempoolContractEvent::Funding { outpoint, value } => {
+                            WireMempoolContractEvent::Funding {
+                                outpoint: WireOutpoint::from(&outpoint),
+                                value,
+                            }
+                        }
+                        MempoolContractEvent::Spend {
+                            funding_outpoint,
+                            input_position,
+                            kind,
+                        } => WireMempoolContractEvent::Spend {
+                            funding_outpoint: WireOutpoint::from(&funding_outpoint),
+                            input_position,
+                            kind: wire_spend_kind(&kind),
+                        },
+                    })
+                    .collect(),
+            })
+            .collect(),
+        continuation: encode_cursor(page.continuation.as_ref())?,
+        preimage_transport: "opaque_unavailable",
+    })
+}

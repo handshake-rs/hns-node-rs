@@ -122,9 +122,23 @@ Implemented:
   contextual transaction admission/P2P fanout, one-pass bounded multi-script
   mempool reconciliation, chain-epoch-bound global confirmed history/UTXO
   restoration, active-height hash reads, atomically bundled transaction/name
-  evidence, collection-admitted/256-examination confirmed pagination, and
-  process-instance- plus generation-bound mempool pagination are implemented in
-  source; all remain disabled by default. Immutable public Shakedex-v2 and
+  evidence, immutable ordered outpoint-spend batches,
+  collection-admitted/256-examination confirmed pagination, and chain-epoch-,
+  process-instance-, plus generation-bound mempool pagination are implemented in
+  source; all remain disabled by default. Native sync now projects the safe
+  subset through wallet RPC v1 without a sibling dependency. That route is
+  absent outside active-state native sync and fails closed unless both explicit
+  listener Authorization and the durable complete wallet profile are
+  configured; it preserves opaque chain/query cursors,
+  explicit chain/tip and mempool instance nonce/generation, optional exact
+  transaction position and block time without zero sentinels, canonical encoded
+  current/proof NameState bytes and separate owner views, contextual
+  signed-transaction broadcast, and stable redacted
+  errors under the existing HTTP/backend resource bounds plus stricter
+  256-row/1,024-scan wire limits and an 8 MiB measured JSON-result ceiling.
+  Contract registration,
+  canonical name/resource interpretation, and raw revealed-preimage transport
+  remain unavailable across this wire boundary. Immutable public Shakedex-v2 and
   HNS-HTLC-v1 registrations drive restart-durable funding, seller-signed
   TRANSFER fulfillment (`0x84`) and recovery (`0x83`), redemption, refund, and
   internally raw/publicly redacted revealed-preimage events in the canonical
@@ -136,11 +150,12 @@ Implemented:
   authenticated pre-current-block UTXO view plus the complete same-block output
   map before state-overlay mutation. The append-only contract registry has no
   safe retirement or capacity reclamation; its lifetime caps are an explicit
-  production-availability blocker. This implementation is awaiting
-  the repository's full gate, a published and pinned canonical `hns-swap`
-  commit, and cross-repository adapter qualification; local script duplication
-  and frozen vectors are not protocol authority and no release-readiness claim
-  is made by this source status update.
+  production-availability blocker. This implementation is awaiting the
+  repository's full gate, an independent wallet transport adapter, a published
+  and pinned canonical `hns-swap` commit, and cross-repository adapter
+  qualification; local script duplication and frozen vectors are not protocol
+  authority and no release-readiness claim is made by this source status
+  update.
 - A bounded hash-first Denuo marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live

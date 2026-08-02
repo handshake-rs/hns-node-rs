@@ -290,19 +290,53 @@ Fixtures are evidence, not authority.
 - Multi-script confirmed and mempool results use positions in the sorted
   request. Confirmed cursors bind the script-set digest and durable chain epoch;
   collection admission and a 256-prefix-page bound permit empty resumable
-  progress. Mempool cursors bind the immutable generation plus a fallibly
-  initialized, OS-random nonzero process-local nonce, rejecting continuations
-  after restart. Wallet adapters retain an explicit reverse map to
+  progress. Mempool cursors bind the durable chain epoch, immutable generation,
+  exact query, plus a fallibly initialized, OS-random nonzero process-local
+  nonce, rejecting continuations after reorg or restart. Responses carry the
+  full tip and exact admission time. Wallet adapters retain an explicit reverse map to
   derivation-order records and discard partial scans when either binding
   changes.
 - Combined transaction evidence binds status, inclusion, payload availability,
-  chain epoch, tip, and mempool generation. Combined name evidence labels both
+  chain epoch, tip, and mempool instance/generation. The wire requires the
+  expected chain epoch and can require the exact prior mempool binding, so a
+  restart cannot be hidden between a page and a point read. Combined name evidence labels both
   pending current state and interval-root-authenticated state and resolves
-  owners from the same snapshot. Authority-bearing reads verify the published
+  owners from the same snapshot. It transports both complete canonical encoded
+  state values so an adapter never rebuilds consensus bytes from JSON hints.
+  Transaction position is exact when retained bytes allow enumeration and is
+  explicitly absent after pruning; zero is not an unavailable sentinel.
+  Chain-bound block-hash and ordered bounded outpoint-spend evidence likewise
+  come from one immutable snapshot. Authority-bearing reads verify the published
   chain epoch before and after decoding and return retryable
   `StaleCanonicalRead` for an in-flight writer or chain-changing overlap,
   including for a terminal restoration page; a completed mempool-only
   publication does not stale a durable-chain result.
+- Wallet RPC is a separate v1 envelope on the active-state native-sync listener
+  and is unavailable in headers-only/observe-only operation or unless an exact
+  Authorization header file and the durable complete wallet profile were
+  explicitly configured. Loopback binding is not authentication.
+  Authorization values are bounded visible ASCII with internal scheme spaces
+  preserved and leading/trailing whitespace, controls, and Unicode rejected;
+  file loading removes only one terminal LF or CRLF and performs no trimming.
+  Authentication middleware rejects before global execution
+  admission; the listener body/concurrency/timeout bounds and the backend's
+  point/collection/writer admission remain cumulative.
+- The wire uses bounded behaviorally opaque cursor tokens and stable redacted
+  errors. Cursors are query-bound traversal hints, not cryptographic secrets or
+  capabilities. Wire pages/scans are stricter than internal index bounds and
+  each JSON result is encoded and measured against an 8 MiB ceiling before
+  publication. It
+  exposes chain epoch/tip and mempool process nonce/generation rather than
+  allowing an adapter to infer continuity. Node/store errors and paths are not
+  reflected. The only mutation accepts a canonical already-signed transaction,
+  passes contextual mempool admission, and performs peer inventory fanout; no
+  signing or secret service exists.
+- Current and proof-root NameState/owner views remain distinct on the wire.
+  Canonical encoded state bytes are explicit; projected resource data is
+  labeled semantically opaque. Contract registration and raw
+  revealed-preimage transport are absent while the canonical protocol release
+  is unpublished; node-local classifications are evidence, not protocol
+  authority.
 - Local Shakedex/HTLC script and branch duplication is not protocol authority.
   The local tracker recognizes only seller-signed Shakedex TRANSFER fulfillment
   (`0x84`) and recovery (`0x83`) shapes; a direct FINALIZE shape is

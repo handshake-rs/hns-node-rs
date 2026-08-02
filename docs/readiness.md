@@ -144,12 +144,15 @@ Implemented in source:
   collection-read admission, a 256-prefix-examination work bound, and resumable
   empty progress;
 - bounded one-pass reconciliation of up to 10,000 sorted-unique wallet scripts
-  against process-instance- and generation-bound immutable mempool pages, with
+  against chain-epoch-, process-instance-, and generation-bound immutable
+  mempool pages, with exact admission times and
   fallible OS-random nonzero instance initialization and result indexes
   explicitly defined against sorted request order for adapter reverse mapping;
-- active-height block hash reads, tree-root-bearing tips, combined
-  generation-stable transaction evidence, and tip/root-bound current-versus-
-  authenticated name evidence;
+- chain-bound active-height block hash reads, tree-root-bearing tips, ordered
+  immutable outpoint-spend batches, combined generation-stable transaction
+  evidence with optional exact retained-block position, optional canonical
+  confirmed block times, and tip/root-bound current-versus-authenticated name
+  evidence with complete canonical encoded state bytes;
 - immutable public Shakedex-v2 and HNS-HTLC-v1 registrations with pinned
   secp256k1 key parsing, canonical scripts, exact signature-hash profiles, and
   an explicit versioned canonical-binary descriptor identity plus bounded
@@ -162,10 +165,20 @@ Implemented in source:
   public serde redacts rather than exports persisted raw preimages;
 - bounded startup topology validation, query pagination, typed
   disabled/corrupt/pruned failures, and explicit preimage redaction.
+- authenticated wallet RPC v1 on the active-state native-sync process
+  boundary, requiring both explicit listener Authorization and the durable
+  complete wallet profile,
+  with canonical hex payloads, bounded opaque cursors, stable redacted errors,
+  exact encoded current/proof name views, snapshot-bound block/spender/mempool
+  evidence, signed-transaction contextual admission,
+  stricter 256-row/1,024-scan wire limits, an 8 MiB measured JSON-result
+  ceiling, and node-local tracked-contract evidence that keeps descriptor
+  registration and raw preimages unavailable.
 
 This implementation is not release-qualified until the full repository gate, a
-published and pinned canonical `hns-swap` commit, and cross-repository wallet
-adapter/restart/reorg qualification pass on its final commit. Local script
+published and pinned canonical `hns-swap` commit, and an independently
+implemented cross-repository wallet transport adapter plus restart/reorg/
+adversarial qualification pass on its final commit. Local script
 duplication and frozen vectors are cross-boundary qualification checks, not
 protocol authority. It stores no wallet key or unrevealed preimage and remains
 disabled by default. Its immutable registry is append-only: no safe retirement

@@ -5,6 +5,7 @@ mod mining_engine;
 mod native_sync;
 mod peer_bans;
 mod wallet_backend;
+mod wallet_rpc;
 
 pub use denuo_market::{DenuoRelayHandle, DenuoRelayHandleError};
 pub use hns_denuo_market_relay::{
@@ -30,16 +31,18 @@ pub use mining_engine::{
 };
 pub use native_sync::{NativeSyncConfig, NativeSyncDiagnostics};
 pub use wallet_backend::{
-    BroadcastResult, ConfirmedScriptHistory, ConfirmedScriptUtxo, ConfirmedScriptsCursor,
-    ConfirmedScriptsPage, FeeEstimate, FeeEstimateSource, MempoolContractActivity,
-    MempoolContractEvent, MempoolContractPage, MempoolScriptActivity, MempoolScriptOutput,
-    MempoolScriptPage, MempoolScriptSpend, NameEvidence, NameOwnerTransaction, NameProofResult,
+    BlockHashEvidence, BroadcastResult, ConfirmedScriptHistory, ConfirmedScriptUtxo,
+    ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate, FeeEstimateSource,
+    MempoolContractActivity, MempoolContractEvent, MempoolContractPage, MempoolScriptActivity,
+    MempoolScriptOutput, MempoolScriptPage, MempoolScriptSpend, NameEvidence,
+    NameOwnerTransaction, NameProofResult, OutpointSpendingEntry, OutpointSpendingEvidence,
     TransactionEvidence, TransactionInclusion, TransactionPayload, TransactionStatus,
     WalletBackend, WalletBackendError, WalletChainTip, WalletContractEventCursor,
     WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
     WalletMempoolCursor, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
-    MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS,
+    MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS, MAX_WALLET_OUTPOINT_SPEND_BATCH,
 };
+pub use wallet_rpc::WALLET_RPC_API_VERSION;
 
 use std::{
     any::Any,
@@ -478,13 +481,16 @@ pub struct RpcAuthorizationHeader(Arc<str>);
 impl RpcAuthorizationHeader {
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
-        if value.is_empty()
-            || value.len() > MAX_RPC_AUTHORIZATION_BYTES
-            || value
-                .chars()
-                .any(|character| matches!(character, '\r' | '\n'))
+        let bytes = value.as_bytes();
+        if bytes.is_empty()
+            || bytes.len() > MAX_RPC_AUTHORIZATION_BYTES
+            || matches!(bytes.first(), Some(b' ' | b'\t'))
+            || matches!(bytes.last(), Some(b' ' | b'\t'))
+            || bytes.iter().any(|byte| !(0x20..=0x7e).contains(byte))
         {
-            anyhow::bail!("RPC Authorization value must be one bounded nonempty line");
+            anyhow::bail!(
+                "RPC Authorization value must be 1..={MAX_RPC_AUTHORIZATION_BYTES} visible ASCII bytes with no leading or trailing whitespace"
+            );
         }
         Ok(Self(Arc::from(value)))
     }
@@ -19788,6 +19794,23 @@ mod tests {
 
         shutdown_tx.send(()).expect("shutdown");
         server.await.expect("server join").expect("server result");
+    }
+
+    #[test]
+    fn rpc_authorization_accepts_only_exact_wire_safe_values() {
+        assert!(RpcAuthorizationHeader::new("Bearer exact-secret").is_ok());
+        for invalid in [
+            "",
+            " Bearer exact-secret",
+            "Bearer exact-secret ",
+            "Bearer\texact-secret",
+            "Bearer\nexact-secret",
+            "Bearer\rexact-secret",
+            "Bearer\0exact-secret",
+            "Bearer café",
+        ] {
+            assert!(RpcAuthorizationHeader::new(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

@@ -13,13 +13,20 @@ repository also contains the separately deployed, bounded
 ordinary HNS DNS without an `hsd` runtime.
 
 The wallet-index source implementation includes bounded chain-epoch-bound
-confirmed restoration, process-instance- and generation-bound mempool
-reconciliation, atomic transaction/name evidence, active-chain height/root
-reads, and restart/reorg-durable public Shakedex-v2/HNS-HTLC-v1 event tracking.
-It is disabled by default and is not release-qualified: the immutable contract
-registry has no safe capacity-reclamation lifecycle, and the repository still
-awaits its canonical `hns-swap` pin and cross-project qualification. See the
-[wallet-index status](docs/HNS_NODE_WALLET_INDEX.md).
+confirmed restoration, chain-epoch/process-instance/generation-bound mempool
+reconciliation, ordered snapshot-bound outpoint-spend evidence, canonical
+encoded current/proof name state, atomic transaction/name evidence,
+active-chain height/root reads, and restart/reorg-durable public
+Shakedex-v2/HNS-HTLC-v1 event tracking.
+Authenticated wallet RPC v1 now projects the safe subset through the native
+node process boundary without a sibling dependency. It requires explicit
+listener Authorization and `--wallet-index`; loopback alone never enables it.
+The subsystem is disabled by default and is not release-qualified: the
+immutable contract registry has no safe capacity-reclamation lifecycle, and
+the repository still awaits its independent wallet adapter, canonical
+`hns-swap` pin, and cross-project qualification. See the
+[wallet-index status](docs/HNS_NODE_WALLET_INDEX.md) and
+[wire contract](docs/WALLET_RPC_V1.md).
 
 > [!IMPORTANT]
 > Functional consensus readiness is complete, but production hardening is
@@ -144,6 +151,7 @@ documented in [Storage rollout](docs/storage-rollout.md).
 - [Production assurance and external evidence](docs/production-assurance.md)
 - [Storage schema and complexity](docs/storage-schema.md)
 - [Wallet indexes and typed backend](docs/HNS_NODE_WALLET_INDEX.md)
+- [Authenticated wallet RPC v1](docs/WALLET_RPC_V1.md)
 - [Bounded Denuo marketplace relay](docs/DENUO_MARKET_RELAY.md)
 - [Docker and GHCR](docs/docker.md)
 - [Native mainnet mining canary](docs/mainnet-canary.md)

@@ -18,6 +18,7 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, State},
     middleware,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -80,6 +81,7 @@ use super::{
     ShutdownSignal, StatelessBodyValidation, HSRD_DIAGNOSTIC_API_VERSION,
     MAX_CANONICAL_WRITER_QUEUE_CAPACITY,
 };
+use super::{wallet_rpc, WalletBackend};
 use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
     HSD_BAN_TIME_SECONDS, MAX_PEER_BANS,
@@ -2713,6 +2715,14 @@ impl NodeService {
             ..NativeSyncDiagnostics::default()
         }));
         let diagnostic_rpc = initialize_cached_diagnostic_rpc(&node, &diagnostics).await?;
+        let wallet_rpc_authenticated = rpc_authorization.is_some();
+        let wallet_rpc_profile_enabled = node.wallet_index_profile().wallet;
+        let wallet_rpc_active_state_enabled = native_sync_config.connect_active_state
+            && !native_sync_config.headers_only;
+        let wallet_backend = (wallet_rpc_authenticated
+            && wallet_rpc_profile_enabled
+            && wallet_rpc_active_state_enabled)
+            .then(|| runtime.wallet_backend(peers.clone()));
 
         // Bind diagnostics before startup replay/compaction. The cached,
         // explicitly timestamped snapshot remains readable while the
@@ -2727,6 +2737,9 @@ impl NodeService {
             diagnostics: Arc::clone(&diagnostics),
             diagnostic_rpc: Arc::clone(&diagnostic_rpc),
             read_context: rpc_read_context,
+            wallet_backend,
+            wallet_rpc_authenticated,
+            wallet_rpc_profile_enabled,
             limits: rpc_limits,
         };
         let rpc_task = tokio::spawn(serve_native_sync_rpc(
@@ -4886,6 +4899,9 @@ struct NativeSyncHttpState {
     diagnostics: Arc<RwLock<NativeSyncDiagnostics>>,
     diagnostic_rpc: Arc<RwLock<CachedDiagnosticRpc>>,
     read_context: RpcReadContext,
+    wallet_backend: Option<WalletBackend>,
+    wallet_rpc_authenticated: bool,
+    wallet_rpc_profile_enabled: bool,
     limits: RpcLimits,
 }
 
@@ -4904,6 +4920,10 @@ async fn serve_native_sync_rpc(
     let limits = state.limits;
     limits.validate()?;
     let runtime_limits = RpcRuntimeLimits::new(limits);
+    let wallet_rpc_enabled = authorization.is_some()
+        && state.wallet_backend.is_some()
+        && state.wallet_rpc_authenticated
+        && state.wallet_rpc_profile_enabled;
     let app = Router::new()
         .route("/", post(handle_native_sync_rpc))
         .route("/rpc", post(handle_native_sync_rpc))
@@ -4917,7 +4937,13 @@ async fn serve_native_sync_rpc(
         .route(
             "/api/v1/mining-engine",
             get(handle_mining_engine_diagnostics),
-        )
+        );
+    let app = if wallet_rpc_enabled {
+        app.route("/api/v1/wallet", post(handle_native_sync_wallet))
+    } else {
+        app
+    };
+    let app = app
         .with_state(state)
         .layer(DefaultBodyLimit::max(limits.maximum_request_bytes))
         .layer(middleware::from_fn_with_state(
@@ -5248,6 +5274,20 @@ async fn handle_native_sync_rpc(
         ),
         Err(error) => Json(json_rpc_error(id, -32603, error.to_string())),
     }
+}
+
+async fn handle_native_sync_wallet(
+    State(state): State<NativeSyncHttpState>,
+    body: Bytes,
+) -> axum::response::Response {
+    wallet_rpc::dispatch_wallet_rpc(
+        state.wallet_backend.as_ref(),
+        state.wallet_rpc_authenticated,
+        state.wallet_rpc_profile_enabled,
+        &body,
+    )
+    .await
+    .into_response()
 }
 
 async fn diagnostic_method(state: &NativeSyncHttpState, method: &str) -> serde_json::Value {
@@ -12279,6 +12319,9 @@ mod tests {
             diagnostics,
             diagnostic_rpc,
             read_context,
+            wallet_backend: None,
+            wallet_rpc_authenticated: false,
+            wallet_rpc_profile_enabled: false,
             limits: rpc_limits,
         };
 
@@ -12451,6 +12494,9 @@ mod tests {
                 diagnostics,
                 diagnostic_rpc,
                 read_context,
+                wallet_backend: None,
+                wallet_rpc_authenticated: true,
+                wallet_rpc_profile_enabled: false,
                 limits: rpc_limits,
             },
             Some(authorization),

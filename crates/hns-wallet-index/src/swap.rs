@@ -73,6 +73,12 @@ const OP_10: u8 = OP_1 + 9;
 pub struct ContractId([u8; 32]);
 
 impl ContractId {
+    /// Construct an identity from its stable raw bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Raw stable identifier bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {

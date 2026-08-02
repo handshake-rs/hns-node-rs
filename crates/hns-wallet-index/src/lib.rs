@@ -150,6 +150,12 @@ pub fn decode_index_profile(raw: &[u8]) -> Result<WalletIndexProfile, IndexError
 pub struct ScriptId([u8; 32]);
 
 impl ScriptId {
+    /// Construct an identity from its stable raw bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Derive an ID from the canonical address encoding used in transaction outputs.
     #[must_use]
     pub fn from_address(address: &Address) -> Self {
