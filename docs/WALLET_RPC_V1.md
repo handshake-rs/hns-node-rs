@@ -84,7 +84,7 @@ wire. Transaction policy rejection text is bounded to 256 characters.
 | Method | Parameters | Result and binding |
 | --- | --- | --- |
 | `capabilities` | none | Hard bounds and explicit unavailable protocol surfaces. |
-| `chain_tip` | none | Active hash, height, and exact proof tree root. |
+| `chain_tip` | none | Active hash, height, HSD-compatible median-time-past, and exact proof tree root. |
 | `block_hash` | `height`, required `expected_chain_epoch` | Requested height and active-chain hash or `null`, bound to the chain epoch and full tip captured in the same immutable read. |
 | `confirmed_scripts_page` | sorted-unique `script_ids`, opaque `cursor`, `limit` (1..=256) | Combined history (including canonical block time when retained in the header index) then UTXOs, chain epoch, tip, work count, continuation. |
 | `mempool_scripts_page` | same script set, required `expected_chain_epoch`, opaque `cursor`, `scan_limit` (1..=1,024) | Relevant transactions with exact admission times, chain epoch/tip, process `instance_nonce`, and immutable `generation`. A mismatched expected epoch fails stale. |
@@ -136,6 +136,12 @@ After the first confirmed restoration page establishes the durable epoch,
 pages also require `expected_chain_epoch`. A mismatch is rejected before wire
 projection. Every response retains the complete captured tip so the adapter can
 also require exact tip equality.
+
+Every non-null `tip` object contains `hash`, `height`, `median_time_past`, and
+`tree_root`. `median_time_past` is the median timestamp of the active tip and up
+to ten ancestors, matching the HSD consensus window. The node loads that header
+ancestry from the same immutable snapshot as the tip and proof root; missing or
+inconsistent ancestry fails closed instead of projecting a partial time value.
 
 ## Transaction-bound fee quotes
 
@@ -255,6 +261,7 @@ The result schema is:
   "tip": {
     "hash": "<64 hex characters>",
     "height": 100000,
+    "median_time_past": 1700000123,
     "tree_root": "<64 hex characters>"
   },
   "candidate_inclusion_height": 100001,

@@ -238,8 +238,10 @@ and the live peer manager. It implements:
 - `get_name_action_context`
 - `get_name_owner_transaction`
 
-`WalletChainTip` contains the active hash, height, and the exact authenticated
-name-tree root used for current persisted proofs. `get_transaction_evidence`
+`WalletChainTip` contains the active hash, height, HSD-compatible
+median-time-past computed over the tip and up to ten ancestors, and the exact
+authenticated name-tree root used for current persisted proofs.
+`get_transaction_evidence`
 captures status, inclusion, retained-or-pruned payload state, active tip,
 durable chain epoch, and immutable mempool instance/generation together, then rejects
 the result if publication changes during the read. The compatibility status,

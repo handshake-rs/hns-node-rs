@@ -37,7 +37,8 @@ use thiserror::Error;
 
 use super::{
     best_block_tip_from_snapshot, chain_epoch_from_snapshot, load_block, read_canonical_hash,
-    CanonicalEpoch, CanonicalStateWriter, CanonicalWriterError,
+    load_header_record, median_time_past_with_lookup, CanonicalEpoch, CanonicalStateWriter,
+    CanonicalWriterError,
     LivePeerManager as ReexportedLivePeerManager, NodeReadHandle, NodeRuntime,
 };
 
@@ -351,6 +352,8 @@ pub struct WalletChainTip {
     pub hash: BlockHash,
     /// Active-chain height.
     pub height: Height,
+    /// HSD-compatible median timestamp of this tip and up to ten ancestors.
+    pub median_time_past: u64,
     /// Exact authenticated name-tree root available for proofs at this tip.
     pub tree_root: TreeRoot,
 }
@@ -2125,10 +2128,22 @@ fn wallet_chain_tip<S: ReadSnapshot>(
     let Some(tip) = best_block_tip_from_snapshot(snapshot).map_err(node_error)? else {
         return Ok(None);
     };
+    let tip_header = load_header_record(snapshot, &tip.hash)
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt("active tip header is missing"))?;
+    if tip_header.height != tip.height {
+        return Err(WalletBackendError::Corrupt(
+            "active tip header height disagrees with the block index",
+        ));
+    }
+    let mut lookup = |hash: &BlockHash| load_header_record(snapshot, hash);
+    let median_time_past =
+        median_time_past_with_lookup(&tip_header, &mut lookup).map_err(node_error)?;
     let tree_root = load_stored_name_tree_root(snapshot).map_err(node_error)?;
     Ok(Some(WalletChainTip {
         hash: tip.hash,
         height: tip.height,
+        median_time_past,
         tree_root,
     }))
 }

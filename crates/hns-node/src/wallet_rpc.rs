@@ -939,6 +939,7 @@ fn encode_cursor<T: Serialize>(cursor: Option<&T>) -> Result<Option<String>, Dis
 struct WireTip {
     hash: String,
     height: u32,
+    median_time_past: u64,
     tree_root: String,
 }
 
@@ -946,6 +947,7 @@ fn wire_tip(tip: Option<super::wallet_backend::WalletChainTip>) -> Option<WireTi
     tip.map(|tip| WireTip {
         hash: tip.hash.to_hex(),
         height: tip.height,
+        median_time_past: tip.median_time_past,
         tree_root: hex_encode(tip.tree_root.as_bytes()),
     })
 }
@@ -1611,6 +1613,7 @@ fn wire_name_action_context(
         tip: WireTip {
             hash: context.tip.hash.to_hex(),
             height: context.tip.height,
+            median_time_past: context.tip.median_time_past,
             tree_root: hex_encode(context.tip.tree_root.as_bytes()),
         },
         candidate_inclusion_height: context.candidate_inclusion_height,
@@ -1870,6 +1873,21 @@ fn wire_mempool_contract_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_tip_wire_projection_includes_median_time_past() {
+        let projected = serde_json::to_value(
+            wire_tip(Some(crate::wallet_backend::WalletChainTip {
+                hash: hns_primitives::BlockHash::new([0x11; 32]),
+                height: 42,
+                median_time_past: 1_700_000_123,
+                tree_root: hns_state::TreeRoot::new([0x22; 32]),
+            }))
+            .expect("present tip"),
+        )
+        .expect("serialize tip");
+        assert_eq!(projected["median_time_past"], 1_700_000_123u64);
+    }
 
     #[test]
     fn name_action_context_request_is_strict_and_exactly_bound() {
