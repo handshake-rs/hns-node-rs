@@ -3961,7 +3961,7 @@ impl NodeService {
                 });
             }
         } else if self.state.is_direct_active_extension(&request)? {
-            let committed = match self.state.commit_staged_block(request, validated) {
+            let committed = match self.state.commit_staged_block(request, validated, true) {
                 Ok(committed) => committed,
                 Err(error) => {
                     self.fail_closed_after_ambiguous_commit();
@@ -4167,6 +4167,35 @@ impl NodeService {
     ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
         self.state
             .apply_reorg_classified_prepared(request, prepared)
+    }
+
+    /// Commit one already-stored canonical successor through the same atomic
+    /// direct-extension path used for a live block.
+    ///
+    /// A one-block forward activation is not a reorganization and cannot be
+    /// bisected further. Routing it through the bounded multi-block reorg
+    /// transaction can turn that batching limit into a permanent IBD liveness
+    /// failure. This path remains fully contextual, atomic, page-tail rollback
+    /// safe, and fail-closed; it only avoids re-persisting the body that native
+    /// sync has already durably authenticated and stored.
+    pub(crate) fn apply_prepared_stored_direct_extension(
+        &mut self,
+        request: NodeBlockImport,
+        prepared: PreparedNativeActivation,
+    ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
+        let stateless = prepared
+            .into_single_for(&request)
+            .map_err(ChainActivationFailure::Internal)?;
+        let mutation = self
+            .state
+            .commit_prepared_stored_direct_extension(request, stateless)?;
+        Ok(NodeReorgMutation {
+            summary: NodeReorgSummary {
+                disconnected: Vec::new(),
+                connected: vec![mutation.record],
+            },
+            mining: mutation.mining,
+        })
     }
 
     fn apply_reorg_with_limits(
@@ -5897,6 +5926,27 @@ impl PreparedNativeActivation {
             proof.verify(connect)?;
         }
         Ok(())
+    }
+
+    /// Consume the exact stateless proof for a one-block direct extension.
+    ///
+    /// Multi-block activation authenticates the whole proof vector at the
+    /// reorganization boundary. When native replay has backed off to one
+    /// block, it uses the ordinary direct-extension commit boundary instead;
+    /// preserve the same process-private hash-and-height binding there.
+    fn into_single_for(mut self, request: &NodeBlockImport) -> Result<StatelessBodyValidation> {
+        if self.stateless.len() != 1 {
+            anyhow::bail!(
+                "prepared direct extension has {} proofs instead of one",
+                self.stateless.len()
+            );
+        }
+        let proof = self
+            .stateless
+            .pop()
+            .expect("single prepared direct-extension proof checked above");
+        proof.verify(request)?;
+        Ok(proof)
     }
 
     fn into_by_identity(self) -> HashMap<(BlockHash, Height), StatelessBodyValidation> {
@@ -10597,10 +10647,11 @@ impl NodeState {
         &mut self,
         request: NodeBlockImport,
         validated: ValidatedImport,
+        persist_raw_body: bool,
     ) -> Result<NodeBlockMutation> {
         self.ensure_storage_operational()?;
         if self.name_pages.is_some() {
-            return self.commit_staged_block_with_name_pages(request, validated);
+            return self.commit_staged_block_with_name_pages(request, validated, persist_raw_body);
         }
         let snapshot = self.store.snapshot()?;
         let generation = next_mining_generation(&snapshot)?;
@@ -10608,7 +10659,7 @@ impl NodeState {
         let previous = load_block_index_record(&snapshot, &request.block.hash())?;
         let mut batch = self.store.batch();
         let staged_connect =
-            self.stage_connect(&snapshot, &mut batch, &request, validated, true)?;
+            self.stage_connect(&snapshot, &mut batch, &request, validated, persist_raw_body)?;
         let record = staged_connect.current.block.clone();
         let mut index_updates = Vec::with_capacity(staged_connect.pruned.len().saturating_add(1));
         index_updates.push(IndexStatusUpdate {
@@ -10643,6 +10694,7 @@ impl NodeState {
         &mut self,
         request: NodeBlockImport,
         validated: ValidatedImport,
+        persist_raw_body: bool,
     ) -> Result<NodeBlockMutation> {
         let store = self.store.clone();
         let raw = store.snapshot()?;
@@ -10659,7 +10711,8 @@ impl NodeState {
         let chain_epoch = next_chain_epoch(&staged)?;
         let previous = load_block_index_record(&staged, &request.block.hash())?;
         let mut batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
-        let staged_connect = self.stage_connect(&staged, &mut batch, &request, validated, true)?;
+        let staged_connect =
+            self.stage_connect(&staged, &mut batch, &request, validated, persist_raw_body)?;
         let record = staged_connect.current.block.clone();
         let mut index_updates = Vec::with_capacity(staged_connect.pruned.len().saturating_add(1));
         index_updates.push(IndexStatusUpdate {
@@ -10736,6 +10789,60 @@ impl NodeState {
             record,
             mining: self.durable_mining_state()?,
         })
+    }
+
+    fn commit_prepared_stored_direct_extension(
+        &mut self,
+        request: NodeBlockImport,
+        stateless: StatelessBodyValidation,
+    ) -> std::result::Result<NodeBlockMutation, ChainActivationFailure> {
+        self.ensure_storage_operational()
+            .map_err(ChainActivationFailure::Internal)?;
+        let validated = {
+            let snapshot = self
+                .store
+                .snapshot()
+                .map_err(anyhow::Error::from)
+                .map_err(ChainActivationFailure::Internal)?;
+            let hash = request.block.hash();
+            let stored = load_block_index_record(&snapshot, &hash)
+                .map_err(ChainActivationFailure::Internal)?
+                .ok_or_else(|| {
+                    ChainActivationFailure::Internal(anyhow::anyhow!(
+                        "prepared direct extension {} at height {} is not durably stored",
+                        hash.to_hex(),
+                        request.height
+                    ))
+                })?;
+            self.validate_stored_activation_with_stateless(
+                &snapshot,
+                &request,
+                &stored,
+                Some(stateless),
+            )
+            .map_err(ChainActivationFailure::Internal)?
+        };
+        let failure_request = request.clone();
+        match self.commit_staged_block(request, validated, false) {
+            Ok(mutation) => Ok(mutation),
+            Err(error)
+                if error
+                    .downcast_ref::<StateConnectError>()
+                    .is_some_and(|error| error.0.is_consensus_invalid()) =>
+            {
+                Err(ChainActivationFailure::ContextualInvalid(Box::new(
+                    ContextualActivationFailure {
+                        request: failure_request,
+                        error,
+                    },
+                )))
+            }
+            Err(error) => Err(ChainActivationFailure::Internal(error.context(format!(
+                "failed to connect stored block {} at height {} through the direct-extension boundary",
+                failure_request.block.hash().to_hex(),
+                failure_request.height
+            )))),
+        }
     }
 
     fn stage_connect<T: ReadSnapshot, B: WriteBatch>(
@@ -15025,6 +15132,13 @@ mod tests {
                 connect: vec![request.clone()],
             })
             .expect("prepared activation identity");
+        prepared
+            .clone()
+            .into_single_for(&request)
+            .expect("prepared direct-extension identity");
+        assert!(PreparedNativeActivation::default()
+            .into_single_for(&request)
+            .is_err());
         assert!(PreparedNativeActivation::new(vec![proof, proof]).is_err());
 
         let wrong_height = NodeBlockImport::from_peer(block.clone(), 18);
@@ -15035,6 +15149,7 @@ mod tests {
                 connect: vec![wrong_height.clone()],
             })
             .is_err());
+        assert!(prepared.clone().into_single_for(&wrong_height).is_err());
 
         let mut mutated = block;
         mutated.header.nonce = mutated.header.nonce.saturating_add(1);

@@ -4305,7 +4305,22 @@ impl NodeService {
                 .reorg_started(activation.disconnect.len(), activation.connect.len());
         }
         let state_commit_started = StdInstant::now();
-        let mutation = self.apply_reorg_classified_prepared(activation, prepared);
+        // Multi-block replay and actual reorganizations retain the cumulative
+        // staged-effect budget. Once direct replay has been reduced to one
+        // block, use the ordinary atomic direct-extension boundary instead:
+        // one consensus block cannot be bisected, and keeping it in the reorg
+        // path would turn the batching resource limit into a permanent IBD
+        // liveness failure.
+        let mutation = if !is_reorg && attempted_connect == 1 {
+            let request = activation
+                .connect
+                .into_iter()
+                .next()
+                .expect("one-block direct activation checked above");
+            self.apply_prepared_stored_direct_extension(request, prepared)
+        } else {
+            self.apply_reorg_classified_prepared(activation, prepared)
+        };
         let state_commit_micros =
             u64::try_from(state_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let post_commit_started = StdInstant::now();
