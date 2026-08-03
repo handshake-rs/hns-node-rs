@@ -619,8 +619,10 @@ jobs:
               --p2p-discovery \
               --check-config
           else
-            test "$(docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --format '{{with index .Config.ExposedPorts "5350/tcp"}}{{.}}{{end}}')" = '{}'
-            test "$(docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" --format '{{with index .Config.ExposedPorts "5350/udp"}}{{.}}{{end}}')" = '{}'
+            docker image inspect "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" | jq -e '
+              .[0].Config.ExposedPorts
+              | length == 2 and has("5350/tcp") and has("5350/udp")
+            ' >/dev/null
           fi
           test "$(docker run --rm --entrypoint /usr/bin/id "${REGISTRY_IMAGE}@${PLATFORM_DIGEST}" -u)" = 10001
 
