@@ -132,7 +132,13 @@ Implemented:
   configured; it preserves opaque chain/query cursors,
   explicit chain/tip and mempool instance nonce/generation, optional exact
   transaction position and block time without zero sentinels, canonical encoded
-  current/proof NameState bytes and separate owner views, contextual
+  current/proof NameState bytes and separate owner views, and versioned
+  TRANSFER/FINALIZE name-action contexts bound to the exact chain epoch and
+  mempool process generation. Each name-action context echoes stable
+  network/genesis/`hns-consensus/name-policy-v1` identity, candidate tip-plus-one
+  height, the exact active owner and any immutable-mempool owner spender,
+  canonical lockup/maturity evidence, and HSD-selected active-chain renewal
+  block under a fixed nine-reason fail-closed eligibility bound. Contextual
   signed-transaction broadcast, transaction-bound HSD policy fee quotes, and
   stable redacted errors under the existing HTTP/backend resource bounds plus stricter
   256-row/1,024-scan wire limits and an 8 MiB measured JSON-result ceiling.
@@ -169,8 +175,9 @@ Implemented:
   and pinned canonical `hns-swap` commit, and cross-repository adapter
   qualification; local script duplication and frozen vectors are not protocol
   authority and no release-readiness claim is made by this source status
-  update. Fee-quote source tests were added but not executed in this source-only
-  tranche and inherit no qualification result from an earlier commit.
+  update. Name-action and immutable owner-spender source tests were added but not
+  executed in this source-only tranche and inherit no qualification result from
+  an earlier commit.
 - A bounded hash-first Denuo marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live

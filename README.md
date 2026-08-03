@@ -16,7 +16,8 @@ The wallet-index source implementation includes bounded chain-epoch-bound
 confirmed restoration, chain-epoch/process-instance/generation-bound mempool
 reconciliation, ordered snapshot-bound outpoint-spend evidence, canonical
 encoded current/proof name state, atomic transaction/name evidence,
-active-chain height/root reads, and restart/reorg-durable public
+active-chain height/root reads, exact-generation TRANSFER/FINALIZE preparation
+context with owner-spender and canonical maturity/renewal evidence, and restart/reorg-durable public
 Shakedex-v2/HNS-HTLC-v1 event tracking.
 Authenticated wallet RPC v1 now projects the safe subset through the native
 node process boundary without a sibling dependency. It requires explicit

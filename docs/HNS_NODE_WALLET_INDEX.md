@@ -235,6 +235,7 @@ and the live peer manager. It implements:
 - `get_name_state`
 - `get_name_proof`
 - `get_name_evidence`
+- `get_name_action_context`
 - `get_name_owner_transaction`
 
 `WalletChainTip` contains the active hash, height, and the exact authenticated
@@ -261,6 +262,18 @@ current and proof states differ; the API labels both instead of implying that
 the persisted proof authenticates pending state. Owner output and transaction
 inclusion are resolved in the same store snapshot. `get_name_proof` also
 returns its atomically captured tip.
+
+`get_name_action_context` is the candidate-specific source for TRANSFER and
+FINALIZE preparation. It requires the caller's exact chain epoch and mempool
+instance/generation, then captures the selected network/genesis and stable
+`hns-consensus/name-policy-v1` identity, tip-plus-one candidate height, canonical
+current state, confirmed owner transaction, matching active UTXO, transfer
+lockup/maturity, and HSD-selected active-chain renewal height/hash together. The
+immutable mempool snapshot carries a persistent owner-outpoint spender index,
+so the exact concurrent spender is an O(log N) lookup rather than a pool scan.
+Eligibility has a fixed maximum of nine reasons and any current spender is a
+fail-closed ineligibility. This evidence does not construct or sign the action,
+and a later chain or mempool generation requires a fresh context.
 
 Authority-bearing durable reads capture the published canonical epoch, prove
 that the store snapshot has the same durable chain epoch and tip, and recheck

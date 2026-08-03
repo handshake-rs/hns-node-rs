@@ -252,13 +252,54 @@ pub fn verify_renewal_commitment(
     let Some(committed_height) = context.main_chain_height(hash)? else {
         return Ok(false);
     };
-    if committed_height > height.saturating_sub(params.renewal_maturity) {
-        return Ok(false);
+    Ok(renewal_commitment_height_is_valid(
+        committed_height,
+        height,
+        params,
+    ))
+}
+
+/// Return whether one active-chain height is a valid renewal commitment at the
+/// candidate inclusion height.
+///
+/// This is the height-only half of [`verify_renewal_commitment`]. Callers must
+/// still prove that the committed hash is the active-chain hash at
+/// `committed_height` in the same immutable snapshot.
+pub const fn renewal_commitment_height_is_valid(
+    committed_height: Height,
+    candidate_height: Height,
+    params: NameParams,
+) -> bool {
+    if candidate_height < params.renewal_maturity {
+        return true;
     }
-    if committed_height < height.saturating_sub(params.renewal_period) {
-        return Ok(false);
-    }
-    Ok(true)
+    committed_height <= candidate_height.saturating_sub(params.renewal_maturity)
+        && committed_height >= candidate_height.saturating_sub(params.renewal_period)
+}
+
+/// Select the active-chain height used by HSD's wallet for renewal-bearing
+/// covenants at `tip_height`.
+///
+/// HSD selects `tip - 2 * renewalMaturity`, clamped to genesis. This is wallet
+/// construction policy rather than an alternative consensus-validity window.
+pub const fn hsd_wallet_renewal_height(tip_height: Height, params: NameParams) -> Height {
+    tip_height.saturating_sub(params.renewal_maturity.saturating_mul(2))
+}
+
+/// First candidate height at which a transfer included at `transfer_height`
+/// may be finalized.
+pub const fn transfer_maturity_height(transfer_height: Height, params: NameParams) -> Height {
+    transfer_height.saturating_add(params.transfer_lockup)
+}
+
+/// Return whether a nonzero pending transfer is mature at one candidate
+/// inclusion height.
+pub const fn is_transfer_mature(
+    transfer_height: Height,
+    candidate_height: Height,
+    params: NameParams,
+) -> bool {
+    transfer_height != 0 && candidate_height >= transfer_maturity_height(transfer_height, params)
 }
 
 /// Apply one non-claim contextual covenant transition to an in-memory name
@@ -498,7 +539,7 @@ pub fn verify_and_apply_name_covenant(
                     "FINALIZE has no pending transfer".to_owned(),
                 ));
             }
-            if height < state.transfer.saturating_add(params.transfer_lockup) {
+            if !is_transfer_mature(state.transfer, height, params) {
                 return Err(ConsensusError::ContextualCovenant(
                     "FINALIZE precedes transfer maturity".to_owned(),
                 ));
@@ -899,6 +940,21 @@ mod tests {
         context.heights.insert(hash, 1_000);
         assert!(verify_renewal_commitment(&context, &hash, 1_060, params()).unwrap());
         assert!(!verify_renewal_commitment(&context, &hash, 3_600, params()).unwrap());
+    }
+
+    #[test]
+    fn wallet_name_action_height_helpers_match_hsd_boundaries() {
+        let params = params();
+        assert_eq!(hsd_wallet_renewal_height(49, params), 0);
+        assert_eq!(hsd_wallet_renewal_height(100, params), 0);
+        assert_eq!(hsd_wallet_renewal_height(101, params), 1);
+        assert!(renewal_commitment_height_is_valid(0, 49, params));
+        assert!(renewal_commitment_height_is_valid(50, 100, params));
+        assert!(!renewal_commitment_height_is_valid(51, 100, params));
+        assert_eq!(transfer_maturity_height(200, params), 210);
+        assert!(!is_transfer_mature(0, u32::MAX, params));
+        assert!(!is_transfer_mature(200, 209, params));
+        assert!(is_transfer_mature(200, 210, params));
     }
 
     #[test]

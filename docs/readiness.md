@@ -153,6 +153,12 @@ Implemented in source:
   evidence with optional exact retained-block position, optional canonical
   confirmed block times, and tip/root-bound current-versus-authenticated name
   evidence with complete canonical encoded state bytes;
+- versioned TRANSFER/FINALIZE name-action contexts requiring exact chain epoch
+  and mempool process-generation bindings, echoing stable network/genesis/name
+  consensus profile identity, tip-plus-one candidate inclusion, active
+  NameState/owner/UTXO consistency, canonical transfer maturity, HSD-selected
+  active-chain renewal block, and exact immutable-mempool owner-spender evidence
+  under a fixed nine-reason fail-closed eligibility bound;
 - immutable public Shakedex-v2 and HNS-HTLC-v1 registrations with pinned
   secp256k1 key parsing, canonical scripts, exact signature-hash profiles, and
   an explicit versioned canonical-binary descriptor identity plus bounded
@@ -170,7 +176,8 @@ Implemented in source:
   complete wallet profile,
   with canonical hex payloads, bounded opaque cursors, stable redacted errors,
   exact encoded current/proof name views, snapshot-bound block/spender/mempool
-  evidence, signed-transaction contextual admission, and transaction-bound
+  evidence, candidate-specific TRANSFER/FINALIZE preparation evidence,
+  signed-transaction contextual admission, and transaction-bound
   fee quotes that resolve input coins and derive exact HSD policy size/minimum
   fee plus checked actual-fee/shortfall evidence from one caller-bound
   chain/mempool capture,

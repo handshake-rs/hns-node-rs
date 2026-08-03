@@ -169,6 +169,16 @@ values. The result is exact for those serialized witness bytes only, so the
 wallet must requote the final signed artifact before broadcast; this read does
 not sign, relay, or promise admission.
 
+TRANSFER/FINALIZE preparation uses a separate versioned name-action read over
+that same stable chain/mempool capture. It binds the configured network,
+genesis, and `hns-consensus/name-policy-v1` identity; verifies the current owner
+against its active UTXO; selects the HSD renewal block from the active chain;
+derives tip-plus-one transfer maturity; and performs an O(log N) immutable
+mempool lookup for an exact owner spender. The response has a fixed nine-reason
+eligibility bound. It supplies public evidence only: the wallet still owns
+approval, signing, durable workflow state, final fee requote, broadcast, and
+restart/reorg reconciliation.
+
 Wire continuations encode typed cursors as bounded behaviorally opaque tokens,
 not secrets or authenticated capabilities. Binary identities and payloads are
 canonical hexadecimal strings, so an independent wallet process need not link

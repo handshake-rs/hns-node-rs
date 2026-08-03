@@ -787,7 +787,7 @@ impl Block {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Outpoint {
     pub txid: Txid,
     pub index: u32,

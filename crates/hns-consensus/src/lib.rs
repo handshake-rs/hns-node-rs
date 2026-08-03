@@ -27,7 +27,8 @@ pub use claim::{
     verify_claim_output, ClaimConsensusError, ClaimFlags, OpenSslDnssecVerifier, VerifiedClaim,
 };
 pub use covenant::{
-    blind_bid, verify_transaction_covenant_links, CovenantLinkError, CovenantLinkSummary,
+    blind_bid, is_finalize_source_covenant, is_transfer_source_covenant,
+    verify_transaction_covenant_links, CovenantLinkError, CovenantLinkSummary,
 };
 pub use deployment::{
     advance_threshold_state, compute_block_version, compute_block_version_from_state,
@@ -41,9 +42,11 @@ pub use locks::{
     verify_sequence_predicate, SequenceLock, SequenceLockView,
 };
 pub use name::{
-    has_rollout, is_locked_up, is_name_claimable, is_name_expired, is_reserved, maybe_expire_name,
-    name_lifecycle, reserved_name, rollout_height, verify_and_apply_name_covenant,
-    verify_renewal_commitment, NameContext, NameFlags, NameMutation, NameParams, ReservedName,
+    has_rollout, hsd_wallet_renewal_height, is_locked_up, is_name_claimable, is_name_expired,
+    is_reserved, is_transfer_mature, maybe_expire_name, name_lifecycle,
+    renewal_commitment_height_is_valid, reserved_name, rollout_height, transfer_maturity_height,
+    verify_and_apply_name_covenant, verify_renewal_commitment, NameContext, NameFlags,
+    NameMutation, NameParams, ReservedName,
 };
 pub use script::{
     count_script_sigops, transaction_sigops, verify_witness_program,
@@ -93,6 +96,12 @@ pub const MAX_SCRIPT_SIZE: usize = 10_000;
 pub const MAX_SCRIPT_PUSH: usize = 520;
 pub const MAX_SCRIPT_OPS: usize = 201;
 pub const MAX_MULTISIG_PUBKEYS: usize = 20;
+/// Stable identifier for the pinned HSD-compatible consensus rule profile.
+///
+/// Process boundaries may echo this value so a caller can reject evidence from
+/// a node built against another consensus profile. Change it only when the
+/// represented consensus rule set changes incompatibly.
+pub const HSD_CONSENSUS_PROFILE: &str = "hns-consensus/name-policy-v1";
 
 pub const fn block_subsidy(height: Height, halving_interval: u32) -> Amount {
     assert!(halving_interval != 0);

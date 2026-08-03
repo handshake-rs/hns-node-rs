@@ -138,7 +138,8 @@ into a process-wide RPC snapshot.
   sufficient. Its v1 envelope projects the typed
   wallet backend without a Rust sibling dependency: chain/tip reads, global
   confirmed restoration, chain-epoch/restart-bound mempool pages, transaction,
-  ordered batch spender, and canonical current/proof-name evidence, fee
+  ordered batch spender, canonical current/proof-name evidence, and exact
+  chain/mempool-bound TRANSFER/FINALIZE preparation contexts, fee
   estimation, signed-transaction broadcast, and opaque tracked
   contract evidence. See [`WALLET_RPC_V1.md`](WALLET_RPC_V1.md).
 - `broadcast_transaction` is the sole wallet mutation. It accepts only a
@@ -174,6 +175,7 @@ mutation, and strict startup reconstruction refuses an over-budget graph.
 | wallet confirmed/script/contract pages | chain-epoch/query-bound wallet indexes under stricter wire limits | bounded by 256 script-prefix examinations or 256 returned rows | at most 8 MiB projected JSON plus opaque cursor |
 | wallet mempool pages/fee estimate | immutable chain-epoch/tip plus process-instance/generation capture | at most 1,024 inspected transactions per wire page; fee sample remains 4,096 | at most 8 MiB projected JSON |
 | wallet point/batch evidence | fixed metadata/index keys, at most one retained block transaction lookup, or up to 256 ordered spend-index reads | point/collection reads plus selected payload | selected bounded result under one chain epoch/tip |
+| wallet name-action context | fixed network/genesis/name params, current name/UTXO/owner and renewal-height point reads plus immutable mempool spender index | point reads plus O(log M) exact owner-spender lookup; fixed at most nine eligibility reasons | one selected owner transaction under the 8 MiB result ceiling |
 
 Both standalone and native-sync listeners enforce the same fail-closed limits:
 
@@ -231,7 +233,7 @@ hsrd --network mainnet --data-dir /path/to/hsrd \
 - add/remove an operator-pinned peer;
 - initiate graceful shutdown or a bounded diagnostic snapshot.
 
-Wallet signing/custody, domain actions, contract registration through the wire,
+Wallet signing/custody, execution of domain actions, contract registration through the wire,
 an embedded DNS listener, explorer/address queries, public mining RPC, and
 broad hsd tooling compatibility are deliberately unsupported. The narrow
 `getdnsresource` read exists only for the separate resolver boundary; wallet

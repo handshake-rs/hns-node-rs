@@ -1117,6 +1117,7 @@ pub struct MempoolSnapshot {
     generation: u64,
     entries: PersistentMap<Txid, Arc<MempoolEntry>>,
     transactions: PersistentMap<Txid, Arc<Transaction>>,
+    spent_outpoints: PersistentMap<Outpoint, Txid>,
     parents: PersistentMap<Txid, Arc<BTreeSet<Txid>>>,
     children: PersistentMap<Txid, Arc<BTreeSet<Txid>>>,
     exclusive_names: PersistentMap<Txid, Arc<Vec<[u8; 32]>>>,
@@ -1133,6 +1134,7 @@ impl MempoolSnapshot {
             generation: 0,
             entries: PersistentMap::default(),
             transactions: PersistentMap::default(),
+            spent_outpoints: PersistentMap::default(),
             parents: PersistentMap::default(),
             children: PersistentMap::default(),
             exclusive_names: PersistentMap::default(),
@@ -1167,6 +1169,14 @@ impl MempoolSnapshot {
 
     pub fn transaction(&self, txid: &Txid) -> Option<&Transaction> {
         self.transactions.get(txid).map(Arc::as_ref)
+    }
+
+    /// Exact transaction spending `outpoint` in this immutable generation.
+    ///
+    /// Lookup is O(log N) and avoids a full mempool scan for race-sensitive
+    /// wallet preparation.
+    pub fn spending_transaction(&self, outpoint: &Outpoint) -> Option<Txid> {
+        self.spent_outpoints.get(outpoint).copied()
     }
 
     pub fn txids(&self) -> impl ExactSizeIterator<Item = Txid> + '_ {
@@ -2910,8 +2920,19 @@ impl MemoryMempool {
         };
 
         for input in &transaction.inputs {
-            self.spent_outpoints
+            let previous = self
+                .spent_outpoints
                 .insert(input.previous_output.clone(), txid);
+            debug_assert!(previous.is_none(), "accepted outpoint spend is unique");
+            let mirrored = persistent_map_replace(
+                &mut self.snapshot_state.spent_outpoints,
+                input.previous_output.clone(),
+                txid,
+            );
+            debug_assert!(
+                mirrored.is_none(),
+                "accepted snapshot outpoint spend is unique"
+            );
         }
         for parent in &direct_parents {
             let children = self.children.entry(*parent).or_default();
@@ -3699,6 +3720,11 @@ impl MemoryMempool {
         for input in &transaction.inputs {
             if self.spent_outpoints.get(&input.previous_output) == Some(&txid) {
                 self.spent_outpoints.remove(&input.previous_output);
+                let mirrored = persistent_map_delete(
+                    &mut self.snapshot_state.spent_outpoints,
+                    &input.previous_output,
+                );
+                debug_assert_eq!(mirrored, Some(txid));
             }
         }
         if let Some(parents) = self.parents.remove(&txid) {
@@ -4351,6 +4377,7 @@ mod tests {
         assert_eq!(snapshot.generation, pool.generation);
         assert_eq!(snapshot.entries.len(), pool.entries.len());
         assert_eq!(snapshot.transactions.len(), pool.transactions.len());
+        assert_eq!(snapshot.spent_outpoints.len(), pool.spent_outpoints.len());
         assert_eq!(snapshot.parents.len(), pool.parents.len());
         assert_eq!(snapshot.children.len(), pool.children.len());
         assert_eq!(snapshot.exclusive_names.len(), pool.exclusive_names.len());
@@ -4373,6 +4400,9 @@ mod tests {
                     .get(txid)
                     .expect("mirrored transaction")
             ));
+        }
+        for (outpoint, txid) in &pool.spent_outpoints {
+            assert_eq!(snapshot.spending_transaction(outpoint), Some(*txid));
         }
         for (txid, parents) in &pool.parents {
             assert!(Arc::ptr_eq(
@@ -4424,6 +4454,7 @@ mod tests {
 
         validate_persistent_map(&snapshot.entries);
         validate_persistent_map(&snapshot.transactions);
+        validate_persistent_map(&snapshot.spent_outpoints);
         validate_persistent_map(&snapshot.parents);
         validate_persistent_map(&snapshot.children);
         validate_persistent_map(&snapshot.exclusive_names);
@@ -4437,6 +4468,7 @@ mod tests {
         [
             snapshot.entries.total_mutation_nodes,
             snapshot.transactions.total_mutation_nodes,
+            snapshot.spent_outpoints.total_mutation_nodes,
             snapshot.parents.total_mutation_nodes,
             snapshot.children.total_mutation_nodes,
             snapshot.exclusive_names.total_mutation_nodes,
@@ -4452,6 +4484,7 @@ mod tests {
     fn assert_snapshot_roots_identical(left: &MempoolSnapshot, right: &MempoolSnapshot) {
         assert!(left.entries.is_same_root(&right.entries));
         assert!(left.transactions.is_same_root(&right.transactions));
+        assert!(left.spent_outpoints.is_same_root(&right.spent_outpoints));
         assert!(left.parents.is_same_root(&right.parents));
         assert!(left.children.is_same_root(&right.children));
         assert!(left.exclusive_names.is_same_root(&right.exclusive_names));
@@ -5305,7 +5338,7 @@ mod tests {
                 covenant: covenant(),
             },
         );
-        let mut first = transaction(first_input, 15);
+        let mut first = transaction(first_input.clone(), 15);
         first.inputs[0].witness.items.push(vec![0x5a; 16 * 1024]);
         let first_txid = first.txid();
         let second = transaction(second_input, 14);
@@ -5317,6 +5350,10 @@ mod tests {
         ));
 
         let retained = pool.snapshot();
+        assert_eq!(
+            retained.spending_transaction(&first_input),
+            Some(first_txid)
+        );
         let allocations = snapshot_total_mutation_nodes(&retained);
         let cloned = retained.clone();
         assert_snapshot_roots_identical(&retained, &cloned);
@@ -5349,6 +5386,11 @@ mod tests {
 
         assert_eq!(pool.remove_transaction(first_txid, false), 1);
         assert_eq!(retained.transaction(&first_txid), Some(&first));
+        assert_eq!(
+            retained.spending_transaction(&first_input),
+            Some(first_txid)
+        );
+        assert!(pool.snapshot().spending_transaction(&first_input).is_none());
         assert!(pool.transaction(&first_txid).is_none());
         assert_cached_info_exact(&pool);
     }

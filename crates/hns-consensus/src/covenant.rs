@@ -5,6 +5,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::is_coinbase;
 
+/// Return whether an active owner coin may create a TRANSFER linked output.
+pub const fn is_transfer_source_covenant(kind: CovenantKind) -> bool {
+    matches!(
+        kind,
+        CovenantKind::Register
+            | CovenantKind::Update
+            | CovenantKind::Renew
+            | CovenantKind::Finalize
+    )
+}
+
+/// Return whether an active owner coin may create a FINALIZE linked output.
+pub const fn is_finalize_source_covenant(kind: CovenantKind) -> bool {
+    matches!(kind, CovenantKind::Transfer)
+}
+
 /// Observable result of the input/output covenant-linkage pass. This pass is
 /// deliberately narrower than Handshake name-state validation: it proves that
 /// each spent covenant is allowed to produce the output at the same index and
@@ -397,6 +413,17 @@ mod tests {
     use hns_primitives::{Address, Covenant, Input, Outpoint, Output, Transaction, Txid, Witness};
 
     use super::*;
+
+    #[test]
+    fn wallet_name_action_source_sets_match_linkage_rules() {
+        assert!(is_transfer_source_covenant(CovenantKind::Register));
+        assert!(is_transfer_source_covenant(CovenantKind::Update));
+        assert!(is_transfer_source_covenant(CovenantKind::Renew));
+        assert!(is_transfer_source_covenant(CovenantKind::Finalize));
+        assert!(!is_transfer_source_covenant(CovenantKind::Transfer));
+        assert!(is_finalize_source_covenant(CovenantKind::Transfer));
+        assert!(!is_finalize_source_covenant(CovenantKind::Finalize));
+    }
 
     fn address(byte: u8) -> Address {
         Address::new(0, vec![byte; 20]).expect("address")

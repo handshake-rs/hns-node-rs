@@ -353,7 +353,18 @@ Fixtures are evidence, not authority.
   the wallet must requote the final signed transaction before broadcast.
 - Current and proof-root NameState/owner views remain distinct on the wire.
   Canonical encoded state bytes are explicit; projected resource data is
-  labeled semantically opaque. Contract registration and raw
+  labeled semantically opaque. TRANSFER/FINALIZE preparation uses the separate
+  `name_action_context` v1 evidence capture: the request requires an exact chain
+  epoch and mempool process nonce/generation; the response binds the stable
+  `hns-consensus/name-policy-v1` network/genesis profile, tip-plus-one candidate
+  height, current NameState/owner/active UTXO, canonical transfer maturity, and
+  HSD-selected active-chain renewal block. An immutable O(log N) lookup reports
+  the exact accepted mempool spender of the owner outpoint. Any spender makes
+  the action ineligible; the wallet must not race it. Eligibility has a fixed
+  nine-reason maximum and unknown reasons fail closed. The context neither
+  signs nor proves that a later generation remains unchanged, so the wallet
+  must preserve the binding, requote final signed bytes against it, and restart
+  on stale evidence. Contract registration and raw
   revealed-preimage transport are absent while the canonical protocol release
   is unpublished; node-local classifications are evidence, not protocol
   authority.

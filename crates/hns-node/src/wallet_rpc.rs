@@ -5,8 +5,8 @@
 
 use axum::{http::StatusCode, Json};
 use hns_primitives::{
-    hex_encode, Address, Coin, Covenant, NameHash, NameState, Outpoint, Output, Transaction, Txid,
-    MAX_TX_SIZE,
+    hex_encode, Address, Coin, Covenant, NameHash, NameLifecycleState, NameState, Outpoint, Output,
+    Transaction, Txid, MAX_TX_SIZE,
 };
 use hns_state::encode_name_state;
 use hns_urkel::ProofKind;
@@ -19,13 +19,14 @@ use serde_json::Value;
 
 use super::wallet_backend::{
     BlockHashEvidence, BroadcastResult, ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate,
-    FeeEstimateSource, MempoolContractEvent, MempoolContractPage, MempoolScriptPage, NameEvidence,
-    NameOwnerTransaction, OutpointSpendingEvidence, TransactionEvidence, TransactionFeeQuote,
-    TransactionPayload, TransactionStatus, WalletBackend, WalletBackendError,
-    WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
-    WalletContractFundingPage, WalletMempoolCursor, MAX_FEE_ESTIMATE_TARGET_BLOCKS,
+    FeeEstimateSource, MempoolContractEvent, MempoolContractPage, MempoolScriptPage, NameAction,
+    NameActionContext, NameActionIneligibility, NameEvidence, NameOwnerTransaction,
+    OutpointSpendingEvidence, TransactionEvidence, TransactionFeeQuote, TransactionPayload,
+    TransactionStatus, WalletBackend, WalletBackendError, WalletContractEventCursor,
+    WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
+    WalletMempoolCursor, MAX_FEE_ESTIMATE_TARGET_BLOCKS, MAX_NAME_ACTION_INELIGIBILITY_REASONS,
     MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_MEMPOOL_SCAN,
-    MAX_WALLET_OUTPOINT_SPEND_BATCH, MAX_WALLET_RESTORE_SCRIPTS,
+    MAX_WALLET_OUTPOINT_SPEND_BATCH, MAX_WALLET_RESTORE_SCRIPTS, NAME_ACTION_CONTEXT_VERSION,
 };
 
 pub const WALLET_RPC_API_VERSION: u16 = 1;
@@ -96,6 +97,12 @@ enum WalletRpcCall {
     NameEvidence {
         name_hash: String,
         expected_chain_epoch: u64,
+    },
+    NameActionContext {
+        action: NameAction,
+        name_hash: String,
+        expected_chain_epoch: u64,
+        expected_mempool: WireExpectedMempool,
     },
     BroadcastTransaction {
         transaction_hex: String,
@@ -321,6 +328,21 @@ async fn dispatch_call(
             "transaction_position": "exact_when_block_payload_retained_null_when_pruned",
             "name_views": ["current_state", "proof_state", "current_owner", "proof_owner"],
             "name_state_encoding": "canonical_current_state_hex_and_proof_state_hex",
+            "name_action_context_version": NAME_ACTION_CONTEXT_VERSION,
+            "name_action_context_actions": ["transfer", "finalize"],
+            "name_action_context_binding": "mandatory_chain_epoch_and_exact_mempool_instance_and_generation",
+            "name_action_context_maximum_ineligibility_reasons": MAX_NAME_ACTION_INELIGIBILITY_REASONS,
+            "name_action_context_ineligibility_reasons": [
+                "name_not_registered",
+                "name_expired_at_candidate",
+                "lifecycle_not_closed",
+                "transfer_already_pending",
+                "transfer_not_pending",
+                "transfer_not_mature",
+                "owner_covenant_invalid_for_action",
+                "renewal_commitment_invalid",
+                "owner_spent_in_mempool"
+            ],
             "tracked_contract_descriptor_registration": "unavailable_unpublished_protocol_boundary",
             "tracked_contract_preimage_transport": "opaque_unavailable",
             "tracked_contract_evidence": "node_local_profile_only_not_protocol_authority"
@@ -437,6 +459,27 @@ async fn dispatch_call(
             let evidence = backend.get_name_evidence(name_hash).await?;
             require_chain_epoch(expected_chain_epoch, evidence.chain_epoch)?;
             value(&wire_name_evidence(evidence)?)?
+        }
+        WalletRpcCall::NameActionContext {
+            action,
+            name_hash,
+            expected_chain_epoch,
+            expected_mempool,
+        } => {
+            let name_hash = NameHash::new(decode_hex_32(&name_hash, "name hash")?);
+            let expected_mempool = decode_expected_mempool(Some(expected_mempool))?.ok_or(
+                DispatchError::Invalid("expected mempool binding is required"),
+            )?;
+            let context = backend
+                .get_name_action_context(
+                    action,
+                    name_hash,
+                    expected_chain_epoch,
+                    expected_mempool.instance_nonce,
+                    expected_mempool.generation,
+                )
+                .await?;
+            value(&wire_name_action_context(context)?)?
         }
         WalletRpcCall::BroadcastTransaction { transaction_hex } => {
             let raw = decode_hex_bounded(&transaction_hex, MAX_TX_SIZE, "raw transaction")?;
@@ -680,6 +723,20 @@ fn map_backend_error(
             "name_has_no_owner",
             "the current name state has no owner",
             false,
+        ),
+        WalletBackendError::NameStateMissing => wallet_rpc_failure(
+            request_id,
+            StatusCode::NOT_FOUND,
+            "name_state_missing",
+            "the requested name has no current active-chain state",
+            false,
+        ),
+        WalletBackendError::ChainUninitialized => wallet_rpc_failure(
+            request_id,
+            StatusCode::CONFLICT,
+            "chain_uninitialized",
+            "name-action context requires an initialized active chain",
+            true,
         ),
         WalletBackendError::OwnerOutputMissing => wallet_rpc_failure(
             request_id,
@@ -1469,6 +1526,156 @@ fn wire_name_evidence(evidence: NameEvidence) -> Result<WireNameEvidence, Dispat
 }
 
 #[derive(Serialize)]
+struct WireNameActionChainIdentity {
+    network: String,
+    network_id: u8,
+    genesis_hash: String,
+    consensus_profile: String,
+}
+
+#[derive(Serialize)]
+struct WireNameActionMempool {
+    instance_nonce: String,
+    generation: u64,
+    owner_spender_txid: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WireNameActionTransfer {
+    lockup_blocks: u32,
+    current_transfer_height: Option<u32>,
+    finalize_maturity_height: Option<u32>,
+    finalize_eligible_at_candidate: bool,
+}
+
+#[derive(Serialize)]
+struct WireNameActionRenewal {
+    maturity_blocks: u32,
+    period_blocks: u32,
+    hsd_selected_height: u32,
+    hsd_selected_hash: String,
+    valid_at_candidate: bool,
+}
+
+#[derive(Serialize)]
+struct WireNameActionEligibility {
+    eligible: bool,
+    reasons: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct WireNameActionContext {
+    context_version: u8,
+    action: &'static str,
+    chain_identity: WireNameActionChainIdentity,
+    chain_epoch: u64,
+    tip: WireTip,
+    candidate_inclusion_height: u32,
+    mempool: WireNameActionMempool,
+    name_hash: String,
+    current_state_hex: String,
+    current_state: WireNameState,
+    owner: WireNameOwner,
+    lifecycle: &'static str,
+    transfer: WireNameActionTransfer,
+    renewal: WireNameActionRenewal,
+    eligibility: WireNameActionEligibility,
+}
+
+fn wire_name_action_context(
+    context: NameActionContext,
+) -> Result<WireNameActionContext, DispatchError> {
+    if context.ineligibility_reasons.len() > MAX_NAME_ACTION_INELIGIBILITY_REASONS {
+        return Err(DispatchError::Internal);
+    }
+    let current_state_hex = encode_name_state(&context.current_state)
+        .map_err(|_| DispatchError::Internal)
+        .map(|raw| hex_encode(&raw))?;
+    let eligible = context.eligible();
+    let reasons = context
+        .ineligibility_reasons
+        .iter()
+        .copied()
+        .map(wire_name_action_ineligibility)
+        .collect();
+    Ok(WireNameActionContext {
+        context_version: context.context_version,
+        action: wire_name_action(context.action),
+        chain_identity: WireNameActionChainIdentity {
+            network: context.network.to_string(),
+            network_id: context.network_id,
+            genesis_hash: context.genesis_hash.to_hex(),
+            consensus_profile: context.consensus_profile,
+        },
+        chain_epoch: context.chain_epoch,
+        tip: WireTip {
+            hash: context.tip.hash.to_hex(),
+            height: context.tip.height,
+            tree_root: hex_encode(context.tip.tree_root.as_bytes()),
+        },
+        candidate_inclusion_height: context.candidate_inclusion_height,
+        mempool: WireNameActionMempool {
+            instance_nonce: hex_encode(&context.mempool_instance_nonce),
+            generation: context.mempool_generation,
+            owner_spender_txid: context.owner_spender_txid.map(Txid::to_hex),
+        },
+        name_hash: context.name_hash.to_hex(),
+        current_state_hex,
+        current_state: WireNameState::from(&context.current_state),
+        owner: WireNameOwner::from(&context.owner),
+        lifecycle: wire_name_lifecycle(context.lifecycle),
+        transfer: WireNameActionTransfer {
+            lockup_blocks: context.transfer.lockup_blocks,
+            current_transfer_height: context.transfer.current_transfer_height,
+            finalize_maturity_height: context.transfer.finalize_maturity_height,
+            finalize_eligible_at_candidate: context.transfer.finalize_eligible_at_candidate,
+        },
+        renewal: WireNameActionRenewal {
+            maturity_blocks: context.renewal.maturity_blocks,
+            period_blocks: context.renewal.period_blocks,
+            hsd_selected_height: context.renewal.hsd_selected_height,
+            hsd_selected_hash: context.renewal.hsd_selected_hash.to_hex(),
+            valid_at_candidate: context.renewal.valid_at_candidate,
+        },
+        eligibility: WireNameActionEligibility { eligible, reasons },
+    })
+}
+
+const fn wire_name_action(action: NameAction) -> &'static str {
+    match action {
+        NameAction::Transfer => "transfer",
+        NameAction::Finalize => "finalize",
+    }
+}
+
+const fn wire_name_lifecycle(lifecycle: NameLifecycleState) -> &'static str {
+    match lifecycle {
+        NameLifecycleState::Opening => "opening",
+        NameLifecycleState::Locked => "locked",
+        NameLifecycleState::Bidding => "bidding",
+        NameLifecycleState::Reveal => "reveal",
+        NameLifecycleState::Closed => "closed",
+        NameLifecycleState::Revoked => "revoked",
+    }
+}
+
+const fn wire_name_action_ineligibility(reason: NameActionIneligibility) -> &'static str {
+    match reason {
+        NameActionIneligibility::NameNotRegistered => "name_not_registered",
+        NameActionIneligibility::NameExpiredAtCandidate => "name_expired_at_candidate",
+        NameActionIneligibility::LifecycleNotClosed => "lifecycle_not_closed",
+        NameActionIneligibility::TransferAlreadyPending => "transfer_already_pending",
+        NameActionIneligibility::TransferNotPending => "transfer_not_pending",
+        NameActionIneligibility::TransferNotMature => "transfer_not_mature",
+        NameActionIneligibility::OwnerCovenantInvalidForAction => {
+            "owner_covenant_invalid_for_action"
+        }
+        NameActionIneligibility::RenewalCommitmentInvalid => "renewal_commitment_invalid",
+        NameActionIneligibility::OwnerSpentInMempool => "owner_spent_in_mempool",
+    }
+}
+
+#[derive(Serialize)]
 struct WireTrackedFunding {
     contract_id: String,
     coin: WireCoin,
@@ -1658,4 +1865,99 @@ fn wire_mempool_contract_page(
         continuation: encode_cursor(page.continuation.as_ref())?,
         preimage_transport: "opaque_unavailable",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_action_context_request_is_strict_and_exactly_bound() {
+        let request: WalletRpcRequest = serde_json::from_value(serde_json::json!({
+            "api_version": 1,
+            "request_id": "name-action-1",
+            "call": {
+                "method": "name_action_context",
+                "params": {
+                    "action": "finalize",
+                    "name_hash": "11".repeat(32),
+                    "expected_chain_epoch": 7,
+                    "expected_mempool": {
+                        "instance_nonce": "22".repeat(32),
+                        "generation": 9
+                    }
+                }
+            }
+        }))
+        .expect("strict name-action request");
+        let WalletRpcCall::NameActionContext {
+            action,
+            name_hash,
+            expected_chain_epoch,
+            expected_mempool,
+        } = request.call
+        else {
+            panic!("name-action method");
+        };
+        assert_eq!(action, NameAction::Finalize);
+        assert_eq!(name_hash, "11".repeat(32));
+        assert_eq!(expected_chain_epoch, 7);
+        assert_eq!(expected_mempool.instance_nonce, "22".repeat(32));
+        assert_eq!(expected_mempool.generation, 9);
+
+        assert!(
+            serde_json::from_value::<WalletRpcRequest>(serde_json::json!({
+                "api_version": 1,
+                "call": {
+                    "method": "name_action_context",
+                    "params": {
+                        "action": "transfer",
+                        "name_hash": "11".repeat(32),
+                        "expected_chain_epoch": 7,
+                        "expected_mempool": {
+                            "instance_nonce": "22".repeat(32),
+                            "generation": 9
+                        },
+                        "unbound_extension": true
+                    }
+                }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn name_action_wire_vocabulary_and_consensus_profile_are_stable() {
+        let reasons = [
+            NameActionIneligibility::NameNotRegistered,
+            NameActionIneligibility::NameExpiredAtCandidate,
+            NameActionIneligibility::LifecycleNotClosed,
+            NameActionIneligibility::TransferAlreadyPending,
+            NameActionIneligibility::TransferNotPending,
+            NameActionIneligibility::TransferNotMature,
+            NameActionIneligibility::OwnerCovenantInvalidForAction,
+            NameActionIneligibility::RenewalCommitmentInvalid,
+            NameActionIneligibility::OwnerSpentInMempool,
+        ]
+        .map(wire_name_action_ineligibility);
+        assert_eq!(reasons.len(), MAX_NAME_ACTION_INELIGIBILITY_REASONS);
+        assert_eq!(
+            reasons,
+            [
+                "name_not_registered",
+                "name_expired_at_candidate",
+                "lifecycle_not_closed",
+                "transfer_already_pending",
+                "transfer_not_pending",
+                "transfer_not_mature",
+                "owner_covenant_invalid_for_action",
+                "renewal_commitment_invalid",
+                "owner_spent_in_mempool",
+            ]
+        );
+        assert_eq!(
+            hns_consensus::HSD_CONSENSUS_PROFILE,
+            "hns-consensus/name-policy-v1"
+        );
+    }
 }

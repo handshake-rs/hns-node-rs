@@ -93,6 +93,7 @@ wire. Transaction policy rejection text is bounded to 256 characters.
 | `spending_transaction` | `txid`, `output_index`, required `expected_chain_epoch` | One-entry ordered active-chain spender evidence bound to one chain epoch/tip. |
 | `spending_transactions` | `outpoints` (1..=256 ordered `{txid, output_index}` values), required `expected_chain_epoch` | Exactly one optional spender entry per requested outpoint, in request order, from one immutable chain snapshot with one epoch/tip binding. |
 | `name_evidence` | `name_hash`, required `expected_chain_epoch` | Canonical encoded current/proof state bytes, separate projected hints and owners, tip/root, and canonical proof hex from one chain snapshot. |
+| `name_action_context` | `action` (`transfer` or `finalize`), `name_hash`, required `expected_chain_epoch`, required exact `expected_mempool` | Versioned candidate-height context containing stable chain identity, canonical current state and owner, exact owner-mempool-spender evidence, transfer maturity, HSD-selected active-chain renewal block, and a fixed bounded eligibility decision from one chain/mempool generation. |
 | `broadcast_transaction` | `transaction_hex` | Canonical contextual admission followed by actual live-peer inventory fanout counts. The node never signs. |
 | `estimate_fee_rate` | `target_blocks` | Bounded deterministic estimate and its sample/source evidence. |
 | `quote_transaction_fee` | bounded canonical `transaction_hex`, `target_blocks`, required `expected_chain_epoch`, required exact `expected_mempool` | Transaction ID, complete chain/mempool bindings, sampled rate evidence, exact transaction weight and node-resolved sigops, HSD sigop-adjusted policy virtual bytes, minimum and actual fees, shortfall, and a meets-minimum boolean in explicit atomic units. The method never signs or broadcasts. |
@@ -212,6 +213,153 @@ hints, `name_hex` is the name and `data_hex` is only the resource-data field,
 not an encoded NameState. Resource semantics remain opaque until a published
 canonical decoder is available.
 
+## Name-action context
+
+`name_action_context` supplies public construction evidence for exactly one
+TRANSFER or FINALIZE candidate. It does not construct, approve, sign, or
+broadcast a transaction. The request must bind the exact chain and mempool
+generation already held by the wallet:
+
+```json
+{
+  "api_version": 1,
+  "request_id": "finalize-alpha-1",
+  "call": {
+    "method": "name_action_context",
+    "params": {
+      "action": "finalize",
+      "name_hash": "<64 hex characters>",
+      "expected_chain_epoch": 42,
+      "expected_mempool": {
+        "instance_nonce": "<64 hex characters>",
+        "generation": 17
+      }
+    }
+  }
+}
+```
+
+The result schema is:
+
+```json
+{
+  "context_version": 1,
+  "action": "finalize",
+  "chain_identity": {
+    "network": "mainnet|testnet|regtest|simnet",
+    "network_id": 0,
+    "genesis_hash": "<64 hex characters>",
+    "consensus_profile": "hns-consensus/name-policy-v1"
+  },
+  "chain_epoch": 42,
+  "tip": {
+    "hash": "<64 hex characters>",
+    "height": 100000,
+    "tree_root": "<64 hex characters>"
+  },
+  "candidate_inclusion_height": 100001,
+  "mempool": {
+    "instance_nonce": "<64 hex characters>",
+    "generation": 17,
+    "owner_spender_txid": null
+  },
+  "name_hash": "<64 hex characters>",
+  "current_state_hex": "<canonical encoded NameState hex>",
+  "current_state": {
+    "name_hash": "<64 hex characters>",
+    "name_hex": "<hex>",
+    "height": 1,
+    "renewal": 90000,
+    "owner": {"txid": "<64 hex characters>", "index": 0},
+    "value": 0,
+    "highest": 0,
+    "data_hex": "<hex>",
+    "transfer": 99713,
+    "revoked": 0,
+    "claimed": 0,
+    "renewals": 0,
+    "registered": true,
+    "expired": false,
+    "weak": false
+  },
+  "owner": {
+    "name_state": {
+      "name_hash": "<64 hex characters>",
+      "name_hex": "<hex>",
+      "height": 1,
+      "renewal": 90000,
+      "owner": {"txid": "<64 hex characters>", "index": 0},
+      "value": 0,
+      "highest": 0,
+      "data_hex": "<hex>",
+      "transfer": 99713,
+      "revoked": 0,
+      "claimed": 0,
+      "renewals": 0,
+      "registered": true,
+      "expired": false,
+      "weak": false
+    },
+    "owner": {"txid": "<64 hex characters>", "index": 0},
+    "transaction_hex": "<canonical raw transaction hex>",
+    "owner_output": {
+      "value": 0,
+      "address": {"version": 0, "hash": "<hex>"},
+      "covenant": {"kind": 9, "items": ["<hex>"]}
+    },
+    "inclusion": {
+      "block_hash": "<64 hex characters>",
+      "height": 99713,
+      "transaction_index": 1,
+      "confirmations": 288
+    }
+  },
+  "lifecycle": "closed",
+  "transfer": {
+    "lockup_blocks": 288,
+    "current_transfer_height": 99713,
+    "finalize_maturity_height": 100001,
+    "finalize_eligible_at_candidate": true
+  },
+  "renewal": {
+    "maturity_blocks": 4320,
+    "period_blocks": 26208,
+    "hsd_selected_height": 91360,
+    "hsd_selected_hash": "<64 hex characters>",
+    "valid_at_candidate": true
+  },
+  "eligibility": {"eligible": true, "reasons": []}
+}
+```
+
+`candidate_inclusion_height` is the captured tip plus one. Network ID, genesis,
+name parameters, transfer maturity, and renewal-window checks come from the
+selected `hns-consensus` network profile. The HSD wallet selection is
+`tip.height - 2 * renewal.maturity_blocks`, clamped to genesis; the returned
+hash is looked up on the active chain in the same immutable snapshot. The
+current owner is also checked against the active UTXO set and its canonical
+name-hash/start-height commitments, plus the registered locked value when the
+state is registered, before projection.
+
+The immutable mempool snapshot provides an O(log N) owner-outpoint spender
+lookup. `owner_spender_txid` is `null` only when that exact generation has no
+accepted spender. A non-null value always adds `owner_spent_in_mempool` and the
+wallet must reject preparation rather than race or replace the existing name
+spend. Any chain epoch, process nonce, or generation mismatch is
+`stale_snapshot`.
+
+`eligibility.reasons` contains at most nine values in this fixed order and
+vocabulary: `name_not_registered`, `name_expired_at_candidate`,
+`lifecycle_not_closed`, `transfer_already_pending`, `transfer_not_pending`,
+`transfer_not_mature`, `owner_covenant_invalid_for_action`,
+`renewal_commitment_invalid`, and `owner_spent_in_mempool`. The response order
+is deterministic according to the backend evaluation; clients must understand
+every returned reason and must not treat an unknown future value as eligible.
+The method returns evidence for an ineligible well-formed state rather than
+turning that decision into transport success. Missing state/owner, malformed or
+inconsistent owner evidence, stale bindings, and unavailable pruned owner bytes
+remain explicit fail-closed errors.
+
 ## Time and transaction order
 
 Mempool history carries exact `admitted_at` values from contextual admission.
@@ -274,6 +422,8 @@ stricter than the internal 4,096-row/16-MiB index envelope and prevents
 hex/covenant expansion from producing a disproportionate response. Raw and
 name-owner transactions are also subject to this projection budget and to the
 configured request-body limit when submitted.
+Name-action eligibility is a fixed nine-reason maximum, and its owner-spender
+lookup is one immutable O(log N) mempool-index read rather than a pool scan.
 
 Wallet-index failure cannot authorize or invalidate consensus. Index writes
 remain derivative members of the canonical batch; a valid block is not rejected

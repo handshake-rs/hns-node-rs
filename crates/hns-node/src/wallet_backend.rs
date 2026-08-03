@@ -4,7 +4,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use hns_chain::{HeaderRecord, TxIndexEntry};
 use hns_consensus::{
-    is_coinbase, transaction_sigops, transaction_weight, validate_transaction_sanity,
+    hsd_wallet_renewal_height, is_coinbase, is_finalize_source_covenant, is_name_expired,
+    is_transfer_mature, is_transfer_source_covenant, name_lifecycle,
+    renewal_commitment_height_is_valid, transaction_sigops, transaction_weight,
+    transfer_maturity_height, validate_transaction_sanity, Network, HSD_CONSENSUS_PROFILE,
 };
 use hns_mempool::{
     minimum_policy_fee, sigop_adjusted_virtual_size, Admission, MempoolInfo, MempoolSnapshot,
@@ -12,8 +15,8 @@ use hns_mempool::{
 };
 use hns_p2p::{Inventory, LivePeerManager, OutboundPriority, Packet};
 use hns_primitives::{
-    blake2b_256, Address, BlockHash, Coin, Covenant, CovenantKind, Height, NameHash, NameState,
-    Outpoint, Output, Transaction, Txid, Writer,
+    blake2b_256, Address, BlockHash, Coin, Covenant, CovenantKind, Height, NameHash,
+    NameLifecycleState, NameState, Outpoint, Output, Transaction, Txid, Writer,
 };
 use hns_state::{
     decode_coin, decode_name_state, encode_outpoint_key, load_stored_name_tree_root,
@@ -56,6 +59,10 @@ pub const MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS: usize = 256;
 pub const MAX_WALLET_OUTPOINT_SPEND_BATCH: usize = 4_096;
 /// Maximum input coins resolved by one transaction-bound fee quote.
 pub const MAX_WALLET_FEE_QUOTE_INPUTS: usize = 4_096;
+/// Version of the immutable name-action preparation evidence contract.
+pub const NAME_ACTION_CONTEXT_VERSION: u8 = 1;
+/// Fixed maximum number of distinct name-action ineligibility reasons.
+pub const MAX_NAME_ACTION_INELIGIBILITY_REASONS: usize = 9;
 
 const CONFIRMED_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-confirmed-script-set/v1";
 const MEMPOOL_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-mempool-script-set/v1";
@@ -543,6 +550,82 @@ pub struct NameOwnerTransaction {
     pub inclusion: TransactionInclusion,
 }
 
+/// Candidate name covenant the external wallet intends to construct.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameAction {
+    /// Begin transfer to a covenant-committed recipient.
+    Transfer,
+    /// Finalize a mature pending transfer.
+    Finalize,
+}
+
+/// Fixed, bounded reason vocabulary for a candidate-specific action decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameActionIneligibility {
+    NameNotRegistered,
+    NameExpiredAtCandidate,
+    LifecycleNotClosed,
+    TransferAlreadyPending,
+    TransferNotPending,
+    TransferNotMature,
+    OwnerCovenantInvalidForAction,
+    RenewalCommitmentInvalid,
+    OwnerSpentInMempool,
+}
+
+/// Canonical transfer lockup evidence at the candidate inclusion height.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameTransferContext {
+    pub lockup_blocks: u32,
+    pub current_transfer_height: Option<Height>,
+    pub finalize_maturity_height: Option<Height>,
+    pub finalize_eligible_at_candidate: bool,
+}
+
+/// HSD wallet-selected renewal commitment and consensus-window evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameRenewalContext {
+    pub maturity_blocks: u32,
+    pub period_blocks: u32,
+    pub hsd_selected_height: Height,
+    pub hsd_selected_hash: BlockHash,
+    pub valid_at_candidate: bool,
+}
+
+/// One immutable, candidate-specific TRANSFER or FINALIZE preparation capture.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameActionContext {
+    pub context_version: u8,
+    pub action: NameAction,
+    pub network: Network,
+    pub network_id: u8,
+    pub genesis_hash: BlockHash,
+    pub consensus_profile: String,
+    pub chain_epoch: u64,
+    pub tip: WalletChainTip,
+    pub candidate_inclusion_height: Height,
+    pub mempool_instance_nonce: [u8; 32],
+    pub mempool_generation: u64,
+    pub owner_spender_txid: Option<Txid>,
+    pub name_hash: NameHash,
+    pub current_state: NameState,
+    pub owner: NameOwnerTransaction,
+    pub lifecycle: NameLifecycleState,
+    pub transfer: NameTransferContext,
+    pub renewal: NameRenewalContext,
+    pub ineligibility_reasons: Vec<NameActionIneligibility>,
+}
+
+impl NameActionContext {
+    /// The action is eligible only when no fixed fail-closed reason applies.
+    #[must_use]
+    pub fn eligible(&self) -> bool {
+        self.ineligibility_reasons.is_empty()
+    }
+}
+
 /// Result of contextual admission and actual P2P inventory fanout.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BroadcastResult {
@@ -651,6 +734,12 @@ pub enum WalletBackendError {
     /// Requested name has no current owner outpoint.
     #[error("current name state has no owner")]
     NameHasNoOwner,
+    /// Requested name has no active state in the current chain snapshot.
+    #[error("current name state is absent")]
+    NameStateMissing,
+    /// Name-action preparation requires an initialized active chain.
+    #[error("name-action context requires an initialized active chain")]
+    ChainUninitialized,
     /// Current owner output index is absent from its transaction.
     #[error("current name owner output is missing")]
     OwnerOutputMissing,
@@ -1790,6 +1879,154 @@ impl WalletBackend {
         .await
     }
 
+    /// Capture every public input needed to prepare one TRANSFER or FINALIZE
+    /// against an exact active-chain and mempool generation.
+    ///
+    /// The node does not construct or sign the action. The caller must retain
+    /// this binding, reject any reported owner spender, and use the same exact
+    /// generation when requoting the final signed transaction.
+    pub async fn get_name_action_context(
+        &self,
+        action: NameAction,
+        name_hash: NameHash,
+        expected_chain_epoch: u64,
+        expected_mempool_instance_nonce: [u8; 32],
+        expected_mempool_generation: u64,
+    ) -> Result<NameActionContext, WalletBackendError> {
+        if !self.read.transaction_index {
+            return Err(WalletBackendError::IndexDisabled("transaction"));
+        }
+        let read = self.read.clone();
+        blocking_mempool_read(read, move |read, snapshot, mempool, _, epoch| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != epoch.chain_epoch {
+                return Err(WalletBackendError::Corrupt(
+                    "published and durable chain generations disagree",
+                ));
+            }
+            if chain_epoch != expected_chain_epoch {
+                return Err(WalletBackendError::StaleChainEpoch {
+                    expected: expected_chain_epoch,
+                    actual: chain_epoch,
+                });
+            }
+            if mempool.instance_nonce() != &expected_mempool_instance_nonce {
+                return Err(WalletBackendError::StaleMempoolInstance);
+            }
+            if mempool.generation() != expected_mempool_generation {
+                return Err(WalletBackendError::StaleMempoolGeneration {
+                    expected: expected_mempool_generation,
+                    actual: mempool.generation(),
+                });
+            }
+
+            let network = read.network();
+            let network_params = network.params();
+            let name_params = network_params.names;
+            let tip = wallet_chain_tip(snapshot)?.ok_or(WalletBackendError::ChainUninitialized)?;
+            let canonical_genesis = read_canonical_hash(snapshot, 0)
+                .map_err(node_error)?
+                .ok_or(WalletBackendError::Corrupt(
+                    "initialized chain has no canonical genesis",
+                ))?;
+            if canonical_genesis != network_params.genesis_hash {
+                return Err(WalletBackendError::Corrupt(
+                    "canonical genesis disagrees with the selected network",
+                ));
+            }
+            let candidate_inclusion_height =
+                tip.height
+                    .checked_add(1)
+                    .ok_or(WalletBackendError::Corrupt(
+                        "candidate inclusion height overflows u32",
+                    ))?;
+
+            let current_state = load_current_name_state(snapshot, name_hash)?
+                .ok_or(WalletBackendError::NameStateMissing)?;
+            if current_state.name_hash != name_hash {
+                return Err(WalletBackendError::Corrupt(
+                    "current name state disagrees with its requested key",
+                ));
+            }
+            if current_state.owner.is_null() {
+                return Err(WalletBackendError::NameHasNoOwner);
+            }
+            let owner = load_name_owner(snapshot, &current_state, true)?
+                .ok_or(WalletBackendError::NameHasNoOwner)?;
+            validate_name_action_owner(snapshot, &current_state, &owner)?;
+
+            let owner_spender_txid = mempool.spending_transaction(&owner.owner);
+            let lifecycle = name_lifecycle(&current_state, candidate_inclusion_height, name_params);
+            let expired_at_candidate =
+                is_name_expired(&current_state, candidate_inclusion_height, name_params);
+            let current_transfer_height =
+                (current_state.transfer != 0).then_some(current_state.transfer);
+            let finalize_maturity_height =
+                current_transfer_height.map(|height| transfer_maturity_height(height, name_params));
+            let finalize_eligible_at_candidate = is_transfer_mature(
+                current_state.transfer,
+                candidate_inclusion_height,
+                name_params,
+            );
+
+            let hsd_selected_height = hsd_wallet_renewal_height(tip.height, name_params);
+            let hsd_selected_hash = read_canonical_hash(snapshot, hsd_selected_height)
+                .map_err(node_error)?
+                .ok_or(WalletBackendError::Corrupt(
+                    "HSD-selected renewal height is absent from the active chain",
+                ))?;
+            let renewal_valid_at_candidate = renewal_commitment_height_is_valid(
+                hsd_selected_height,
+                candidate_inclusion_height,
+                name_params,
+            );
+            let ineligibility_reasons = name_action_ineligibility_reasons(
+                action,
+                &current_state,
+                owner.owner_output.covenant.kind,
+                lifecycle,
+                expired_at_candidate,
+                finalize_eligible_at_candidate,
+                renewal_valid_at_candidate,
+                owner_spender_txid,
+            )?;
+
+            Ok(NameActionContext {
+                context_version: NAME_ACTION_CONTEXT_VERSION,
+                action,
+                network,
+                network_id: network.canonical_id(),
+                genesis_hash: network_params.genesis_hash,
+                consensus_profile: HSD_CONSENSUS_PROFILE.to_owned(),
+                chain_epoch,
+                tip,
+                candidate_inclusion_height,
+                mempool_instance_nonce: *mempool.instance_nonce(),
+                mempool_generation: mempool.generation(),
+                owner_spender_txid,
+                name_hash,
+                current_state,
+                owner,
+                lifecycle,
+                transfer: NameTransferContext {
+                    lockup_blocks: name_params.transfer_lockup,
+                    current_transfer_height,
+                    finalize_maturity_height,
+                    finalize_eligible_at_candidate,
+                },
+                renewal: NameRenewalContext {
+                    maturity_blocks: name_params.renewal_maturity,
+                    period_blocks: name_params.renewal_period,
+                    hsd_selected_height,
+                    hsd_selected_hash,
+                    valid_at_candidate: renewal_valid_at_candidate,
+                },
+                ineligibility_reasons,
+            })
+        })
+        .await
+    }
+
     /// Read current active name state by canonical name hash.
     pub async fn get_name_state(
         &self,
@@ -1978,6 +2215,104 @@ fn load_name_owner<S: ReadSnapshot>(
         owner_output,
         inclusion,
     }))
+}
+
+fn validate_name_action_owner<S: ReadSnapshot>(
+    snapshot: &S,
+    state: &NameState,
+    owner: &NameOwnerTransaction,
+) -> Result<(), WalletBackendError> {
+    if &owner.name_state != state || &owner.owner != &state.owner {
+        return Err(WalletBackendError::Corrupt(
+            "name action owner disagrees with current name state",
+        ));
+    }
+    if state.registered && owner.owner_output.value != state.value {
+        return Err(WalletBackendError::Corrupt(
+            "registered name action owner value disagrees with current name state",
+        ));
+    }
+    if owner.owner_output.covenant.item_hash(0) != Some(*state.name_hash.as_bytes())
+        || owner.owner_output.covenant.item_u32(1) != Some(state.height)
+    {
+        return Err(WalletBackendError::Corrupt(
+            "name action owner covenant identity disagrees with current name state",
+        ));
+    }
+    let raw = snapshot
+        .get(ColumnFamily::Utxo, &encode_outpoint_key(&owner.owner))
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "current name owner is absent from the active UTXO set",
+        ))?;
+    let coin = decode_coin(&raw)
+        .map_err(|_| WalletBackendError::Corrupt("current name owner UTXO cannot be decoded"))?;
+    if &coin.outpoint != &owner.owner
+        || coin.height != owner.inclusion.height
+        || coin.value != owner.owner_output.value
+        || &coin.address != &owner.owner_output.address
+        || &coin.covenant != &owner.owner_output.covenant
+    {
+        return Err(WalletBackendError::Corrupt(
+            "current name owner transaction and active UTXO disagree",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn name_action_ineligibility_reasons(
+    action: NameAction,
+    state: &NameState,
+    owner_covenant: CovenantKind,
+    lifecycle: NameLifecycleState,
+    expired_at_candidate: bool,
+    finalize_eligible_at_candidate: bool,
+    renewal_valid_at_candidate: bool,
+    owner_spender_txid: Option<Txid>,
+) -> Result<Vec<NameActionIneligibility>, WalletBackendError> {
+    let mut reasons = Vec::with_capacity(MAX_NAME_ACTION_INELIGIBILITY_REASONS);
+    if !state.registered {
+        reasons.push(NameActionIneligibility::NameNotRegistered);
+    }
+    if expired_at_candidate {
+        reasons.push(NameActionIneligibility::NameExpiredAtCandidate);
+    }
+    if lifecycle != NameLifecycleState::Closed {
+        reasons.push(NameActionIneligibility::LifecycleNotClosed);
+    }
+    match action {
+        NameAction::Transfer => {
+            if state.transfer != 0 {
+                reasons.push(NameActionIneligibility::TransferAlreadyPending);
+            }
+            if !is_transfer_source_covenant(owner_covenant) {
+                reasons.push(NameActionIneligibility::OwnerCovenantInvalidForAction);
+            }
+        }
+        NameAction::Finalize => {
+            if state.transfer == 0 {
+                reasons.push(NameActionIneligibility::TransferNotPending);
+            } else if !finalize_eligible_at_candidate {
+                reasons.push(NameActionIneligibility::TransferNotMature);
+            }
+            if !is_finalize_source_covenant(owner_covenant) {
+                reasons.push(NameActionIneligibility::OwnerCovenantInvalidForAction);
+            }
+            if !renewal_valid_at_candidate {
+                reasons.push(NameActionIneligibility::RenewalCommitmentInvalid);
+            }
+        }
+    }
+    if owner_spender_txid.is_some() {
+        reasons.push(NameActionIneligibility::OwnerSpentInMempool);
+    }
+    if reasons.len() > MAX_NAME_ACTION_INELIGIBILITY_REASONS {
+        return Err(WalletBackendError::Corrupt(
+            "name action ineligibility reason bound exceeded",
+        ));
+    }
+    Ok(reasons)
 }
 
 async fn blocking_chain_read<T, F>(
@@ -2523,6 +2858,51 @@ mod tests {
         0xf8, 0x17, 0x98,
     ];
 
+    #[test]
+    fn name_action_eligibility_uses_fixed_bounded_candidate_reasons() {
+        let mut state = NameState::null(NameHash::new([0x31; 32]));
+        state.height = 1;
+        state.renewal = 1;
+        state.owner = Outpoint {
+            txid: Txid::new([0x32; 32]),
+            index: 0,
+        };
+        state.registered = true;
+        let eligible = name_action_ineligibility_reasons(
+            NameAction::Transfer,
+            &state,
+            CovenantKind::Register,
+            NameLifecycleState::Closed,
+            false,
+            false,
+            true,
+            None,
+        )
+        .expect("bounded reasons");
+        assert!(eligible.is_empty());
+
+        state.transfer = 100;
+        let blocked = name_action_ineligibility_reasons(
+            NameAction::Finalize,
+            &state,
+            CovenantKind::Transfer,
+            NameLifecycleState::Closed,
+            false,
+            false,
+            true,
+            Some(Txid::new([0x33; 32])),
+        )
+        .expect("bounded reasons");
+        assert_eq!(
+            blocked,
+            vec![
+                NameActionIneligibility::TransferNotMature,
+                NameActionIneligibility::OwnerSpentInMempool,
+            ]
+        );
+        assert!(blocked.len() <= MAX_NAME_ACTION_INELIGIBILITY_REASONS);
+    }
+
     #[tokio::test]
     async fn typed_backend_reads_are_bounded_and_broadcast_is_not_a_success_stub() {
         let config = NodeConfig {
@@ -2559,6 +2939,54 @@ mod tests {
         assert_eq!(unknown.inclusion, None);
         assert_eq!(unknown.payload, TransactionPayload::Absent);
         assert_eq!(unknown.tip, None);
+        assert!(matches!(
+            backend
+                .get_name_action_context(
+                    NameAction::Transfer,
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch.saturating_add(1),
+                    unknown.mempool_instance_nonce,
+                    unknown.mempool_generation,
+                )
+                .await,
+            Err(WalletBackendError::StaleChainEpoch { .. })
+        ));
+        assert!(matches!(
+            backend
+                .get_name_action_context(
+                    NameAction::Transfer,
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch,
+                    [0; 32],
+                    unknown.mempool_generation,
+                )
+                .await,
+            Err(WalletBackendError::StaleMempoolInstance)
+        ));
+        assert!(matches!(
+            backend
+                .get_name_action_context(
+                    NameAction::Transfer,
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch,
+                    unknown.mempool_instance_nonce,
+                    unknown.mempool_generation.saturating_add(1),
+                )
+                .await,
+            Err(WalletBackendError::StaleMempoolGeneration { .. })
+        ));
+        assert!(matches!(
+            backend
+                .get_name_action_context(
+                    NameAction::Transfer,
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch,
+                    unknown.mempool_instance_nonce,
+                    unknown.mempool_generation,
+                )
+                .await,
+            Err(WalletBackendError::ChainUninitialized)
+        ));
 
         let quote_candidate = Transaction {
             version: 0,
