@@ -204,6 +204,11 @@ advertisement separately awaits the
 published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
 adapter gate.
 
+The current local evidence is intentionally narrow: the NVMe
+`hns-consensus` `wallet_name_action` filter passed 2 tests with 0 failures and
+75 filtered. No `hns-node` target, RocksDB target, full gate, network, restart,
+reorg, or resource qualification ran for this source tranche.
+
 Fee-quote source tests and documentation are present but were not executed in
 the source-only tranche that introduced the method. A quote is exact only for
 the supplied serialized witness bytes; production wallet qualification must

@@ -175,9 +175,12 @@ Implemented:
   and pinned canonical `hns-swap` commit, and cross-repository adapter
   qualification; local script duplication and frozen vectors are not protocol
   authority and no release-readiness claim is made by this source status
-  update. Name-action and immutable owner-spender source tests were added but not
-  executed in this source-only tranche and inherit no qualification result from
-  an earlier commit.
+  update. The focused NVMe command
+  `cargo test --locked -p hns-consensus wallet_name_action -- --test-threads=1`
+  passed 2 tests with 0 failures and 75 filtered. It covers only the canonical
+  action-height/source helpers; wallet-backend/RPC, restart/reorg/adversarial,
+  RocksDB, and the repository's full qualification gate remain unexecuted for
+  this tranche and inherit no result from an earlier commit.
 - A bounded hash-first Denuo marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live
