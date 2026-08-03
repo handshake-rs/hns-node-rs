@@ -7,13 +7,13 @@ use hns_consensus::{
     is_coinbase, transaction_sigops, transaction_weight, validate_transaction_sanity,
 };
 use hns_mempool::{
-    minimum_policy_fee, sigop_adjusted_virtual_size, Admission, MempoolSnapshot,
+    minimum_policy_fee, sigop_adjusted_virtual_size, Admission, MempoolInfo, MempoolSnapshot,
     HSD_MINIMUM_RELAY_FEE_RATE,
 };
 use hns_p2p::{Inventory, LivePeerManager, OutboundPriority, Packet};
 use hns_primitives::{
-    blake2b_256, BlockHash, Coin, Height, NameHash, NameState, Outpoint, Output, Transaction, Txid,
-    Writer,
+    blake2b_256, Address, BlockHash, Coin, Covenant, CovenantKind, Height, NameHash, NameState,
+    Outpoint, Output, Transaction, Txid, Writer,
 };
 use hns_state::{
     decode_coin, decode_name_state, encode_outpoint_key, load_stored_name_tree_root,
@@ -23,19 +23,19 @@ use hns_store::{ColumnFamily, ReadSnapshot, Store};
 use hns_urkel::UrkelProof;
 use hns_wallet_index::{
     script_history, script_utxos, spending_transaction, tracked_contract, tracked_contract_events,
-    tracked_contract_funding, tracked_contract_fundings, ContractId, ContractRegistration,
-    ContractRegistrationOutcome, IndexError, ScriptHistoryCursor, ScriptHistoryEntry,
-    ScriptHistoryPage, ScriptId, ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage, SpendingTransaction,
-    TrackedContractCursor, TrackedContractEvent, TrackedContractFunding, TrackedContractSpendKind,
-    MAX_QUERY_ENTRIES,
+    tracked_contract_funding, tracked_contract_fundings, tracked_contract_lifecycle_revision,
+    ContractId, ContractRegistration, ContractRegistrationOutcome, ContractRetirementOutcome,
+    IndexError, ScriptHistoryCursor, ScriptHistoryEntry, ScriptHistoryPage, ScriptId, ScriptUtxo,
+    ScriptUtxoCursor, ScriptUtxoPage, SpendingTransaction, TrackedContractCursor,
+    TrackedContractEvent, TrackedContractFunding, TrackedContractSpendKind, MAX_QUERY_ENTRIES,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
     best_block_tip_from_snapshot, chain_epoch_from_snapshot, load_block, read_canonical_hash,
-    CanonicalEpoch, CanonicalStateWriter, LivePeerManager as ReexportedLivePeerManager,
-    NodeReadHandle, NodeRuntime,
+    CanonicalEpoch, CanonicalStateWriter, CanonicalWriterError,
+    LivePeerManager as ReexportedLivePeerManager, NodeReadHandle, NodeRuntime,
 };
 
 /// Maximum mempool entries sampled by one fee estimate.
@@ -271,6 +271,70 @@ pub struct WalletContractEventPage {
     pub entries: Vec<TrackedContractEvent>,
     /// Exclusive continuation rejected after reorg or contract substitution.
     pub continuation: Option<WalletContractEventCursor>,
+}
+
+/// Exact authority-bearing snapshot expected by never-confirmed retirement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrackedContractRetirementRequest {
+    /// Complete public registration being retired.
+    pub registration: ContractRegistration,
+    /// Exact durable lifecycle revision observed with this registration.
+    pub expected_lifecycle_revision: u64,
+    /// Durable chain generation observed by the caller.
+    pub expected_chain_epoch: u64,
+    /// Exact authenticated tip observed in that generation.
+    pub expected_tip: Option<WalletChainTip>,
+    /// Process-local immutable mempool identity observed by the caller.
+    pub expected_mempool_instance_nonce: [u8; 32],
+    /// Exact immutable mempool generation observed by the caller.
+    pub expected_mempool_generation: u64,
+}
+
+/// Typed in-process preparation context for never-confirmed retirement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrackedContractRetirementContext {
+    /// Active registration, when present.
+    pub registration: Option<ContractRegistration>,
+    /// Durable lifecycle revision, when a marker exists. Revision presence is
+    /// not an eligibility claim: `LegacyUnknown` markers still fail closed.
+    pub lifecycle_revision: Option<u64>,
+    /// Durable chain generation captured with the lifecycle.
+    pub chain_epoch: u64,
+    /// Exact authenticated tip captured with the lifecycle.
+    pub tip: Option<WalletChainTip>,
+    /// Process-local immutable mempool identity captured with the lifecycle.
+    pub mempool_instance_nonce: [u8; 32],
+    /// Exact immutable mempool generation captured with the lifecycle.
+    pub mempool_generation: u64,
+}
+
+/// Committed never-confirmed retirement and its exact proof binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrackedContractRetirement {
+    /// Content-derived registration identity.
+    pub contract_id: ContractId,
+    /// Idempotent durable mutation result.
+    pub outcome: ContractRetirementOutcome,
+    /// Lifecycle revision targeted by this request, including idempotent retry.
+    pub lifecycle_revision: u64,
+    /// Durable chain generation used for the proof and mutation.
+    pub chain_epoch: u64,
+    /// Exact authenticated tip used for the proof and mutation.
+    pub tip: Option<WalletChainTip>,
+    /// Process-local mempool identity used for the proof.
+    pub mempool_instance_nonce: [u8; 32],
+    /// Exact immutable mempool generation scanned for matching funding.
+    pub mempool_generation: u64,
+}
+
+struct TrackedContractRetirementPlan {
+    epoch: CanonicalEpoch,
+    registration: ContractRegistration,
+    lifecycle_revision: u64,
+    chain_epoch: u64,
+    tip: Option<WalletChainTip>,
+    mempool_instance_nonce: [u8; 32],
+    mempool_generation: u64,
 }
 
 /// Current canonical active-chain tip.
@@ -516,9 +580,17 @@ pub enum WalletBackendError {
     /// Public contract terms are malformed or conflict with an existing lock.
     #[error("wallet tracked-contract registration is invalid or conflicts")]
     InvalidContract,
-    /// Immutable public contract registry capacity is exhausted.
+    /// Active public contract registry capacity is exhausted.
     #[error("wallet tracked-contract registry is full")]
     ContractCapacity,
+    /// Retirement requires no confirmed history, no retained transaction
+    /// orphans, and no matching ordinary or airdrop funding in the exact
+    /// currently bound mempool generation.
+    #[error("wallet tracked-contract registration is not eligible for never-confirmed retirement")]
+    ContractNotRetirable,
+    /// A retirement request belongs to an older exact registration lifecycle.
+    #[error("wallet tracked-contract lifecycle changed from {expected} to {actual:?}")]
+    StaleContractLifecycle { expected: u64, actual: Option<u64> },
     /// A continuation belongs to an older immutable mempool generation.
     #[error("wallet mempool generation changed from {expected} to {actual}")]
     StaleMempoolGeneration { expected: u64, actual: u64 },
@@ -671,7 +743,7 @@ impl WalletBackend {
     ) -> Result<TransactionEvidence, WalletBackendError> {
         let transaction_index = self.read.transaction_index;
         let read = self.read.clone();
-        blocking_mempool_read(read, move |_, snapshot, mempool, epoch| {
+        blocking_mempool_read(read, move |_, snapshot, mempool, _, epoch| {
             let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
             if chain_epoch != epoch.chain_epoch {
                 return Err(WalletBackendError::Corrupt(
@@ -1048,6 +1120,210 @@ impl WalletBackend {
             .map_err(wallet_writer_error)
     }
 
+    /// Capture the in-process lifecycle and exact chain/mempool binding needed
+    /// to prepare a never-confirmed retirement request.
+    pub async fn get_tracked_contract_retirement_context(
+        &self,
+        id: ContractId,
+    ) -> Result<TrackedContractRetirementContext, WalletBackendError> {
+        if !self.read.wallet_index_profile().wallet {
+            return Err(WalletBackendError::IndexDisabled("tracked-contract"));
+        }
+        let profile = self.read.wallet_index_profile();
+        let read = self.read.clone();
+        blocking_mempool_read(read, move |_, snapshot, mempool, _, epoch| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != epoch.chain_epoch {
+                return Err(WalletBackendError::Corrupt(
+                    "published and durable chain generations disagree",
+                ));
+            }
+            Ok(TrackedContractRetirementContext {
+                registration: tracked_contract(snapshot, profile, id)
+                    .map_err(wallet_index_error)?,
+                lifecycle_revision: tracked_contract_lifecycle_revision(snapshot, profile, id)
+                    .map_err(wallet_index_error)?,
+                chain_epoch,
+                tip: wallet_chain_tip(snapshot)?,
+                mempool_instance_nonce: *mempool.instance_nonce(),
+                mempool_generation: mempool.generation(),
+            })
+        })
+        .await
+    }
+
+    /// Retire one never-confirmed registration and reclaim its active global
+    /// and per-address capacity after the caller explicitly abandons every
+    /// previously broadcast funding transaction.
+    ///
+    /// The caller context binds the target lifecycle plus one exact durable-
+    /// chain and immutable-mempool generation. The bound publication must have
+    /// no retained transaction orphans; accepted ordinary transactions and
+    /// airdrop outputs are scanned for exact funding. After the internal stable
+    /// scan, any intervening canonical writer command rejects compare-and-
+    /// commit. Completed or legacy registrations are not eligible for this
+    /// narrow lifecycle operation.
+    pub async fn retire_never_confirmed_tracked_contract(
+        &self,
+        request: TrackedContractRetirementRequest,
+    ) -> Result<TrackedContractRetirement, WalletBackendError> {
+        if !self.read.wallet_index_profile().wallet {
+            return Err(WalletBackendError::IndexDisabled("tracked-contract"));
+        }
+        request
+            .registration
+            .funding_address()
+            .map_err(wallet_index_error)?;
+        let profile = self.read.wallet_index_profile();
+        let read = self.read.clone();
+        let plan = blocking_mempool_read(read, move |_, snapshot, mempool, mempool_info, epoch| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != epoch.chain_epoch {
+                return Err(WalletBackendError::Corrupt(
+                    "published and durable chain generations disagree",
+                ));
+            }
+            if request.expected_chain_epoch != chain_epoch {
+                return Err(WalletBackendError::StaleChainEpoch {
+                    expected: request.expected_chain_epoch,
+                    actual: chain_epoch,
+                });
+            }
+            let tip = wallet_chain_tip(snapshot)?;
+            if request.expected_tip != tip {
+                return Err(WalletBackendError::StaleCanonicalRead);
+            }
+            if request.expected_mempool_instance_nonce != *mempool.instance_nonce() {
+                return Err(WalletBackendError::StaleMempoolInstance);
+            }
+            if request.expected_mempool_generation != mempool.generation() {
+                return Err(WalletBackendError::StaleMempoolGeneration {
+                    expected: request.expected_mempool_generation,
+                    actual: mempool.generation(),
+                });
+            }
+
+            if let Some(stored) = tracked_contract(snapshot, profile, request.registration.id)
+                .map_err(wallet_index_error)?
+            {
+                if stored != request.registration {
+                    return Err(WalletBackendError::InvalidContract);
+                }
+                let actual_lifecycle_revision =
+                    tracked_contract_lifecycle_revision(snapshot, profile, stored.id)
+                        .map_err(wallet_index_error)?;
+                if actual_lifecycle_revision != Some(request.expected_lifecycle_revision) {
+                    return Err(WalletBackendError::StaleContractLifecycle {
+                        expected: request.expected_lifecycle_revision,
+                        actual: actual_lifecycle_revision,
+                    });
+                }
+                if !tracked_contract_fundings(snapshot, profile, stored.id, None, 1)
+                    .map_err(wallet_index_error)?
+                    .entries
+                    .is_empty()
+                    || !tracked_contract_events(snapshot, profile, stored.id, None, 1)
+                        .map_err(wallet_index_error)?
+                        .entries
+                        .is_empty()
+                {
+                    return Err(WalletBackendError::ContractNotRetirable);
+                }
+                // Retained transaction orphans are not part of the immutable
+                // transaction snapshot. Requiring the exact published pool to
+                // have none keeps the proof complete without cloning orphan
+                // bodies into every publication. The canonical-writer epoch
+                // below rejects any orphan mutation after this stable read.
+                if mempool_info.orphan_count != 0 {
+                    return Err(WalletBackendError::ContractNotRetirable);
+                }
+                for txid in mempool.txids() {
+                    let transaction =
+                        mempool
+                            .transaction(&txid)
+                            .ok_or(WalletBackendError::Corrupt(
+                                "published mempool references an absent transaction",
+                            ))?;
+                    if transaction_contains_contract_funding(&stored, transaction)? {
+                        return Err(WalletBackendError::ContractNotRetirable);
+                    }
+                }
+                // Accepted airdrop proofs become CovenantKind::None coinbase
+                // outputs and can therefore satisfy an HNS-HTLC descriptor.
+                // Claims use CovenantKind::Claim and cannot match either
+                // supported funding profile.
+                for airdrop in mempool.airdrops() {
+                    let address =
+                        Address::new(airdrop.proof.version, airdrop.proof.address.clone())
+                            .map_err(|_| {
+                                WalletBackendError::Corrupt(
+                                    "accepted airdrop proof has an invalid output address",
+                                )
+                            })?;
+                    let value = airdrop.value.checked_sub(airdrop.fee).ok_or(
+                        WalletBackendError::Corrupt(
+                            "accepted airdrop proof fee exceeds its output value",
+                        ),
+                    )?;
+                    if stored
+                        .matches_funding_output(&Output {
+                            value,
+                            address,
+                            covenant: Covenant {
+                                kind: CovenantKind::None,
+                                items: Vec::new(),
+                            },
+                        })
+                        .map_err(wallet_index_error)?
+                    {
+                        return Err(WalletBackendError::ContractNotRetirable);
+                    }
+                }
+            }
+
+            Ok(TrackedContractRetirementPlan {
+                epoch: epoch.clone(),
+                registration: request.registration,
+                lifecycle_revision: request.expected_lifecycle_revision,
+                chain_epoch,
+                tip,
+                mempool_instance_nonce: *mempool.instance_nonce(),
+                mempool_generation: mempool.generation(),
+            })
+        })
+        .await?;
+        let TrackedContractRetirementPlan {
+            epoch,
+            registration,
+            lifecycle_revision,
+            chain_epoch,
+            tip,
+            mempool_instance_nonce,
+            mempool_generation,
+        } = plan;
+        let contract_id = registration.id;
+        let outcome = self
+            .writer
+            .execute_at(
+                epoch,
+                "retire never-confirmed wallet contract",
+                move |node| {
+                    node.retire_never_confirmed_wallet_contract(registration, lifecycle_revision)
+                },
+            )
+            .await
+            .map_err(wallet_writer_error)?;
+        Ok(TrackedContractRetirement {
+            contract_id,
+            outcome,
+            lifecycle_revision,
+            chain_epoch,
+            tip,
+            mempool_instance_nonce,
+            mempool_generation,
+        })
+    }
+
     /// Read one immutable public Shakedex/HTLC registration.
     pub async fn get_tracked_contract(
         &self,
@@ -1167,7 +1443,7 @@ impl WalletBackend {
         validate_script_set(&scripts)?;
         let query_id = script_set_id(MEMPOOL_SCRIPT_SET_DOMAIN, &scripts)?;
         let read = self.read.clone();
-        blocking_mempool_read(read, move |_, snapshot, mempool, epoch| {
+        blocking_mempool_read(read, move |_, snapshot, mempool, _, epoch| {
             let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
             if chain_epoch != epoch.chain_epoch {
                 return Err(WalletBackendError::Corrupt(
@@ -1279,7 +1555,7 @@ impl WalletBackend {
         let profile = self.read.wallet_index_profile();
         let query_id = mempool_contract_query_id(id);
         let read = self.read.clone();
-        blocking_mempool_read(read, move |_, snapshot, mempool, epoch| {
+        blocking_mempool_read(read, move |_, snapshot, mempool, _, epoch| {
             let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
             if chain_epoch != epoch.chain_epoch {
                 return Err(WalletBackendError::Corrupt(
@@ -1480,7 +1756,7 @@ impl WalletBackend {
         }
 
         let read = self.read.clone();
-        blocking_mempool_read(read, move |_, snapshot, mempool, epoch| {
+        blocking_mempool_read(read, move |_, snapshot, mempool, _, epoch| {
             let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
             if chain_epoch != epoch.chain_epoch {
                 return Err(WalletBackendError::Corrupt(
@@ -1792,6 +2068,7 @@ where
             &NodeReadHandle,
             &hns_store::StoreHandleSnapshot<'_>,
             &MempoolSnapshot,
+            &MempoolInfo,
             &CanonicalEpoch,
         ) -> Result<T, WalletBackendError>
         + Send
@@ -1804,7 +2081,8 @@ where
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let epoch = read.canonical_epoch();
-        let mempool = read.published_mempool_snapshot().map_err(node_error)?;
+        let published_mempool = read.published_mempool().map_err(node_error)?;
+        let mempool = published_mempool.snapshot();
         let snapshot = read.store.snapshot().map_err(node_error)?;
         if chain_epoch_from_snapshot(&snapshot).map_err(node_error)? != epoch.chain_epoch
             || best_block_tip_from_snapshot(&snapshot)
@@ -1814,7 +2092,7 @@ where
         {
             return Err(WalletBackendError::StaleCanonicalRead);
         }
-        let result = operation(&read, &snapshot, &mempool, &epoch);
+        let result = operation(&read, &snapshot, &mempool, &published_mempool.info, &epoch);
         if !read.canonical_generation_is_stable(&epoch) {
             return Err(WalletBackendError::StaleCanonicalRead);
         }
@@ -1863,6 +2141,21 @@ fn mempool_contract_query_id(id: ContractId) -> [u8; 32] {
     identity.write_bytes(MEMPOOL_CONTRACT_DOMAIN);
     identity.write_bytes(id.as_bytes());
     blake2b_256(&identity.finish())
+}
+
+fn transaction_contains_contract_funding(
+    registration: &ContractRegistration,
+    transaction: &Transaction,
+) -> Result<bool, WalletBackendError> {
+    for output in &transaction.outputs {
+        if registration
+            .matches_funding_output(output)
+            .map_err(wallet_index_error)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn mempool_scan_page(
@@ -2165,11 +2458,28 @@ fn wallet_index_error(error: IndexError) -> WalletBackendError {
         IndexError::ContractCapacity | IndexError::ContractAddressCapacity => {
             WalletBackendError::ContractCapacity
         }
+        IndexError::ContractConfirmed | IndexError::ContractConfirmationUnknown => {
+            WalletBackendError::ContractNotRetirable
+        }
+        IndexError::StaleContractLifecycle { expected, actual } => {
+            WalletBackendError::StaleContractLifecycle {
+                expected,
+                actual: Some(actual),
+            }
+        }
         other => node_error(other),
     }
 }
 
 fn wallet_writer_error(error: anyhow::Error) -> WalletBackendError {
+    if let Some(writer) = error.downcast_ref::<CanonicalWriterError>() {
+        if matches!(
+            writer,
+            CanonicalWriterError::StaleEpoch { .. } | CanonicalWriterError::StaleChainEpoch { .. }
+        ) {
+            return WalletBackendError::StaleCanonicalRead;
+        }
+    }
     if let Some(index) = error.downcast_ref::<IndexError>() {
         return match index {
             IndexError::Disabled(component) => WalletBackendError::IndexDisabled(component),
@@ -2179,6 +2489,15 @@ fn wallet_writer_error(error: anyhow::Error) -> WalletBackendError {
             IndexError::InvalidContract => WalletBackendError::InvalidContract,
             IndexError::ContractCapacity | IndexError::ContractAddressCapacity => {
                 WalletBackendError::ContractCapacity
+            }
+            IndexError::ContractConfirmed | IndexError::ContractConfirmationUnknown => {
+                WalletBackendError::ContractNotRetirable
+            }
+            IndexError::StaleContractLifecycle { expected, actual } => {
+                WalletBackendError::StaleContractLifecycle {
+                    expected: *expected,
+                    actual: Some(*actual),
+                }
             }
             _ => node_error(index),
         };
@@ -2429,6 +2748,144 @@ mod tests {
             backend.broadcast_transaction(unsigned).await,
             Err(WalletBackendError::Rejected(reason))
                 if reason == "mining_engine-transaction-relay-disabled"
+        ));
+
+        drop(backend);
+        runtime.shutdown_unclean().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn never_confirmed_contract_retirement_is_generation_and_lifecycle_bound() {
+        let config = NodeConfig {
+            network: Network::Regtest,
+            wallet_index: true,
+            ..NodeConfig::default()
+        };
+        let node = NodeService::try_new(config).unwrap();
+        let runtime = NodeRuntime::spawn(node, DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY).unwrap();
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest)).unwrap();
+        let backend = runtime.wallet_backend(peers);
+        let registration =
+            ContractRegistration::shakedex_v2(hns_wallet_index::ShakedexV2Descriptor {
+                name_hash: [0x71; 32],
+                seller_public_key: GENERATOR_KEY,
+                value: 1_000,
+            })
+            .unwrap();
+        let matching_funding = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 1_000,
+                address: registration.funding_address().unwrap(),
+                covenant: hns_primitives::Covenant {
+                    kind: CovenantKind::Finalize,
+                    items: vec![vec![0x71; 32]],
+                },
+            }],
+            locktime: 0,
+        };
+        assert!(transaction_contains_contract_funding(&registration, &matching_funding).unwrap());
+        let mut wrong_funding = matching_funding;
+        wrong_funding.outputs[0].value = 999;
+        assert!(!transaction_contains_contract_funding(&registration, &wrong_funding).unwrap());
+        assert_eq!(
+            backend
+                .register_tracked_contract(registration.clone())
+                .await
+                .unwrap(),
+            ContractRegistrationOutcome::Registered
+        );
+        let binding = backend
+            .get_tracked_contract_retirement_context(registration.id)
+            .await
+            .unwrap();
+        assert_eq!(binding.registration, Some(registration.clone()));
+        let lifecycle_revision = binding
+            .lifecycle_revision
+            .expect("new registration lifecycle revision");
+        let request = TrackedContractRetirementRequest {
+            registration: registration.clone(),
+            expected_lifecycle_revision: lifecycle_revision,
+            expected_chain_epoch: binding.chain_epoch,
+            expected_tip: binding.tip.clone(),
+            expected_mempool_instance_nonce: binding.mempool_instance_nonce,
+            expected_mempool_generation: binding.mempool_generation,
+        };
+
+        let mut wrong_instance = request.clone();
+        wrong_instance.expected_mempool_instance_nonce = [0; 32];
+        assert!(matches!(
+            backend
+                .retire_never_confirmed_tracked_contract(wrong_instance)
+                .await,
+            Err(WalletBackendError::StaleMempoolInstance)
+        ));
+        let mut wrong_generation = request.clone();
+        wrong_generation.expected_mempool_generation = binding.mempool_generation.saturating_add(1);
+        assert!(matches!(
+            backend
+                .retire_never_confirmed_tracked_contract(wrong_generation)
+                .await,
+            Err(WalletBackendError::StaleMempoolGeneration { .. })
+        ));
+        let mut wrong_chain = request.clone();
+        wrong_chain.expected_chain_epoch = binding.chain_epoch.saturating_add(1);
+        assert!(matches!(
+            backend
+                .retire_never_confirmed_tracked_contract(wrong_chain)
+                .await,
+            Err(WalletBackendError::StaleChainEpoch { .. })
+        ));
+
+        let retired = backend
+            .retire_never_confirmed_tracked_contract(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(retired.contract_id, registration.id);
+        assert_eq!(retired.outcome, ContractRetirementOutcome::Retired);
+        assert_eq!(retired.lifecycle_revision, lifecycle_revision);
+        assert_eq!(retired.chain_epoch, binding.chain_epoch);
+        assert_eq!(retired.tip, binding.tip);
+        assert_eq!(
+            retired.mempool_instance_nonce,
+            binding.mempool_instance_nonce
+        );
+        assert_eq!(retired.mempool_generation, binding.mempool_generation);
+        assert_eq!(
+            backend.get_tracked_contract(registration.id).await.unwrap(),
+            None
+        );
+
+        let retry = backend
+            .retire_never_confirmed_tracked_contract(request.clone())
+            .await
+            .unwrap();
+        assert_eq!(retry.outcome, ContractRetirementOutcome::AlreadyAbsent);
+        assert_eq!(
+            backend
+                .register_tracked_contract(registration.clone())
+                .await
+                .unwrap(),
+            ContractRegistrationOutcome::Registered
+        );
+        assert_eq!(
+            backend.get_tracked_contract(registration.id).await.unwrap(),
+            Some(registration.clone())
+        );
+        assert!(matches!(
+            backend
+                .retire_never_confirmed_tracked_contract(request)
+                .await,
+            Err(WalletBackendError::StaleContractLifecycle {
+                expected,
+                actual: Some(actual),
+            }) if expected == lifecycle_revision && actual != lifecycle_revision
         ));
 
         drop(backend);

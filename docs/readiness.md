@@ -184,9 +184,15 @@ implemented cross-repository wallet transport adapter plus restart/reorg/
 adversarial qualification pass on its final commit. Local script
 duplication and frozen vectors are cross-boundary qualification checks, not
 protocol authority. It stores no wallet key or unrevealed preimage and remains
-disabled by default. Its immutable registry is append-only: no safe retirement
-or capacity-reclamation lifecycle exists, making the global/per-address
-lifetime caps a separate production-availability blocker. Live marketplace wire
+disabled by default. Exact never-confirmed registrations now have a monotonic,
+revision- and restart/reorg-safe in-process retirement path that reclaims active
+global and per-address slots under an exact chain/current-mempool generation.
+It requires zero retained transaction orphans and scans accepted ordinary
+transactions and airdrop outputs. The caller must durably abandon prior
+broadcasts; the node cannot prove an evicted transaction will never return.
+Completed or legacy
+registrations still have no safe retirement lifecycle, leaving a narrower
+production-availability blocker. Live marketplace wire
 advertisement separately awaits the
 published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
 adapter gate.

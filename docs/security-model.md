@@ -287,6 +287,16 @@ Fixtures are evidence, not authority.
   redact them, public serde input cannot reconstruct them, and raw access
   requires an explicitly named settlement accessor. No unrevealed secret, seed,
   password, or signing capability enters node storage.
+- Every new contract registration has a checksummed monotonic confirmation row
+  and a retained lifecycle revision that changes on serialized re-registration.
+  Matching funding marks it confirmed in the
+  same canonical batch and disconnect never clears it. Never-confirmed
+  retirement requires the authoritative false state, caller-bound revision,
+  empty confirmed prefixes, zero retained transaction orphans, a complete
+  current immutable accepted ordinary/airdrop scan, and an exact canonical-
+  writer compare-and-commit. Legacy-unknown or ever-confirmed
+  state fails closed, so retirement cannot remove a descriptor required by a
+  retained disconnect.
 - Multi-script confirmed and mempool results use positions in the sorted
   request. Confirmed cursors bind the script-set digest and durable chain epoch;
   collection admission and a 256-prefix-page bound permit empty resumable
@@ -354,9 +364,12 @@ Fixtures are evidence, not authority.
   Frozen vectors are cross-boundary qualification evidence; release qualification
   requires a published canonical `hns-swap` commit plus a pinned, qualified
   adapter.
-- The contract registry is append-only. Its global and per-address caps cannot
-  be safely reclaimed in this schema, so exhaustion is a production-availability
-  threat and untrusted registration must remain unavailable.
+- Active global and per-address registry slots can be reclaimed only for
+  never-confirmed registrations whose prior broadcasts the caller explicitly
+  abandons. Used/completed descriptors still
+  cannot be retired safely in this schema, so exhaustion remains a
+  production-availability threat and untrusted registration must remain
+  unavailable.
 
 ## Failure policy
 

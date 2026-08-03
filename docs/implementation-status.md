@@ -156,8 +156,14 @@ Implemented:
   address candidates preserve valid key reuse and match exact output terms.
   Contract pages bind their contract and chain epoch. Connect indexing reads the
   authenticated pre-current-block UTXO view plus the complete same-block output
-  map before state-overlay mutation. The append-only contract registry has no
-  safe retirement or capacity reclamation; its lifetime caps are an explicit
+  map before state-overlay mutation. A checksummed monotonic confirmation row and lifecycle revision are
+  written with every new registration and set permanently on first matching
+  canonical funding. The typed backend can retire only exact never-confirmed
+  registrations after binding the caller's revision, requiring no retained
+  transaction orphans, and applying an exact current accepted ordinary/airdrop
+  scan plus canonical-writer guard,
+  atomically reclaiming active global and per-address slots. Used, completed,
+  and legacy-unknown registrations remain non-retirable and a narrower
   production-availability blocker. This implementation is awaiting the
   repository's full gate, an independent wallet transport adapter, a published
   and pinned canonical `hns-swap` commit, and cross-repository adapter

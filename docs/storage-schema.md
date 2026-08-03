@@ -315,8 +315,8 @@ cannot promote a block or grant authority.
   until an offline rebuild or a new data directory is used.
   Versioned `wallet-index/v1/` subspaces in the same column family optionally
   store script history, outpoint spenders, script UTXOs, immutable public
-  Shakedex/HTLC registrations and address bindings, active contract fundings,
-  and confirmed contract events. Their keys cannot collide with fixed 32-byte
+  Shakedex/HTLC registrations and address bindings, monotonic confirmation
+  records, active contract fundings, and confirmed contract events. Their keys cannot collide with fixed 32-byte
   transaction keys. Every derivative value is checksummed against its exact
   key; UTXO reads reconstruct the script/outpoint key and contract reads verify
   descriptor/content/address topology, so relocated values fail closed. The
@@ -334,13 +334,29 @@ cannot promote a block or grant authority.
   shape; storage corruption still fails the node closed.
   Confirmed HTLC events retain raw revealed preimages in their internal durable
   representation, while public DTO serde is redacted and non-round-trippable.
-  Registrations have no delete/tombstone/retirement record: the global and
-  per-address caps are unreclaimable lifetime data-directory limits in this
-  schema and remain a production-availability blocker. The checksummed
+  `wallet-index/v1/contract/observation/<contract-id>` stores a checksummed
+  lifecycle revision and `NeverConfirmed`, `Confirmed`, or fail-
+  closed `LegacyUnknown` state. `wallet-index/v1/contract/lifecycle-sequence`
+  allocates revisions across serialized node registration and is retained
+  across retirement. New
+  registration writes `NeverConfirmed`; the first matching connected funding
+  writes `Confirmed` in the canonical block batch, and disconnect never clears
+  it. Exact never-confirmed retirement requires the caller's matching revision plus empty funding/event
+  prefixes, then atomically deletes the registration and observation, removes
+  its address membership, and decrements/deletes the active count. No tombstone
+  is needed because no chain event existed; an exact later registration is a
+  fresh lifecycle. The typed node wrapper additionally requires no retained
+  transaction orphans and scans the exact accepted ordinary/airdrop generation
+  before exact-epoch commit. Completed/used registrations have no safe retirement record
+  and remain a production-availability blocker. The checksummed
   `wallet-index-profile/v1` snapshot record prevents partially
   indexed history
   from being enabled after startup; see
   [Handshake wallet indexes](HNS_NODE_WALLET_INDEX.md).
+  Profile payload version 2 is a downgrade fence for the lifecycle records.
+  Current startup reads version 1 only to validate and atomically rewrite it to
+  version 2 before enabling writers; older binaries reject version 2 instead of
+  silently connecting/disconnecting blocks without updating confirmation state.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.

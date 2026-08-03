@@ -22,9 +22,12 @@ Authenticated wallet RPC v1 now projects the safe subset through the native
 node process boundary without a sibling dependency. It requires explicit
 listener Authorization and `--wallet-index`; loopback alone never enables it.
 The subsystem is disabled by default and is not release-qualified: the
-immutable contract registry has no safe capacity-reclamation lifecycle, and
-the repository still awaits its independent wallet adapter, canonical
-`hns-swap` pin, and cross-project qualification. See the
+typed in-process backend can reclaim registrations that authoritative durable
+state proves were never confirmed, provided the caller permanently abandons
+every prior funding broadcast, the exact current accepted ordinary/airdrop pool
+has no matching funding, and the bound pool retains no transaction orphans.
+Completed-contract retirement is still unavailable. The repository also awaits its independent wallet adapter,
+canonical `hns-swap` pin, and cross-project qualification. See the
 [wallet-index status](docs/HNS_NODE_WALLET_INDEX.md) and
 [wire contract](docs/WALLET_RPC_V1.md).
 

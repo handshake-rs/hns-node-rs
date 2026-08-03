@@ -196,13 +196,23 @@ terms; key uniqueness is not a protocol assumption. Revealed preimages remain
 raw only in internal durable events; public debug/serde surfaces redact them and
 raw access is explicit.
 
-The immutable registry is append-only and has no authenticated retirement or
-capacity-reclamation lifecycle. Its global and per-address caps are therefore
-lifetime data-directory limits and an explicit production-availability blocker.
+New registrations carry a checksummed monotonic confirmation record and a
+retained lifecycle revision that changes on serialized exact re-registration.
+The first matching canonical funding marks it confirmed
+atomically and reorg disconnects never clear that fact. The typed backend may
+retire only exact never-confirmed registrations after binding the caller's
+lifecycle revision, requiring zero retained transaction orphans, scanning the
+current immutable accepted ordinary/airdrop pool, and exact canonical-writer
+compare-and-commit. This reclaims active global and per-address slots without
+removing any descriptor needed by disconnect. Legacy-unknown and ever-confirmed
+registrations fail closed. Completed-contract retirement still needs a
+reorg-aware lifecycle and remains an explicit production-availability blocker.
+The caller must separately and durably abandon prior broadcasts because an
+evicted transaction can be rebroadcast after the current-mempool proof.
 Local profile duplication and frozen vectors are not protocol authority.
-Release qualification requires safe registry lifecycle work, a published and
-pinned canonical `hns-swap` commit, and a qualified adapter. Wallet secrets,
-signing, workflow decisions, and unrevealed preimages remain outside the node.
+Release qualification also requires a published and pinned canonical
+`hns-swap` commit and a qualified adapter. Wallet secrets, signing, workflow
+decisions, and unrevealed preimages remain outside the node.
 
 ## Compatibility boundary
 

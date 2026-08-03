@@ -376,6 +376,13 @@ Tests must cover:
   same-block tracked create/spend reversal;
 - same-address/different-term contract registrations, per-address candidate
   caps, exact output selection, and startup topology/count validation;
+- never-confirmed contract retirement reclaiming shared-address and global
+  capacity, idempotent absence, exact re-registration with lifecycle-ABA
+  rejection, monotonic confirmation across disconnect/restart reads,
+  legacy-unknown refusal, profile-v1-to-v2 downgrade fencing, exact
+  chain/tip/mempool-generation backend guards, the conservative zero-retained-
+  orphan gate, and exact funding-predicate rejection used by the immutable
+  accepted ordinary/airdrop scan;
 - contract-ID- and chain-epoch-bound funding/event continuations plus terminal-
   page canonical-generation overlap rejection;
 - global sorted-script confirmed history/UTXO traversal, reverse index mapping,

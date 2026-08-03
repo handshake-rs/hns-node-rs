@@ -18,9 +18,9 @@ pub use hns_denuo_market_relay::{
 };
 pub use hns_p2p::LivePeerManager;
 pub use hns_wallet_index::{
-    ContractId, ContractRegistration, ContractRegistrationOutcome, HnsHtlcDescriptor,
-    RevealedPreimage, ScriptHistoryCursor, ScriptHistoryDirection, ScriptHistoryEntry,
-    ScriptHistoryPage, ScriptId, ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage,
+    ContractId, ContractRegistration, ContractRegistrationOutcome, ContractRetirementOutcome,
+    HnsHtlcDescriptor, RevealedPreimage, ScriptHistoryCursor, ScriptHistoryDirection,
+    ScriptHistoryEntry, ScriptHistoryPage, ScriptId, ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage,
     ShakedexV2Descriptor, SpendingTransaction, TrackedContractEvent, TrackedContractFunding,
     TrackedContractKind, TrackedContractSpendKind, WalletIndexProfile,
 };
@@ -35,7 +35,8 @@ pub use wallet_backend::{
     ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate, FeeEstimateSource,
     MempoolContractActivity, MempoolContractEvent, MempoolContractPage, MempoolScriptActivity,
     MempoolScriptOutput, MempoolScriptPage, MempoolScriptSpend, NameEvidence, NameOwnerTransaction,
-    NameProofResult, OutpointSpendingEntry, OutpointSpendingEvidence, TransactionEvidence,
+    NameProofResult, OutpointSpendingEntry, OutpointSpendingEvidence, TrackedContractRetirement,
+    TrackedContractRetirementContext, TrackedContractRetirementRequest, TransactionEvidence,
     TransactionFeeQuote, TransactionInclusion, TransactionPayload, TransactionStatus,
     WalletBackend, WalletBackendError, WalletChainTip, WalletContractEventCursor,
     WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
@@ -143,7 +144,8 @@ use hns_store::{
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, STORAGE_PROFILE,
 };
 use hns_wallet_index::{
-    decode_index_profile, encode_index_profile, register_tracked_contract,
+    decode_index_profile, encode_index_profile, index_profile_is_current,
+    register_tracked_contract, retire_never_confirmed_tracked_contract,
     stage_connect as stage_wallet_index_connect, stage_disconnect as stage_wallet_index_disconnect,
     validate_tracked_contract_registry, INDEX_PROFILE_MODE_KEY,
 };
@@ -3863,6 +3865,27 @@ impl NodeService {
             &mut batch,
             self.state.wallet_index_profile,
             &registration,
+        )
+        .map_err(anyhow::Error::new)?;
+        drop(snapshot);
+        self.state.store.commit(batch)?;
+        Ok(outcome)
+    }
+
+    pub(crate) fn retire_never_confirmed_wallet_contract(
+        &mut self,
+        registration: ContractRegistration,
+        expected_lifecycle_revision: u64,
+    ) -> Result<ContractRetirementOutcome> {
+        self.state.ensure_storage_operational()?;
+        let snapshot = self.state.store.snapshot()?;
+        let mut batch = self.state.store.batch();
+        let outcome = retire_never_confirmed_tracked_contract(
+            &snapshot,
+            &mut batch,
+            self.state.wallet_index_profile,
+            &registration,
+            expected_lifecycle_revision,
         )
         .map_err(anyhow::Error::new)?;
         drop(snapshot);
@@ -9489,10 +9512,18 @@ impl NodeState {
     fn configure_wallet_indexes(&mut self, profile: WalletIndexProfile) -> Result<()> {
         self.ensure_storage_operational()?;
         let snapshot = self.store.snapshot()?;
-        let persisted = snapshot
+        let persisted_raw = snapshot
             .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
-            .context("failed to read wallet-index profile")?
-            .map(|raw| decode_index_profile(&raw))
+            .context("failed to read wallet-index profile")?;
+        let profile_is_current = persisted_raw
+            .as_deref()
+            .map(index_profile_is_current)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!(error))?
+            .unwrap_or(false);
+        let persisted = persisted_raw
+            .as_deref()
+            .map(decode_index_profile)
             .transpose()
             .map_err(|error| anyhow::anyhow!(error))?;
         let adds_unbuilt_component = persisted.map_or(profile.enabled(), |available| {
@@ -9527,7 +9558,7 @@ impl NodeState {
             .map_err(anyhow::Error::new)
             .context("failed to validate tracked wallet contracts")?;
         drop(snapshot);
-        if persisted != Some(profile) {
+        if persisted != Some(profile) || !profile_is_current {
             let mut batch = self.store.batch();
             batch.put(
                 ColumnFamily::Snapshots,

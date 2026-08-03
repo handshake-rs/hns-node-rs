@@ -40,18 +40,18 @@ mod serde_compressed_public_key {
     }
 }
 
-/// Maximum immutable public contract registrations in one node store.
-/// Registrations are append-only in this schema and capacity is not reclaimed.
+/// Maximum active public contract registrations in one node store.
 pub const MAX_TRACKED_CONTRACTS: u32 = 16_384;
-/// Maximum distinct public descriptors sharing one script address.
-/// Address bindings are append-only in this schema and capacity is not reclaimed.
+/// Maximum active public descriptors sharing one script address.
 pub const MAX_TRACKED_CONTRACTS_PER_ADDRESS: usize = 256;
 
 const REGISTRATION_PREFIX: &[u8] = b"wallet-index/v1/contract/registration/";
 const ADDRESS_PREFIX: &[u8] = b"wallet-index/v1/contract/address/";
+const OBSERVATION_PREFIX: &[u8] = b"wallet-index/v1/contract/observation/";
 const FUNDING_PREFIX: &[u8] = b"wallet-index/v1/contract/funding/";
 const EVENT_PREFIX: &[u8] = b"wallet-index/v1/contract/event/";
 const REGISTRATION_COUNT_KEY: &[u8] = b"wallet-index/v1/contract/count";
+const LIFECYCLE_SEQUENCE_KEY: &[u8] = b"wallet-index/v1/contract/lifecycle-sequence";
 const RECORD_VERSION: u8 = 1;
 const CHECKSUM_BYTES: usize = 32;
 const ADDRESS_BINDING_HEADER_BYTES: usize = 3;
@@ -330,6 +330,31 @@ pub enum ContractRegistrationOutcome {
     Registered,
     /// The exact registration was already persisted.
     AlreadyRegistered,
+}
+
+/// Result of an idempotent never-confirmed registration retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ContractRetirementOutcome {
+    /// The never-confirmed registration and its active capacity were removed.
+    Retired,
+    /// The exact registration was already absent.
+    AlreadyAbsent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ContractObservationState {
+    // Existing v1 registrations predate authoritative observation state. They
+    // remain readable but can never be treated as never confirmed.
+    LegacyUnknown,
+    NeverConfirmed,
+    Confirmed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ContractObservationRecord {
+    contract_id: ContractId,
+    lifecycle_revision: u64,
+    state: ContractObservationState,
 }
 
 /// A revealed on-chain preimage. Debug output is deliberately redacted.
@@ -631,7 +656,34 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
                 "tracked contract registration address binding mismatch",
             ));
         }
+        if load_observation(snapshot, registration.id)?.is_none() {
+            let lifecycle_revision = next_lifecycle_revision(snapshot, batch)?;
+            put_observation(
+                batch,
+                ContractObservationRecord {
+                    contract_id: registration.id,
+                    lifecycle_revision,
+                    state: ContractObservationState::LegacyUnknown,
+                },
+            )?;
+        }
         return Ok(ContractRegistrationOutcome::AlreadyRegistered);
+    }
+
+    if snapshot
+        .get(ColumnFamily::TxIndex, &observation_key(registration.id))?
+        .is_some()
+    {
+        return Err(IndexError::Corrupt(
+            "tracked contract observation exists without registration",
+        ));
+    }
+    if prefix_has_entry(snapshot, &funding_prefix(registration.id))?
+        || prefix_has_entry(snapshot, &event_prefix(registration.id))?
+    {
+        return Err(IndexError::Corrupt(
+            "tracked contract history exists without registration",
+        ));
     }
 
     let address = registration.funding_address()?;
@@ -663,10 +715,19 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         return Err(IndexError::ContractCapacity);
     }
     let next = count.checked_add(1).ok_or(IndexError::ContractCapacity)?;
+    let lifecycle_revision = next_lifecycle_revision(snapshot, batch)?;
     batch.put(
         ColumnFamily::TxIndex,
         &key,
         &encode_record(b"contract-registration-v1", &key, registration)?,
+    )?;
+    put_observation(
+        batch,
+        ContractObservationRecord {
+            contract_id: registration.id,
+            lifecycle_revision,
+            state: ContractObservationState::NeverConfirmed,
+        },
     )?;
     batch.put(
         ColumnFamily::TxIndex,
@@ -679,6 +740,143 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         &encode_registration_count(next),
     )?;
     Ok(ContractRegistrationOutcome::Registered)
+}
+
+/// Read the durable lifecycle revision for one active registration.
+pub fn tracked_contract_lifecycle_revision<S: ReadSnapshot>(
+    snapshot: &S,
+    profile: WalletIndexProfile,
+    id: ContractId,
+) -> Result<Option<u64>, IndexError> {
+    require_contract_profile(profile)?;
+    if load_registration(snapshot, id)?.is_none() {
+        return Ok(None);
+    }
+    Ok(load_observation(snapshot, id)?.map(|record| record.lifecycle_revision))
+}
+
+/// Atomically remove an exact registration only when durable monotonic state
+/// proves that no matching funding output has ever been confirmed.
+///
+/// The caller must also serialize this mutation against mempool changes, prove
+/// that the same current accepted ordinary/airdrop generation contains no
+/// matching funding and no retained transaction orphans, and durably abandon
+/// every broadcast/rebroadcast source for this descriptor. A previously evicted
+/// transaction can otherwise confirm after deletion without being tracked.
+/// Confirmed funding/event prefixes are checked again here. Legacy registrations
+/// without an authoritative confirmation record fail closed.
+pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
+    snapshot: &S,
+    batch: &mut B,
+    profile: WalletIndexProfile,
+    registration: &ContractRegistration,
+    expected_lifecycle_revision: u64,
+) -> Result<ContractRetirementOutcome, IndexError> {
+    require_contract_profile(profile)?;
+    registration.validate()?;
+    let key = registration_key(registration.id);
+    let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
+        if snapshot
+            .get(ColumnFamily::TxIndex, &observation_key(registration.id))?
+            .is_some()
+        {
+            return Err(IndexError::Corrupt(
+                "tracked contract observation exists without registration",
+            ));
+        }
+        let binding_key = address_key(&registration.funding_address()?);
+        if snapshot
+            .get(ColumnFamily::TxIndex, &binding_key)?
+            .as_deref()
+            .map(|raw| decode_address_bindings(&binding_key, raw))
+            .transpose()?
+            .is_some_and(|ids| ids.binary_search(&registration.id).is_ok())
+        {
+            return Err(IndexError::Corrupt(
+                "tracked contract address binding exists without registration",
+            ));
+        }
+        if prefix_has_entry(snapshot, &funding_prefix(registration.id))?
+            || prefix_has_entry(snapshot, &event_prefix(registration.id))?
+        {
+            return Err(IndexError::Corrupt(
+                "tracked contract history exists without registration",
+            ));
+        }
+        return Ok(ContractRetirementOutcome::AlreadyAbsent);
+    };
+    let stored: ContractRegistration = decode_record(b"contract-registration-v1", &key, &raw)?;
+    if stored != *registration {
+        return Err(IndexError::Corrupt(
+            "tracked contract retirement terms disagree with registration",
+        ));
+    }
+
+    let observation = load_observation(snapshot, registration.id)?
+        .ok_or(IndexError::ContractConfirmationUnknown)?;
+    if observation.lifecycle_revision != expected_lifecycle_revision {
+        return Err(IndexError::StaleContractLifecycle {
+            expected: expected_lifecycle_revision,
+            actual: observation.lifecycle_revision,
+        });
+    }
+    match observation.state {
+        ContractObservationState::NeverConfirmed => {}
+        ContractObservationState::LegacyUnknown => {
+            return Err(IndexError::ContractConfirmationUnknown);
+        }
+        ContractObservationState::Confirmed => return Err(IndexError::ContractConfirmed),
+    }
+    if prefix_has_entry(snapshot, &funding_prefix(registration.id))?
+        || prefix_has_entry(snapshot, &event_prefix(registration.id))?
+    {
+        return Err(IndexError::ContractConfirmed);
+    }
+
+    let binding_key = address_key(&registration.funding_address()?);
+    let binding = snapshot
+        .get(ColumnFamily::TxIndex, &binding_key)?
+        .ok_or(IndexError::Corrupt(
+            "tracked contract registration has no address binding",
+        ))?;
+    let mut ids = decode_address_bindings(&binding_key, &binding)?;
+    let position = ids
+        .binary_search(&registration.id)
+        .map_err(|_| IndexError::Corrupt("tracked contract address binding mismatch"))?;
+    ids.remove(position);
+    let count = snapshot
+        .get(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?
+        .as_deref()
+        .map(decode_registration_count)
+        .transpose()?
+        .ok_or(IndexError::Corrupt(
+            "tracked contract count is absent while registry is non-empty",
+        ))?;
+    let next = count.checked_sub(1).ok_or(IndexError::Corrupt(
+        "tracked contract count underflow during retirement",
+    ))?;
+
+    batch.delete(ColumnFamily::TxIndex, &key)?;
+    batch.delete(ColumnFamily::TxIndex, &observation_key(registration.id))?;
+    if ids.is_empty() {
+        batch.delete(ColumnFamily::TxIndex, &binding_key)?;
+    } else {
+        batch.put(
+            ColumnFamily::TxIndex,
+            &binding_key,
+            &encode_address_bindings(&binding_key, &ids)?,
+        )?;
+    }
+    if next == 0 {
+        batch.delete(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?;
+    } else {
+        batch.put(
+            ColumnFamily::TxIndex,
+            REGISTRATION_COUNT_KEY,
+            &encode_registration_count(next),
+        )?;
+    }
+    Ok(ContractRetirementOutcome::Retired)
 }
 
 /// Read one immutable public contract registration.
@@ -710,6 +908,7 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
             "tracked contract count exceeds schema bound",
         ));
     }
+    let lifecycle_sequence = load_lifecycle_sequence(snapshot)?;
 
     let registrations = validate_registry_prefix(snapshot, REGISTRATION_PREFIX, |key, raw| {
         let registration: ContractRegistration =
@@ -735,6 +934,7 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
                 "tracked contract registration address binding mismatch",
             ));
         }
+        let _ = load_observation(snapshot, registration.id)?;
         Ok(())
     })?;
     let mut binding_total = 0_u32;
@@ -760,9 +960,42 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
         }
         Ok(())
     })?;
+    let observations = validate_registry_prefix(snapshot, OBSERVATION_PREFIX, |key, raw| {
+        let record: ContractObservationRecord =
+            decode_record(b"contract-observation-v1", key, raw)?;
+        if observation_key(record.contract_id) != key {
+            return Err(IndexError::Corrupt(
+                "tracked contract observation key/value binding mismatch",
+            ));
+        }
+        if load_registration(snapshot, record.contract_id)?.is_none() {
+            return Err(IndexError::Corrupt(
+                "tracked contract observation points to missing registration",
+            ));
+        }
+        if record.lifecycle_revision == 0 || record.lifecycle_revision > lifecycle_sequence {
+            return Err(IndexError::Corrupt(
+                "tracked contract lifecycle revision exceeds its sequence",
+            ));
+        }
+        if record.state == ContractObservationState::NeverConfirmed
+            && (prefix_has_entry(snapshot, &funding_prefix(record.contract_id))?
+                || prefix_has_entry(snapshot, &event_prefix(record.contract_id))?)
+        {
+            return Err(IndexError::Corrupt(
+                "never-confirmed tracked contract has confirmed activity",
+            ));
+        }
+        Ok(())
+    })?;
     if registrations != expected || binding_total != expected || (expected != 0 && addresses == 0) {
         return Err(IndexError::Corrupt(
             "tracked contract registry count/topology mismatch",
+        ));
+    }
+    if observations > registrations {
+        return Err(IndexError::Corrupt(
+            "tracked contract observations exceed registry count",
         ));
     }
     Ok(())
@@ -901,6 +1134,7 @@ pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
                 transaction_position,
                 output_position,
             };
+            mark_contract_confirmed(snapshot, batch, registration.id)?;
             put_funding(batch, &funding)?;
             put_event(batch, &TrackedContractEvent::Funding(funding.clone()))?;
             tracked_created.insert(outpoint, (registration, funding));
@@ -1334,6 +1568,114 @@ fn load_registration<S: ReadSnapshot>(
         .transpose()
 }
 
+fn observation_key(id: ContractId) -> Vec<u8> {
+    prefixed_id(OBSERVATION_PREFIX, id)
+}
+
+fn load_lifecycle_sequence<S: ReadSnapshot>(snapshot: &S) -> Result<u64, IndexError> {
+    snapshot
+        .get(ColumnFamily::TxIndex, LIFECYCLE_SEQUENCE_KEY)?
+        .as_deref()
+        .map(decode_lifecycle_sequence)
+        .transpose()
+        .map(|sequence| sequence.unwrap_or(0))
+}
+
+fn next_lifecycle_revision<S: ReadSnapshot, B: WriteBatch>(
+    snapshot: &S,
+    batch: &mut B,
+) -> Result<u64, IndexError> {
+    let next = load_lifecycle_sequence(snapshot)?
+        .checked_add(1)
+        .ok_or(IndexError::Corrupt(
+            "tracked contract lifecycle sequence exhausted",
+        ))?;
+    batch.put(
+        ColumnFamily::TxIndex,
+        LIFECYCLE_SEQUENCE_KEY,
+        &encode_lifecycle_sequence(next),
+    )?;
+    Ok(next)
+}
+
+fn load_observation<S: ReadSnapshot>(
+    snapshot: &S,
+    id: ContractId,
+) -> Result<Option<ContractObservationRecord>, IndexError> {
+    let key = observation_key(id);
+    snapshot
+        .get(ColumnFamily::TxIndex, &key)?
+        .as_deref()
+        .map(|raw| {
+            let record: ContractObservationRecord =
+                decode_record(b"contract-observation-v1", &key, raw)?;
+            if record.contract_id != id
+                || record.lifecycle_revision == 0
+                || record.lifecycle_revision > load_lifecycle_sequence(snapshot)?
+            {
+                return Err(IndexError::Corrupt(
+                    "tracked contract observation key/value binding mismatch",
+                ));
+            }
+            Ok(record)
+        })
+        .transpose()
+}
+
+fn put_observation<B: WriteBatch>(
+    batch: &mut B,
+    record: ContractObservationRecord,
+) -> Result<(), IndexError> {
+    let key = observation_key(record.contract_id);
+    batch.put(
+        ColumnFamily::TxIndex,
+        &key,
+        &encode_record(b"contract-observation-v1", &key, &record)?,
+    )?;
+    Ok(())
+}
+
+fn mark_contract_confirmed<S: ReadSnapshot, B: WriteBatch>(
+    snapshot: &S,
+    batch: &mut B,
+    id: ContractId,
+) -> Result<(), IndexError> {
+    let existing = load_observation(snapshot, id)?;
+    if existing.is_some_and(|record| record.state == ContractObservationState::Confirmed) {
+        return Ok(());
+    }
+    let lifecycle_revision = match existing {
+        Some(record) => record.lifecycle_revision,
+        None => next_lifecycle_revision(snapshot, batch)?,
+    };
+    put_observation(
+        batch,
+        ContractObservationRecord {
+            contract_id: id,
+            lifecycle_revision,
+            state: ContractObservationState::Confirmed,
+        },
+    )
+}
+
+fn prefix_has_entry<S: ReadSnapshot>(snapshot: &S, prefix: &[u8]) -> Result<bool, IndexError> {
+    let page = snapshot.scan_prefix_page(
+        ColumnFamily::TxIndex,
+        prefix,
+        None,
+        PrefixScanBudget {
+            max_entries: 1,
+            max_bytes: MAX_QUERY_BYTES,
+        },
+    )?;
+    if page.entries.is_empty() && page.continuation.is_some() {
+        return Err(IndexError::Corrupt(
+            "tracked contract prefix probe made no progress",
+        ));
+    }
+    Ok(!page.entries.is_empty())
+}
+
 fn matching_contract_for_output<S: ReadSnapshot>(
     snapshot: &S,
     output: &Output,
@@ -1649,6 +1991,52 @@ fn decode_registration_count(raw: &[u8]) -> Result<u32, IndexError> {
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or(IndexError::Corrupt("invalid tracked contract count"))?,
     ))
+}
+
+fn encode_lifecycle_sequence(sequence: u64) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(1 + 8 + CHECKSUM_BYTES);
+    raw.push(RECORD_VERSION);
+    raw.extend_from_slice(&sequence.to_le_bytes());
+    raw.extend_from_slice(&bound_checksum(
+        b"contract-lifecycle-sequence-v1",
+        LIFECYCLE_SEQUENCE_KEY,
+        &raw,
+    ));
+    raw
+}
+
+fn decode_lifecycle_sequence(raw: &[u8]) -> Result<u64, IndexError> {
+    if raw.len() != 1 + 8 + CHECKSUM_BYTES || raw.first().copied() != Some(RECORD_VERSION) {
+        return Err(IndexError::Corrupt(
+            "invalid tracked contract lifecycle sequence",
+        ));
+    }
+    let (body, checksum) = raw.split_at(9);
+    if checksum
+        != bound_checksum(
+            b"contract-lifecycle-sequence-v1",
+            LIFECYCLE_SEQUENCE_KEY,
+            body,
+        )
+        .as_slice()
+    {
+        return Err(IndexError::Corrupt(
+            "invalid tracked contract lifecycle sequence checksum",
+        ));
+    }
+    let sequence = u64::from_le_bytes(
+        body.get(1..)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(IndexError::Corrupt(
+                "invalid tracked contract lifecycle sequence",
+            ))?,
+    );
+    if sequence == 0 {
+        return Err(IndexError::Corrupt(
+            "invalid tracked contract lifecycle sequence",
+        ));
+    }
+    Ok(sequence)
 }
 
 fn bound_checksum(domain: &[u8], key: &[u8], value: &[u8]) -> [u8; 32] {
@@ -2022,6 +2410,255 @@ mod tests {
             validate_tracked_contract_registry(&snapshot, profile()),
             Err(IndexError::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn never_confirmed_contract_retirement_reclaims_shared_address_and_active_count() {
+        let store = MemoryStore::new();
+        let first = htlc([0x31; 32]);
+        let TrackedContractKind::HnsHtlcV1(mut second_descriptor) = first.kind.clone() else {
+            panic!("HTLC fixture kind");
+        };
+        second_descriptor.value = 75;
+        let second =
+            ContractRegistration::hns_htlc_v1(second_descriptor).expect("second registration");
+        assert_eq!(
+            first.funding_address().expect("first address"),
+            second.funding_address().expect("second address")
+        );
+
+        for registration in [&first, &second] {
+            let snapshot = store.snapshot().expect("registration snapshot");
+            let mut batch = store.batch();
+            assert_eq!(
+                register_tracked_contract(&snapshot, &mut batch, profile(), registration)
+                    .expect("registration"),
+                ContractRegistrationOutcome::Registered
+            );
+            drop(snapshot);
+            store.commit(batch).expect("registration commit");
+        }
+
+        let snapshot = store.snapshot().expect("retirement snapshot");
+        let first_revision = tracked_contract_lifecycle_revision(&snapshot, profile(), first.id)
+            .expect("lifecycle read")
+            .expect("lifecycle revision");
+        let mut retire = store.batch();
+        assert_eq!(
+            retire_never_confirmed_tracked_contract(
+                &snapshot,
+                &mut retire,
+                profile(),
+                &first,
+                first_revision,
+            )
+            .expect("never-confirmed retirement"),
+            ContractRetirementOutcome::Retired
+        );
+        drop(snapshot);
+        store.commit(retire).expect("retirement commit");
+
+        let snapshot = store.snapshot().expect("retired snapshot");
+        validate_tracked_contract_registry(&snapshot, profile()).expect("reduced registry");
+        assert_eq!(
+            tracked_contract(&snapshot, profile(), first.id).expect("first lookup"),
+            None
+        );
+        assert_eq!(
+            tracked_contract(&snapshot, profile(), second.id).expect("second lookup"),
+            Some(second.clone())
+        );
+        let binding_key = address_key(&first.funding_address().expect("shared address"));
+        assert_eq!(
+            decode_address_bindings(
+                &binding_key,
+                &snapshot
+                    .get(ColumnFamily::TxIndex, &binding_key)
+                    .expect("binding read")
+                    .expect("remaining binding"),
+            )
+            .expect("binding decode"),
+            vec![second.id]
+        );
+        assert_eq!(
+            decode_registration_count(
+                &snapshot
+                    .get(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)
+                    .expect("count read")
+                    .expect("remaining count"),
+            )
+            .expect("count decode"),
+            1
+        );
+        let mut retry = store.batch();
+        assert_eq!(
+            retire_never_confirmed_tracked_contract(
+                &snapshot,
+                &mut retry,
+                profile(),
+                &first,
+                first_revision,
+            )
+            .expect("idempotent retirement"),
+            ContractRetirementOutcome::AlreadyAbsent
+        );
+        drop(snapshot);
+
+        let snapshot = store.snapshot().expect("reactivation snapshot");
+        let mut reactivate = store.batch();
+        assert_eq!(
+            register_tracked_contract(&snapshot, &mut reactivate, profile(), &first)
+                .expect("exact re-registration"),
+            ContractRegistrationOutcome::Registered
+        );
+        drop(snapshot);
+        store
+            .commit(reactivate)
+            .expect("exact re-registration commit");
+        let snapshot = store.snapshot().expect("reactivated snapshot");
+        validate_tracked_contract_registry(&snapshot, profile()).expect("reactivated registry");
+        assert_eq!(
+            load_observation(&snapshot, first.id)
+                .expect("observation read")
+                .expect("observation")
+                .state,
+            ContractObservationState::NeverConfirmed
+        );
+        assert_ne!(
+            tracked_contract_lifecycle_revision(&snapshot, profile(), first.id)
+                .expect("new lifecycle read")
+                .expect("new lifecycle revision"),
+            first_revision
+        );
+    }
+
+    #[test]
+    fn never_confirmed_contract_retirement_never_forgets_confirmation_or_legacy_uncertainty() {
+        let store = MemoryStore::new();
+        let registration = htlc([0x32; 32]);
+        let snapshot = store.snapshot().expect("registration snapshot");
+        let mut register = store.batch();
+        register_tracked_contract(&snapshot, &mut register, profile(), &registration)
+            .expect("registration");
+        drop(snapshot);
+        store.commit(register).expect("registration commit");
+        let snapshot = store.snapshot().expect("lifecycle snapshot");
+        let lifecycle_revision =
+            tracked_contract_lifecycle_revision(&snapshot, profile(), registration.id)
+                .expect("lifecycle read")
+                .expect("lifecycle revision");
+        drop(snapshot);
+
+        let funding_transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 50,
+                address: registration.funding_address().expect("funding address"),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: 0,
+        };
+        let funding_block = block(vec![funding_transaction]);
+        let snapshot = store.snapshot().expect("connect snapshot");
+        let mut connect = store.batch();
+        stage_connect(&snapshot, &mut connect, &funding_block, 42, profile())
+            .expect("funding connect");
+        drop(snapshot);
+        store.commit(connect).expect("funding commit");
+
+        let snapshot = store.snapshot().expect("disconnect snapshot");
+        let mut disconnect = store.batch();
+        stage_disconnect(
+            &snapshot,
+            &mut disconnect,
+            &funding_block,
+            &undo(&funding_block, 42, Vec::new()),
+            profile(),
+        )
+        .expect("funding disconnect");
+        drop(snapshot);
+        store.commit(disconnect).expect("disconnect commit");
+
+        let snapshot = store.snapshot().expect("reorged snapshot");
+        assert!(
+            tracked_contract_fundings(&snapshot, profile(), registration.id, None, 1)
+                .expect("funding page")
+                .entries
+                .is_empty()
+        );
+        assert!(
+            tracked_contract_events(&snapshot, profile(), registration.id, None, 1)
+                .expect("event page")
+                .entries
+                .is_empty()
+        );
+        assert_eq!(
+            load_observation(&snapshot, registration.id)
+                .expect("observation read")
+                .expect("observation")
+                .state,
+            ContractObservationState::Confirmed
+        );
+        let mut retire = store.batch();
+        assert!(matches!(
+            retire_never_confirmed_tracked_contract(
+                &snapshot,
+                &mut retire,
+                profile(),
+                &registration,
+                lifecycle_revision,
+            ),
+            Err(IndexError::ContractConfirmed)
+        ));
+        drop(snapshot);
+
+        let legacy = htlc([0x33; 32]);
+        let snapshot = store.snapshot().expect("legacy registration snapshot");
+        let mut register = store.batch();
+        register_tracked_contract(&snapshot, &mut register, profile(), &legacy)
+            .expect("legacy registration");
+        drop(snapshot);
+        store.commit(register).expect("legacy registration commit");
+        let mut erase_state = store.batch();
+        erase_state
+            .delete(ColumnFamily::TxIndex, &observation_key(legacy.id))
+            .expect("stage legacy state removal");
+        store
+            .commit(erase_state)
+            .expect("legacy state removal commit");
+
+        let snapshot = store.snapshot().expect("legacy snapshot");
+        validate_tracked_contract_registry(&snapshot, profile())
+            .expect("legacy registry remains readable");
+        let mut retire = store.batch();
+        assert!(matches!(
+            retire_never_confirmed_tracked_contract(&snapshot, &mut retire, profile(), &legacy, 0,),
+            Err(IndexError::ContractConfirmationUnknown)
+        ));
+        let mut migrate = store.batch();
+        assert_eq!(
+            register_tracked_contract(&snapshot, &mut migrate, profile(), &legacy)
+                .expect("legacy idempotent registration"),
+            ContractRegistrationOutcome::AlreadyRegistered
+        );
+        drop(snapshot);
+        store.commit(migrate).expect("legacy marker commit");
+        let snapshot = store.snapshot().expect("marked legacy snapshot");
+        assert_eq!(
+            load_observation(&snapshot, legacy.id)
+                .expect("legacy observation read")
+                .expect("legacy observation")
+                .state,
+            ContractObservationState::LegacyUnknown
+        );
     }
 
     #[test]

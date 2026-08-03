@@ -110,22 +110,47 @@ point reads for pre-block input coins. Intra-block outputs use a bounded
 block-local map. Query pages are capped at 4,096 entries and 16 MiB of combined
 key/value data.
 
-The public contract registry is capped at 16,384 entries. Each funding output
+The active public contract registry is capped at 16,384 entries. Each funding output
 and input adds constant-count address/registration/funding point reads; block
 connection never scans the registry. Contract funding and event pages share the
 4,096-entry/16-MiB limits. Startup walks the bounded registration and address
 topology, verifies the checksummed count and every reverse binding, and fails
 closed on missing, duplicate, or malformed state.
 
-The registry is append-only in this schema. There is no unregister, tombstone,
-retirement proof, or qualified capacity-reclamation path, so the 16,384 global
-cap and 256-per-address cap are lifetime limits for a data directory. Exhausting
-either cap prevents new registrations even after every related funding is spent.
-A new data directory and trusted replay is the only currently qualified reset;
-manual key deletion is corruption, not reclamation. Until authenticated safe
-retirement and its restart/reorg lifecycle are implemented and qualified, this
-is an explicit production-availability blocker. Operators must not expose
-untrusted registration and must enforce tighter caller quotas below both caps.
+Each new registration atomically creates a checksummed monotonic confirmation
+record with a retained lifecycle revision that changes on exact re-registration
+through the serialized node writer. The first matching confirmed funding marks it confirmed in the same
+canonical block batch, including a funding spent later in that block; disconnect
+never clears the mark. `retire_never_confirmed_tracked_contract` can therefore remove an
+exact `NeverConfirmed` registration, its address membership, confirmation row, and
+active count in one batch. It also requires the caller-observed lifecycle
+revision and empty funding/event prefixes. The
+typed backend requires the bound publication to retain no transaction orphans,
+scans its exact immutable accepted ordinary transactions and airdrop outputs for
+matching funding, and commits through the exact canonical-writer epoch. A
+target-lifecycle, chain, or current-mempool change after the caller context
+rejects the request; any canonical-writer mutation after the internal stable
+proof rejects the compare-and-commit. This safely reclaims both the 16,384-entry
+active cap and the 256-active-descriptors-per-address cap for mistaken or
+abandoned registrations.
+
+The mempool proof establishes only that the currently bound accepted ordinary
+and airdrop generation has no matching funding and retains no transaction
+orphans. It cannot prove that an earlier evicted transaction was never broadcast
+or will never be rebroadcast. Calling retirement is therefore an explicit
+abandonment decision: the wallet must durably cancel every related broadcast/
+rebroadcast intent and accept that a later matching confirmation will not be
+tracked under the removed descriptor.
+
+Existing registrations that predate the monotonic record are marked
+`LegacyUnknown` on an idempotent registration write and fail closed for this
+retirement. Registrations ever confirmed on any connected branch also remain
+ineligible even after disconnect removes all current events. Completed or used
+contracts still have no reorg-aware retirement/tombstone lifecycle because
+disconnect discovers historical reversals through the live descriptor binding.
+Their capacity remains unreclaimable, so completed-contract lifecycle and
+untrusted-registration quotas remain explicit production-availability work.
+Manual key deletion is corruption, not reclamation.
 
 ## Pruning
 
@@ -197,6 +222,8 @@ and the live peer manager. It implements:
 - `get_spending_transaction`
 - `get_outpoint_spending_evidence`
 - `register_tracked_contract`
+- `get_tracked_contract_retirement_context`
+- `retire_never_confirmed_tracked_contract`
 - `get_tracked_contract`
 - `get_tracked_contract_fundings`
 - `get_tracked_contract_events`
@@ -359,6 +386,13 @@ Mempool overlays are not durable truth: after restart, the wallet reconciles its
 persisted workflow and rebroadcast journal against the node's newly admitted
 mempool and durable confirmed events.
 
+Never-confirmed registration retirement is intentionally an in-process typed-
+backend operation, not a wallet RPC v1 method. A preparation read returns the
+complete public registration, exact lifecycle revision, chain epoch,
+authenticated tip, mempool-instance nonce, and generation. The backend scans the complete hard-bounded accepted
+mempool once on a collection worker, fails on the first matching funding, and
+uses the internally captured exact writer sequence for compare-and-commit.
+
 ## Shakedex and HNS HTLC tracking
 
 Supported immutable registrations are deliberately narrow:
@@ -406,9 +440,10 @@ still keep it out of logs.
 This source implementation now has a bounded authenticated process transport,
 but still needs the repository's full qualification gate and an independent
 cross-repository wallet adapter implementation/qualification, including the
-canonical `hns-swap` pin described above, before it is release-qualified. Safe immutable
-registry retirement and capacity reclamation are also unavailable and remain a
-production-availability blocker. Live subscription delivery remains outside
+canonical `hns-swap` pin described above, before it is release-qualified.
+Completed-contract retirement and capacity reclamation remain unavailable and
+are a production-availability blocker; only never-confirmed, explicitly
+abandoned active slots can currently be reclaimed. Live subscription delivery remains outside
 this typed pull API. Durable encrypted workflow state, rebroadcast journals,
 matching decisions, transaction construction/signing, and secret preimages
 remain wallet responsibilities.

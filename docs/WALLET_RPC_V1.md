@@ -245,10 +245,16 @@ registration or preimage transport requires a published canonical protocol
 revision, an explicit wire-version change, threat review, and cross-repository
 qualification.
 
-The append-only 16,384-entry registry and 256-descriptors-per-address cap have
-no authenticated retirement/reclamation lifecycle. Capacity exhaustion remains
-a production-availability blocker even though untrusted registration is absent
-from this endpoint.
+Wallet RPC v1 exposes neither registration nor retirement. The in-process typed
+backend can reclaim the 16,384-active-entry and 256-active-descriptors-per-address
+capacity only for registrations whose monotonic durable state proves they were
+never confirmed, after binding its exact lifecycle revision, requiring no
+retained transaction orphans, and scanning the exact current accepted ordinary/
+airdrop generation. The in-process caller must also abandon prior broadcasts
+that the node can no longer observe. Used/completed and
+legacy-unknown registrations remain non-retirable, so capacity exhaustion is
+still a production-availability blocker even though untrusted registration is
+absent from this endpoint.
 
 ## Resource and authority boundaries
 
