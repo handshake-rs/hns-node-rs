@@ -35,7 +35,10 @@ use crate::{
     hnsr::{
         is_hnsr_packet_type, peer_id_from_hnsr, HnsrCoordinator, HnsrIncoming, HnsrPeerAdmission,
     },
-    odoh::{is_odoh_packet_type, OdohFailureReason, OdohPeerProvenance, OdohRequesterRuntime},
+    odoh::{
+        is_odoh_packet_type, OdohFailureReason, OdohPeerProvenance, OdohProxyAdmission,
+        OdohRequesterRuntime,
+    },
     wire::{
         AsyncFrameReader, AsyncFrameWriter, Frame, NetworkMagic, Packet, PacketType, VersionPacket,
     },
@@ -1441,10 +1444,12 @@ where
                 continue;
             };
             odoh.lock().await.receive(
-                odoh_provenance,
-                remote_services,
-                wire_profile,
-                negotiated,
+                OdohProxyAdmission {
+                    provenance: odoh_provenance,
+                    remote_services,
+                    wire_profile,
+                    negotiated,
+                },
                 &frame.payload,
                 unix_time(),
                 Instant::now(),

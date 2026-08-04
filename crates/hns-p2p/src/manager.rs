@@ -107,8 +107,10 @@ impl LivePeerConfig {
             }
             Network::Regtest | Network::Simnet => PeerTransport::Plaintext,
         };
-        let mut odoh = OdohRequesterConfig::default();
-        odoh.allow_private_targets = matches!(network, Network::Regtest | Network::Simnet);
+        let odoh = OdohRequesterConfig {
+            allow_private_targets: matches!(network, Network::Regtest | Network::Simnet),
+            ..OdohRequesterConfig::default()
+        };
         Self {
             network,
             transport,

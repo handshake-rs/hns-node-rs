@@ -23,8 +23,8 @@ use hns_odoh_protocol::{
 use hns_p2p_experimental::{
     ExperimentalWireProfile, NegotiatedRegistry, Network as ExperimentalNetwork,
     DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT, DENUO_V1_REGISTRY_PROTOCOL_VERSION,
-    DENUO_V1_REGISTRY_VERSION, DENUO_V1_WIRE_PROFILE, DENUO_V2_REGISTRY_FINGERPRINT, ODOH_PACKET,
-    ODOH_SERVICE, REGISTRY_NEGOTIATION_PROTOCOL_ID,
+    DENUO_V1_REGISTRY_VERSION, DENUO_V1_WIRE_PROFILE, ODOH_PACKET, ODOH_SERVICE,
+    REGISTRY_NEGOTIATION_PROTOCOL_ID,
 };
 use hns_primitives::blake2b_256_many;
 use serde::{Deserialize, Serialize};
@@ -858,7 +858,7 @@ impl TargetCache {
 
 enum PendingKind {
     Query {
-        context: QueryContext,
+        context: Box<QueryContext>,
         target: AuthenticatedPeerKey,
         target_expiry: u64,
     },
@@ -1148,7 +1148,7 @@ impl OdohRequesterRuntime {
             OdohOpcode::ClientQuery,
             body,
             PendingKind::Query {
-                context,
+                context: Box::new(context),
                 target: target_key,
                 target_expiry: target.expires_at,
             },
@@ -1286,25 +1286,17 @@ impl OdohRequesterRuntime {
 
     pub(crate) fn receive(
         &mut self,
-        provenance: OdohPeerProvenance,
-        remote_services: u64,
-        wire_profile: ExperimentalWireProfile,
-        negotiated: NegotiatedRegistry,
+        admission: OdohProxyAdmission,
         payload: &[u8],
         now_unix: u64,
         now: Instant,
     ) {
+        let provenance = admission.provenance;
         self.expire(now);
         if self.cache.advance_time_and_prune(now_unix).is_err() {
             self.fault_peer(provenance.peer, OdohFailureReason::TrustedTimeRollback);
             return;
         }
-        let admission = OdohProxyAdmission {
-            provenance,
-            remote_services,
-            wire_profile,
-            negotiated,
-        };
         if let Err(reason) = self.ensure_proxy(&admission) {
             self.fault_peer(provenance.peer, reason);
             return;
@@ -1620,6 +1612,7 @@ impl<'input> CacheDecoder<'input> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hns_p2p_experimental::DENUO_V2_REGISTRY_FINGERPRINT;
 
     const TEST_MAGIC: u32 = 0xae38_95cf;
     const TEST_GENESIS: [u8; 32] = [0x42; 32];
