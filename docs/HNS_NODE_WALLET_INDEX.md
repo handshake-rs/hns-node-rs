@@ -481,9 +481,13 @@ This source implementation now has a bounded authenticated process transport,
 but still needs the repository's full qualification gate and an independent
 cross-repository wallet adapter implementation/qualification, including the
 canonical `hns-swap` pin described above, before it is release-qualified.
-Completed-contract active-slot reclamation is implemented in source but has
-not run its focused, restart/reorg, RocksDB, adversarial, or full qualification
-gates in this tranche. Its finite 65,536 tombstone quota and permanent-
+Completed-contract active-slot reclamation passed its four focused
+`production_next_` wallet-index tests at exact local revision
+`fd0c9b00114e3fa0a293972de7d4538dcd959ce0`; the test filter covered bounded
+retirement/reopen/idempotence/preimage evidence, startup rollback authority,
+reused-outpoint corruption, and the profile-version downgrade fence. It has
+not run a RocksDB reopen, live restart/reorg, adversarial topology, or full
+qualification gate. Its finite 65,536 tombstone quota and permanent-
 abandonment semantics are still production-availability constraints, so
 untrusted registration remains unavailable. Live subscription delivery remains outside
 this typed pull API. Durable encrypted workflow state, rebroadcast journals,

@@ -18,11 +18,14 @@ committed fixture tests, `scripts/check.sh`, and
 `scripts/qualify-two-node-regtest.sh` run directly from this standalone
 repository.
 
-The completed-contract retirement tranche adds focused tests prefixed
-`production_next_`, but no Cargo test, build, RocksDB reopen, or full gate was
-run while authoring this source commit. The cases are committed qualification
-inputs, not a passed result; release evidence must execute them on the final
-integrated commit with the repository's required prebuilt RocksDB linkage.
+At exact local revision `fd0c9b00114e3fa0a293972de7d4538dcd959ce0`, one
+focused NVMe command ran with `--locked --offline`, `ROCKSDB_COMPILE=0`, and
+the existing prebuilt RocksDB 10.4.2 archive:
+`cargo test -p hns-wallet-index -p hns-node production_next --
+--test-threads=1`. All four matching completed-retirement tests passed with
+zero failures and 15 wallet-index tests filtered; no hns-node test matched the
+filter, although the package compiled. This is not a RocksDB reopen, regtest,
+adversarial, performance, or full repository-gate result.
 
 ## Current standalone gate
 

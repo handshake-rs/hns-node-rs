@@ -202,10 +202,13 @@ but only after their bounded exact event history lies below the irreversible
 undo frontier and the caller permanently abandons descriptor reuse. The
 tombstone retains terminal/preimage evidence and a commitment over deleted
 rows while reclaiming active slots. Legacy-unknown records remain
-non-retirable. The completed path has not run its focused or full qualification
-gates, its immutable tombstone registry has a finite 65,536-entry lifetime cap,
-and later matching outputs are deliberately untracked; untrusted registration
-therefore remains unavailable and production availability remains blocked.
+non-retirable. The completed path passed four focused wallet-index tests at
+exact local revision `fd0c9b00114e3fa0a293972de7d4538dcd959ce0`, but has not
+run a RocksDB reopen, live restart/reorg, adversarial topology, performance
+measurement, or the full qualification gate. Its immutable tombstone registry
+has a finite 65,536-entry lifetime cap, and later matching outputs are
+deliberately untracked; untrusted registration therefore remains unavailable
+and production availability remains blocked.
 Live marketplace wire
 advertisement separately awaits the
 published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
