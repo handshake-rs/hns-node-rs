@@ -2128,9 +2128,11 @@ pub(crate) fn rpc_hnsr_info(status: &HnsrCoordinatorStatus) -> RpcHnsrInfo {
 }
 
 fn rpc_inactive_odoh_info(network: Network, requester_enabled: bool) -> RpcOdohInfo {
-    let mut config = OdohRequesterConfig::default();
-    config.enabled = requester_enabled;
-    config.allow_private_targets = matches!(network, Network::Regtest | Network::Simnet);
+    let config = OdohRequesterConfig {
+        enabled: requester_enabled,
+        allow_private_targets: matches!(network, Network::Regtest | Network::Simnet),
+        ..OdohRequesterConfig::default()
+    };
     let now = current_unix_time().unwrap_or_default();
     let mut runtime =
         OdohRequesterRuntime::new(OdohNetworkBinding::for_network(network), config, 1, now)

@@ -2597,7 +2597,7 @@ fn validate_name_action_owner<S: ReadSnapshot>(
     state: &NameState,
     owner: &NameOwnerTransaction,
 ) -> Result<(), WalletBackendError> {
-    if &owner.name_state != state || &owner.owner != &state.owner {
+    if &owner.name_state != state || owner.owner != state.owner {
         return Err(WalletBackendError::Corrupt(
             "name action owner disagrees with current name state",
         ));
@@ -2622,11 +2622,11 @@ fn validate_name_action_owner<S: ReadSnapshot>(
         ))?;
     let coin = decode_coin(&raw)
         .map_err(|_| WalletBackendError::Corrupt("current name owner UTXO cannot be decoded"))?;
-    if &coin.outpoint != &owner.owner
+    if coin.outpoint != owner.owner
         || coin.height != owner.inclusion.height
         || coin.value != owner.owner_output.value
-        || &coin.address != &owner.owner_output.address
-        || &coin.covenant != &owner.owner_output.covenant
+        || coin.address != owner.owner_output.address
+        || coin.covenant != owner.owner_output.covenant
     {
         return Err(WalletBackendError::Corrupt(
             "current name owner transaction and active UTXO disagree",
