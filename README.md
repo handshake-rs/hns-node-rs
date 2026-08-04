@@ -32,11 +32,14 @@ an exact fully spent lifecycle can become an immutable tombstone only after
 every confirmed event is below the store's irreversible undo-pruning frontier.
 The tombstone retains the complete descriptor, terminal spend and revealed
 preimages, min/max heights, and an ordered event commitment while reclaiming
-active global/per-address slots. This path has not yet run its focused or full
-qualification gates. Tombstones have a separate finite lifetime cap, later
-matching funding is deliberately untracked after explicit permanent
-abandonment, and registration remains absent from untrusted wallet RPC. The
-repository also awaits its independent wallet adapter,
+active global/per-address slots. At exact local revision
+`fd0c9b00114e3fa0a293972de7d4538dcd959ce0`, this path passed all four matching
+focused `production_next_` wallet-index tests with zero failures. It has not run
+a RocksDB reopen, live restart/reorg, adversarial topology, performance
+measurement, or the full qualification gate. Tombstones have a separate finite
+lifetime cap; later matching funding is deliberately untracked after explicit
+permanent abandonment, and registration remains absent from untrusted wallet
+RPC. The repository also awaits its independent wallet adapter,
 canonical `hns-swap` pin, and cross-project qualification. See the
 [wallet-index status](docs/HNS_NODE_WALLET_INDEX.md) and
 [wire contract](docs/WALLET_RPC_V1.md).

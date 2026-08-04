@@ -214,11 +214,14 @@ advertisement separately awaits the
 published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
 adapter gate.
 
-The prior local evidence is intentionally narrow: the NVMe
-`hns-consensus` `wallet_name_action` filter passed 2 tests with 0 failures and
-75 filtered. The completed-retirement source commit has no executed test or
-build result. No `hns-node` target, RocksDB target, full gate, network, restart,
-reorg, or resource qualification ran for it.
+The local evidence is intentionally narrow: the NVMe `hns-consensus`
+`wallet_name_action` filter passed 2 tests with 0 failures and 75 filtered. At
+exact local revision `fd0c9b00114e3fa0a293972de7d4538dcd959ce0`, the separate
+`production_next_` filter passed all four matching completed-retirement/profile
+wallet-index tests with zero failures and 15 filtered; no `hns-node` test
+matched the filter. No RocksDB reopen, full gate, network, live restart/reorg,
+adversarial topology, performance, or resource qualification ran for this
+tranche.
 
 Fee-quote source tests and documentation are present but were not executed in
 the source-only tranche that introduced the method. A quote is exact only for
