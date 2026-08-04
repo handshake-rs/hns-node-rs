@@ -7,8 +7,8 @@ use hns_consensus::Network;
 use hns_dns_relay_protocol::{
     MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE, MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
 };
-use hns_odoh_protocol::MAX_ODOH_PACKET_SIZE;
 use hns_hnsr_protocol::{HNSR_PACKET_TYPE, MAX_PACKET_SIZE as MAX_HNSR_PACKET_SIZE};
+use hns_odoh_protocol::MAX_ODOH_PACKET_SIZE;
 use hns_p2p_experimental::{DNS_RELAY_REQUEST_PACKET, DNS_RELAY_RESPONSE_PACKET, ODOH_PACKET};
 use hns_primitives::{
     blake2b_256_many, AirdropProof, Block, BlockHash, Claim, Header, Reader, Transaction, Txid,
@@ -2006,10 +2006,7 @@ mod tests {
                 PacketType::Unknown(ODOH_PACKET.value()),
                 MAX_ODOH_PACKET_SIZE,
             ),
-            (
-                PacketType::Unknown(HNSR_PACKET_TYPE),
-                MAX_HNSR_PACKET_SIZE,
-            ),
+            (PacketType::Unknown(HNSR_PACKET_TYPE), MAX_HNSR_PACKET_SIZE),
             (
                 PacketType::Unknown(0xef),
                 MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE + 1,

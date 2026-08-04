@@ -16,24 +16,21 @@ use std::{
 
 pub use hns_odoh_protocol::DirectTargetLocator;
 use hns_odoh_protocol::{
-    ClientQuery, GetConfigBody, MAX_ODOH_CONFIG_SIZE,
-    MAX_ODOH_PACKET_SIZE, MAX_ODOH_QUERY_SIZE, MAX_OUTER_PADDING_SIZE, OdnsPacket,
-    OdohConfig, OdohConfigBody, OdohErrorBody, OdohOpcode, OdohProtocolError,
-    OdohResponseBody, QueryContext, TargetConfigRecord, seal_query,
+    seal_query, ClientQuery, GetConfigBody, OdnsPacket, OdohConfig, OdohConfigBody, OdohErrorBody,
+    OdohOpcode, OdohProtocolError, OdohResponseBody, QueryContext, TargetConfigRecord,
+    MAX_ODOH_CONFIG_SIZE, MAX_ODOH_PACKET_SIZE, MAX_ODOH_QUERY_SIZE, MAX_OUTER_PADDING_SIZE,
 };
 use hns_p2p_experimental::{
-    DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT,
-    DENUO_V1_REGISTRY_PROTOCOL_VERSION, DENUO_V1_REGISTRY_VERSION, DENUO_V1_WIRE_PROFILE,
-    DENUO_V2_REGISTRY_FINGERPRINT, ExperimentalWireProfile, NegotiatedRegistry,
-    Network as ExperimentalNetwork, ODOH_PACKET, ODOH_SERVICE, REGISTRY_NEGOTIATION_PROTOCOL_ID,
+    ExperimentalWireProfile, NegotiatedRegistry, Network as ExperimentalNetwork,
+    DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT, DENUO_V1_REGISTRY_PROTOCOL_VERSION,
+    DENUO_V1_REGISTRY_VERSION, DENUO_V1_WIRE_PROFILE, DENUO_V2_REGISTRY_FINGERPRINT, ODOH_PACKET,
+    ODOH_SERVICE, REGISTRY_NEGOTIATION_PROTOCOL_ID,
 };
 use hns_primitives::blake2b_256_many;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, time::Instant};
 
-use crate::{
-    AuthenticatedPeerKey, Packet, PacketType, PeerDirection, PeerId, PeerTransportKind,
-};
+use crate::{AuthenticatedPeerKey, Packet, PacketType, PeerDirection, PeerId, PeerTransportKind};
 
 pub const fn is_odoh_packet_type(packet_type: PacketType) -> bool {
     matches!(packet_type, PacketType::Unknown(value) if value == ODOH_PACKET.value())
@@ -103,29 +100,33 @@ pub enum OdohFailureReason {
 
 impl fmt::Display for OdohFailureReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", match self {
-            Self::RequesterDisabled => "requester-disabled",
-            Self::UnauthenticatedProxy => "unauthenticated-proxy",
-            Self::RemoteServiceNotAdvertised => "remote-service-not-advertised",
-            Self::RegistryNotNegotiated => "registry-not-negotiated",
-            Self::ProxyTargetCollision => "proxy-target-collision",
-            Self::TargetUnavailable => "target-unavailable",
-            Self::TargetExpired => "target-expired",
-            Self::CapacityExceeded => "capacity-exceeded",
-            Self::RequestTooLarge => "request-too-large",
-            Self::PacketTooLarge => "packet-too-large",
-            Self::InvalidLocalRequest => "invalid-local-request",
-            Self::MalformedResponse => "malformed-response",
-            Self::UnexpectedOpcode => "unexpected-opcode",
-            Self::UncorrelatedResponse => "uncorrelated-response",
-            Self::WrongProxy => "wrong-proxy",
-            Self::DeadlineExpired => "deadline-expired",
-            Self::StaleGeneration => "stale-generation",
-            Self::Revoked => "revoked",
-            Self::Disconnected => "disconnected",
-            Self::LocalSendUnavailable => "local-send-unavailable",
-            Self::TrustedTimeRollback => "trusted-time-rollback",
-        })
+        write!(
+            formatter,
+            "{}",
+            match self {
+                Self::RequesterDisabled => "requester-disabled",
+                Self::UnauthenticatedProxy => "unauthenticated-proxy",
+                Self::RemoteServiceNotAdvertised => "remote-service-not-advertised",
+                Self::RegistryNotNegotiated => "registry-not-negotiated",
+                Self::ProxyTargetCollision => "proxy-target-collision",
+                Self::TargetUnavailable => "target-unavailable",
+                Self::TargetExpired => "target-expired",
+                Self::CapacityExceeded => "capacity-exceeded",
+                Self::RequestTooLarge => "request-too-large",
+                Self::PacketTooLarge => "packet-too-large",
+                Self::InvalidLocalRequest => "invalid-local-request",
+                Self::MalformedResponse => "malformed-response",
+                Self::UnexpectedOpcode => "unexpected-opcode",
+                Self::UncorrelatedResponse => "uncorrelated-response",
+                Self::WrongProxy => "wrong-proxy",
+                Self::DeadlineExpired => "deadline-expired",
+                Self::StaleGeneration => "stale-generation",
+                Self::Revoked => "revoked",
+                Self::Disconnected => "disconnected",
+                Self::LocalSendUnavailable => "local-send-unavailable",
+                Self::TrustedTimeRollback => "trusted-time-rollback",
+            }
+        )
     }
 }
 
@@ -223,7 +224,9 @@ pub struct OdohPendingRequest {
 
 impl OdohPendingRequest {
     pub async fn outcome(self) -> OdohRequestOutcome {
-        self.outcome.await.unwrap_or(OdohRequestOutcome::Disconnected)
+        self.outcome
+            .await
+            .unwrap_or(OdohRequestOutcome::Disconnected)
     }
 }
 
@@ -633,7 +636,10 @@ impl TargetCache {
     }
 
     fn current_count(&self) -> usize {
-        self.slots.values().filter(|slot| slot.current.is_some()).count()
+        self.slots
+            .values()
+            .filter(|slot| slot.current.is_some())
+            .count()
     }
 
     fn earliest_expiry(&self) -> u64 {
@@ -667,8 +673,8 @@ impl TargetCache {
             if slot.locator.encode() != *locator_key {
                 return Err(OdohCacheError::InvalidLocator);
             }
-            let locator_length = u16::try_from(locator_key.len())
-                .map_err(|_| OdohCacheError::InvalidLocator)?;
+            let locator_length =
+                u16::try_from(locator_key.len()).map_err(|_| OdohCacheError::InvalidLocator)?;
             output.extend_from_slice(&locator_length.to_le_bytes());
             output.extend_from_slice(locator_key);
             output.extend_from_slice(&slot.highest_sequence.to_le_bytes());
@@ -684,7 +690,9 @@ impl TargetCache {
                 output.push(0);
             }
         }
-        if output.len().saturating_add(ODOH_TARGET_CACHE_CHECKSUM_BYTES)
+        if output
+            .len()
+            .saturating_add(ODOH_TARGET_CACHE_CHECKSUM_BYTES)
             > ODOH_MAXIMUM_TARGET_CACHE_BLOB_BYTES
         {
             return Err(OdohCacheError::InvalidSnapshot);
@@ -921,11 +929,7 @@ impl OdohRequesterRuntime {
             revoked: false,
             pending: BTreeMap::new(),
             faulted_proxies: BTreeSet::new(),
-            cache: TargetCache::empty(
-                binding.magic,
-                config.allow_private_targets,
-                trusted_now,
-            ),
+            cache: TargetCache::empty(binding.magic, config.allow_private_targets, trusted_now),
             process: OdohProcessTotals::default(),
         })
     }
@@ -939,13 +943,14 @@ impl OdohRequesterRuntime {
         now: u64,
     ) -> Result<Self, OdohCacheError> {
         let mut config = config.validate()?;
-        let (cache, persisted_policy_generation, persisted_enabled, revoked) = TargetCache::restore(
-            snapshot,
-            binding.magic,
-            config.allow_private_targets,
-            now,
-            minimum,
-        )?;
+        let (cache, persisted_policy_generation, persisted_enabled, revoked) =
+            TargetCache::restore(
+                snapshot,
+                binding.magic,
+                config.allow_private_targets,
+                now,
+                minimum,
+            )?;
         let mut generation = persisted_policy_generation;
         let persisted_generation = persisted_policy_generation;
         config.enabled = config.enabled && persisted_enabled;
@@ -1005,10 +1010,8 @@ impl OdohRequesterRuntime {
             && floor.policy_generation <= self.generation
             && floor.trusted_time_high_water <= self.cache.trusted_time_high_water
         {
-            self.cache.persisted_generation = self
-                .cache
-                .persisted_generation
-                .max(floor.cache_generation);
+            self.cache.persisted_generation =
+                self.cache.persisted_generation.max(floor.cache_generation);
             self.persisted_policy_generation = self
                 .persisted_policy_generation
                 .max(floor.policy_generation);
@@ -1129,8 +1132,8 @@ impl OdohRequesterRuntime {
         if query.is_empty() || query.len() > MAX_ODOH_QUERY_SIZE {
             return Err(OdohFailureReason::RequestTooLarge);
         }
-        let (message, context) =
-            seal_query(&target.configuration, &query).map_err(|_| OdohFailureReason::InvalidLocalRequest)?;
+        let (message, context) = seal_query(&target.configuration, &query)
+            .map_err(|_| OdohFailureReason::InvalidLocalRequest)?;
         let body = encode_padded_client_query(
             ClientQuery {
                 locator: target.locator,
@@ -1165,11 +1168,9 @@ impl OdohRequesterRuntime {
             .advance_time_and_prune(now_unix)
             .map_err(|_| OdohFailureReason::TrustedTimeRollback)?;
         self.ensure_proxy(&proxy)?;
-        let locator = DirectTargetLocator::decode(
-            &locator.encode(),
-            self.config.allow_private_targets,
-        )
-        .map_err(|_| OdohFailureReason::InvalidLocalRequest)?;
+        let locator =
+            DirectTargetLocator::decode(&locator.encode(), self.config.allow_private_targets)
+                .map_err(|_| OdohFailureReason::InvalidLocalRequest)?;
         ensure_distinct_proxy_target(
             proxy.provenance,
             AuthenticatedPeerKey::new(locator.target_peer_key),
@@ -1203,8 +1204,7 @@ impl OdohRequesterRuntime {
         now: Instant,
     ) -> Result<PreparedOdohRequest, OdohFailureReason> {
         let negotiated_live = usize::from(proxy.negotiated.maximum_live_requests);
-        if self.pending.len()
-            >= usize::from(self.config.maximum_live_requests).min(negotiated_live)
+        if self.pending.len() >= usize::from(self.config.maximum_live_requests).min(negotiated_live)
         {
             return Err(OdohFailureReason::CapacityExceeded);
         }
@@ -1373,12 +1373,7 @@ impl OdohRequesterRuntime {
                 OdohOpcode::Config,
             ) => match OdohConfigBody::decode(&packet.body).and_then(|body| {
                 self.cache
-                    .install(
-                        locator,
-                        &body.record,
-                        configuration_index,
-                        now_unix,
-                    )
+                    .install(locator, &body.record, configuration_index, now_unix)
                     .map_err(|_| OdohProtocolError::Invalid("target cache rejected record"))
             }) {
                 Ok((changed, record_id, sequence, expires_at)) => {
@@ -1451,7 +1446,9 @@ impl OdohRequesterRuntime {
             .collect::<Vec<_>>();
         for request_id in requests {
             if let Some(pending) = self.pending.remove(&request_id) {
-                let _ = pending.completion.send(OdohRequestOutcome::Rejected(reason));
+                let _ = pending
+                    .completion
+                    .send(OdohRequestOutcome::Rejected(reason));
             }
         }
     }
@@ -1485,9 +1482,7 @@ impl OdohRequesterRuntime {
         {
             return Err(OdohFailureReason::RegistryNotNegotiated);
         }
-        if proxy.negotiated.maximum_send_size == 0
-            || proxy.negotiated.maximum_live_requests == 0
-        {
+        if proxy.negotiated.maximum_send_size == 0 || proxy.negotiated.maximum_live_requests == 0 {
             return Err(OdohFailureReason::RegistryNotNegotiated);
         }
         Ok(())
@@ -1671,9 +1666,9 @@ mod tests {
     fn locator() -> DirectTargetLocator {
         DirectTargetLocator::new(
             [
-                0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62,
-                0x95, 0xce, 0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28,
-                0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+                0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+                0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+                0x5b, 0x16, 0xf8, 0x17, 0x98,
             ],
             "127.0.0.1:14039".parse().expect("address"),
             true,
@@ -1718,33 +1713,15 @@ mod tests {
             Err(OdohCacheError::ChecksumMismatch)
         ));
         assert!(matches!(
-            TargetCache::restore(
-                &snapshot.bytes,
-                0x5b6e_f2d3,
-                true,
-                1_700_000_000,
-                floor,
-            ),
+            TargetCache::restore(&snapshot.bytes, 0x5b6e_f2d3, true, 1_700_000_000, floor,),
             Err(OdohCacheError::NetworkMismatch)
         ));
         assert!(matches!(
-            TargetCache::restore(
-                &snapshot.bytes,
-                TEST_MAGIC,
-                false,
-                1_700_000_000,
-                floor,
-            ),
+            TargetCache::restore(&snapshot.bytes, TEST_MAGIC, false, 1_700_000_000, floor,),
             Err(OdohCacheError::AddressPolicyMismatch)
         ));
         assert!(matches!(
-            TargetCache::restore(
-                &snapshot.bytes,
-                TEST_MAGIC,
-                true,
-                1_699_999_999,
-                floor,
-            ),
+            TargetCache::restore(&snapshot.bytes, TEST_MAGIC, true, 1_699_999_999, floor,),
             Err(OdohCacheError::TrustedTimeRollback)
         ));
         let newer_floor = OdohDurableFloor {

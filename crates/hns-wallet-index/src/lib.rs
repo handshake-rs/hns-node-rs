@@ -35,10 +35,10 @@ pub use swap::{
     CompletedContractRetirementOutcome, ContractId, ContractRegistration,
     ContractRegistrationOutcome, ContractRetirementOutcome, ContractRollbackBoundary,
     HnsHtlcDescriptor, RetiredRevealedPreimage, RevealedPreimage, ShakedexV2Descriptor,
-    TrackedContractCursor, TrackedContractEvent, TrackedContractEventPage,
-    TrackedContractFunding, TrackedContractFundingPage, TrackedContractKind,
-    TrackedContractSpendKind, MAX_RETIRED_TRACKED_CONTRACTS, MAX_TRACKED_CONTRACTS,
-    MAX_TRACKED_CONTRACTS_PER_ADDRESS, MAX_TRACKED_CONTRACT_RETIREMENT_EVENTS,
+    TrackedContractCursor, TrackedContractEvent, TrackedContractEventPage, TrackedContractFunding,
+    TrackedContractFundingPage, TrackedContractKind, TrackedContractSpendKind,
+    MAX_RETIRED_TRACKED_CONTRACTS, MAX_TRACKED_CONTRACTS, MAX_TRACKED_CONTRACTS_PER_ADDRESS,
+    MAX_TRACKED_CONTRACT_RETIREMENT_EVENTS,
 };
 
 /// Persistent profile key. Changing a non-empty chain's profile requires an

@@ -11,9 +11,8 @@ use std::{
 
 use hns_consensus::Network;
 use hns_p2p_experimental::{
-    DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT,
-    DENUO_V1_REGISTRY_PROTOCOL_VERSION, DENUO_V1_REGISTRY_VERSION,
-    ExperimentalWireProfile, HnsrPolicy, ODOH_PACKET, ODOH_SERVICE,
+    ExperimentalWireProfile, HnsrPolicy, DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT,
+    DENUO_V1_REGISTRY_PROTOCOL_VERSION, DENUO_V1_REGISTRY_VERSION, ODOH_PACKET, ODOH_SERVICE,
     REGISTRY_NEGOTIATION_PROTOCOL_ID,
 };
 use tokio::{
@@ -37,8 +36,8 @@ use crate::{
         HnsrRelayBackend, HnsrStateSnapshot,
     },
     odoh::{
-        DirectTargetLocator, OdohFailureReason, OdohPendingRequest, OdohPeerProvenance,
-        OdohDurableFloor, OdohNetworkBinding, OdohProxyAdmission, OdohRequesterConfig,
+        DirectTargetLocator, OdohDurableFloor, OdohFailureReason, OdohNetworkBinding,
+        OdohPeerProvenance, OdohPendingRequest, OdohProxyAdmission, OdohRequesterConfig,
         OdohRequesterRuntime, OdohRequesterStatus, OdohTargetCacheSnapshot,
     },
     runtime::{
@@ -186,8 +185,7 @@ impl LivePeerConfig {
         }
         if self.hnsr_state.is_some() != self.hnsr_durable_floor.is_some() {
             return Err(P2pError::Configuration(
-                "HNSR runtime state and durable floor must be restored as an exact pair"
-                    .to_owned(),
+                "HNSR runtime state and durable floor must be restored as an exact pair".to_owned(),
             ));
         }
         if self.hnsr_relay_address.is_some()
@@ -267,7 +265,7 @@ impl LivePeerManager {
             config.odoh_target_cache.as_deref(),
             config.odoh_durable_floor.as_deref(),
         ) {
-            (Some(snapshot), Some(encoded_floor)) =>
+            (Some(snapshot), Some(encoded_floor)) => {
                 OdohDurableFloor::decode(encoded_floor, binding.magic).and_then(|floor| {
                     OdohRequesterRuntime::restore(
                         binding,
@@ -277,18 +275,16 @@ impl LivePeerManager {
                         floor,
                         trusted_now,
                     )
-                }),
-            (None, None) => OdohRequesterRuntime::new(
-                binding,
-                config.odoh,
-                first_odoh_request_id,
-                trusted_now,
-            ),
+                })
+            }
+            (None, None) => {
+                OdohRequesterRuntime::new(binding, config.odoh, first_odoh_request_id, trusted_now)
+            }
             _ => Err(crate::OdohCacheError::InvalidDurableFloor),
         }
-        .map_err(|error| P2pError::Configuration(format!(
-            "ODoH requester initialization failed: {error}"
-        )))?;
+        .map_err(|error| {
+            P2pError::Configuration(format!("ODoH requester initialization failed: {error}"))
+        })?;
         let hnsr_config = hnsr_coordinator_config(&config);
         let hnsr = match (
             config.hnsr_state.as_deref(),
@@ -303,9 +299,9 @@ impl LivePeerManager {
             (None, None) => HnsrCoordinator::fresh(hnsr_config, trusted_now),
             _ => unreachable!("configuration validation requires an exact HNSR state pair"),
         }
-        .map_err(|error| P2pError::Configuration(format!(
-            "HNSR coordinator initialization failed: {error}"
-        )))?;
+        .map_err(|error| {
+            P2pError::Configuration(format!("HNSR coordinator initialization failed: {error}"))
+        })?;
         let initial_services = if hnsr.relay_service_advertised() {
             config.services | hns_hnsr_protocol::HNSR_RELAY_SERVICE
         } else {
@@ -701,9 +697,7 @@ impl LivePeerManager {
         let maximum_wait = exchange
             .deadline
             .saturating_duration_since(tokio::time::Instant::now());
-        if maximum_wait.is_zero()
-            || handle.send_critical(packet, maximum_wait).await.is_err()
-        {
+        if maximum_wait.is_zero() || handle.send_critical(packet, maximum_wait).await.is_err() {
             self.experimental.lock().await.cancel(
                 snapshot.id,
                 exchange.packet_type,
@@ -741,9 +735,9 @@ impl LivePeerManager {
             .lock()
             .await
             .install_target(locator, signed_record, configuration_index, unix_time())
-            .map_err(|error| P2pError::Configuration(format!(
-                "ODoH target record rejected: {error}"
-            )))
+            .map_err(|error| {
+                P2pError::Configuration(format!("ODoH target record rejected: {error}"))
+            })
     }
 
     /// Begin one HPKE-sealed query through a distinct authenticated proxy.
@@ -773,13 +767,9 @@ impl LivePeerManager {
                 peer: PeerId(0),
                 reason: OdohFailureReason::UnauthenticatedProxy,
             })?;
-        self.send_odoh_locked(
-            &mut runtime,
-            proxy,
-            |runtime, proxy, now| {
-                runtime.begin_query(proxy, target_record_id, query, now_unix, now)
-            },
-        )
+        self.send_odoh_locked(&mut runtime, proxy, |runtime, proxy, now| {
+            runtime.begin_query(proxy, target_record_id, query, now_unix, now)
+        })
         .await
     }
 
@@ -805,19 +795,9 @@ impl LivePeerManager {
                 peer: PeerId(0),
                 reason: OdohFailureReason::UnauthenticatedProxy,
             })?;
-        self.send_odoh_locked(
-            &mut runtime,
-            proxy,
-            |runtime, proxy, now| {
-                runtime.begin_configuration(
-                    proxy,
-                    locator,
-                    configuration_index,
-                    now_unix,
-                    now,
-                )
-            },
-        )
+        self.send_odoh_locked(&mut runtime, proxy, |runtime, proxy, now| {
+            runtime.begin_configuration(proxy, locator, configuration_index, now_unix, now)
+        })
         .await
     }
 
@@ -889,9 +869,7 @@ impl LivePeerManager {
             .lock()
             .await
             .target_cache_snapshot(now)
-            .map_err(|error| P2pError::State(format!(
-                "ODoH target-cache snapshot failed: {error}"
-            )))
+            .map_err(|error| P2pError::State(format!("ODoH target-cache snapshot failed: {error}")))
     }
 
     pub async fn acknowledge_odoh_target_cache_persisted(&self, floor: OdohDurableFloor) {
@@ -1027,10 +1005,7 @@ impl LivePeerManager {
         self.send_hnsr_route(route).await
     }
 
-    pub async fn take_hnsr_data(
-        &self,
-        circuit_id: [u8; 8],
-    ) -> Result<Vec<u8>, P2pError> {
+    pub async fn take_hnsr_data(&self, circuit_id: [u8; 8]) -> Result<Vec<u8>, P2pError> {
         let (bytes, window) = self
             .hnsr
             .lock()
@@ -1080,9 +1055,8 @@ impl LivePeerManager {
         &self,
         route: hns_hnsr_protocol::HnsrRoute,
     ) -> Result<(), P2pError> {
-        let peer = crate::peer_id_from_hnsr(&route.destination).map_err(|error| {
-            P2pError::State(format!("invalid HNSR route destination: {error}"))
-        })?;
+        let peer = crate::peer_id_from_hnsr(&route.destination)
+            .map_err(|error| P2pError::State(format!("invalid HNSR route destination: {error}")))?;
         let handle = self
             .peers
             .read()
@@ -1090,11 +1064,10 @@ impl LivePeerManager {
             .get(&peer)
             .cloned()
             .ok_or(P2pError::PeerUnavailable(peer))?;
-        let packet = crate::hnsr_packet(route.packet)
-            .map_err(|error| P2pError::Hnsr {
-                peer,
-                reason: error.to_string(),
-            })?;
+        let packet = crate::hnsr_packet(route.packet).map_err(|error| P2pError::Hnsr {
+            peer,
+            reason: error.to_string(),
+        })?;
         if let Err(error) = handle
             .send_critical(Arc::new(packet), self.config.critical_broadcast_timeout)
             .await
@@ -1116,9 +1089,7 @@ impl LivePeerManager {
             .lock()
             .await
             .acknowledge_relay_action(action_id, delivered)
-            .map_err(|error| P2pError::State(format!(
-                "HNSR relay acknowledgement failed: {error}"
-            )))
+            .map_err(|error| P2pError::State(format!("HNSR relay acknowledgement failed: {error}")))
     }
 
     pub async fn replace_hnsr_policy(
@@ -1138,19 +1109,14 @@ impl LivePeerManager {
         self.dispatch_hnsr_relay_routes(cleanup.relay_routes).await;
         let advertised = self.hnsr.lock().await.relay_service_advertised();
         let services = if advertised {
-            self.local_services.load(Ordering::Acquire)
-                | hns_hnsr_protocol::HNSR_RELAY_SERVICE
+            self.local_services.load(Ordering::Acquire) | hns_hnsr_protocol::HNSR_RELAY_SERVICE
         } else {
-            self.local_services.load(Ordering::Acquire)
-                & !hns_hnsr_protocol::HNSR_RELAY_SERVICE
+            self.local_services.load(Ordering::Acquire) & !hns_hnsr_protocol::HNSR_RELAY_SERVICE
         };
         Ok(self.apply_local_services(services).await)
     }
 
-    async fn dispatch_hnsr_relay_routes(
-        &self,
-        routes: Vec<hns_hnsr_protocol::QueuedHnsrRoute>,
-    ) {
+    async fn dispatch_hnsr_relay_routes(&self, routes: Vec<hns_hnsr_protocol::QueuedHnsrRoute>) {
         let mut routes = std::collections::VecDeque::from(routes);
         let mut dispatched = 0usize;
         while let Some(queued) = routes.pop_front() {

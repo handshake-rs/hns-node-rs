@@ -72,8 +72,7 @@ const HNS_HTLC_SIGHASH_ALL: u8 = 0x01;
 const HIP1_SELLER_FULFILLMENT_SIGHASH: u8 = 0x84;
 const HIP1_SELLER_RECOVERY_SIGHASH: u8 = 0x83;
 const CONTRACT_ID_DOMAIN: &[u8] = b"hns-wallet-index/contract-id";
-const RETIRED_EVENT_COMMITMENT_DOMAIN: &[u8] =
-    b"hns-wallet-index/completed-retirement-events-v1";
+const RETIRED_EVENT_COMMITMENT_DOMAIN: &[u8] = b"hns-wallet-index/completed-retirement-events-v1";
 const CONTRACT_ID_ENCODING_VERSION: u8 = 1;
 const SHAKEDEX_V2_CONTRACT_TAG: u8 = 1;
 const HNS_HTLC_V1_CONTRACT_TAG: u8 = 2;
@@ -1351,9 +1350,7 @@ pub fn validate_completed_tracked_contract_retirements<
         .map(decode_retirement_count)
         .transpose()?
         .unwrap_or(0);
-    if expected > MAX_RETIRED_TRACKED_CONTRACTS
-        || (expected == 0 && expected_raw.is_some())
-    {
+    if expected > MAX_RETIRED_TRACKED_CONTRACTS || (expected == 0 && expected_raw.is_some()) {
         return Err(IndexError::Corrupt(
             "tracked contract retirement count exceeds schema bound",
         ));
@@ -2040,7 +2037,10 @@ fn analyze_completed_history<S: ReadSnapshot>(
             },
         )?;
         for (key, raw) in &page.entries {
-            if previous_key.as_ref().is_some_and(|previous| previous >= key) {
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| previous >= key)
+            {
                 return Err(IndexError::Corrupt(
                     "tracked contract retirement event order did not advance",
                 ));
@@ -2052,8 +2052,7 @@ fn analyze_completed_history<S: ReadSnapshot>(
             if next_count > MAX_TRACKED_CONTRACT_RETIREMENT_EVENTS {
                 return Err(IndexError::ContractRetirementHistoryCapacity);
             }
-            let stored: StoredTrackedContractEvent =
-                decode_record(b"contract-event-v1", key, raw)?;
+            let stored: StoredTrackedContractEvent = decode_record(b"contract-event-v1", key, raw)?;
             let event: TrackedContractEvent = stored.clone().into();
             if event.contract_id() != registration.id || event.key() != *key {
                 return Err(IndexError::Corrupt(
@@ -2064,12 +2063,10 @@ fn analyze_completed_history<S: ReadSnapshot>(
                 TrackedContractEvent::Funding(funding) => funding.height,
                 TrackedContractEvent::Spend { height, .. } => *height,
             };
-            minimum_event_height = Some(
-                minimum_event_height.map_or(height, |minimum| minimum.min(height)),
-            );
-            maximum_event_height = Some(
-                maximum_event_height.map_or(height, |maximum| maximum.max(height)),
-            );
+            minimum_event_height =
+                Some(minimum_event_height.map_or(height, |minimum| minimum.min(height)));
+            maximum_event_height =
+                Some(maximum_event_height.map_or(height, |maximum| maximum.max(height)));
 
             match &event {
                 TrackedContractEvent::Funding(funding) => {
@@ -2216,9 +2213,8 @@ fn validate_stored_completed_retirement<S: ReadSnapshot>(
         || retirement.minimum_event_height > retirement.maximum_event_height
         || retirement.maximum_event_height > retirement.rollback_boundary.pruned_through
         || retirement.ordered_event_commitment == [0; 32]
-        || current_pruned_through.is_some_and(|height| {
-            height < retirement.rollback_boundary.pruned_through
-        })
+        || current_pruned_through
+            .is_some_and(|height| height < retirement.rollback_boundary.pruned_through)
     {
         return Err(IndexError::Corrupt(
             "tracked contract retirement proof has an invalid rollback binding",
@@ -2274,10 +2270,8 @@ fn validate_stored_completed_retirement<S: ReadSnapshot>(
             for evidence in &retirement.revealed_preimages {
                 let observed_hash: [u8; 32] = Sha256::digest(evidence.preimage).into();
                 if observed_hash != descriptor.hashlock
-                    || !seen_evidence.insert((
-                        evidence.funding_outpoint.clone(),
-                        evidence.spending_txid,
-                    ))
+                    || !seen_evidence
+                        .insert((evidence.funding_outpoint.clone(), evidence.spending_txid))
                 {
                     return Err(IndexError::Corrupt(
                         "tracked contract retirement retained an invalid preimage",
@@ -2776,12 +2770,7 @@ fn decode_retirement_count(raw: &[u8]) -> Result<u32, IndexError> {
     }
     let (body, checksum) = raw.split_at(5);
     if checksum
-        != bound_checksum(
-            b"contract-retirement-count-v1",
-            RETIREMENT_COUNT_KEY,
-            body,
-        )
-        .as_slice()
+        != bound_checksum(b"contract-retirement-count-v1", RETIREMENT_COUNT_KEY, body).as_slice()
     {
         return Err(IndexError::Corrupt(
             "invalid tracked contract retirement count checksum",
@@ -3236,9 +3225,7 @@ mod tests {
         assert_ne!(proof.ordered_event_commitment, [0; 32]);
         assert_eq!(proof.revealed_preimages.len(), 1);
         assert_eq!(
-            proof.revealed_preimages[0]
-                .preimage
-                .expose_for_settlement(),
+            proof.revealed_preimages[0].preimage.expose_for_settlement(),
             &preimage
         );
         drop(snapshot);
@@ -3249,13 +3236,10 @@ mod tests {
             tracked_contract(&snapshot, profile(), registration.id).expect("active lookup"),
             None
         );
-        let restarted = completed_tracked_contract_retirement(
-            &snapshot,
-            profile(),
-            registration.id,
-        )
-        .expect("retirement lookup")
-        .expect("retirement proof");
+        let restarted =
+            completed_tracked_contract_retirement(&snapshot, profile(), registration.id)
+                .expect("retirement lookup")
+                .expect("retirement proof");
         assert_eq!(restarted, proof);
         validate_tracked_contract_registry(&snapshot, profile()).expect("active topology");
         validate_completed_tracked_contract_retirements(

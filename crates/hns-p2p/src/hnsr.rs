@@ -6,26 +6,22 @@ use std::{
 };
 
 use hns_hnsr_protocol::{
-    HnsrActionId, HnsrOpcode, HnsrPacket, HnsrPeerId, HnsrRequester,
-    HnsrRequesterConfig, HnsrRequesterEvent, HnsrRequesterSnapshot, HnsrRoute,
-    HnsrRuntimeError, HnsrRuntimeStatus, HnsrService, OpaqueRelayConfig,
-    OpaqueRelayRuntime, OpaqueRelaySnapshot, QueuedHnsrRoute, RelayConfig, RelayLimits,
-    RelayService, RelayTicket, DEFAULT_WINDOW, HNSR_PACKET_TYPE, HNSR_RELAY_SERVICE,
-    HNS_NODE_V1, MAX_CIRCUIT_QUEUE, MAX_CIRCUITS, MAX_PACKET_SIZE,
+    HnsrActionId, HnsrOpcode, HnsrPacket, HnsrPeerId, HnsrRequester, HnsrRequesterConfig,
+    HnsrRequesterEvent, HnsrRequesterSnapshot, HnsrRoute, HnsrRuntimeError, HnsrRuntimeStatus,
+    HnsrService, OpaqueRelayConfig, OpaqueRelayRuntime, OpaqueRelaySnapshot, QueuedHnsrRoute,
+    RelayConfig, RelayLimits, RelayService, RelayTicket, DEFAULT_WINDOW, HNSR_PACKET_TYPE,
+    HNSR_RELAY_SERVICE, HNS_NODE_V1, MAX_CIRCUITS, MAX_CIRCUIT_QUEUE, MAX_PACKET_SIZE,
 };
 use hns_p2p_experimental::{
-    DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT,
-    DENUO_V1_REGISTRY_PROTOCOL_VERSION, DENUO_V1_REGISTRY_VERSION,
-    ExperimentalWireProfile, HnsrPolicy, NegotiatedRegistry,
-    Network as ExperimentalNetwork, REGISTRY_NEGOTIATION_PROTOCOL_ID,
-    HNSR_PROFILE_REGISTRY_FINGERPRINT, HNSR_PROFILE_REGISTRY_PROTOCOL_VERSION,
-    HNSR_PROFILE_REGISTRY_VERSION, HNSR_PROFILE_WIRE_PROFILE,
+    ExperimentalWireProfile, HnsrPolicy, NegotiatedRegistry, Network as ExperimentalNetwork,
+    DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT, DENUO_V1_REGISTRY_PROTOCOL_VERSION,
+    DENUO_V1_REGISTRY_VERSION, HNSR_PROFILE_REGISTRY_FINGERPRINT,
+    HNSR_PROFILE_REGISTRY_PROTOCOL_VERSION, HNSR_PROFILE_REGISTRY_VERSION,
+    HNSR_PROFILE_WIRE_PROFILE, REGISTRY_NEGOTIATION_PROTOCOL_ID,
 };
 use hns_primitives::blake2b_256;
 
-use crate::{
-    AuthenticatedPeerKey, Packet, PacketType, PeerDirection, PeerId, PeerTransportKind,
-};
+use crate::{AuthenticatedPeerKey, Packet, PacketType, PeerDirection, PeerId, PeerTransportKind};
 
 const STATE_MAGIC: &[u8; 8] = b"HNSHRS1\0";
 const FLOOR_MAGIC: &[u8; 8] = b"HNSHRF1\0";
@@ -98,7 +94,10 @@ impl HnsrNetworkBinding {
     }
 
     const fn allows_private(self) -> bool {
-        matches!(self.network, ExperimentalNetwork::Regtest | ExperimentalNetwork::Simnet)
+        matches!(
+            self.network,
+            ExperimentalNetwork::Regtest | ExperimentalNetwork::Simnet
+        )
     }
 }
 
@@ -284,12 +283,8 @@ impl HnsrCoordinator {
             .with_relay(config.opaque_relay_enabled)
             .with_endpoint(false)
             .with_rendezvous(false);
-        let requester = HnsrRequester::new(
-            fresh_session(),
-            1,
-            requester_config(&config),
-            trusted_now,
-        )?;
+        let requester =
+            HnsrRequester::new(fresh_session(), 1, requester_config(&config), trusted_now)?;
         let relay = OpaqueRelayRuntime::new(
             fresh_session(),
             1,
@@ -461,7 +456,8 @@ impl HnsrCoordinator {
         circuit_id: [u8; 8],
         bytes: Vec<u8>,
     ) -> Result<HnsrRoute, HnsrCoordinatorError> {
-        let route = self.requester
+        let route = self
+            .requester
             .send_data(circuit_id, bytes)
             .map_err(HnsrCoordinatorError::Runtime)?;
         self.mark_dirty();
@@ -472,7 +468,8 @@ impl HnsrCoordinator {
         &mut self,
         circuit_id: [u8; 8],
     ) -> Result<(Vec<u8>, HnsrRoute), HnsrCoordinatorError> {
-        let result = self.requester
+        let result = self
+            .requester
             .take_data(circuit_id)
             .map_err(HnsrCoordinatorError::Runtime)?;
         self.mark_dirty();
@@ -485,19 +482,18 @@ impl HnsrCoordinator {
         reason: u16,
     ) -> Result<HnsrRoute, HnsrCoordinatorError> {
         self.contexts.remove(&circuit_id);
-        let route = self.requester
+        let route = self
+            .requester
             .close(circuit_id, reason, "local requester closed")
             .map_err(HnsrCoordinatorError::Runtime)?;
         self.mark_dirty();
         Ok(route)
     }
 
-    pub fn cancel_open(
-        &mut self,
-        context_id: [u8; 8],
-    ) -> Result<HnsrRoute, HnsrCoordinatorError> {
+    pub fn cancel_open(&mut self, context_id: [u8; 8]) -> Result<HnsrRoute, HnsrCoordinatorError> {
         self.contexts.remove(&context_id);
-        let route = self.requester
+        let route = self
+            .requester
             .cancel_open(context_id, 0, "local requester cancelled")
             .map_err(HnsrCoordinatorError::Runtime)?;
         self.mark_dirty();
@@ -558,8 +554,7 @@ impl HnsrCoordinator {
                     .relay()
                     .ok_or(HnsrCoordinatorError::RoleUnavailable)?;
                 let routes = self.relay.handle(reservations, &source_id, packet, now)?;
-                self.contexts
-                    .insert(packet.context_id, ContextOwner::Relay);
+                self.contexts.insert(packet.context_id, ContextOwner::Relay);
                 for route in &routes {
                     self.contexts
                         .insert(route.route.packet.context_id, ContextOwner::Relay);
@@ -716,10 +711,9 @@ impl HnsrCoordinator {
             .ok_or(HnsrCoordinatorError::GenerationExhausted)?;
         let requester_enabled = policy.has_client() && self.config.requester_enabled;
         let relay_enabled = policy.has_relay() && self.config.opaque_relay_enabled;
-        let direct_routes = self.requester.replace_enabled(
-            self.requester.status().generation,
-            requester_enabled,
-        )?;
+        let direct_routes = self
+            .requester
+            .replace_enabled(self.requester.status().generation, requester_enabled)?;
         let relay_routes = self
             .relay
             .replace_enabled(self.relay.status().generation, relay_enabled)?;
@@ -809,10 +803,9 @@ impl HnsrCoordinator {
         let requester_enabled = self.policy.has_client() && self.config.requester_enabled;
         let relay_enabled = self.policy.has_relay() && self.config.opaque_relay_enabled;
         if self.requester.status().enabled != requester_enabled {
-            let _ = self.requester.replace_enabled(
-                self.requester.status().generation,
-                requester_enabled,
-            )?;
+            let _ = self
+                .requester
+                .replace_enabled(self.requester.status().generation, requester_enabled)?;
         }
         if self.relay.status().enabled != relay_enabled {
             let _ = self
@@ -953,8 +946,7 @@ fn decode_state(
     if reader.u16()? != STATE_SCHEMA {
         return Err(HnsrCoordinatorError::UnsupportedSchema);
     }
-    if reader.u32()? != config.binding.magic || reader.array::<32>()? != config.configuration_hash
-    {
+    if reader.u32()? != config.binding.magic || reader.array::<32>()? != config.configuration_hash {
         return Err(HnsrCoordinatorError::ConfigurationMismatch);
     }
     let state_generation = reader.u64()?;
@@ -966,10 +958,10 @@ fn decode_state(
         expired_work: reader.u64()?,
         rejected_packets: reader.u64()?,
     };
-    let requester_len = usize::try_from(reader.u32()?)
-        .map_err(|_| HnsrCoordinatorError::CorruptSnapshot)?;
-    let relay_len = usize::try_from(reader.u32()?)
-        .map_err(|_| HnsrCoordinatorError::CorruptSnapshot)?;
+    let requester_len =
+        usize::try_from(reader.u32()?).map_err(|_| HnsrCoordinatorError::CorruptSnapshot)?;
+    let relay_len =
+        usize::try_from(reader.u32()?).map_err(|_| HnsrCoordinatorError::CorruptSnapshot)?;
     let requester = reader.bytes(requester_len)?.to_vec();
     let relay = reader.bytes(relay_len)?.to_vec();
     reader.finish()?;

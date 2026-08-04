@@ -3525,18 +3525,20 @@ impl NodeService {
             if ban_list_persistent {
                 flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
                 if let Err(error) = flush_odoh_target_cache(&store, &peers).await {
-                    record_error(&diagnostics, format!(
-                        "failed to persist final ODoH target cache: {error:#}"
-                    ))
+                    record_error(
+                        &diagnostics,
+                        format!("failed to persist final ODoH target cache: {error:#}"),
+                    )
                     .await;
                     if terminal_error.is_none() {
                         terminal_error = Some(error);
                     }
                 }
                 if let Err(error) = flush_hnsr_state(&store, &peers).await {
-                    record_error(&diagnostics, format!(
-                        "failed to persist final HNSR runtime state: {error:#}"
-                    ))
+                    record_error(
+                        &diagnostics,
+                        format!("failed to persist final HNSR runtime state: {error:#}"),
+                    )
                     .await;
                     if terminal_error.is_none() {
                         terminal_error = Some(error);
@@ -8257,10 +8259,7 @@ async fn flush_address_book(
     }
 }
 
-async fn flush_odoh_target_cache(
-    store: &StoreHandle,
-    peers: &LivePeerManager,
-) -> Result<bool> {
+async fn flush_odoh_target_cache(store: &StoreHandle, peers: &LivePeerManager) -> Result<bool> {
     let timestamp = unix_time();
     if !peers.odoh_status(timestamp).await.durable_state_dirty {
         return Ok(false);
@@ -8270,15 +8269,9 @@ async fn flush_odoh_target_cache(
     let encoded_floor = floor.encode(peers.config().network.params().packet_magic);
     let mut batch = store.batch();
     batch.put(ColumnFamily::Peers, ODOH_TARGET_CACHE_KEY, &snapshot.bytes)?;
-    batch.put(
-        ColumnFamily::Peers,
-        ODOH_DURABLE_FLOOR_KEY,
-        &encoded_floor,
-    )?;
+    batch.put(ColumnFamily::Peers, ODOH_DURABLE_FLOOR_KEY, &encoded_floor)?;
     store.commit(batch)?;
-    peers
-        .acknowledge_odoh_target_cache_persisted(floor)
-        .await;
+    peers.acknowledge_odoh_target_cache_persisted(floor).await;
     Ok(true)
 }
 
@@ -8291,11 +8284,7 @@ async fn flush_hnsr_state(store: &StoreHandle, peers: &LivePeerManager) -> Resul
     let encoded_floor = snapshot.floor.encode();
     let mut batch = store.batch();
     batch.put(ColumnFamily::Peers, HNSR_STATE_KEY, &snapshot.bytes)?;
-    batch.put(
-        ColumnFamily::Peers,
-        HNSR_DURABLE_FLOOR_KEY,
-        &encoded_floor,
-    )?;
+    batch.put(ColumnFamily::Peers, HNSR_DURABLE_FLOOR_KEY, &encoded_floor)?;
     store.commit(batch)?;
     peers.acknowledge_hnsr_persisted(snapshot.floor).await;
     Ok(true)
@@ -10695,7 +10684,7 @@ mod tests {
             hns_p2p::decode_compressed_public_key(
                 hns_p2p::hsd_brontide_seed_table(Network::Mainnet)[0].public_key_hex,
             )
-                .expect("pinned key")[0],
+            .expect("pinned key")[0],
             0x02
         );
 

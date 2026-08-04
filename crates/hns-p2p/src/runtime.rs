@@ -32,10 +32,10 @@ use crate::{
         Hip76ProviderRequest, Hip76ProviderWork, Hip76RequesterResponse, Hip76RevokedWork,
         Hip76Session, Hip76SessionConfig, Hip76SessionDiagnostics, Hip76WriteToken,
     },
-    hnsr::{is_hnsr_packet_type, peer_id_from_hnsr, HnsrCoordinator, HnsrIncoming, HnsrPeerAdmission},
-    odoh::{
-        is_odoh_packet_type, OdohFailureReason, OdohPeerProvenance, OdohRequesterRuntime,
+    hnsr::{
+        is_hnsr_packet_type, peer_id_from_hnsr, HnsrCoordinator, HnsrIncoming, HnsrPeerAdmission,
     },
+    odoh::{is_odoh_packet_type, OdohFailureReason, OdohPeerProvenance, OdohRequesterRuntime},
     wire::{
         AsyncFrameReader, AsyncFrameWriter, Frame, NetworkMagic, Packet, PacketType, VersionPacket,
     },

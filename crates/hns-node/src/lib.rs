@@ -105,9 +105,9 @@ use hns_mining::{
     SolvedMiningCandidate, TemplateCoordinator,
 };
 use hns_p2p::{
-    DenuoSummary, Hip76Summary, HnsrCoordinator, HnsrCoordinatorConfig,
-    HnsrCoordinatorStatus, OdohNetworkBinding, OdohRequesterConfig, OdohRequesterRuntime,
-    OdohRequesterStatus, PeerSnapshot,
+    DenuoSummary, Hip76Summary, HnsrCoordinator, HnsrCoordinatorConfig, HnsrCoordinatorStatus,
+    OdohNetworkBinding, OdohRequesterConfig, OdohRequesterRuntime, OdohRequesterStatus,
+    PeerSnapshot,
 };
 use hns_primitives::{
     blake2b_256, hex_encode, sha3_256, Block, BlockHash, Coin, CompactTarget, Height, NameHash,
@@ -154,9 +154,10 @@ use hns_store::{
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, STORAGE_PROFILE,
 };
 use hns_wallet_index::{
-    decode_index_profile, encode_index_profile, index_profile_is_current, register_tracked_contract,
-    retire_completed_tracked_contract, retire_never_confirmed_tracked_contract,
-    stage_connect as stage_wallet_index_connect, stage_disconnect as stage_wallet_index_disconnect,
+    decode_index_profile, encode_index_profile, index_profile_is_current,
+    register_tracked_contract, retire_completed_tracked_contract,
+    retire_never_confirmed_tracked_contract, stage_connect as stage_wallet_index_connect,
+    stage_disconnect as stage_wallet_index_disconnect,
     validate_completed_tracked_contract_retirements, validate_tracked_contract_registry,
     INDEX_PROFILE_MODE_KEY,
 };
@@ -2131,13 +2132,9 @@ fn rpc_inactive_odoh_info(network: Network, requester_enabled: bool) -> RpcOdohI
     config.enabled = requester_enabled;
     config.allow_private_targets = matches!(network, Network::Regtest | Network::Simnet);
     let now = current_unix_time().unwrap_or_default();
-    let mut runtime = OdohRequesterRuntime::new(
-        OdohNetworkBinding::for_network(network),
-        config,
-        1,
-        now,
-    )
-    .expect("built-in ODoH requester defaults are valid");
+    let mut runtime =
+        OdohRequesterRuntime::new(OdohNetworkBinding::for_network(network), config, 1, now)
+            .expect("built-in ODoH requester defaults are valid");
     rpc_odoh_info(&runtime.status(now, 0))
 }
 
@@ -4077,28 +4074,22 @@ impl NodeService {
         if read_canonical_hash(&snapshot, rollback_boundary.pruned_through)?
             != Some(rollback_boundary.block_hash)
         {
-            return Err(anyhow::Error::new(
-                hns_wallet_index::IndexError::Corrupt(
-                    "completed retirement rollback block is not canonical",
-                ),
-            ));
+            return Err(anyhow::Error::new(hns_wallet_index::IndexError::Corrupt(
+                "completed retirement rollback block is not canonical",
+            )));
         }
         let TrackedContractEvent::Spend {
             height, block_hash, ..
         } = &retirement.1.terminal_event
         else {
-            return Err(anyhow::Error::new(
-                hns_wallet_index::IndexError::Corrupt(
-                    "completed retirement terminal evidence is not a spend",
-                ),
-            ));
+            return Err(anyhow::Error::new(hns_wallet_index::IndexError::Corrupt(
+                "completed retirement terminal evidence is not a spend",
+            )));
         };
         if read_canonical_hash(&snapshot, *height)? != Some(*block_hash) {
-            return Err(anyhow::Error::new(
-                hns_wallet_index::IndexError::Corrupt(
-                    "completed retirement terminal block is not canonical",
-                ),
-            ));
+            return Err(anyhow::Error::new(hns_wallet_index::IndexError::Corrupt(
+                "completed retirement terminal block is not canonical",
+            )));
         }
         drop(snapshot);
         self.state.store.commit(batch)?;
@@ -9828,12 +9819,11 @@ impl NodeState {
         validate_tracked_contract_registry(&snapshot, profile)
             .map_err(anyhow::Error::new)
             .context("failed to validate tracked wallet contracts")?;
-        let rollback_boundary = load_undo_pruning_checkpoint(&snapshot)?.map(|checkpoint| {
-            ContractRollbackBoundary {
+        let rollback_boundary =
+            load_undo_pruning_checkpoint(&snapshot)?.map(|checkpoint| ContractRollbackBoundary {
                 pruned_through: checkpoint.pruned_through,
                 block_hash: checkpoint.block_hash,
-            }
-        });
+            });
         validate_completed_tracked_contract_retirements(
             &snapshot,
             profile,

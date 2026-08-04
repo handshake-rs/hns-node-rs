@@ -1628,12 +1628,9 @@ impl WalletBackend {
 
             let active = tracked_contract(snapshot, profile, request.registration.id)
                 .map_err(wallet_index_error)?;
-            let retired = completed_tracked_contract_retirement(
-                snapshot,
-                profile,
-                request.registration.id,
-            )
-            .map_err(wallet_index_error)?;
+            let retired =
+                completed_tracked_contract_retirement(snapshot, profile, request.registration.id)
+                    .map_err(wallet_index_error)?;
             match (active, retired) {
                 (Some(stored), None) => {
                     if stored != request.registration {
@@ -1695,11 +1692,13 @@ impl WalletBackend {
                             "accepted airdrop proof has an invalid output address",
                         )
                     })?;
-                let value = airdrop.value.checked_sub(airdrop.fee).ok_or(
-                    WalletBackendError::Corrupt(
-                        "accepted airdrop proof fee exceeds its output value",
-                    ),
-                )?;
+                let value =
+                    airdrop
+                        .value
+                        .checked_sub(airdrop.fee)
+                        .ok_or(WalletBackendError::Corrupt(
+                            "accepted airdrop proof fee exceeds its output value",
+                        ))?;
                 if request
                     .registration
                     .matches_funding_output(&Output {
@@ -1743,18 +1742,14 @@ impl WalletBackend {
         } = plan;
         let (outcome, retirement) = self
             .writer
-            .execute_at(
-                epoch,
-                "retire completed wallet contract",
-                move |node| {
-                    node.retire_completed_wallet_contract(
-                        registration,
-                        lifecycle_revision,
-                        rollback_boundary,
-                        permanent_abandonment_acknowledged,
-                    )
-                },
-            )
+            .execute_at(epoch, "retire completed wallet contract", move |node| {
+                node.retire_completed_wallet_contract(
+                    registration,
+                    lifecycle_revision,
+                    rollback_boundary,
+                    permanent_abandonment_acknowledged,
+                )
+            })
             .await
             .map_err(wallet_writer_error)?;
         Ok(CompletedTrackedContractRetirement {
@@ -1789,8 +1784,7 @@ impl WalletBackend {
         let profile = self.read.wallet_index_profile();
         let read = self.read.clone();
         blocking_chain_read(read, move |_, snapshot| {
-            completed_tracked_contract_retirement(snapshot, profile, id)
-                .map_err(wallet_index_error)
+            completed_tracked_contract_retirement(snapshot, profile, id).map_err(wallet_index_error)
         })
         .await
     }
@@ -3218,9 +3212,7 @@ fn wallet_writer_error(error: anyhow::Error) -> WalletBackendError {
             IndexError::ContractRetirementHistoryCapacity => {
                 WalletBackendError::ContractRetirementHistoryCapacity
             }
-            IndexError::ContractRollbackRequired => {
-                WalletBackendError::ContractRollbackRequired
-            }
+            IndexError::ContractRollbackRequired => WalletBackendError::ContractRollbackRequired,
             IndexError::ContractRetired => WalletBackendError::InvalidContract,
             IndexError::ContractConfirmed | IndexError::ContractConfirmationUnknown => {
                 WalletBackendError::ContractNotRetirable

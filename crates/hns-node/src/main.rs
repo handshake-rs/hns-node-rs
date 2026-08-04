@@ -145,10 +145,7 @@ struct Cli {
     no_native_sync: bool,
 
     /// Validate and persist only headers; do not download or connect bodies.
-    #[arg(
-        long = "native-sync-headers-only",
-        conflicts_with = "no_native_sync"
-    )]
+    #[arg(long = "native-sync-headers-only", conflicts_with = "no_native_sync")]
     native_sync_headers_only: bool,
 
     /// Download bodies without connecting them to active state.
