@@ -27,14 +27,18 @@ use thiserror::Error;
 mod swap;
 
 pub use swap::{
-    register_tracked_contract, retire_never_confirmed_tracked_contract, tracked_contract,
+    completed_tracked_contract_retirement, register_tracked_contract,
+    retire_completed_tracked_contract, retire_never_confirmed_tracked_contract, tracked_contract,
     tracked_contract_events, tracked_contract_funding, tracked_contract_fundings,
-    tracked_contract_lifecycle_revision, validate_tracked_contract_registry, ContractId,
-    ContractRegistration, ContractRegistrationOutcome, ContractRetirementOutcome,
-    HnsHtlcDescriptor, RevealedPreimage, ShakedexV2Descriptor, TrackedContractCursor,
-    TrackedContractEvent, TrackedContractEventPage, TrackedContractFunding,
-    TrackedContractFundingPage, TrackedContractKind, TrackedContractSpendKind,
-    MAX_TRACKED_CONTRACTS, MAX_TRACKED_CONTRACTS_PER_ADDRESS,
+    tracked_contract_lifecycle_revision, validate_completed_tracked_contract_retirements,
+    validate_tracked_contract_registry, CompletedContractRetirement,
+    CompletedContractRetirementOutcome, ContractId, ContractRegistration,
+    ContractRegistrationOutcome, ContractRetirementOutcome, ContractRollbackBoundary,
+    HnsHtlcDescriptor, RetiredRevealedPreimage, RevealedPreimage, ShakedexV2Descriptor,
+    TrackedContractCursor, TrackedContractEvent, TrackedContractEventPage,
+    TrackedContractFunding, TrackedContractFundingPage, TrackedContractKind,
+    TrackedContractSpendKind, MAX_RETIRED_TRACKED_CONTRACTS, MAX_TRACKED_CONTRACTS,
+    MAX_TRACKED_CONTRACTS_PER_ADDRESS, MAX_TRACKED_CONTRACT_RETIREMENT_EVENTS,
 };
 
 /// Persistent profile key. Changing a non-empty chain's profile requires an
@@ -45,8 +49,9 @@ pub const MAX_QUERY_ENTRIES: usize = PREFIX_SCAN_MAX_ENTRIES;
 /// Maximum aggregate key/value bytes in one wallet-index page.
 pub const MAX_QUERY_BYTES: usize = 16 * 1024 * 1024;
 
-const LEGACY_PROFILE_VERSION: u8 = 1;
-const PROFILE_VERSION: u8 = 2;
+const ORIGINAL_PROFILE_VERSION: u8 = 1;
+const LIFECYCLE_PROFILE_VERSION: u8 = 2;
+const PROFILE_VERSION: u8 = 3;
 const PROFILE_SCRIPT_HISTORY: u8 = 1 << 0;
 const PROFILE_SPENDER: u8 = 1 << 1;
 const PROFILE_WALLET: u8 = 1 << 2;
@@ -133,7 +138,9 @@ pub fn decode_index_profile(raw: &[u8]) -> Result<WalletIndexProfile, IndexError
     if raw.len() != PROFILE_BYTES
         || !matches!(
             raw.first().copied(),
-            Some(LEGACY_PROFILE_VERSION) | Some(PROFILE_VERSION)
+            Some(ORIGINAL_PROFILE_VERSION)
+                | Some(LIFECYCLE_PROFILE_VERSION)
+                | Some(PROFILE_VERSION)
         )
         || raw
             .get(1)
@@ -407,6 +414,12 @@ pub enum IndexError {
     /// The configured active contract registry has reached its hard bound.
     #[error("wallet tracked-contract registry is full")]
     ContractCapacity,
+    /// The immutable completed-contract retirement registry is full.
+    #[error("wallet tracked-contract retirement registry is full")]
+    ContractRetirementCapacity,
+    /// This exact descriptor identity was irreversibly retired.
+    #[error("wallet tracked-contract descriptor was permanently retired")]
+    ContractRetired,
     /// A matching funding has already been confirmed for this registration.
     #[error("wallet tracked-contract registration has confirmed funding history")]
     ContractConfirmed,
@@ -416,6 +429,13 @@ pub enum IndexError {
     /// The caller prepared retirement for another registration lifecycle.
     #[error("wallet tracked-contract lifecycle changed from {expected} to {actual}")]
     StaleContractLifecycle { expected: u64, actual: u64 },
+    /// Completed retirement still needs retained rollback data or has no exact
+    /// terminal spend proof.
+    #[error("wallet tracked-contract history is not safely retireable")]
+    ContractRollbackRequired,
+    /// Completed retirement history exceeds the bounded atomic proof walk.
+    #[error("wallet tracked-contract retirement history exceeds its hard bound")]
+    ContractRetirementHistoryCapacity,
     /// No immutable contract registration exists for the requested identity.
     #[error("wallet tracked-contract registration is unknown")]
     UnknownContract,
@@ -1050,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn never_confirmed_contract_retirement_profile_version_fences_downgrade() {
+    fn production_next_completed_retirement_profile_version_fences_downgrade() {
         let profile = WalletIndexProfile {
             script_history: true,
             spender: true,
@@ -1060,15 +1080,17 @@ mod tests {
         assert_eq!(current[0], PROFILE_VERSION);
         assert!(index_profile_is_current(&current).expect("current profile"));
 
-        let mut legacy = current;
-        legacy[0] = LEGACY_PROFILE_VERSION;
-        let legacy_checksum = blake2b_256(&legacy[..2]);
-        legacy[2..].copy_from_slice(&legacy_checksum);
-        assert_eq!(
-            decode_index_profile(&legacy).expect("legacy profile"),
-            profile
-        );
-        assert!(!index_profile_is_current(&legacy).expect("legacy version"));
+        for prior_version in [ORIGINAL_PROFILE_VERSION, LIFECYCLE_PROFILE_VERSION] {
+            let mut legacy = current;
+            legacy[0] = prior_version;
+            let legacy_checksum = blake2b_256(&legacy[..2]);
+            legacy[2..].copy_from_slice(&legacy_checksum);
+            assert_eq!(
+                decode_index_profile(&legacy).expect("legacy profile"),
+                profile
+            );
+            assert!(!index_profile_is_current(&legacy).expect("legacy version"));
+        }
     }
 
     #[test]

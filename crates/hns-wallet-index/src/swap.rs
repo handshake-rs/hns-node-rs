@@ -5,7 +5,7 @@
 //! Confirmed funding/spend events are written in the canonical block batch and
 //! are therefore recovered on restart and reversed exactly with a reorg.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hns_primitives::{
     blake2b_256, sha3_256, Address, Block, BlockHash, Coin, CovenantKind, Height, Outpoint, Output,
@@ -44,13 +44,23 @@ mod serde_compressed_public_key {
 pub const MAX_TRACKED_CONTRACTS: u32 = 16_384;
 /// Maximum active public descriptors sharing one script address.
 pub const MAX_TRACKED_CONTRACTS_PER_ADDRESS: usize = 256;
+/// Maximum durable completed-contract retirement proofs in one node store.
+///
+/// Retirements are deliberately irreversible and never garbage-collected:
+/// this independent bound keeps their restart validation and storage cost
+/// finite without reusing an already-consumed descriptor identity.
+pub const MAX_RETIRED_TRACKED_CONTRACTS: u32 = 65_536;
+/// Maximum confirmed rows which one completed-contract retirement may consume.
+pub const MAX_TRACKED_CONTRACT_RETIREMENT_EVENTS: u32 = 4_096;
 
 const REGISTRATION_PREFIX: &[u8] = b"wallet-index/v1/contract/registration/";
 const ADDRESS_PREFIX: &[u8] = b"wallet-index/v1/contract/address/";
 const OBSERVATION_PREFIX: &[u8] = b"wallet-index/v1/contract/observation/";
 const FUNDING_PREFIX: &[u8] = b"wallet-index/v1/contract/funding/";
 const EVENT_PREFIX: &[u8] = b"wallet-index/v1/contract/event/";
+const RETIREMENT_PREFIX: &[u8] = b"wallet-index/v1/contract/retirement/";
 const REGISTRATION_COUNT_KEY: &[u8] = b"wallet-index/v1/contract/count";
+const RETIREMENT_COUNT_KEY: &[u8] = b"wallet-index/v1/contract/retirement-count";
 const LIFECYCLE_SEQUENCE_KEY: &[u8] = b"wallet-index/v1/contract/lifecycle-sequence";
 const RECORD_VERSION: u8 = 1;
 const CHECKSUM_BYTES: usize = 32;
@@ -62,6 +72,8 @@ const HNS_HTLC_SIGHASH_ALL: u8 = 0x01;
 const HIP1_SELLER_FULFILLMENT_SIGHASH: u8 = 0x84;
 const HIP1_SELLER_RECOVERY_SIGHASH: u8 = 0x83;
 const CONTRACT_ID_DOMAIN: &[u8] = b"hns-wallet-index/contract-id";
+const RETIRED_EVENT_COMMITMENT_DOMAIN: &[u8] =
+    b"hns-wallet-index/completed-retirement-events-v1";
 const CONTRACT_ID_ENCODING_VERSION: u8 = 1;
 const SHAKEDEX_V2_CONTRACT_TAG: u8 = 1;
 const HNS_HTLC_V1_CONTRACT_TAG: u8 = 2;
@@ -341,6 +353,24 @@ pub enum ContractRetirementOutcome {
     AlreadyAbsent,
 }
 
+/// Result of an idempotent completed-contract retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum CompletedContractRetirementOutcome {
+    /// The completed active lifecycle became an immutable retirement proof.
+    Retired,
+    /// The exact lifecycle was already retired with the same public terms.
+    AlreadyRetired,
+}
+
+/// Exact durable undo-retirement boundary authorizing completed retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContractRollbackBoundary {
+    /// Last canonical height whose undo has been irreversibly retired.
+    pub pruned_through: Height,
+    /// Canonical block at `pruned_through` when the proof was committed.
+    pub block_hash: BlockHash,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ContractObservationState {
     // Existing v1 registrations predate authoritative observation state. They
@@ -455,7 +485,7 @@ pub enum TrackedContractEvent {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum StoredTrackedContractSpendKind {
     Unrecognized,
     ShakedexFulfillment,
@@ -494,7 +524,7 @@ impl From<StoredTrackedContractSpendKind> for TrackedContractSpendKind {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum StoredTrackedContractEvent {
     Funding(TrackedContractFunding),
     Spend {
@@ -600,6 +630,91 @@ impl TrackedContractEvent {
     }
 }
 
+/// Immutable proof that one exact, previously confirmed descriptor lifecycle
+/// was retired only after its complete active-chain history became
+/// non-rollbackable by this node store.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompletedContractRetirement {
+    /// Original immutable public registration. The consumed ID is never reused.
+    pub registration: ContractRegistration,
+    /// Exact monotonic lifecycle revision consumed by this transition.
+    pub lifecycle_revision: u64,
+    /// Number of confirmed funding/spend rows consumed atomically.
+    pub confirmed_event_count: u32,
+    /// Lowest consumed canonical event height.
+    pub minimum_event_height: Height,
+    /// Highest consumed canonical event height.
+    pub maximum_event_height: Height,
+    /// SHA-256 commitment to the exact ordered event keys and stored bytes.
+    pub ordered_event_commitment: [u8; 32],
+    /// Last confirmed row, necessarily an exact terminal spend.
+    pub terminal_event: TrackedContractEvent,
+    /// Settlement-sensitive preimages retained from every consumed redemption.
+    pub revealed_preimages: Vec<RetiredRevealedPreimage>,
+    /// Undo-pruning checkpoint which made every consumed row irreversible.
+    pub rollback_boundary: ContractRollbackBoundary,
+    /// Durable acknowledgement that this exact descriptor will never be funded
+    /// or registered again after retirement.
+    pub permanent_abandonment_acknowledged: bool,
+}
+
+/// One internally retained revealed preimage from retired event history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RetiredRevealedPreimage {
+    /// Funding outpoint consumed by the redemption.
+    pub funding_outpoint: Outpoint,
+    /// Canonical transaction which revealed the value.
+    pub spending_txid: Txid,
+    /// Previously public chain value, still redacted by public serde/debug.
+    pub preimage: RevealedPreimage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredRetiredRevealedPreimage {
+    funding_outpoint: Outpoint,
+    spending_txid: Txid,
+    preimage: [u8; HNS_HTLC_PREIMAGE_BYTES],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct StoredCompletedContractRetirement {
+    registration: ContractRegistration,
+    lifecycle_revision: u64,
+    confirmed_event_count: u32,
+    minimum_event_height: Height,
+    maximum_event_height: Height,
+    ordered_event_commitment: [u8; 32],
+    terminal_event: StoredTrackedContractEvent,
+    revealed_preimages: Vec<StoredRetiredRevealedPreimage>,
+    rollback_boundary: ContractRollbackBoundary,
+    permanent_abandonment_acknowledged: bool,
+}
+
+impl From<StoredCompletedContractRetirement> for CompletedContractRetirement {
+    fn from(stored: StoredCompletedContractRetirement) -> Self {
+        Self {
+            registration: stored.registration,
+            lifecycle_revision: stored.lifecycle_revision,
+            confirmed_event_count: stored.confirmed_event_count,
+            minimum_event_height: stored.minimum_event_height,
+            maximum_event_height: stored.maximum_event_height,
+            ordered_event_commitment: stored.ordered_event_commitment,
+            terminal_event: stored.terminal_event.into(),
+            revealed_preimages: stored
+                .revealed_preimages
+                .into_iter()
+                .map(|evidence| RetiredRevealedPreimage {
+                    funding_outpoint: evidence.funding_outpoint,
+                    spending_txid: evidence.spending_txid,
+                    preimage: RevealedPreimage(evidence.preimage),
+                })
+                .collect(),
+            rollback_boundary: stored.rollback_boundary,
+            permanent_abandonment_acknowledged: stored.permanent_abandonment_acknowledged,
+        }
+    }
+}
+
 /// Opaque exclusive continuation for contract funding or event pages.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TrackedContractCursor {
@@ -633,6 +748,15 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
 ) -> Result<ContractRegistrationOutcome, IndexError> {
     require_contract_profile(profile)?;
     registration.validate()?;
+    if let Some(retirement) = load_stored_completed_retirement(snapshot, registration.id)? {
+        validate_stored_completed_retirement(snapshot, &retirement, None)?;
+        if retirement.registration != *registration {
+            return Err(IndexError::Corrupt(
+                "retired tracked contract identity disagrees with registration terms",
+            ));
+        }
+        return Err(IndexError::ContractRetired);
+    }
     let key = registration_key(registration.id);
     if let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? {
         let stored: ContractRegistration = decode_record(b"contract-registration-v1", &key, &raw)?;
@@ -776,6 +900,15 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     registration.validate()?;
     let key = registration_key(registration.id);
     let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
+        if let Some(retirement) = load_stored_completed_retirement(snapshot, registration.id)? {
+            validate_stored_completed_retirement(snapshot, &retirement, None)?;
+            if retirement.registration != *registration {
+                return Err(IndexError::Corrupt(
+                    "retired tracked contract identity disagrees with retirement request",
+                ));
+            }
+            return Err(IndexError::ContractRetired);
+        }
         if snapshot
             .get(ColumnFamily::TxIndex, &observation_key(registration.id))?
             .is_some()
@@ -877,6 +1010,199 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         )?;
     }
     Ok(ContractRetirementOutcome::Retired)
+}
+
+/// Atomically retire one exact confirmed descriptor lifecycle after every
+/// event it could need for disconnect is below the node's irreversible undo
+/// frontier.
+///
+/// The caller must derive `rollback_boundary` from the same canonical snapshot
+/// and serialize this mutation against chain and mempool changes. It must also
+/// durably abandon every funding/rebroadcast source and acknowledge that this
+/// content-derived descriptor identity can never be registered again. This
+/// layer independently requires an empty active-funding prefix, walks the
+/// complete bounded event history, proves exact funding/spend pairing, retains
+/// every revealed preimage, and refuses to delete any row above the boundary.
+pub fn retire_completed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
+    snapshot: &S,
+    batch: &mut B,
+    profile: WalletIndexProfile,
+    registration: &ContractRegistration,
+    expected_lifecycle_revision: u64,
+    rollback_boundary: ContractRollbackBoundary,
+    permanent_abandonment_acknowledged: bool,
+) -> Result<
+    (
+        CompletedContractRetirementOutcome,
+        CompletedContractRetirement,
+    ),
+    IndexError,
+> {
+    require_contract_profile(profile)?;
+    registration.validate()?;
+    if !permanent_abandonment_acknowledged {
+        return Err(IndexError::ContractRollbackRequired);
+    }
+
+    if let Some(stored) = load_stored_completed_retirement(snapshot, registration.id)? {
+        validate_stored_completed_retirement(
+            snapshot,
+            &stored,
+            Some(rollback_boundary.pruned_through),
+        )?;
+        if stored.registration != *registration {
+            return Err(IndexError::Corrupt(
+                "retired tracked contract identity disagrees with retirement request",
+            ));
+        }
+        if stored.lifecycle_revision != expected_lifecycle_revision {
+            return Err(IndexError::StaleContractLifecycle {
+                expected: expected_lifecycle_revision,
+                actual: stored.lifecycle_revision,
+            });
+        }
+        return Ok((
+            CompletedContractRetirementOutcome::AlreadyRetired,
+            stored.into(),
+        ));
+    }
+
+    let key = registration_key(registration.id);
+    let raw = snapshot
+        .get(ColumnFamily::TxIndex, &key)?
+        .ok_or(IndexError::UnknownContract)?;
+    let stored_registration: ContractRegistration =
+        decode_record(b"contract-registration-v1", &key, &raw)?;
+    if stored_registration != *registration {
+        return Err(IndexError::Corrupt(
+            "completed retirement terms disagree with registration",
+        ));
+    }
+    let observation = load_observation(snapshot, registration.id)?
+        .ok_or(IndexError::ContractConfirmationUnknown)?;
+    if observation.lifecycle_revision != expected_lifecycle_revision {
+        return Err(IndexError::StaleContractLifecycle {
+            expected: expected_lifecycle_revision,
+            actual: observation.lifecycle_revision,
+        });
+    }
+    if observation.state != ContractObservationState::Confirmed {
+        return Err(IndexError::ContractRollbackRequired);
+    }
+    if prefix_has_entry(snapshot, &funding_prefix(registration.id))? {
+        return Err(IndexError::ContractRollbackRequired);
+    }
+
+    let history = analyze_completed_history(snapshot, registration)?;
+    if history.maximum_event_height > rollback_boundary.pruned_through {
+        return Err(IndexError::ContractRollbackRequired);
+    }
+
+    let retirement_count = snapshot
+        .get(ColumnFamily::TxIndex, RETIREMENT_COUNT_KEY)?
+        .as_deref()
+        .map(decode_retirement_count)
+        .transpose()?
+        .unwrap_or(0);
+    if retirement_count >= MAX_RETIRED_TRACKED_CONTRACTS {
+        return Err(IndexError::ContractRetirementCapacity);
+    }
+    let next_retirement_count = retirement_count
+        .checked_add(1)
+        .ok_or(IndexError::ContractRetirementCapacity)?;
+
+    let binding_key = address_key(&registration.funding_address()?);
+    let binding = snapshot
+        .get(ColumnFamily::TxIndex, &binding_key)?
+        .ok_or(IndexError::Corrupt(
+            "tracked contract registration has no address binding",
+        ))?;
+    let mut ids = decode_address_bindings(&binding_key, &binding)?;
+    let position = ids
+        .binary_search(&registration.id)
+        .map_err(|_| IndexError::Corrupt("tracked contract address binding mismatch"))?;
+    ids.remove(position);
+    let active_count = snapshot
+        .get(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?
+        .as_deref()
+        .map(decode_registration_count)
+        .transpose()?
+        .ok_or(IndexError::Corrupt(
+            "tracked contract count is absent while registry is non-empty",
+        ))?;
+    let next_active_count = active_count.checked_sub(1).ok_or(IndexError::Corrupt(
+        "tracked contract count underflow during completed retirement",
+    ))?;
+
+    let retirement = StoredCompletedContractRetirement {
+        registration: registration.clone(),
+        lifecycle_revision: expected_lifecycle_revision,
+        confirmed_event_count: history.event_count,
+        minimum_event_height: history.minimum_event_height,
+        maximum_event_height: history.maximum_event_height,
+        ordered_event_commitment: history.ordered_event_commitment,
+        terminal_event: history.terminal_event,
+        revealed_preimages: history.revealed_preimages,
+        rollback_boundary,
+        permanent_abandonment_acknowledged,
+    };
+    let retirement_key = retirement_key(registration.id);
+    batch.put(
+        ColumnFamily::TxIndex,
+        &retirement_key,
+        &encode_record(
+            b"contract-completed-retirement-v1",
+            &retirement_key,
+            &retirement,
+        )?,
+    )?;
+    batch.put(
+        ColumnFamily::TxIndex,
+        RETIREMENT_COUNT_KEY,
+        &encode_retirement_count(next_retirement_count),
+    )?;
+    batch.delete(ColumnFamily::TxIndex, &key)?;
+    batch.delete(ColumnFamily::TxIndex, &observation_key(registration.id))?;
+    for event_key in history.event_keys {
+        batch.delete(ColumnFamily::TxIndex, &event_key)?;
+    }
+    if ids.is_empty() {
+        batch.delete(ColumnFamily::TxIndex, &binding_key)?;
+    } else {
+        batch.put(
+            ColumnFamily::TxIndex,
+            &binding_key,
+            &encode_address_bindings(&binding_key, &ids)?,
+        )?;
+    }
+    if next_active_count == 0 {
+        batch.delete(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?;
+    } else {
+        batch.put(
+            ColumnFamily::TxIndex,
+            REGISTRATION_COUNT_KEY,
+            &encode_registration_count(next_active_count),
+        )?;
+    }
+
+    Ok((
+        CompletedContractRetirementOutcome::Retired,
+        retirement.into(),
+    ))
+}
+
+/// Read the immutable completed-retirement proof for one consumed descriptor.
+pub fn completed_tracked_contract_retirement<S: ReadSnapshot>(
+    snapshot: &S,
+    profile: WalletIndexProfile,
+    id: ContractId,
+) -> Result<Option<CompletedContractRetirement>, IndexError> {
+    require_contract_profile(profile)?;
+    let Some(retirement) = load_stored_completed_retirement(snapshot, id)? else {
+        return Ok(None);
+    };
+    validate_stored_completed_retirement(snapshot, &retirement, None)?;
+    Ok(Some(retirement.into()))
 }
 
 /// Read one immutable public contract registration.
@@ -996,6 +1322,114 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
     if observations > registrations {
         return Err(IndexError::Corrupt(
             "tracked contract observations exceed registry count",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate every immutable completed-retirement proof against the current
+/// undo frontier and canonical height index during startup.
+///
+/// `canonical_hash_at` must read from the same immutable snapshot. A tombstone
+/// without a current pruning checkpoint, above a regressed checkpoint, or
+/// bound to a non-canonical boundary/terminal block fails startup closed.
+pub fn validate_completed_tracked_contract_retirements<
+    S: ReadSnapshot,
+    F: FnMut(Height) -> Result<Option<BlockHash>, IndexError>,
+>(
+    snapshot: &S,
+    profile: WalletIndexProfile,
+    current_rollback_boundary: Option<ContractRollbackBoundary>,
+    mut canonical_hash_at: F,
+) -> Result<(), IndexError> {
+    if !profile.wallet {
+        return Ok(());
+    }
+    let expected_raw = snapshot.get(ColumnFamily::TxIndex, RETIREMENT_COUNT_KEY)?;
+    let expected = expected_raw
+        .as_deref()
+        .map(decode_retirement_count)
+        .transpose()?
+        .unwrap_or(0);
+    if expected > MAX_RETIRED_TRACKED_CONTRACTS
+        || (expected == 0 && expected_raw.is_some())
+    {
+        return Err(IndexError::Corrupt(
+            "tracked contract retirement count exceeds schema bound",
+        ));
+    }
+
+    let mut cursor = None::<Vec<u8>>;
+    let mut total = 0_u32;
+    loop {
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::TxIndex,
+            RETIREMENT_PREFIX,
+            cursor.as_deref(),
+            PrefixScanBudget {
+                max_entries: MAX_QUERY_ENTRIES,
+                max_bytes: MAX_QUERY_BYTES,
+            },
+        )?;
+        for (key, raw) in &page.entries {
+            total = total.checked_add(1).ok_or(IndexError::Corrupt(
+                "tracked contract retirement count overflow",
+            ))?;
+            if total > MAX_RETIRED_TRACKED_CONTRACTS {
+                return Err(IndexError::Corrupt(
+                    "tracked contract retirement registry exceeds schema bound",
+                ));
+            }
+            let retirement: StoredCompletedContractRetirement =
+                decode_record(b"contract-completed-retirement-v1", key, raw)?;
+            if retirement_key(retirement.registration.id) != *key {
+                return Err(IndexError::Corrupt(
+                    "tracked contract retirement key/value binding mismatch",
+                ));
+            }
+            let current = current_rollback_boundary.ok_or(IndexError::Corrupt(
+                "tracked contract retirement exists without an undo-pruning checkpoint",
+            ))?;
+            validate_stored_completed_retirement(
+                snapshot,
+                &retirement,
+                Some(current.pruned_through),
+            )?;
+            if canonical_hash_at(retirement.rollback_boundary.pruned_through)?
+                != Some(retirement.rollback_boundary.block_hash)
+            {
+                return Err(IndexError::Corrupt(
+                    "tracked contract retirement rollback block is not canonical",
+                ));
+            }
+            let terminal: TrackedContractEvent = retirement.terminal_event.clone().into();
+            let TrackedContractEvent::Spend {
+                height, block_hash, ..
+            } = terminal
+            else {
+                return Err(IndexError::Corrupt(
+                    "tracked contract retirement terminal evidence is not a spend",
+                ));
+            };
+            if canonical_hash_at(height)? != Some(block_hash) {
+                return Err(IndexError::Corrupt(
+                    "tracked contract retirement terminal block is not canonical",
+                ));
+            }
+        }
+        let Some(next) = page.continuation else {
+            break;
+        };
+        if cursor.as_ref().is_some_and(|previous| previous >= &next) {
+            return Err(IndexError::Corrupt(
+                "tracked contract retirement continuation did not advance",
+            ));
+        }
+        cursor = Some(next);
+    }
+    if total != expected {
+        return Err(IndexError::Corrupt(
+            "tracked contract retirement count/topology mismatch",
         ));
     }
     Ok(())
@@ -1568,6 +2002,331 @@ fn load_registration<S: ReadSnapshot>(
         .transpose()
 }
 
+struct CompletedHistoryAnalysis {
+    event_keys: Vec<Vec<u8>>,
+    event_count: u32,
+    minimum_event_height: Height,
+    maximum_event_height: Height,
+    ordered_event_commitment: [u8; 32],
+    terminal_event: StoredTrackedContractEvent,
+    revealed_preimages: Vec<StoredRetiredRevealedPreimage>,
+}
+
+fn analyze_completed_history<S: ReadSnapshot>(
+    snapshot: &S,
+    registration: &ContractRegistration,
+) -> Result<CompletedHistoryAnalysis, IndexError> {
+    let prefix = event_prefix(registration.id);
+    let mut cursor = None::<Vec<u8>>;
+    let mut previous_key = None::<Vec<u8>>;
+    let mut event_keys = Vec::new();
+    let mut active_fundings = HashMap::<Outpoint, TrackedContractFunding>::new();
+    let mut seen_funding_outpoints = HashSet::<Outpoint>::new();
+    let mut terminal_event = None::<StoredTrackedContractEvent>;
+    let mut revealed_preimages = Vec::new();
+    let mut minimum_event_height = None::<Height>;
+    let mut maximum_event_height = None::<Height>;
+    let mut commitment = Sha256::new();
+    commitment.update(RETIRED_EVENT_COMMITMENT_DOMAIN);
+
+    loop {
+        let page = snapshot.scan_prefix_page(
+            ColumnFamily::TxIndex,
+            &prefix,
+            cursor.as_deref(),
+            PrefixScanBudget {
+                max_entries: MAX_QUERY_ENTRIES,
+                max_bytes: MAX_QUERY_BYTES,
+            },
+        )?;
+        for (key, raw) in &page.entries {
+            if previous_key.as_ref().is_some_and(|previous| previous >= key) {
+                return Err(IndexError::Corrupt(
+                    "tracked contract retirement event order did not advance",
+                ));
+            }
+            let next_count = u32::try_from(event_keys.len())
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or(IndexError::ContractRetirementHistoryCapacity)?;
+            if next_count > MAX_TRACKED_CONTRACT_RETIREMENT_EVENTS {
+                return Err(IndexError::ContractRetirementHistoryCapacity);
+            }
+            let stored: StoredTrackedContractEvent =
+                decode_record(b"contract-event-v1", key, raw)?;
+            let event: TrackedContractEvent = stored.clone().into();
+            if event.contract_id() != registration.id || event.key() != *key {
+                return Err(IndexError::Corrupt(
+                    "tracked contract retirement event key/value binding mismatch",
+                ));
+            }
+            let height = match &event {
+                TrackedContractEvent::Funding(funding) => funding.height,
+                TrackedContractEvent::Spend { height, .. } => *height,
+            };
+            minimum_event_height = Some(
+                minimum_event_height.map_or(height, |minimum| minimum.min(height)),
+            );
+            maximum_event_height = Some(
+                maximum_event_height.map_or(height, |maximum| maximum.max(height)),
+            );
+
+            match &event {
+                TrackedContractEvent::Funding(funding) => {
+                    if funding.contract_id != registration.id
+                        || !registration.matches_funding_output(&Output {
+                            value: funding.coin.value,
+                            address: funding.coin.address.clone(),
+                            covenant: funding.coin.covenant.clone(),
+                        })?
+                        || !seen_funding_outpoints.insert(funding.coin.outpoint.clone())
+                        || active_fundings
+                            .insert(funding.coin.outpoint.clone(), funding.clone())
+                            .is_some()
+                    {
+                        return Err(IndexError::Corrupt(
+                            "tracked contract retirement funding history is inconsistent",
+                        ));
+                    }
+                }
+                TrackedContractEvent::Spend {
+                    funding,
+                    spending_txid,
+                    kind,
+                    ..
+                } => {
+                    let prior = active_fundings.remove(&funding.coin.outpoint).ok_or(
+                        IndexError::Corrupt(
+                            "tracked contract retirement spend has no prior funding event",
+                        ),
+                    )?;
+                    if prior != *funding || !spend_kind_matches_registration(registration, kind) {
+                        return Err(IndexError::Corrupt(
+                            "tracked contract retirement spend history is inconsistent",
+                        ));
+                    }
+                    if let TrackedContractSpendKind::HtlcRedemption { preimage } = kind {
+                        revealed_preimages.push(StoredRetiredRevealedPreimage {
+                            funding_outpoint: funding.coin.outpoint.clone(),
+                            spending_txid: *spending_txid,
+                            preimage: *preimage.expose_for_settlement(),
+                        });
+                    }
+                }
+            }
+
+            let key_len = u64::try_from(key.len())
+                .map_err(|_| IndexError::ContractRetirementHistoryCapacity)?;
+            let raw_len = u64::try_from(raw.len())
+                .map_err(|_| IndexError::ContractRetirementHistoryCapacity)?;
+            commitment.update(key_len.to_be_bytes());
+            commitment.update(key);
+            commitment.update(raw_len.to_be_bytes());
+            commitment.update(raw);
+            previous_key = Some(key.clone());
+            event_keys.push(key.clone());
+            terminal_event = Some(stored);
+        }
+        let Some(next) = page.continuation else {
+            break;
+        };
+        if cursor.as_ref().is_some_and(|previous| previous >= &next) {
+            return Err(IndexError::Corrupt(
+                "tracked contract retirement continuation did not advance",
+            ));
+        }
+        cursor = Some(next);
+    }
+
+    if !active_fundings.is_empty() {
+        return Err(IndexError::ContractRollbackRequired);
+    }
+    let terminal_event = terminal_event.ok_or(IndexError::ContractRollbackRequired)?;
+    if !matches!(terminal_event, StoredTrackedContractEvent::Spend { .. }) {
+        return Err(IndexError::ContractRollbackRequired);
+    }
+    let event_count = u32::try_from(event_keys.len())
+        .map_err(|_| IndexError::ContractRetirementHistoryCapacity)?;
+    let minimum_event_height = minimum_event_height.ok_or(IndexError::ContractRollbackRequired)?;
+    let maximum_event_height = maximum_event_height.ok_or(IndexError::ContractRollbackRequired)?;
+    commitment.update(event_count.to_be_bytes());
+
+    Ok(CompletedHistoryAnalysis {
+        event_keys,
+        event_count,
+        minimum_event_height,
+        maximum_event_height,
+        ordered_event_commitment: commitment.finalize().into(),
+        terminal_event,
+        revealed_preimages,
+    })
+}
+
+fn spend_kind_matches_registration(
+    registration: &ContractRegistration,
+    kind: &TrackedContractSpendKind,
+) -> bool {
+    matches!(
+        (&registration.kind, kind),
+        (_, TrackedContractSpendKind::Unrecognized)
+            | (
+                TrackedContractKind::ShakedexV2(_),
+                TrackedContractSpendKind::ShakedexFulfillment
+                    | TrackedContractSpendKind::ShakedexRecovery
+            )
+            | (
+                TrackedContractKind::HnsHtlcV1(_),
+                TrackedContractSpendKind::HtlcRedemption { .. }
+                    | TrackedContractSpendKind::HtlcRefund
+            )
+    )
+}
+
+fn load_stored_completed_retirement<S: ReadSnapshot>(
+    snapshot: &S,
+    id: ContractId,
+) -> Result<Option<StoredCompletedContractRetirement>, IndexError> {
+    let key = retirement_key(id);
+    snapshot
+        .get(ColumnFamily::TxIndex, &key)?
+        .as_deref()
+        .map(|raw| {
+            let retirement: StoredCompletedContractRetirement =
+                decode_record(b"contract-completed-retirement-v1", &key, raw)?;
+            if retirement.registration.id != id {
+                return Err(IndexError::Corrupt(
+                    "tracked contract retirement key/value binding mismatch",
+                ));
+            }
+            Ok(retirement)
+        })
+        .transpose()
+}
+
+fn validate_stored_completed_retirement<S: ReadSnapshot>(
+    snapshot: &S,
+    retirement: &StoredCompletedContractRetirement,
+    current_pruned_through: Option<Height>,
+) -> Result<(), IndexError> {
+    retirement.registration.validate()?;
+    if !retirement.permanent_abandonment_acknowledged
+        || retirement.lifecycle_revision == 0
+        || retirement.confirmed_event_count < 2
+        || retirement.confirmed_event_count > MAX_TRACKED_CONTRACT_RETIREMENT_EVENTS
+        || retirement.minimum_event_height > retirement.maximum_event_height
+        || retirement.maximum_event_height > retirement.rollback_boundary.pruned_through
+        || retirement.ordered_event_commitment == [0; 32]
+        || current_pruned_through.is_some_and(|height| {
+            height < retirement.rollback_boundary.pruned_through
+        })
+    {
+        return Err(IndexError::Corrupt(
+            "tracked contract retirement proof has an invalid rollback binding",
+        ));
+    }
+    let lifecycle_sequence = load_lifecycle_sequence(snapshot)?;
+    if retirement.lifecycle_revision > lifecycle_sequence {
+        return Err(IndexError::Corrupt(
+            "tracked contract retirement lifecycle exceeds its sequence",
+        ));
+    }
+    let terminal: TrackedContractEvent = retirement.terminal_event.clone().into();
+    let TrackedContractEvent::Spend {
+        contract_id,
+        funding,
+        spending_txid,
+        height,
+        kind,
+        ..
+    } = &terminal
+    else {
+        return Err(IndexError::Corrupt(
+            "tracked contract retirement terminal evidence is not a spend",
+        ));
+    };
+    if *contract_id != retirement.registration.id
+        || funding.contract_id != retirement.registration.id
+        || funding.height < retirement.minimum_event_height
+        || funding.height > retirement.maximum_event_height
+        || *height != retirement.maximum_event_height
+        || !retirement.registration.matches_funding_output(&Output {
+            value: funding.coin.value,
+            address: funding.coin.address.clone(),
+            covenant: funding.coin.covenant.clone(),
+        })?
+        || !spend_kind_matches_registration(&retirement.registration, kind)
+    {
+        return Err(IndexError::Corrupt(
+            "tracked contract retirement terminal evidence is inconsistent",
+        ));
+    }
+    if retirement.revealed_preimages.len()
+        > usize::try_from(retirement.confirmed_event_count)
+            .map_err(|_| IndexError::Corrupt("tracked contract retirement count overflow"))?
+    {
+        return Err(IndexError::Corrupt(
+            "tracked contract retirement preimage count is invalid",
+        ));
+    }
+    match &retirement.registration.kind {
+        TrackedContractKind::HnsHtlcV1(descriptor) => {
+            let mut seen_evidence = HashSet::new();
+            for evidence in &retirement.revealed_preimages {
+                let observed_hash: [u8; 32] = Sha256::digest(evidence.preimage).into();
+                if observed_hash != descriptor.hashlock
+                    || !seen_evidence.insert((
+                        evidence.funding_outpoint.clone(),
+                        evidence.spending_txid,
+                    ))
+                {
+                    return Err(IndexError::Corrupt(
+                        "tracked contract retirement retained an invalid preimage",
+                    ));
+                }
+            }
+            if let TrackedContractSpendKind::HtlcRedemption { preimage } = kind {
+                if !retirement.revealed_preimages.iter().any(|evidence| {
+                    evidence.funding_outpoint == funding.coin.outpoint
+                        && evidence.spending_txid == *spending_txid
+                        && evidence.preimage == *preimage.expose_for_settlement()
+                }) {
+                    return Err(IndexError::Corrupt(
+                        "tracked contract retirement dropped its terminal revealed preimage",
+                    ));
+                }
+            }
+        }
+        TrackedContractKind::ShakedexV2(_) if !retirement.revealed_preimages.is_empty() => {
+            return Err(IndexError::Corrupt(
+                "Shakedex retirement contains unrelated revealed preimages",
+            ));
+        }
+        TrackedContractKind::ShakedexV2(_) => {}
+    }
+    if load_registration(snapshot, retirement.registration.id)?.is_some()
+        || load_observation(snapshot, retirement.registration.id)?.is_some()
+        || prefix_has_entry(snapshot, &funding_prefix(retirement.registration.id))?
+        || prefix_has_entry(snapshot, &event_prefix(retirement.registration.id))?
+    {
+        return Err(IndexError::Corrupt(
+            "retired tracked contract still has active topology or history",
+        ));
+    }
+    let binding_key = address_key(&retirement.registration.funding_address()?);
+    if snapshot
+        .get(ColumnFamily::TxIndex, &binding_key)?
+        .as_deref()
+        .map(|raw| decode_address_bindings(&binding_key, raw))
+        .transpose()?
+        .is_some_and(|ids| ids.binary_search(&retirement.registration.id).is_ok())
+    {
+        return Err(IndexError::Corrupt(
+            "retired tracked contract remains in the active address binding",
+        ));
+    }
+    Ok(())
+}
+
 fn observation_key(id: ContractId) -> Vec<u8> {
     prefixed_id(OBSERVATION_PREFIX, id)
 }
@@ -1806,6 +2565,10 @@ fn registration_key(id: ContractId) -> Vec<u8> {
     prefixed_id(REGISTRATION_PREFIX, id)
 }
 
+fn retirement_key(id: ContractId) -> Vec<u8> {
+    prefixed_id(RETIREMENT_PREFIX, id)
+}
+
 fn address_key(address: &Address) -> Vec<u8> {
     let mut writer = Writer::with_capacity(ADDRESS_PREFIX.len() + 42);
     writer.write_bytes(ADDRESS_PREFIX);
@@ -1990,6 +2753,46 @@ fn decode_registration_count(raw: &[u8]) -> Result<u32, IndexError> {
         body.get(1..)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or(IndexError::Corrupt("invalid tracked contract count"))?,
+    ))
+}
+
+fn encode_retirement_count(count: u32) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(1 + 4 + CHECKSUM_BYTES);
+    raw.push(RECORD_VERSION);
+    raw.extend_from_slice(&count.to_le_bytes());
+    raw.extend_from_slice(&bound_checksum(
+        b"contract-retirement-count-v1",
+        RETIREMENT_COUNT_KEY,
+        &raw,
+    ));
+    raw
+}
+
+fn decode_retirement_count(raw: &[u8]) -> Result<u32, IndexError> {
+    if raw.len() != 1 + 4 + CHECKSUM_BYTES || raw.first().copied() != Some(RECORD_VERSION) {
+        return Err(IndexError::Corrupt(
+            "invalid tracked contract retirement count",
+        ));
+    }
+    let (body, checksum) = raw.split_at(5);
+    if checksum
+        != bound_checksum(
+            b"contract-retirement-count-v1",
+            RETIREMENT_COUNT_KEY,
+            body,
+        )
+        .as_slice()
+    {
+        return Err(IndexError::Corrupt(
+            "invalid tracked contract retirement count checksum",
+        ));
+    }
+    Ok(u32::from_le_bytes(
+        body.get(1..)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(IndexError::Corrupt(
+                "invalid tracked contract retirement count",
+            ))?,
     ))
 }
 
@@ -2291,6 +3094,388 @@ mod tests {
                 kind: TrackedContractSpendKind::Unrecognized,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn production_next_completed_retirement_is_pruning_bound_and_restart_exact() {
+        let store = MemoryStore::new();
+        let preimage = [0x6a; 32];
+        let registration = htlc(preimage);
+        let snapshot = store.snapshot().expect("registration snapshot");
+        let mut register = store.batch();
+        register_tracked_contract(&snapshot, &mut register, profile(), &registration)
+            .expect("register completed fixture");
+        drop(snapshot);
+        store.commit(register).expect("commit registration");
+
+        let funding_transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 50,
+                address: registration.funding_address().expect("funding address"),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: 0,
+        };
+        let funding_block = block(vec![funding_transaction.clone()]);
+        let snapshot = store.snapshot().expect("funding snapshot");
+        let mut connect = store.batch();
+        stage_connect(&snapshot, &mut connect, &funding_block, 10, profile())
+            .expect("connect funding");
+        drop(snapshot);
+        store.commit(connect).expect("commit funding");
+
+        let funding = Coin {
+            outpoint: Outpoint {
+                txid: funding_transaction.txid(),
+                index: 0,
+            },
+            value: 50,
+            height: 10,
+            coinbase: true,
+            address: registration.funding_address().expect("funding address"),
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        };
+        let mut state = store.batch();
+        write_coin_to_batch(&mut state, &funding).expect("seed funding coin");
+        store.commit(state).expect("commit funding coin");
+        let spending_transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: funding.outpoint.clone(),
+                sequence: u32::MAX,
+                witness: Witness {
+                    items: vec![
+                        low_s_signature(HNS_HTLC_SIGHASH_ALL),
+                        preimage.to_vec(),
+                        vec![1],
+                        registration.lock_script().expect("HTLC script"),
+                    ],
+                },
+            }],
+            outputs: Vec::new(),
+            locktime: 0,
+        };
+        let spending_block = block(vec![spending_transaction.clone()]);
+        let snapshot = store.snapshot().expect("spend snapshot");
+        let mut spend = store.batch();
+        stage_connect(&snapshot, &mut spend, &spending_block, 11, profile())
+            .expect("connect spend");
+        drop(snapshot);
+        store.commit(spend).expect("commit spend");
+
+        let snapshot = store.snapshot().expect("completed snapshot");
+        let lifecycle_revision =
+            tracked_contract_lifecycle_revision(&snapshot, profile(), registration.id)
+                .expect("lifecycle read")
+                .expect("lifecycle revision");
+        let mut unacknowledged = store.batch();
+        assert!(matches!(
+            retire_completed_tracked_contract(
+                &snapshot,
+                &mut unacknowledged,
+                profile(),
+                &registration,
+                lifecycle_revision,
+                ContractRollbackBoundary {
+                    pruned_through: 11,
+                    block_hash: spending_block.hash(),
+                },
+                false,
+            ),
+            Err(IndexError::ContractRollbackRequired)
+        ));
+        let mut too_early = store.batch();
+        assert!(matches!(
+            retire_completed_tracked_contract(
+                &snapshot,
+                &mut too_early,
+                profile(),
+                &registration,
+                lifecycle_revision,
+                ContractRollbackBoundary {
+                    pruned_through: 10,
+                    block_hash: funding_block.hash(),
+                },
+                true,
+            ),
+            Err(IndexError::ContractRollbackRequired)
+        ));
+
+        let rollback_boundary = ContractRollbackBoundary {
+            pruned_through: 11,
+            block_hash: spending_block.hash(),
+        };
+        let mut retire = store.batch();
+        let (outcome, proof) = retire_completed_tracked_contract(
+            &snapshot,
+            &mut retire,
+            profile(),
+            &registration,
+            lifecycle_revision,
+            rollback_boundary,
+            true,
+        )
+        .expect("completed retirement");
+        assert_eq!(outcome, CompletedContractRetirementOutcome::Retired);
+        assert_eq!(proof.confirmed_event_count, 2);
+        assert_eq!(proof.minimum_event_height, 10);
+        assert_eq!(proof.maximum_event_height, 11);
+        assert_ne!(proof.ordered_event_commitment, [0; 32]);
+        assert_eq!(proof.revealed_preimages.len(), 1);
+        assert_eq!(
+            proof.revealed_preimages[0]
+                .preimage
+                .expose_for_settlement(),
+            &preimage
+        );
+        drop(snapshot);
+        store.commit(retire).expect("commit retirement");
+
+        let snapshot = store.snapshot().expect("restart snapshot");
+        assert_eq!(
+            tracked_contract(&snapshot, profile(), registration.id).expect("active lookup"),
+            None
+        );
+        let restarted = completed_tracked_contract_retirement(
+            &snapshot,
+            profile(),
+            registration.id,
+        )
+        .expect("retirement lookup")
+        .expect("retirement proof");
+        assert_eq!(restarted, proof);
+        validate_tracked_contract_registry(&snapshot, profile()).expect("active topology");
+        validate_completed_tracked_contract_retirements(
+            &snapshot,
+            profile(),
+            Some(rollback_boundary),
+            |height| Ok((height == 11).then_some(spending_block.hash())),
+        )
+        .expect("retirement restart validation");
+        let mut reregister = store.batch();
+        assert!(matches!(
+            register_tracked_contract(&snapshot, &mut reregister, profile(), &registration),
+            Err(IndexError::ContractRetired)
+        ));
+        let mut retry = store.batch();
+        let (retry_outcome, retry_proof) = retire_completed_tracked_contract(
+            &snapshot,
+            &mut retry,
+            profile(),
+            &registration,
+            lifecycle_revision,
+            rollback_boundary,
+            true,
+        )
+        .expect("idempotent completed retirement");
+        assert_eq!(
+            retry_outcome,
+            CompletedContractRetirementOutcome::AlreadyRetired
+        );
+        assert_eq!(retry_proof, proof);
+    }
+
+    #[test]
+    fn production_next_retirement_startup_refuses_missing_or_changed_rollback_authority() {
+        let store = MemoryStore::new();
+        let registration = htlc([0x6b; 32]);
+        let lifecycle_revision = 7;
+        let terminal = StoredTrackedContractEvent::Spend {
+            contract_id: registration.id,
+            funding: TrackedContractFunding {
+                contract_id: registration.id,
+                coin: Coin {
+                    outpoint: Outpoint {
+                        txid: Txid::new([0x71; 32]),
+                        index: 1,
+                    },
+                    value: 50,
+                    height: 20,
+                    coinbase: false,
+                    address: registration.funding_address().expect("funding address"),
+                    covenant: Covenant {
+                        kind: CovenantKind::None,
+                        items: Vec::new(),
+                    },
+                },
+                block_hash: BlockHash::new([0x72; 32]),
+                height: 20,
+                transaction_position: 1,
+                output_position: 1,
+            },
+            spending_txid: Txid::new([0x73; 32]),
+            block_hash: BlockHash::new([0x74; 32]),
+            height: 21,
+            transaction_position: 2,
+            input_position: 1,
+            kind: StoredTrackedContractSpendKind::HtlcRefund,
+        };
+        let boundary = ContractRollbackBoundary {
+            pruned_through: 21,
+            block_hash: BlockHash::new([0x75; 32]),
+        };
+        let tombstone = StoredCompletedContractRetirement {
+            registration: registration.clone(),
+            lifecycle_revision,
+            confirmed_event_count: 2,
+            minimum_event_height: 20,
+            maximum_event_height: 21,
+            ordered_event_commitment: [0x76; 32],
+            terminal_event: terminal,
+            revealed_preimages: Vec::new(),
+            rollback_boundary: boundary,
+            permanent_abandonment_acknowledged: true,
+        };
+        let key = retirement_key(registration.id);
+        let mut seed = store.batch();
+        seed.put(
+            ColumnFamily::TxIndex,
+            LIFECYCLE_SEQUENCE_KEY,
+            &encode_lifecycle_sequence(lifecycle_revision),
+        )
+        .expect("seed lifecycle");
+        seed.put(
+            ColumnFamily::TxIndex,
+            RETIREMENT_COUNT_KEY,
+            &encode_retirement_count(1),
+        )
+        .expect("seed retirement count");
+        seed.put(
+            ColumnFamily::TxIndex,
+            &key,
+            &encode_record(b"contract-completed-retirement-v1", &key, &tombstone)
+                .expect("encode tombstone"),
+        )
+        .expect("seed tombstone");
+        store.commit(seed).expect("commit tombstone");
+
+        let snapshot = store.snapshot().expect("restart snapshot");
+        assert!(validate_completed_tracked_contract_retirements(
+            &snapshot,
+            profile(),
+            None,
+            |_| Ok(None),
+        )
+        .is_err());
+        assert!(validate_completed_tracked_contract_retirements(
+            &snapshot,
+            profile(),
+            Some(ContractRollbackBoundary {
+                pruned_through: 20,
+                block_hash: BlockHash::new([0x77; 32]),
+            }),
+            |_| Ok(None),
+        )
+        .is_err());
+        assert!(validate_completed_tracked_contract_retirements(
+            &snapshot,
+            profile(),
+            Some(boundary),
+            |height| Ok((height == 21).then_some(BlockHash::new([0x78; 32]))),
+        )
+        .is_err());
+        validate_completed_tracked_contract_retirements(
+            &snapshot,
+            profile(),
+            Some(boundary),
+            |height| {
+                Ok(match height {
+                    21 => Some(boundary.block_hash),
+                    _ => None,
+                })
+            },
+        )
+        .expect_err("terminal block also needs exact canonical authority");
+        validate_completed_tracked_contract_retirements(
+            &snapshot,
+            profile(),
+            Some(boundary),
+            |height| {
+                Ok(match height {
+                    21 => Some(BlockHash::new([0x74; 32])),
+                    _ => None,
+                })
+            },
+        )
+        .expect_err("rollback checkpoint hash must remain canonical too");
+    }
+
+    #[test]
+    fn production_next_completed_retirement_rejects_reused_funding_outpoint_history() {
+        let store = MemoryStore::new();
+        let registration = htlc([0x6c; 32]);
+        let outpoint = Outpoint {
+            txid: Txid::new([0x81; 32]),
+            index: 0,
+        };
+        let funding = TrackedContractFunding {
+            contract_id: registration.id,
+            coin: Coin {
+                outpoint: outpoint.clone(),
+                value: 50,
+                height: 30,
+                coinbase: false,
+                address: registration.funding_address().expect("funding address"),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            },
+            block_hash: BlockHash::new([0x82; 32]),
+            height: 30,
+            transaction_position: 0,
+            output_position: 0,
+        };
+        let first_spend = TrackedContractEvent::Spend {
+            contract_id: registration.id,
+            funding: funding.clone(),
+            spending_txid: Txid::new([0x83; 32]),
+            block_hash: BlockHash::new([0x84; 32]),
+            height: 31,
+            transaction_position: 0,
+            input_position: 0,
+            kind: TrackedContractSpendKind::HtlcRefund,
+        };
+        let mut reused_funding = funding.clone();
+        reused_funding.height = 32;
+        reused_funding.block_hash = BlockHash::new([0x85; 32]);
+        let second_spend = TrackedContractEvent::Spend {
+            contract_id: registration.id,
+            funding: reused_funding.clone(),
+            spending_txid: Txid::new([0x86; 32]),
+            block_hash: BlockHash::new([0x87; 32]),
+            height: 33,
+            transaction_position: 0,
+            input_position: 0,
+            kind: TrackedContractSpendKind::HtlcRefund,
+        };
+        let mut seed = store.batch();
+        for event in [
+            TrackedContractEvent::Funding(funding),
+            first_spend,
+            TrackedContractEvent::Funding(reused_funding),
+            second_spend,
+        ] {
+            put_event(&mut seed, &event).expect("seed corrupt event history");
+        }
+        store.commit(seed).expect("commit corrupt event history");
+        let snapshot = store.snapshot().expect("history snapshot");
+        assert!(matches!(
+            analyze_completed_history(&snapshot, &registration),
+            Err(IndexError::Corrupt(_))
         ));
     }
 

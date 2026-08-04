@@ -18,6 +18,12 @@ committed fixture tests, `scripts/check.sh`, and
 `scripts/qualify-two-node-regtest.sh` run directly from this standalone
 repository.
 
+The completed-contract retirement tranche adds focused tests prefixed
+`production_next_`, but no Cargo test, build, RocksDB reopen, or full gate was
+run while authoring this source commit. The cases are committed qualification
+inputs, not a passed result; release evidence must execute them on the final
+integrated commit with the repository's required prebuilt RocksDB linkage.
+
 ## Current standalone gate
 
 ```bash
@@ -379,10 +385,18 @@ Tests must cover:
 - never-confirmed contract retirement reclaiming shared-address and global
   capacity, idempotent absence, exact re-registration with lifecycle-ABA
   rejection, monotonic confirmation across disconnect/restart reads,
-  legacy-unknown refusal, profile-v1-to-v2 downgrade fencing, exact
+  legacy-unknown refusal, profile-v1/v2-to-v3 downgrade fencing, exact
   chain/tip/mempool-generation backend guards, the conservative zero-retained-
   orphan gate, and exact funding-predicate rejection used by the immutable
   accepted ordinary/airdrop scan;
+- completed-contract retirement rejecting a retained rollback horizon, active
+  funding, missing permanent-abandonment acknowledgement, reused historical
+  outpoints, matching current funding, and retained orphans; atomically
+  reclaiming active topology only after a bounded exact funding/spend walk;
+  preserving terminal branch evidence and every revealed preimage; committing
+  ordered event bytes plus min/max heights; refusing re-registration; exact
+  idempotent retries; and startup refusal for missing/regressed/non-canonical
+  pruning authority or corrupt tombstone topology;
 - contract-ID- and chain-epoch-bound funding/event continuations plus terminal-
   page canonical-generation overlap rejection;
 - global sorted-script confirmed history/UTXO traversal, reverse index mapping,

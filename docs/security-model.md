@@ -297,6 +297,16 @@ Fixtures are evidence, not authority.
   writer compare-and-commit. Legacy-unknown or ever-confirmed
   state fails closed, so retirement cannot remove a descriptor required by a
   retained disconnect.
+- Completed retirement is a distinct irreversible transition. It requires a
+  fully spent, bounded, exactly paired event history entirely below the
+  store's undo-pruned frontier, plus exact descriptor/lifecycle,
+  chain/tip/checkpoint, mempool instance/generation, zero-orphan, and
+  no-matching-funding authority. The immutable tombstone retains the descriptor,
+  terminal spend, every revealed preimage, min/max heights, and an ordered-row
+  commitment. Startup checks its canonical boundary and terminal hashes. An
+  explicit permanent-abandonment acknowledgement records that later matching
+  consensus outputs will be deliberately untracked; retired IDs cannot be
+  reused or automatically reactivated.
 - Multi-script confirmed and mempool results use positions in the sorted
   request. Confirmed cursors bind the script-set digest and durable chain epoch;
   collection admission and a 256-prefix-page bound permit empty resumable
@@ -375,12 +385,13 @@ Fixtures are evidence, not authority.
   Frozen vectors are cross-boundary qualification evidence; release qualification
   requires a published canonical `hns-swap` commit plus a pinned, qualified
   adapter.
-- Active global and per-address registry slots can be reclaimed only for
-  never-confirmed registrations whose prior broadcasts the caller explicitly
-  abandons. Used/completed descriptors still
-  cannot be retired safely in this schema, so exhaustion remains a
-  production-availability threat and untrusted registration must remain
-  unavailable.
+- Active global and per-address registry slots can be reclaimed for exact
+  never-confirmed abandonments and for qualified completed lifecycles. The
+  completed tombstone registry is itself immutable and capped at 65,536, while
+  each atomic proof walk is capped at 4,096 rows. Those finite lifetime limits,
+  the unpublished canonical protocol adapter, and unexecuted qualification for
+  this source tranche remain production-availability threats; untrusted
+  registration therefore remains unavailable.
 
 ## Failure policy
 

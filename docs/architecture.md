@@ -215,8 +215,16 @@ lifecycle revision, requiring zero retained transaction orphans, scanning the
 current immutable accepted ordinary/airdrop pool, and exact canonical-writer
 compare-and-commit. This reclaims active global and per-address slots without
 removing any descriptor needed by disconnect. Legacy-unknown and ever-confirmed
-registrations fail closed. Completed-contract retirement still needs a
-reorg-aware lifecycle and remains an explicit production-availability blocker.
+registrations fail closed on that path. The distinct completed transition
+requires a fully paired, fully spent bounded event history below the durable
+undo-pruned frontier and the same exact chain/tip/mempool authority. It replaces
+the live descriptor with an immutable, separately bounded tombstone containing
+the exact public identity, terminal and revealed-preimage evidence, min/max
+heights, pruning checkpoint, and commitment over all ordered deleted rows.
+Startup rechecks the current frontier and canonical proof hashes; the retired
+ID can never be reused. Active slots are reclaimed, but the finite tombstone
+quota and explicit decision to leave any later matching output untracked keep
+untrusted registration a production-availability blocker.
 The caller must separately and durably abandon prior broadcasts because an
 evicted transaction can be rebroadcast after the current-mempool proof.
 Local profile duplication and frozen vectors are not protocol authority.

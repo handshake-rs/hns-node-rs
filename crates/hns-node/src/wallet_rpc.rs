@@ -636,14 +636,18 @@ fn map_backend_error(
             "the tracked-contract registration is invalid or conflicts",
             false,
         ),
-        WalletBackendError::ContractCapacity => wallet_rpc_failure(
+        WalletBackendError::ContractCapacity
+        | WalletBackendError::ContractRetirementCapacity
+        | WalletBackendError::ContractRetirementHistoryCapacity => wallet_rpc_failure(
             request_id,
             StatusCode::INSUFFICIENT_STORAGE,
             "contract_registry_full",
             "the active tracked-contract registry is full",
             false,
         ),
-        WalletBackendError::ContractNotRetirable => wallet_rpc_failure(
+        WalletBackendError::ContractNotRetirable
+        | WalletBackendError::ContractRollbackRequired
+        | WalletBackendError::PermanentContractAbandonmentRequired => wallet_rpc_failure(
             request_id,
             StatusCode::CONFLICT,
             "contract_not_retirable",
@@ -653,6 +657,7 @@ fn map_backend_error(
         WalletBackendError::StaleMempoolGeneration { .. }
         | WalletBackendError::StaleMempoolInstance
         | WalletBackendError::StaleContractLifecycle { .. }
+        | WalletBackendError::StaleContractRollbackBoundary
         | WalletBackendError::StaleChainEpoch { .. }
         | WalletBackendError::StaleCanonicalRead => wallet_rpc_failure(
             request_id,

@@ -168,9 +168,16 @@ Implemented:
   registrations after binding the caller's revision, requiring no retained
   transaction orphans, and applying an exact current accepted ordinary/airdrop
   scan plus canonical-writer guard,
-  atomically reclaiming active global and per-address slots. Used, completed,
-  and legacy-unknown registrations remain non-retirable and a narrower
-  production-availability blocker. This implementation is awaiting the
+  atomically reclaiming active global and per-address slots. A separate typed
+  completed transition reclaims the same active slots only for an exactly
+  paired, fully spent event history below the durable undo-pruned frontier.
+  Its immutable tombstone preserves exact descriptor/lifecycle identity,
+  terminal and revealed-preimage evidence, min/max heights, and a commitment
+  over all ordered deleted rows; startup checks current pruning and canonical
+  block authority. Retired IDs cannot be reused. Legacy-unknown records remain
+  non-retirable. The finite tombstone/event limits and permanent-abandonment
+  semantics remain a narrower production-availability blocker and untrusted
+  registration remains absent. This implementation is awaiting the
   repository's full gate, an independent wallet transport adapter, a published
   and pinned canonical `hns-swap` commit, and cross-repository adapter
   qualification; local script duplication and frozen vectors are not protocol
@@ -180,7 +187,9 @@ Implemented:
   passed 2 tests with 0 failures and 75 filtered. It covers only the canonical
   action-height/source helpers; wallet-backend/RPC, restart/reorg/adversarial,
   RocksDB, and the repository's full qualification gate remain unexecuted for
-  this tranche and inherit no result from an earlier commit.
+  that prior tranche and inherit no result from an earlier commit. The new
+  `production_next_` completed-retirement tests were added as source but no
+  Cargo test, build, RocksDB reopen, or full gate was run for this commit.
 - A bounded hash-first Denuo marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live

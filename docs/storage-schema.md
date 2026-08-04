@@ -347,16 +347,34 @@ cannot promote a block or grant authority.
   is needed because no chain event existed; an exact later registration is a
   fresh lifecycle. The typed node wrapper additionally requires no retained
   transaction orphans and scans the exact accepted ordinary/airdrop generation
-  before exact-epoch commit. Completed/used registrations have no safe retirement record
-  and remain a production-availability blocker. The checksummed
+  before exact-epoch commit.
+  `wallet-index/v1/contract/retirement/<contract-id>` holds an immutable,
+  checksummed completed-lifecycle tombstone. It preserves the exact descriptor,
+  lifecycle revision, terminal spend, every revealed preimage with its
+  outpoint/transaction binding, event count and min/max heights, the exact
+  undo-pruning checkpoint, a permanent-abandonment acknowledgement, and a
+  domain-separated SHA-256 commitment over each ordered deleted event key and
+  stored value followed by the event count. Retirement requires a bounded
+  complete funding/spend pairing walk, no reused funding outpoint, no active
+  funding, and every event at or below the authoritative pruned-undo frontier.
+  The tombstone, event deletion, active address/count reclamation, and
+  observation/registration deletion share one batch. A separate checksummed
+  `wallet-index/v1/contract/retirement-count` caps immutable tombstones at
+  65,536; one transition is capped at 4,096 event rows. Startup checks every
+  tombstone against the current pruning frontier and canonical boundary and
+  terminal hashes. Retired IDs cannot be registered again. These finite
+  lifetime bounds keep untrusted registration unavailable despite reclaiming
+  active slots. The checksummed
   `wallet-index-profile/v1` snapshot record prevents partially
   indexed history
   from being enabled after startup; see
   [Handshake wallet indexes](HNS_NODE_WALLET_INDEX.md).
-  Profile payload version 2 is a downgrade fence for the lifecycle records.
-  Current startup reads version 1 only to validate and atomically rewrite it to
-  version 2 before enabling writers; older binaries reject version 2 instead of
-  silently connecting/disconnecting blocks without updating confirmation state.
+  Profile payload version 3 is a downgrade fence for immutable retirement
+  tombstones. Current startup reads versions 1 and 2 only to validate all
+  lifecycle/retirement topology and atomically rewrite the profile to version 3
+  before enabling writers. Older binaries reject version 3 instead of silently
+  allowing a retired descriptor identity to be registered or ignoring its
+  startup proof.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.

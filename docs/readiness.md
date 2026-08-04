@@ -197,17 +197,25 @@ global and per-address slots under an exact chain/current-mempool generation.
 It requires zero retained transaction orphans and scans accepted ordinary
 transactions and airdrop outputs. The caller must durably abandon prior
 broadcasts; the node cannot prove an evicted transaction will never return.
-Completed or legacy
-registrations still have no safe retirement lifecycle, leaving a narrower
-production-availability blocker. Live marketplace wire
+Completed lifecycles now have a source-complete typed tombstone transition,
+but only after their bounded exact event history lies below the irreversible
+undo frontier and the caller permanently abandons descriptor reuse. The
+tombstone retains terminal/preimage evidence and a commitment over deleted
+rows while reclaiming active slots. Legacy-unknown records remain
+non-retirable. The completed path has not run its focused or full qualification
+gates, its immutable tombstone registry has a finite 65,536-entry lifetime cap,
+and later matching outputs are deliberately untracked; untrusted registration
+therefore remains unavailable and production availability remains blocked.
+Live marketplace wire
 advertisement separately awaits the
 published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
 adapter gate.
 
-The current local evidence is intentionally narrow: the NVMe
+The prior local evidence is intentionally narrow: the NVMe
 `hns-consensus` `wallet_name_action` filter passed 2 tests with 0 failures and
-75 filtered. No `hns-node` target, RocksDB target, full gate, network, restart,
-reorg, or resource qualification ran for this source tranche.
+75 filtered. The completed-retirement source commit has no executed test or
+build result. No `hns-node` target, RocksDB target, full gate, network, restart,
+reorg, or resource qualification ran for it.
 
 Fee-quote source tests and documentation are present but were not executed in
 the source-only tranche that introduced the method. A quote is exact only for

@@ -117,6 +117,11 @@ connection never scans the registry. Contract funding and event pages share the
 topology, verifies the checksummed count and every reverse binding, and fails
 closed on missing, duplicate, or malformed state.
 
+Completed retirements use a separate immutable registry capped at 65,536
+tombstones. One transition may consume at most 4,096 confirmed event rows. The
+finite limits bound atomic write size and startup validation; they do not claim
+lifetime-unbounded admission for an untrusted registrar.
+
 Each new registration atomically creates a checksummed monotonic confirmation
 record with a retained lifecycle revision that changes on exact re-registration
 through the serialized node writer. The first matching confirmed funding marks it confirmed in the same
@@ -144,18 +149,33 @@ tracked under the removed descriptor.
 
 Existing registrations that predate the monotonic record are marked
 `LegacyUnknown` on an idempotent registration write and fail closed for this
-retirement. Registrations ever confirmed on any connected branch also remain
-ineligible even after disconnect removes all current events. Completed or used
-contracts still have no reorg-aware retirement/tombstone lifecycle because
-disconnect discovers historical reversals through the live descriptor binding.
-Their capacity remains unreclaimable, so completed-contract lifecycle and
-untrusted-registration quotas remain explicit production-availability work.
-Manual key deletion is corruption, not reclamation.
+retirement. A distinct typed completed-retirement operation handles only a
+currently fully spent `Confirmed` lifecycle. It walks the complete bounded,
+ordered event history, rejects duplicate funding outpoints, proves every
+funding has one exact spend, requires no active funding, and refuses any event
+above the durable undo-pruning checkpoint. The same chain/tip/mempool binding,
+zero-orphan rule, accepted ordinary/airdrop funding scan, and exact writer
+compare-and-commit apply. The caller must explicitly acknowledge permanent
+descriptor abandonment.
+
+The atomic mutation replaces the active registration/observation/history with
+a checksummed tombstone containing the exact descriptor and lifecycle,
+terminal spend, every revealed-preimage settlement binding, event count,
+minimum/maximum height, undo-frontier height/hash, and SHA-256 commitment to
+the exact ordered deleted event keys and stored bytes. It removes active
+address membership and reclaims global/per-address capacity. Startup validates
+the bounded tombstone topology, current frontier, and canonical checkpoint and
+terminal hashes. Re-registration of that content-derived ID is permanently
+rejected. A later consensus-valid matching output is deliberately untracked,
+which is why abandonment is explicit and this operation is not automatic.
+Manual key deletion remains corruption, not reclamation.
 
 ## Pruning
 
-Wallet index rows are active-chain metadata and are not deleted by raw
-block/undo pruning. Therefore:
+Wallet index rows are active-chain metadata and are not automatically deleted
+by raw block/undo pruning. The only coupling is explicit completed retirement,
+which may replace a fully spent contract history with its immutable tombstone
+after the corresponding undo is already gone. Therefore:
 
 - transaction inclusion, confirmation, script history, script UTXOs, spender
   lookup, name state, and current name proof continue to work;
@@ -183,8 +203,8 @@ them from canonical block/state data, never modifying consensus state to agree
 with a secondary index.
 
 Contract registrations, address bindings, active fundings, confirmed events,
-and the registry count are independently versioned, checksummed, and bound to
-their complete database keys. Descriptor identities are BLAKE2b-256 over the
+active/retirement counts, and completed tombstones are independently versioned,
+checksummed, and bound to their complete database keys. Descriptor identities are BLAKE2b-256 over the
 fixed `hns-wallet-index/contract-id` domain, encoding version byte, contract
 tag, fixed descriptor fields, and fixed-width big-endian integer fields. They
 do not depend on JSON, serde, field order, or a node network. This intentional
@@ -224,6 +244,9 @@ and the live peer manager. It implements:
 - `register_tracked_contract`
 - `get_tracked_contract_retirement_context`
 - `retire_never_confirmed_tracked_contract`
+- `get_completed_tracked_contract_retirement_context`
+- `retire_completed_tracked_contract`
+- `get_completed_tracked_contract_retirement`
 - `get_tracked_contract`
 - `get_tracked_contract_fundings`
 - `get_tracked_contract_events`
@@ -448,7 +471,9 @@ deserialization refuses to reconstruct a preimage. Internal checksummed event
 persistence retains the raw 32 bytes so restart and disconnect remain exact;
 callers can obtain them only through the explicit `expose_for_settlement`
 accessor. The chain value is already public at that point; wallet code must
-still keep it out of logs.
+still keep it out of logs. Completed retirement carries every such value into
+the tombstone with its funding-outpoint and spending-transaction binding; it
+never drops an internally retained revealed preimage.
 
 ## Remaining integration work
 
@@ -456,9 +481,11 @@ This source implementation now has a bounded authenticated process transport,
 but still needs the repository's full qualification gate and an independent
 cross-repository wallet adapter implementation/qualification, including the
 canonical `hns-swap` pin described above, before it is release-qualified.
-Completed-contract retirement and capacity reclamation remain unavailable and
-are a production-availability blocker; only never-confirmed, explicitly
-abandoned active slots can currently be reclaimed. Live subscription delivery remains outside
+Completed-contract active-slot reclamation is implemented in source but has
+not run its focused, restart/reorg, RocksDB, adversarial, or full qualification
+gates in this tranche. Its finite 65,536 tombstone quota and permanent-
+abandonment semantics are still production-availability constraints, so
+untrusted registration remains unavailable. Live subscription delivery remains outside
 this typed pull API. Durable encrypted workflow state, rebroadcast journals,
 matching decisions, transaction construction/signing, and secret preimages
 remain wallet responsibilities.

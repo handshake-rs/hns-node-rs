@@ -27,7 +27,16 @@ typed in-process backend can reclaim registrations that authoritative durable
 state proves were never confirmed, provided the caller permanently abandons
 every prior funding broadcast, the exact current accepted ordinary/airdrop pool
 has no matching funding, and the bound pool retains no transaction orphans.
-Completed-contract retirement is still unavailable. The repository also awaits its independent wallet adapter,
+It also contains a source-complete, typed completed-contract retirement path:
+an exact fully spent lifecycle can become an immutable tombstone only after
+every confirmed event is below the store's irreversible undo-pruning frontier.
+The tombstone retains the complete descriptor, terminal spend and revealed
+preimages, min/max heights, and an ordered event commitment while reclaiming
+active global/per-address slots. This path has not yet run its focused or full
+qualification gates. Tombstones have a separate finite lifetime cap, later
+matching funding is deliberately untracked after explicit permanent
+abandonment, and registration remains absent from untrusted wallet RPC. The
+repository also awaits its independent wallet adapter,
 canonical `hns-swap` pin, and cross-project qualification. See the
 [wallet-index status](docs/HNS_NODE_WALLET_INDEX.md) and
 [wire contract](docs/WALLET_RPC_V1.md).

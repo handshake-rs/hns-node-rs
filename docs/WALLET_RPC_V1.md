@@ -402,14 +402,16 @@ qualification.
 
 Wallet RPC v1 exposes neither registration nor retirement. The in-process typed
 backend can reclaim the 16,384-active-entry and 256-active-descriptors-per-address
-capacity only for registrations whose monotonic durable state proves they were
-never confirmed, after binding its exact lifecycle revision, requiring no
-retained transaction orphans, and scanning the exact current accepted ordinary/
-airdrop generation. The in-process caller must also abandon prior broadcasts
-that the node can no longer observe. Used/completed and
-legacy-unknown registrations remain non-retirable, so capacity exhaustion is
-still a production-availability blocker even though untrusted registration is
-absent from this endpoint.
+capacity for exact never-confirmed abandonments and for fully spent completed
+lifecycles below the irreversible undo frontier. Both paths bind exact
+lifecycle/chain/mempool authority, require no retained transaction orphans,
+and scan the current accepted ordinary/airdrop generation. Completed retirement
+is an irreversible, separately bounded tombstone transition with explicit
+permanent-abandonment semantics; later matching outputs are deliberately
+untracked. Legacy-unknown registrations remain non-retirable, and the finite
+tombstone quota keeps capacity exhaustion a production-availability blocker.
+Untrusted registration and every retirement mutation remain absent from this
+endpoint.
 
 ## Resource and authority boundaries
 

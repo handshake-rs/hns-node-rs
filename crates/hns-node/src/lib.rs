@@ -18,11 +18,13 @@ pub use hns_denuo_market_relay::{
 };
 pub use hns_p2p::LivePeerManager;
 pub use hns_wallet_index::{
-    ContractId, ContractRegistration, ContractRegistrationOutcome, ContractRetirementOutcome,
-    HnsHtlcDescriptor, RevealedPreimage, ScriptHistoryCursor, ScriptHistoryDirection,
-    ScriptHistoryEntry, ScriptHistoryPage, ScriptId, ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage,
-    ShakedexV2Descriptor, SpendingTransaction, TrackedContractEvent, TrackedContractFunding,
-    TrackedContractKind, TrackedContractSpendKind, WalletIndexProfile,
+    CompletedContractRetirement, CompletedContractRetirementOutcome, ContractId,
+    ContractRegistration, ContractRegistrationOutcome, ContractRetirementOutcome,
+    ContractRollbackBoundary, HnsHtlcDescriptor, RetiredRevealedPreimage, RevealedPreimage,
+    ScriptHistoryCursor, ScriptHistoryDirection, ScriptHistoryEntry, ScriptHistoryPage, ScriptId,
+    ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage, ShakedexV2Descriptor, SpendingTransaction,
+    TrackedContractEvent, TrackedContractFunding, TrackedContractKind, TrackedContractSpendKind,
+    WalletIndexProfile,
 };
 pub use mining_engine::{
     recommended_template_build_limits, MiningEngineConfig, MiningEngineDiagnostics,
@@ -31,19 +33,21 @@ pub use mining_engine::{
 };
 pub use native_sync::{NativeSyncConfig, NativeSyncDiagnostics};
 pub use wallet_backend::{
-    BlockHashEvidence, BroadcastResult, ConfirmedScriptHistory, ConfirmedScriptUtxo,
-    ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate, FeeEstimateSource,
-    MempoolContractActivity, MempoolContractEvent, MempoolContractPage, MempoolScriptActivity,
-    MempoolScriptOutput, MempoolScriptPage, MempoolScriptSpend, NameAction, NameActionContext,
-    NameActionIneligibility, NameEvidence, NameOwnerTransaction, NameProofResult,
-    NameRenewalContext, NameTransferContext, OutpointSpendingEntry, OutpointSpendingEvidence,
-    TrackedContractRetirement, TrackedContractRetirementContext, TrackedContractRetirementRequest,
-    TransactionEvidence, TransactionFeeQuote, TransactionInclusion, TransactionPayload,
-    TransactionStatus, WalletBackend, WalletBackendError, WalletChainTip,
-    WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
-    WalletContractFundingPage, WalletMempoolCursor, MAX_NAME_ACTION_INELIGIBILITY_REASONS,
-    MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS,
-    MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_OUTPOINT_SPEND_BATCH, NAME_ACTION_CONTEXT_VERSION,
+    BlockHashEvidence, BroadcastResult, CompletedTrackedContractRetirement,
+    CompletedTrackedContractRetirementContext, CompletedTrackedContractRetirementRequest,
+    ConfirmedScriptHistory, ConfirmedScriptUtxo, ConfirmedScriptsCursor, ConfirmedScriptsPage,
+    FeeEstimate, FeeEstimateSource, MempoolContractActivity, MempoolContractEvent,
+    MempoolContractPage, MempoolScriptActivity, MempoolScriptOutput, MempoolScriptPage,
+    MempoolScriptSpend, NameAction, NameActionContext, NameActionIneligibility, NameEvidence,
+    NameOwnerTransaction, NameProofResult, NameRenewalContext, NameTransferContext,
+    OutpointSpendingEntry, OutpointSpendingEvidence, TrackedContractRetirement,
+    TrackedContractRetirementContext, TrackedContractRetirementRequest, TransactionEvidence,
+    TransactionFeeQuote, TransactionInclusion, TransactionPayload, TransactionStatus,
+    WalletBackend, WalletBackendError, WalletChainTip, WalletContractEventCursor,
+    WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
+    WalletMempoolCursor, MAX_NAME_ACTION_INELIGIBILITY_REASONS, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
+    MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS, MAX_WALLET_FEE_QUOTE_INPUTS,
+    MAX_WALLET_OUTPOINT_SPEND_BATCH, NAME_ACTION_CONTEXT_VERSION,
 };
 pub use wallet_rpc::WALLET_RPC_API_VERSION;
 
@@ -146,10 +150,11 @@ use hns_store::{
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, STORAGE_PROFILE,
 };
 use hns_wallet_index::{
-    decode_index_profile, encode_index_profile, index_profile_is_current,
-    register_tracked_contract, retire_never_confirmed_tracked_contract,
+    decode_index_profile, encode_index_profile, index_profile_is_current, register_tracked_contract,
+    retire_completed_tracked_contract, retire_never_confirmed_tracked_contract,
     stage_connect as stage_wallet_index_connect, stage_disconnect as stage_wallet_index_disconnect,
-    validate_tracked_contract_registry, INDEX_PROFILE_MODE_KEY,
+    validate_completed_tracked_contract_retirements, validate_tracked_contract_registry,
+    INDEX_PROFILE_MODE_KEY,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -3869,6 +3874,32 @@ impl NodeService {
             &registration,
         )
         .map_err(anyhow::Error::new)?;
+        if read_canonical_hash(&snapshot, rollback_boundary.pruned_through)?
+            != Some(rollback_boundary.block_hash)
+        {
+            return Err(anyhow::Error::new(
+                hns_wallet_index::IndexError::Corrupt(
+                    "completed retirement rollback block is not canonical",
+                ),
+            ));
+        }
+        let TrackedContractEvent::Spend {
+            height, block_hash, ..
+        } = &retirement.1.terminal_event
+        else {
+            return Err(anyhow::Error::new(
+                hns_wallet_index::IndexError::Corrupt(
+                    "completed retirement terminal evidence is not a spend",
+                ),
+            ));
+        };
+        if read_canonical_hash(&snapshot, *height)? != Some(*block_hash) {
+            return Err(anyhow::Error::new(
+                hns_wallet_index::IndexError::Corrupt(
+                    "completed retirement terminal block is not canonical",
+                ),
+            ));
+        }
         drop(snapshot);
         self.state.store.commit(batch)?;
         Ok(outcome)
@@ -3893,6 +3924,46 @@ impl NodeService {
         drop(snapshot);
         self.state.store.commit(batch)?;
         Ok(outcome)
+    }
+
+    pub(crate) fn retire_completed_wallet_contract(
+        &mut self,
+        registration: ContractRegistration,
+        expected_lifecycle_revision: u64,
+        expected_rollback_boundary: ContractRollbackBoundary,
+        permanent_abandonment_acknowledged: bool,
+    ) -> Result<(
+        CompletedContractRetirementOutcome,
+        CompletedContractRetirement,
+    )> {
+        self.state.ensure_storage_operational()?;
+        let snapshot = self.state.store.snapshot()?;
+        let checkpoint = load_undo_pruning_checkpoint(&snapshot)?.ok_or_else(|| {
+            anyhow::Error::new(hns_wallet_index::IndexError::ContractRollbackRequired)
+        })?;
+        let rollback_boundary = ContractRollbackBoundary {
+            pruned_through: checkpoint.pruned_through,
+            block_hash: checkpoint.block_hash,
+        };
+        if rollback_boundary != expected_rollback_boundary {
+            return Err(anyhow::Error::new(
+                hns_wallet_index::IndexError::ContractRollbackRequired,
+            ));
+        }
+        let mut batch = self.state.store.batch();
+        let retirement = retire_completed_tracked_contract(
+            &snapshot,
+            &mut batch,
+            self.state.wallet_index_profile,
+            &registration,
+            expected_lifecycle_revision,
+            rollback_boundary,
+            permanent_abandonment_acknowledged,
+        )
+        .map_err(anyhow::Error::new)?;
+        drop(snapshot);
+        self.state.store.commit(batch)?;
+        Ok(retirement)
     }
 
     pub fn observed_mining_snapshot(&self) -> Result<Option<Arc<MiningSnapshot>>> {
@@ -9609,6 +9680,26 @@ impl NodeState {
         validate_tracked_contract_registry(&snapshot, profile)
             .map_err(anyhow::Error::new)
             .context("failed to validate tracked wallet contracts")?;
+        let rollback_boundary = load_undo_pruning_checkpoint(&snapshot)?.map(|checkpoint| {
+            ContractRollbackBoundary {
+                pruned_through: checkpoint.pruned_through,
+                block_hash: checkpoint.block_hash,
+            }
+        });
+        validate_completed_tracked_contract_retirements(
+            &snapshot,
+            profile,
+            rollback_boundary,
+            |height| {
+                read_canonical_hash(&snapshot, height).map_err(|_| {
+                    hns_wallet_index::IndexError::Corrupt(
+                        "failed to read canonical retirement proof height",
+                    )
+                })
+            },
+        )
+        .map_err(anyhow::Error::new)
+        .context("failed to validate completed wallet contract retirements")?;
         drop(snapshot);
         if persisted != Some(profile) || !profile_is_current {
             let mut batch = self.store.batch();

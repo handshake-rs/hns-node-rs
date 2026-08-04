@@ -25,10 +25,12 @@ use hns_state::{
 use hns_store::{ColumnFamily, ReadSnapshot, Store};
 use hns_urkel::UrkelProof;
 use hns_wallet_index::{
-    script_history, script_utxos, spending_transaction, tracked_contract, tracked_contract_events,
-    tracked_contract_funding, tracked_contract_fundings, tracked_contract_lifecycle_revision,
-    ContractId, ContractRegistration, ContractRegistrationOutcome, ContractRetirementOutcome,
-    IndexError, ScriptHistoryCursor, ScriptHistoryEntry, ScriptHistoryPage, ScriptId, ScriptUtxo,
+    completed_tracked_contract_retirement, script_history, script_utxos, spending_transaction,
+    tracked_contract, tracked_contract_events, tracked_contract_funding, tracked_contract_fundings,
+    tracked_contract_lifecycle_revision, CompletedContractRetirement,
+    CompletedContractRetirementOutcome, ContractId, ContractRegistration,
+    ContractRegistrationOutcome, ContractRetirementOutcome, ContractRollbackBoundary, IndexError,
+    ScriptHistoryCursor, ScriptHistoryEntry, ScriptHistoryPage, ScriptId, ScriptUtxo,
     ScriptUtxoCursor, ScriptUtxoPage, SpendingTransaction, TrackedContractCursor,
     TrackedContractEvent, TrackedContractFunding, TrackedContractSpendKind, MAX_QUERY_ENTRIES,
 };
@@ -36,9 +38,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    best_block_tip_from_snapshot, chain_epoch_from_snapshot, load_block, read_canonical_hash,
-    load_header_record, median_time_past_with_lookup, CanonicalEpoch, CanonicalStateWriter,
-    CanonicalWriterError,
+    best_block_tip_from_snapshot, chain_epoch_from_snapshot, load_block, load_header_record,
+    load_undo_pruning_checkpoint, median_time_past_with_lookup, read_canonical_hash,
+    CanonicalEpoch, CanonicalStateWriter, CanonicalWriterError,
     LivePeerManager as ReexportedLivePeerManager, NodeReadHandle, NodeRuntime,
 };
 
@@ -343,6 +345,80 @@ struct TrackedContractRetirementPlan {
     tip: Option<WalletChainTip>,
     mempool_instance_nonce: [u8; 32],
     mempool_generation: u64,
+}
+
+/// Exact authority-bearing request for irreversible completed retirement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompletedTrackedContractRetirementRequest {
+    /// Complete public registration being permanently consumed.
+    pub registration: ContractRegistration,
+    /// Exact durable lifecycle revision observed with this registration.
+    pub expected_lifecycle_revision: u64,
+    /// Durable chain generation observed by the caller.
+    pub expected_chain_epoch: u64,
+    /// Exact authenticated tip observed in that generation.
+    pub expected_tip: Option<WalletChainTip>,
+    /// Exact undo-pruning checkpoint which must still authorize deletion.
+    pub expected_rollback_boundary: ContractRollbackBoundary,
+    /// Process-local immutable mempool identity observed by the caller.
+    pub expected_mempool_instance_nonce: [u8; 32],
+    /// Exact immutable mempool generation observed by the caller.
+    pub expected_mempool_generation: u64,
+    /// Explicit acknowledgement that no party controlled by the caller will
+    /// ever fund, rebroadcast funding for, or re-register this descriptor.
+    /// Later matching outputs remain consensus-valid but deliberately
+    /// untracked by this retired lifecycle.
+    pub acknowledge_permanent_descriptor_abandonment: bool,
+}
+
+/// Typed in-process preparation context for completed retirement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompletedTrackedContractRetirementContext {
+    /// Active registration, when this lifecycle is not yet retired.
+    pub registration: Option<ContractRegistration>,
+    /// Existing immutable proof, when this lifecycle is already retired.
+    pub retirement: Option<CompletedContractRetirement>,
+    /// Active or retired lifecycle revision.
+    pub lifecycle_revision: Option<u64>,
+    /// Durable chain generation captured with the lifecycle.
+    pub chain_epoch: u64,
+    /// Exact authenticated tip captured with the lifecycle.
+    pub tip: Option<WalletChainTip>,
+    /// Current undo-pruning authority. Absence makes completion ineligible.
+    pub rollback_boundary: Option<ContractRollbackBoundary>,
+    /// Process-local immutable mempool identity captured with the lifecycle.
+    pub mempool_instance_nonce: [u8; 32],
+    /// Exact immutable mempool generation captured with the lifecycle.
+    pub mempool_generation: u64,
+}
+
+/// Committed completed retirement and its exact canonical proof binding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompletedTrackedContractRetirement {
+    /// Idempotent durable mutation result.
+    pub outcome: CompletedContractRetirementOutcome,
+    /// Immutable persisted proof, including the descriptor and event digest.
+    pub retirement: CompletedContractRetirement,
+    /// Durable chain generation used for the proof and mutation.
+    pub chain_epoch: u64,
+    /// Exact authenticated tip used for the proof and mutation.
+    pub tip: Option<WalletChainTip>,
+    /// Process-local mempool identity used for the proof.
+    pub mempool_instance_nonce: [u8; 32],
+    /// Exact immutable mempool generation scanned for future funding.
+    pub mempool_generation: u64,
+}
+
+struct CompletedTrackedContractRetirementPlan {
+    epoch: CanonicalEpoch,
+    registration: ContractRegistration,
+    lifecycle_revision: u64,
+    chain_epoch: u64,
+    tip: Option<WalletChainTip>,
+    rollback_boundary: ContractRollbackBoundary,
+    mempool_instance_nonce: [u8; 32],
+    mempool_generation: u64,
+    permanent_abandonment_acknowledged: bool,
 }
 
 /// Current canonical active-chain tip.
@@ -669,11 +745,29 @@ pub enum WalletBackendError {
     /// Active public contract registry capacity is exhausted.
     #[error("wallet tracked-contract registry is full")]
     ContractCapacity,
-    /// Retirement requires no confirmed history, no retained transaction
-    /// orphans, and no matching ordinary or airdrop funding in the exact
-    /// currently bound mempool generation.
-    #[error("wallet tracked-contract registration is not eligible for never-confirmed retirement")]
+    /// Immutable retirement tombstone registry capacity is exhausted.
+    #[error("wallet tracked-contract retirement registry is full")]
+    ContractRetirementCapacity,
+    /// One lifecycle has more confirmed rows than the bounded atomic
+    /// retirement proof walk permits.
+    #[error("wallet tracked-contract retirement history exceeds its hard bound")]
+    ContractRetirementHistoryCapacity,
+    /// Retirement requires the lifecycle-specific history state, no retained
+    /// transaction orphans, and no matching ordinary or airdrop funding in the
+    /// exact currently bound mempool generation.
+    #[error("wallet tracked-contract registration is not eligible for retirement")]
     ContractNotRetirable,
+    /// Completed retirement is above the durable undo-pruned frontier or lacks
+    /// a complete terminal history proof.
+    #[error("wallet tracked-contract history still requires rollback authority")]
+    ContractRollbackRequired,
+    /// Completed retirement requires an explicit permanent descriptor-lifecycle
+    /// abandonment acknowledgement.
+    #[error("wallet tracked-contract permanent abandonment was not acknowledged")]
+    PermanentContractAbandonmentRequired,
+    /// The undo-pruning checkpoint changed after retirement preparation.
+    #[error("wallet tracked-contract rollback boundary changed; retry")]
+    StaleContractRollbackBoundary,
     /// A retirement request belongs to an older exact registration lifecycle.
     #[error("wallet tracked-contract lifecycle changed from {expected} to {actual:?}")]
     StaleContractLifecycle { expected: u64, actual: Option<u64> },
@@ -1416,6 +1510,263 @@ impl WalletBackend {
         })
     }
 
+    /// Capture the exact lifecycle, canonical, mempool, and undo-pruning
+    /// bindings needed to prepare an irreversible completed retirement.
+    pub async fn get_completed_tracked_contract_retirement_context(
+        &self,
+        id: ContractId,
+    ) -> Result<CompletedTrackedContractRetirementContext, WalletBackendError> {
+        if !self.read.wallet_index_profile().wallet {
+            return Err(WalletBackendError::IndexDisabled("tracked-contract"));
+        }
+        let profile = self.read.wallet_index_profile();
+        let read = self.read.clone();
+        blocking_mempool_read(read, move |_, snapshot, mempool, _, epoch| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != epoch.chain_epoch {
+                return Err(WalletBackendError::Corrupt(
+                    "published and durable chain generations disagree",
+                ));
+            }
+            let registration =
+                tracked_contract(snapshot, profile, id).map_err(wallet_index_error)?;
+            let retirement = completed_tracked_contract_retirement(snapshot, profile, id)
+                .map_err(wallet_index_error)?;
+            if registration.is_some() && retirement.is_some() {
+                return Err(WalletBackendError::Corrupt(
+                    "tracked contract is both active and retired",
+                ));
+            }
+            let lifecycle_revision = match (&registration, &retirement) {
+                (Some(_), None) => tracked_contract_lifecycle_revision(snapshot, profile, id)
+                    .map_err(wallet_index_error)?,
+                (None, Some(retirement)) => Some(retirement.lifecycle_revision),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("checked above"),
+            };
+            let rollback_boundary = load_undo_pruning_checkpoint(snapshot)
+                .map_err(node_error)?
+                .map(|checkpoint| ContractRollbackBoundary {
+                    pruned_through: checkpoint.pruned_through,
+                    block_hash: checkpoint.block_hash,
+                });
+            Ok(CompletedTrackedContractRetirementContext {
+                registration,
+                retirement,
+                lifecycle_revision,
+                chain_epoch,
+                tip: wallet_chain_tip(snapshot)?,
+                rollback_boundary,
+                mempool_instance_nonce: *mempool.instance_nonce(),
+                mempool_generation: mempool.generation(),
+            })
+        })
+        .await
+    }
+
+    /// Permanently retire one fully spent descriptor lifecycle after its
+    /// complete confirmed history falls below the irreversible undo frontier.
+    ///
+    /// This is a first-party typed operation only; it is intentionally absent
+    /// from wallet RPC. The exact published mempool must contain no orphans and
+    /// no matching future funding, and the caller must explicitly acknowledge
+    /// permanent descriptor abandonment. The acknowledgement cannot prevent a
+    /// third party from creating a later consensus-valid matching output; such
+    /// an output is deliberately outside this retired lifecycle and untracked.
+    pub async fn retire_completed_tracked_contract(
+        &self,
+        request: CompletedTrackedContractRetirementRequest,
+    ) -> Result<CompletedTrackedContractRetirement, WalletBackendError> {
+        if !self.read.wallet_index_profile().wallet {
+            return Err(WalletBackendError::IndexDisabled("tracked-contract"));
+        }
+        if !request.acknowledge_permanent_descriptor_abandonment {
+            return Err(WalletBackendError::PermanentContractAbandonmentRequired);
+        }
+        request
+            .registration
+            .funding_address()
+            .map_err(wallet_index_error)?;
+        let profile = self.read.wallet_index_profile();
+        let read = self.read.clone();
+        let plan = blocking_mempool_read(read, move |_, snapshot, mempool, mempool_info, epoch| {
+            let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+            if chain_epoch != epoch.chain_epoch {
+                return Err(WalletBackendError::Corrupt(
+                    "published and durable chain generations disagree",
+                ));
+            }
+            if request.expected_chain_epoch != chain_epoch {
+                return Err(WalletBackendError::StaleChainEpoch {
+                    expected: request.expected_chain_epoch,
+                    actual: chain_epoch,
+                });
+            }
+            let tip = wallet_chain_tip(snapshot)?;
+            if request.expected_tip != tip {
+                return Err(WalletBackendError::StaleCanonicalRead);
+            }
+            let rollback_boundary = load_undo_pruning_checkpoint(snapshot)
+                .map_err(node_error)?
+                .map(|checkpoint| ContractRollbackBoundary {
+                    pruned_through: checkpoint.pruned_through,
+                    block_hash: checkpoint.block_hash,
+                })
+                .ok_or(WalletBackendError::ContractRollbackRequired)?;
+            if request.expected_rollback_boundary != rollback_boundary {
+                return Err(WalletBackendError::StaleContractRollbackBoundary);
+            }
+            if request.expected_mempool_instance_nonce != *mempool.instance_nonce() {
+                return Err(WalletBackendError::StaleMempoolInstance);
+            }
+            if request.expected_mempool_generation != mempool.generation() {
+                return Err(WalletBackendError::StaleMempoolGeneration {
+                    expected: request.expected_mempool_generation,
+                    actual: mempool.generation(),
+                });
+            }
+
+            let active = tracked_contract(snapshot, profile, request.registration.id)
+                .map_err(wallet_index_error)?;
+            let retired = completed_tracked_contract_retirement(
+                snapshot,
+                profile,
+                request.registration.id,
+            )
+            .map_err(wallet_index_error)?;
+            match (active, retired) {
+                (Some(stored), None) => {
+                    if stored != request.registration {
+                        return Err(WalletBackendError::InvalidContract);
+                    }
+                    let actual_lifecycle_revision =
+                        tracked_contract_lifecycle_revision(snapshot, profile, stored.id)
+                            .map_err(wallet_index_error)?;
+                    if actual_lifecycle_revision != Some(request.expected_lifecycle_revision) {
+                        return Err(WalletBackendError::StaleContractLifecycle {
+                            expected: request.expected_lifecycle_revision,
+                            actual: actual_lifecycle_revision,
+                        });
+                    }
+                    if !tracked_contract_fundings(snapshot, profile, stored.id, None, 1)
+                        .map_err(wallet_index_error)?
+                        .entries
+                        .is_empty()
+                    {
+                        return Err(WalletBackendError::ContractNotRetirable);
+                    }
+                }
+                (None, Some(retirement)) => {
+                    if retirement.registration != request.registration {
+                        return Err(WalletBackendError::InvalidContract);
+                    }
+                    if retirement.lifecycle_revision != request.expected_lifecycle_revision {
+                        return Err(WalletBackendError::StaleContractLifecycle {
+                            expected: request.expected_lifecycle_revision,
+                            actual: Some(retirement.lifecycle_revision),
+                        });
+                    }
+                }
+                (None, None) => return Err(WalletBackendError::UnknownContract),
+                (Some(_), Some(_)) => {
+                    return Err(WalletBackendError::Corrupt(
+                        "tracked contract is both active and retired",
+                    ));
+                }
+            }
+
+            if mempool_info.orphan_count != 0 {
+                return Err(WalletBackendError::ContractNotRetirable);
+            }
+            for txid in mempool.txids() {
+                let transaction = mempool
+                    .transaction(&txid)
+                    .ok_or(WalletBackendError::Corrupt(
+                        "published mempool references an absent transaction",
+                    ))?;
+                if transaction_contains_contract_funding(&request.registration, transaction)? {
+                    return Err(WalletBackendError::ContractNotRetirable);
+                }
+            }
+            for airdrop in mempool.airdrops() {
+                let address = Address::new(airdrop.proof.version, airdrop.proof.address.clone())
+                    .map_err(|_| {
+                        WalletBackendError::Corrupt(
+                            "accepted airdrop proof has an invalid output address",
+                        )
+                    })?;
+                let value = airdrop.value.checked_sub(airdrop.fee).ok_or(
+                    WalletBackendError::Corrupt(
+                        "accepted airdrop proof fee exceeds its output value",
+                    ),
+                )?;
+                if request
+                    .registration
+                    .matches_funding_output(&Output {
+                        value,
+                        address,
+                        covenant: Covenant {
+                            kind: CovenantKind::None,
+                            items: Vec::new(),
+                        },
+                    })
+                    .map_err(wallet_index_error)?
+                {
+                    return Err(WalletBackendError::ContractNotRetirable);
+                }
+            }
+
+            Ok(CompletedTrackedContractRetirementPlan {
+                epoch: epoch.clone(),
+                registration: request.registration,
+                lifecycle_revision: request.expected_lifecycle_revision,
+                chain_epoch,
+                tip,
+                rollback_boundary,
+                mempool_instance_nonce: *mempool.instance_nonce(),
+                mempool_generation: mempool.generation(),
+                permanent_abandonment_acknowledged: request
+                    .acknowledge_permanent_descriptor_abandonment,
+            })
+        })
+        .await?;
+        let CompletedTrackedContractRetirementPlan {
+            epoch,
+            registration,
+            lifecycle_revision,
+            chain_epoch,
+            tip,
+            rollback_boundary,
+            mempool_instance_nonce,
+            mempool_generation,
+            permanent_abandonment_acknowledged,
+        } = plan;
+        let (outcome, retirement) = self
+            .writer
+            .execute_at(
+                epoch,
+                "retire completed wallet contract",
+                move |node| {
+                    node.retire_completed_wallet_contract(
+                        registration,
+                        lifecycle_revision,
+                        rollback_boundary,
+                        permanent_abandonment_acknowledged,
+                    )
+                },
+            )
+            .await
+            .map_err(wallet_writer_error)?;
+        Ok(CompletedTrackedContractRetirement {
+            outcome,
+            retirement,
+            chain_epoch,
+            tip,
+            mempool_instance_nonce,
+            mempool_generation,
+        })
+    }
+
     /// Read one immutable public Shakedex/HTLC registration.
     pub async fn get_tracked_contract(
         &self,
@@ -1425,6 +1776,21 @@ impl WalletBackend {
         let read = self.read.clone();
         blocking_chain_read(read, move |_, snapshot| {
             tracked_contract(snapshot, profile, id).map_err(wallet_index_error)
+        })
+        .await
+    }
+
+    /// Read one immutable completed-retirement proof. This is a typed local
+    /// read and is intentionally not projected through wallet RPC.
+    pub async fn get_completed_tracked_contract_retirement(
+        &self,
+        id: ContractId,
+    ) -> Result<Option<CompletedContractRetirement>, WalletBackendError> {
+        let profile = self.read.wallet_index_profile();
+        let read = self.read.clone();
+        blocking_chain_read(read, move |_, snapshot| {
+            completed_tracked_contract_retirement(snapshot, profile, id)
+                .map_err(wallet_index_error)
         })
         .await
     }
@@ -2808,6 +3174,12 @@ fn wallet_index_error(error: IndexError) -> WalletBackendError {
         IndexError::ContractCapacity | IndexError::ContractAddressCapacity => {
             WalletBackendError::ContractCapacity
         }
+        IndexError::ContractRetirementCapacity => WalletBackendError::ContractRetirementCapacity,
+        IndexError::ContractRetirementHistoryCapacity => {
+            WalletBackendError::ContractRetirementHistoryCapacity
+        }
+        IndexError::ContractRollbackRequired => WalletBackendError::ContractRollbackRequired,
+        IndexError::ContractRetired => WalletBackendError::InvalidContract,
         IndexError::ContractConfirmed | IndexError::ContractConfirmationUnknown => {
             WalletBackendError::ContractNotRetirable
         }
@@ -2840,6 +3212,16 @@ fn wallet_writer_error(error: anyhow::Error) -> WalletBackendError {
             IndexError::ContractCapacity | IndexError::ContractAddressCapacity => {
                 WalletBackendError::ContractCapacity
             }
+            IndexError::ContractRetirementCapacity => {
+                WalletBackendError::ContractRetirementCapacity
+            }
+            IndexError::ContractRetirementHistoryCapacity => {
+                WalletBackendError::ContractRetirementHistoryCapacity
+            }
+            IndexError::ContractRollbackRequired => {
+                WalletBackendError::ContractRollbackRequired
+            }
+            IndexError::ContractRetired => WalletBackendError::InvalidContract,
             IndexError::ContractConfirmed | IndexError::ContractConfirmationUnknown => {
                 WalletBackendError::ContractNotRetirable
             }
