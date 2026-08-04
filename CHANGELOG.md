@@ -6,6 +6,10 @@ qualification or authorize deployment.
 
 ## 0.3.5 - unreleased
 
+- Enable outbound standard Handshake P2P, active-state synchronization, and
+  fixed-seed/GETADDR discovery in the standalone process by default, with
+  explicit `--no-native-sync` and `--no-p2p-discovery` opt-outs. HIP-76
+  requester policy remains `Auto`; its plaintext output role remains off.
 - Bind wallet snapshots and name-action contexts to consensus median time past.
 - Reclaim never-confirmed contract capacity and safely retire completed tracked
   contracts only after canonical evidence is validated.

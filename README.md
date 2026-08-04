@@ -94,12 +94,14 @@ mkdir -p "$PWD/data/mainnet"
 ./target/release/hsrd \
   --network mainnet \
   --data-dir "$PWD/data/mainnet" \
-  --rpc-bind 127.0.0.1:12037 \
-  --native-sync \
-  --p2p-discovery
+  --rpc-bind 127.0.0.1:12037
 ```
 
-Press `Ctrl-C` for a clean shutdown.
+Outbound native P2P, fixed-seed discovery, and active-state synchronization are
+enabled by default. `--no-native-sync` creates an RPC-only process, while
+`--no-p2p-discovery` requires an explicit `--connect` peer or inbound listener.
+The former positive flags remain accepted for deployment compatibility. Press
+`Ctrl-C` for a clean shutdown.
 
 In another terminal, inspect node and synchronization status:
 
@@ -125,8 +127,6 @@ without opening the node:
 ./target/release/hsrd \
   --network mainnet \
   --data-dir "$PWD/data/mainnet" \
-  --native-sync \
-  --p2p-discovery \
   --check-config
 ```
 
@@ -153,8 +153,6 @@ block history, start a new data directory with:
 ./target/release/hsrd \
   --network mainnet \
   --data-dir "$PWD/data/mainnet-archive" \
-  --native-sync \
-  --p2p-discovery \
   --storage-mode archive
 ```
 

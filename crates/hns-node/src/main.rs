@@ -13,7 +13,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use hns_consensus::Network;
 use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
@@ -136,19 +136,25 @@ struct Cli {
     #[arg(long, hide = true)]
     prune_undo_history: bool,
 
-    /// Enable native P2P, headers, block-body, and active-state synchronization.
-    #[arg(long = "native-sync")]
+    /// Reaffirm the default native P2P, headers, block-body, and active-state synchronization.
+    #[arg(long = "native-sync", action = ArgAction::SetTrue)]
     native_sync: bool,
 
+    /// Disable native P2P and synchronization for an RPC-only process.
+    #[arg(long = "no-native-sync", conflicts_with = "native_sync")]
+    no_native_sync: bool,
+
     /// Validate and persist only headers; do not download or connect bodies.
-    #[arg(long = "native-sync-headers-only", requires = "native_sync")]
+    #[arg(
+        long = "native-sync-headers-only",
+        conflicts_with = "no_native_sync"
+    )]
     native_sync_headers_only: bool,
 
     /// Download bodies without connecting them to active state.
     #[arg(
         long,
-        requires = "native_sync",
-        conflicts_with = "native_sync_headers_only"
+        conflicts_with_all = ["native_sync_headers_only", "no_native_sync"]
     )]
     native_sync_observe_only: bool,
 
@@ -164,9 +170,13 @@ struct Cli {
     #[arg(long = "connect")]
     p2p_connect: Vec<P2pConnectArg>,
 
-    /// Bootstrap from HSD's key-bearing fixed seeds and learn peers through GETADDR/ADDR.
-    #[arg(long)]
+    /// Reaffirm default fixed-seed bootstrap and GETADDR/ADDR peer discovery.
+    #[arg(long, action = ArgAction::SetTrue)]
     p2p_discovery: bool,
+
+    /// Disable fixed-seed bootstrap and learned-peer discovery.
+    #[arg(long = "no-p2p-discovery", conflicts_with = "p2p_discovery")]
+    no_p2p_discovery: bool,
 
     /// Maximum explicit and discovered peers retained by the address book.
     #[arg(long, default_value_t = 4_096)]
@@ -255,6 +265,8 @@ impl Cli {
         if self.prune_undo_history && self.storage_mode == StorageMode::Archive {
             anyhow::bail!("--prune-undo-history conflicts with explicit --storage-mode archive");
         }
+        let native_sync = self.native_sync || !self.no_native_sync;
+        let p2p_discovery = self.p2p_discovery || !self.no_p2p_discovery;
         let connect = self
             .p2p_connect
             .iter()
@@ -318,16 +330,16 @@ impl Cli {
                     || self.storage_mode.prunes_payload_history(),
             },
             native_sync: NativeSyncConfig {
-                enabled: self.native_sync,
+                enabled: native_sync,
                 headers_only: self.native_sync_headers_only,
-                connect_active_state: self.native_sync
+                connect_active_state: native_sync
                     && !self.native_sync_headers_only
                     && !self.native_sync_observe_only,
                 active_state_connect_batch: self.active_state_connect_batch,
                 listen: self.p2p_listen,
                 connect,
                 connect_keys,
-                discovery: self.p2p_discovery,
+                discovery: p2p_discovery,
                 maximum_known_addresses: self.maximum_known_addresses,
                 maximum_inbound: self.maximum_inbound,
                 maximum_outbound: self.maximum_outbound,
@@ -535,6 +547,30 @@ mod tests {
                 .into_config()
                 .expect_err("archive and legacy prune flag conflict");
         assert!(conflict.to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn outbound_p2p_and_discovery_default_on_with_explicit_opt_outs() {
+        let default = Cli::try_parse_from(["hsrd"])
+            .expect("default CLI")
+            .into_config()
+            .expect("default config");
+        assert!(default.native_sync.enabled);
+        assert!(default.native_sync.connect_active_state);
+        assert!(default.native_sync.discovery);
+        assert!(default.native_sync.listen.is_none());
+
+        let disabled = Cli::try_parse_from([
+            "hsrd",
+            "--no-native-sync",
+            "--no-p2p-discovery",
+        ])
+        .expect("explicit opt-out CLI")
+        .into_config()
+        .expect("explicit opt-out config");
+        assert!(!disabled.native_sync.enabled);
+        assert!(!disabled.native_sync.connect_active_state);
+        assert!(!disabled.native_sync.discovery);
     }
 
     #[test]

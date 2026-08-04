@@ -7,12 +7,16 @@ no HSD runtime dependency. It discovers chain progress from authenticated
 peers, validates and retains headers and block bodies, connects active UTXO and
 name state, serves retained data, and resumes from a durable checkpoint.
 
-`--native-sync` downloads bodies and connects active state by default.
-`--native-sync-headers-only` narrows operation to canonical headers, while
-`--native-sync-observe-only` downloads bodies without connecting them. Native
-operation does not by itself grant mining authority: the separate readiness
-gate and the durable tip's complete consensus-authoritative status remain
-mandatory.
+The standalone `hsrd` process enables outbound native P2P, fixed-seed
+discovery, block download, and active-state synchronization by default.
+`--native-sync` and `--p2p-discovery` remain accepted to reaffirm that default
+for existing deployment commands. `--native-sync-headers-only` narrows
+operation to canonical headers, while `--native-sync-observe-only` downloads
+bodies without connecting them. `--no-native-sync` is the explicit RPC-only
+opt-out; `--no-p2p-discovery` preserves native P2P but requires an explicit
+peer or listener. Native operation does not by itself grant mining authority:
+the separate readiness gate and the durable tip's complete
+consensus-authoritative status remain mandatory.
 
 The standalone node and unified miner are outbound-only unless
 `--p2p-listen` is supplied. Listener mode accepts inbound Brontide sessions
@@ -513,8 +517,10 @@ active block/root evidence rather than header-only evidence.
 
 ## Peer discovery
 
-`--p2p-discovery` opts into the key-bearing fixed-seed tables pinned from HSD,
-then uses GETADDR/ADDR for additional records. Mainnet starts with ten
+Peer discovery defaults on and uses the key-bearing fixed-seed tables pinned
+from HSD, then GETADDR/ADDR for additional records. `--p2p-discovery` remains
+an accepted compatibility spelling; `--no-p2p-discovery` is the explicit
+operator opt-out. Mainnet starts with ten
 authenticated endpoints on port 44806; testnet starts with four on port 45806.
 Regtest and simnet have no fixed seeds, so discovery alone is rejected there.
 
