@@ -6,7 +6,7 @@ untrusted until an explicit validation stage accepts their use. The source
 consensus-readiness matrix is complete, but authority is still a runtime
 capability: only the explicit synchronized mainnet canary with a coherent
 durable authoritative tip may receive it. The pinned `hsd` revision remains an
-offline comparison oracle, not a runtime or production authority. API-v14's
+offline comparison oracle, not a runtime or production authority. API-v15's
 base snapshot initializes `release_stage: "pre-authority"`; live native RPC
 replaces it with a configuration-specific diagnostic stage that does not grant
 authority.
@@ -121,7 +121,7 @@ does not grant authority. Solved-block staging, connection, and
 publication require the same private authority capability as the existing
 authoritative mining boundary.
 
-Current API-v14 retains the next-header interval-committed root introduced in
+Current API-v15 retains the next-header interval-committed root introduced in
 API-v10 for external qualification. `compare-hsrd-hsd-shadow.py` reads that
 material and a pinned
 HSD node, but its observations and evidence checkpoint never enter the store,
@@ -241,6 +241,14 @@ clean marker or matching startup checkpoint cannot restore authority.
   or mining authority. Successfully opened ODoH bytes remain untrusted until a
   higher layer performs strict DNS parsing, query correlation, and DNSSEC
   validation.
+- HIP-78 requester and opaque-relay policy default on, but each packet still
+  requires an exact live Brontide identity, canonical Denuo V1 registry,
+  matching network/genesis, and HNS Node v1 profile. Requester routes require
+  the remote relay service bit. Relay routes retain bounded accounting until
+  actual socket-write acknowledgement; ambiguous failures disconnect the exact
+  owner and revoke affected state. Endpoint, rendezvous, and plaintext roles
+  are unavailable. The local relay service bit is absent unless explicit
+  address, key, policy, and backend readiness all hold.
 
 ## Mining-engine and publication policy
 

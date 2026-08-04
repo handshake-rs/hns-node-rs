@@ -384,6 +384,53 @@ pub struct RpcOdohInfo {
     pub rejected_packets: u64,
 }
 
+/// Name-free HIP-78 requester and opaque-relay diagnostics. Provider
+/// availability is distinct from default-on policy: a local relay is not
+/// advertised until an explicit public address and durable Brontide identity
+/// are available.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcHnsrInfo {
+    pub schema_version: u16,
+    pub state_generation: u64,
+    pub requester_generation: u64,
+    pub relay_generation: u64,
+    pub requester_enabled: bool,
+    pub requester_default_enabled: bool,
+    pub opaque_relay_enabled: bool,
+    pub opaque_relay_default_enabled: bool,
+    pub relay_service_available: bool,
+    pub relay_service_advertised: bool,
+    pub endpoint_role_available: bool,
+    pub rendezvous_role_available: bool,
+    pub plaintext_transport_available: bool,
+    pub service_bit: u64,
+    pub packet_type: u8,
+    pub profile: u16,
+    pub profile_registry_fingerprint: String,
+    pub profile_registry_version: u16,
+    pub profile_registry_protocol_version: u16,
+    pub profile_registry_wire_profile: String,
+    pub eligible_authenticated_relays: u64,
+    pub faulted_peers: u64,
+    pub reservations: u64,
+    pub requester_pending_circuits: u64,
+    pub requester_active_circuits: u64,
+    pub relay_pending_circuits: u64,
+    pub relay_active_circuits: u64,
+    pub queued_bytes: u64,
+    pub queued_actions: u64,
+    pub trusted_time_high_water: u64,
+    pub durable_state_dirty: bool,
+    pub admitted_opens: u64,
+    pub opened_circuits: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub socket_write_failures: u64,
+    pub expired_work: u64,
+    pub revoked_work: u64,
+    pub rejected_packets: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcNodeStatus {
     pub api_version: u32,
@@ -418,6 +465,8 @@ pub struct RpcNodeStatus {
     pub hip76: RpcHip76Info,
     #[serde(default)]
     pub odoh: RpcOdohInfo,
+    #[serde(default)]
+    pub hnsr: RpcHnsrInfo,
     pub authority: RpcAuthorityInfo,
     pub parity: RpcParityInfo,
 }

@@ -21,6 +21,18 @@ qualification or authorize deployment.
   live request IDs and HPKE state are never persisted. Proxy, target, and DNS
   output provider roles remain unavailable; `--no-odoh-requester` is the
   explicit requester opt-out.
+- Enable HIP-78 HNSR requester and opaque-relay policy by default with
+  independent `--no-hnsr-requester` and `--no-hnsr-relay` opt-outs. Exact
+  Brontide/Denuo/network/genesis admission, HNS Node v1-only circuits, actual
+  socket-write acknowledgements, connection-bound cleanup, and atomic
+  checksummed state/floor persistence fail closed. Relay service advertisement
+  additionally requires `--hnsr-relay-address`; endpoint, rendezvous, and
+  plaintext roles remain unavailable.
+- Publish key-bearing HSD fixed seeds, canonical negotiated-peer evidence, and
+  a bounded raw authenticated extension exchange from `hns-p2p` for browser
+  and mobile adapters. Brontide now uses portable RustCrypto
+  ChaCha20-Poly1305; standalone `hns-p2p` no longer enables OpenSSL consensus
+  verifiers.
 - Bind wallet snapshots and name-action contexts to consensus median time past.
 - Reclaim never-confirmed contract capacity and safely retire completed tracked
   contracts only after canonical evidence is validated.

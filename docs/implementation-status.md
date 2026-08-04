@@ -86,13 +86,22 @@ live sessions and HPKE context are not. Local proxy, target, and output roles
 remain unavailable, and decrypted response bytes remain untrusted until the
 higher resolver boundary parses, correlates, and DNSSEC-validates them.
 
+HIP-78 requester and opaque circuit relay are wired through live authenticated
+peers and default on with independent opt-outs. The runtime admits only HNS
+Node v1 over exact Brontide and canonical Denuo V1 evidence, acknowledges real
+destination writes, revokes connection-owned state on lifecycle failure, and
+persists only checksummed policy/counter/generation/time state. Relay service
+advertisement remains unavailable until an explicit valid advertise address
+and durable Brontide identity are configured. Endpoint, rendezvous, and
+plaintext provider roles are unavailable.
+
 The current tree contains hardened authority, storage, transaction, covenant,
 and name-state foundations, a live native P2P/synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication
 foundation. Native synchronization can produce fully validated durable block
 status, but the mining engine cannot authorize jobs or publish solved blocks
 without the private authority capability and a currently authoritative durable
-tip. API-v14
+tip. API-v15
 exposes the exact next-header interval-committed root, and the external comparison
 runner can check it against a pinned live HSD node without feeding oracle data
 back into consensus.
@@ -362,7 +371,7 @@ Implemented:
   commits leave all records unchanged.
 - HSD-shaped opt-in startup scheduling with a nonzero block-height interval
   (10,000 by default), a checksummed last-run checkpoint committed in the same
-  batch as deletions, manual serialized maintenance, and current API-v14 status
+  batch as deletions, manual serialized maintenance, and current API-v15 status
   counts (introduced with the API-v9 compaction diagnostics).
 - Optional HSD-shaped undo retirement preserves heights through
   `pruneAfterHeight` and the newest `keepBlocks`, advances a checksummed

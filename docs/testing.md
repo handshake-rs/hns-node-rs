@@ -265,7 +265,7 @@ Current evidence includes:
   set unchanged, followed by an idempotent successful retry;
 - startup compaction due/not-due scheduling, nonzero interval validation,
   forced coordinator maintenance, checksummed checkpoint rejection, compaction
-  status introduced in API-v10 and retained in current API-v14, and unclean
+  status introduced in API-v10 and retained in current API-v15, and unclean
   RocksDB reopen with exact checkpoint/node-set agreement;
 - exact HSD undo-retention constants, steady/startup retirement, protected and
   retained windows, atomic interval-pin retirement, scheduled non-empty root
@@ -318,7 +318,7 @@ Current evidence includes:
   persistence, and proof that local state faults do not poison stored branches
   or grant shadow mining authority;
 - next-header committed-root material introduced in API-v10 and retained in
-  current API-v14, opaque runtime-instance exposure, and the external HSD
+  current API-v15, opaque runtime-instance exposure, and the external HSD
   comparison self-test covering confirmed/provisional roots,
   header-derived deployment/script-policy comparison, divergence,
   restart/reorganization counters, hash normalization, and checksummed evidence

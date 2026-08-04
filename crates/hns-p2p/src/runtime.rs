@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     net::SocketAddr,
     sync::Arc,
@@ -7,7 +7,10 @@ use std::{
 };
 
 use hns_consensus::Network;
-use hns_p2p_experimental::{ExperimentalWireProfile, NegotiatedRegistry};
+use hns_p2p_experimental::{
+    ExperimentalPeerState, ExperimentalWireProfile, NegotiatedRegistry, ServiceMask,
+    DENUO_V1_REGISTRY_FINGERPRINT,
+};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -22,12 +25,14 @@ use crate::{
         extension_packet, is_extension_packet_type, is_registry_hello_packet, DenuoAction,
         DenuoCoordinator, DenuoPeerDiagnostics, DenuoPeerPhase, DenuoRuntimeMetrics,
     },
+    experimental::{ExperimentalExchangeError, ExperimentalExchangeRuntime},
     handshake::{PeerDirection, PeerHandshake, PeerState},
     hip76::{
         is_hip76_packet_type, Hip76FailureReason, Hip76Inbound, Hip76ProviderPolicy,
         Hip76ProviderRequest, Hip76ProviderWork, Hip76RequesterResponse, Hip76RevokedWork,
         Hip76Session, Hip76SessionConfig, Hip76SessionDiagnostics, Hip76WriteToken,
     },
+    hnsr::{is_hnsr_packet_type, peer_id_from_hnsr, HnsrCoordinator, HnsrIncoming, HnsrPeerAdmission},
     odoh::{
         is_odoh_packet_type, OdohFailureReason, OdohPeerProvenance, OdohRequesterRuntime,
     },
@@ -184,6 +189,20 @@ pub struct PeerSnapshot {
     pub hip76: Hip76SessionDiagnostics,
 }
 
+/// Exact ready Denuo evidence bound to one authenticated live Brontide
+/// connection. Browser and mobile adapters can consume this without
+/// reconstructing registry state from diagnostics strings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedExperimentalPeerEvidence {
+    pub peer: PeerId,
+    pub address: SocketAddr,
+    pub direction: PeerDirection,
+    pub peer_key: AuthenticatedPeerKey,
+    pub services: u64,
+    pub state: ExperimentalPeerState,
+    pub negotiated: NegotiatedRegistry,
+}
+
 impl PeerSnapshot {
     pub fn new(id: PeerId, address: SocketAddr, direction: PeerDirection) -> Self {
         Self {
@@ -210,6 +229,35 @@ impl PeerSnapshot {
             denuo_negotiated_registry: None,
             hip76: Hip76SessionDiagnostics::awaiting_registry(direction),
         }
+    }
+
+    pub fn authenticated_experimental_evidence(
+        &self,
+    ) -> Option<AuthenticatedExperimentalPeerEvidence> {
+        if self.state != PeerState::Ready || self.transport != PeerTransportKind::Brontide {
+            return None;
+        }
+        let peer_key = self.authenticated_remote_static?;
+        let profile = self.denuo_wire_profile?;
+        let negotiated = self.denuo_negotiated_registry.clone()?;
+        let mut state = ExperimentalPeerState::new(
+            profile,
+            negotiated.network,
+            negotiated.genesis_hash,
+            DENUO_V1_REGISTRY_FINGERPRINT,
+            ServiceMask::new(self.services),
+        );
+        state.mark_established();
+        state.install_negotiation(negotiated.clone()).ok()?;
+        Some(AuthenticatedExperimentalPeerEvidence {
+            peer: self.id,
+            address: self.address,
+            direction: self.direction,
+            peer_key,
+            services: self.services,
+            state,
+            negotiated,
+        })
     }
 }
 
@@ -312,6 +360,9 @@ pub enum PeerEvent {
     Hip76CapabilityChanged {
         provenance: Hip76PeerProvenance,
         diagnostics: Hip76SessionDiagnostics,
+    },
+    HnsrRequester {
+        event: hns_hnsr_protocol::HnsrRequesterEvent,
     },
 }
 
@@ -628,10 +679,14 @@ pub(crate) struct PeerRuntimeParameters {
     pub magic: NetworkMagic,
     pub local_version: VersionPacket,
     pub config: PeerRuntimeConfig,
+    pub critical_write_timeout: Duration,
     pub events: mpsc::Sender<PeerEvent>,
     pub denuo_metrics: DenuoRuntimeMetrics,
     pub hip76_config: Hip76SessionConfig,
     pub odoh: Arc<Mutex<OdohRequesterRuntime>>,
+    pub experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
+    pub hnsr: Arc<Mutex<HnsrCoordinator>>,
+    pub peers: Arc<RwLock<HashMap<PeerId, PeerHandle>>>,
 }
 
 pub(crate) fn spawn_peer_runtime<R, W>(
@@ -694,10 +749,14 @@ where
         magic,
         local_version,
         config,
+        critical_write_timeout,
         events,
         denuo_metrics,
         mut hip76_config,
         odoh,
+        experimental,
+        hnsr,
+        peers,
     } = parameters;
     config.validate()?;
     // Runtime request IDs are unpredictable per connection. The configurable
@@ -764,11 +823,15 @@ where
         denuo,
         hip76,
         odoh,
+        experimental,
+        hnsr,
+        peers,
         transport,
         authenticated_remote_static,
         reader,
         writer,
         config,
+        critical_write_timeout,
         events,
         snapshot,
         critical_rx,
@@ -833,11 +896,15 @@ async fn run_peer<R, W>(
     denuo: DenuoCoordinator,
     hip76: Hip76Session,
     odoh: Arc<Mutex<OdohRequesterRuntime>>,
+    experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
+    hnsr: Arc<Mutex<HnsrCoordinator>>,
+    peers: Arc<RwLock<HashMap<PeerId, PeerHandle>>>,
     transport: PeerTransportKind,
     authenticated_remote_static: Option<AuthenticatedPeerKey>,
     reader: PeerFrameReader<R>,
     writer: PeerFrameWriter<W>,
     config: PeerRuntimeConfig,
+    critical_write_timeout: Duration,
     events: mpsc::Sender<PeerEvent>,
     snapshot: Arc<RwLock<PeerSnapshot>>,
     critical_rx: mpsc::Receiver<CriticalOutbound>,
@@ -897,10 +964,14 @@ where
         denuo,
         hip76,
         odoh,
+        experimental,
+        hnsr,
+        peers,
         transport,
         authenticated_remote_static,
         reader,
         config,
+        critical_write_timeout,
         events,
         Arc::clone(&snapshot),
         control_tx,
@@ -940,10 +1011,14 @@ async fn peer_reader<R>(
     mut denuo: DenuoCoordinator,
     mut hip76: Hip76Session,
     odoh: Arc<Mutex<OdohRequesterRuntime>>,
+    experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
+    hnsr: Arc<Mutex<HnsrCoordinator>>,
+    peers: Arc<RwLock<HashMap<PeerId, PeerHandle>>>,
     transport: PeerTransportKind,
     authenticated_remote_static: Option<AuthenticatedPeerKey>,
     mut reader: PeerFrameReader<R>,
     config: PeerRuntimeConfig,
+    critical_write_timeout: Duration,
     events: mpsc::Sender<PeerEvent>,
     snapshot: Arc<RwLock<PeerSnapshot>>,
     control_tx: mpsc::Sender<Arc<Packet>>,
@@ -1024,6 +1099,37 @@ where
                                     .lock()
                                     .await
                                     .fault_peer(id, OdohFailureReason::PacketTooLarge);
+                                experimental.lock().await.cancel(
+                                    id,
+                                    PacketType::Unknown(packet_type),
+                                    ExperimentalExchangeError::ResponseTooLarge,
+                                );
+                                continue 'peer;
+                            }
+                            Err(P2pError::ScopedPacketLimit {
+                                packet_type,
+                                actual,
+                                ..
+                            }) if is_hnsr_packet_type(PacketType::Unknown(packet_type)) => {
+                                last_receive = Instant::now();
+                                let mut state = snapshot.write().await;
+                                state.bytes_received = state.bytes_received.saturating_add(
+                                    (crate::constants::FRAME_HEADER_SIZE + actual) as u64,
+                                );
+                                state.last_receive = Some(unix_time());
+                                drop(state);
+                                let routes = hnsr.lock().await.fault_peer(id);
+                                dispatch_hnsr_incoming(
+                                    &hnsr,
+                                    &peers,
+                                    &events,
+                                    HnsrIncoming {
+                                        relay_routes: routes,
+                                        ..HnsrIncoming::default()
+                                    },
+                                    critical_write_timeout,
+                                )
+                                .await;
                                 continue 'peer;
                             }
                             Err(P2pError::ScopedPacketLimit {
@@ -1070,6 +1176,18 @@ where
                                 .lock()
                                 .await
                                 .fault_peer(id, OdohFailureReason::RegistryNotNegotiated);
+                            let hnsr_routes = hnsr.lock().await.fault_peer(id);
+                            dispatch_hnsr_incoming(
+                                &hnsr,
+                                &peers,
+                                &events,
+                                HnsrIncoming {
+                                    relay_routes: hnsr_routes,
+                                    ..HnsrIncoming::default()
+                                },
+                                critical_write_timeout,
+                            )
+                            .await;
                             let revoked = synchronize_hip76_with_denuo(&denuo, &mut hip76);
                             complete_revoked_requesters(
                                 &mut pending_requesters,
@@ -1188,6 +1306,13 @@ where
                 .bytes_received
                 .saturating_add((crate::constants::FRAME_HEADER_SIZE + frame.payload.len()) as u64);
         }
+        if experimental
+            .lock()
+            .await
+            .receive(id, frame.packet_type, &frame.payload)
+        {
+            continue;
+        }
         if is_extension_packet_type(frame.packet_type) {
             denuo.expire(Instant::now());
             let action = denuo.receive_extension(&frame.payload);
@@ -1198,6 +1323,18 @@ where
                     .lock()
                     .await
                     .fault_peer(id, OdohFailureReason::RegistryNotNegotiated);
+                let hnsr_routes = hnsr.lock().await.fault_peer(id);
+                dispatch_hnsr_incoming(
+                    &hnsr,
+                    &peers,
+                    &events,
+                    HnsrIncoming {
+                        relay_routes: hnsr_routes,
+                        ..HnsrIncoming::default()
+                    },
+                    critical_write_timeout,
+                )
+                .await;
             }
             complete_revoked_requesters(
                 &mut pending_requesters,
@@ -1230,6 +1367,62 @@ where
                 &hip76_writer_state_tx,
                 &hip76_status_tx,
             );
+            continue;
+        }
+        if is_hnsr_packet_type(frame.packet_type) {
+            let Some(admission) = hnsr_peer_admission(
+                id,
+                provenance.address,
+                direction,
+                transport,
+                authenticated_remote_static,
+                &handshake,
+                &denuo,
+            ) else {
+                let routes = hnsr.lock().await.fault_peer(id);
+                dispatch_hnsr_incoming(
+                    &hnsr,
+                    &peers,
+                    &events,
+                    HnsrIncoming {
+                        relay_routes: routes,
+                        ..HnsrIncoming::default()
+                    },
+                    critical_write_timeout,
+                )
+                .await;
+                continue;
+            };
+            let incoming = hnsr
+                .lock()
+                .await
+                .handle_encoded(&admission, &frame.payload, unix_time());
+            match incoming {
+                Ok(incoming) => {
+                    dispatch_hnsr_incoming(
+                        &hnsr,
+                        &peers,
+                        &events,
+                        incoming,
+                        critical_write_timeout,
+                    )
+                    .await;
+                }
+                Err(_) => {
+                    let routes = hnsr.lock().await.fault_peer(id);
+                    dispatch_hnsr_incoming(
+                        &hnsr,
+                        &peers,
+                        &events,
+                        HnsrIncoming {
+                            relay_routes: routes,
+                            ..HnsrIncoming::default()
+                        },
+                        critical_write_timeout,
+                    )
+                    .await;
+                }
+            }
             continue;
         }
         if is_odoh_packet_type(frame.packet_type) {
@@ -1375,6 +1568,19 @@ where
         &hip76_status_tx,
     );
     odoh.lock().await.disconnect(id);
+    experimental.lock().await.disconnect(id);
+    let routes = hnsr.lock().await.disconnect(id);
+    dispatch_hnsr_incoming(
+        &hnsr,
+        &peers,
+        &events,
+        HnsrIncoming {
+            relay_routes: routes,
+            ..HnsrIncoming::default()
+        },
+        critical_write_timeout,
+    )
+    .await;
     result
 }
 
@@ -1397,6 +1603,92 @@ fn synchronize_hip76_with_denuo(
         }
     }
     hip76.set_registry_negotiated(false)
+}
+
+fn hnsr_peer_admission(
+    peer: PeerId,
+    address: SocketAddr,
+    direction: PeerDirection,
+    transport: PeerTransportKind,
+    authenticated_remote_static: Option<AuthenticatedPeerKey>,
+    handshake: &PeerHandshake,
+    denuo: &DenuoCoordinator,
+) -> Option<HnsrPeerAdmission> {
+    let remote_services = handshake.remote_version()?.services;
+    let (wire_profile, negotiated) = denuo.negotiated_evidence()?;
+    handshake.is_ready().then(|| HnsrPeerAdmission {
+        peer,
+        address,
+        direction,
+        transport,
+        authenticated_remote_static,
+        remote_services,
+        wire_profile,
+        negotiated: negotiated.clone(),
+    })
+}
+
+async fn dispatch_hnsr_incoming(
+    coordinator: &Arc<Mutex<HnsrCoordinator>>,
+    peers: &Arc<RwLock<HashMap<PeerId, PeerHandle>>>,
+    events: &mpsc::Sender<PeerEvent>,
+    incoming: HnsrIncoming,
+    maximum_wait: Duration,
+) {
+    if let Some(event) = incoming.requester_event {
+        let _ = events.try_send(PeerEvent::HnsrRequester { event });
+    }
+    let mut relay_routes = VecDeque::from(incoming.relay_routes);
+    for route in incoming.direct_routes {
+        let Ok(destination) = peer_id_from_hnsr(&route.destination) else {
+            continue;
+        };
+        let handle = peers.read().await.get(&destination).cloned();
+        let delivered = match (handle.as_ref(), crate::hnsr_packet(route.packet)) {
+            (Some(handle), Ok(packet)) => handle
+                .send_critical(Arc::new(packet), maximum_wait)
+                .await
+                .is_ok(),
+            _ => false,
+        };
+        if !delivered {
+            if let Some(handle) = handle {
+                handle.disconnect();
+            }
+            relay_routes.extend(coordinator.lock().await.fault_peer(destination));
+        }
+    }
+    let mut dispatched = 0usize;
+    while let Some(queued) = relay_routes.pop_front() {
+        dispatched = dispatched.saturating_add(1);
+        if dispatched > 65_536 {
+            break;
+        }
+        let destination = peer_id_from_hnsr(&queued.route.destination);
+        let handle = match destination {
+            Ok(destination) => peers.read().await.get(&destination).cloned(),
+            Err(_) => None,
+        };
+        let delivered = match (handle.as_ref(), crate::hnsr_packet(queued.route.packet)) {
+            (Some(handle), Ok(packet)) => handle
+                .send_critical(Arc::new(packet), maximum_wait)
+                .await
+                .is_ok(),
+            _ => false,
+        };
+        if !delivered {
+            if let Some(handle) = handle {
+                handle.disconnect();
+            }
+        }
+        if let Ok(cleanup) = coordinator
+            .lock()
+            .await
+            .acknowledge_relay_action(queued.action_id, delivered)
+        {
+            relay_routes.extend(cleanup);
+        }
+    }
 }
 
 fn handle_hip76_command(

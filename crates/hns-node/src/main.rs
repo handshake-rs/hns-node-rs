@@ -183,6 +183,21 @@ struct Cli {
     #[arg(long = "no-odoh-requester")]
     no_odoh_requester: bool,
 
+    /// Disable the HIP-78 HNSR requester. Requester policy is enabled by
+    /// default and uses only authenticated, exactly negotiated relay peers.
+    #[arg(long = "no-hnsr-requester")]
+    no_hnsr_requester: bool,
+
+    /// Disable the HIP-78 opaque relay policy. Endpoint and rendezvous roles
+    /// remain unavailable regardless of this setting.
+    #[arg(long = "no-hnsr-relay")]
+    no_hnsr_relay: bool,
+
+    /// Public address placed in locally issued HNSR relay tickets. The relay
+    /// service is unavailable until this explicit address is configured.
+    #[arg(long = "hnsr-relay-address")]
+    hnsr_relay_address: Option<SocketAddr>,
+
     /// Maximum explicit and discovered peers retained by the address book.
     #[arg(long, default_value_t = 4_096)]
     maximum_known_addresses: usize,
@@ -346,6 +361,9 @@ impl Cli {
                 connect_keys,
                 discovery: p2p_discovery,
                 odoh_requester: !self.no_odoh_requester,
+                hnsr_requester: !self.no_hnsr_requester,
+                hnsr_opaque_relay: !self.no_hnsr_relay,
+                hnsr_relay_address: self.hnsr_relay_address,
                 maximum_known_addresses: self.maximum_known_addresses,
                 maximum_inbound: self.maximum_inbound,
                 maximum_outbound: self.maximum_outbound,
@@ -504,6 +522,9 @@ async fn main() -> anyhow::Result<()> {
             native_sync_headers_only = config.native_sync.headers_only,
             native_sync_active_state = config.native_sync.connect_active_state,
             odoh_requester = config.native_sync.odoh_requester,
+            hnsr_requester = config.native_sync.hnsr_requester,
+            hnsr_opaque_relay = config.native_sync.hnsr_opaque_relay,
+            hnsr_relay_address = ?config.native_sync.hnsr_relay_address,
             validation_workers = config.native_sync.validation_workers,
             validation_queue = config.native_sync.validation_queue,
             mining_engine = config.mining_engine.enabled,
@@ -566,6 +587,9 @@ mod tests {
         assert!(default.native_sync.connect_active_state);
         assert!(default.native_sync.discovery);
         assert!(default.native_sync.odoh_requester);
+        assert!(default.native_sync.hnsr_requester);
+        assert!(default.native_sync.hnsr_opaque_relay);
+        assert!(default.native_sync.hnsr_relay_address.is_none());
         assert!(default.native_sync.listen.is_none());
 
         let disabled = Cli::try_parse_from([
@@ -573,6 +597,8 @@ mod tests {
             "--no-native-sync",
             "--no-p2p-discovery",
             "--no-odoh-requester",
+            "--no-hnsr-requester",
+            "--no-hnsr-relay",
         ])
         .expect("explicit opt-out CLI")
         .into_config()
@@ -581,6 +607,8 @@ mod tests {
         assert!(!disabled.native_sync.connect_active_state);
         assert!(!disabled.native_sync.discovery);
         assert!(!disabled.native_sync.odoh_requester);
+        assert!(!disabled.native_sync.hnsr_requester);
+        assert!(!disabled.native_sync.hnsr_opaque_relay);
     }
 
     #[test]

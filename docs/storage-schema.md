@@ -429,6 +429,12 @@ cannot promote a block or grant authority.
   Both ODoH records are written in one atomic batch; startup accepts both or
   neither and rejects rollback, clock regression, corruption, network mismatch,
   or address-policy mismatch.
+  `hnsr-runtime-state/v1` contains checksummed requester/opaque-relay policy,
+  counters, configuration identity, and fail-closed live-work counts.
+  `hnsr-durable-floor/v1` independently binds the state, requester, and relay
+  generation floors plus trusted-time high-water. Both records commit
+  atomically and restore only under a fresh process session. Reservations,
+  circuits, queued bytes, route actions, and peer authority remain memory-only.
 - `orphans`, `mempool_persist`: reserved operational records as those
   subsystems mature. Subthreshold per-connection peer scores, socket reconnect
   timers, inflight requests, orphan bodies, and the mining-engine
@@ -613,7 +619,7 @@ scheduling. In undo-pruned mining mode the same scheduler also runs during
 native replay. A nonzero height interval (10,000 by default) prevents repeated
 work at the same tip. The checksummed height/tip/count completion checkpoint is
 written only after every deletion chunk succeeds; malformed checkpoints fail
-startup. Current API-v14 status retains the configured policy and
+startup. Current API-v15 status retains the configured policy and
 last-completed result fields introduced in API-v10. During the serialized pass
 it serves an explicitly marked, timestamped
 cached diagnostic snapshot, while authority-bearing reads continue waiting for

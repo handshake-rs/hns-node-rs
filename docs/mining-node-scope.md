@@ -73,7 +73,7 @@ assignments through the gateway, retires work on tip loss/change, and rechecks
 authority before publication. The qualified synchronized mainnet canary now
 permits native production authority without a live HSD process; the remaining
 operational campaigns below are explicit hardening work. That conditional
-runtime capability is separate from API-v14's release-stage diagnostic: the
+runtime capability is separate from API-v15's release-stage diagnostic: the
 base snapshot starts at `pre-authority`, while the live mainnet canary RPC
 reports `mainnet-canary-gated`.
 

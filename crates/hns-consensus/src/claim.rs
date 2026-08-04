@@ -2,6 +2,7 @@ use hns_primitives::{
     hash_name, Amount, CovenantKind, DnssecVerifier, Height, NameHash, Output, OwnershipProof,
     OwnershipProofError,
 };
+#[cfg(feature = "openssl-verifiers")]
 use openssl::{
     bn::{BigNum, BigNumContext},
     ec::{EcGroup, EcKey, EcPoint},
@@ -30,6 +31,7 @@ const ALG_ED448: u8 = 16;
 /// in `hns-primitives`. SHA-1, SHA-256, SHA-384, and SHA-512 use OpenSSL;
 /// DNSSEC digest type 3 uses the exact GOST R 34.11-94 CryptoPro construction
 /// selected by HSD's pinned `bns` dependency.
+#[cfg(feature = "openssl-verifiers")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OpenSslDnssecVerifier;
 
@@ -213,6 +215,7 @@ pub enum ClaimConsensusError {
     InitialFee,
 }
 
+#[cfg(feature = "openssl-verifiers")]
 impl DnssecVerifier for OpenSslDnssecVerifier {
     fn digest(&self, digest_type: u8, data: &[u8]) -> Option<Vec<u8>> {
         if digest_type == 3 {
@@ -258,6 +261,7 @@ impl DnssecVerifier for OpenSslDnssecVerifier {
     }
 }
 
+#[cfg(feature = "openssl-verifiers")]
 fn verify_rsa(digest: MessageDigest, public_key: &[u8], data: &[u8], signature: &[u8]) -> bool {
     let Some((exponent, modulus)) = rsa_components(public_key) else {
         return false;
@@ -291,6 +295,7 @@ fn rsa_components(raw: &[u8]) -> Option<(&[u8], &[u8])> {
     (!modulus.is_empty()).then_some((exponent, modulus))
 }
 
+#[cfg(feature = "openssl-verifiers")]
 fn verify_ecdsa(
     curve: Nid,
     coordinate_size: usize,
@@ -326,6 +331,7 @@ fn verify_ecdsa(
     verify_digest(digest, &key, data, &der, false)
 }
 
+#[cfg(feature = "openssl-verifiers")]
 fn verify_ed(id: Id, public_key: &[u8], data: &[u8], signature: &[u8]) -> bool {
     let Ok(key) = PKey::public_key_from_raw_bytes(public_key, id) else {
         return false;
@@ -336,6 +342,7 @@ fn verify_ed(id: Id, public_key: &[u8], data: &[u8], signature: &[u8]) -> bool {
     verifier.verify_oneshot(signature, data).unwrap_or(false)
 }
 
+#[cfg(feature = "openssl-verifiers")]
 fn verify_digest(
     digest: MessageDigest,
     key: &PKey<Public>,

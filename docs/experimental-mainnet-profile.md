@@ -74,7 +74,7 @@ canonical identity and wire profile, advertised state, peer negotiation
 counts, bounded message totals, and a closed set of rejection reasons.
 Per-peer native diagnostics report the connection's negotiation phase,
 disable reason, negotiated limits, and qname-free HIP-76 phase/role/counter
-state. API-v13 introduced the aggregate `hip76` object; current API-v14 adds
+state. API-v13 introduced the aggregate `hip76` object; API-v14 adds
 the process-wide, qname-free `odoh` requester object.
 
 Outbound message totals count bounded queue admission, not socket-write

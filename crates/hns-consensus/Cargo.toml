@@ -6,11 +6,15 @@ license = "ISC AND MIT"
 publish.workspace = true
 repository.workspace = true
 
+[features]
+default = ["openssl-verifiers"]
+openssl-verifiers = ["dep:openssl"]
+
 [dependencies]
 hns-primitives = { path = "../hns-primitives" }
 hns-goosig = { path = "../hns-goosig" }
 hns-secp256k1 = { path = "../hns-secp256k1" }
-openssl = "0.10"
+openssl = { version = "0.10", optional = true }
 serde.workspace = true
 thiserror.workspace = true
 

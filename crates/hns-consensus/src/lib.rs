@@ -20,12 +20,13 @@ mod script;
 mod sighash;
 
 pub use airdrop::{
-    verify_airdrop_output, AirdropConsensusError, AirdropFlags, NativeAirdropSignatureVerifier,
-    VerifiedAirdrop,
+    verify_airdrop_output, AirdropConsensusError, AirdropFlags, VerifiedAirdrop,
 };
-pub use claim::{
-    verify_claim_output, ClaimConsensusError, ClaimFlags, OpenSslDnssecVerifier, VerifiedClaim,
-};
+#[cfg(feature = "openssl-verifiers")]
+pub use airdrop::NativeAirdropSignatureVerifier;
+pub use claim::{verify_claim_output, ClaimConsensusError, ClaimFlags, VerifiedClaim};
+#[cfg(feature = "openssl-verifiers")]
+pub use claim::OpenSslDnssecVerifier;
 pub use covenant::{
     blind_bid, is_finalize_source_covenant, is_transfer_source_covenant,
     verify_transaction_covenant_links, CovenantLinkError, CovenantLinkSummary,

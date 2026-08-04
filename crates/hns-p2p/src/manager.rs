@@ -10,7 +10,12 @@ use std::{
 };
 
 use hns_consensus::Network;
-use hns_p2p_experimental::DENUO_EXTENSION_SERVICE;
+use hns_p2p_experimental::{
+    DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT,
+    DENUO_V1_REGISTRY_PROTOCOL_VERSION, DENUO_V1_REGISTRY_VERSION,
+    ExperimentalWireProfile, HnsrPolicy, ODOH_PACKET, ODOH_SERVICE,
+    REGISTRY_NEGOTIATION_PROTOCOL_ID,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, Mutex, RwLock},
@@ -21,8 +26,16 @@ use crate::{
     brontide::{inbound_handshake, outbound_handshake, BrontideIdentity, BrontideSession},
     constants::{DEFAULT_USER_AGENT, PROTOCOL_VERSION, SERVICE_NETWORK},
     denuo::{DenuoRuntimeMetrics, DenuoSummary},
+    experimental::{
+        ExperimentalExchange, ExperimentalExchangeError, ExperimentalExchangeResponse,
+        ExperimentalExchangeRuntime,
+    },
     handshake::{PeerDirection, PeerState},
     hip76::{hip76_advertised_services, Hip76ProviderPolicy, Hip76SessionConfig, Hip76Summary},
+    hnsr::{
+        HnsrCoordinator, HnsrCoordinatorConfig, HnsrDurableFloor, HnsrPeerAdmission,
+        HnsrRelayBackend, HnsrStateSnapshot,
+    },
     odoh::{
         DirectTargetLocator, OdohFailureReason, OdohPendingRequest, OdohPeerProvenance,
         OdohDurableFloor, OdohNetworkBinding, OdohProxyAdmission, OdohRequesterConfig,
@@ -46,6 +59,9 @@ pub enum PeerTransport {
 pub struct LivePeerConfig {
     pub network: Network,
     pub transport: PeerTransport,
+    /// Whether the Brontide private key is persisted under platform-owned
+    /// durable storage. HNSR relay tickets are unavailable without this bit.
+    pub brontide_identity_durable: bool,
     pub maximum_inbound: usize,
     pub maximum_outbound: usize,
     pub event_capacity: usize,
@@ -67,6 +83,14 @@ pub struct LivePeerConfig {
     /// high-water loaded alongside the cache. A cache without its durable
     /// floor (or a floor without its cache) is never restored.
     pub odoh_durable_floor: Option<Vec<u8>>,
+    pub hnsr_requester: bool,
+    pub hnsr_opaque_relay: bool,
+    pub hnsr_relay_address: Option<SocketAddr>,
+    /// Checksummed policy/counter snapshot. No reservation, circuit, queued
+    /// bytes, action token, or peer authority is restored from this blob.
+    pub hnsr_state: Option<Vec<u8>>,
+    /// Independent state/requester/relay generation and trusted-time floor.
+    pub hnsr_durable_floor: Option<Vec<u8>>,
 }
 
 impl LivePeerConfig {
@@ -84,6 +108,7 @@ impl LivePeerConfig {
         Self {
             network,
             transport,
+            brontide_identity_durable: false,
             maximum_inbound: 32,
             maximum_outbound: 8,
             event_capacity: 1_024,
@@ -100,6 +125,11 @@ impl LivePeerConfig {
             odoh,
             odoh_target_cache: None,
             odoh_durable_floor: None,
+            hnsr_requester: true,
+            hnsr_opaque_relay: true,
+            hnsr_relay_address: None,
+            hnsr_state: None,
+            hnsr_durable_floor: None,
         }
     }
 
@@ -154,6 +184,20 @@ impl LivePeerConfig {
                 "private ODoH targets are restricted to regtest and simnet".to_owned(),
             ));
         }
+        if self.hnsr_state.is_some() != self.hnsr_durable_floor.is_some() {
+            return Err(P2pError::Configuration(
+                "HNSR runtime state and durable floor must be restored as an exact pair"
+                    .to_owned(),
+            ));
+        }
+        if self.hnsr_relay_address.is_some()
+            && (!self.brontide_identity_durable
+                || !matches!(self.transport, PeerTransport::Brontide(_)))
+        {
+            return Err(P2pError::Configuration(
+                "HNSR relay advertisement requires a durable Brontide identity".to_owned(),
+            ));
+        }
         self.runtime.validate()
     }
 }
@@ -173,6 +217,13 @@ pub struct PeerTrafficTotals {
     pub bytes_received: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LocalServicesUpdate {
+    pub previous: u64,
+    pub current: u64,
+    pub disconnected_peers: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerBan {
     pub address: IpAddr,
@@ -188,10 +239,13 @@ pub struct LivePeerManager {
     events: mpsc::Sender<PeerEvent>,
     next_peer_id: Arc<AtomicU64>,
     local_height: Arc<AtomicU32>,
+    local_services: Arc<AtomicU64>,
     retired_bytes_sent: Arc<AtomicU64>,
     retired_bytes_received: Arc<AtomicU64>,
     denuo_metrics: DenuoRuntimeMetrics,
     odoh: Arc<Mutex<OdohRequesterRuntime>>,
+    experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
+    hnsr: Arc<Mutex<HnsrCoordinator>>,
     local_nonce: [u8; 8],
     registration_lock: Arc<Mutex<()>>,
     banned: Arc<RwLock<HashMap<IpAddr, u64>>>,
@@ -235,6 +289,28 @@ impl LivePeerManager {
         .map_err(|error| P2pError::Configuration(format!(
             "ODoH requester initialization failed: {error}"
         )))?;
+        let hnsr_config = hnsr_coordinator_config(&config);
+        let hnsr = match (
+            config.hnsr_state.as_deref(),
+            config.hnsr_durable_floor.as_deref(),
+        ) {
+            (Some(state), Some(encoded_floor)) => {
+                let floor = HnsrDurableFloor::decode(encoded_floor).map_err(|error| {
+                    P2pError::Configuration(format!("HNSR durable floor is invalid: {error}"))
+                })?;
+                HnsrCoordinator::restore(hnsr_config, state, floor, trusted_now)
+            }
+            (None, None) => HnsrCoordinator::fresh(hnsr_config, trusted_now),
+            _ => unreachable!("configuration validation requires an exact HNSR state pair"),
+        }
+        .map_err(|error| P2pError::Configuration(format!(
+            "HNSR coordinator initialization failed: {error}"
+        )))?;
+        let initial_services = if hnsr.relay_service_advertised() {
+            config.services | hns_hnsr_protocol::HNSR_RELAY_SERVICE
+        } else {
+            config.services & !hns_hnsr_protocol::HNSR_RELAY_SERVICE
+        };
         Ok((
             Self {
                 config,
@@ -242,10 +318,13 @@ impl LivePeerManager {
                 events,
                 next_peer_id: Arc::new(AtomicU64::new(1)),
                 local_height: Arc::new(AtomicU32::new(0)),
+                local_services: Arc::new(AtomicU64::new(initial_services)),
                 retired_bytes_sent: Arc::new(AtomicU64::new(0)),
                 retired_bytes_received: Arc::new(AtomicU64::new(0)),
                 denuo_metrics: DenuoRuntimeMetrics::default(),
                 odoh: Arc::new(Mutex::new(odoh)),
+                experimental: Arc::new(Mutex::new(ExperimentalExchangeRuntime::default())),
+                hnsr: Arc::new(Mutex::new(hnsr)),
                 // Use one unpredictable process-local nonce across all live
                 // connections. A loopback outbound/inbound pair will therefore
                 // observe its own nonce and fail the VERSION handshake.
@@ -264,6 +343,43 @@ impl LivePeerManager {
 
     pub fn set_local_height(&self, height: u32) {
         self.local_height.store(height, Ordering::Release);
+    }
+
+    pub fn local_services(&self) -> u64 {
+        hip76_advertised_services(
+            self.local_services.load(Ordering::Acquire),
+            self.config.hip76.provider_policy,
+        )
+    }
+
+    /// Replace the service mask used by future VERSION handshakes and retire
+    /// every current connection. VERSION capabilities are immutable once a
+    /// connection is ready, so a bounded reconnect is the only honest way to
+    /// withdraw or advertise a provider role.
+    pub async fn apply_local_services(&self, services: u64) -> LocalServicesUpdate {
+        let previous = self.local_services.swap(services, Ordering::AcqRel);
+        if previous == services {
+            return LocalServicesUpdate {
+                previous: self.local_services(),
+                current: self.local_services(),
+                disconnected_peers: 0,
+            };
+        }
+        let handles = self
+            .peers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for handle in &handles {
+            handle.disconnect();
+        }
+        LocalServicesUpdate {
+            previous: hip76_advertised_services(previous, self.config.hip76.provider_policy),
+            current: self.local_services(),
+            disconnected_peers: handles.len(),
+        }
     }
 
     pub async fn replace_bans(&self, bans: Vec<(IpAddr, u64)>) {
@@ -435,6 +551,26 @@ impl LivePeerManager {
         snapshots
     }
 
+    /// Return exact live Denuo state and its negotiated registry for the
+    /// authenticated static key selected by a platform adapter.
+    pub async fn authenticated_experimental_peer(
+        &self,
+        peer_key: crate::AuthenticatedPeerKey,
+    ) -> Option<crate::AuthenticatedExperimentalPeerEvidence> {
+        self.snapshots()
+            .await
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.authenticated_remote_static == Some(peer_key)
+                    && exact_experimental_admission(
+                        snapshot,
+                        self.config.network,
+                        crate::PacketType::Unknown(0xff),
+                    )
+            })
+            .and_then(|snapshot| snapshot.authenticated_experimental_evidence())
+    }
+
     pub async fn denuo_summary(&self) -> DenuoSummary {
         self.snapshots_with_denuo_summary().await.1
     }
@@ -521,6 +657,75 @@ impl LivePeerManager {
             .cloned()
             .ok_or(P2pError::PeerUnavailable(peer))?;
         handle.begin_hip76_request(query).await
+    }
+
+    /// Perform one raw extension exchange over the exact ready Brontide peer
+    /// identified by its authenticated static key. At most one exchange for a
+    /// peer/packet-type pair may be live, so the response is correlated by the
+    /// authenticated connection and exact extension packet type rather than a
+    /// socket address. The normal protocol runtime does not consume a matched
+    /// response.
+    pub async fn experimental_exchange(
+        &self,
+        exchange: ExperimentalExchange,
+    ) -> Result<ExperimentalExchangeResponse, ExperimentalExchangeError> {
+        let snapshot = self
+            .snapshots()
+            .await
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.state == PeerState::Ready
+                    && snapshot.transport == crate::PeerTransportKind::Brontide
+                    && snapshot.authenticated_remote_static == Some(exchange.peer_key)
+            })
+            .ok_or(ExperimentalExchangeError::PeerUnavailable)?;
+        if !exact_experimental_admission(&snapshot, self.config.network, exchange.packet_type) {
+            return Err(ExperimentalExchangeError::AdmissionRejected);
+        }
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&snapshot.id)
+            .cloned()
+            .ok_or(ExperimentalExchangeError::PeerUnavailable)?;
+        let registered = self
+            .experimental
+            .lock()
+            .await
+            .register(snapshot.id, &exchange)?;
+        let packet = Arc::new(Packet::Unknown {
+            packet_type: exchange.packet_type,
+            payload: exchange.payload,
+        });
+        let maximum_wait = exchange
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if maximum_wait.is_zero()
+            || handle.send_critical(packet, maximum_wait).await.is_err()
+        {
+            self.experimental.lock().await.cancel(
+                snapshot.id,
+                exchange.packet_type,
+                ExperimentalExchangeError::WriteFailed,
+            );
+            // A critical-write timeout is ambiguous: retire the exact stream
+            // before another exchange can reuse its correlation domain.
+            handle.disconnect();
+            return Err(ExperimentalExchangeError::WriteFailed);
+        }
+        match tokio::time::timeout_at(exchange.deadline, registered.receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ExperimentalExchangeError::Disconnected),
+            Err(_) => {
+                self.experimental.lock().await.cancel(
+                    snapshot.id,
+                    exchange.packet_type,
+                    ExperimentalExchangeError::DeadlineExpired,
+                );
+                Err(ExperimentalExchangeError::DeadlineExpired)
+            }
+        }
     }
 
     /// Install one target-signed HIP-77 configuration in the restart-safe
@@ -722,6 +927,249 @@ impl LivePeerManager {
             })
     }
 
+    /// Clone the storage-independent coordinator for platform supervisors that
+    /// own HNSR packet routing themselves.
+    pub fn hnsr_coordinator(&self) -> Arc<Mutex<HnsrCoordinator>> {
+        Arc::clone(&self.hnsr)
+    }
+
+    pub async fn hnsr_peer_admission(&self, peer: PeerId) -> Option<HnsrPeerAdmission> {
+        self.snapshots()
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.id == peer)
+            .and_then(hnsr_admission_from_snapshot)
+    }
+
+    pub async fn hnsr_status(&self) -> crate::HnsrCoordinatorStatus {
+        let candidates = self.hnsr_candidates().await;
+        let coordinator = self.hnsr.lock().await;
+        let eligible = candidates
+            .iter()
+            .filter(|candidate| coordinator.admit_requester_relay(candidate).is_ok())
+            .count();
+        coordinator.status(eligible)
+    }
+
+    pub async fn hnsr_state_snapshot(
+        &self,
+        trusted_now: u64,
+    ) -> Result<HnsrStateSnapshot, P2pError> {
+        self.hnsr
+            .lock()
+            .await
+            .snapshot_bundle(trusted_now)
+            .map_err(|error| P2pError::State(format!("HNSR snapshot failed: {error}")))
+    }
+
+    pub async fn acknowledge_hnsr_persisted(&self, floor: HnsrDurableFloor) {
+        self.hnsr.lock().await.acknowledge_persisted(floor);
+    }
+
+    /// Expire requester and relay work against the caller's trusted Unix
+    /// clock and deliver every best-effort relay cleanup route.
+    pub async fn expire_hnsr(&self, trusted_now: u64) -> Result<usize, P2pError> {
+        let cleanup = self
+            .hnsr
+            .lock()
+            .await
+            .expire(trusted_now)
+            .map_err(|error| P2pError::State(format!("HNSR expiry failed: {error}")))?;
+        let routes = cleanup.len();
+        self.dispatch_hnsr_relay_routes(cleanup).await;
+        Ok(routes)
+    }
+
+    pub async fn begin_hnsr_open(
+        &self,
+        relay: PeerId,
+        ticket: hns_hnsr_protocol::RelayTicket,
+        deadline: u64,
+        initial_window: u32,
+    ) -> Result<[u8; 8], P2pError> {
+        let admission = self
+            .hnsr_peer_admission(relay)
+            .await
+            .ok_or(P2pError::PeerUnavailable(relay))?;
+        let route = self
+            .hnsr
+            .lock()
+            .await
+            .begin_open(&admission, ticket, unix_time(), deadline, initial_window)
+            .map_err(|error| P2pError::Hnsr {
+                peer: relay,
+                reason: error.to_string(),
+            })?;
+        let context_id = route.packet.context_id;
+        if let Err(error) = self.send_hnsr_route(route).await {
+            let mut coordinator = self.hnsr.lock().await;
+            let _ = coordinator.cancel_open(context_id);
+            let _ = coordinator.fault_peer(relay);
+            return Err(error);
+        }
+        Ok(context_id)
+    }
+
+    pub async fn send_hnsr_data(
+        &self,
+        circuit_id: [u8; 8],
+        bytes: Vec<u8>,
+    ) -> Result<(), P2pError> {
+        let route = self
+            .hnsr
+            .lock()
+            .await
+            .send_data(circuit_id, bytes)
+            .map_err(|error| P2pError::Hnsr {
+                peer: PeerId(0),
+                reason: error.to_string(),
+            })?;
+        self.send_hnsr_route(route).await
+    }
+
+    pub async fn take_hnsr_data(
+        &self,
+        circuit_id: [u8; 8],
+    ) -> Result<Vec<u8>, P2pError> {
+        let (bytes, window) = self
+            .hnsr
+            .lock()
+            .await
+            .take_data(circuit_id)
+            .map_err(|error| P2pError::Hnsr {
+                peer: PeerId(0),
+                reason: error.to_string(),
+            })?;
+        self.send_hnsr_route(window).await?;
+        Ok(bytes)
+    }
+
+    pub async fn close_hnsr_circuit(
+        &self,
+        circuit_id: [u8; 8],
+        reason: u16,
+    ) -> Result<(), P2pError> {
+        let route = self
+            .hnsr
+            .lock()
+            .await
+            .close(circuit_id, reason)
+            .map_err(|error| P2pError::Hnsr {
+                peer: PeerId(0),
+                reason: error.to_string(),
+            })?;
+        self.send_hnsr_route(route).await
+    }
+
+    pub async fn cancel_hnsr_open(&self, context_id: [u8; 8]) -> Result<(), P2pError> {
+        let route = self
+            .hnsr
+            .lock()
+            .await
+            .cancel_open(context_id)
+            .map_err(|error| P2pError::Hnsr {
+                peer: PeerId(0),
+                reason: error.to_string(),
+            })?;
+        self.send_hnsr_route(route).await
+    }
+
+    /// Send one coordinator-produced route and wait for the destination's
+    /// actual socket write. An ambiguous failure retires the destination.
+    pub async fn send_hnsr_route(
+        &self,
+        route: hns_hnsr_protocol::HnsrRoute,
+    ) -> Result<(), P2pError> {
+        let peer = crate::peer_id_from_hnsr(&route.destination).map_err(|error| {
+            P2pError::State(format!("invalid HNSR route destination: {error}"))
+        })?;
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        let packet = crate::hnsr_packet(route.packet)
+            .map_err(|error| P2pError::Hnsr {
+                peer,
+                reason: error.to_string(),
+            })?;
+        if let Err(error) = handle
+            .send_critical(Arc::new(packet), self.config.critical_broadcast_timeout)
+            .await
+        {
+            handle.disconnect();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Complete an action when a platform-owned writer, rather than the live
+    /// manager, routes an opaque relay packet.
+    pub async fn acknowledge_hnsr_relay_action(
+        &self,
+        action_id: hns_hnsr_protocol::HnsrActionId,
+        delivered: bool,
+    ) -> Result<Vec<hns_hnsr_protocol::QueuedHnsrRoute>, P2pError> {
+        self.hnsr
+            .lock()
+            .await
+            .acknowledge_relay_action(action_id, delivered)
+            .map_err(|error| P2pError::State(format!(
+                "HNSR relay acknowledgement failed: {error}"
+            )))
+    }
+
+    pub async fn replace_hnsr_policy(
+        &self,
+        expected_state_generation: u64,
+        policy: HnsrPolicy,
+    ) -> Result<LocalServicesUpdate, P2pError> {
+        let cleanup = self
+            .hnsr
+            .lock()
+            .await
+            .replace_policy(expected_state_generation, policy)
+            .map_err(|error| P2pError::State(format!("HNSR policy rejected: {error}")))?;
+        for route in cleanup.direct_routes {
+            let _ = self.send_hnsr_route(route).await;
+        }
+        self.dispatch_hnsr_relay_routes(cleanup.relay_routes).await;
+        let advertised = self.hnsr.lock().await.relay_service_advertised();
+        let services = if advertised {
+            self.local_services.load(Ordering::Acquire)
+                | hns_hnsr_protocol::HNSR_RELAY_SERVICE
+        } else {
+            self.local_services.load(Ordering::Acquire)
+                & !hns_hnsr_protocol::HNSR_RELAY_SERVICE
+        };
+        Ok(self.apply_local_services(services).await)
+    }
+
+    async fn dispatch_hnsr_relay_routes(
+        &self,
+        routes: Vec<hns_hnsr_protocol::QueuedHnsrRoute>,
+    ) {
+        let mut routes = std::collections::VecDeque::from(routes);
+        let mut dispatched = 0usize;
+        while let Some(queued) = routes.pop_front() {
+            dispatched = dispatched.saturating_add(1);
+            if dispatched > 65_536 {
+                break;
+            }
+            let delivered = self.send_hnsr_route(queued.route).await.is_ok();
+            if let Ok(cleanup) = self
+                .hnsr
+                .lock()
+                .await
+                .acknowledge_relay_action(queued.action_id, delivered)
+            {
+                routes.extend(cleanup);
+            }
+        }
+    }
+
     async fn odoh_candidates(&self) -> Vec<OdohProxyAdmission> {
         let mut candidates = self
             .snapshots()
@@ -755,6 +1203,22 @@ impl LivePeerManager {
             (
                 candidate.provenance.direction != PeerDirection::Outbound,
                 candidate.provenance.peer.0,
+            )
+        });
+        candidates
+    }
+
+    async fn hnsr_candidates(&self) -> Vec<HnsrPeerAdmission> {
+        let mut candidates = self
+            .snapshots()
+            .await
+            .into_iter()
+            .filter_map(hnsr_admission_from_snapshot)
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| {
+            (
+                candidate.direction != PeerDirection::Outbound,
+                candidate.peer.0,
             )
         });
         candidates
@@ -1053,8 +1517,7 @@ impl LivePeerManager {
         self.ensure_capacity(direction, address).await?;
         let id = PeerId(self.next_peer_id.fetch_add(1, Ordering::Relaxed));
         let nonce = self.local_nonce;
-        let services =
-            hip76_advertised_services(self.config.services, self.config.hip76.provider_policy);
+        let services = self.local_services();
         let local_version = VersionPacket {
             version: self.config.protocol_version,
             services,
@@ -1075,10 +1538,14 @@ impl LivePeerManager {
             magic,
             local_version,
             config: self.config.runtime.clone(),
+            critical_write_timeout: self.config.critical_broadcast_timeout,
             events: self.events.clone(),
             denuo_metrics: self.denuo_metrics.clone(),
             hip76_config: self.config.hip76.clone(),
             odoh: Arc::clone(&self.odoh),
+            experimental: Arc::clone(&self.experimental),
+            hnsr: Arc::clone(&self.hnsr),
+            peers: Arc::clone(&self.peers),
         };
         let spawned = match brontide {
             Some(session) => spawn_brontide_peer_runtime(parameters, reader, writer, session)?,
@@ -1116,6 +1583,102 @@ impl LivePeerManager {
         });
         Ok(id)
     }
+}
+
+fn hnsr_coordinator_config(config: &LivePeerConfig) -> HnsrCoordinatorConfig {
+    let mut coordinator = HnsrCoordinatorConfig::for_network(config.network);
+    coordinator.requester_enabled = config.hnsr_requester;
+    coordinator.opaque_relay_enabled = config.hnsr_opaque_relay;
+    coordinator.relay_backend = match (
+        config.hnsr_relay_address,
+        config.brontide_identity_durable,
+        &config.transport,
+    ) {
+        (Some(advertised_address), true, PeerTransport::Brontide(identity)) => {
+            Some(HnsrRelayBackend {
+                advertised_address,
+                private_key: *identity.private_key(),
+            })
+        }
+        _ => None,
+    };
+    let mut identity = Vec::with_capacity(96);
+    identity.extend_from_slice(&coordinator.binding.magic.to_le_bytes());
+    identity.extend_from_slice(&coordinator.binding.genesis_hash);
+    identity.extend_from_slice(&hns_hnsr_protocol::HNS_NODE_V1.to_le_bytes());
+    if let Some(backend) = coordinator.relay_backend {
+        match backend.advertised_address.ip() {
+            IpAddr::V4(address) => identity.extend_from_slice(&address.octets()),
+            IpAddr::V6(address) => identity.extend_from_slice(&address.octets()),
+        }
+        identity.extend_from_slice(&backend.advertised_address.port().to_le_bytes());
+        if let PeerTransport::Brontide(local) = &config.transport {
+            identity.extend_from_slice(local.public_key());
+        }
+    }
+    coordinator.configuration_hash = hns_primitives::blake2b_256(&identity);
+    coordinator
+}
+
+fn hnsr_admission_from_snapshot(snapshot: PeerSnapshot) -> Option<HnsrPeerAdmission> {
+    let wire_profile = snapshot.denuo_wire_profile?;
+    let negotiated = snapshot.denuo_negotiated_registry?;
+    (snapshot.state == PeerState::Ready
+        && snapshot.transport == crate::PeerTransportKind::Brontide
+        && snapshot.authenticated_remote_static.is_some()
+        && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
+        && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
+        && wire_profile == ExperimentalWireProfile::DenuoV1)
+        .then_some(HnsrPeerAdmission {
+            peer: snapshot.id,
+            address: snapshot.address,
+            direction: snapshot.direction,
+            transport: snapshot.transport,
+            authenticated_remote_static: snapshot.authenticated_remote_static,
+            remote_services: snapshot.services,
+            wire_profile,
+            negotiated,
+        })
+}
+
+fn exact_experimental_admission(
+    snapshot: &PeerSnapshot,
+    network: Network,
+    packet_type: crate::PacketType,
+) -> bool {
+    let Some(wire_profile) = snapshot.denuo_wire_profile else {
+        return false;
+    };
+    let Some(negotiated) = snapshot.denuo_negotiated_registry.as_ref() else {
+        return false;
+    };
+    let binding = OdohNetworkBinding::for_network(network);
+    let service_available = match packet_type {
+        crate::PacketType::Unknown(value) if value == ODOH_PACKET.value() => {
+            snapshot.services & ODOH_SERVICE.value() != 0
+        }
+        crate::PacketType::Unknown(value) if value == hns_hnsr_protocol::HNSR_PACKET_TYPE => {
+            snapshot.services & hns_hnsr_protocol::HNSR_RELAY_SERVICE != 0
+        }
+        crate::PacketType::Unknown(_) => true,
+        _ => false,
+    };
+    service_available
+        && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
+        && snapshot.transport == crate::PeerTransportKind::Brontide
+        && snapshot.authenticated_remote_static.is_some()
+        && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
+        && wire_profile == ExperimentalWireProfile::DenuoV1
+        && negotiated.fingerprint == DENUO_V1_REGISTRY_FINGERPRINT
+        && negotiated.registry_version == DENUO_V1_REGISTRY_VERSION
+        && negotiated.protocols.contains(&(
+            REGISTRY_NEGOTIATION_PROTOCOL_ID,
+            DENUO_V1_REGISTRY_PROTOCOL_VERSION,
+        ))
+        && negotiated.network == binding.network
+        && negotiated.genesis_hash == binding.genesis_hash
+        && negotiated.maximum_send_size != 0
+        && negotiated.maximum_live_requests != 0
 }
 
 fn atomic_saturating_add(counter: &AtomicU64, value: u64) {

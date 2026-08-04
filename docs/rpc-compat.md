@@ -106,7 +106,13 @@ into a process-wide RPC snapshot.
   bounded live work, socket-write outcomes, and explicit false provider-role
   fields. It never exposes request IDs, locators, DNS bodies, HPKE context, or
   response payloads.
-- API-v14's base `NodeService` snapshot initializes `release_stage:
+- API-v15 adds a name-free `hnsr` object. It separates default-on requester and
+  opaque-relay policy from actual relay-service availability/advertisement,
+  reports bounded circuit/action totals and durable generation/time state, and
+  explicitly reports endpoint, rendezvous, and plaintext roles as unavailable.
+  It never exposes tickets, reservation IDs, circuit/context IDs, peer keys,
+  opaque payloads, or endpoint addresses.
+- API-v15's base `NodeService` snapshot initializes `release_stage:
   "pre-authority"`. The native-sync composer replaces it in live RPC with
   `native-sync-live-p2p`, `mining-engine-observe`, or
   `mainnet-canary-gated`, according to configuration. These diagnostic stages

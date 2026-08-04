@@ -10,8 +10,11 @@ use hns_dns_relay_protocol::MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE as HIP76_MAX_RES
 use hns_primitives::sha256;
 use std::{fmt, sync::Arc};
 
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305, Nonce, Tag,
+};
 use hns_secp256k1::{Secp256k1Transport, SecpError};
-use openssl::symm::{decrypt_aead, encrypt_aead, Cipher};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
@@ -134,16 +137,18 @@ impl CipherState {
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<(Vec<u8>, [u8; TAG_SIZE]), P2pError> {
+        let cipher = ChaCha20Poly1305::new(self.key.as_array().into());
+        let nonce_bytes = self.nonce_bytes();
+        let mut ciphertext = plaintext.to_vec();
+        let detached = cipher
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                associated_data,
+                &mut ciphertext,
+            )
+            .map_err(|_| P2pError::State("Brontide encryption failed".to_owned()))?;
         let mut tag = [0u8; TAG_SIZE];
-        let ciphertext = encrypt_aead(
-            Cipher::chacha20_poly1305(),
-            self.key.as_array(),
-            Some(&self.nonce_bytes()),
-            associated_data,
-            plaintext,
-            &mut tag,
-        )
-        .map_err(crypto_error)?;
+        tag.copy_from_slice(&detached);
         self.advance()?;
         Ok((ciphertext, tag))
     }
@@ -154,15 +159,17 @@ impl CipherState {
         tag: &[u8; TAG_SIZE],
         associated_data: &[u8],
     ) -> Result<Vec<u8>, P2pError> {
-        let plaintext = decrypt_aead(
-            Cipher::chacha20_poly1305(),
-            self.key.as_array(),
-            Some(&self.nonce_bytes()),
-            associated_data,
-            ciphertext,
-            tag,
-        )
-        .map_err(|_| P2pError::Protocol("Brontide authentication tag mismatch".to_owned()))?;
+        let cipher = ChaCha20Poly1305::new(self.key.as_array().into());
+        let nonce_bytes = self.nonce_bytes();
+        let mut plaintext = ciphertext.to_vec();
+        cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                associated_data,
+                &mut plaintext,
+                Tag::from_slice(tag),
+            )
+            .map_err(|_| P2pError::Protocol("Brontide authentication tag mismatch".to_owned()))?;
         self.advance()?;
         Ok(plaintext)
     }
@@ -781,10 +788,6 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     outer.extend(normalized.iter().map(|byte| byte ^ 0x5c));
     outer.extend_from_slice(&inner_hash);
     sha256(&outer)
-}
-
-fn crypto_error(error: openssl::error::ErrorStack) -> P2pError {
-    P2pError::State(format!("Brontide crypto failed: {error}"))
 }
 
 fn secp_error(error: SecpError) -> P2pError {

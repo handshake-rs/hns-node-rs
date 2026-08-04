@@ -105,8 +105,9 @@ use hns_mining::{
     SolvedMiningCandidate, TemplateCoordinator,
 };
 use hns_p2p::{
-    DenuoSummary, Hip76Summary, OdohNetworkBinding, OdohRequesterConfig,
-    OdohRequesterRuntime, OdohRequesterStatus, PeerSnapshot,
+    DenuoSummary, Hip76Summary, HnsrCoordinator, HnsrCoordinatorConfig,
+    HnsrCoordinatorStatus, OdohNetworkBinding, OdohRequesterConfig, OdohRequesterRuntime,
+    OdohRequesterStatus, PeerSnapshot,
 };
 use hns_primitives::{
     blake2b_256, hex_encode, sha3_256, Block, BlockHash, Coin, CompactTarget, Height, NameHash,
@@ -115,9 +116,9 @@ use hns_primitives::{
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
     RpcConsensusReadiness, RpcErrorObject, RpcExperimentalRegistryInfo,
-    RpcExperimentalRejectionCount, RpcHeaderEntry, RpcHip76Info, RpcMethod, RpcMiningEngineInfo,
-    RpcNameTreeCompactionInfo, RpcNodeStatus, RpcOdohInfo, RpcParityInfo, RpcService, RpcSnapshot,
-    RpcTransactionEntry, RpcUndoRetentionInfo,
+    RpcExperimentalRejectionCount, RpcHeaderEntry, RpcHip76Info, RpcHnsrInfo, RpcMethod,
+    RpcMiningEngineInfo, RpcNameTreeCompactionInfo, RpcNodeStatus, RpcOdohInfo, RpcParityInfo,
+    RpcService, RpcSnapshot, RpcTransactionEntry, RpcUndoRetentionInfo,
 };
 use hns_state::{
     compact_name_tree_nodes_streaming, connect_block_to_batch_with_services, decode_coin,
@@ -167,7 +168,7 @@ use tokio::{
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 14;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 15;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -2055,11 +2056,81 @@ pub(crate) fn rpc_odoh_info(status: &OdohRequesterStatus) -> RpcOdohInfo {
     }
 }
 
+pub(crate) fn rpc_hnsr_info(status: &HnsrCoordinatorStatus) -> RpcHnsrInfo {
+    let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    RpcHnsrInfo {
+        schema_version: status.schema_version,
+        state_generation: status.state_generation,
+        requester_generation: status.requester.generation,
+        relay_generation: status.relay.generation,
+        requester_enabled: status.requester.enabled,
+        requester_default_enabled: status.requester_default_enabled,
+        opaque_relay_enabled: status.relay.enabled,
+        opaque_relay_default_enabled: status.opaque_relay_default_enabled,
+        relay_service_available: status.relay_service_available,
+        relay_service_advertised: status.relay_service_advertised,
+        endpoint_role_available: status.endpoint_role_available,
+        rendezvous_role_available: status.rendezvous_role_available,
+        plaintext_transport_available: status.plaintext_transport_available,
+        service_bit: status.service_bit,
+        packet_type: status.packet_type,
+        profile: status.profile,
+        profile_registry_fingerprint: status.profile_registry_fingerprint.clone(),
+        profile_registry_version: status.profile_registry_version,
+        profile_registry_protocol_version: status.profile_registry_protocol_version,
+        profile_registry_wire_profile: status.profile_registry_wire_profile.clone(),
+        eligible_authenticated_relays: count(status.eligible_authenticated_relays),
+        faulted_peers: count(status.faulted_peers),
+        reservations: count(status.reservations),
+        requester_pending_circuits: count(status.requester.pending_circuits),
+        requester_active_circuits: count(status.requester.active_circuits),
+        relay_pending_circuits: count(status.relay.pending_circuits),
+        relay_active_circuits: count(status.relay.active_circuits),
+        queued_bytes: count(
+            status
+                .requester
+                .queued_bytes
+                .saturating_add(status.relay.queued_bytes),
+        ),
+        queued_actions: count(
+            status
+                .requester
+                .queued_actions
+                .saturating_add(status.relay.queued_actions),
+        ),
+        trusted_time_high_water: status.trusted_time_high_water,
+        durable_state_dirty: status.durable_state_dirty,
+        admitted_opens: status
+            .requester
+            .admitted_opens
+            .saturating_add(status.relay.admitted_opens),
+        opened_circuits: status
+            .requester
+            .opened_circuits
+            .saturating_add(status.relay.opened_circuits),
+        bytes_sent: status
+            .requester
+            .bytes_sent
+            .saturating_add(status.relay.bytes_sent),
+        bytes_received: status
+            .requester
+            .bytes_received
+            .saturating_add(status.relay.bytes_received),
+        socket_write_failures: status.process.socket_write_failures,
+        expired_work: status.process.expired_work,
+        revoked_work: status
+            .requester
+            .revoked_work
+            .saturating_add(status.relay.revoked_work),
+        rejected_packets: status.process.rejected_packets,
+    }
+}
+
 fn rpc_inactive_odoh_info(network: Network, requester_enabled: bool) -> RpcOdohInfo {
     let mut config = OdohRequesterConfig::default();
     config.enabled = requester_enabled;
     config.allow_private_targets = matches!(network, Network::Regtest | Network::Simnet);
-    let now = current_unix_time();
+    let now = current_unix_time().unwrap_or_default();
     let mut runtime = OdohRequesterRuntime::new(
         OdohNetworkBinding::for_network(network),
         config,
@@ -2068,6 +2139,19 @@ fn rpc_inactive_odoh_info(network: Network, requester_enabled: bool) -> RpcOdohI
     )
     .expect("built-in ODoH requester defaults are valid");
     rpc_odoh_info(&runtime.status(now, 0))
+}
+
+fn rpc_inactive_hnsr_info(
+    network: Network,
+    requester_enabled: bool,
+    relay_enabled: bool,
+) -> RpcHnsrInfo {
+    let mut config = HnsrCoordinatorConfig::for_network(network);
+    config.requester_enabled = requester_enabled;
+    config.opaque_relay_enabled = relay_enabled;
+    let coordinator = HnsrCoordinator::fresh(config, current_unix_time().unwrap_or_default())
+        .expect("built-in HNSR coordinator defaults are valid");
+    rpc_hnsr_info(&coordinator.status(0))
 }
 
 fn parity_info() -> RpcParityInfo {
@@ -4658,6 +4742,11 @@ impl NodeService {
             odoh: rpc_inactive_odoh_info(
                 self.config.network,
                 self.config.native_sync.enabled && self.config.native_sync.odoh_requester,
+            ),
+            hnsr: rpc_inactive_hnsr_info(
+                self.config.network,
+                self.config.native_sync.enabled && self.config.native_sync.hnsr_requester,
+                self.config.native_sync.enabled && self.config.native_sync.hnsr_opaque_relay,
             ),
             authority,
             parity,

@@ -45,7 +45,7 @@ use hns_primitives::{
 };
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcExperimentalRegistryInfo, RpcHip76Info,
-    RpcMethod, RpcOdohInfo, RpcService, RpcSnapshot,
+    RpcHnsrInfo, RpcMethod, RpcOdohInfo, RpcService, RpcSnapshot,
 };
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use hns_store::mark_clean_shutdown;
@@ -72,8 +72,8 @@ use super::{
     load_block as load_block_from_snapshot, load_block_index_record, load_header_record,
     median_time_past_with_lookup, mining_generation_from_snapshot, mining_snapshot_for_hash,
     preflight_reorg_reconciliation_budget, require_rpc_authorization,
-    rpc_experimental_registry_info, rpc_hip76_info, rpc_immediately_unsupported, rpc_odoh_info,
-    rpc_point_read_method, AuthorityMode, CanonicalChainEpoch, CanonicalStateWriter,
+    rpc_experimental_registry_info, rpc_hip76_info, rpc_hnsr_info, rpc_immediately_unsupported,
+    rpc_odoh_info, rpc_point_read_method, AuthorityMode, CanonicalChainEpoch, CanonicalStateWriter,
     CanonicalWriterError, ChainActivationFailure, DurableMiningState, FailedBlockMutation,
     FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport, NodeReadHandle,
     NodeReorg, NodeReorgLimits, NodeRuntime, NodeService, PreparedNativeActivation,
@@ -101,6 +101,8 @@ const DEFAULT_KNOWN_PEER_ADDRESSES: usize = 4_096;
 const ADDRESS_BOOK_KEY: &[u8] = b"address-book/v1";
 const ODOH_TARGET_CACHE_KEY: &[u8] = b"odoh-target-cache/v1";
 const ODOH_DURABLE_FLOOR_KEY: &[u8] = b"odoh-durable-floor/v1";
+const HNSR_STATE_KEY: &[u8] = b"hnsr-runtime-state/v1";
+const HNSR_DURABLE_FLOOR_KEY: &[u8] = b"hnsr-durable-floor/v1";
 const ADDRESS_BOOK_MAGIC: &[u8; 4] = b"HAB1";
 const ADDRESS_BOOK_VERSION: u8 = 2;
 const ADDRESS_BOOK_CHECKSUM_SIZE: usize = 32;
@@ -712,80 +714,6 @@ fn charge_header_deployment_read(
     Ok(())
 }
 
-// Key-bearing fixed seeds from the pinned HSD `lib/net/seeds` tables. HSD's
-// DNS seed answers expose unauthenticated plaintext endpoints without static keys, so a
-// native Brontide bootstrap must begin from these authenticated records and
-// then learn more key-bearing peers through ADDR.
-const HSD_MAINNET_BRONTIDE_SEEDS: &[(&str, &str)] = &[
-    (
-        "129.153.177.220",
-        "02a58318ea330487308b1a4bd90bd196a466e99be64a3cf2f1fe7b5352154a25c2",
-    ),
-    (
-        "159.69.46.23",
-        "03e7c897432e08b0a2a6f6e9cfdb0aa8d3392f8abe4a3c2d40013b2ee06b1adb6a",
-    ),
-    (
-        "173.255.209.126",
-        "024798bdd795240b711787273406f7950fd2a943a0bb096701720682eb3aea37ed",
-    ),
-    (
-        "74.207.247.120",
-        "0290c11c1d0895f96f9c1b0c4f2b6034ee3d4ee8f5f90c9b6c76bd27d4bd0a5cbd",
-    ),
-    (
-        "172.104.214.189",
-        "039078400609f39f5ae6e6d132161561860e52d35637ed3f5a5050c160dd28dfde",
-    ),
-    (
-        "45.79.134.225",
-        "03fb5a5801cdb19f01472480d00c1c928e498f49955eab5217cd00e755bd267973",
-    ),
-    (
-        "35.154.209.88",
-        "022d850f3bfb951c6de1d2f239183721bfaa2b1ac89576200fcca6f84181d1da62",
-    ),
-    (
-        "194.50.5.26",
-        "023e3322d4221160923ea1dc481523a26ef3fa8483da062f7e92040534cc6b3606",
-    ),
-    (
-        "194.50.5.27",
-        "03949fede42b27117d0a75e08cf1b139a37241ad4bebcb5c8a9928fdec7469107d",
-    ),
-    (
-        "194.50.5.28",
-        "0247eb646fdf05bd470c5ad380d42e936ffe8278e46cc9bd5791ea58c28587ab45",
-    ),
-];
-
-const HSD_TESTNET_BRONTIDE_SEEDS: &[(&str, &str)] = &[
-    (
-        "172.104.214.189",
-        "039078400609f39f5ae6e6d132161561860e52d35637ed3f5a5050c160dd28dfde",
-    ),
-    (
-        "173.255.209.126",
-        "024798bdd795240b711787273406f7950fd2a943a0bb096701720682eb3aea37ed",
-    ),
-    (
-        "172.104.177.177",
-        "0255dfda9369ca3cd616844c00eed63f2d7740cd56780a856def1e64f536214539",
-    ),
-    (
-        "139.162.183.168",
-        "0334b93039cdda203e704bb5a4831b66665b2f7b0dcea7fd022dfea623b1aa4081",
-    ),
-];
-
-const fn hsd_brontide_seeds(network: Network) -> &'static [(&'static str, &'static str)] {
-    match network {
-        Network::Mainnet => HSD_MAINNET_BRONTIDE_SEEDS,
-        Network::Testnet => HSD_TESTNET_BRONTIDE_SEEDS,
-        Network::Regtest | Network::Simnet => &[],
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeSyncConfig {
     pub enabled: bool,
@@ -803,6 +731,13 @@ pub struct NativeSyncConfig {
     /// Enable the outbound-only HIP-77 ODoH requester. This never enables or
     /// advertises a local proxy, target, or plaintext output role.
     pub odoh_requester: bool,
+    /// Enable the HIP-78 HNSR requester policy.
+    pub hnsr_requester: bool,
+    /// Enable the connection-bound HIP-78 opaque relay policy. This does not
+    /// make the service available without an explicit relay address.
+    pub hnsr_opaque_relay: bool,
+    /// Explicit address advertised in locally issued HNSR relay tickets.
+    pub hnsr_relay_address: Option<SocketAddr>,
     pub maximum_known_addresses: usize,
     pub maximum_inbound: usize,
     pub maximum_outbound: usize,
@@ -831,6 +766,9 @@ impl Default for NativeSyncConfig {
             connect_keys: BTreeMap::new(),
             discovery: false,
             odoh_requester: true,
+            hnsr_requester: true,
+            hnsr_opaque_relay: true,
+            hnsr_relay_address: None,
             maximum_known_addresses: DEFAULT_KNOWN_PEER_ADDRESSES,
             maximum_inbound: 32,
             maximum_outbound: 8,
@@ -871,7 +809,8 @@ impl NativeSyncConfig {
                 self.active_state_connect_batch
             );
         }
-        let has_discovery_endpoint = self.discovery && !hsd_brontide_seeds(network).is_empty();
+        let has_discovery_endpoint =
+            self.discovery && !hns_p2p::hsd_brontide_seed_table(network).is_empty();
         if self.listen.is_none() && self.connect.is_empty() && !has_discovery_endpoint {
             anyhow::bail!(
                 "Native sync requires an inbound listener, an explicit outbound peer, or DNS discovery on a seeded network"
@@ -1055,6 +994,8 @@ pub struct NativeSyncDiagnostics {
     pub hip76: RpcHip76Info,
     #[serde(default)]
     pub odoh: RpcOdohInfo,
+    #[serde(default)]
+    pub hnsr: RpcHnsrInfo,
     pub sync: SyncSnapshot,
     pub orphans: OrphanSnapshot,
     pub checkpoint_sequence: u64,
@@ -2345,14 +2286,19 @@ struct DnsSeedResolution {
 }
 
 async fn resolve_hsd_dns_seeds(network: Network) -> DnsSeedResolution {
-    let seeds = hsd_brontide_seeds(network);
+    let seeds = hns_p2p::hsd_brontide_seed_table(network);
     let mut resolved = Vec::with_capacity(seeds.len());
     let mut errors = Vec::new();
-    for (host, encoded_key) in seeds {
-        let parsed = host
+    for seed in seeds {
+        let parsed = seed
+            .host
             .parse::<IpAddr>()
-            .map_err(|error| format!("invalid pinned HSD seed IP {host}: {error}"))
-            .and_then(|ip| decode_compressed_public_key(encoded_key).map(|key| (ip, key)));
+            .map_err(|error| format!("invalid pinned HSD seed IP {}: {error}", seed.host))
+            .and_then(|ip| {
+                hns_p2p::decode_compressed_public_key(seed.public_key_hex)
+                    .map(|key| (ip, key))
+                    .map_err(|error| error.to_string())
+            });
         match parsed {
             Ok((ip, key)) => {
                 let mut wire = hns_p2p::NetAddress::from_socket_addr(
@@ -2370,25 +2316,6 @@ async fn resolve_hsd_dns_seeds(network: Network) -> DnsSeedResolution {
         addresses: resolved,
         errors,
     }
-}
-
-fn decode_compressed_public_key(encoded: &str) -> std::result::Result<[u8; 33], String> {
-    if encoded.len() != 66 {
-        return Err(format!(
-            "compressed public key has {} hex characters; expected 66",
-            encoded.len()
-        ));
-    }
-    let mut key = [0u8; 33];
-    for (index, output) in key.iter_mut().enumerate() {
-        let offset = index * 2;
-        *output = u8::from_str_radix(&encoded[offset..offset + 2], 16)
-            .map_err(|error| format!("invalid compressed public key hex: {error}"))?;
-    }
-    if !matches!(key[0], 0x02 | 0x03) {
-        return Err("compressed public key has an invalid prefix".to_owned());
-    }
-    Ok(key)
 }
 
 fn load_or_create_brontide_identity(data_dir: Option<&Path>) -> Result<BrontideIdentity> {
@@ -2546,12 +2473,16 @@ impl NodeService {
         if matches!(network, Network::Mainnet | Network::Testnet) {
             peer_config.transport =
                 PeerTransport::Brontide(load_or_create_brontide_identity(data_dir.as_deref())?);
+            peer_config.brontide_identity_durable = data_dir.is_some();
         }
         peer_config.maximum_inbound = native_sync_config.maximum_inbound;
         peer_config.maximum_outbound = native_sync_config.maximum_outbound;
         peer_config.ban_score = HSD_BAN_SCORE;
         peer_config.ban_time = Duration::from_secs(HSD_BAN_TIME_SECONDS);
         peer_config.odoh.enabled = native_sync_config.odoh_requester;
+        peer_config.hnsr_requester = native_sync_config.hnsr_requester;
+        peer_config.hnsr_opaque_relay = native_sync_config.hnsr_opaque_relay;
+        peer_config.hnsr_relay_address = native_sync_config.hnsr_relay_address;
         if ban_list_persistent {
             let snapshot = store
                 .snapshot()
@@ -2562,6 +2493,12 @@ impl NodeService {
             peer_config.odoh_durable_floor = snapshot
                 .get(ColumnFamily::Peers, ODOH_DURABLE_FLOOR_KEY)
                 .context("failed to read durable ODoH generation floor")?;
+            peer_config.hnsr_state = snapshot
+                .get(ColumnFamily::Peers, HNSR_STATE_KEY)
+                .context("failed to read durable HNSR runtime state")?;
+            peer_config.hnsr_durable_floor = snapshot
+                .get(ColumnFamily::Peers, HNSR_DURABLE_FLOOR_KEY)
+                .context("failed to read durable HNSR generation floor")?;
         }
         let (peers, mut peer_events) = LivePeerManager::new(peer_config)
             .map_err(|error| anyhow::anyhow!("failed to initialize live peers: {error}"))?;
@@ -2701,6 +2638,7 @@ impl NodeService {
         let initial_experimental_registry =
             rpc_experimental_registry_info(&peers.denuo_summary().await);
         let initial_odoh = rpc_odoh_info(&peers.odoh_status(address_timestamp).await);
+        let initial_hnsr = rpc_hnsr_info(&peers.hnsr_status().await);
         let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
@@ -2731,6 +2669,7 @@ impl NodeService {
             experimental_registry: initial_experimental_registry,
             hip76: rpc_hip76_info(&[]),
             odoh: initial_odoh,
+            hnsr: initial_hnsr,
             sync: scheduler.snapshot(),
             orphans: orphan_pool.snapshot(),
             checkpoint_sequence: initial_sequence,
@@ -2880,6 +2819,9 @@ impl NodeService {
                     flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
                     if let Err(error) = flush_odoh_target_cache(&store, &peers).await {
                         record_warning(format!("failed to persist ODoH target cache: {error:#}"));
+                    }
+                    if let Err(error) = flush_hnsr_state(&store, &peers).await {
+                        record_warning(format!("failed to persist HNSR runtime state: {error:#}"));
                     }
                 }
                 _ = active_state_poll.tick(),
@@ -3061,6 +3003,10 @@ impl NodeService {
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
+                    }
+
+                    if let Err(error) = peers.expire_hnsr(unix_time()).await {
+                        record_warning(format!("failed to expire HNSR runtime work: {error}"));
                     }
 
                     let compact_now = Instant::now();
@@ -3581,6 +3527,15 @@ impl NodeService {
                 if let Err(error) = flush_odoh_target_cache(&store, &peers).await {
                     record_error(&diagnostics, format!(
                         "failed to persist final ODoH target cache: {error:#}"
+                    ))
+                    .await;
+                    if terminal_error.is_none() {
+                        terminal_error = Some(error);
+                    }
+                }
+                if let Err(error) = flush_hnsr_state(&store, &peers).await {
+                    record_error(&diagnostics, format!(
+                        "failed to persist final HNSR runtime state: {error:#}"
                     ))
                     .await;
                     if terminal_error.is_none() {
@@ -5026,6 +4981,7 @@ async fn compose_native_sync_rpc_service(
     snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
     snapshot.node_status.hip76 = rpc_hip76_info(&diagnostics.peers);
     snapshot.node_status.odoh = diagnostics.odoh.clone();
+    snapshot.node_status.hnsr = diagnostics.hnsr.clone();
     snapshot.node_status.release_stage = if config.mainnet_canary {
         "mainnet-canary-gated".to_owned()
     } else if config.mining_engine.enabled {
@@ -5087,6 +5043,7 @@ async fn available_diagnostic_rpc(
     snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
     snapshot.node_status.hip76 = diagnostics.hip76.clone();
     snapshot.node_status.odoh = diagnostics.odoh.clone();
+    snapshot.node_status.hnsr = diagnostics.hnsr.clone();
     if let Some(best_header) = diagnostics.sync.best_header.as_ref() {
         snapshot.node_status.best_header_hash = Some(best_header.hash);
         snapshot.node_status.best_header_height = Some(best_header.height);
@@ -5574,6 +5531,10 @@ async fn handle_peer_event(
             // Provider policy defaults off. A future explicitly configured
             // resolver backend must consume this typed event without logging
             // its DNS query.
+        }
+        PeerEvent::HnsrRequester { .. } => {
+            // Circuit IDs and opaque application events remain on the typed
+            // manager event surface and are deliberately absent from logs.
         }
         PeerEvent::Packet { peer, packet } => match packet {
             Packet::Headers(headers) => {
@@ -8219,11 +8180,13 @@ async fn refresh_diagnostics(
     let traffic = peers.traffic_totals().await;
     let (snapshots, experimental_registry) = peers.snapshots_with_denuo_summary().await;
     let odoh = rpc_odoh_info(&peers.odoh_status(unix_time()).await);
+    let hnsr = rpc_hnsr_info(&peers.hnsr_status().await);
     let mut state = diagnostics.write().await;
     state.bytes_sent = traffic.bytes_sent;
     state.bytes_received = traffic.bytes_received;
     state.hip76 = rpc_hip76_info(&snapshots);
     state.odoh = odoh;
+    state.hnsr = hnsr;
     state.peers = snapshots;
     state.experimental_registry = rpc_experimental_registry_info(&experimental_registry);
     state.sync = scheduler.snapshot();
@@ -8316,6 +8279,25 @@ async fn flush_odoh_target_cache(
     peers
         .acknowledge_odoh_target_cache_persisted(floor)
         .await;
+    Ok(true)
+}
+
+async fn flush_hnsr_state(store: &StoreHandle, peers: &LivePeerManager) -> Result<bool> {
+    let timestamp = unix_time();
+    if !peers.hnsr_status().await.durable_state_dirty {
+        return Ok(false);
+    }
+    let snapshot = peers.hnsr_state_snapshot(timestamp).await?;
+    let encoded_floor = snapshot.floor.encode();
+    let mut batch = store.batch();
+    batch.put(ColumnFamily::Peers, HNSR_STATE_KEY, &snapshot.bytes)?;
+    batch.put(
+        ColumnFamily::Peers,
+        HNSR_DURABLE_FLOOR_KEY,
+        &encoded_floor,
+    )?;
+    store.commit(batch)?;
+    peers.acknowledge_hnsr_persisted(snapshot.floor).await;
     Ok(true)
 }
 
@@ -10706,11 +10688,13 @@ mod tests {
 
     #[test]
     fn discovery_uses_pinned_hsd_key_bearing_seeds() {
-        assert_eq!(hsd_brontide_seeds(Network::Mainnet).len(), 10);
-        assert_eq!(hsd_brontide_seeds(Network::Testnet).len(), 4);
-        assert!(hsd_brontide_seeds(Network::Regtest).is_empty());
+        assert_eq!(hns_p2p::hsd_brontide_seed_table(Network::Mainnet).len(), 10);
+        assert_eq!(hns_p2p::hsd_brontide_seed_table(Network::Testnet).len(), 4);
+        assert!(hns_p2p::hsd_brontide_seed_table(Network::Regtest).is_empty());
         assert_eq!(
-            decode_compressed_public_key(hsd_brontide_seeds(Network::Mainnet)[0].1)
+            hns_p2p::decode_compressed_public_key(
+                hns_p2p::hsd_brontide_seed_table(Network::Mainnet)[0].public_key_hex,
+            )
                 .expect("pinned key")[0],
             0x02
         );
@@ -10738,7 +10722,10 @@ mod tests {
             .is_err());
         explicit.connect_keys.insert(
             address,
-            decode_compressed_public_key(HSD_MAINNET_BRONTIDE_SEEDS[0].1).expect("seed key"),
+            hns_p2p::decode_compressed_public_key(
+                hns_p2p::HSD_MAINNET_BRONTIDE_SEEDS[0].public_key_hex,
+            )
+            .expect("seed key"),
         );
         explicit
             .validate(AuthorityMode::Native, Network::Mainnet)

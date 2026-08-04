@@ -1,7 +1,9 @@
+#[cfg(feature = "openssl-verifiers")]
 use hns_goosig::GooSigVerifier;
 use hns_primitives::{
     AirdropError, AirdropKey, AirdropProof, AirdropSignatureVerifier, Amount, CovenantKind, Output,
 };
+#[cfg(feature = "openssl-verifiers")]
 use openssl::{
     bn::{BigNum, BigNumContext},
     ec::{EcGroup, EcKey, EcPoint},
@@ -18,11 +20,13 @@ use openssl::{
 /// digest in the SHA-256 PKCS#1 v1.5 `DigestInfo`, while P-256, Ed25519, and
 /// GooSig consume those bytes directly, matching `AirdropKey.verify` in the
 /// pinned oracle.
+#[cfg(feature = "openssl-verifiers")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeAirdropSignatureVerifier {
     goo: GooSigVerifier,
 }
 
+#[cfg(feature = "openssl-verifiers")]
 impl NativeAirdropSignatureVerifier {
     pub fn new() -> Result<Self, AirdropError> {
         let goo = GooSigVerifier::new()
@@ -31,6 +35,7 @@ impl NativeAirdropSignatureVerifier {
     }
 }
 
+#[cfg(feature = "openssl-verifiers")]
 impl AirdropSignatureVerifier for NativeAirdropSignatureVerifier {
     fn verify(
         &self,
@@ -55,6 +60,7 @@ impl AirdropSignatureVerifier for NativeAirdropSignatureVerifier {
     }
 }
 
+#[cfg(feature = "openssl-verifiers")]
 fn verify_rsa(message: &[u8], signature: &[u8], modulus: &[u8], exponent: &[u8]) -> bool {
     let key = (|| {
         let modulus = BigNum::from_slice(modulus)?;
@@ -77,6 +83,7 @@ fn verify_rsa(message: &[u8], signature: &[u8], modulus: &[u8], exponent: &[u8])
     verifier.verify(message, signature).unwrap_or(false)
 }
 
+#[cfg(feature = "openssl-verifiers")]
 fn verify_p256(message: &[u8], signature: &[u8], point: &[u8; 33]) -> bool {
     if signature.len() != 64 {
         return false;
@@ -101,6 +108,7 @@ fn verify_p256(message: &[u8], signature: &[u8], point: &[u8; 33]) -> bool {
     compact.verify(message, &key).unwrap_or(false)
 }
 
+#[cfg(feature = "openssl-verifiers")]
 fn verify_ed25519(message: &[u8], signature: &[u8], point: &[u8; 32]) -> bool {
     let Ok(key) = PKey::public_key_from_raw_bytes(point, Id::ED25519) else {
         return false;
