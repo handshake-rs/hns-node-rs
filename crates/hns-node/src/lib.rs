@@ -3874,32 +3874,6 @@ impl NodeService {
             &registration,
         )
         .map_err(anyhow::Error::new)?;
-        if read_canonical_hash(&snapshot, rollback_boundary.pruned_through)?
-            != Some(rollback_boundary.block_hash)
-        {
-            return Err(anyhow::Error::new(
-                hns_wallet_index::IndexError::Corrupt(
-                    "completed retirement rollback block is not canonical",
-                ),
-            ));
-        }
-        let TrackedContractEvent::Spend {
-            height, block_hash, ..
-        } = &retirement.1.terminal_event
-        else {
-            return Err(anyhow::Error::new(
-                hns_wallet_index::IndexError::Corrupt(
-                    "completed retirement terminal evidence is not a spend",
-                ),
-            ));
-        };
-        if read_canonical_hash(&snapshot, *height)? != Some(*block_hash) {
-            return Err(anyhow::Error::new(
-                hns_wallet_index::IndexError::Corrupt(
-                    "completed retirement terminal block is not canonical",
-                ),
-            ));
-        }
         drop(snapshot);
         self.state.store.commit(batch)?;
         Ok(outcome)
@@ -3961,6 +3935,32 @@ impl NodeService {
             permanent_abandonment_acknowledged,
         )
         .map_err(anyhow::Error::new)?;
+        if read_canonical_hash(&snapshot, rollback_boundary.pruned_through)?
+            != Some(rollback_boundary.block_hash)
+        {
+            return Err(anyhow::Error::new(
+                hns_wallet_index::IndexError::Corrupt(
+                    "completed retirement rollback block is not canonical",
+                ),
+            ));
+        }
+        let TrackedContractEvent::Spend {
+            height, block_hash, ..
+        } = &retirement.1.terminal_event
+        else {
+            return Err(anyhow::Error::new(
+                hns_wallet_index::IndexError::Corrupt(
+                    "completed retirement terminal evidence is not a spend",
+                ),
+            ));
+        };
+        if read_canonical_hash(&snapshot, *height)? != Some(*block_hash) {
+            return Err(anyhow::Error::new(
+                hns_wallet_index::IndexError::Corrupt(
+                    "completed retirement terminal block is not canonical",
+                ),
+            ));
+        }
         drop(snapshot);
         self.state.store.commit(batch)?;
         Ok(retirement)
