@@ -103,6 +103,13 @@ enabled by default. `--no-native-sync` creates an RPC-only process, while
 The former positive flags remain accepted for deployment compatibility. Press
 `Ctrl-C` for a clean shutdown.
 
+HIP-76, ODoH, and HNSR requester policies also default on (`Auto` for HIP-76).
+With a persistent data directory, the `--no-hip76-requester`,
+`--no-odoh-requester`, `--no-hnsr-requester`, and `--no-hnsr-relay` choices
+persist across restart. Their matching positive flags explicitly reverse a
+saved opt-out; omitting both forms preserves the durable choice. These
+requester controls do not opt into HIP-76 or ODoH DNS-output provider roles.
+
 In another terminal, inspect node and synchronization status:
 
 ```bash

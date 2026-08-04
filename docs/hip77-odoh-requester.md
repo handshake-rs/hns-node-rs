@@ -3,8 +3,11 @@
 `hns-p2p` provides a process-wide HIP-77 requester over live HNS peers. The
 requester policy is enabled by default on every network and can be disabled or
 revoked with a monotonic policy generation. Standalone operators can start with
-`--no-odoh-requester`; embedded users set `NativeSyncConfig::odoh_requester`.
-This does not enable a local ODoH
+`--no-odoh-requester`, explicitly reverse a saved opt-out with
+`--odoh-requester`, or use neither flag to preserve the durable choice.
+Embedded users use `NativeSyncConfig::odoh_requester_override`; the separate
+`odoh_requester` field is a capability ceiling and must remain true if later
+live re-enable is required. This does not enable a local ODoH
 proxy, target, DNS resolver, or plaintext output role, and the node does not
 advertise the ODoH provider service bit on their behalf.
 
@@ -55,9 +58,11 @@ records or neither and rejects older generations or a clock below the durable
 high-water. Advancing time or pruning on restore makes the cache dirty so the
 new floor is persisted. The explicit requester opt-out and revocation state are
 part of the versioned snapshot, so restart cannot silently re-enable them.
-Persistent native-sync nodes flush this state at the bounded peer-state interval
-and once more during orderly shutdown. Corrupt, incomplete, rolled-back, or
-policy-mismatched state rejects requester initialization.
+Explicit startup selection advances the monotonic generation and is flushed
+before peer networking starts. Persistent native-sync nodes retry dirty state
+at the bounded peer-state interval and once more during orderly shutdown.
+Corrupt, incomplete, rolled-back, or policy-mismatched state rejects requester
+initialization.
 
 Only signed public target records, selected configuration indexes, expiration
 times, sequence high-water marks, requester policy, and the durable rollback

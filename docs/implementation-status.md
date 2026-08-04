@@ -67,27 +67,29 @@ HNSR, or market-role consent.
 
 The bounded [HIP-76 session boundary](hip76-session.md) is now wired
 through live peers. Requesting is available by default and can be disabled
-(opt-out); serving DNS output remains disabled until an operator explicitly
-opts in and marks a backend ready. The session validates framing, DNS message
-shape, correlation, policy generations, deadlines, queue admission, and socket
-completion. A received DNS answer remains untrusted input for a separate
-resolver/DNSSEC validation boundary.
+(opt-out); its process-wide policy/floor pair is persisted atomically and an
+explicit enable reverses a saved opt-out. Serving DNS output remains disabled
+until an operator explicitly opts in and marks a backend ready. The session
+validates framing, DNS message shape, correlation, policy generations,
+deadlines, queue admission, and socket completion. A received DNS answer
+remains untrusted input for a separate resolver/DNSSEC validation boundary.
 
 The bounded HIP-77 ODoH requester is likewise wired through live peers and is
-enabled by default with a policy opt-out. It requires exact Brontide proxy
-  authentication, both Denuo and ODoH service advertisements, exact Denuo V1
-  profile/registry/network/genesis evidence, and a
-proxy key distinct from the target-signed locator. Request correlation,
+enabled by default with durable opt-out and explicit re-enable. It requires
+exact Brontide proxy authentication, both Denuo and ODoH service advertisements,
+exact Denuo V1 profile/registry/network/genesis evidence, and a proxy key
+distinct from the target-signed locator. Request correlation,
 deadlines, negotiated bounds, disconnect cleanup, policy revocation, and
 socket-write acknowledgement are enforced in the live runtime. Only verified
-  public target records, anti-rollback sequence high-water marks, policy state,
-  and cache/policy/trusted-time generation floors are durable atomically;
+public target records, anti-rollback sequence high-water marks, policy state,
+and cache/policy/trusted-time generation floors are durable atomically;
 live sessions and HPKE context are not. Local proxy, target, and output roles
 remain unavailable, and decrypted response bytes remain untrusted until the
 higher resolver boundary parses, correlates, and DNSSEC-validates them.
 
 HIP-78 requester and opaque circuit relay are wired through live authenticated
-peers and default on with independent opt-outs. The runtime admits only HNS
+peers and default on with independent durable opt-outs and explicit re-enable.
+The runtime admits only HNS
 Node v1 over exact Brontide and canonical Denuo V1 evidence, acknowledges real
 destination writes, revokes connection-owned state on lifecycle failure, and
 persists only checksummed policy/counter/generation/time state. Relay service

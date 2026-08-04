@@ -44,10 +44,11 @@ pub use hip76::{
     Hip76FailureReason, Hip76Inbound, Hip76OutboundRequest, Hip76OutboundResponse,
     Hip76PhaseCounts, Hip76ProcessTotals, Hip76ProtocolIdentity, Hip76ProviderDisposition,
     Hip76ProviderPolicy, Hip76ProviderRejection, Hip76ProviderRequest, Hip76ProviderWork,
-    Hip76RequesterResponse, Hip76RevokedWork, Hip76Session, Hip76SessionConfig,
-    Hip76SessionDiagnostics, Hip76Summary, Hip76UntrustedDnsResponse, Hip76WriteToken,
-    HIP76_DEFAULT_MAXIMUM_LIVE_REQUESTS, MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE,
-    MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
+    Hip76RequesterPolicyError, Hip76RequesterPolicyFloor, Hip76RequesterPolicyRuntime,
+    Hip76RequesterPolicySnapshot, Hip76RequesterPolicyStatus, Hip76RequesterResponse,
+    Hip76RevokedWork, Hip76Session, Hip76SessionConfig, Hip76SessionDiagnostics, Hip76Summary,
+    Hip76UntrustedDnsResponse, Hip76WriteToken, HIP76_DEFAULT_MAXIMUM_LIVE_REQUESTS,
+    MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE, MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
 };
 pub use hns_hnsr_protocol::{
     HnsrActionId, HnsrOpcode, HnsrPacket, HnsrPeerId, HnsrRequesterEvent, HnsrRoute,
@@ -62,8 +63,8 @@ pub use hnsr::{
     HnsrPolicyUpdate, HnsrProcessTotals, HnsrRelayBackend, HnsrStateSnapshot,
 };
 pub use manager::{
-    normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, LocalServicesUpdate,
-    PeerBan, PeerTrafficTotals, PeerTransport,
+    normalize_peer_ip, BroadcastReport, Hip76RequesterPolicyUpdate, LivePeerConfig,
+    LivePeerManager, LocalServicesUpdate, PeerBan, PeerTrafficTotals, PeerTransport,
 };
 pub use odoh::{
     is_odoh_packet_type, DirectTargetLocator, OdohCacheError, OdohDurableFloor, OdohFailureReason,

@@ -2408,6 +2408,40 @@ mod tests {
         }
     }
 
+    struct TestPrivateReaderState {
+        odoh: Arc<Mutex<OdohRequesterRuntime>>,
+        experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
+        hnsr: Arc<Mutex<HnsrCoordinator>>,
+        peers: Arc<RwLock<HashMap<PeerId, PeerHandle>>>,
+    }
+
+    fn test_private_reader_state() -> TestPrivateReaderState {
+        let trusted_now = unix_time();
+        TestPrivateReaderState {
+            odoh: Arc::new(Mutex::new(
+                OdohRequesterRuntime::new(
+                    crate::OdohNetworkBinding::for_network(Network::Regtest),
+                    crate::OdohRequesterConfig {
+                        allow_private_targets: true,
+                        ..crate::OdohRequesterConfig::default()
+                    },
+                    1,
+                    trusted_now,
+                )
+                .expect("ODoH test runtime"),
+            )),
+            experimental: Arc::new(Mutex::new(ExperimentalExchangeRuntime::default())),
+            hnsr: Arc::new(Mutex::new(
+                HnsrCoordinator::fresh(
+                    crate::HnsrCoordinatorConfig::for_network(Network::Regtest),
+                    trusted_now,
+                )
+                .expect("HNSR test coordinator"),
+            )),
+            peers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
     #[test]
     fn full_control_queue_disables_only_denuo_admission() {
         let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
@@ -2598,16 +2632,27 @@ mod tests {
             writer_state: hip76_writer_state_tx,
             status: hip76_status_tx,
         } = test_reader_channels(PeerDirection::Inbound);
+        let TestPrivateReaderState {
+            odoh,
+            experimental,
+            hnsr,
+            peers,
+        } = test_private_reader_state();
         let reader = tokio::spawn(peer_reader(
             peer,
             PeerDirection::Inbound,
             test_version([1; 8]),
             denuo,
             test_hip76(PeerDirection::Inbound, SERVICE_NETWORK),
+            odoh,
+            experimental,
+            hnsr,
+            peers,
             PeerTransportKind::Plaintext,
             None,
             PeerFrameReader::Plaintext(AsyncFrameReader::new(peer_io, NetworkMagic::Regtest)),
             config,
+            Duration::from_millis(250),
             events_tx,
             Arc::clone(&snapshot),
             control_tx,
@@ -2707,16 +2752,27 @@ mod tests {
             writer_state: hip76_writer_state_tx,
             status: hip76_status_tx,
         } = test_reader_channels(PeerDirection::Inbound);
+        let TestPrivateReaderState {
+            odoh,
+            experimental,
+            hnsr,
+            peers,
+        } = test_private_reader_state();
         let reader = tokio::spawn(peer_reader(
             peer,
             PeerDirection::Inbound,
             test_version_with_services([3; 8], services),
             denuo,
             test_hip76(PeerDirection::Inbound, services),
+            odoh,
+            experimental,
+            hnsr,
+            peers,
             PeerTransportKind::Plaintext,
             None,
             PeerFrameReader::Plaintext(AsyncFrameReader::new(peer_io, NetworkMagic::Regtest)),
             config,
+            Duration::from_millis(250),
             events_tx,
             Arc::clone(&snapshot),
             control_tx,
@@ -2815,16 +2871,27 @@ mod tests {
             writer_state: hip76_writer_state_tx,
             status: hip76_status_tx,
         } = test_reader_channels(PeerDirection::Inbound);
+        let TestPrivateReaderState {
+            odoh,
+            experimental,
+            hnsr,
+            peers,
+        } = test_private_reader_state();
         let reader = tokio::spawn(peer_reader(
             peer,
             PeerDirection::Inbound,
             test_version_with_services([5; 8], services),
             denuo,
             test_hip76(PeerDirection::Inbound, services),
+            odoh,
+            experimental,
+            hnsr,
+            peers,
             PeerTransportKind::Plaintext,
             None,
             PeerFrameReader::Plaintext(AsyncFrameReader::new(peer_io, NetworkMagic::Regtest)),
             config,
+            Duration::from_millis(250),
             events_tx,
             Arc::clone(&snapshot),
             control_tx,

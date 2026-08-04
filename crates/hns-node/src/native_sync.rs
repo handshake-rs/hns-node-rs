@@ -36,9 +36,9 @@ use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
 use hns_p2p::{
     generate_private_key, normalize_peer_ip, peer_address_group, BrontideIdentity, CompactBlock,
     CompactBlockError, CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse,
-    Inventory, InventoryKind, LivePeerConfig, LivePeerManager, LocatorPacket, OutboundPriority,
-    P2pError, Packet, PeerDirection, PeerEvent, PeerId, PeerSnapshot, PeerTransport,
-    SERVICE_NETWORK,
+    DnsRelayRequesterPolicy, Inventory, InventoryKind, LivePeerConfig, LivePeerManager,
+    LocatorPacket, OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent, PeerId,
+    PeerSnapshot, PeerTransport, SERVICE_NETWORK,
 };
 use hns_primitives::{
     blake2b_256, Block, BlockHash, CovenantKind, Header, Height, Reader, Txid, Writer,
@@ -99,6 +99,8 @@ const COMPACT_BLOCK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_KNOWN_PEER_ADDRESSES: usize = 16_384;
 const DEFAULT_KNOWN_PEER_ADDRESSES: usize = 4_096;
 const ADDRESS_BOOK_KEY: &[u8] = b"address-book/v1";
+const HIP76_REQUESTER_POLICY_KEY: &[u8] = b"hip76-requester-policy/v1";
+const HIP76_REQUESTER_POLICY_FLOOR_KEY: &[u8] = b"hip76-requester-policy-floor/v1";
 const ODOH_TARGET_CACHE_KEY: &[u8] = b"odoh-target-cache/v1";
 const ODOH_DURABLE_FLOOR_KEY: &[u8] = b"odoh-durable-floor/v1";
 const HNSR_STATE_KEY: &[u8] = b"hnsr-runtime-state/v1";
@@ -728,14 +730,25 @@ pub struct NativeSyncConfig {
     /// Bootstrap from HSD's key-bearing fixed seeds and learn bounded peers
     /// from GETADDR/ADDR. Explicit `connect` peers remain pinned reconnect targets.
     pub discovery: bool,
-    /// Enable the outbound-only HIP-77 ODoH requester. This never enables or
-    /// advertises a local proxy, target, or plaintext output role.
+    /// Explicit process-start override for the durable HIP-76 requester policy.
+    /// `None` preserves a saved selection; `Some(true)` selects `Auto`, and
+    /// `Some(false)` records an opt-out.
+    pub hip76_requester_override: Option<bool>,
+    /// Capability ceiling for the outbound-only HIP-77 ODoH requester. This
+    /// never enables or advertises a local proxy, target, or plaintext output
+    /// role. Runtime selection is restored separately below.
     pub odoh_requester: bool,
-    /// Enable the HIP-78 HNSR requester policy.
+    /// Explicit startup override; absent preserves the durable requester bit.
+    pub odoh_requester_override: Option<bool>,
+    /// Capability ceiling for the HIP-78 HNSR requester policy.
     pub hnsr_requester: bool,
-    /// Enable the connection-bound HIP-78 opaque relay policy. This does not
-    /// make the service available without an explicit relay address.
+    /// Capability ceiling for the connection-bound HIP-78 opaque relay policy.
+    /// This does not make the service available without an explicit relay
+    /// address.
     pub hnsr_opaque_relay: bool,
+    /// Explicit startup overrides; absent preserves each durable HNSR bit.
+    pub hnsr_requester_override: Option<bool>,
+    pub hnsr_opaque_relay_override: Option<bool>,
     /// Explicit address advertised in locally issued HNSR relay tickets.
     pub hnsr_relay_address: Option<SocketAddr>,
     pub maximum_known_addresses: usize,
@@ -765,9 +778,13 @@ impl Default for NativeSyncConfig {
             connect: Vec::new(),
             connect_keys: BTreeMap::new(),
             discovery: false,
+            hip76_requester_override: None,
             odoh_requester: true,
+            odoh_requester_override: None,
             hnsr_requester: true,
             hnsr_opaque_relay: true,
+            hnsr_requester_override: None,
+            hnsr_opaque_relay_override: None,
             hnsr_relay_address: None,
             maximum_known_addresses: DEFAULT_KNOWN_PEER_ADDRESSES,
             maximum_inbound: 32,
@@ -2479,14 +2496,32 @@ impl NodeService {
         peer_config.maximum_outbound = native_sync_config.maximum_outbound;
         peer_config.ban_score = HSD_BAN_SCORE;
         peer_config.ban_time = Duration::from_secs(HSD_BAN_TIME_SECONDS);
+        peer_config.hip76_requester_policy_override =
+            native_sync_config.hip76_requester_override.map(|enabled| {
+                if enabled {
+                    DnsRelayRequesterPolicy::Auto
+                } else {
+                    DnsRelayRequesterPolicy::Disabled
+                }
+            });
         peer_config.odoh.enabled = native_sync_config.odoh_requester;
+        peer_config.odoh_requester_policy_override = native_sync_config.odoh_requester_override;
         peer_config.hnsr_requester = native_sync_config.hnsr_requester;
         peer_config.hnsr_opaque_relay = native_sync_config.hnsr_opaque_relay;
+        peer_config.hnsr_requester_policy_override = native_sync_config.hnsr_requester_override;
+        peer_config.hnsr_opaque_relay_policy_override =
+            native_sync_config.hnsr_opaque_relay_override;
         peer_config.hnsr_relay_address = native_sync_config.hnsr_relay_address;
         if ban_list_persistent {
             let snapshot = store
                 .snapshot()
-                .context("failed to open ODoH target-cache snapshot")?;
+                .context("failed to open durable private-transport snapshot")?;
+            peer_config.hip76_requester_policy_state = snapshot
+                .get(ColumnFamily::Peers, HIP76_REQUESTER_POLICY_KEY)
+                .context("failed to read durable HIP-76 requester policy")?;
+            peer_config.hip76_requester_policy_floor = snapshot
+                .get(ColumnFamily::Peers, HIP76_REQUESTER_POLICY_FLOOR_KEY)
+                .context("failed to read durable HIP-76 requester policy floor")?;
             peer_config.odoh_target_cache = snapshot
                 .get(ColumnFamily::Peers, ODOH_TARGET_CACHE_KEY)
                 .context("failed to read durable ODoH target cache")?;
@@ -2502,6 +2537,17 @@ impl NodeService {
         }
         let (peers, mut peer_events) = LivePeerManager::new(peer_config)
             .map_err(|error| anyhow::anyhow!("failed to initialize live peers: {error}"))?;
+        if ban_list_persistent {
+            flush_hip76_requester_policy(&store, &peers)
+                .await
+                .context("failed to persist initial HIP-76 requester policy")?;
+            flush_odoh_target_cache(&store, &peers)
+                .await
+                .context("failed to persist initial ODoH requester state")?;
+            flush_hnsr_state(&store, &peers)
+                .await
+                .context("failed to persist initial HNSR policy state")?;
+        }
         peers.set_local_height(active_tip.as_ref().map_or(0, |tip| tip.height));
 
         let ban_timestamp = unix_time();
@@ -2817,6 +2863,9 @@ impl NodeService {
                         flush_address_book(&store, &mut address_book, &diagnostics).await;
                     }
                     flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
+                    if let Err(error) = flush_hip76_requester_policy(&store, &peers).await {
+                        record_warning(format!("failed to persist HIP-76 requester policy: {error:#}"));
+                    }
                     if let Err(error) = flush_odoh_target_cache(&store, &peers).await {
                         record_warning(format!("failed to persist ODoH target cache: {error:#}"));
                     }
@@ -3524,6 +3573,16 @@ impl NodeService {
             }
             if ban_list_persistent {
                 flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
+                if let Err(error) = flush_hip76_requester_policy(&store, &peers).await {
+                    record_error(
+                        &diagnostics,
+                        format!("failed to persist final HIP-76 requester policy: {error:#}"),
+                    )
+                    .await;
+                    if terminal_error.is_none() {
+                        terminal_error = Some(error);
+                    }
+                }
                 if let Err(error) = flush_odoh_target_cache(&store, &peers).await {
                     record_error(
                         &diagnostics,
@@ -8272,6 +8331,37 @@ async fn flush_odoh_target_cache(store: &StoreHandle, peers: &LivePeerManager) -
     batch.put(ColumnFamily::Peers, ODOH_DURABLE_FLOOR_KEY, &encoded_floor)?;
     store.commit(batch)?;
     peers.acknowledge_odoh_target_cache_persisted(floor).await;
+    Ok(true)
+}
+
+async fn flush_hip76_requester_policy(
+    store: &StoreHandle,
+    peers: &LivePeerManager,
+) -> Result<bool> {
+    if !peers
+        .hip76_requester_policy_status()
+        .await
+        .durable_state_dirty
+    {
+        return Ok(false);
+    }
+    let snapshot = peers.hip76_requester_policy_snapshot().await;
+    let encoded_floor = snapshot.floor.encode();
+    let mut batch = store.batch();
+    batch.put(
+        ColumnFamily::Peers,
+        HIP76_REQUESTER_POLICY_KEY,
+        &snapshot.bytes,
+    )?;
+    batch.put(
+        ColumnFamily::Peers,
+        HIP76_REQUESTER_POLICY_FLOOR_KEY,
+        &encoded_floor,
+    )?;
+    store.commit(batch)?;
+    peers
+        .acknowledge_hip76_requester_policy_persisted(snapshot.floor)
+        .await;
     Ok(true)
 }
 

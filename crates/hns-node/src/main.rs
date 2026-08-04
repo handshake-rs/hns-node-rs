@@ -175,19 +175,39 @@ struct Cli {
     #[arg(long = "no-p2p-discovery", conflicts_with = "p2p_discovery")]
     no_p2p_discovery: bool,
 
+    /// Explicitly restore HIP-76 requester policy to the default `Auto` mode.
+    #[arg(long = "hip76-requester", action = ArgAction::SetTrue)]
+    hip76_requester: bool,
+
+    /// Persistently disable the HIP-76 requester without enabling a DNS output.
+    #[arg(long = "no-hip76-requester", conflicts_with = "hip76_requester")]
+    no_hip76_requester: bool,
+
+    /// Explicitly restore the HIP-77 ODoH requester to its default-on policy.
+    #[arg(long = "odoh-requester", action = ArgAction::SetTrue)]
+    odoh_requester: bool,
+
     /// Disable the outbound-only HIP-77 ODoH requester. Local provider roles
     /// remain unavailable regardless of this setting.
-    #[arg(long = "no-odoh-requester")]
+    #[arg(long = "no-odoh-requester", conflicts_with = "odoh_requester")]
     no_odoh_requester: bool,
+
+    /// Explicitly restore the HIP-78 HNSR requester to its default-on policy.
+    #[arg(long = "hnsr-requester", action = ArgAction::SetTrue)]
+    hnsr_requester: bool,
 
     /// Disable the HIP-78 HNSR requester. Requester policy is enabled by
     /// default and uses only authenticated, exactly negotiated relay peers.
-    #[arg(long = "no-hnsr-requester")]
+    #[arg(long = "no-hnsr-requester", conflicts_with = "hnsr_requester")]
     no_hnsr_requester: bool,
+
+    /// Explicitly restore the HIP-78 opaque-relay policy to its default-on state.
+    #[arg(long = "hnsr-relay", action = ArgAction::SetTrue)]
+    hnsr_relay: bool,
 
     /// Disable the HIP-78 opaque relay policy. Endpoint and rendezvous roles
     /// remain unavailable regardless of this setting.
-    #[arg(long = "no-hnsr-relay")]
+    #[arg(long = "no-hnsr-relay", conflicts_with = "hnsr_relay")]
     no_hnsr_relay: bool,
 
     /// Public address placed in locally issued HNSR relay tickets. The relay
@@ -357,9 +377,40 @@ impl Cli {
                 connect,
                 connect_keys,
                 discovery: p2p_discovery,
-                odoh_requester: !self.no_odoh_requester,
-                hnsr_requester: !self.no_hnsr_requester,
-                hnsr_opaque_relay: !self.no_hnsr_relay,
+                hip76_requester_override: if self.hip76_requester {
+                    Some(true)
+                } else if self.no_hip76_requester {
+                    Some(false)
+                } else {
+                    None
+                },
+                // These are capability ceilings for the node runtime. The
+                // CLI selection belongs exclusively in the tri-state
+                // overrides so a saved opt-out can be explicitly reversed.
+                odoh_requester: true,
+                odoh_requester_override: if self.odoh_requester {
+                    Some(true)
+                } else if self.no_odoh_requester {
+                    Some(false)
+                } else {
+                    None
+                },
+                hnsr_requester: true,
+                hnsr_opaque_relay: true,
+                hnsr_requester_override: if self.hnsr_requester {
+                    Some(true)
+                } else if self.no_hnsr_requester {
+                    Some(false)
+                } else {
+                    None
+                },
+                hnsr_opaque_relay_override: if self.hnsr_relay {
+                    Some(true)
+                } else if self.no_hnsr_relay {
+                    Some(false)
+                } else {
+                    None
+                },
                 hnsr_relay_address: self.hnsr_relay_address,
                 maximum_known_addresses: self.maximum_known_addresses,
                 maximum_inbound: self.maximum_inbound,
@@ -518,9 +569,13 @@ async fn main() -> anyhow::Result<()> {
             native_sync = config.native_sync.enabled,
             native_sync_headers_only = config.native_sync.headers_only,
             native_sync_active_state = config.native_sync.connect_active_state,
-            odoh_requester = config.native_sync.odoh_requester,
-            hnsr_requester = config.native_sync.hnsr_requester,
-            hnsr_opaque_relay = config.native_sync.hnsr_opaque_relay,
+            hip76_requester_override = ?config.native_sync.hip76_requester_override,
+            odoh_requester_capable = config.native_sync.odoh_requester,
+            odoh_requester_override = ?config.native_sync.odoh_requester_override,
+            hnsr_requester_capable = config.native_sync.hnsr_requester,
+            hnsr_requester_override = ?config.native_sync.hnsr_requester_override,
+            hnsr_opaque_relay_capable = config.native_sync.hnsr_opaque_relay,
+            hnsr_opaque_relay_override = ?config.native_sync.hnsr_opaque_relay_override,
             hnsr_relay_address = ?config.native_sync.hnsr_relay_address,
             validation_workers = config.native_sync.validation_workers,
             validation_queue = config.native_sync.validation_queue,
@@ -583,9 +638,13 @@ mod tests {
         assert!(default.native_sync.enabled);
         assert!(default.native_sync.connect_active_state);
         assert!(default.native_sync.discovery);
+        assert_eq!(default.native_sync.hip76_requester_override, None);
         assert!(default.native_sync.odoh_requester);
+        assert_eq!(default.native_sync.odoh_requester_override, None);
         assert!(default.native_sync.hnsr_requester);
         assert!(default.native_sync.hnsr_opaque_relay);
+        assert_eq!(default.native_sync.hnsr_requester_override, None);
+        assert_eq!(default.native_sync.hnsr_opaque_relay_override, None);
         assert!(default.native_sync.hnsr_relay_address.is_none());
         assert!(default.native_sync.listen.is_none());
 
@@ -593,6 +652,7 @@ mod tests {
             "hsrd",
             "--no-native-sync",
             "--no-p2p-discovery",
+            "--no-hip76-requester",
             "--no-odoh-requester",
             "--no-hnsr-requester",
             "--no-hnsr-relay",
@@ -603,9 +663,28 @@ mod tests {
         assert!(!disabled.native_sync.enabled);
         assert!(!disabled.native_sync.connect_active_state);
         assert!(!disabled.native_sync.discovery);
-        assert!(!disabled.native_sync.odoh_requester);
-        assert!(!disabled.native_sync.hnsr_requester);
-        assert!(!disabled.native_sync.hnsr_opaque_relay);
+        assert_eq!(disabled.native_sync.hip76_requester_override, Some(false));
+        assert!(disabled.native_sync.odoh_requester);
+        assert_eq!(disabled.native_sync.odoh_requester_override, Some(false));
+        assert!(disabled.native_sync.hnsr_requester);
+        assert!(disabled.native_sync.hnsr_opaque_relay);
+        assert_eq!(disabled.native_sync.hnsr_requester_override, Some(false));
+        assert_eq!(disabled.native_sync.hnsr_opaque_relay_override, Some(false));
+
+        let reenabled = Cli::try_parse_from([
+            "hsrd",
+            "--hip76-requester",
+            "--odoh-requester",
+            "--hnsr-requester",
+            "--hnsr-relay",
+        ])
+        .expect("explicit requester enable CLI")
+        .into_config()
+        .expect("explicit requester enable config");
+        assert_eq!(reenabled.native_sync.hip76_requester_override, Some(true));
+        assert_eq!(reenabled.native_sync.odoh_requester_override, Some(true));
+        assert_eq!(reenabled.native_sync.hnsr_requester_override, Some(true));
+        assert_eq!(reenabled.native_sync.hnsr_opaque_relay_override, Some(true));
     }
 
     #[test]

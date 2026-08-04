@@ -9,8 +9,9 @@ the returned DNS data, or enables a public output service by default.
 
 - The requester policy defaults to `Auto`. A node may request through a peer
   that advertises the HIP-76 DNS output service after the Denuo registry
-  agreement becomes active. Operators can opt out by disabling the requester
-  policy.
+  agreement becomes active. `--no-hip76-requester` records a process-wide
+  opt-out, `--hip76-requester` explicitly restores `Auto`, and using neither
+  flag preserves the durable selection.
 - The provider/output policy defaults to disabled. The HIP-76 service bit is
   stripped from the configured VERSION mask and restored only when the
   operator explicitly opts in and declares the provider backend ready.
@@ -19,6 +20,25 @@ the returned DNS data, or enables a public output service by default.
 - Mainnet and testnet reject plaintext peer configuration; HIP-76 provenance
   on public networks is therefore bound to the authenticated Brontide remote
   static key. Plaintext remains available for regtest and simnet development.
+
+The live manager owns one monotonic requester-policy generation for the whole
+process. A compare-and-replace update is serialized with peer registration,
+revokes prior-generation requester work on every live peer, disconnects a peer
+whose update channel has failed, and is inherited by every future peer.
+Per-peer provider consent is deliberately outside this record and remains off
+unless separately configured.
+
+## Requester policy and restart
+
+Persistent native nodes commit checksummed, network-bound
+`hip76-requester-policy/v1` and `hip76-requester-policy-floor/v1` records in one
+storage batch. Startup accepts both or neither and rejects corruption, wrong
+network binding, a zero generation, or rollback below the independent floor.
+An explicit startup enable or disable advances the restored generation and is
+flushed before peer networking starts; policy changes are retried at the
+bounded peer-state interval and at orderly shutdown. Request IDs, peer
+sessions, queries, responses, provider consent, and backend readiness never
+cross restart.
 
 ## Admission and completion
 

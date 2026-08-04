@@ -421,10 +421,18 @@ cannot promote a block or grant authority.
   when score 100 is crossed, compacted on HSD-style expiry, retried on the same
   120-second cadence, and flushed at shutdown. The record has independent
   version, checksum, generation, and network binding; earliest-expiring bans
-  are evicted first if the hard bound is reached. `odoh-target-cache/v1` stores
-  at most 16 verified public HIP-77 target locators, signed records, selected
-  configuration indexes, expiry and sequence high-water values, plus requester
-  opt-out/revocation policy. `odoh-durable-floor/v1` independently checksums the
+  are evicted first if the hard bound is reached.
+  `hip76-requester-policy/v1` stores only the process-wide HIP-76 requester
+  selection and its monotonic generation; it never stores provider consent,
+  peer authority, request IDs, or DNS bytes.
+  `hip76-requester-policy-floor/v1` independently checksums the minimum
+  generation and network binding. Both fixed-size records commit atomically;
+  startup accepts both or neither and rejects corruption, network mismatch, or
+  generation rollback.
+  `odoh-target-cache/v1` stores at most 16 verified public HIP-77 target
+  locators, signed records, selected configuration indexes, expiry and sequence
+  high-water values, plus requester opt-out/revocation policy.
+  `odoh-durable-floor/v1` independently checksums the
   minimum cache generation, policy generation, and trusted-time high-water.
   Both ODoH records are written in one atomic batch; startup accepts both or
   neither and rejects rollback, clock regression, corruption, network mismatch,

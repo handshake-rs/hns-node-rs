@@ -10,6 +10,10 @@ qualification or authorize deployment.
   fixed-seed/GETADDR discovery in the standalone process by default, with
   explicit `--no-native-sync` and `--no-p2p-discovery` opt-outs. HIP-76
   requester policy remains `Auto`; its plaintext output role remains off.
+  The process-wide requester selection now has checksummed, network-bound,
+  atomic policy/floor persistence. `--no-hip76-requester` records a durable
+  opt-out, `--hip76-requester` explicitly restores `Auto`, and an absent flag
+  preserves the saved choice while every live and future peer inherits it.
 - Enable the HIP-77 ODoH requester policy by default. Requests use only ready,
   exact-Denuo-V1-negotiated, Brontide-authenticated peers advertising both the
   Denuo and ODoH services with matching network and genesis evidence,
@@ -19,8 +23,9 @@ qualification or authorize deployment.
   with atomic cache/policy generation and trusted-time floors. Opt-out and
   revocation policy survive restart;
   live request IDs and HPKE state are never persisted. Proxy, target, and DNS
-  output provider roles remain unavailable; `--no-odoh-requester` is the
-  explicit requester opt-out.
+  output provider roles remain unavailable. `--no-odoh-requester` is the
+  explicit requester opt-out, `--odoh-requester` explicitly reverses a saved
+  opt-out, and an absent flag preserves the durable choice.
 - Enable HIP-78 HNSR requester and opaque-relay policy by default with
   independent `--no-hnsr-requester` and `--no-hnsr-relay` opt-outs. Exact
   Brontide/Denuo/network/genesis admission, explicit `HNS_NODE_V1` or
@@ -28,7 +33,9 @@ qualification or authorize deployment.
   connection-bound cleanup, and atomic
   checksummed state/floor persistence fail closed. Relay service advertisement
   additionally requires `--hnsr-relay-address`; endpoint, rendezvous, and
-  plaintext roles remain unavailable.
+  plaintext roles remain unavailable. Symmetric `--hnsr-requester` and
+  `--hnsr-relay` flags explicitly reverse saved opt-outs; absent flags preserve
+  the durable selections without lowering the node's live capability ceiling.
 - Publish key-bearing HSD fixed seeds, canonical negotiated-peer evidence, and
   a bounded raw authenticated extension exchange from `hns-p2p` for browser
   and mobile adapters. Brontide now uses portable RustCrypto

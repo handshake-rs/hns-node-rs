@@ -216,9 +216,14 @@ clean marker or matching startup checkpoint cannot restore authority.
 - Header-derived deployment diagnostics walk only the validated canonical
   ancestry and bind any historical-script assumption to the exact final
   configured checkpoint; they do not confer body, state, or mining authority.
-- Denuo registry agreement and HIP-76 role/session state are connection-local
-  private transport capabilities. HIP-76 requester operation can be disabled;
-  provider advertisement requires explicit opt-in and a ready backend.
+- Denuo registry agreement and HIP-76 provider/session state are
+  connection-local private transport capabilities. HIP-76 requester selection
+  is process-wide: a monotonic replacement is serialized with peer admission,
+  revokes every live prior-generation request, and is inherited by future
+  peers. Its checksummed, network-bound policy and independent generation floor
+  commit atomically so an opt-out survives restart. Provider advertisement is
+  excluded from that record and still requires explicit opt-in plus a ready
+  backend.
 - HIP-77 requester operation defaults on but admits only ready,
   Brontide-authenticated sessions retaining exact upstream Denuo V1 profile and
   registry evidence. Both Denuo and ODoH service bits, the canonical
@@ -237,6 +242,12 @@ clean marker or matching startup checkpoint cannot restore authority.
   IDs, HPKE contexts, decrypted DNS
   bytes, and in-flight work are never persisted. Local ODoH proxy, target, and
   output provider roles remain unavailable.
+- HIP-76, ODoH, and HNSR startup selection uses tri-state overrides. Absence
+  preserves durable policy; an explicit enable advances the restored
+  generation and reverses a saved opt-out. The hsrd CLI keeps requester and
+  opaque-relay capability ceilings available, while live updates remain
+  clamped by embedding ceilings and cannot create roles outside the configured
+  provider backends.
 - Neither private transport negotiation nor received DNS bytes grant consensus
   or mining authority. Successfully opened ODoH bytes remain untrusted until a
   higher layer performs strict DNS parsing, query correlation, and DNSSEC

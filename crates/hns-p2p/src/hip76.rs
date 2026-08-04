@@ -40,6 +40,13 @@ use crate::{
 };
 
 pub const HIP76_DEFAULT_MAXIMUM_LIVE_REQUESTS: u16 = 64;
+const HIP76_POLICY_STATE_MAGIC: &[u8; 8] = b"HNSH7P1\0";
+const HIP76_POLICY_FLOOR_MAGIC: &[u8; 8] = b"HNSH7F1\0";
+const HIP76_POLICY_STATE_SCHEMA: u16 = 1;
+const HIP76_POLICY_FLOOR_SCHEMA: u16 = 1;
+const HIP76_POLICY_CHECKSUM_BYTES: usize = 32;
+const HIP76_POLICY_STATE_BYTES: usize = 55;
+const HIP76_POLICY_FLOOR_BYTES: usize = 54;
 
 /// Provider consent is explicit and backend readiness is a separate fact.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -150,6 +157,245 @@ pub enum Hip76ConfigurationError {
     ZeroTimeout,
     #[error("HIP-76 first request ID must be nonzero")]
     ZeroFirstRequestId,
+}
+
+/// Process-wide HIP-76 requester policy restored before any peer is admitted.
+///
+/// Provider/output consent deliberately remains in [`Hip76ProviderPolicy`] and
+/// is never encoded in this requester-only record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Hip76RequesterPolicyStatus {
+    pub schema_version: u16,
+    pub requester_policy: DnsRelayRequesterPolicy,
+    pub generation: u64,
+    pub durable_state_dirty: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Hip76RequesterPolicySnapshot {
+    pub bytes: Vec<u8>,
+    pub floor: Hip76RequesterPolicyFloor,
+}
+
+/// Independently checksummed generation floor committed atomically with the
+/// requester policy record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Hip76RequesterPolicyFloor {
+    pub generation: u64,
+    pub network_magic: u32,
+}
+
+impl Hip76RequesterPolicyFloor {
+    pub fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(HIP76_POLICY_FLOOR_BYTES);
+        bytes.extend_from_slice(HIP76_POLICY_FLOOR_MAGIC);
+        bytes.extend_from_slice(&HIP76_POLICY_FLOOR_SCHEMA.to_le_bytes());
+        bytes.extend_from_slice(&self.network_magic.to_le_bytes());
+        bytes.extend_from_slice(&self.generation.to_le_bytes());
+        append_policy_checksum(&mut bytes);
+        debug_assert_eq!(bytes.len(), HIP76_POLICY_FLOOR_BYTES);
+        bytes
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, Hip76RequesterPolicyError> {
+        let payload =
+            verified_policy_payload(input, HIP76_POLICY_FLOOR_MAGIC, HIP76_POLICY_FLOOR_BYTES)?;
+        if u16::from_le_bytes(payload[8..10].try_into().expect("fixed schema field"))
+            != HIP76_POLICY_FLOOR_SCHEMA
+        {
+            return Err(Hip76RequesterPolicyError::UnsupportedSchema);
+        }
+        let floor = Self {
+            network_magic: u32::from_le_bytes(
+                payload[10..14].try_into().expect("fixed network field"),
+            ),
+            generation: u64::from_le_bytes(
+                payload[14..22].try_into().expect("fixed generation field"),
+            ),
+        };
+        if floor.generation == 0 {
+            return Err(Hip76RequesterPolicyError::GenerationRollback);
+        }
+        Ok(floor)
+    }
+}
+
+/// Storage-independent authority for one process-wide requester policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Hip76RequesterPolicyRuntime {
+    network_magic: u32,
+    requester_policy: DnsRelayRequesterPolicy,
+    generation: u64,
+    persisted_generation: u64,
+}
+
+impl Hip76RequesterPolicyRuntime {
+    pub fn fresh(
+        network_magic: u32,
+        requester_policy: DnsRelayRequesterPolicy,
+        generation: u64,
+    ) -> Result<Self, Hip76RequesterPolicyError> {
+        if generation == 0 {
+            return Err(Hip76RequesterPolicyError::GenerationRollback);
+        }
+        Ok(Self {
+            network_magic,
+            requester_policy,
+            generation,
+            persisted_generation: 0,
+        })
+    }
+
+    pub fn restore(
+        network_magic: u32,
+        requester_override: Option<DnsRelayRequesterPolicy>,
+        snapshot: &[u8],
+        floor: Hip76RequesterPolicyFloor,
+    ) -> Result<Self, Hip76RequesterPolicyError> {
+        if floor.network_magic != network_magic {
+            return Err(Hip76RequesterPolicyError::NetworkMismatch);
+        }
+        let payload =
+            verified_policy_payload(snapshot, HIP76_POLICY_STATE_MAGIC, HIP76_POLICY_STATE_BYTES)?;
+        if u16::from_le_bytes(payload[8..10].try_into().expect("fixed schema field"))
+            != HIP76_POLICY_STATE_SCHEMA
+        {
+            return Err(Hip76RequesterPolicyError::UnsupportedSchema);
+        }
+        if u32::from_le_bytes(payload[10..14].try_into().expect("fixed network field"))
+            != network_magic
+        {
+            return Err(Hip76RequesterPolicyError::NetworkMismatch);
+        }
+        let persisted_generation =
+            u64::from_le_bytes(payload[14..22].try_into().expect("fixed generation field"));
+        if persisted_generation == 0 || persisted_generation < floor.generation {
+            return Err(Hip76RequesterPolicyError::GenerationRollback);
+        }
+        let persisted_policy = decode_requester_policy(payload[22])?;
+        let mut runtime = Self {
+            network_magic,
+            requester_policy: persisted_policy,
+            generation: persisted_generation,
+            persisted_generation,
+        };
+        if let Some(requester_override) = requester_override {
+            if requester_override != runtime.requester_policy {
+                runtime.generation = runtime
+                    .generation
+                    .checked_add(1)
+                    .ok_or(Hip76RequesterPolicyError::GenerationExhausted)?;
+                runtime.requester_policy = requester_override;
+            }
+        }
+        Ok(runtime)
+    }
+
+    pub const fn status(&self) -> Hip76RequesterPolicyStatus {
+        Hip76RequesterPolicyStatus {
+            schema_version: HIP76_POLICY_STATE_SCHEMA,
+            requester_policy: self.requester_policy,
+            generation: self.generation,
+            durable_state_dirty: self.persisted_generation < self.generation,
+        }
+    }
+
+    pub fn replace(
+        &mut self,
+        expected_generation: u64,
+        requester_policy: DnsRelayRequesterPolicy,
+        next_generation: u64,
+    ) -> Result<Hip76RequesterPolicyStatus, Hip76RequesterPolicyError> {
+        if expected_generation != self.generation {
+            return Err(Hip76RequesterPolicyError::StaleGeneration);
+        }
+        if next_generation <= self.generation {
+            return Err(Hip76RequesterPolicyError::StaleGeneration);
+        }
+        self.requester_policy = requester_policy;
+        self.generation = next_generation;
+        Ok(self.status())
+    }
+
+    pub fn snapshot(&self) -> Hip76RequesterPolicySnapshot {
+        let mut bytes = Vec::with_capacity(HIP76_POLICY_STATE_BYTES);
+        bytes.extend_from_slice(HIP76_POLICY_STATE_MAGIC);
+        bytes.extend_from_slice(&HIP76_POLICY_STATE_SCHEMA.to_le_bytes());
+        bytes.extend_from_slice(&self.network_magic.to_le_bytes());
+        bytes.extend_from_slice(&self.generation.to_le_bytes());
+        bytes.push(encode_requester_policy(self.requester_policy));
+        append_policy_checksum(&mut bytes);
+        debug_assert_eq!(bytes.len(), HIP76_POLICY_STATE_BYTES);
+        Hip76RequesterPolicySnapshot {
+            bytes,
+            floor: Hip76RequesterPolicyFloor {
+                generation: self.generation,
+                network_magic: self.network_magic,
+            },
+        }
+    }
+
+    pub fn acknowledge_persisted(&mut self, floor: Hip76RequesterPolicyFloor) {
+        if floor.network_magic == self.network_magic && floor.generation == self.generation {
+            self.persisted_generation = self.persisted_generation.max(floor.generation);
+        }
+    }
+}
+
+const fn encode_requester_policy(policy: DnsRelayRequesterPolicy) -> u8 {
+    match policy {
+        DnsRelayRequesterPolicy::Auto => 0,
+        DnsRelayRequesterPolicy::Disabled => 1,
+        DnsRelayRequesterPolicy::Required => 2,
+    }
+}
+
+fn decode_requester_policy(
+    value: u8,
+) -> Result<DnsRelayRequesterPolicy, Hip76RequesterPolicyError> {
+    match value {
+        0 => Ok(DnsRelayRequesterPolicy::Auto),
+        1 => Ok(DnsRelayRequesterPolicy::Disabled),
+        2 => Ok(DnsRelayRequesterPolicy::Required),
+        _ => Err(Hip76RequesterPolicyError::CorruptSnapshot),
+    }
+}
+
+fn append_policy_checksum(bytes: &mut Vec<u8>) {
+    let checksum = blake2b_256(bytes);
+    bytes.extend_from_slice(&checksum);
+}
+
+fn verified_policy_payload<'a>(
+    input: &'a [u8],
+    magic: &[u8; 8],
+    exact_bytes: usize,
+) -> Result<&'a [u8], Hip76RequesterPolicyError> {
+    if input.len() != exact_bytes {
+        return Err(Hip76RequesterPolicyError::CorruptSnapshot);
+    }
+    let payload_length = exact_bytes - HIP76_POLICY_CHECKSUM_BYTES;
+    let (payload, checksum) = input.split_at(payload_length);
+    if !payload.starts_with(magic) || blake2b_256(payload).as_slice() != checksum {
+        return Err(Hip76RequesterPolicyError::CorruptSnapshot);
+    }
+    Ok(payload)
+}
+
+#[derive(Clone, Copy, Debug, Eq, thiserror::Error, PartialEq)]
+pub enum Hip76RequesterPolicyError {
+    #[error("corrupt HIP-76 requester policy snapshot")]
+    CorruptSnapshot,
+    #[error("unsupported HIP-76 requester policy snapshot schema")]
+    UnsupportedSchema,
+    #[error("HIP-76 requester policy network mismatch")]
+    NetworkMismatch,
+    #[error("HIP-76 requester policy generation rollback")]
+    GenerationRollback,
+    #[error("stale HIP-76 requester policy generation")]
+    StaleGeneration,
+    #[error("HIP-76 requester policy generation exhausted")]
+    GenerationExhausted,
 }
 
 #[derive(
@@ -2353,6 +2599,86 @@ mod tests {
                 panic!("unexpected provider work: {request:?}")
             }
         }
+    }
+
+    #[test]
+    fn requester_policy_snapshot_preserves_opt_out_and_allows_explicit_reenable() {
+        let magic = 0x1122_3344;
+        let mut policy =
+            Hip76RequesterPolicyRuntime::fresh(magic, DnsRelayRequesterPolicy::Auto, 1)
+                .expect("fresh requester policy");
+        assert!(policy.status().durable_state_dirty);
+        let initial = policy.snapshot();
+        policy.acknowledge_persisted(initial.floor);
+        assert!(!policy.status().durable_state_dirty);
+
+        let disabled = policy
+            .replace(1, DnsRelayRequesterPolicy::Disabled, 2)
+            .expect("persist requester opt-out");
+        assert_eq!(disabled.requester_policy, DnsRelayRequesterPolicy::Disabled);
+        let snapshot = policy.snapshot();
+        let floor = Hip76RequesterPolicyFloor::decode(&snapshot.floor.encode())
+            .expect("decode requester floor");
+        let restored = Hip76RequesterPolicyRuntime::restore(magic, None, &snapshot.bytes, floor)
+            .expect("restore requester opt-out");
+        assert_eq!(
+            restored.status().requester_policy,
+            DnsRelayRequesterPolicy::Disabled
+        );
+        assert!(!restored.status().durable_state_dirty);
+
+        let reenabled = Hip76RequesterPolicyRuntime::restore(
+            magic,
+            Some(DnsRelayRequesterPolicy::Auto),
+            &snapshot.bytes,
+            floor,
+        )
+        .expect("explicitly re-enable requester");
+        assert_eq!(
+            reenabled.status().requester_policy,
+            DnsRelayRequesterPolicy::Auto
+        );
+        assert_eq!(reenabled.status().generation, 3);
+        assert!(reenabled.status().durable_state_dirty);
+    }
+
+    #[test]
+    fn requester_policy_snapshot_rejects_corruption_network_mismatch_and_rollback() {
+        let magic = 0x1122_3344;
+        let policy =
+            Hip76RequesterPolicyRuntime::fresh(magic, DnsRelayRequesterPolicy::Disabled, 7)
+                .expect("fresh requester policy");
+        let snapshot = policy.snapshot();
+
+        let mut corrupt = snapshot.bytes.clone();
+        corrupt[22] ^= 1;
+        assert_eq!(
+            Hip76RequesterPolicyRuntime::restore(magic, None, &corrupt, snapshot.floor),
+            Err(Hip76RequesterPolicyError::CorruptSnapshot)
+        );
+        assert_eq!(
+            Hip76RequesterPolicyRuntime::restore(magic ^ 1, None, &snapshot.bytes, snapshot.floor,),
+            Err(Hip76RequesterPolicyError::NetworkMismatch)
+        );
+        assert_eq!(
+            Hip76RequesterPolicyRuntime::restore(
+                magic,
+                None,
+                &snapshot.bytes,
+                Hip76RequesterPolicyFloor {
+                    generation: 8,
+                    network_magic: magic,
+                },
+            ),
+            Err(Hip76RequesterPolicyError::GenerationRollback)
+        );
+
+        let mut corrupt_floor = snapshot.floor.encode();
+        corrupt_floor[14] ^= 1;
+        assert_eq!(
+            Hip76RequesterPolicyFloor::decode(&corrupt_floor),
+            Err(Hip76RequesterPolicyError::CorruptSnapshot)
+        );
     }
 
     #[test]

@@ -94,20 +94,24 @@ packet `0xf4`. A matching agreement may activate the separate typed HIP-76
 provider advertisement defaults off and requires both explicit opt-in and a
 ready backend. The packet-specific limits, role generations, deadlines, queue
 admission, and socket-write completion are connection-local and cannot grant
-consensus or mining authority.
+consensus or mining authority. Requester selection itself is process-wide:
+every live and future peer inherits one monotonic generation. Checksummed,
+network-bound policy/floor records atomically preserve opt-out across restart;
+an absent startup flag preserves that choice, while `--hip76-requester`
+explicitly restores `Auto`.
 
 HIP-77 packet `0xf2` is also intercepted before generic packet delivery. Its
-  requester policy defaults on and selects only a ready Brontide peer advertising
-  both service bits with exact Denuo V1 registry, network, genesis, and resource
-  evidence, whose authenticated key differs from the signed
-target locator. The process-wide requester bounds live work, correlates the
-exact response peer/key and request generation, expires deadlines, and clears
-  work on disconnect or policy revocation. A checksummed, network-bound cache and
-  independent floor atomically persist verified public target records,
-  sequence/policy generations, opt-out/revocation state, and trusted-time
-  high-water; incomplete pairs, old generations, and clock rollback fail closed.
-request IDs, proxy sessions, HPKE contexts, and decrypted DNS bytes remain
-process-local. Local ODoH proxy, target, and output-provider roles are off.
+requester policy defaults on and selects only a ready Brontide peer advertising
+both service bits with exact Denuo V1 registry, network, genesis, and resource
+evidence, whose authenticated key differs from the signed target locator. The
+process-wide requester bounds live work, correlates the exact response peer/key
+and request generation, expires deadlines, and clears work on disconnect or
+policy revocation. A checksummed, network-bound cache and independent floor
+atomically persist verified public target records, sequence/policy generations,
+opt-out/revocation state, and trusted-time high-water; incomplete pairs, old
+generations, and clock rollback fail closed. Request IDs, proxy sessions, HPKE
+contexts, and decrypted DNS bytes remain process-local. Local ODoH proxy,
+target, and output-provider roles are off.
 
 HIP-78 packet `0xf3` enters the process-wide HNSR coordinator before generic
 delivery. Requester and opaque-relay policy default on, while endpoint,
@@ -115,7 +119,9 @@ rendezvous, and plaintext roles remain unavailable. Every route is bound to an
 exact Brontide connection and canonical Denuo V1 evidence; relay actions are
 retained until the destination writer reports the actual socket write. The
 relay service bit is advertised only with an explicit valid relay address and
-durable local Brontide key. See [the HNSR runtime boundary](hip78-hnsr-runtime.md).
+durable local Brontide key. Negative and positive startup flags respectively
+record or reverse durable opt-outs; absent flags preserve the saved policy.
+See [the HNSR runtime boundary](hip78-hnsr-runtime.md).
 
 The HSD fixture generator verifies subtle compatibility behavior:
 

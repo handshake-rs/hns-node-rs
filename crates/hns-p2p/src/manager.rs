@@ -32,7 +32,11 @@ use crate::{
         ExperimentalExchangeRuntime,
     },
     handshake::{PeerDirection, PeerState},
-    hip76::{hip76_advertised_services, Hip76ProviderPolicy, Hip76SessionConfig, Hip76Summary},
+    hip76::{
+        hip76_advertised_services, DnsRelayRequesterPolicy, Hip76ProviderPolicy,
+        Hip76RequesterPolicyFloor, Hip76RequesterPolicyRuntime, Hip76RequesterPolicySnapshot,
+        Hip76RequesterPolicyStatus, Hip76SessionConfig, Hip76Summary,
+    },
     hnsr::{
         HnsrCoordinator, HnsrCoordinatorConfig, HnsrDurableFloor, HnsrPeerAdmission,
         HnsrRelayBackend, HnsrStateSnapshot,
@@ -76,7 +80,16 @@ pub struct LivePeerConfig {
     pub no_relay: bool,
     pub runtime: PeerRuntimeConfig,
     pub hip76: Hip76SessionConfig,
+    /// Explicit startup override for a restored requester policy. `None`
+    /// preserves the durable selection; `Some(Auto)` reverses a saved opt-out.
+    pub hip76_requester_policy_override: Option<DnsRelayRequesterPolicy>,
+    /// Checksummed process-wide requester policy restored before peer startup.
+    pub hip76_requester_policy_state: Option<Vec<u8>>,
+    /// Independently checksummed generation floor loaded with the policy state.
+    pub hip76_requester_policy_floor: Option<Vec<u8>>,
     pub odoh: OdohRequesterConfig,
+    /// Explicit startup override for the restored ODoH requester selection.
+    pub odoh_requester_policy_override: Option<bool>,
     /// Canonical target-cache snapshot loaded before peer startup. Live
     /// proxy sessions and in-flight HPKE state are never accepted here.
     pub odoh_target_cache: Option<Vec<u8>>,
@@ -86,6 +99,10 @@ pub struct LivePeerConfig {
     pub odoh_durable_floor: Option<Vec<u8>>,
     pub hnsr_requester: bool,
     pub hnsr_opaque_relay: bool,
+    /// Explicit startup overrides for restored HNSR consumer/opaque-relay
+    /// selections. Provider roles remain unavailable regardless.
+    pub hnsr_requester_policy_override: Option<bool>,
+    pub hnsr_opaque_relay_policy_override: Option<bool>,
     /// Canonical circuit profile. Native nodes use `HNS_NODE_V1`; embedded
     /// browser adapters select `HNS_WEB_V1` before manager construction.
     pub hnsr_profile: u16,
@@ -128,11 +145,17 @@ impl LivePeerConfig {
             no_relay: false,
             runtime: PeerRuntimeConfig::default(),
             hip76: Hip76SessionConfig::default(),
+            hip76_requester_policy_override: None,
+            hip76_requester_policy_state: None,
+            hip76_requester_policy_floor: None,
             odoh,
+            odoh_requester_policy_override: None,
             odoh_target_cache: None,
             odoh_durable_floor: None,
             hnsr_requester: true,
             hnsr_opaque_relay: true,
+            hnsr_requester_policy_override: None,
+            hnsr_opaque_relay_policy_override: None,
             hnsr_profile: HNS_NODE_V1,
             hnsr_relay_address: None,
             hnsr_state: None,
@@ -181,9 +204,22 @@ impl LivePeerConfig {
         self.hip76
             .validate()
             .map_err(|error| P2pError::Configuration(error.to_string()))?;
+        if self.hip76_requester_policy_state.is_some()
+            != self.hip76_requester_policy_floor.is_some()
+        {
+            return Err(P2pError::Configuration(
+                "HIP-76 requester policy and durable floor must be restored as an exact pair"
+                    .to_owned(),
+            ));
+        }
         self.odoh
             .validate()
             .map_err(|error| P2pError::Configuration(error.to_string()))?;
+        if self.odoh_target_cache.is_some() != self.odoh_durable_floor.is_some() {
+            return Err(P2pError::Configuration(
+                "ODoH target cache and durable floor must be restored as an exact pair".to_owned(),
+            ));
+        }
         if self.odoh.allow_private_targets
             && !matches!(self.network, Network::Regtest | Network::Simnet)
         {
@@ -236,6 +272,18 @@ pub struct LocalServicesUpdate {
     pub disconnected_peers: usize,
 }
 
+/// Process-wide HIP-76 requester policy transition applied to every live peer
+/// and inherited by every future peer in this process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Hip76RequesterPolicyUpdate {
+    pub previous_policy: DnsRelayRequesterPolicy,
+    pub requester_policy: DnsRelayRequesterPolicy,
+    pub previous_generation: u64,
+    pub generation: u64,
+    pub revoked_requests: usize,
+    pub disconnected_peers: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeerBan {
     pub address: IpAddr,
@@ -255,6 +303,7 @@ pub struct LivePeerManager {
     retired_bytes_sent: Arc<AtomicU64>,
     retired_bytes_received: Arc<AtomicU64>,
     denuo_metrics: DenuoRuntimeMetrics,
+    hip76_requester_policy: Arc<Mutex<Hip76RequesterPolicyRuntime>>,
     odoh: Arc<Mutex<OdohRequesterRuntime>>,
     experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
     hnsr: Arc<Mutex<HnsrCoordinator>>,
@@ -298,7 +347,39 @@ impl LivePeerManager {
         let first_odoh_request_id = rand::random::<u64>().max(1);
         let binding = OdohNetworkBinding::for_network(config.network);
         let trusted_now = unix_time();
-        let odoh = match (
+        let network_magic = config.network.params().packet_magic;
+        let hip76_requester_policy = match (
+            config.hip76_requester_policy_state.as_deref(),
+            config.hip76_requester_policy_floor.as_deref(),
+        ) {
+            (Some(snapshot), Some(encoded_floor)) => {
+                let floor = Hip76RequesterPolicyFloor::decode(encoded_floor).map_err(|error| {
+                    P2pError::Configuration(format!(
+                        "HIP-76 requester policy floor is invalid: {error}"
+                    ))
+                })?;
+                Hip76RequesterPolicyRuntime::restore(
+                    network_magic,
+                    config.hip76_requester_policy_override,
+                    snapshot,
+                    floor,
+                )
+            }
+            (None, None) => Hip76RequesterPolicyRuntime::fresh(
+                network_magic,
+                config
+                    .hip76_requester_policy_override
+                    .unwrap_or(config.hip76.requester_policy),
+                config.hip76.policy_generation,
+            ),
+            _ => unreachable!("configuration validation requires an exact HIP-76 policy pair"),
+        }
+        .map_err(|error| {
+            P2pError::Configuration(format!(
+                "HIP-76 requester policy initialization failed: {error}"
+            ))
+        })?;
+        let mut odoh = match (
             config.odoh_target_cache.as_deref(),
             config.odoh_durable_floor.as_deref(),
         ) {
@@ -322,8 +403,25 @@ impl LivePeerManager {
         .map_err(|error| {
             P2pError::Configuration(format!("ODoH requester initialization failed: {error}"))
         })?;
+        if let Some(requested) = config.odoh_requester_policy_override {
+            let desired = requested && config.odoh.enabled;
+            let status = odoh.status(trusted_now, 0);
+            if status.requester_enabled != desired {
+                let next_generation = status.policy_generation.checked_add(1).ok_or_else(|| {
+                    P2pError::Configuration(
+                        "ODoH requester policy generation exhausted during startup".to_owned(),
+                    )
+                })?;
+                odoh.replace_enabled(desired, next_generation)
+                    .map_err(|reason| {
+                        P2pError::Configuration(format!(
+                            "ODoH requester startup override failed: {reason}"
+                        ))
+                    })?;
+            }
+        }
         let hnsr_config = hnsr_coordinator_config(&config);
-        let hnsr = match (
+        let mut hnsr = match (
             config.hnsr_state.as_deref(),
             config.hnsr_durable_floor.as_deref(),
         ) {
@@ -339,6 +437,26 @@ impl LivePeerManager {
         .map_err(|error| {
             P2pError::Configuration(format!("HNSR coordinator initialization failed: {error}"))
         })?;
+        if config.hnsr_requester_policy_override.is_some()
+            || config.hnsr_opaque_relay_policy_override.is_some()
+        {
+            let current = hnsr.policy();
+            let requester = config
+                .hnsr_requester_policy_override
+                .unwrap_or(current.has_client())
+                && config.hnsr_requester;
+            let relay = config
+                .hnsr_opaque_relay_policy_override
+                .unwrap_or(current.has_relay())
+                && config.hnsr_opaque_relay;
+            let next = current.with_client(requester).with_relay(relay);
+            if next != current {
+                let generation = hnsr.status(0).state_generation;
+                hnsr.replace_policy(generation, next).map_err(|error| {
+                    P2pError::Configuration(format!("HNSR startup policy override failed: {error}"))
+                })?;
+            }
+        }
         let initial_services = if hnsr.relay_service_advertised() {
             config.services | hns_hnsr_protocol::HNSR_RELAY_SERVICE
         } else {
@@ -355,6 +473,7 @@ impl LivePeerManager {
                 retired_bytes_sent: Arc::new(AtomicU64::new(0)),
                 retired_bytes_received: Arc::new(AtomicU64::new(0)),
                 denuo_metrics: DenuoRuntimeMetrics::default(),
+                hip76_requester_policy: Arc::new(Mutex::new(hip76_requester_policy)),
                 odoh: Arc::new(Mutex::new(odoh)),
                 experimental: Arc::new(Mutex::new(ExperimentalExchangeRuntime::default())),
                 hnsr: Arc::new(Mutex::new(hnsr)),
@@ -618,6 +737,115 @@ impl LivePeerManager {
         summary
     }
 
+    pub async fn hip76_requester_policy_status(&self) -> Hip76RequesterPolicyStatus {
+        self.hip76_requester_policy.lock().await.status()
+    }
+
+    pub async fn hip76_requester_policy_snapshot(&self) -> Hip76RequesterPolicySnapshot {
+        self.hip76_requester_policy.lock().await.snapshot()
+    }
+
+    pub async fn acknowledge_hip76_requester_policy_persisted(
+        &self,
+        floor: Hip76RequesterPolicyFloor,
+    ) {
+        self.hip76_requester_policy
+            .lock()
+            .await
+            .acknowledge_persisted(floor);
+    }
+
+    /// Replace the process-wide requester policy, revoke prior-generation work
+    /// on every live peer, and make the new generation authoritative for peers
+    /// registered later. A peer whose command channel has already failed is
+    /// disconnected so stale requester authority cannot survive the update.
+    /// Fan-out shares one bounded deadline; timeout or task failure retires the
+    /// complete captured peer set.
+    pub async fn replace_hip76_requester_policy(
+        &self,
+        expected_generation: u64,
+        requester_policy: DnsRelayRequesterPolicy,
+    ) -> Result<Hip76RequesterPolicyUpdate, P2pError> {
+        let _registration = self.registration_lock.lock().await;
+        let handles = self
+            .peers
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut maximum_generation = expected_generation;
+        let mut live = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let diagnostics = handle.snapshot().await.hip76;
+            maximum_generation = maximum_generation.max(diagnostics.policy_generation);
+            live.push((handle, diagnostics));
+        }
+        let next_generation = maximum_generation.checked_add(1).ok_or_else(|| {
+            P2pError::State("HIP-76 requester policy generation exhausted".to_owned())
+        })?;
+        let mut policy = self.hip76_requester_policy.lock().await;
+        let previous = policy.status();
+        let current = policy
+            .replace(expected_generation, requester_policy, next_generation)
+            .map_err(|error| P2pError::State(error.to_string()))?;
+        drop(policy);
+
+        let all_handles = live
+            .iter()
+            .map(|(handle, _)| handle.clone())
+            .collect::<Vec<_>>();
+        let mut updates = JoinSet::new();
+        for (handle, diagnostics) in live {
+            let provider = if diagnostics.provider_opted_in {
+                Hip76ProviderPolicy::opted_in(diagnostics.provider_backend_ready)
+            } else {
+                Hip76ProviderPolicy::disabled()
+            };
+            updates.spawn(async move {
+                let result = handle
+                    .replace_hip76_policy(requester_policy, provider, current.generation)
+                    .await;
+                (handle, result)
+            });
+        }
+        let deadline = tokio::time::Instant::now() + self.config.critical_broadcast_timeout;
+        let mut revoked_requests = 0usize;
+        let mut disconnected_peers = 0usize;
+        let mut retire_all = false;
+        loop {
+            match tokio::time::timeout_at(deadline, updates.join_next()).await {
+                Ok(Some(Ok((_handle, Ok(revoked))))) => {
+                    revoked_requests = revoked_requests.saturating_add(revoked.count())
+                }
+                Ok(Some(Ok((handle, Err(_))))) => {
+                    disconnected_peers = disconnected_peers.saturating_add(1);
+                    handle.disconnect();
+                }
+                Ok(Some(Err(_))) | Err(_) => {
+                    retire_all = true;
+                    break;
+                }
+                Ok(None) => break,
+            }
+        }
+        if retire_all {
+            updates.abort_all();
+            disconnected_peers = all_handles.len();
+            for handle in all_handles {
+                handle.disconnect();
+            }
+        }
+        Ok(Hip76RequesterPolicyUpdate {
+            previous_policy: previous.requester_policy,
+            requester_policy: current.requester_policy,
+            previous_generation: previous.generation,
+            generation: current.generation,
+            revoked_requests,
+            disconnected_peers,
+        })
+    }
+
     pub async fn snapshots_with_denuo_summary(&self) -> (Vec<PeerSnapshot>, DenuoSummary) {
         let snapshots = self.snapshots().await;
         let diagnostics = snapshots
@@ -682,6 +910,23 @@ impl LivePeerManager {
         peer: PeerId,
         query: Vec<u8>,
     ) -> Result<crate::Hip76PendingRequest, P2pError> {
+        // Serialize admission with process-wide generation replacement. Work
+        // admitted before a replacement is included in its revocation set;
+        // work arriving afterward observes the new process policy.
+        let _registration = self.registration_lock.lock().await;
+        if self
+            .hip76_requester_policy
+            .lock()
+            .await
+            .status()
+            .requester_policy
+            == DnsRelayRequesterPolicy::Disabled
+        {
+            return Err(P2pError::Hip76 {
+                peer,
+                reason: crate::Hip76FailureReason::RequesterDisabled,
+            });
+        }
         let handle = self
             .peers
             .read()
@@ -689,7 +934,21 @@ impl LivePeerManager {
             .get(&peer)
             .cloned()
             .ok_or(P2pError::PeerUnavailable(peer))?;
-        handle.begin_hip76_request(query).await
+        match tokio::time::timeout(
+            self.config.critical_broadcast_timeout,
+            handle.begin_hip76_request(query),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                // Admission may already be queued but its acknowledgement is
+                // now ambiguous. Retire the exact connection so no work can
+                // escape a later process-wide policy transition.
+                handle.disconnect();
+                Err(P2pError::PeerUnavailable(peer))
+            }
+        }
     }
 
     /// Perform one raw extension exchange over the exact ready Brontide peer
@@ -924,7 +1183,7 @@ impl LivePeerManager {
         self.odoh
             .lock()
             .await
-            .replace_enabled(enabled, generation)
+            .replace_enabled(enabled && self.config.odoh.enabled, generation)
             .map_err(|reason| P2pError::Odoh {
                 peer: PeerId(0),
                 reason,
@@ -1262,7 +1521,9 @@ impl LivePeerManager {
 
     /// Replace a connected peer's HIP-76 policy generation. Provider changes
     /// that alter VERSION advertisement require a reconnect and are rejected
-    /// here so the service mask can never drift from live admission.
+    /// here so the service mask can never drift from live admission. The
+    /// requester selection must equal the process-wide policy; this seam may
+    /// vary only provider state and the peer-local generation.
     pub async fn replace_peer_hip76_policy(
         &self,
         peer: PeerId,
@@ -1270,6 +1531,18 @@ impl LivePeerManager {
         provider: Hip76ProviderPolicy,
         generation: u64,
     ) -> Result<crate::Hip76RevokedWork, P2pError> {
+        let _registration = self.registration_lock.lock().await;
+        let process_requester = self
+            .hip76_requester_policy
+            .lock()
+            .await
+            .status()
+            .requester_policy;
+        if requester != process_requester {
+            return Err(P2pError::Configuration(
+                "per-peer HIP-76 requester policy must equal the process-wide policy".to_owned(),
+            ));
+        }
         let current_services =
             hip76_advertised_services(self.config.services, self.config.hip76.provider_policy);
         let next_services = hip76_advertised_services(self.config.services, provider);
@@ -1295,6 +1568,7 @@ impl LivePeerManager {
         peer: PeerId,
         generation: u64,
     ) -> Result<crate::Hip76RevokedWork, P2pError> {
+        let _registration = self.registration_lock.lock().await;
         let handle = self
             .peers
             .read()
@@ -1533,6 +1807,10 @@ impl LivePeerManager {
         };
         let magic = NetworkMagic::from(self.config.network);
         let (reader, writer) = stream.into_split();
+        let requester_policy = self.hip76_requester_policy.lock().await.status();
+        let mut hip76_config = self.config.hip76.clone();
+        hip76_config.requester_policy = requester_policy.requester_policy;
+        hip76_config.policy_generation = requester_policy.generation;
         let parameters = PeerRuntimeParameters {
             id,
             address,
@@ -1544,7 +1822,7 @@ impl LivePeerManager {
             critical_write_timeout: self.config.critical_broadcast_timeout,
             events: self.events.clone(),
             denuo_metrics: self.denuo_metrics.clone(),
-            hip76_config: self.config.hip76.clone(),
+            hip76_config,
             odoh: Arc::clone(&self.odoh),
             experimental: Arc::clone(&self.experimental),
             hnsr: Arc::clone(&self.hnsr),
@@ -2026,6 +2304,7 @@ mod tests {
 
         let mut requester_config = LivePeerConfig::for_network(Network::Regtest);
         requester_config.runtime.ping_interval = Duration::from_secs(60);
+        requester_config.critical_broadcast_timeout = LIVE_EVENT_TIMEOUT;
         assert!(matches!(
             requester_config.transport,
             PeerTransport::Plaintext
@@ -2187,7 +2466,7 @@ mod tests {
             .expect("ordinary provider packet");
         await_ordinary_packet(&mut requester_events, requester_peer, Packet::GetAddr).await;
 
-        requester_manager
+        let divergent = requester_manager
             .replace_peer_hip76_policy(
                 requester_peer,
                 DnsRelayRequesterPolicy::Disabled,
@@ -2195,9 +2474,56 @@ mod tests {
                 generation + 1,
             )
             .await
+            .expect_err("per-peer requester policy cannot diverge");
+        assert!(matches!(
+            divergent,
+            P2pError::Configuration(ref message)
+                if message
+                    == "per-peer HIP-76 requester policy must equal the process-wide policy"
+        ));
+        let provider_only = requester_manager
+            .replace_peer_hip76_policy(
+                requester_peer,
+                DnsRelayRequesterPolicy::Auto,
+                Hip76ProviderPolicy::opted_in(false),
+                generation + 1,
+            )
+            .await
+            .expect("provider-only per-peer policy update");
+        assert!(provider_only.is_empty());
+        tokio::time::timeout(LIVE_EVENT_TIMEOUT, async {
+            loop {
+                let diagnostics = requester_hip76.borrow().clone();
+                if diagnostics.policy_generation == generation + 1
+                    && diagnostics.provider_opted_in
+                    && !diagnostics.provider_backend_ready
+                {
+                    break;
+                }
+                requester_hip76
+                    .changed()
+                    .await
+                    .expect("requester HIP-76 status sender");
+            }
+        })
+        .await
+        .expect("provider-only policy diagnostics");
+
+        let process_policy = requester_manager.hip76_requester_policy_status().await;
+        assert_eq!(process_policy.generation, generation);
+        let update = requester_manager
+            .replace_hip76_requester_policy(
+                process_policy.generation,
+                DnsRelayRequesterPolicy::Disabled,
+            )
+            .await
             .expect("apply requester opt-out");
+        assert_eq!(update.previous_generation, generation);
+        assert_eq!(update.disconnected_peers, 0);
         let opted_out = await_hip76_capability(&mut requester_hip76, false, false).await;
         assert!(!opted_out.requester_enabled);
+        assert!(opted_out.provider_opted_in);
+        assert!(!opted_out.provider_backend_ready);
         let error = requester_manager
             .begin_hip76_request(requester_peer, strict_nonrecursive_dnssec_query(0x77))
             .await
@@ -2220,6 +2546,120 @@ mod tests {
 
         requester_manager.disconnect_all().await;
         provider_manager.disconnect_all().await;
+    }
+
+    #[tokio::test]
+    async fn durable_requester_opt_outs_survive_restart_and_explicit_enables_reverse_them() {
+        let config = LivePeerConfig::for_network(Network::Regtest);
+        let network_magic = config.network.params().packet_magic;
+        let (source, _events) = LivePeerManager::new(config).expect("source manager");
+
+        let hip76_status = source.hip76_requester_policy_status().await;
+        source
+            .replace_hip76_requester_policy(
+                hip76_status.generation,
+                DnsRelayRequesterPolicy::Disabled,
+            )
+            .await
+            .expect("disable HIP-76 requester");
+        let odoh_status = source.odoh_status(unix_time()).await;
+        source
+            .replace_odoh_requester_policy(false, odoh_status.policy_generation + 1)
+            .await
+            .expect("disable ODoH requester");
+        let hnsr_status = source.hnsr_status().await;
+        source
+            .replace_hnsr_policy(hnsr_status.state_generation, HnsrPolicy::disabled())
+            .await
+            .expect("disable HNSR requester and relay");
+
+        let hip76_snapshot = source.hip76_requester_policy_snapshot().await;
+        let odoh_snapshot = source
+            .odoh_target_cache_snapshot(unix_time())
+            .await
+            .expect("ODoH snapshot");
+        let hnsr_snapshot = source
+            .hnsr_state_snapshot(unix_time())
+            .await
+            .expect("HNSR snapshot");
+
+        let mut restored_config = LivePeerConfig::for_network(Network::Regtest);
+        restored_config.hip76_requester_policy_state = Some(hip76_snapshot.bytes.clone());
+        restored_config.hip76_requester_policy_floor = Some(hip76_snapshot.floor.encode());
+        restored_config.odoh_target_cache = Some(odoh_snapshot.bytes.clone());
+        restored_config.odoh_durable_floor =
+            Some(odoh_snapshot.durable_floor().encode(network_magic));
+        restored_config.hnsr_state = Some(hnsr_snapshot.bytes.clone());
+        restored_config.hnsr_durable_floor = Some(hnsr_snapshot.floor.encode());
+
+        let (restored, _events) =
+            LivePeerManager::new(restored_config.clone()).expect("restored manager");
+        let restored_hip76 = restored.hip76_requester_policy_status().await;
+        let restored_odoh = restored.odoh_status(unix_time()).await;
+        let restored_hnsr = restored.hnsr_status().await;
+        assert_eq!(
+            restored_hip76.requester_policy,
+            DnsRelayRequesterPolicy::Disabled
+        );
+        assert!(!restored_odoh.requester_enabled);
+        assert!(!restored_hnsr.requester.enabled);
+        assert!(!restored_hnsr.relay.enabled);
+
+        restored_config.hip76_requester_policy_override = Some(DnsRelayRequesterPolicy::Auto);
+        restored_config.odoh_requester_policy_override = Some(true);
+        restored_config.hnsr_requester_policy_override = Some(true);
+        restored_config.hnsr_opaque_relay_policy_override = Some(true);
+        let (reenabled, _events) =
+            LivePeerManager::new(restored_config).expect("explicitly re-enabled manager");
+        let reenabled_hip76 = reenabled.hip76_requester_policy_status().await;
+        let reenabled_odoh = reenabled.odoh_status(unix_time()).await;
+        let reenabled_hnsr = reenabled.hnsr_status().await;
+        assert_eq!(
+            reenabled_hip76.requester_policy,
+            DnsRelayRequesterPolicy::Auto
+        );
+        assert!(reenabled_odoh.requester_enabled);
+        assert!(reenabled_hnsr.requester.enabled);
+        assert!(reenabled_hnsr.relay.enabled);
+        assert!(reenabled_hip76.generation > restored_hip76.generation);
+        assert!(reenabled_odoh.policy_generation > restored_odoh.policy_generation);
+        assert!(reenabled_hnsr.state_generation > restored_hnsr.state_generation);
+
+        assert!(!reenabled.config().hip76.provider_policy.is_opted_in());
+        assert!(!reenabled_odoh.proxy_provider_available);
+        assert!(!reenabled_odoh.target_provider_available);
+        assert!(!reenabled_odoh.output_provider_available);
+        assert!(!reenabled_hnsr.endpoint_role_available);
+        assert!(!reenabled_hnsr.rendezvous_role_available);
+        assert!(!reenabled_hnsr.relay_service_available);
+    }
+
+    #[tokio::test]
+    async fn live_policy_updates_cannot_exceed_private_transport_capability_ceilings() {
+        let mut config = LivePeerConfig::for_network(Network::Regtest);
+        config.odoh.enabled = false;
+        config.hnsr_requester = false;
+        config.hnsr_opaque_relay = false;
+        let (manager, _events) = LivePeerManager::new(config).expect("bounded manager");
+
+        let odoh = manager.odoh_status(unix_time()).await;
+        manager
+            .replace_odoh_requester_policy(true, odoh.policy_generation + 1)
+            .await
+            .expect("bounded ODoH update");
+        assert!(!manager.odoh_status(unix_time()).await.requester_enabled);
+
+        let hnsr = manager.hnsr_status().await;
+        manager
+            .replace_hnsr_policy(
+                hnsr.state_generation,
+                HnsrPolicy::disabled().with_client(true).with_relay(true),
+            )
+            .await
+            .expect("bounded HNSR update");
+        let hnsr = manager.hnsr_status().await;
+        assert!(!hnsr.requester.enabled);
+        assert!(!hnsr.relay.enabled);
     }
 
     #[test]

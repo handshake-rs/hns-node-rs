@@ -4732,12 +4732,30 @@ impl NodeService {
             hip76: rpc_hip76_info(&[]),
             odoh: rpc_inactive_odoh_info(
                 self.config.network,
-                self.config.native_sync.enabled && self.config.native_sync.odoh_requester,
+                self.config.native_sync.enabled
+                    && self.config.native_sync.odoh_requester
+                    && self
+                        .config
+                        .native_sync
+                        .odoh_requester_override
+                        .unwrap_or(true),
             ),
             hnsr: rpc_inactive_hnsr_info(
                 self.config.network,
-                self.config.native_sync.enabled && self.config.native_sync.hnsr_requester,
-                self.config.native_sync.enabled && self.config.native_sync.hnsr_opaque_relay,
+                self.config.native_sync.enabled
+                    && self.config.native_sync.hnsr_requester
+                    && self
+                        .config
+                        .native_sync
+                        .hnsr_requester_override
+                        .unwrap_or(true),
+                self.config.native_sync.enabled
+                    && self.config.native_sync.hnsr_opaque_relay
+                    && self
+                        .config
+                        .native_sync
+                        .hnsr_opaque_relay_override
+                        .unwrap_or(true),
             ),
             authority,
             parity,

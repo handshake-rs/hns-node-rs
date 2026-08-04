@@ -2,9 +2,13 @@
 
 The native P2P runtime enables the HNSR requester and opaque circuit-relay
 policies by default. Operators can independently opt out with
-`--no-hnsr-requester` and `--no-hnsr-relay`. Embedded callers use the public
-`hns-p2p` coordinator and live-manager APIs. Endpoint/output-node and
-rendezvous roles are unavailable, and plaintext peers are never eligible.
+`--no-hnsr-requester` and `--no-hnsr-relay`, explicitly reverse saved choices
+with `--hnsr-requester` and `--hnsr-relay`, or use no policy flag to preserve
+the durable selections. The CLI keeps the node-supported capability ceilings
+available so a live or later-start re-enable remains possible. Embedded callers
+use the public `hns-p2p` coordinator and live-manager APIs.
+Endpoint/output-node and rendezvous roles are unavailable, and plaintext peers
+are never eligible.
 
 Policy enablement is not provider availability. A local relay service is
 created and advertises `HNSR_RELAY_SERVICE` only when the operator supplies
@@ -45,6 +49,11 @@ requester and relay generations, counts formerly live work as revoked, and
 rejects corruption, wrong network/configuration, generation rollback, or clock
 regression. Reservations, circuit IDs, queued opaque bytes, action tokens, and
 authenticated peer authority are never restored.
+Explicit startup overrides advance the restored coordinator generation and are
+flushed before peer networking. Absent overrides preserve the saved requester
+and opaque-relay bits. Live replacements remain clamped by the immutable
+embedding capability ceilings and cannot activate endpoint or rendezvous
+roles.
 
 The public authenticated experimental-evidence getter exposes the exact
 upstream `ExperimentalPeerState` and `NegotiatedRegistry` keyed by Brontide
