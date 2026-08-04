@@ -32,8 +32,9 @@ repository = "https://github.com/handshake-rs/hns-node-rs"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
-hns-dns-relay-protocol = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "dde2da81f29df935f043978a6d517c1d60ceff31" }
-hns-p2p-experimental = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "dde2da81f29df935f043978a6d517c1d60ceff31" }
+hns-dns-relay-protocol = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "682554914729e83cdd9dbdb76b5f9923f8278f59" }
+hns-odoh-protocol = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "682554914729e83cdd9dbdb76b5f9923f8278f59" }
+hns-p2p-experimental = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "682554914729e83cdd9dbdb76b5f9923f8278f59" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.9"

@@ -73,13 +73,26 @@ shape, correlation, policy generations, deadlines, queue admission, and socket
 completion. A received DNS answer remains untrusted input for a separate
 resolver/DNSSEC validation boundary.
 
+The bounded HIP-77 ODoH requester is likewise wired through live peers and is
+enabled by default with a policy opt-out. It requires exact Brontide proxy
+  authentication, both Denuo and ODoH service advertisements, exact Denuo V1
+  profile/registry/network/genesis evidence, and a
+proxy key distinct from the target-signed locator. Request correlation,
+deadlines, negotiated bounds, disconnect cleanup, policy revocation, and
+socket-write acknowledgement are enforced in the live runtime. Only verified
+  public target records, anti-rollback sequence high-water marks, policy state,
+  and cache/policy/trusted-time generation floors are durable atomically;
+live sessions and HPKE context are not. Local proxy, target, and output roles
+remain unavailable, and decrypted response bytes remain untrusted until the
+higher resolver boundary parses, correlates, and DNSSEC-validates them.
+
 The current tree contains hardened authority, storage, transaction, covenant,
 and name-state foundations, a live native P2P/synchronization foundation, and a
 bounded mempool, future-template, and durable solved-block publication
 foundation. Native synchronization can produce fully validated durable block
 status, but the mining engine cannot authorize jobs or publish solved blocks
 without the private authority capability and a currently authoritative durable
-tip. API-v13
+tip. API-v14
 exposes the exact next-header interval-committed root, and the external comparison
 runner can check it against a pinned live HSD node without feeding oracle data
 back into consensus.
@@ -349,7 +362,7 @@ Implemented:
   commits leave all records unchanged.
 - HSD-shaped opt-in startup scheduling with a nonzero block-height interval
   (10,000 by default), a checksummed last-run checkpoint committed in the same
-  batch as deletions, manual serialized maintenance, and current API-v13 status
+  batch as deletions, manual serialized maintenance, and current API-v14 status
   counts (introduced with the API-v9 compaction diagnostics).
 - Optional HSD-shaped undo retirement preserves heights through
   `pruneAfterHeight` and the newest `keepBlocks`, advances a checksummed

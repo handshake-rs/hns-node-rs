@@ -421,7 +421,14 @@ cannot promote a block or grant authority.
   when score 100 is crossed, compacted on HSD-style expiry, retried on the same
   120-second cadence, and flushed at shutdown. The record has independent
   version, checksum, generation, and network binding; earliest-expiring bans
-  are evicted first if the hard bound is reached.
+  are evicted first if the hard bound is reached. `odoh-target-cache/v1` stores
+  at most 16 verified public HIP-77 target locators, signed records, selected
+  configuration indexes, expiry and sequence high-water values, plus requester
+  opt-out/revocation policy. `odoh-durable-floor/v1` independently checksums the
+  minimum cache generation, policy generation, and trusted-time high-water.
+  Both ODoH records are written in one atomic batch; startup accepts both or
+  neither and rejects rollback, clock regression, corruption, network mismatch,
+  or address-policy mismatch.
 - `orphans`, `mempool_persist`: reserved operational records as those
   subsystems mature. Subthreshold per-connection peer scores, socket reconnect
   timers, inflight requests, orphan bodies, and the mining-engine
@@ -606,7 +613,7 @@ scheduling. In undo-pruned mining mode the same scheduler also runs during
 native replay. A nonzero height interval (10,000 by default) prevents repeated
 work at the same tip. The checksummed height/tip/count completion checkpoint is
 written only after every deletion chunk succeeds; malformed checkpoints fail
-startup. Current API-v13 status retains the configured policy and
+startup. Current API-v14 status retains the configured policy and
 last-completed result fields introduced in API-v10. During the serialized pass
 it serves an explicitly marked, timestamped
 cached diagnostic snapshot, while authority-bearing reads continue waiting for

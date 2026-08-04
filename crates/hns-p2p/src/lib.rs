@@ -16,6 +16,7 @@ pub mod denuo;
 pub mod handshake;
 pub mod hip76;
 pub mod manager;
+pub mod odoh;
 pub mod runtime;
 pub mod wire;
 
@@ -44,6 +45,15 @@ pub use hip76::{
 pub use manager::{
     normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, PeerBan,
     PeerTrafficTotals, PeerTransport,
+};
+pub use odoh::{
+    is_odoh_packet_type, DirectTargetLocator, OdohCacheError, OdohFailureReason,
+    OdohDurableFloor, OdohNetworkBinding, OdohPendingRequest, OdohPeerProvenance,
+    OdohProcessTotals, OdohProxyAdmission, OdohRequestAdmission, OdohRequestOutcome,
+    OdohRequesterConfig, OdohRequesterRuntime, OdohRequesterStatus, OdohRuntimePhase,
+    OdohTargetCacheSnapshot, OdohUntrustedDnsResponse,
+    ODOH_DEFAULT_MAXIMUM_LIVE_REQUESTS,
+    ODOH_MAXIMUM_TARGET_CACHE_BLOB_BYTES,
 };
 pub use runtime::{
     AuthenticatedPeerKey, Hip76PeerProvenance, Hip76PendingRequest, Hip76RequestAdmission,
@@ -208,6 +218,11 @@ pub enum P2pError {
     Hip76 {
         peer: PeerId,
         reason: Hip76FailureReason,
+    },
+    #[error("peer {peer:?} HIP-77 operation rejected: {reason}")]
+    Odoh {
+        peer: PeerId,
+        reason: OdohFailureReason,
     },
     #[error("p2p state failed: {0}")]
     State(String),

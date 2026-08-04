@@ -10,6 +10,17 @@ qualification or authorize deployment.
   fixed-seed/GETADDR discovery in the standalone process by default, with
   explicit `--no-native-sync` and `--no-p2p-discovery` opt-outs. HIP-76
   requester policy remains `Auto`; its plaintext output role remains off.
+- Enable the HIP-77 ODoH requester policy by default. Requests use only ready,
+  exact-Denuo-V1-negotiated, Brontide-authenticated peers advertising both the
+  Denuo and ODoH services with matching network and genesis evidence,
+  reject proxy/target identity collisions, and carry bounded correlation and
+  deadlines through socket-write acknowledgement. Target-signed public
+  configuration records use a checksummed, network-bound, anti-rollback cache
+  with atomic cache/policy generation and trusted-time floors. Opt-out and
+  revocation policy survive restart;
+  live request IDs and HPKE state are never persisted. Proxy, target, and DNS
+  output provider roles remain unavailable; `--no-odoh-requester` is the
+  explicit requester opt-out.
 - Bind wallet snapshots and name-action contexts to consensus median time past.
 - Reclaim never-confirmed contract capacity and safely retire completed tracked
   contracts only after canonical evidence is validated.

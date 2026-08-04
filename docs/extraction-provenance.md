@@ -52,7 +52,7 @@ added live Denuo registry and role-safe HIP-76 negotiation. At standalone commit
 `42c76a622f2600a833835b4ca737d3350f73af52`, every
 `RpcConsensusReadiness` field is true and the strict mainnet canary can issue
 its private permit only for a synchronized, durably authoritative tip.
-API-v13's base snapshot initializes `release_stage: "pre-authority"`, while
+API-v14's base snapshot initializes `release_stage: "pre-authority"`, while
 live native RPC replaces it with a configuration-specific diagnostic stage.
 Functional readiness and a conditional permit therefore do not imply
 independent production endorsement.

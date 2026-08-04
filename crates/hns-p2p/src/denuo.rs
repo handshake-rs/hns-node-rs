@@ -15,8 +15,9 @@ use std::{
 use hns_consensus::Network as ConsensusNetwork;
 use hns_dns_relay_protocol::MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE;
 use hns_p2p_experimental::{
-    DenuoExtensionEnvelope, EnvelopeError, KnownMessage, NegotiatedRegistry, NegotiationError,
-    Network, ProtocolDisposition, RegistryEnvelopeError, RegistryHello,
+    DenuoExtensionEnvelope, EnvelopeError, ExperimentalWireProfile, KnownMessage,
+    NegotiatedRegistry, NegotiationError, Network, ProtocolDisposition, RegistryEnvelopeError,
+    RegistryHello,
     DENUO_EXTENSION_MAX_NESTED_PAYLOAD, DENUO_EXTENSION_MAX_PACKET_PAYLOAD, DENUO_EXTENSION_PACKET,
     DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT, DENUO_V1_REGISTRY_ID,
     DENUO_V1_REGISTRY_NAME, DENUO_V1_REGISTRY_PROTOCOL_VERSION, DENUO_V1_REGISTRY_VERSION,
@@ -480,6 +481,14 @@ impl DenuoCoordinator {
 
     pub(crate) fn diagnostics(&self) -> DenuoPeerDiagnostics {
         self.diagnostics.clone()
+    }
+
+    pub(crate) fn negotiated_evidence(
+        &self,
+    ) -> Option<(ExperimentalWireProfile, &NegotiatedRegistry)> {
+        self.negotiated
+            .as_ref()
+            .map(|negotiated| (ExperimentalWireProfile::DenuoV1, negotiated))
     }
 
     pub(crate) fn observe_remote_services(&mut self, services: u64) {

@@ -104,7 +104,10 @@ use hns_mining::{
     HeaderSummary, MiningEventHub, MiningGeneration, MiningSnapshot, MiningSubscriptions,
     SolvedMiningCandidate, TemplateCoordinator,
 };
-use hns_p2p::{DenuoSummary, Hip76Summary, PeerSnapshot};
+use hns_p2p::{
+    DenuoSummary, Hip76Summary, OdohNetworkBinding, OdohRequesterConfig,
+    OdohRequesterRuntime, OdohRequesterStatus, PeerSnapshot,
+};
 use hns_primitives::{
     blake2b_256, hex_encode, sha3_256, Block, BlockHash, Coin, CompactTarget, Height, NameHash,
     NameState, Outpoint, Reader, Transaction, Txid, Uint256, Writer,
@@ -113,7 +116,7 @@ use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
     RpcConsensusReadiness, RpcErrorObject, RpcExperimentalRegistryInfo,
     RpcExperimentalRejectionCount, RpcHeaderEntry, RpcHip76Info, RpcMethod, RpcMiningEngineInfo,
-    RpcNameTreeCompactionInfo, RpcNodeStatus, RpcParityInfo, RpcService, RpcSnapshot,
+    RpcNameTreeCompactionInfo, RpcNodeStatus, RpcOdohInfo, RpcParityInfo, RpcService, RpcSnapshot,
     RpcTransactionEntry, RpcUndoRetentionInfo,
 };
 use hns_state::{
@@ -164,7 +167,7 @@ use tokio::{
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 13;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 14;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -2013,6 +2016,58 @@ pub(crate) fn rpc_hip76_info(peers: &[PeerSnapshot]) -> RpcHip76Info {
         revoked_requests: hip76.process.revoked_requests,
         rejected_operations: hip76.process.rejected_operations,
     }
+}
+
+pub(crate) fn rpc_odoh_info(status: &OdohRequesterStatus) -> RpcOdohInfo {
+    RpcOdohInfo {
+        schema_version: status.schema_version,
+        phase: status.phase.as_str().to_owned(),
+        policy_generation: status.policy_generation,
+        requester_enabled: status.requester_enabled,
+        requester_default_enabled: status.requester_default_enabled,
+        service_bit: status.service_bit,
+        packet_type: status.packet_type,
+        registry_fingerprint: status.registry_fingerprint.clone(),
+        registry_wire_profile: status.registry_wire_profile.clone(),
+        eligible_authenticated_proxies: status.eligible_authenticated_proxies,
+        faulted_proxies: status.faulted_proxies,
+        target_slots: status.target_slots,
+        current_targets: status.current_targets,
+        earliest_target_expiry: status.earliest_target_expiry,
+        live_requests: status.live_requests,
+        maximum_live_requests: status.maximum_live_requests,
+        cache_generation: status.cache_generation,
+        cache_dirty: status.cache_dirty,
+        policy_dirty: status.policy_dirty,
+        durable_state_dirty: status.durable_state_dirty,
+        trusted_time_high_water: status.trusted_time_high_water,
+        proxy_provider_available: status.proxy_provider_available,
+        target_provider_available: status.target_provider_available,
+        output_provider_available: status.output_provider_available,
+        requests_created: status.process.requests_created,
+        requests_socket_written: status.process.requests_socket_written,
+        responses_received: status.process.responses_received,
+        configurations_installed: status.process.configurations_installed,
+        socket_write_failures: status.process.socket_write_failures,
+        expired_requests: status.process.expired_requests,
+        revoked_requests: status.process.revoked_requests,
+        rejected_packets: status.process.rejected_packets,
+    }
+}
+
+fn rpc_inactive_odoh_info(network: Network, requester_enabled: bool) -> RpcOdohInfo {
+    let mut config = OdohRequesterConfig::default();
+    config.enabled = requester_enabled;
+    config.allow_private_targets = matches!(network, Network::Regtest | Network::Simnet);
+    let now = current_unix_time();
+    let mut runtime = OdohRequesterRuntime::new(
+        OdohNetworkBinding::for_network(network),
+        config,
+        1,
+        now,
+    )
+    .expect("built-in ODoH requester defaults are valid");
+    rpc_odoh_info(&runtime.status(now, 0))
 }
 
 fn parity_info() -> RpcParityInfo {
@@ -4600,6 +4655,10 @@ impl NodeService {
             undo_retention,
             experimental_registry: rpc_experimental_registry_info(&DenuoSummary::default()),
             hip76: rpc_hip76_info(&[]),
+            odoh: rpc_inactive_odoh_info(
+                self.config.network,
+                self.config.native_sync.enabled && self.config.native_sync.odoh_requester,
+            ),
             authority,
             parity,
         };
@@ -14787,6 +14846,42 @@ mod tests {
             "\"response\"",
             "\"status\"",
             "\"deadline\"",
+        ] {
+            assert!(!json.contains(forbidden_key));
+        }
+    }
+
+    #[test]
+    fn odoh_rpc_projection_is_qname_free_and_exposes_false_provider_roles() {
+        let mut runtime = OdohRequesterRuntime::new(
+            OdohNetworkBinding::for_network(Network::Regtest),
+            OdohRequesterConfig {
+                allow_private_targets: true,
+                ..OdohRequesterConfig::default()
+            },
+            7,
+            1_700_000_000,
+        )
+        .expect("ODoH requester");
+        let projected = rpc_odoh_info(&runtime.status(1_700_000_000, 2));
+
+        assert_eq!(projected.phase, "awaiting-target");
+        assert!(projected.requester_enabled);
+        assert!(projected.requester_default_enabled);
+        assert_eq!(projected.eligible_authenticated_proxies, 2);
+        assert!(!projected.proxy_provider_available);
+        assert!(!projected.target_provider_available);
+        assert!(!projected.output_provider_available);
+
+        let json = serde_json::to_string(&projected).expect("serialize HIP-77 diagnostics");
+        for forbidden_key in [
+            "\"qname\"",
+            "\"request_id\"",
+            "\"locator\"",
+            "\"query\"",
+            "\"response\"",
+            "\"deadline\"",
+            "\"hpke\"",
         ] {
             assert!(!json.contains(forbidden_key));
         }

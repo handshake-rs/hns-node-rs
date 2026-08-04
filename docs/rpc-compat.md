@@ -100,7 +100,13 @@ into a process-wide RPC snapshot.
   separate packet-created, queue-admitted, socket-written, failed-write, and
   stale-drop counters. It never exposes request IDs, question names, raw DNS
   bodies, response statuses, or deadlines.
-- API-v13's base `NodeService` snapshot initializes `release_stage:
+- API-v14 adds a qname-free `odoh` object with requester/default policy,
+  authenticated-proxy eligibility, target-cache/policy generations and expiry,
+  durable-state dirtiness and trusted-time high-water,
+  bounded live work, socket-write outcomes, and explicit false provider-role
+  fields. It never exposes request IDs, locators, DNS bodies, HPKE context, or
+  response payloads.
+- API-v14's base `NodeService` snapshot initializes `release_stage:
   "pre-authority"`. The native-sync composer replaces it in live RPC with
   `native-sync-live-p2p`, `mining-engine-observe`, or
   `mainnet-canary-gated`, according to configuration. These diagnostic stages
@@ -112,7 +118,7 @@ into a process-wide RPC snapshot.
   by a connect slice or name-tree compaction. HTTP requests always use the last
   sync-loop storage capture rather than recomputing potentially linear
   diagnostic counts under the coordinator lock. Already-bounded live
-  peer-count, network-active, registry, HIP-76, and scheduler best-header
+  peer-count, network-active, registry, HIP-76, HIP-77, and scheduler best-header
   fields are overlaid per request from the diagnostics lock, so ordinary
   network/status RPCs do not freeze at their startup values. Each response reports
   `diagnostic_snapshot_cached: true` and

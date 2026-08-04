@@ -7,7 +7,8 @@ use hns_consensus::Network;
 use hns_dns_relay_protocol::{
     MAX_DNS_RELAY_REQUEST_PAYLOAD_SIZE, MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
 };
-use hns_p2p_experimental::{DNS_RELAY_REQUEST_PACKET, DNS_RELAY_RESPONSE_PACKET};
+use hns_odoh_protocol::MAX_ODOH_PACKET_SIZE;
+use hns_p2p_experimental::{DNS_RELAY_REQUEST_PACKET, DNS_RELAY_RESPONSE_PACKET, ODOH_PACKET};
 use hns_primitives::{
     blake2b_256_many, AirdropProof, Block, BlockHash, Claim, Header, Reader, Transaction, Txid,
     Writer,
@@ -1596,6 +1597,12 @@ fn packet_payload_limit(packet_type: PacketType) -> Option<PacketPayloadLimit> {
             maximum: MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
         });
     }
+    if value == ODOH_PACKET.value() {
+        return Some(PacketPayloadLimit {
+            context: "HIP-77 ODoH payload",
+            maximum: MAX_ODOH_PACKET_SIZE,
+        });
+    }
     None
 }
 
@@ -1937,6 +1944,11 @@ mod tests {
                 MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
                 "HIP-76 response payload",
             ),
+            (
+                PacketType::Unknown(ODOH_PACKET.value()),
+                MAX_ODOH_PACKET_SIZE,
+                "HIP-77 ODoH payload",
+            ),
         ] {
             let rejected =
                 Frame::new(packet_type, vec![0xa5; limit + 1]).expect("generic frame bound");
@@ -1979,6 +1991,10 @@ mod tests {
                 MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
             ),
             (
+                PacketType::Unknown(ODOH_PACKET.value()),
+                MAX_ODOH_PACKET_SIZE,
+            ),
+            (
                 PacketType::Unknown(0xef),
                 MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE + 1,
             ),
@@ -2002,6 +2018,11 @@ mod tests {
                 PacketType::Unknown(DNS_RELAY_RESPONSE_PACKET.value()),
                 MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE,
                 "HIP-76 response payload",
+            ),
+            (
+                PacketType::Unknown(ODOH_PACKET.value()),
+                MAX_ODOH_PACKET_SIZE,
+                "HIP-77 ODoH payload",
             ),
         ] {
             let frame = Frame::new(packet_type, vec![0; limit + 1]).expect("generic frame bound");

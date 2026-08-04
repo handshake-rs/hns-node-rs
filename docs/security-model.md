@@ -6,7 +6,7 @@ untrusted until an explicit validation stage accepts their use. The source
 consensus-readiness matrix is complete, but authority is still a runtime
 capability: only the explicit synchronized mainnet canary with a coherent
 durable authoritative tip may receive it. The pinned `hsd` revision remains an
-offline comparison oracle, not a runtime or production authority. API-v13's
+offline comparison oracle, not a runtime or production authority. API-v14's
 base snapshot initializes `release_stage: "pre-authority"`; live native RPC
 replaces it with a configuration-specific diagnostic stage that does not grant
 authority.
@@ -121,7 +121,7 @@ does not grant authority. Solved-block staging, connection, and
 publication require the same private authority capability as the existing
 authoritative mining boundary.
 
-Current API-v13 retains the next-header interval-committed root introduced in
+Current API-v14 retains the next-header interval-committed root introduced in
 API-v10 for external qualification. `compare-hsrd-hsd-shadow.py` reads that
 material and a pinned
 HSD node, but its observations and evidence checkpoint never enter the store,
@@ -217,10 +217,30 @@ clean marker or matching startup checkpoint cannot restore authority.
   ancestry and bind any historical-script assumption to the exact final
   configured checkpoint; they do not confer body, state, or mining authority.
 - Denuo registry agreement and HIP-76 role/session state are connection-local
-  experimental transport capabilities. Requester operation can be disabled;
-  provider advertisement requires explicit opt-in and a ready backend. Neither
-  DNS relay negotiation nor received DNS bytes grant consensus or mining
-  authority.
+  private transport capabilities. HIP-76 requester operation can be disabled;
+  provider advertisement requires explicit opt-in and a ready backend.
+- HIP-77 requester operation defaults on but admits only ready,
+  Brontide-authenticated sessions retaining exact upstream Denuo V1 profile and
+  registry evidence. Both Denuo and ODoH service bits, the canonical
+  fingerprint and versions, and the local network and genesis must match. The
+  selected authenticated proxy key must differ from the
+  target-signed locator key. Correlation binds request ID, policy generation,
+  deadline, peer connection, and authenticated proxy key. Disconnect,
+  revocation, registry loss, malformed input, or a missed deadline closes the
+  affected work fail closed.
+- Only signed public ODoH target records, per-locator sequence high-water marks,
+  and explicit requester policy cross restart. The bounded canonical cache is
+  checksummed, network and address-policy bound, and reverified at startup. An
+  independently checksummed floor requires monotonic cache/policy generations
+  and trusted time; both records commit atomically, and missing pairs, old
+  generations, or clock rollback fail startup closed. Proxy sessions, request
+  IDs, HPKE contexts, decrypted DNS
+  bytes, and in-flight work are never persisted. Local ODoH proxy, target, and
+  output provider roles remain unavailable.
+- Neither private transport negotiation nor received DNS bytes grant consensus
+  or mining authority. Successfully opened ODoH bytes remain untrusted until a
+  higher layer performs strict DNS parsing, query correlation, and DNSSEC
+  validation.
 
 ## Mining-engine and publication policy
 

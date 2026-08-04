@@ -345,6 +345,45 @@ pub struct RpcHip76Info {
     pub rejected_operations: u64,
 }
 
+/// Query-name-free HIP-77 requester diagnostics. Provider booleans are
+/// explicit so an enabled requester cannot be mistaken for a local proxy,
+/// target, resolver, or plaintext-output capability.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcOdohInfo {
+    pub schema_version: u16,
+    pub phase: String,
+    pub policy_generation: u64,
+    pub requester_enabled: bool,
+    pub requester_default_enabled: bool,
+    pub service_bit: u64,
+    pub packet_type: u8,
+    pub registry_fingerprint: String,
+    pub registry_wire_profile: String,
+    pub eligible_authenticated_proxies: u64,
+    pub faulted_proxies: u64,
+    pub target_slots: u16,
+    pub current_targets: u16,
+    pub earliest_target_expiry: u64,
+    pub live_requests: u16,
+    pub maximum_live_requests: u16,
+    pub cache_generation: u64,
+    pub cache_dirty: bool,
+    pub policy_dirty: bool,
+    pub durable_state_dirty: bool,
+    pub trusted_time_high_water: u64,
+    pub proxy_provider_available: bool,
+    pub target_provider_available: bool,
+    pub output_provider_available: bool,
+    pub requests_created: u64,
+    pub requests_socket_written: u64,
+    pub responses_received: u64,
+    pub configurations_installed: u64,
+    pub socket_write_failures: u64,
+    pub expired_requests: u64,
+    pub revoked_requests: u64,
+    pub rejected_packets: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RpcNodeStatus {
     pub api_version: u32,
@@ -377,6 +416,8 @@ pub struct RpcNodeStatus {
     pub experimental_registry: RpcExperimentalRegistryInfo,
     #[serde(default)]
     pub hip76: RpcHip76Info,
+    #[serde(default)]
+    pub odoh: RpcOdohInfo,
     pub authority: RpcAuthorityInfo,
     pub parity: RpcParityInfo,
 }

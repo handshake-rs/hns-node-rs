@@ -23,6 +23,11 @@ use crate::{
     denuo::{DenuoRuntimeMetrics, DenuoSummary},
     handshake::{PeerDirection, PeerState},
     hip76::{hip76_advertised_services, Hip76ProviderPolicy, Hip76SessionConfig, Hip76Summary},
+    odoh::{
+        DirectTargetLocator, OdohFailureReason, OdohPendingRequest, OdohPeerProvenance,
+        OdohDurableFloor, OdohNetworkBinding, OdohProxyAdmission, OdohRequesterConfig,
+        OdohRequesterRuntime, OdohRequesterStatus, OdohTargetCacheSnapshot,
+    },
     runtime::{
         spawn_brontide_peer_runtime, spawn_peer_runtime, OutboundPriority, PeerEvent, PeerHandle,
         PeerId, PeerRuntimeConfig, PeerRuntimeParameters, PeerSnapshot,
@@ -54,6 +59,14 @@ pub struct LivePeerConfig {
     pub no_relay: bool,
     pub runtime: PeerRuntimeConfig,
     pub hip76: Hip76SessionConfig,
+    pub odoh: OdohRequesterConfig,
+    /// Canonical target-cache snapshot loaded before peer startup. Live
+    /// proxy sessions and in-flight HPKE state are never accepted here.
+    pub odoh_target_cache: Option<Vec<u8>>,
+    /// Independently checksummed minimum generations and trusted-time
+    /// high-water loaded alongside the cache. A cache without its durable
+    /// floor (or a floor without its cache) is never restored.
+    pub odoh_durable_floor: Option<Vec<u8>>,
 }
 
 impl LivePeerConfig {
@@ -66,6 +79,8 @@ impl LivePeerConfig {
             }
             Network::Regtest | Network::Simnet => PeerTransport::Plaintext,
         };
+        let mut odoh = OdohRequesterConfig::default();
+        odoh.allow_private_targets = matches!(network, Network::Regtest | Network::Simnet);
         Self {
             network,
             transport,
@@ -82,6 +97,9 @@ impl LivePeerConfig {
             no_relay: false,
             runtime: PeerRuntimeConfig::default(),
             hip76: Hip76SessionConfig::default(),
+            odoh,
+            odoh_target_cache: None,
+            odoh_durable_floor: None,
         }
     }
 
@@ -126,6 +144,16 @@ impl LivePeerConfig {
         self.hip76
             .validate()
             .map_err(|error| P2pError::Configuration(error.to_string()))?;
+        self.odoh
+            .validate()
+            .map_err(|error| P2pError::Configuration(error.to_string()))?;
+        if self.odoh.allow_private_targets
+            && !matches!(self.network, Network::Regtest | Network::Simnet)
+        {
+            return Err(P2pError::Configuration(
+                "private ODoH targets are restricted to regtest and simnet".to_owned(),
+            ));
+        }
         self.runtime.validate()
     }
 }
@@ -163,6 +191,7 @@ pub struct LivePeerManager {
     retired_bytes_sent: Arc<AtomicU64>,
     retired_bytes_received: Arc<AtomicU64>,
     denuo_metrics: DenuoRuntimeMetrics,
+    odoh: Arc<Mutex<OdohRequesterRuntime>>,
     local_nonce: [u8; 8],
     registration_lock: Arc<Mutex<()>>,
     banned: Arc<RwLock<HashMap<IpAddr, u64>>>,
@@ -177,6 +206,35 @@ impl LivePeerManager {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
+        let first_odoh_request_id = rand::random::<u64>().max(1);
+        let binding = OdohNetworkBinding::for_network(config.network);
+        let trusted_now = unix_time();
+        let odoh = match (
+            config.odoh_target_cache.as_deref(),
+            config.odoh_durable_floor.as_deref(),
+        ) {
+            (Some(snapshot), Some(encoded_floor)) =>
+                OdohDurableFloor::decode(encoded_floor, binding.magic).and_then(|floor| {
+                    OdohRequesterRuntime::restore(
+                        binding,
+                        config.odoh,
+                        first_odoh_request_id,
+                        snapshot,
+                        floor,
+                        trusted_now,
+                    )
+                }),
+            (None, None) => OdohRequesterRuntime::new(
+                binding,
+                config.odoh,
+                first_odoh_request_id,
+                trusted_now,
+            ),
+            _ => Err(crate::OdohCacheError::InvalidDurableFloor),
+        }
+        .map_err(|error| P2pError::Configuration(format!(
+            "ODoH requester initialization failed: {error}"
+        )))?;
         Ok((
             Self {
                 config,
@@ -187,6 +245,7 @@ impl LivePeerManager {
                 retired_bytes_sent: Arc::new(AtomicU64::new(0)),
                 retired_bytes_received: Arc::new(AtomicU64::new(0)),
                 denuo_metrics: DenuoRuntimeMetrics::default(),
+                odoh: Arc::new(Mutex::new(odoh)),
                 // Use one unpredictable process-local nonce across all live
                 // connections. A loopback outbound/inbound pair will therefore
                 // observe its own nonce and fail the VERSION handshake.
@@ -462,6 +521,243 @@ impl LivePeerManager {
             .cloned()
             .ok_or(P2pError::PeerUnavailable(peer))?;
         handle.begin_hip76_request(query).await
+    }
+
+    /// Install one target-signed HIP-77 configuration in the restart-safe
+    /// anti-rollback cache. The record is public metadata; no HPKE context or
+    /// live peer authority is persisted with it.
+    pub async fn install_odoh_target(
+        &self,
+        locator: DirectTargetLocator,
+        signed_record: &[u8],
+        configuration_index: usize,
+    ) -> Result<[u8; 32], P2pError> {
+        self.odoh
+            .lock()
+            .await
+            .install_target(locator, signed_record, configuration_index, unix_time())
+            .map_err(|error| P2pError::Configuration(format!(
+                "ODoH target record rejected: {error}"
+            )))
+    }
+
+    /// Begin one HPKE-sealed query through a distinct authenticated proxy.
+    /// The returned response bytes remain untrusted DNS input for the caller's
+    /// parser and DNSSEC validation path.
+    pub async fn begin_odoh_request(
+        &self,
+        target_record_id: [u8; 32],
+        query: Vec<u8>,
+    ) -> Result<OdohPendingRequest, P2pError> {
+        let candidates = self.odoh_candidates().await;
+        let mut runtime = self.odoh.lock().await;
+        let now_unix = unix_time();
+        let target_key = runtime
+            .target_peer_key(target_record_id, now_unix)
+            .map_err(|reason| P2pError::Odoh {
+                peer: PeerId(0),
+                reason,
+            })?;
+        let proxy = candidates
+            .into_iter()
+            .find(|candidate| {
+                candidate.provenance.authenticated_remote_static != Some(target_key)
+                    && !runtime.proxy_faulted(candidate.provenance.peer)
+            })
+            .ok_or(P2pError::Odoh {
+                peer: PeerId(0),
+                reason: OdohFailureReason::UnauthenticatedProxy,
+            })?;
+        self.send_odoh_locked(
+            &mut runtime,
+            proxy,
+            |runtime, proxy, now| {
+                runtime.begin_query(proxy, target_record_id, query, now_unix, now)
+            },
+        )
+        .await
+    }
+
+    /// Request one target-signed configuration from an authenticated ODoH
+    /// peer. A successful response is verified and installed atomically in
+    /// the same anti-rollback cache used by direct installation.
+    pub async fn begin_odoh_configuration_request(
+        &self,
+        locator: DirectTargetLocator,
+        configuration_index: usize,
+    ) -> Result<OdohPendingRequest, P2pError> {
+        let candidates = self.odoh_candidates().await;
+        let mut runtime = self.odoh.lock().await;
+        let now_unix = unix_time();
+        let target_key = crate::AuthenticatedPeerKey::new(locator.target_peer_key);
+        let proxy = candidates
+            .into_iter()
+            .find(|candidate| {
+                candidate.provenance.authenticated_remote_static != Some(target_key)
+                    && !runtime.proxy_faulted(candidate.provenance.peer)
+            })
+            .ok_or(P2pError::Odoh {
+                peer: PeerId(0),
+                reason: OdohFailureReason::UnauthenticatedProxy,
+            })?;
+        self.send_odoh_locked(
+            &mut runtime,
+            proxy,
+            |runtime, proxy, now| {
+                runtime.begin_configuration(
+                    proxy,
+                    locator,
+                    configuration_index,
+                    now_unix,
+                    now,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn send_odoh_locked(
+        &self,
+        runtime: &mut OdohRequesterRuntime,
+        proxy: OdohProxyAdmission,
+        prepare: impl FnOnce(
+            &mut OdohRequesterRuntime,
+            OdohProxyAdmission,
+            tokio::time::Instant,
+        ) -> Result<crate::odoh::PreparedOdohRequest, OdohFailureReason>,
+    ) -> Result<OdohPendingRequest, P2pError> {
+        let peer = proxy.provenance.peer;
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        let prepared = prepare(runtime, proxy, tokio::time::Instant::now())
+            .map_err(|reason| P2pError::Odoh { peer, reason })?;
+        let request_id = prepared.request_id;
+        let generation = prepared.generation;
+        let deadline = prepared.deadline;
+        match handle
+            .send_critical(
+                Arc::new(prepared.packet),
+                self.config.critical_broadcast_timeout,
+            )
+            .await
+        {
+            Ok(()) => runtime.socket_written(request_id, generation),
+            Err(error) => {
+                runtime.socket_failed(request_id, generation);
+                // A timed-out socket acknowledgement can mean the writer was
+                // already inside a partial frame write. Retire the exact
+                // connection so no later bytes or response can be mistaken
+                // for live requester work after the state lock is released.
+                handle.disconnect();
+                return Err(error);
+            }
+        }
+        let pending = prepared.pending;
+        let runtime = Arc::clone(&self.odoh);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            runtime.lock().await.expire(tokio::time::Instant::now());
+        });
+        Ok(pending)
+    }
+
+    pub async fn odoh_status(&self, now: u64) -> OdohRequesterStatus {
+        let candidates = self.odoh_candidates().await;
+        let mut runtime = self.odoh.lock().await;
+        let eligible = candidates
+            .iter()
+            .filter(|candidate| !runtime.proxy_faulted(candidate.provenance.peer))
+            .count();
+        runtime.status(now, eligible)
+    }
+
+    pub async fn odoh_target_cache_snapshot(
+        &self,
+        now: u64,
+    ) -> Result<OdohTargetCacheSnapshot, P2pError> {
+        self.odoh
+            .lock()
+            .await
+            .target_cache_snapshot(now)
+            .map_err(|error| P2pError::State(format!(
+                "ODoH target-cache snapshot failed: {error}"
+            )))
+    }
+
+    pub async fn acknowledge_odoh_target_cache_persisted(&self, floor: OdohDurableFloor) {
+        self.odoh
+            .lock()
+            .await
+            .acknowledge_target_cache_persisted(floor);
+    }
+
+    pub async fn replace_odoh_requester_policy(
+        &self,
+        enabled: bool,
+        generation: u64,
+    ) -> Result<usize, P2pError> {
+        self.odoh
+            .lock()
+            .await
+            .replace_enabled(enabled, generation)
+            .map_err(|reason| P2pError::Odoh {
+                peer: PeerId(0),
+                reason,
+            })
+    }
+
+    pub async fn revoke_odoh_requester(&self, generation: u64) -> Result<usize, P2pError> {
+        self.odoh
+            .lock()
+            .await
+            .revoke(generation)
+            .map_err(|reason| P2pError::Odoh {
+                peer: PeerId(0),
+                reason,
+            })
+    }
+
+    async fn odoh_candidates(&self) -> Vec<OdohProxyAdmission> {
+        let mut candidates = self
+            .snapshots()
+            .await
+            .into_iter()
+            .filter_map(|snapshot| {
+                let wire_profile = snapshot.denuo_wire_profile?;
+                let negotiated = snapshot.denuo_negotiated_registry?;
+                (snapshot.state == PeerState::Ready
+                    && snapshot.transport == crate::PeerTransportKind::Brontide
+                    && snapshot.authenticated_remote_static.is_some()
+                    && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
+                    && snapshot.services & hns_p2p_experimental::ODOH_SERVICE.value() != 0
+                    && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
+                    && wire_profile == hns_p2p_experimental::ExperimentalWireProfile::DenuoV1)
+                    .then_some(OdohProxyAdmission {
+                        provenance: OdohPeerProvenance {
+                            peer: snapshot.id,
+                            address: snapshot.address,
+                            direction: snapshot.direction,
+                            transport: snapshot.transport,
+                            authenticated_remote_static: snapshot.authenticated_remote_static,
+                        },
+                        remote_services: snapshot.services,
+                        wire_profile,
+                        negotiated,
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| {
+            (
+                candidate.provenance.direction != PeerDirection::Outbound,
+                candidate.provenance.peer.0,
+            )
+        });
+        candidates
     }
 
     pub async fn finish_hip76_provider_request(
@@ -782,6 +1078,7 @@ impl LivePeerManager {
             events: self.events.clone(),
             denuo_metrics: self.denuo_metrics.clone(),
             hip76_config: self.config.hip76.clone(),
+            odoh: Arc::clone(&self.odoh),
         };
         let spawned = match brontide {
             Some(session) => spawn_brontide_peer_runtime(parameters, reader, writer, session)?,

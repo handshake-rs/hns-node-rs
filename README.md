@@ -164,6 +164,7 @@ documented in [Storage rollout](docs/storage-rollout.md).
 
 - [Architecture](docs/architecture.md)
 - [P2P and synchronization](docs/p2p-sync.md)
+- [HIP-77 ODoH requester boundary](docs/hip77-odoh-requester.md)
 - [Control and diagnostic API](docs/rpc-compat.md)
 - [Native Handshake DNS resolver](docs/hns-resolverd.md)
 - [Mining engine](docs/mining-engine.md)

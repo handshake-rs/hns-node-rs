@@ -4,7 +4,7 @@ Status labels describe source maturity, not production authority. At the
 current source revision every `RpcConsensusReadiness` field is true, including
 historical replay and invalid-corpus readiness. Runtime authority remains
 conditional on the explicit mainnet canary, exact synchronization, and a
-coherent durable authoritative tip. API-v13 initializes the base
+coherent durable authoritative tip. API-v14 initializes the base
 `release_stage` as `pre-authority`, then the live native RPC composer replaces
 it with a configuration-specific diagnostic stage.
 
@@ -111,7 +111,7 @@ Implemented:
   root union, including idempotence and failed-commit atomicity evidence.
 - Opt-in interval-gated startup scheduling, forced serialized maintenance, an
   atomic checksummed last-run checkpoint, compaction diagnostics introduced in
-  API-v10 and retained in current API-v13, and unclean
+  API-v10 and retained in current API-v14, and unclean
   RocksDB reopen evidence.
 - Matching clean checkpoints audit the complete network reorganization/undo
   suffix with keyed reads; unclean or stale checkpoints retain exhaustive
@@ -283,7 +283,7 @@ Implemented:
   reorganizations, exact contextual-invalid ancestry, and fail-closed
   local-fault separation;
 - next-header committed-root material introduced in API-v10 and retained in
-  current API-v13, plus a pinned-source, race-safe external HSD block/root
+  current API-v14, plus a pinned-source, race-safe external HSD block/root
   comparator with checksummed bounded evidence and explicit
   restart/reorganization accounting;
 - complete native mainnet active-state replay through height 339,660, a

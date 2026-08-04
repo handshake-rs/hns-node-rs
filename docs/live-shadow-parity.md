@@ -9,7 +9,7 @@ a mining capability.
 
 ## Comparison material
 
-Current API-v13 `/api/v1/status` retains the active block hash/height and
+Current API-v14 `/api/v1/status` retains the active block hash/height and
 `active_state_resulting_root` fields introduced in API-v10. The latter is the interval-committed name-tree
 root that the next block must place in its header. HSD applies name changes to
 a working transaction every block but commits that transaction only at the

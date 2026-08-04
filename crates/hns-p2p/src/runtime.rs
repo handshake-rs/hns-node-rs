@@ -7,10 +7,11 @@ use std::{
 };
 
 use hns_consensus::Network;
+use hns_p2p_experimental::{ExperimentalWireProfile, NegotiatedRegistry};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{mpsc, oneshot, watch, RwLock},
+    sync::{mpsc, oneshot, watch, Mutex, RwLock},
     task::JoinHandle,
     time::{sleep_until, Instant, MissedTickBehavior},
 };
@@ -26,6 +27,9 @@ use crate::{
         is_hip76_packet_type, Hip76FailureReason, Hip76Inbound, Hip76ProviderPolicy,
         Hip76ProviderRequest, Hip76ProviderWork, Hip76RequesterResponse, Hip76RevokedWork,
         Hip76Session, Hip76SessionConfig, Hip76SessionDiagnostics, Hip76WriteToken,
+    },
+    odoh::{
+        is_odoh_packet_type, OdohFailureReason, OdohPeerProvenance, OdohRequesterRuntime,
     },
     wire::{
         AsyncFrameReader, AsyncFrameWriter, Frame, NetworkMagic, Packet, PacketType, VersionPacket,
@@ -173,6 +177,10 @@ pub struct PeerSnapshot {
     pub bytes_received: u64,
     pub ping_millis: Option<u64>,
     pub denuo: DenuoPeerDiagnostics,
+    #[serde(skip)]
+    pub(crate) denuo_wire_profile: Option<ExperimentalWireProfile>,
+    #[serde(skip)]
+    pub(crate) denuo_negotiated_registry: Option<NegotiatedRegistry>,
     pub hip76: Hip76SessionDiagnostics,
 }
 
@@ -198,7 +206,23 @@ impl PeerSnapshot {
             bytes_received: 0,
             ping_millis: None,
             denuo: DenuoPeerDiagnostics::default(),
+            denuo_wire_profile: None,
+            denuo_negotiated_registry: None,
             hip76: Hip76SessionDiagnostics::awaiting_registry(direction),
+        }
+    }
+}
+
+fn refresh_denuo_snapshot(snapshot: &mut PeerSnapshot, denuo: &DenuoCoordinator) {
+    snapshot.denuo = denuo.diagnostics();
+    match denuo.negotiated_evidence() {
+        Some((wire_profile, negotiated)) => {
+            snapshot.denuo_wire_profile = Some(wire_profile);
+            snapshot.denuo_negotiated_registry = Some(negotiated.clone());
+        }
+        None => {
+            snapshot.denuo_wire_profile = None;
+            snapshot.denuo_negotiated_registry = None;
         }
     }
 }
@@ -607,6 +631,7 @@ pub(crate) struct PeerRuntimeParameters {
     pub events: mpsc::Sender<PeerEvent>,
     pub denuo_metrics: DenuoRuntimeMetrics,
     pub hip76_config: Hip76SessionConfig,
+    pub odoh: Arc<Mutex<OdohRequesterRuntime>>,
 }
 
 pub(crate) fn spawn_peer_runtime<R, W>(
@@ -672,6 +697,7 @@ where
         events,
         denuo_metrics,
         mut hip76_config,
+        odoh,
     } = parameters;
     config.validate()?;
     // Runtime request IDs are unpredictable per connection. The configurable
@@ -715,7 +741,7 @@ where
     let mut initial_snapshot = PeerSnapshot::new(id, address, direction);
     initial_snapshot.transport = transport;
     initial_snapshot.authenticated_remote_static = authenticated_remote_static;
-    initial_snapshot.denuo = denuo.diagnostics();
+    refresh_denuo_snapshot(&mut initial_snapshot, &denuo);
     initial_snapshot.hip76 = initial_hip76;
     let snapshot = Arc::new(RwLock::new(initial_snapshot));
     let handle = PeerHandle {
@@ -737,6 +763,7 @@ where
         local_version,
         denuo,
         hip76,
+        odoh,
         transport,
         authenticated_remote_static,
         reader,
@@ -805,6 +832,7 @@ async fn run_peer<R, W>(
     local_version: VersionPacket,
     denuo: DenuoCoordinator,
     hip76: Hip76Session,
+    odoh: Arc<Mutex<OdohRequesterRuntime>>,
     transport: PeerTransportKind,
     authenticated_remote_static: Option<AuthenticatedPeerKey>,
     reader: PeerFrameReader<R>,
@@ -868,6 +896,7 @@ where
         local_version,
         denuo,
         hip76,
+        odoh,
         transport,
         authenticated_remote_static,
         reader,
@@ -910,6 +939,7 @@ async fn peer_reader<R>(
     local_version: VersionPacket,
     mut denuo: DenuoCoordinator,
     mut hip76: Hip76Session,
+    odoh: Arc<Mutex<OdohRequesterRuntime>>,
     transport: PeerTransportKind,
     authenticated_remote_static: Option<AuthenticatedPeerKey>,
     mut reader: PeerFrameReader<R>,
@@ -949,6 +979,13 @@ where
         transport,
         authenticated_remote_static,
     };
+    let odoh_provenance = OdohPeerProvenance {
+        peer: id,
+        address: provenance.address,
+        direction,
+        transport,
+        authenticated_remote_static,
+    };
 
     let result = async {
         'peer: loop {
@@ -971,6 +1008,24 @@ where
                     frame = &mut frame_read => {
                         match frame {
                             Ok(frame) => break frame,
+                            Err(P2pError::ScopedPacketLimit {
+                                packet_type,
+                                actual,
+                                ..
+                            }) if is_odoh_packet_type(PacketType::Unknown(packet_type)) => {
+                                last_receive = Instant::now();
+                                let mut state = snapshot.write().await;
+                                state.bytes_received = state.bytes_received.saturating_add(
+                                    (crate::constants::FRAME_HEADER_SIZE + actual) as u64,
+                                );
+                                state.last_receive = Some(unix_time());
+                                drop(state);
+                                odoh
+                                    .lock()
+                                    .await
+                                    .fault_peer(id, OdohFailureReason::PacketTooLarge);
+                                continue 'peer;
+                            }
                             Err(P2pError::ScopedPacketLimit {
                                 packet_type,
                                 actual,
@@ -1011,13 +1066,17 @@ where
                     },
                     _ = sleep_until(denuo.pending_deadline().unwrap_or(deadline)), if denuo.pending_deadline().is_some() => {
                         if denuo.expire(Instant::now()) {
+                            odoh
+                                .lock()
+                                .await
+                                .fault_peer(id, OdohFailureReason::RegistryNotNegotiated);
                             let revoked = synchronize_hip76_with_denuo(&denuo, &mut hip76);
                             complete_revoked_requesters(
                                 &mut pending_requesters,
                                 &revoked,
                             );
                             let mut state = snapshot.write().await;
-                            state.denuo = denuo.diagnostics();
+                            refresh_denuo_snapshot(&mut state, &denuo);
                             state.hip76 = refresh_hip76_state(
                                 &hip76,
                                 provenance,
@@ -1134,12 +1193,18 @@ where
             let action = denuo.receive_extension(&frame.payload);
             admit_denuo_action(&mut denuo, action, &control_tx);
             let revoked = synchronize_hip76_with_denuo(&denuo, &mut hip76);
+            if denuo.diagnostics().phase != DenuoPeerPhase::Negotiated {
+                odoh
+                    .lock()
+                    .await
+                    .fault_peer(id, OdohFailureReason::RegistryNotNegotiated);
+            }
             complete_revoked_requesters(
                 &mut pending_requesters,
                 &revoked,
             );
             let mut state = snapshot.write().await;
-            state.denuo = denuo.diagnostics();
+            refresh_denuo_snapshot(&mut state, &denuo);
             state.hip76 = refresh_hip76_state(
                 &hip76,
                 provenance,
@@ -1164,6 +1229,32 @@ where
                 &events,
                 &hip76_writer_state_tx,
                 &hip76_status_tx,
+            );
+            continue;
+        }
+        if is_odoh_packet_type(frame.packet_type) {
+            let remote_services = handshake
+                .remote_version()
+                .map_or(0, |version| version.services);
+            let Some((wire_profile, negotiated)) = denuo
+                .negotiated_evidence()
+                .filter(|_| handshake.is_ready())
+                .map(|(wire_profile, negotiated)| (wire_profile, negotiated.clone()))
+            else {
+                odoh
+                    .lock()
+                    .await
+                    .fault_peer(id, OdohFailureReason::RegistryNotNegotiated);
+                continue;
+            };
+            odoh.lock().await.receive(
+                odoh_provenance,
+                remote_services,
+                wire_profile,
+                negotiated,
+                &frame.payload,
+                unix_time(),
+                Instant::now(),
             );
             continue;
         }
@@ -1210,7 +1301,7 @@ where
             state.advertised_height = Some(version.height);
             state.agent = Some(version.agent.clone());
             state.no_relay = version.no_relay;
-            state.denuo = denuo.diagnostics();
+            refresh_denuo_snapshot(&mut state, &denuo);
         }
         if update.became_ready {
             snapshot.write().await.state = PeerState::Ready;
@@ -1233,7 +1324,7 @@ where
                 &revoked,
             );
             let mut state = snapshot.write().await;
-            state.denuo = denuo.diagnostics();
+            refresh_denuo_snapshot(&mut state, &denuo);
             state.hip76 = refresh_hip76_state(
                 &hip76,
                 provenance,
@@ -1283,6 +1374,7 @@ where
         &hip76_writer_state_tx,
         &hip76_status_tx,
     );
+    odoh.lock().await.disconnect(id);
     result
 }
 
@@ -1819,6 +1911,15 @@ where
         };
         let (packet, completion, hip76_metadata) = match outgoing {
             PeerWriterOutbound::Ordinary { packet, completion } => {
+                if completion
+                    .as_ref()
+                    .is_some_and(tokio::sync::oneshot::Sender::is_closed)
+                {
+                    // The bounded caller stopped waiting before this item
+                    // reached the writer. Do not put abandoned critical work
+                    // on the wire.
+                    continue;
+                }
                 if is_registry_hello_packet(&packet)
                     && snapshot.read().await.denuo.phase != DenuoPeerPhase::HelloAdmitted
                 {
@@ -2089,7 +2190,7 @@ mod tests {
             "127.0.0.1:12041".parse().expect("peer address"),
             PeerDirection::Outbound,
         );
-        initial_snapshot.denuo = outbound.diagnostics();
+        refresh_denuo_snapshot(&mut initial_snapshot, &outbound);
         let snapshot = Arc::new(RwLock::new(initial_snapshot));
         let (writer_io, reader_io) = duplex(64 * 1024);
         let (critical_tx, critical_rx) = mpsc::channel::<CriticalOutbound>(1);

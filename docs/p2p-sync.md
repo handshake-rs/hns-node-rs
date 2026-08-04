@@ -96,6 +96,19 @@ ready backend. The packet-specific limits, role generations, deadlines, queue
 admission, and socket-write completion are connection-local and cannot grant
 consensus or mining authority.
 
+HIP-77 packet `0xf2` is also intercepted before generic packet delivery. Its
+  requester policy defaults on and selects only a ready Brontide peer advertising
+  both service bits with exact Denuo V1 registry, network, genesis, and resource
+  evidence, whose authenticated key differs from the signed
+target locator. The process-wide requester bounds live work, correlates the
+exact response peer/key and request generation, expires deadlines, and clears
+  work on disconnect or policy revocation. A checksummed, network-bound cache and
+  independent floor atomically persist verified public target records,
+  sequence/policy generations, opt-out/revocation state, and trusted-time
+  high-water; incomplete pairs, old generations, and clock rollback fail closed.
+request IDs, proxy sessions, HPKE contexts, and decrypted DNS bytes remain
+process-local. Local ODoH proxy, target, and output-provider roles are off.
+
 The HSD fixture generator verifies subtle compatibility behavior:
 
 - low service bits and reserved high service words;
@@ -478,7 +491,7 @@ they do not poison `last_error` after healthy synchronization continues.
 Discovery diagnostics additionally expose durable
 address-book availability, loaded/pruned counts, generation, dirty state,
 successful/failed flushes, decode failures, the last flush time, and its last
-storage error. Current API-v13 retains the API-v10 valid non-active and durably
+storage error. Current API-v14 retains the API-v10 valid non-active and durably
 failed block counts and active-tip resulting authenticated root/height. It also
 exposes the canonical Denuo registry and qname-free HIP-76 phase, role, and
 write-stage counters. The native endpoint includes an opaque runtime instance
@@ -597,7 +610,7 @@ The native-sync runtime still needs:
 
 The functional readiness matrix and conditional mainnet permit path are
 implemented, but every live permit remains dependent on the explicit canary,
-exact synchronization, and durable authoritative tip. API-v13's base snapshot
+exact synchronization, and durable authoritative tip. API-v14's base snapshot
 uses `pre-authority`, while live native RPC advertises a separate
 configuration-specific stage. The optional comparison runner supplies external
 qualification evidence; it is not in the native sync runtime or its consensus

@@ -79,7 +79,7 @@
   every node.
 - Opt-in height-gated startup scheduling and forced serialized maintenance with
   an atomic checksummed last-run checkpoint, compaction status introduced in
-  API-v10 and retained in current API-v13, and unclean RocksDB reopen evidence.
+  API-v10 and retained in current API-v14, and unclean RocksDB reopen evidence.
 - Exact HSD `pruneAfterHeight`/`keepBlocks` constants and opt-in atomic undo
   retirement, including startup catch-up, pruning-aware pinned-root compaction,
   deep-reorg rejection, checksummed checkpoints, and unclean RocksDB reopen.
@@ -165,7 +165,7 @@
   attribution, local-fault separation, shutdown-responsive eight-block direct
   slices, and full-configured-bound atomic reorganizations.
 - Next-header committed-root diagnostics introduced in API-v10 and retained in
-  current API-v13, plus a pinned-source external HSD comparator with coherent-tip
+  current API-v14, plus a pinned-source external HSD comparator with coherent-tip
   retries, provisional/confirmed root labels, and bounded checksummed
   restart/reorganization evidence.
 - Non-authoritative diagnostics; network data cannot grant mining authority.
@@ -227,7 +227,7 @@
 
 These foundations now satisfy the source consensus-readiness matrix. Production
 eligibility still depends on the explicit synchronized canary, deployment
-operations, independent review, and the hardening work below. API-v13's base
+operations, independent review, and the hardening work below. API-v14's base
 snapshot uses `release_stage: "pre-authority"`; live native RPC replaces it
 with a configuration-specific diagnostic stage.
 

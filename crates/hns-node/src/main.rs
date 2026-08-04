@@ -178,6 +178,11 @@ struct Cli {
     #[arg(long = "no-p2p-discovery", conflicts_with = "p2p_discovery")]
     no_p2p_discovery: bool,
 
+    /// Disable the outbound-only HIP-77 ODoH requester. Local provider roles
+    /// remain unavailable regardless of this setting.
+    #[arg(long = "no-odoh-requester")]
+    no_odoh_requester: bool,
+
     /// Maximum explicit and discovered peers retained by the address book.
     #[arg(long, default_value_t = 4_096)]
     maximum_known_addresses: usize,
@@ -340,6 +345,7 @@ impl Cli {
                 connect,
                 connect_keys,
                 discovery: p2p_discovery,
+                odoh_requester: !self.no_odoh_requester,
                 maximum_known_addresses: self.maximum_known_addresses,
                 maximum_inbound: self.maximum_inbound,
                 maximum_outbound: self.maximum_outbound,
@@ -497,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
             native_sync = config.native_sync.enabled,
             native_sync_headers_only = config.native_sync.headers_only,
             native_sync_active_state = config.native_sync.connect_active_state,
+            odoh_requester = config.native_sync.odoh_requester,
             validation_workers = config.native_sync.validation_workers,
             validation_queue = config.native_sync.validation_queue,
             mining_engine = config.mining_engine.enabled,
@@ -558,12 +565,14 @@ mod tests {
         assert!(default.native_sync.enabled);
         assert!(default.native_sync.connect_active_state);
         assert!(default.native_sync.discovery);
+        assert!(default.native_sync.odoh_requester);
         assert!(default.native_sync.listen.is_none());
 
         let disabled = Cli::try_parse_from([
             "hsrd",
             "--no-native-sync",
             "--no-p2p-discovery",
+            "--no-odoh-requester",
         ])
         .expect("explicit opt-out CLI")
         .into_config()
@@ -571,6 +580,7 @@ mod tests {
         assert!(!disabled.native_sync.enabled);
         assert!(!disabled.native_sync.connect_active_state);
         assert!(!disabled.native_sync.discovery);
+        assert!(!disabled.native_sync.odoh_requester);
     }
 
     #[test]

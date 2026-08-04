@@ -45,7 +45,7 @@ use hns_primitives::{
 };
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcExperimentalRegistryInfo, RpcHip76Info,
-    RpcMethod, RpcService, RpcSnapshot,
+    RpcMethod, RpcOdohInfo, RpcService, RpcSnapshot,
 };
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use hns_store::mark_clean_shutdown;
@@ -72,7 +72,7 @@ use super::{
     load_block as load_block_from_snapshot, load_block_index_record, load_header_record,
     median_time_past_with_lookup, mining_generation_from_snapshot, mining_snapshot_for_hash,
     preflight_reorg_reconciliation_budget, require_rpc_authorization,
-    rpc_experimental_registry_info, rpc_hip76_info, rpc_immediately_unsupported,
+    rpc_experimental_registry_info, rpc_hip76_info, rpc_immediately_unsupported, rpc_odoh_info,
     rpc_point_read_method, AuthorityMode, CanonicalChainEpoch, CanonicalStateWriter,
     CanonicalWriterError, ChainActivationFailure, DurableMiningState, FailedBlockMutation,
     FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport, NodeReadHandle,
@@ -99,6 +99,8 @@ const COMPACT_BLOCK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_KNOWN_PEER_ADDRESSES: usize = 16_384;
 const DEFAULT_KNOWN_PEER_ADDRESSES: usize = 4_096;
 const ADDRESS_BOOK_KEY: &[u8] = b"address-book/v1";
+const ODOH_TARGET_CACHE_KEY: &[u8] = b"odoh-target-cache/v1";
+const ODOH_DURABLE_FLOOR_KEY: &[u8] = b"odoh-durable-floor/v1";
 const ADDRESS_BOOK_MAGIC: &[u8; 4] = b"HAB1";
 const ADDRESS_BOOK_VERSION: u8 = 2;
 const ADDRESS_BOOK_CHECKSUM_SIZE: usize = 32;
@@ -798,6 +800,9 @@ pub struct NativeSyncConfig {
     /// Bootstrap from HSD's key-bearing fixed seeds and learn bounded peers
     /// from GETADDR/ADDR. Explicit `connect` peers remain pinned reconnect targets.
     pub discovery: bool,
+    /// Enable the outbound-only HIP-77 ODoH requester. This never enables or
+    /// advertises a local proxy, target, or plaintext output role.
+    pub odoh_requester: bool,
     pub maximum_known_addresses: usize,
     pub maximum_inbound: usize,
     pub maximum_outbound: usize,
@@ -825,6 +830,7 @@ impl Default for NativeSyncConfig {
             connect: Vec::new(),
             connect_keys: BTreeMap::new(),
             discovery: false,
+            odoh_requester: true,
             maximum_known_addresses: DEFAULT_KNOWN_PEER_ADDRESSES,
             maximum_inbound: 32,
             maximum_outbound: 8,
@@ -1047,6 +1053,8 @@ pub struct NativeSyncDiagnostics {
     pub experimental_registry: RpcExperimentalRegistryInfo,
     #[serde(default)]
     pub hip76: RpcHip76Info,
+    #[serde(default)]
+    pub odoh: RpcOdohInfo,
     pub sync: SyncSnapshot,
     pub orphans: OrphanSnapshot,
     pub checkpoint_sequence: u64,
@@ -2543,6 +2551,18 @@ impl NodeService {
         peer_config.maximum_outbound = native_sync_config.maximum_outbound;
         peer_config.ban_score = HSD_BAN_SCORE;
         peer_config.ban_time = Duration::from_secs(HSD_BAN_TIME_SECONDS);
+        peer_config.odoh.enabled = native_sync_config.odoh_requester;
+        if ban_list_persistent {
+            let snapshot = store
+                .snapshot()
+                .context("failed to open ODoH target-cache snapshot")?;
+            peer_config.odoh_target_cache = snapshot
+                .get(ColumnFamily::Peers, ODOH_TARGET_CACHE_KEY)
+                .context("failed to read durable ODoH target cache")?;
+            peer_config.odoh_durable_floor = snapshot
+                .get(ColumnFamily::Peers, ODOH_DURABLE_FLOOR_KEY)
+                .context("failed to read durable ODoH generation floor")?;
+        }
         let (peers, mut peer_events) = LivePeerManager::new(peer_config)
             .map_err(|error| anyhow::anyhow!("failed to initialize live peers: {error}"))?;
         peers.set_local_height(active_tip.as_ref().map_or(0, |tip| tip.height));
@@ -2680,6 +2700,7 @@ impl NodeService {
             .map_or(0, |checkpoint| checkpoint.sequence);
         let initial_experimental_registry =
             rpc_experimental_registry_info(&peers.denuo_summary().await);
+        let initial_odoh = rpc_odoh_info(&peers.odoh_status(address_timestamp).await);
         let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics {
             api_version: HSRD_DIAGNOSTIC_API_VERSION,
             enabled: true,
@@ -2709,6 +2730,7 @@ impl NodeService {
             started_at: unix_time(),
             experimental_registry: initial_experimental_registry,
             hip76: rpc_hip76_info(&[]),
+            odoh: initial_odoh,
             sync: scheduler.snapshot(),
             orphans: orphan_pool.snapshot(),
             checkpoint_sequence: initial_sequence,
@@ -2856,6 +2878,9 @@ impl NodeService {
                         flush_address_book(&store, &mut address_book, &diagnostics).await;
                     }
                     flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
+                    if let Err(error) = flush_odoh_target_cache(&store, &peers).await {
+                        record_warning(format!("failed to persist ODoH target cache: {error:#}"));
+                    }
                 }
                 _ = active_state_poll.tick(),
                     if native_sync_config.connect_active_state
@@ -3553,6 +3578,15 @@ impl NodeService {
             }
             if ban_list_persistent {
                 flush_peer_bans(&store, &mut ban_list, &diagnostics).await;
+                if let Err(error) = flush_odoh_target_cache(&store, &peers).await {
+                    record_error(&diagnostics, format!(
+                        "failed to persist final ODoH target cache: {error:#}"
+                    ))
+                    .await;
+                    if terminal_error.is_none() {
+                        terminal_error = Some(error);
+                    }
+                }
             }
             checkpoint_sequence = checkpoint_sequence.saturating_add(1);
             if let Err(error) =
@@ -4991,6 +5025,7 @@ async fn compose_native_sync_rpc_service(
     snapshot.peer_count = diagnostics.peers.len();
     snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
     snapshot.node_status.hip76 = rpc_hip76_info(&diagnostics.peers);
+    snapshot.node_status.odoh = diagnostics.odoh.clone();
     snapshot.node_status.release_stage = if config.mainnet_canary {
         "mainnet-canary-gated".to_owned()
     } else if config.mining_engine.enabled {
@@ -5051,6 +5086,7 @@ async fn available_diagnostic_rpc(
     snapshot.peer_count = diagnostics.peers.len();
     snapshot.node_status.experimental_registry = diagnostics.experimental_registry.clone();
     snapshot.node_status.hip76 = diagnostics.hip76.clone();
+    snapshot.node_status.odoh = diagnostics.odoh.clone();
     if let Some(best_header) = diagnostics.sync.best_header.as_ref() {
         snapshot.node_status.best_header_hash = Some(best_header.hash);
         snapshot.node_status.best_header_height = Some(best_header.height);
@@ -8182,10 +8218,12 @@ async fn refresh_diagnostics(
 ) {
     let traffic = peers.traffic_totals().await;
     let (snapshots, experimental_registry) = peers.snapshots_with_denuo_summary().await;
+    let odoh = rpc_odoh_info(&peers.odoh_status(unix_time()).await);
     let mut state = diagnostics.write().await;
     state.bytes_sent = traffic.bytes_sent;
     state.bytes_received = traffic.bytes_received;
     state.hip76 = rpc_hip76_info(&snapshots);
+    state.odoh = odoh;
     state.peers = snapshots;
     state.experimental_registry = rpc_experimental_registry_info(&experimental_registry);
     state.sync = scheduler.snapshot();
@@ -8254,6 +8292,31 @@ async fn flush_address_book(
             tracing::warn!(%error, "failed to persist HNS address book");
         }
     }
+}
+
+async fn flush_odoh_target_cache(
+    store: &StoreHandle,
+    peers: &LivePeerManager,
+) -> Result<bool> {
+    let timestamp = unix_time();
+    if !peers.odoh_status(timestamp).await.durable_state_dirty {
+        return Ok(false);
+    }
+    let snapshot = peers.odoh_target_cache_snapshot(timestamp).await?;
+    let floor = snapshot.durable_floor();
+    let encoded_floor = floor.encode(peers.config().network.params().packet_magic);
+    let mut batch = store.batch();
+    batch.put(ColumnFamily::Peers, ODOH_TARGET_CACHE_KEY, &snapshot.bytes)?;
+    batch.put(
+        ColumnFamily::Peers,
+        ODOH_DURABLE_FLOOR_KEY,
+        &encoded_floor,
+    )?;
+    store.commit(batch)?;
+    peers
+        .acknowledge_odoh_target_cache_persisted(floor)
+        .await;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
