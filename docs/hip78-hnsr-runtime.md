@@ -20,7 +20,10 @@ is therefore neither configured nor persisted.
 
 Every circuit path is bound to the exact Brontide-authenticated connection,
 canonical Denuo V1 registry fingerprint/version/protocol tuple, matching
-network and genesis, nonzero negotiated limits, and HNS Node v1 profile.
+network and genesis, nonzero negotiated limits, and one explicit canonical
+profile. Native nodes default to `HNS_NODE_V1`; embedded browser adapters set
+`HNS_WEB_V1`. The selected profile is bound into requester admission, relay
+support, status, and durable configuration identity.
 Requester selection additionally requires the remote HNSR relay service bit.
 Incoming requesters and endpoints need Denuo admission but do not impersonate
 a provider by advertising that bit. Connection IDs, not socket addresses, own

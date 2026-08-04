@@ -769,6 +769,9 @@ fn map_registry_error(error: &RegistryEnvelopeError) -> DenuoDisableReason {
         RegistryEnvelopeError::Envelope(error) => map_envelope_error(error),
         RegistryEnvelopeError::Negotiation(error) => map_negotiation_error(error),
         RegistryEnvelopeError::WrongRegistryVersion(_) => DenuoDisableReason::IncompatibleVersion,
+        RegistryEnvelopeError::RegistryIdentityMismatch { .. } => {
+            DenuoDisableReason::WrongFingerprint
+        }
         RegistryEnvelopeError::WrongProtocol { .. } => DenuoDisableReason::UnsupportedProtocol,
         RegistryEnvelopeError::UnsupportedFlags(_) => DenuoDisableReason::UnsupportedProtocol,
         RegistryEnvelopeError::UnexpectedMessage { .. } => DenuoDisableReason::UnexpectedMessage,
@@ -780,6 +783,9 @@ fn map_envelope_error(error: &EnvelopeError) -> DenuoDisableReason {
         EnvelopeError::PacketTooLarge { .. } => DenuoDisableReason::PacketTooLarge,
         EnvelopeError::PayloadTooLarge { .. } => DenuoDisableReason::PayloadTooLarge,
         EnvelopeError::UnknownMessage { .. } => DenuoDisableReason::UnexpectedMessage,
+        EnvelopeError::ProtocolUnavailable { .. } | EnvelopeError::UnsupportedFlags { .. } => {
+            DenuoDisableReason::UnsupportedProtocol
+        }
         EnvelopeError::ZeroRequestId { .. }
         | EnvelopeError::Decode(_)
         | EnvelopeError::WrongMagic(_)
@@ -793,7 +799,9 @@ fn map_negotiation_error(error: &NegotiationError) -> DenuoDisableReason {
         NegotiationError::WrongNetwork { .. } | NegotiationError::UnknownNetwork(_) => {
             DenuoDisableReason::WrongNetwork
         }
-        NegotiationError::WrongGenesis => DenuoDisableReason::WrongGenesis,
+        NegotiationError::WrongGenesis | NegotiationError::ZeroGenesis => {
+            DenuoDisableReason::WrongGenesis
+        }
         NegotiationError::UnknownFormatVersion(_) | NegotiationError::NoCommonRegistry => {
             DenuoDisableReason::IncompatibleVersion
         }
@@ -887,6 +895,35 @@ mod tests {
             );
             assert_eq!(summary.rejection_reasons[index].reason, reason);
         }
+    }
+
+    #[test]
+    fn pinned_registry_errors_map_to_fail_closed_disable_reasons() {
+        assert_eq!(
+            map_registry_error(&RegistryEnvelopeError::RegistryIdentityMismatch {
+                registry_version: 1,
+            }),
+            DenuoDisableReason::WrongFingerprint
+        );
+        assert_eq!(
+            map_envelope_error(&EnvelopeError::ProtocolUnavailable {
+                registry_version: 1,
+                protocol_id: 1,
+            }),
+            DenuoDisableReason::UnsupportedProtocol
+        );
+        assert_eq!(
+            map_envelope_error(&EnvelopeError::UnsupportedFlags {
+                protocol_id: 1,
+                protocol_version: 1,
+                flags: 1,
+            }),
+            DenuoDisableReason::UnsupportedProtocol
+        );
+        assert_eq!(
+            map_negotiation_error(&NegotiationError::ZeroGenesis),
+            DenuoDisableReason::WrongGenesis
+        );
     }
 
     #[test]

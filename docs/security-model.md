@@ -243,8 +243,11 @@ clean marker or matching startup checkpoint cannot restore authority.
   validation.
 - HIP-78 requester and opaque-relay policy default on, but each packet still
   requires an exact live Brontide identity, canonical Denuo V1 registry,
-  matching network/genesis, and HNS Node v1 profile. Requester routes require
-  the remote relay service bit. Relay routes retain bounded accounting until
+  matching network/genesis, and the explicitly configured `HNS_NODE_V1` or
+  `HNS_WEB_V1` profile. Native nodes default to `HNS_NODE_V1`; the profile is
+  bound into requester, relay, status, and durable configuration identity.
+  Requester routes require the remote relay service bit. Relay routes retain
+  bounded accounting until
   actual socket-write acknowledgement; ambiguous failures disconnect the exact
   owner and revoke affected state. Endpoint, rendezvous, and plaintext roles
   are unavailable. The local relay service bit is absent unless explicit

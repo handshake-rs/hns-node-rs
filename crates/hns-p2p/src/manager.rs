@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt,
     future::Future,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -10,6 +11,7 @@ use std::{
 };
 
 use hns_consensus::Network;
+use hns_hnsr_protocol::{HNS_NODE_V1, HNS_WEB_V1};
 use hns_p2p_experimental::{
     ExperimentalWireProfile, HnsrPolicy, DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT,
     DENUO_V1_REGISTRY_PROTOCOL_VERSION, DENUO_V1_REGISTRY_VERSION, ODOH_PACKET, ODOH_SERVICE,
@@ -84,6 +86,9 @@ pub struct LivePeerConfig {
     pub odoh_durable_floor: Option<Vec<u8>>,
     pub hnsr_requester: bool,
     pub hnsr_opaque_relay: bool,
+    /// Canonical circuit profile. Native nodes use `HNS_NODE_V1`; embedded
+    /// browser adapters select `HNS_WEB_V1` before manager construction.
+    pub hnsr_profile: u16,
     pub hnsr_relay_address: Option<SocketAddr>,
     /// Checksummed policy/counter snapshot. No reservation, circuit, queued
     /// bytes, action token, or peer authority is restored from this blob.
@@ -126,6 +131,7 @@ impl LivePeerConfig {
             odoh_durable_floor: None,
             hnsr_requester: true,
             hnsr_opaque_relay: true,
+            hnsr_profile: HNS_NODE_V1,
             hnsr_relay_address: None,
             hnsr_state: None,
             hnsr_durable_floor: None,
@@ -188,6 +194,12 @@ impl LivePeerConfig {
                 "HNSR runtime state and durable floor must be restored as an exact pair".to_owned(),
             ));
         }
+        if !crate::hnsr::is_supported_hnsr_profile(self.hnsr_profile) {
+            return Err(P2pError::Configuration(format!(
+                "unsupported HNSR profile {}; expected HNS_NODE_V1 ({HNS_NODE_V1}) or HNS_WEB_V1 ({HNS_WEB_V1})",
+                self.hnsr_profile
+            )));
+        }
         if self.hnsr_relay_address.is_some()
             && (!self.brontide_identity_durable
                 || !matches!(self.transport, PeerTransport::Brontide(_)))
@@ -230,7 +242,7 @@ pub struct PeerBan {
     pub score: i32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LivePeerManager {
     config: LivePeerConfig,
     peers: Arc<RwLock<HashMap<PeerId, PeerHandle>>>,
@@ -248,6 +260,29 @@ pub struct LivePeerManager {
     registration_lock: Arc<Mutex<()>>,
     banned: Arc<RwLock<HashMap<IpAddr, u64>>>,
     pending_bans: Arc<Mutex<Vec<PeerBan>>>,
+}
+
+impl fmt::Debug for LivePeerManager {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let transport = match &self.config.transport {
+            PeerTransport::Plaintext => "plaintext",
+            PeerTransport::Brontide(_) => "brontide",
+        };
+        formatter
+            .debug_struct("LivePeerManager")
+            .field("network", &self.config.network)
+            .field("transport", &transport)
+            .field("maximum_inbound", &self.config.maximum_inbound)
+            .field("maximum_outbound", &self.config.maximum_outbound)
+            .field("hnsr_profile", &self.config.hnsr_profile)
+            .field("local_height", &self.local_height.load(Ordering::Acquire))
+            .field(
+                "local_services",
+                &self.local_services.load(Ordering::Acquire),
+            )
+            .field("runtime_state", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl LivePeerManager {
@@ -1553,6 +1588,7 @@ impl LivePeerManager {
 
 fn hnsr_coordinator_config(config: &LivePeerConfig) -> HnsrCoordinatorConfig {
     let mut coordinator = HnsrCoordinatorConfig::for_network(config.network);
+    coordinator.profile = config.hnsr_profile;
     coordinator.requester_enabled = config.hnsr_requester;
     coordinator.opaque_relay_enabled = config.hnsr_opaque_relay;
     coordinator.relay_backend = match (
@@ -1571,7 +1607,7 @@ fn hnsr_coordinator_config(config: &LivePeerConfig) -> HnsrCoordinatorConfig {
     let mut identity = Vec::with_capacity(96);
     identity.extend_from_slice(&coordinator.binding.magic.to_le_bytes());
     identity.extend_from_slice(&coordinator.binding.genesis_hash);
-    identity.extend_from_slice(&hns_hnsr_protocol::HNS_NODE_V1.to_le_bytes());
+    identity.extend_from_slice(&config.hnsr_profile.to_le_bytes());
     if let Some(backend) = coordinator.relay_backend {
         match backend.advertised_address.ip() {
             IpAddr::V4(address) => identity.extend_from_slice(&address.octets()),
@@ -2182,6 +2218,39 @@ mod tests {
 
         requester_manager.disconnect_all().await;
         provider_manager.disconnect_all().await;
+    }
+
+    #[test]
+    fn hnsr_profile_defaults_to_node_and_web_is_configuration_bound() {
+        let node = LivePeerConfig::for_network(Network::Regtest);
+        assert_eq!(node.hnsr_profile, HNS_NODE_V1);
+        let node_coordinator = hnsr_coordinator_config(&node);
+
+        let mut web = node.clone();
+        web.hnsr_profile = HNS_WEB_V1;
+        web.validate().expect("HNS Web profile");
+        let web_coordinator = hnsr_coordinator_config(&web);
+
+        assert_eq!(web_coordinator.profile, HNS_WEB_V1);
+        assert_ne!(
+            node_coordinator.configuration_hash,
+            web_coordinator.configuration_hash
+        );
+        let status = HnsrCoordinator::fresh(web_coordinator, 1)
+            .expect("HNS Web coordinator")
+            .status(0);
+        assert_eq!(status.profile, HNS_WEB_V1);
+    }
+
+    #[test]
+    fn hnsr_profile_rejects_values_outside_the_supported_set() {
+        let mut config = LivePeerConfig::for_network(Network::Regtest);
+        config.hnsr_profile = u16::MAX;
+        assert!(matches!(config.validate(), Err(P2pError::Configuration(_))));
+        assert!(matches!(
+            HnsrCoordinatorConfig::for_network_with_profile(Network::Regtest, u16::MAX),
+            Err(crate::HnsrCoordinatorError::UnsupportedProfile(u16::MAX))
+        ));
     }
 
     #[test]

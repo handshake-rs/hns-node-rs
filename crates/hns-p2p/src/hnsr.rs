@@ -10,7 +10,7 @@ use hns_hnsr_protocol::{
     HnsrRequesterEvent, HnsrRequesterSnapshot, HnsrRoute, HnsrRuntimeError, HnsrRuntimeStatus,
     HnsrService, OpaqueRelayConfig, OpaqueRelayRuntime, OpaqueRelaySnapshot, QueuedHnsrRoute,
     RelayConfig, RelayLimits, RelayService, RelayTicket, DEFAULT_WINDOW, HNSR_PACKET_TYPE,
-    HNSR_RELAY_SERVICE, HNS_NODE_V1, MAX_CIRCUITS, MAX_CIRCUIT_QUEUE, MAX_PACKET_SIZE,
+    HNSR_RELAY_SERVICE, HNS_NODE_V1, HNS_WEB_V1, MAX_CIRCUITS, MAX_CIRCUIT_QUEUE, MAX_PACKET_SIZE,
 };
 use hns_p2p_experimental::{
     ExperimentalWireProfile, HnsrPolicy, NegotiatedRegistry, Network as ExperimentalNetwork,
@@ -32,6 +32,10 @@ const MAXIMUM_STATE_BYTES: usize = 4_096;
 
 pub const fn is_hnsr_packet_type(packet_type: PacketType) -> bool {
     matches!(packet_type, PacketType::Unknown(value) if value == HNSR_PACKET_TYPE)
+}
+
+pub const fn is_supported_hnsr_profile(profile: u16) -> bool {
+    matches!(profile, HNS_NODE_V1 | HNS_WEB_V1)
 }
 
 pub fn hnsr_peer_id(peer: PeerId) -> Result<HnsrPeerId, HnsrCoordinatorError> {
@@ -110,6 +114,7 @@ pub struct HnsrRelayBackend {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HnsrCoordinatorConfig {
     pub binding: HnsrNetworkBinding,
+    pub profile: u16,
     pub configuration_hash: [u8; 32],
     pub requester_enabled: bool,
     pub opaque_relay_enabled: bool,
@@ -119,19 +124,31 @@ pub struct HnsrCoordinatorConfig {
 
 impl HnsrCoordinatorConfig {
     pub fn for_network(network: hns_consensus::Network) -> Self {
+        Self::for_network_with_profile(network, HNS_NODE_V1)
+            .expect("the canonical HNS Node profile is supported")
+    }
+
+    pub fn for_network_with_profile(
+        network: hns_consensus::Network,
+        profile: u16,
+    ) -> Result<Self, HnsrCoordinatorError> {
+        if !is_supported_hnsr_profile(profile) {
+            return Err(HnsrCoordinatorError::UnsupportedProfile(profile));
+        }
         let binding = HnsrNetworkBinding::for_network(network);
         let mut bytes = Vec::with_capacity(40);
         bytes.extend_from_slice(&binding.magic.to_le_bytes());
         bytes.extend_from_slice(&binding.genesis_hash);
-        bytes.extend_from_slice(&HNS_NODE_V1.to_le_bytes());
-        Self {
+        bytes.extend_from_slice(&profile.to_le_bytes());
+        Ok(Self {
             binding,
+            profile,
             configuration_hash: blake2b_256(&bytes),
             requester_enabled: true,
             opaque_relay_enabled: true,
             relay_backend: None,
             relay_limits: RelayLimits::default(),
-        }
+        })
     }
 }
 
@@ -278,6 +295,9 @@ impl HnsrCoordinator {
         config: HnsrCoordinatorConfig,
         trusted_now: u64,
     ) -> Result<Self, HnsrCoordinatorError> {
+        if !is_supported_hnsr_profile(config.profile) {
+            return Err(HnsrCoordinatorError::UnsupportedProfile(config.profile));
+        }
         let policy = HnsrPolicy::default()
             .with_client(config.requester_enabled)
             .with_relay(config.opaque_relay_enabled)
@@ -314,6 +334,9 @@ impl HnsrCoordinator {
         floor: HnsrDurableFloor,
         trusted_now: u64,
     ) -> Result<Self, HnsrCoordinatorError> {
+        if !is_supported_hnsr_profile(config.profile) {
+            return Err(HnsrCoordinatorError::UnsupportedProfile(config.profile));
+        }
         if floor.network_magic != config.binding.magic
             || floor.configuration_hash != config.configuration_hash
             || trusted_now < floor.trusted_time_high_water
@@ -388,7 +411,7 @@ impl HnsrCoordinator {
             plaintext_transport_available: false,
             service_bit: HNSR_RELAY_SERVICE,
             packet_type: HNSR_PACKET_TYPE,
-            profile: HNS_NODE_V1,
+            profile: self.config.profile,
             profile_registry_fingerprint: HNSR_PROFILE_REGISTRY_FINGERPRINT.to_string(),
             profile_registry_version: HNSR_PROFILE_REGISTRY_VERSION,
             profile_registry_protocol_version: HNSR_PROFILE_REGISTRY_PROTOCOL_VERSION,
@@ -830,7 +853,7 @@ impl HnsrCoordinator {
 fn requester_config(config: &HnsrCoordinatorConfig) -> HnsrRequesterConfig {
     HnsrRequesterConfig {
         network_magic: config.binding.magic,
-        profile: HNS_NODE_V1,
+        profile: config.profile,
         allow_private_relay: config.binding.allows_private(),
         maximum_circuits: MAX_CIRCUITS,
         maximum_queue_bytes: MAX_CIRCUIT_QUEUE,
@@ -862,7 +885,7 @@ fn build_relay_service(
             host,
             port: backend.advertised_address.port(),
             allow_private_address: config.binding.allows_private(),
-            supported_profiles: BTreeSet::from([HNS_NODE_V1]),
+            supported_profiles: BTreeSet::from([config.profile]),
             limits: config.relay_limits,
         },
         backend.private_key,
@@ -1067,6 +1090,8 @@ pub enum HnsrCoordinatorError {
     UnauthenticatedPeer,
     #[error("HNSR requires exact canonical Denuo V1 negotiation")]
     RegistryNotNegotiated,
+    #[error("unsupported HNSR profile {0}; expected HNS_NODE_V1 or HNS_WEB_V1")]
+    UnsupportedProfile(u16),
     #[error("HNSR role is unavailable")]
     RoleUnavailable,
     #[error("HNSR rendezvous role is unavailable")]

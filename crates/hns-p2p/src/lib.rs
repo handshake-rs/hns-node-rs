@@ -52,14 +52,14 @@ pub use hip76::{
 pub use hns_hnsr_protocol::{
     HnsrActionId, HnsrOpcode, HnsrPacket, HnsrPeerId, HnsrRequesterEvent, HnsrRoute,
     HnsrRuntimeStatus, QueuedHnsrRoute, RelayLimits, RelayTicket, HNSR_PACKET_TYPE,
-    HNSR_RELAY_SERVICE, HNS_NODE_V1,
+    HNSR_RELAY_SERVICE, HNS_NODE_V1, HNS_WEB_V1,
 };
 pub use hns_p2p_experimental::HnsrPolicy;
 pub use hnsr::{
-    decode_hnsr_packet, hnsr_packet, hnsr_peer_id, is_hnsr_packet_type, peer_id_from_hnsr,
-    HnsrCoordinator, HnsrCoordinatorConfig, HnsrCoordinatorError, HnsrCoordinatorStatus,
-    HnsrDurableFloor, HnsrIncoming, HnsrNetworkBinding, HnsrPeerAdmission, HnsrPolicyUpdate,
-    HnsrProcessTotals, HnsrRelayBackend, HnsrStateSnapshot,
+    decode_hnsr_packet, hnsr_packet, hnsr_peer_id, is_hnsr_packet_type, is_supported_hnsr_profile,
+    peer_id_from_hnsr, HnsrCoordinator, HnsrCoordinatorConfig, HnsrCoordinatorError,
+    HnsrCoordinatorStatus, HnsrDurableFloor, HnsrIncoming, HnsrNetworkBinding, HnsrPeerAdmission,
+    HnsrPolicyUpdate, HnsrProcessTotals, HnsrRelayBackend, HnsrStateSnapshot,
 };
 pub use manager::{
     normalize_peer_ip, BroadcastReport, LivePeerConfig, LivePeerManager, LocalServicesUpdate,

@@ -23,8 +23,9 @@ qualification or authorize deployment.
   explicit requester opt-out.
 - Enable HIP-78 HNSR requester and opaque-relay policy by default with
   independent `--no-hnsr-requester` and `--no-hnsr-relay` opt-outs. Exact
-  Brontide/Denuo/network/genesis admission, HNS Node v1-only circuits, actual
-  socket-write acknowledgements, connection-bound cleanup, and atomic
+  Brontide/Denuo/network/genesis admission, explicit `HNS_NODE_V1` or
+  `HNS_WEB_V1` circuit profiles, actual socket-write acknowledgements,
+  connection-bound cleanup, and atomic
   checksummed state/floor persistence fail closed. Relay service advertisement
   additionally requires `--hnsr-relay-address`; endpoint, rendezvous, and
   plaintext roles remain unavailable.
