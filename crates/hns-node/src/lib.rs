@@ -2220,6 +2220,13 @@ pub struct CanonicalChainEpoch {
     pub tip: Option<ChainTip>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NamePageCompactionDue {
+    pub epoch: CanonicalChainEpoch,
+    pub generation: u64,
+    pub active_segment: u32,
+}
+
 #[derive(Clone, Debug)]
 enum ExpectedCanonicalState {
     Exact(CanonicalEpoch),
@@ -3007,6 +3014,47 @@ impl NodeReadHandle {
     pub fn stable_canonical_epoch(&self) -> Result<CanonicalEpoch> {
         self.ensure_storage_operational()?;
         Ok(self.canonical_epoch())
+    }
+
+    pub(crate) fn name_page_compaction_due(
+        &self,
+    ) -> Result<Option<NamePageCompactionDue>> {
+        if !self.config.undo_retention.prune_history
+            || self.config.data_dir.is_none()
+        {
+            return Ok(None);
+        }
+
+        let (epoch, page_identity) = self.with_stable_epoch_read(|store, _headers| {
+            let snapshot = store.snapshot()?;
+
+            let Some(raw) = snapshot.get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)? else {
+                return Ok(None);
+            };
+
+            let state = NamePageState::decode(&raw)
+                .map_err(anyhow::Error::new)
+                .context("failed to decode name-page state for online maintenance")?;
+
+            Ok(Some((
+                state.manifest.generation,
+                state.manifest.active_segment,
+            )))
+        })?;
+
+        let Some((generation, active_segment)) = page_identity else {
+            return Ok(None);
+        };
+
+        if active_segment < NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD {
+            return Ok(None);
+        }
+
+        Ok(Some(NamePageCompactionDue {
+            epoch: epoch.chain(),
+            generation,
+            active_segment,
+        }))
     }
 
     /// Reserve one configured template slot before capturing the mempool. The
