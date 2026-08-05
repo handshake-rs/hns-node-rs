@@ -80,7 +80,7 @@ use super::{
     NodeReorg, NodeReorgLimits, NodeRuntime, NodeService, PreparedNativeActivation,
     ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits, RpcReadContext, RpcRuntimeLimits,
     ShutdownSignal, StatelessBodyValidation, HSRD_DIAGNOSTIC_API_VERSION,
-    MAX_CANONICAL_WRITER_QUEUE_CAPACITY,
+    MAX_CANONICAL_WRITER_QUEUE_CAPACITY, NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
 };
 use super::{wallet_rpc, WalletBackend};
 use crate::peer_bans::{
@@ -1210,14 +1210,14 @@ fn schedule_name_page_compaction_if_due(
     let writer = writer.clone();
 
     *task = Some(tokio::spawn(async move {
-        writer
-            .execute_at_chain(
-                due.epoch,
-                "compact pruned name-page generation",
-                move |service| service.compact_pruned_name_pages_if_due(),
-            )
-            .await
-    }));
+            writer
+                .execute_at_chain(
+                    due.epoch,
+                    "compact pruned name-page generation",
+                    move |service| service.state.compact_pruned_name_pages_if_due(),
+                )
+                .await
+        }));
 
     Ok(true)
 }
