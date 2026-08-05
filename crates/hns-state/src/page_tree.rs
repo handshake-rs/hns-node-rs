@@ -3379,6 +3379,156 @@ mod tests {
         prove_hsd_from_records, update_record_tree, validate_record_tree, MemoryUrkel,
     };
 
+    struct NamePageGenerationFixture {
+        path: std::path::PathBuf,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+        validation_limits: NamePageValidationLimits,
+    }
+
+    fn build_test_name_page_generation(
+        record_count: usize,
+    ) -> NamePageGenerationFixture {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-page-validation-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let entries = (0..record_count)
+            .map(|index| {
+                let index = u8::try_from(index).expect("entry index fits into byte");
+                let mut key = [0u8; 32];
+                key[0] = index;
+                (NameHash::new(key), vec![index; 2])
+            })
+            .collect::<Vec<_>>();
+        let tree = MemoryUrkel::from_entries(entries).expect("test tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("tree records");
+
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        for (record_root, raw) in records {
+            batch
+                .put(ColumnFamily::NameTreeNodes, record_root.as_bytes(), &raw)
+                .expect("stage records");
+        }
+        store.commit(batch).expect("commit records");
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut appender = NamePageAppender::create_new(&path, 1, 0).expect("create pages");
+        let streamed = stream_name_page_tree_with_limits(
+            &snapshot,
+            root,
+            &mut appender,
+            default_name_page_stream_limits(),
+        )
+        .expect("stream test generation");
+        let root_address = streamed.root_address.expect("test generation root");
+        let locator = NamePageRootLocator::new(streamed.manifest.generation, root_address);
+
+        let now = Instant::now();
+        let validation_limits = NamePageValidationLimits {
+            max_segments: 1,
+            max_pages: 2_000_000,
+            max_records: maximum_name_page_validation_records(4 * 1024 * 1024 * 1024),
+            max_bytes: 4 * 1024 * 1024 * 1024,
+            max_spill_bytes: 4 * 1024 * 1024 * 1024,
+            max_published_roots: 2_000_000,
+            minimum_filesystem_reserve_bytes: 0,
+            deadline: now
+                .checked_add(Duration::from_secs(60 * 60))
+                .unwrap_or(now),
+        };
+
+        NamePageGenerationFixture {
+            path,
+            root,
+            locator,
+            validation_limits,
+        }
+    }
+
+    #[test]
+    fn validation_record_limit_is_derived_from_spill_bytes() {
+        let record_bytes = NAME_PAGE_VALIDATION_RECORD_BYTES as u64;
+
+        assert_eq!(
+            maximum_name_page_validation_records(record_bytes * 10),
+            10,
+        );
+
+        assert_eq!(
+            maximum_name_page_validation_records(record_bytes * 10 + record_bytes - 1),
+            10,
+        );
+
+        assert_eq!(
+            maximum_name_page_validation_records(record_bytes * 11),
+            11,
+        );
+    }
+
+    #[test]
+    fn validation_progress_finishes_at_exact_counts() {
+        let fixture = build_test_name_page_generation(256);
+
+        let reader = NamePageTreeReader::open(
+            &fixture.path,
+            fixture.root,
+            fixture.locator,
+        )
+        .expect("open test generation");
+
+        let mut updates = Vec::new();
+
+        let validation = reader
+            .validate_committed_pages_with_limits_and_progress(
+                fixture.validation_limits,
+                Duration::ZERO,
+                |progress| updates.push(progress),
+            )
+            .expect("validate pages");
+
+        let final_progress =
+            updates.last().copied().expect("progress");
+
+        assert_eq!(
+            final_progress.pages_completed,
+            validation.pages,
+        );
+
+        assert_eq!(
+            final_progress.records_completed,
+            validation.records,
+        );
+
+        assert_eq!(
+            final_progress.bytes_completed,
+            validation.bytes,
+        );
+
+        assert_eq!(
+            final_progress.segments_completed,
+            final_progress.segments_total,
+        );
+
+        assert!(
+            updates.windows(2).all(|pair| {
+                pair[0].pages_completed <= pair[1].pages_completed
+                    && pair[0].records_completed <= pair[1].records_completed
+            }),
+            "audit progress must be monotonic",
+        );
+
+        drop(reader);
+        std::fs::remove_file(fixture.path).expect("remove generation");
+    }
+
     #[test]
     fn validation_spill_reloads_evicted_pages_without_a_visible_temp_file() {
         let nonce = std::time::SystemTime::now()
