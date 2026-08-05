@@ -1153,6 +1153,35 @@ struct NativeActiveStateSliceResult {
     outcome: ActiveStateConnectOutcome,
     preparation: ActiveStatePreparationMetrics,
     wall_millis: u64,
+    next_connect_limit: usize,
+}
+
+#[derive(Debug)]
+struct ActiveStateBatchTuner {
+    next_limit: usize,
+}
+
+impl ActiveStateBatchTuner {
+    fn new(initial_connect_limit: usize) -> Self {
+        Self {
+            next_limit: initial_connect_limit
+                .max(1)
+                .min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE),
+        }
+    }
+
+    fn record_budget_retry(&mut self, retry_connect: usize) {
+        self.next_limit = retry_connect
+            .max(1)
+            .min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+    }
+
+    fn record_success(&mut self, connected: usize) {
+        if connected >= self.next_limit {
+            let increase = (self.next_limit / 8).max(1);
+            self.next_limit = self.next_limit.saturating_add(increase).min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+        }
+    }
 }
 
 struct ActiveStateWorkerPermit {
@@ -2764,7 +2793,7 @@ impl NodeService {
                 diagnostics: &diagnostics,
                 diagnostic_rpc: &diagnostic_rpc,
             };
-            let startup_affected = connect_stored_active_state_with_diagnostic_rpc(
+            let startup_completed = connect_stored_active_state_with_diagnostic_rpc(
                 &context,
                 &mut scheduler,
                 &mut orphan_pool,
@@ -2772,8 +2801,17 @@ impl NodeService {
             )
             .await
             .map_err(|error| error.context("failed to resume active-state synchronization"));
-            let startup_affected = match startup_affected {
-                Ok(affected) => affected,
+            let startup_affected = match startup_completed {
+                Ok(startup_completed) => {
+                    active_state_batch_tuner
+                        .record_budget_retry(startup_completed.next_connect_limit);
+                    active_state_batch_tuner.record_success(startup_completed.outcome.connected);
+                    startup_completed
+                        .outcome
+                        .contextual_failure
+                        .as_ref()
+                        .map_or_else(Vec::new, |failed| failed.affected.clone())
+                }
                 Err(error) => {
                     let _ = shutdown_tx.send(true);
                     let _ = rpc_task.await;
@@ -2837,6 +2875,8 @@ impl NodeService {
         let mut active_state_task: Option<JoinHandle<Result<NativeActiveStateSliceResult>>> = None;
         let mut active_state_completion: Option<NativeActiveStateSliceResult> = None;
         let mut consecutive_active_state_contention = 0usize;
+        let mut active_state_batch_tuner =
+            ActiveStateBatchTuner::new(native_sync_config.active_state_connect_batch);
         let mut consecutive_maintenance_busy = 0usize;
         let mut next_supervisor_lane = NativeSupervisorLane::Maintenance;
 
@@ -2887,6 +2927,10 @@ impl NodeService {
                             diagnostics: &diagnostics,
                             diagnostic_rpc: &diagnostic_rpc,
                         };
+                        let (next_connect_limit, connected_blocks) = active_state_completion
+                            .as_ref()
+                            .map(|completed| (completed.next_connect_limit, completed.outcome.connected))
+                            .expect("active-state completion remains retained");
                         let completion_result = {
                             let completed = active_state_completion
                                 .as_ref()
@@ -2906,6 +2950,8 @@ impl NodeService {
                                 // Relinquish the retained completion before
                                 // fallible deferred-orphan bookkeeping so a
                                 // terminal shutdown cannot publish it twice.
+                                active_state_batch_tuner.record_budget_retry(next_connect_limit);
+                                active_state_batch_tuner.record_success(connected_blocks);
                                 let completed = active_state_completion
                                     .take()
                                     .expect("published active-state completion remains retained");
@@ -2975,6 +3021,7 @@ impl NodeService {
                             }
                         }
                     } else {
+                        let maximum_connect = active_state_batch_tuner.next_limit;
                         // Preparation is pure, bounded CPU work and remains
                         // independent of the network supervisor. Exactly one
                         // job may be in flight, and a completed job remains
@@ -2982,7 +3029,7 @@ impl NodeService {
                         active_state_task = Some(tokio::spawn(execute_native_active_state_slice(
                             node.clone(),
                             writer.clone(),
-                            native_sync_config.active_state_connect_batch,
+                            maximum_connect,
                             scheduler.stored_tip().cloned(),
                             native_sync_config.validation_workers,
                             native_sync_config.validation_queue,
@@ -7582,6 +7629,7 @@ async fn execute_native_active_state_slice_with_validator(
                 outcome: ActiveStateConnectOutcome::default(),
                 preparation,
                 wall_millis: u64::try_from(slice_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                next_connect_limit: attempt_limit,
             });
         };
         let prepared = prepare_native_active_state_plan_with_validator(
@@ -7613,6 +7661,7 @@ async fn execute_native_active_state_slice_with_validator(
                     preparation,
                     wall_millis: u64::try_from(slice_started.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
+                    next_connect_limit: attempt_limit,
                 });
             }
             Ok(std::ops::ControlFlow::Break(DirectStagedEffectLimit {
@@ -7671,13 +7720,18 @@ pub(super) async fn connect_stored_active_state(
         diagnostics,
         diagnostic_rpc: &diagnostic_rpc,
     };
-    let affected = connect_stored_active_state_with_diagnostic_rpc(
+    let completed = connect_stored_active_state_with_diagnostic_rpc(
         &context,
         scheduler,
         orphans,
         maximum_connect,
     )
     .await?;
+    let affected = completed
+        .outcome
+        .contextual_failure
+        .as_ref()
+        .map_or_else(Vec::new, |failed| failed.affected.clone());
     for root in affected {
         discard_orphan_descendants(root, orphans)?;
     }
@@ -7689,7 +7743,7 @@ async fn connect_stored_active_state_with_diagnostic_rpc<P: ActiveStateOrphanPoo
     scheduler: &mut SyncScheduler,
     orphans: &mut P,
     maximum_connect: usize,
-) -> Result<Vec<BlockHash>> {
+) -> Result<NativeActiveStateSliceResult> {
     let config = context.node.config();
     let completed = execute_native_active_state_slice(
         context.node.clone(),
@@ -7701,11 +7755,7 @@ async fn connect_stored_active_state_with_diagnostic_rpc<P: ActiveStateOrphanPoo
     )
     .await?;
     complete_stored_active_state_slice(&completed, context, scheduler, orphans).await?;
-    Ok(completed
-        .outcome
-        .contextual_failure
-        .as_ref()
-        .map_or_else(Vec::new, |failed| failed.affected.clone()))
+    Ok(completed)
 }
 
 async fn complete_stored_active_state_slice<P: ActiveStateOrphanPool>(
