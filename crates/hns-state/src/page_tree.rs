@@ -843,9 +843,7 @@ where
         ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         let first_page = appender.next_page();
         let now = Instant::now();
-        let next_progress = now
-            .checked_add(progress_interval)
-            .unwrap_or(now);
+        let next_progress = now.checked_add(progress_interval).unwrap_or(now);
         let mut emitter = Self {
             builder: Some(NamePageBuilder::new(appender.segment(), first_page)?),
             appender,
@@ -858,7 +856,8 @@ where
             next_progress,
             on_progress,
         };
-        (emitter.on_progress)(emitter.progress());
+        let progress = emitter.progress();
+        (emitter.on_progress)(progress);
         Ok(emitter)
     }
 
@@ -866,9 +865,7 @@ where
         NamePageStreamProgress {
             records_completed: self.record_count,
             pages_completed: self.page_count,
-            bytes_completed: self
-                .page_count
-                .saturating_mul(NAME_PAGE_BYTES as u64),
+            bytes_completed: self.page_count.saturating_mul(NAME_PAGE_BYTES as u64),
         }
     }
 
@@ -878,10 +875,9 @@ where
         }
         let now = Instant::now();
         if now >= self.next_progress {
-            (self.on_progress)(self.progress());
-            self.next_progress = now
-                .checked_add(self.progress_interval)
-                .unwrap_or(now);
+            let progress = self.progress();
+            (self.on_progress)(progress);
+            self.next_progress = now.checked_add(self.progress_interval).unwrap_or(now);
         }
     }
 
@@ -967,7 +963,8 @@ where
             self.page_count,
             u64::from(self.appender.next_page() - self.first_page)
         );
-        (self.on_progress)(self.progress());
+        let progress = self.progress();
+        (self.on_progress)(progress);
         Ok((manifest, self.record_count, self.page_count))
     }
 }
@@ -1092,8 +1089,7 @@ where
         limits.max_known_addresses,
         "name-page known addresses",
     )?;
-    let mut emitter =
-        StreamingPageEmitter::new(appender, limits, progress_interval, on_progress)?;
+    let mut emitter = StreamingPageEmitter::new(appender, limits, progress_interval, on_progress)?;
     if root == TreeRoot::ZERO {
         let (manifest, record_count, page_count) = emitter.finish()?;
         return Ok(StreamedNamePages {
@@ -1233,6 +1229,7 @@ fn stream_name_page_tree_with_parallelism<T: ReadSnapshot>(
     )
 }
 
+#[allow(dead_code)]
 fn stream_name_page_tree_with_parallelism_and_limits<T: ReadSnapshot>(
     snapshot: &T,
     root: TreeRoot,
@@ -1265,8 +1262,7 @@ where
 {
     ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
     let target_subtrees = target_subtrees.max(1);
-    let mut emitter =
-        StreamingPageEmitter::new(appender, limits, progress_interval, on_progress)?;
+    let mut emitter = StreamingPageEmitter::new(appender, limits, progress_interval, on_progress)?;
     if root == TreeRoot::ZERO {
         let (manifest, record_count, page_count) = emitter.finish()?;
         return Ok(StreamedNamePages {
@@ -1667,9 +1663,7 @@ pub const NAME_PAGE_VALIDATION_RECORD_BYTES: usize = 32 + std::mem::size_of::<u1
 /// Maximum number of complete validation records that fit in the spill file.
 ///
 /// Any remaining partial-record bytes are intentionally unusable.
-pub const fn maximum_name_page_validation_records(
-    maximum_spill_bytes: u64,
-) -> u64 {
+pub const fn maximum_name_page_validation_records(maximum_spill_bytes: u64) -> u64 {
     maximum_spill_bytes / NAME_PAGE_VALIDATION_RECORD_BYTES as u64
 }
 
@@ -2491,9 +2485,7 @@ impl NamePageTreeReader {
                 max_records: 100_000_000,
                 max_frontier: 1_000_000,
                 max_known_addresses: 100_000_000,
-                deadline: now
-                    .checked_add(Duration::from_secs(60 * 60))
-                    .unwrap_or(now),
+                deadline: now.checked_add(Duration::from_secs(60 * 60)).unwrap_or(now),
             },
         )
     }
@@ -2575,9 +2567,7 @@ impl NamePageTreeReader {
             max_spill_bytes: 4 * 1024 * 1024 * 1024,
             max_published_roots: 1_000_000,
             minimum_filesystem_reserve_bytes: 0,
-            deadline: now
-                .checked_add(Duration::from_secs(60 * 60))
-                .unwrap_or(now),
+            deadline: now.checked_add(Duration::from_secs(60 * 60)).unwrap_or(now),
         })
     }
 
@@ -2585,11 +2575,7 @@ impl NamePageTreeReader {
         &self,
         limits: NamePageValidationLimits,
     ) -> Result<NamePageValidation, PageTreeError> {
-        self.validate_committed_pages_with_limits_and_progress(
-            limits,
-            Duration::MAX,
-            |_| {},
-        )
+        self.validate_committed_pages_with_limits_and_progress(limits, Duration::MAX, |_| {})
     }
 
     pub fn validate_committed_pages_with_limits_and_progress<F>(
@@ -2801,9 +2787,7 @@ impl NamePageTreeReader {
                     "name-page validation pages",
                 )?;
 
-                if progress_interval.is_zero()
-                    || last_progress.elapsed() >= progress_interval
-                {
+                if progress_interval.is_zero() || last_progress.elapsed() >= progress_interval {
                     progress(NamePageValidationProgress {
                         segments_completed,
                         segments_total: total_segments,
@@ -3338,9 +3322,7 @@ fn default_name_page_stream_limits() -> NamePageStreamLimits {
         max_frontier: 1_000_000,
         max_known_addresses: 100_000_000,
         minimum_filesystem_reserve_bytes: 0,
-        deadline: now
-            .checked_add(Duration::from_secs(60 * 60))
-            .unwrap_or(now),
+        deadline: now.checked_add(Duration::from_secs(60 * 60)).unwrap_or(now),
     }
 }
 
@@ -3515,9 +3497,7 @@ mod tests {
         validation_limits: NamePageValidationLimits,
     }
 
-    fn build_test_name_page_generation(
-        record_count: usize,
-    ) -> NamePageGenerationFixture {
+    fn build_test_name_page_generation(record_count: usize) -> NamePageGenerationFixture {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
@@ -3569,9 +3549,7 @@ mod tests {
             max_spill_bytes: 4 * 1024 * 1024 * 1024,
             max_published_roots: 2_000_000,
             minimum_filesystem_reserve_bytes: 0,
-            deadline: now
-                .checked_add(Duration::from_secs(60 * 60))
-                .unwrap_or(now),
+            deadline: now.checked_add(Duration::from_secs(60 * 60)).unwrap_or(now),
         };
 
         NamePageGenerationFixture {
@@ -3586,32 +3564,22 @@ mod tests {
     fn validation_record_limit_is_derived_from_spill_bytes() {
         let record_bytes = NAME_PAGE_VALIDATION_RECORD_BYTES as u64;
 
-        assert_eq!(
-            maximum_name_page_validation_records(record_bytes * 10),
-            10,
-        );
+        assert_eq!(maximum_name_page_validation_records(record_bytes * 10), 10,);
 
         assert_eq!(
             maximum_name_page_validation_records(record_bytes * 10 + record_bytes - 1),
             10,
         );
 
-        assert_eq!(
-            maximum_name_page_validation_records(record_bytes * 11),
-            11,
-        );
+        assert_eq!(maximum_name_page_validation_records(record_bytes * 11), 11,);
     }
 
     #[test]
     fn validation_progress_finishes_at_exact_counts() {
         let fixture = build_test_name_page_generation(256);
 
-        let reader = NamePageTreeReader::open(
-            &fixture.path,
-            fixture.root,
-            fixture.locator,
-        )
-        .expect("open test generation");
+        let reader = NamePageTreeReader::open(&fixture.path, fixture.root, fixture.locator)
+            .expect("open test generation");
 
         let mut updates = Vec::new();
 
@@ -3623,23 +3591,13 @@ mod tests {
             )
             .expect("validate pages");
 
-        let final_progress =
-            updates.last().copied().expect("progress");
+        let final_progress = updates.last().copied().expect("progress");
 
-        assert_eq!(
-            final_progress.pages_completed,
-            validation.pages,
-        );
+        assert_eq!(final_progress.pages_completed, validation.pages,);
 
-        assert_eq!(
-            final_progress.records_completed,
-            validation.records,
-        );
+        assert_eq!(final_progress.records_completed, validation.records,);
 
-        assert_eq!(
-            final_progress.bytes_completed,
-            validation.bytes,
-        );
+        assert_eq!(final_progress.bytes_completed, validation.bytes,);
 
         assert_eq!(
             final_progress.segments_completed,
@@ -3661,8 +3619,8 @@ mod tests {
     #[test]
     fn stream_progress_finishes_at_exact_counts() {
         let record_count = 512u32;
-        let mut nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
@@ -3685,17 +3643,14 @@ mod tests {
         let mut batch = store.batch();
         for (record_root, raw) in records {
             batch
-                .put(
-                    ColumnFamily::NameTreeNodes,
-                    record_root.as_bytes(),
-                    &raw,
-                )
+                .put(ColumnFamily::NameTreeNodes, record_root.as_bytes(), &raw)
                 .expect("stream fixture node");
         }
         store.commit(batch).expect("stream fixture state");
         let snapshot = store.snapshot().expect("stream fixture snapshot");
 
-        let mut appender = NamePageAppender::create_new(&path, 1, 0).expect("stream fixture appender");
+        let mut appender =
+            NamePageAppender::create_new(&path, 1, 0).expect("stream fixture appender");
         let mut progress = Vec::new();
 
         let streamed = stream_name_page_tree_with_limits_and_progress(
@@ -3710,14 +3665,8 @@ mod tests {
 
         let final_progress = progress.last().copied().expect("stream progress");
 
-        assert_eq!(
-            final_progress.records_completed,
-            streamed.record_count,
-        );
-        assert_eq!(
-            final_progress.pages_completed,
-            streamed.page_count,
-        );
+        assert_eq!(final_progress.records_completed, streamed.record_count,);
+        assert_eq!(final_progress.pages_completed, streamed.page_count,);
         assert_eq!(
             final_progress.bytes_completed,
             streamed.page_count.saturating_mul(NAME_PAGE_BYTES as u64),
@@ -3739,8 +3688,8 @@ mod tests {
     #[test]
     fn stream_progress_does_not_fire_after_failed_page_append_attempt() {
         let record_count = 2048u32;
-        let mut nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
@@ -3762,17 +3711,14 @@ mod tests {
         let mut batch = store.batch();
         for (record_root, raw) in records {
             batch
-                .put(
-                    ColumnFamily::NameTreeNodes,
-                    record_root.as_bytes(),
-                    &raw,
-                )
+                .put(ColumnFamily::NameTreeNodes, record_root.as_bytes(), &raw)
                 .expect("stream-failed fixture node");
         }
         store.commit(batch).expect("stream-failed fixture state");
         let snapshot = store.snapshot().expect("stream-failed snapshot");
 
-        let mut appender = NamePageAppender::create_new(&path, 1, 0).expect("stream-failed appender");
+        let mut appender =
+            NamePageAppender::create_new(&path, 1, 0).expect("stream-failed appender");
         let mut progress = Vec::new();
         let mut limits = default_name_page_stream_limits();
         limits.max_pages = 1;
@@ -3785,7 +3731,10 @@ mod tests {
             |event| progress.push(event),
         );
 
-        assert!(result.is_err(), "stream should fail when page budget is exhausted");
+        assert!(
+            result.is_err(),
+            "stream should fail when page budget is exhausted"
+        );
         let final_callback_count = progress.len();
         assert!(
             final_callback_count >= 2,
@@ -3799,7 +3748,8 @@ mod tests {
         assert!(
             !progress
                 .iter()
-                .any(|event| event.pages_completed > 1 || event.records_completed > limits.max_records),
+                .any(|event| event.pages_completed > 1
+                    || event.records_completed > limits.max_records),
             "failed append should not advance progress",
         );
 
@@ -4096,9 +4046,7 @@ mod tests {
             max_frontier: 1,
             max_known_addresses: 1,
             minimum_filesystem_reserve_bytes: 0,
-            deadline: now
-                .checked_add(Duration::from_secs(30))
-                .unwrap_or(now),
+            deadline: now.checked_add(Duration::from_secs(30)).unwrap_or(now),
         };
 
         let exact_path = path("exact");

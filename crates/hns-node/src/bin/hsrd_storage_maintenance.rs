@@ -942,10 +942,7 @@ mod tests {
         initialize_schema(&store).expect("initialize schema");
 
         let requires_clean = |command: &Command| {
-            !matches!(
-                command,
-                Command::FenceInspect | Command::FenceClear { .. }
-            )
+            !matches!(command, Command::FenceInspect | Command::FenceClear { .. })
         };
         let commands = [
             Command::Inventory,
@@ -972,7 +969,10 @@ mod tests {
             },
         ];
         for command in commands.iter() {
-            assert!(requires_clean(command), "non-fence maintenance command {command:?}");
+            assert!(
+                requires_clean(command),
+                "non-fence maintenance command {command:?}"
+            );
             assert!(
                 require_clean_store(&store).is_err(),
                 "unclean store should reject {command:?}"

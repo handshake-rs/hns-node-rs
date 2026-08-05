@@ -75,12 +75,12 @@ use super::{
     rpc_experimental_registry_info, rpc_hip76_info, rpc_hnsr_info, rpc_immediately_unsupported,
     rpc_odoh_info, rpc_point_read_method, AuthorityMode, CanonicalChainEpoch, CanonicalStateWriter,
     CanonicalWriterError, ChainActivationFailure, DurableMiningState, FailedBlockMutation,
-    FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport, NodeReadHandle,
-    NamePageCompactionReport,
-    NodeReorg, NodeReorgLimits, NodeRuntime, NodeService, PreparedNativeActivation,
-    ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits, RpcReadContext, RpcRuntimeLimits,
-    ShutdownSignal, StatelessBodyValidation, HSRD_DIAGNOSTIC_API_VERSION,
-    MAX_CANONICAL_WRITER_QUEUE_CAPACITY, NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+    FailedBlockStage, HeaderSummary, NamePageCompactionReport, NativeRuntimeExtension,
+    NodeBlockImport, NodeReadHandle, NodeReorg, NodeReorgLimits, NodeRuntime, NodeService,
+    PreparedNativeActivation, ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits,
+    RpcReadContext, RpcRuntimeLimits, ShutdownSignal, StatelessBodyValidation,
+    HSRD_DIAGNOSTIC_API_VERSION, MAX_CANONICAL_WRITER_QUEUE_CAPACITY,
+    NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
 };
 use super::{wallet_rpc, WalletBackend};
 use crate::peer_bans::{
@@ -1167,22 +1167,21 @@ struct ActiveStateBatchTuner {
 impl ActiveStateBatchTuner {
     fn new(initial_connect_limit: usize) -> Self {
         Self {
-            next_limit: initial_connect_limit
-                .max(1)
-                .min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE),
+            next_limit: initial_connect_limit.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE),
         }
     }
 
     fn record_budget_retry(&mut self, retry_connect: usize) {
-        self.next_limit = retry_connect
-            .max(1)
-            .min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+        self.next_limit = retry_connect.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
     }
 
     fn record_success(&mut self, connected: usize) {
         if connected >= self.next_limit {
             let increase = (self.next_limit / 8).max(1);
-            self.next_limit = self.next_limit.saturating_add(increase).min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+            self.next_limit = self
+                .next_limit
+                .saturating_add(increase)
+                .min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
         }
     }
 }
@@ -1210,14 +1209,14 @@ fn schedule_name_page_compaction_if_due(
     let writer = writer.clone();
 
     *task = Some(tokio::spawn(async move {
-            writer
-                .execute_at_chain(
-                    due.epoch,
-                    "compact pruned name-page generation",
-                    move |service| service.state.compact_pruned_name_pages_if_due(),
-                )
-                .await
-        }));
+        writer
+            .execute_at_chain(
+                due.epoch,
+                "compact pruned name-page generation",
+                move |service| service.state.compact_pruned_name_pages_if_due(),
+            )
+            .await
+    }));
 
     Ok(true)
 }

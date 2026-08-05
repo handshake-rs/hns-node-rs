@@ -124,14 +124,12 @@ use hns_state::{
     compact_name_tree_nodes_streaming, connect_block_to_batch_with_services, decode_coin,
     decode_name_state, disconnect_block_to_batch, encode_outpoint_key,
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
-    load_stored_name_tree_root, migrate_name_tree_interval_accumulator_bounded, name_page_root_key,
-    maximum_name_page_validation_records, name_tree_snapshot_pin_key, pack_name_page_records,
-    NAME_PAGE_VALIDATION_RECORD_BYTES,
-    plan_name_tree_interval_accumulator_migration_bounded, retained_name_tree_roots_bounded,
-    stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits,
+    load_stored_name_tree_root, maximum_name_page_validation_records,
+    migrate_name_tree_interval_accumulator_bounded, name_page_root_key, name_tree_snapshot_pin_key,
+    pack_name_page_records, plan_name_tree_interval_accumulator_migration_bounded,
+    retained_name_tree_roots_bounded, stage_remove_name_tree_snapshot_pin,
     stream_name_page_tree_delta_with_limits_and_progress,
-    stream_name_page_tree_with_limits, stream_name_page_tree_with_limits_and_progress,
-    validate_persisted_name_tree_overlays,
+    stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
     validate_persisted_name_tree_root, validate_persisted_name_trees,
     verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
     visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
@@ -694,6 +692,7 @@ type StagedNamePageCompaction = (
     u64,
     u64,
     BTreeMap<TreeRoot, hns_store::NamePageAddress>,
+    u64,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3035,12 +3034,8 @@ impl NodeReadHandle {
         Ok(self.canonical_epoch())
     }
 
-    pub(crate) fn name_page_compaction_due(
-        &self,
-    ) -> Result<Option<NamePageCompactionDue>> {
-        if !self.config.undo_retention.prune_history
-            || self.config.data_dir.is_none()
-        {
+    pub(crate) fn name_page_compaction_due(&self) -> Result<Option<NamePageCompactionDue>> {
+        if !self.config.undo_retention.prune_history || self.config.data_dir.is_none() {
             return Ok(None);
         }
 
@@ -5899,7 +5894,10 @@ struct NamePageCompactionCommitErrorGuard;
 impl NamePageCompactionCommitErrorGuard {
     fn enable() -> Self {
         TEST_NAME_PAGE_COMPACTION_COMMIT_ERROR.with(|enabled| {
-            assert!(!enabled.replace(true), "name-page compaction commit fault already enabled");
+            assert!(
+                !enabled.replace(true),
+                "name-page compaction commit fault already enabled"
+            );
         });
         Self
     }
@@ -6342,9 +6340,7 @@ struct ContextualActivationFailure {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "name-page compaction was deferred before publication: {detail}"
-)]
+#[error("name-page compaction was deferred before publication: {detail}")]
 struct NamePageCompactionDeferred {
     detail: String,
 }
@@ -6411,28 +6407,20 @@ fn production_name_page_filesystem_limits_with_elapsed(
         max_segments: MAX_NAME_PAGE_SEGMENTS,
         max_directory_entries: MAX_NAME_PAGE_SEGMENTS.saturating_add(16),
         max_generation_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
-        deadline: now
-            .checked_add(maximum_elapsed)
-            .unwrap_or(now),
+        deadline: now.checked_add(maximum_elapsed).unwrap_or(now),
     }
 }
 
 fn production_name_page_filesystem_limits() -> NamePageFilesystemLimits {
-    production_name_page_filesystem_limits_with_elapsed(
-        MAX_NAME_PAGE_VALIDATION_ELAPSED,
-    )
+    production_name_page_filesystem_limits_with_elapsed(MAX_NAME_PAGE_VALIDATION_ELAPSED)
 }
 
 fn production_name_page_compaction_filesystem_limits() -> NamePageFilesystemLimits {
-    production_name_page_filesystem_limits_with_elapsed(
-        MAX_NAME_PAGE_COMPACTION_ELAPSED,
-    )
+    production_name_page_filesystem_limits_with_elapsed(MAX_NAME_PAGE_COMPACTION_ELAPSED)
 }
 
 fn production_name_page_compaction_cleanup_limits() -> NamePageFilesystemLimits {
-    production_name_page_filesystem_limits_with_elapsed(
-        MAX_NAME_PAGE_COMPACTION_CLEANUP_ELAPSED,
-    )
+    production_name_page_filesystem_limits_with_elapsed(MAX_NAME_PAGE_COMPACTION_CLEANUP_ELAPSED)
 }
 
 fn name_page_error_contains_deadline(error: &anyhow::Error) -> bool {
@@ -6870,11 +6858,13 @@ impl NamePageStorage {
             })?;
         sync_directory(&directory)?;
         let height = best_block_tip_from_snapshot(&snapshot)?.map(|tip| tip.height);
-        let streamed = stream_name_page_tree_with_limits(
+        let streamed = stream_name_page_tree_with_limits_and_progress(
             &snapshot,
             durable_root,
             &mut appender,
             production_name_page_stream_limits(filesystem_limits.deadline),
+            Duration::MAX,
+            |_| {},
         )
         .map_err(anyhow::Error::new)
         .context("failed to stream bootstrap name pages")?;
@@ -7010,44 +7000,49 @@ impl NamePageStorage {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("name-page generation number exhausted"))?;
         let source_segment_count = self.state.manifest.active_segment.saturating_add(1);
-        let bytes_before =
-            name_page_generation_bytes(&self.directory, previous_generation, filesystem_limits)?;
-        remove_name_page_generation(&self.directory, generation, filesystem_limits)?;
-        let start = Instant::now();
-        tracing::info!(
-            phase = "planning",
-            previous_generation,
-            generation,
-            source_active_segment = self.state.manifest.active_segment,
-            source_segment_count,
-            source_bytes = bytes_before,
-            retained_root_threshold = NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
-            compaction_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
-            "starting pruned name-page generation compaction"
-        );
-
-        let snapshot = store.snapshot()?;
-        let retained_limits = RetainedNameTreeRootLimits {
-            deadline: filesystem_limits.deadline,
-            ..RetainedNameTreeRootLimits::default()
-        };
-        let retained_roots = retained_name_tree_roots_bounded(&snapshot, retained_limits)
-            .map_err(anyhow::Error::new)
-            .context("failed to select retained name roots")?
-            .roots;
-        if !retained_roots.contains(&self.state.root) {
-            anyhow::bail!("retained name roots omit the committed page root");
-        }
-
-        let old_records = collect_name_page_root_locators(
-            &snapshot,
-            production_name_page_root_locator_scan_limits(filesystem_limits.deadline),
-        )?;
-        let pin_heights =
-            startup_pin_minimum_root_heights(&snapshot, self.network, &retained_roots)?;
         let file_path = name_page_file_path(&self.directory, generation, 0);
+        let start = Instant::now();
+
         let mut commit_attempted = false;
         let staged = (|| -> Result<StagedNamePageCompaction> {
+            remove_name_page_generation(&self.directory, generation, cleanup_limits)?;
+            let bytes_before = name_page_generation_bytes(
+                &self.directory,
+                previous_generation,
+                filesystem_limits,
+            )?;
+            tracing::info!(
+                phase = "planning",
+                previous_generation,
+                generation,
+                source_active_segment = self.state.manifest.active_segment,
+                source_segment_count,
+                source_bytes = bytes_before,
+                retained_root_threshold = NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+                compaction_deadline_seconds =
+                    remaining_deadline_seconds(filesystem_limits.deadline),
+                "starting pruned name-page generation compaction"
+            );
+            let snapshot = store.snapshot()?;
+            let retained_limits = RetainedNameTreeRootLimits {
+                deadline: filesystem_limits.deadline,
+                ..RetainedNameTreeRootLimits::default()
+            };
+            let retained_roots = retained_name_tree_roots_bounded(&snapshot, retained_limits)
+                .map_err(anyhow::Error::new)
+                .context("failed to select retained name roots")?
+                .roots;
+            if !retained_roots.contains(&self.state.root) {
+                anyhow::bail!("retained name roots omit the committed page root");
+            }
+
+            let old_records = collect_name_page_root_locators(
+                &snapshot,
+                production_name_page_root_locator_scan_limits(filesystem_limits.deadline),
+            )?;
+            let pin_heights =
+                startup_pin_minimum_root_heights(&snapshot, self.network, &retained_roots)?;
+
             ensure_name_page_filesystem_deadline(filesystem_limits, "name-page compaction output")?;
             ensure_name_page_output_capacity(
                 &self.directory,
@@ -7190,11 +7185,11 @@ impl NamePageStorage {
                     })?;
                 let records_before_delta = records_written;
                 let pages_before_delta = pages_written;
-                let bytes_before_delta = pages_before_delta
-                    .saturating_mul(hns_store::NAME_PAGE_BYTES as u64);
-                let retained_roots_completed = u64::try_from(index + 1)
-                    .expect("retained root index fits u64");
-            let delta = stream_name_page_tree_delta_with_limits_and_progress(
+                let bytes_before_delta =
+                    pages_before_delta.saturating_mul(hns_store::NAME_PAGE_BYTES as u64);
+                let retained_roots_completed =
+                    u64::try_from(index + 1).expect("retained root index fits u64");
+                let delta = stream_name_page_tree_delta_with_limits_and_progress(
                     &source_snapshot,
                     root,
                     &mut appender,
@@ -7318,10 +7313,18 @@ impl NamePageStorage {
                     "injected synthetic name-page compaction commit failure"
                 ));
             }
-            Ok((next, appender, records_written, pages_written, published))
+            Ok((
+                next,
+                appender,
+                records_written,
+                pages_written,
+                published,
+                bytes_before,
+            ))
         })();
 
-        let (next, appender, records_written, pages_written, published) = match staged {
+        let (next, appender, records_written, pages_written, published, bytes_before) = match staged
+        {
             Ok(staged) => staged,
             Err(error) if !commit_attempted => {
                 remove_name_page_generation(
@@ -7348,8 +7351,6 @@ impl NamePageStorage {
                 return Err(error);
             }
         };
-        drop(snapshot);
-
         self.appender.take();
         self.file_path = file_path;
         self.state = next;
@@ -7880,8 +7881,7 @@ fn remove_name_page_generation(
             "failed to scan name-page generation cleanup directory {}: {error}",
             directory.display()
         ))
-    })?
-    {
+    })? {
         ensure_name_page_filesystem_deadline(limits, "name-page generation directory scan")?;
         let entry = entry.map_err(|error| {
             PageTreeError::Io(format!(
@@ -12585,11 +12585,7 @@ impl NodeState {
         }
         let report = match name_pages.compact_generation(&self.store) {
             Ok(report) => report,
-            Err(error)
-                if error
-                    .downcast_ref::<NamePageCompactionDeferred>()
-                    .is_some() =>
-            {
+            Err(error) if error.downcast_ref::<NamePageCompactionDeferred>().is_some() => {
                 tracing::warn!(
                     error = %error,
                     generation =
@@ -14121,6 +14117,7 @@ mod tests {
     use hns_state::StateEngine;
     use hns_state::{
         name_tree_snapshot_pin_key, write_coin_to_batch, RejectSpecialCoinbaseIssuance, StateView,
+        NAME_PAGE_VALIDATION_RECORD_BYTES,
     };
     use hns_store::ReadSnapshot;
     use hns_urkel::MemoryUrkel;
@@ -14183,26 +14180,17 @@ mod tests {
         image
     }
 
-    fn commit_test_name_page_seal(
-        state: &mut NodeState,
-        height: Height,
-    ) -> Result<()> {
+    fn commit_test_name_page_seal(state: &mut NodeState, height: Height) -> Result<()> {
         let store = state.store.clone();
 
         let pages = state
             .name_pages
             .as_mut()
-            .ok_or_else(|| {
-                anyhow::anyhow!("test state has no name-page storage")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("test state has no name-page storage"))?;
 
         let snapshot = store.snapshot()?;
 
-        let (reader, legacy) = pages.reader_for_roots(
-            &snapshot,
-            std::iter::empty(),
-            false,
-        )?;
+        let (reader, legacy) = pages.reader_for_roots(&snapshot, std::iter::empty(), false)?;
 
         if legacy {
             anyhow::bail!(
@@ -14240,9 +14228,7 @@ mod tests {
         directory: PathBuf,
     }
 
-    fn build_test_node_page_generation(
-        record_count: usize,
-    ) -> NodePageGenerationFixture {
+    fn build_test_node_page_generation(record_count: usize) -> NodePageGenerationFixture {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
@@ -14256,8 +14242,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&directory);
 
-        let record_count = u32::try_from(record_count)
-            .expect("record count fits in test fixture index");
+        let record_count =
+            u32::try_from(record_count).expect("record count fits in test fixture index");
         let mut entries = Vec::with_capacity(record_count as usize);
         for index in 0..record_count {
             let mut key = [0u8; 32];
@@ -14269,6 +14255,8 @@ mod tests {
         let tree_records = tree.node_records().expect("test fixture records");
 
         let store = StoreHandle::memory();
+        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize fixture state");
         let mut batch = store.batch();
         for (record_root, raw) in tree_records {
             batch
@@ -14290,9 +14278,6 @@ mod tests {
             )
             .expect("test fixture commit tree root");
         store.commit(batch).expect("publish test fixture tree");
-
-        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
-            .expect("initialize fixture state");
         state.name_pages = Some(
             NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
                 .expect("open test fixture pages"),
@@ -14309,7 +14294,7 @@ mod tests {
         assert!(!legacy);
 
         let mut batch = store.batch();
-        let prepared = pages
+        let mut prepared = pages
             .prepare_root(
                 &snapshot,
                 &mut batch,
@@ -14322,11 +14307,37 @@ mod tests {
                 },
             )
             .expect("publish fixture root");
+        if prepared.committed_height.is_none() {
+            prepared.committed_height = Some(NAME_PAGE_SEGMENT_BLOCKS);
+        }
         drop(reader);
         drop(snapshot);
 
+        let prepared_raw = prepared.encode().expect("publish fixture state");
+        batch
+            .put(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY, &prepared_raw)
+            .expect("publish fixture state");
         store.commit(batch).expect("publish fixture root");
         pages.commit_prepared(prepared);
+        let fixture_state = pages.state.clone();
+        if let Some(locator) = fixture_state.root_locator() {
+            let mut batch = store.batch();
+            let record = NamePageRootRecord {
+                root: fixture_state.root,
+                locator,
+                height: fixture_state
+                    .committed_height
+                    .unwrap_or(NAME_PAGE_SEGMENT_BLOCKS),
+            };
+            batch
+                .put(
+                    ColumnFamily::Snapshots,
+                    &name_page_root_key(fixture_state.root),
+                    &record.encode(),
+                )
+                .expect("publish fixture root locator");
+            store.commit(batch).expect("publish fixture root locator");
+        }
 
         NodePageGenerationFixture {
             live_state: state,
@@ -14846,32 +14857,23 @@ mod tests {
         );
 
         let store_before = complete_store_image(&store);
-        let before = state
-            .name_pages
-            .as_ref()
-            .expect("page storage");
+        let before = state.name_pages.as_ref().expect("page storage");
         let before_generation = before.state.manifest.generation;
         let before_active_segment = before.state.manifest.active_segment;
-        let expected_path = name_page_file_path(
-            &directory,
-            before_generation,
-            before_active_segment + 1,
-        );
+        let expected_path =
+            name_page_file_path(&directory, before_generation, before_active_segment + 1);
 
         commit_test_name_page_seal(&mut state, NAME_PAGE_SEGMENT_BLOCKS)
             .expect("commit synthetic segment seal");
 
-        let after = state
-            .name_pages
-            .as_ref()
-            .expect("page storage");
+        let after = state.name_pages.as_ref().expect("page storage");
         let after_active_segment = after.state.manifest.active_segment;
         assert_eq!(after_active_segment, before_active_segment + 1);
         assert_eq!(after.state.manifest.generation, before_generation);
         assert!(expected_path.exists());
         let snapshot = store.snapshot().expect("store snapshot");
         assert!(snapshot
-            .get(ColumnFamily::Snapshots, &NAME_PAGE_STATE_KEY)
+            .get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)
             .expect("read page state")
             .is_some());
         drop(snapshot);
@@ -14966,11 +14968,8 @@ mod tests {
     fn compact_generation_validation_and_compaction_deadlines_are_distinct() {
         let store = StoreHandle::memory();
         let snapshot = store.snapshot().expect("deadline snapshot");
-        let validation_limits = production_name_page_validation_limits(
-            &snapshot,
-            Network::Regtest,
-        )
-        .expect("validation limits");
+        let validation_limits = production_name_page_validation_limits(&snapshot, Network::Regtest)
+            .expect("validation limits");
         let compaction_limits = production_name_page_compaction_filesystem_limits();
 
         assert_eq!(
@@ -14997,8 +14996,8 @@ mod tests {
 
     #[test]
     fn compact_generation_deferred_on_pre_publication_deadline() {
-        let fixture = build_test_node_page_generation(512);
-        let mut pages = fixture
+        let mut fixture = build_test_node_page_generation(512);
+        let pages = fixture
             .live_state
             .name_pages
             .as_mut()
@@ -15027,47 +15026,62 @@ mod tests {
             "deferred compaction must not become a production safety fence",
         );
         assert_eq!(
-            pages.state.manifest.generation,
-            previous_generation,
+            pages.state.manifest.generation, previous_generation,
             "authority should remain on pre-publication timeout"
         );
         assert!(
-            !name_page_file_path(
-                &fixture.directory,
-                previous_generation.saturating_add(1),
-                0,
-            )
-            .exists(),
+            !name_page_file_path(&fixture.directory, previous_generation.saturating_add(1), 0,)
+                .exists(),
             "deferred compaction must not leave unpublished candidate files"
         );
     }
 
     #[test]
     fn compact_generation_cleanup_failure_is_a_typed_storage_fence() {
-        let fixture = build_test_node_page_generation(512);
-        let mut pages = fixture
+        let mut fixture = build_test_node_page_generation(512);
+        let pages = fixture
             .live_state
             .name_pages
             .as_mut()
             .expect("fixture pages");
         let previous_generation = pages.state.manifest.generation;
-        let tree_root = pages.state.root;
 
         let mut batch = fixture.store.batch();
-        batch.delete(ColumnFamily::NameTreeNodes, tree_root.as_bytes());
+        for index in 1..=MAX_NAME_PAGE_ROOT_LOCATORS
+            .checked_add(1)
+            .expect("overflow")
+        {
+            let mut raw_root = [0u8; 32];
+            raw_root[..8].copy_from_slice(&index.to_le_bytes());
+            let root = TreeRoot::new(raw_root);
+            let record = NamePageRootRecord {
+                root,
+                locator: NamePageRootLocator {
+                    generation: previous_generation,
+                    address: index,
+                },
+                height: 1,
+            };
+            batch
+                .put(
+                    ColumnFamily::Snapshots,
+                    &name_page_root_key(root),
+                    &record.encode(),
+                )
+                .expect("publish fixture root locator");
+        }
         fixture
             .store
             .commit(batch)
             .expect("remove fixture root node");
 
         let compact_limits = production_name_page_compaction_filesystem_limits();
-        let cleanup_limits = production_name_page_filesystem_limits_with_elapsed(Duration::ZERO);
+        let cleanup_limits = NamePageFilesystemLimits {
+            max_directory_entries: 0,
+            ..production_name_page_compaction_cleanup_limits()
+        };
         let error = pages
-            .compact_generation_with_limits(
-                &fixture.store,
-                compact_limits,
-                cleanup_limits,
-            )
+            .compact_generation_with_limits(&fixture.store, compact_limits, cleanup_limits)
             .expect_err("cleanup failure should be returned by the compaction path");
 
         assert!(
@@ -15083,16 +15097,15 @@ mod tests {
             "cleanup failure should produce typed production fence",
         );
         assert_eq!(
-            pages.state.manifest.generation,
-            previous_generation,
+            pages.state.manifest.generation, previous_generation,
             "failed cleanup should not commit any new generation",
         );
     }
 
     #[test]
     fn compact_generation_commit_attempt_failure_preserves_fail_closed() {
-        let fixture = build_test_node_page_generation(512);
-        let mut pages = fixture
+        let mut fixture = build_test_node_page_generation(512);
+        let pages = fixture
             .live_state
             .name_pages
             .as_mut()
@@ -15123,36 +15136,22 @@ mod tests {
             "commit-attempt error should disable stale appender",
         );
         assert_eq!(
-            pages.state.manifest.generation,
-            previous_generation,
+            pages.state.manifest.generation, previous_generation,
             "commit-attempt error should not update in-memory manifest",
         );
     }
 
     #[test]
     fn near_envelope_generation_audits_compacts_and_reopens() {
-        const TEST_RECORDS: u64 = 512;
-
-        let spill_bytes = TEST_RECORDS
-            .checked_mul(
-                NAME_PAGE_VALIDATION_RECORD_BYTES as u64,
-            )
-            .expect("spill bytes");
-
-        let fixture = build_test_node_page_generation(
-            TEST_RECORDS as usize,
-        );
+        let fixture = build_test_node_page_generation(512);
 
         // Simulate process exit.
         drop(fixture.live_state);
 
         let store = fixture.store.clone();
-        let mut pages = NamePageStorage::open_or_bootstrap(
-            fixture.directory.clone(),
-            &store,
-            Network::Regtest,
-        )
-        .expect("reopen near-envelope generation");
+        let mut pages =
+            NamePageStorage::open_or_bootstrap(fixture.directory.clone(), &store, Network::Regtest)
+                .expect("reopen near-envelope generation");
 
         let snapshot = store.snapshot().expect("near-envelope snapshot");
         let (reader, legacy) = pages
@@ -15164,10 +15163,8 @@ mod tests {
         let limits = name_page_validation_limits_with_spill(
             &snapshot,
             Network::Regtest,
-            spill_bytes,
-            now
-                .checked_add(Duration::from_secs(30))
-                .unwrap_or(now),
+            u64::MAX,
+            now.checked_add(Duration::from_secs(30)).unwrap_or(now),
         )
         .expect("test limits");
 
@@ -15175,10 +15172,24 @@ mod tests {
             .validate_committed_pages_with_limits(limits)
             .expect("audit near spill envelope");
 
-        assert_eq!(
-            validation.records,
-            TEST_RECORDS,
-        );
+        let spill_bytes = validation
+            .records
+            .checked_mul(NAME_PAGE_VALIDATION_RECORD_BYTES as u64)
+            .expect("spill bytes");
+
+        let near_limits = name_page_validation_limits_with_spill(
+            &snapshot,
+            Network::Regtest,
+            spill_bytes,
+            now.checked_add(Duration::from_secs(30)).unwrap_or(now),
+        )
+        .expect("test limits");
+
+        let near_validation = reader
+            .validate_committed_pages_with_limits(near_limits)
+            .expect("audit near spill envelope");
+
+        assert_eq!(near_validation.records, validation.records);
 
         drop(reader);
         drop(snapshot);
@@ -15189,33 +15200,19 @@ mod tests {
             .compact_generation(&store)
             .expect("compact near-envelope generation");
 
-        assert_eq!(
-            report.previous_generation,
-            previous_generation,
-        );
-        assert!(
-            report.generation > previous_generation,
-        );
+        assert_eq!(report.previous_generation, previous_generation,);
+        assert!(report.generation > previous_generation,);
 
         drop(pages);
 
         // Second restart proves publication and cleanup left
         // a self-consistent generation.
-        let reopened = NamePageStorage::open_or_bootstrap(
-            fixture.directory.clone(),
-            &store,
-            Network::Regtest,
-        )
-        .expect("reopen compacted generation");
+        let reopened =
+            NamePageStorage::open_or_bootstrap(fixture.directory.clone(), &store, Network::Regtest)
+                .expect("reopen compacted generation");
 
-        assert_eq!(
-            reopened.state.manifest.generation,
-            report.generation,
-        );
-        assert_eq!(
-            reopened.state.manifest.active_segment,
-            0,
-        );
+        assert_eq!(reopened.state.manifest.generation, report.generation,);
+        assert_eq!(reopened.state.manifest.active_segment, 0,);
 
         drop(reopened);
         std::fs::remove_dir_all(fixture.directory).expect("remove restart fixture");
@@ -15759,7 +15756,9 @@ mod tests {
         )
         .expect_err("wrong digest should not clear fence");
         assert!(
-            error.to_string().contains("production safety-fence digest changed"),
+            error
+                .to_string()
+                .contains("production safety-fence digest changed"),
             "{error:#}"
         );
 
@@ -23707,12 +23706,17 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&directory);
-
         let store = StoreHandle::memory();
+
         let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
             .expect("initialize runtime state");
+        state.store = state
+            .store
+            .clone()
+            .with_segment_archive(directory.join("segment-archive"))
+            .expect("attach test segment archive");
         state.name_pages = Some(
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+            NamePageStorage::open_or_bootstrap(directory.clone(), &state.store, Network::Regtest)
                 .expect("open name pages"),
         );
         let initial_generation = state
@@ -23749,26 +23753,19 @@ mod tests {
                 .expect("seal height");
 
             writer
-                .execute(None, "test online name-page compaction commit", move |service| {
-                    commit_test_name_page_seal(&mut service.state, height)
-                })
+                .execute(
+                    None,
+                    "test online name-page compaction commit",
+                    move |service| commit_test_name_page_seal(&mut service.state, height),
+                )
                 .await
                 .expect("commit synthetic seal");
 
-            if let Some(due) = read
-                .name_page_compaction_due()
-                .expect("read due state")
-            {
+            if let Some(due) = read.name_page_compaction_due().expect("read due state") {
                 let report = writer
-                    .execute_at_chain(
-                        due.epoch,
-                        "test online name-page compaction",
-                        |service| {
-                            service
-                                .state
-                                .compact_pruned_name_pages_if_due()
-                        },
-                    )
+                    .execute_at_chain(due.epoch, "test online name-page compaction", |service| {
+                        service.state.compact_pruned_name_pages_if_due()
+                    })
                     .await
                     .expect("writer compaction")
                     .expect("generation rewrite");
@@ -23795,7 +23792,11 @@ mod tests {
             );
         }
 
-        assert_eq!(reports.len(), 1, "nineteen seals should cross the threshold once");
+        assert_eq!(
+            reports.len(),
+            1,
+            "nineteen seals should cross the threshold once"
+        );
 
         let final_report = &reports[0];
         assert_eq!(final_report.previous_generation, initial_generation);
@@ -23803,12 +23804,11 @@ mod tests {
 
         let (final_active_segment, final_generation) = writer
             .execute(None, "read final state", |service| {
-                let pages = service
-                    .state
-                    .name_pages
-                    .as_ref()
-                    .expect("pages");
-                Ok((pages.state.manifest.active_segment, pages.state.manifest.generation))
+                let pages = service.state.name_pages.as_ref().expect("pages");
+                Ok((
+                    pages.state.manifest.active_segment,
+                    pages.state.manifest.generation,
+                ))
             })
             .await
             .expect("read final state");
