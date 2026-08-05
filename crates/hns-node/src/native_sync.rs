@@ -2784,6 +2784,8 @@ impl NodeService {
             rpc_authorization,
             shutdown_rx.clone(),
         ));
+        let mut active_state_batch_tuner =
+            ActiveStateBatchTuner::new(native_sync_config.active_state_connect_batch);
 
         if native_sync_config.connect_active_state {
             let context = ActiveStateConnectionContext {
@@ -2875,8 +2877,6 @@ impl NodeService {
         let mut active_state_task: Option<JoinHandle<Result<NativeActiveStateSliceResult>>> = None;
         let mut active_state_completion: Option<NativeActiveStateSliceResult> = None;
         let mut consecutive_active_state_contention = 0usize;
-        let mut active_state_batch_tuner =
-            ActiveStateBatchTuner::new(native_sync_config.active_state_connect_batch);
         let mut consecutive_maintenance_busy = 0usize;
         let mut next_supervisor_lane = NativeSupervisorLane::Maintenance;
 
