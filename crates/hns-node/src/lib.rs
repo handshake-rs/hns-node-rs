@@ -14504,6 +14504,87 @@ mod tests {
     }
 
     #[test]
+    fn online_pruned_name_pages_compact_after_sixteen_segments() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+
+        let directory = test_root.join(format!(
+            "hsrd-online-name-page-compaction-{}-{nonce}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+
+        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize state");
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("open name pages"),
+        );
+        state.undo_retention_policy = Some(UndoRetentionPolicy::for_network(Network::Regtest));
+
+        let initial_generation = state
+            .name_pages
+            .as_ref()
+            .expect("name pages")
+            .state
+            .manifest
+            .generation;
+
+        let mut reports = Vec::new();
+
+        // Nineteen seals means the process passes the normal
+        // sixteen-segment threshold and continues operating
+        // after the generation rewrite.
+        for seal in 1_u32..=19 {
+            let height = seal
+                .checked_mul(NAME_PAGE_SEGMENT_BLOCKS)
+                .expect("seal height");
+
+            commit_test_name_page_seal(&mut state, height).expect("commit synthetic seal");
+
+            if let Some(report) = state
+                .compact_pruned_name_pages_if_due()
+                .expect("run online compaction")
+            {
+                reports.push(report);
+            }
+
+            let pages = state.name_pages.as_ref().expect("pages");
+            assert!(
+                pages.state.manifest.active_segment
+                    < NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+                "maintenance must rewrite the generation before another committed operation can leave it at or above the threshold"
+            );
+        }
+
+        assert_eq!(
+            reports.len(),
+            1,
+            "nineteen seals should cross the threshold once"
+        );
+
+        let report = &reports[0];
+        assert_eq!(report.previous_generation, initial_generation);
+        assert!(report.generation > initial_generation);
+
+        let pages = state.name_pages.as_ref().expect("pages");
+        assert_eq!(pages.state.manifest.generation, report.generation);
+        assert_eq!(pages.state.manifest.active_segment, 3);
+
+        drop(state);
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
     fn failed_name_page_tail_rollback_fences_node_storage() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -22838,6 +22919,134 @@ mod tests {
         assert!(read.published_mempool().is_err());
         assert!(!read.published().storage_operational());
         assert!(read.mining_snapshot().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn online_pruned_name_pages_compact_after_sixteen_segments_with_scheduler_writer() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-online-name-page-compaction-runtime-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize runtime state");
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("open name pages"),
+        );
+        let initial_generation = state
+            .name_pages
+            .as_ref()
+            .expect("name pages")
+            .state
+            .manifest
+            .generation;
+
+        let node = NodeService::with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                data_dir: Some(directory.clone()),
+                authority_mode: AuthorityMode::Disabled,
+                undo_retention: UndoRetentionConfig {
+                    prune_history: true,
+                },
+                ..NodeConfig::default()
+            },
+            state,
+        );
+        let runtime = NodeRuntime::spawn(node, 2).expect("runtime");
+        let read = runtime.read();
+        let writer = runtime.writer();
+        let mut reports = Vec::new();
+
+        // Nineteen seals means the process passes the normal
+        // sixteen-segment threshold and continues operating
+        // after the generation rewrite.
+        for seal in 1_u32..=19 {
+            let height = seal
+                .checked_mul(NAME_PAGE_SEGMENT_BLOCKS)
+                .expect("seal height");
+
+            writer
+                .execute(None, "test online name-page compaction commit", move |service| {
+                    commit_test_name_page_seal(&mut service.state, height)
+                })
+                .await
+                .expect("commit synthetic seal");
+
+            if let Some(due) = read
+                .name_page_compaction_due()
+                .expect("read due state")
+            {
+                let report = writer
+                    .execute_at_chain(
+                        due.epoch,
+                        "test online name-page compaction",
+                        |service| {
+                            service
+                                .state
+                                .compact_pruned_name_pages_if_due()
+                        },
+                    )
+                    .await
+                    .expect("writer compaction")
+                    .expect("generation rewrite");
+                assert_eq!(report.previous_generation, due.generation);
+                reports.push(report);
+            }
+
+            let active_segment = writer
+                .execute(None, "read active segment", |service| {
+                    Ok(service
+                        .state
+                        .name_pages
+                        .as_ref()
+                        .expect("pages")
+                        .state
+                        .manifest
+                        .active_segment)
+                })
+                .await
+                .expect("read pages");
+            assert!(
+                active_segment < NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+                "maintenance should rewrite generation as soon as the threshold is crossed"
+            );
+        }
+
+        assert_eq!(reports.len(), 1, "nineteen seals should cross the threshold once");
+
+        let final_report = &reports[0];
+        assert_eq!(final_report.previous_generation, initial_generation);
+        assert!(final_report.generation > initial_generation);
+
+        let (final_active_segment, final_generation) = writer
+            .execute(None, "read final state", |service| {
+                let pages = service
+                    .state
+                    .name_pages
+                    .as_ref()
+                    .expect("pages");
+                Ok((pages.state.manifest.active_segment, pages.state.manifest.generation))
+            })
+            .await
+            .expect("read final state");
+        assert_eq!(final_generation, final_report.generation);
+        assert_eq!(final_active_segment, 3);
+
+        runtime.shutdown().await.expect("runtime shutdown");
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
