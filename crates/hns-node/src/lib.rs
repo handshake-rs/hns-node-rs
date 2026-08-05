@@ -126,6 +126,7 @@ use hns_state::{
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
     load_stored_name_tree_root, migrate_name_tree_interval_accumulator_bounded, name_page_root_key,
     maximum_name_page_validation_records, name_tree_snapshot_pin_key, pack_name_page_records,
+    NAME_PAGE_VALIDATION_RECORD_BYTES,
     plan_name_tree_interval_accumulator_migration_bounded, retained_name_tree_roots_bounded,
     stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits,
     stream_name_page_tree_with_limits, validate_persisted_name_tree_overlays,
@@ -1223,22 +1224,35 @@ fn production_name_page_validation_limits(
     snapshot: &impl ReadSnapshot,
     network: Network,
 ) -> Result<NamePageValidationLimits> {
-    let pin_limits = startup_pin_scan_limits(snapshot, network)?;
     let now = Instant::now();
+    name_page_validation_limits_with_spill(
+        snapshot,
+        network,
+        MAX_NAME_PAGE_VALIDATION_SPILL_BYTES,
+        now.checked_add(MAX_NAME_PAGE_VALIDATION_ELAPSED)
+            .unwrap_or(now),
+    )
+}
+
+fn name_page_validation_limits_with_spill(
+    snapshot: &impl ReadSnapshot,
+    network: Network,
+    maximum_spill_bytes: u64,
+    deadline: Instant,
+) -> Result<NamePageValidationLimits> {
+    let pin_limits = startup_pin_scan_limits(snapshot, network)?;
     Ok(NamePageValidationLimits {
         max_segments: MAX_NAME_PAGE_SEGMENTS,
         max_pages: MAX_NAME_PAGE_GENERATION_BYTES / hns_store::NAME_PAGE_BYTES as u64,
-        max_records: MAX_NAME_PAGE_VALIDATION_RECORDS,
+        max_records: maximum_name_page_validation_records(maximum_spill_bytes),
         max_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
-        max_spill_bytes: MAX_NAME_PAGE_VALIDATION_SPILL_BYTES,
+        max_spill_bytes: maximum_spill_bytes,
         max_published_roots: pin_limits
             .max_records
             .checked_add(2)
             .ok_or_else(|| anyhow::anyhow!("startup published name-page root limit overflow"))?,
-        minimum_filesystem_reserve_bytes: MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
-        deadline: now
-            .checked_add(MAX_NAME_PAGE_VALIDATION_ELAPSED)
-            .unwrap_or(now),
+        minimum_filesystem_reserve_bytes: 0,
+        deadline,
     })
 }
 
@@ -13957,6 +13971,107 @@ mod tests {
         Ok(())
     }
 
+    struct NodePageGenerationFixture {
+        live_state: NodeState,
+        store: StoreHandle,
+        directory: PathBuf,
+    }
+
+    fn build_test_node_page_generation(
+        record_count: usize,
+    ) -> NodePageGenerationFixture {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-name-page-generation-{}-{nonce}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let record_count = u32::try_from(record_count)
+            .expect("record count fits in test fixture index");
+        let mut entries = Vec::with_capacity(record_count as usize);
+        for index in 0..record_count {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&index.to_le_bytes());
+            entries.push((NameHash::new(key), index.to_le_bytes().to_vec()));
+        }
+        let tree = MemoryUrkel::from_entries(entries).expect("test fixture tree");
+        let tree_root = tree.root();
+        let tree_records = tree.node_records().expect("test fixture records");
+
+        let store = StoreHandle::memory();
+        let mut batch = store.batch();
+        for (record_root, raw) in tree_records {
+            batch
+                .put(ColumnFamily::NameTreeNodes, record_root.as_bytes(), &raw)
+                .expect("test fixture node");
+        }
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                tree_root.as_bytes(),
+            )
+            .expect("test fixture tree root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                tree_root.as_bytes(),
+            )
+            .expect("test fixture commit tree root");
+        store.commit(batch).expect("publish test fixture tree");
+
+        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize fixture state");
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("open test fixture pages"),
+        );
+
+        let snapshot = store.snapshot().expect("fixture snapshot");
+        let pages = state
+            .name_pages
+            .as_mut()
+            .expect("fixture state has name pages");
+        let (reader, legacy) = pages
+            .reader_for_roots(&snapshot, std::iter::empty(), false)
+            .expect("fixture reader");
+        assert!(!legacy);
+
+        let mut batch = store.batch();
+        let prepared = pages
+            .prepare_root(
+                &snapshot,
+                &mut batch,
+                &reader,
+                BTreeMap::new(),
+                &[],
+                NamePageRootTarget {
+                    root: tree_root,
+                    height: Some(NAME_PAGE_SEGMENT_BLOCKS),
+                },
+            )
+            .expect("publish fixture root");
+        drop(reader);
+        drop(snapshot);
+
+        store.commit(batch).expect("publish fixture root");
+        pages.commit_prepared(prepared);
+
+        NodePageGenerationFixture {
+            live_state: state,
+            store: store.clone(),
+            directory,
+        }
+    }
+
     #[cfg(feature = "rocksdb-backend")]
     fn flat_directory_file_image(directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
         let mut image = std::fs::read_dir(directory)
@@ -14582,6 +14697,98 @@ mod tests {
         drop(state);
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn near_envelope_generation_audits_compacts_and_reopens() {
+        const TEST_RECORDS: u64 = 512;
+
+        let spill_bytes = TEST_RECORDS
+            .checked_mul(
+                NAME_PAGE_VALIDATION_RECORD_BYTES as u64,
+            )
+            .expect("spill bytes");
+
+        let fixture = build_test_node_page_generation(
+            TEST_RECORDS as usize,
+        );
+
+        // Simulate process exit.
+        drop(fixture.live_state);
+
+        let store = fixture.store.clone();
+        let mut pages = NamePageStorage::open_or_bootstrap(
+            fixture.directory.clone(),
+            &store,
+            Network::Regtest,
+        )
+        .expect("reopen near-envelope generation");
+
+        let snapshot = store.snapshot().expect("near-envelope snapshot");
+        let (reader, legacy) = pages
+            .reader_for_roots(&snapshot, std::iter::empty(), false)
+            .expect("open near-envelope reader");
+        assert!(!legacy);
+
+        let now = Instant::now();
+        let limits = name_page_validation_limits_with_spill(
+            &snapshot,
+            Network::Regtest,
+            spill_bytes,
+            now
+                .checked_add(Duration::from_secs(30))
+                .unwrap_or(now),
+        )
+        .expect("test limits");
+
+        let validation = reader
+            .validate_committed_pages_with_limits(limits)
+            .expect("audit near spill envelope");
+
+        assert_eq!(
+            validation.records,
+            TEST_RECORDS,
+        );
+
+        drop(reader);
+        drop(snapshot);
+
+        let previous_generation = pages.state.manifest.generation;
+
+        let report = pages
+            .compact_generation(&store)
+            .expect("compact near-envelope generation");
+
+        assert_eq!(
+            report.previous_generation,
+            previous_generation,
+        );
+        assert!(
+            report.generation > previous_generation,
+        );
+
+        drop(pages);
+
+        // Second restart proves publication and cleanup left
+        // a self-consistent generation.
+        let reopened = NamePageStorage::open_or_bootstrap(
+            fixture.directory.clone(),
+            &store,
+            Network::Regtest,
+        )
+        .expect("reopen compacted generation");
+
+        assert_eq!(
+            reopened.state.manifest.generation,
+            report.generation,
+        );
+        assert_eq!(
+            reopened.state.manifest.active_segment,
+            0,
+        );
+
+        drop(reopened);
+        std::fs::remove_dir_all(fixture.directory).expect("remove restart fixture");
     }
 
     #[test]
