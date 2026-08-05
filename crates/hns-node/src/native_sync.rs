@@ -76,6 +76,7 @@ use super::{
     rpc_odoh_info, rpc_point_read_method, AuthorityMode, CanonicalChainEpoch, CanonicalStateWriter,
     CanonicalWriterError, ChainActivationFailure, DurableMiningState, FailedBlockMutation,
     FailedBlockStage, HeaderSummary, NativeRuntimeExtension, NodeBlockImport, NodeReadHandle,
+    NamePageCompactionReport,
     NodeReorg, NodeReorgLimits, NodeRuntime, NodeService, PreparedNativeActivation,
     ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits, RpcReadContext, RpcRuntimeLimits,
     ShutdownSignal, StatelessBodyValidation, HSRD_DIAGNOSTIC_API_VERSION,
@@ -1156,6 +1157,8 @@ struct NativeActiveStateSliceResult {
     next_connect_limit: usize,
 }
 
+type NamePageCompactionTask = JoinHandle<Result<Option<NamePageCompactionReport>>>;
+
 #[derive(Debug)]
 struct ActiveStateBatchTuner {
     next_limit: usize,
@@ -1182,6 +1185,41 @@ impl ActiveStateBatchTuner {
             self.next_limit = self.next_limit.saturating_add(increase).min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
         }
     }
+}
+
+fn schedule_name_page_compaction_if_due(
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
+    task: &mut Option<NamePageCompactionTask>,
+) -> Result<bool> {
+    if task.is_some() {
+        return Ok(false);
+    }
+
+    let Some(due) = node.name_page_compaction_due()? else {
+        return Ok(false);
+    };
+
+    tracing::info!(
+        generation = due.generation,
+        active_segment = due.active_segment,
+        threshold = NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+        "scheduling online pruned name-page compaction"
+    );
+
+    let writer = writer.clone();
+
+    *task = Some(tokio::spawn(async move {
+        writer
+            .execute_at_chain(
+                due.epoch,
+                "compact pruned name-page generation",
+                move |service| service.compact_pruned_name_pages_if_due(),
+            )
+            .await
+    }));
+
+    Ok(true)
 }
 
 struct ActiveStateWorkerPermit {
@@ -2876,6 +2914,7 @@ impl NodeService {
         let mut terminal_error: Option<anyhow::Error> = None;
         let mut active_state_task: Option<JoinHandle<Result<NativeActiveStateSliceResult>>> = None;
         let mut active_state_completion: Option<NativeActiveStateSliceResult> = None;
+        let mut name_page_compaction_task: Option<NamePageCompactionTask> = None;
         let mut consecutive_active_state_contention = 0usize;
         let mut consecutive_maintenance_busy = 0usize;
         let mut next_supervisor_lane = NativeSupervisorLane::Maintenance;
@@ -2916,6 +2955,7 @@ impl NodeService {
                 _ = active_state_poll.tick(),
                     if native_sync_config.connect_active_state
                         && active_state_task.is_none()
+                        && name_page_compaction_task.is_none()
                         && (active_state_completion.is_some()
                             || active_state_work_ready(&scheduler)) =>
                 {
@@ -3080,6 +3120,84 @@ impl NodeService {
                         }
                     }
                 }
+                result = async {
+                    name_page_compaction_task
+                        .as_mut()
+                        .expect("name-page compaction task select guard")
+                        .await
+                }, if name_page_compaction_task.is_some() => {
+                    let _finished = name_page_compaction_task
+                        .take()
+                        .expect("completed name-page compaction task remains present");
+
+                    match result {
+                        Ok(Ok(Some(report))) => {
+                            tracing::info!(
+                                previous_generation = report.previous_generation,
+                                generation = report.generation,
+                                retained_roots = report.retained_roots,
+                                records_written = report.records_written,
+                                pages_written = report.pages_written,
+                                reclaimed_bytes = report.reclaimed_bytes,
+                                "online pruned name-page compaction completed"
+                            );
+
+                            active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
+                        }
+
+                        Ok(Ok(None)) => {
+                            // The generation may have been compacted by a
+                            // preceding command, or a resource failure may
+                            // have installed a durable safety fence.
+                            tracing::debug!(
+                                "online name-page compaction completed without a generation rewrite"
+                            );
+                        }
+
+                        Ok(Err(error))
+                            if canonical_writer_contention(&error) =>
+                        {
+                            tracing::debug!(
+                                %error,
+                                "online name-page compaction lost its canonical epoch; it will be reconsidered"
+                            );
+
+                            reset_native_supervisor_poll(
+                                &mut poll,
+                                native_sync_config.poll_interval,
+                            );
+                        }
+
+                        Ok(Err(error)) => {
+                            let error = error.context(
+                                "online pruned name-page compaction failed",
+                            );
+
+                            record_error(
+                                &diagnostics,
+                                format!("{error:#}"),
+                            )
+                            .await;
+
+                            terminal_error = Some(error);
+                            break;
+                        }
+
+                        Err(error) => {
+                            let error = anyhow::Error::new(error)
+                                .context("online name-page compaction task failed");
+
+                            record_error(
+                                &diagnostics,
+                                format!("{error:#}"),
+                            )
+                            .await;
+
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    }
+                }
                 event = next_native_supervisor_event(
                     &mut next_supervisor_lane,
                     &mut poll,
@@ -3109,6 +3227,42 @@ impl NodeService {
                             "deferred maintenance while canonical active-state commit is in flight"
                         );
                         continue;
+                    }
+                    if active_state_task.is_none()
+                        && active_state_completion.is_none()
+                    {
+                        match schedule_name_page_compaction_if_due(
+                            &node,
+                            &writer,
+                            &mut name_page_compaction_task,
+                        ) {
+                            Ok(_) => {}
+
+                            Err(error)
+                                if canonical_writer_contention(&error) =>
+                            {
+                                tracing::debug!(
+                                    %error,
+                                    "online name-page compaction scheduling raced canonical publication"
+                                );
+                            }
+
+                            Err(error) => {
+                                let error = error.context(
+                                    "failed to schedule online \
+                                     name-page compaction",
+                                );
+
+                                record_error(
+                                    &diagnostics,
+                                    format!("{error:#}"),
+                                )
+                                .await;
+
+                                terminal_error = Some(error);
+                                break;
+                            }
+                        }
                     }
                     if listener_task.as_ref().is_some_and(|task| task.is_finished()) {
                         let message = "Native sync P2P listener terminated unexpectedly".to_owned();

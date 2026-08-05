@@ -3906,7 +3906,7 @@ impl NodeService {
             state.prune_undo_history_to_policy()?;
             if config.data_dir.is_some() {
                 state.compact_pruned_payload_segments_if_due()?;
-                state.compact_pruned_name_pages_if_due()?;
+                let _ = state.compact_pruned_name_pages_if_due()?;
             }
         }
 
@@ -12313,13 +12313,13 @@ impl NodeState {
         Ok(())
     }
 
-    fn compact_pruned_name_pages_if_due(&mut self) -> Result<()> {
+    fn compact_pruned_name_pages_if_due(&mut self) -> Result<Option<NamePageCompactionReport>> {
         self.ensure_storage_operational()?;
         let Some(name_pages) = self.name_pages.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         if name_pages.state.manifest.active_segment < NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD {
-            return Ok(());
+            return Ok(None);
         }
         let report = match name_pages.compact_generation(&self.store) {
             Ok(report) => report,
@@ -12333,21 +12333,12 @@ impl NodeState {
                         error = %error,
                         "deferred name-page compaction behind a durable production safety fence"
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
                 return Err(error).context("failed to compact pruned name pages");
             }
         };
-        tracing::info!(
-            previous_generation = report.previous_generation,
-            generation = report.generation,
-            retained_roots = report.retained_roots,
-            records_written = report.records_written,
-            pages_written = report.pages_written,
-            reclaimed_bytes = report.reclaimed_bytes,
-            "compacted retained name roots into a fresh page generation"
-        );
-        Ok(())
+        Ok(Some(report))
     }
 }
 
