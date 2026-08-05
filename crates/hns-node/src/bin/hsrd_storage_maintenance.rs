@@ -43,7 +43,7 @@ const DEFAULT_MIN_COMPACTION_RECLAIM_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Debug, Parser)]
 #[command(
     about = "Audit or migrate hsrd block/undo segments while the node is stopped",
-    long_about = "Audit or migrate hsrd block/undo segments while the node is stopped. The data directory must contain the exact .hsrd-storage-maintenance marker documented in storage-schema.md, and the database must have a clean-shutdown marker.",
+    long_about = "Audit or migrate hsrd block/undo segments while the node is stopped. The data directory must contain the exact .hsrd-storage-maintenance marker documented in storage-schema.md. For most operations, the database must also have a clean-shutdown marker; fence-inspect and fence-clear are allowed on an unclean store for recovery workflows.",
     version = env!("CARGO_PKG_VERSION")
 )]
 struct Arguments {
@@ -257,7 +257,14 @@ fn run() -> Result<()> {
         durability: DurabilityPolicy::Sync,
     })
     .context("failed to acquire the offline hsrd RocksDB")?;
-    let identity = validate_clean_store(&raw)?;
+    let identity = validate_store_identity(&raw)?;
+    let fence_operation = matches!(
+        &arguments.command,
+        Command::FenceInspect | Command::FenceClear { .. }
+    );
+    if !fence_operation {
+        require_clean_store(&raw)?;
+    }
     if let Command::Backup { backup_dir } = &arguments.command {
         let output = create_fallback_backup(&data_dir, backup_dir, &raw, identity)?;
         return write_output(&output);
@@ -507,7 +514,7 @@ fn require_offline_maintenance_root(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn validate_clean_store(store: &hns_store::StoreHandle) -> Result<StoreIdentity> {
+fn validate_store_identity(store: &hns_store::StoreHandle) -> Result<StoreIdentity> {
     let snapshot = store.snapshot()?;
     let schema = snapshot
         .get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())?
@@ -527,16 +534,21 @@ fn validate_clean_store(store: &hns_store::StoreHandle) -> Result<StoreIdentity>
             String::from_utf8_lossy(&profile)
         );
     }
+    Ok(StoreIdentity {
+        storage_schema: schema,
+        storage_profile: String::from_utf8_lossy(&profile).into_owned(),
+    })
+}
+
+fn require_clean_store(store: &hns_store::StoreHandle) -> Result<()> {
+    let snapshot = store.snapshot()?;
     let clean = snapshot
         .get(ColumnFamily::Meta, MetaKey::CleanShutdown.as_bytes())?
         .context("clean-shutdown marker is missing")?;
     if clean.as_slice() != [1] {
         bail!("storage maintenance requires an explicit clean node shutdown");
     }
-    Ok(StoreIdentity {
-        storage_schema: schema,
-        storage_profile: String::from_utf8_lossy(&profile).into_owned(),
-    })
+    Ok(())
 }
 
 fn require_current_store(identity: &StoreIdentity) -> Result<()> {
@@ -757,7 +769,7 @@ mod tests {
         .expect("open source");
         initialize_schema(&store).expect("initialize source");
         mark_clean_shutdown(&store).expect("mark source clean");
-        let identity = validate_clean_store(&store).expect("validate source");
+        let identity = validate_store_identity(&store).expect("validate source");
 
         let manifest =
             create_fallback_backup(&source, &backup, &store, identity).expect("create fallback");
@@ -790,7 +802,7 @@ mod tests {
             durability: DurabilityPolicy::Sync,
         })
         .expect("reopen checkpoint");
-        validate_clean_store(&reopened).expect("validate checkpoint");
+        validate_store_identity(&reopened).expect("validate checkpoint");
         drop(reopened);
         fs::remove_dir_all(root).expect("remove backup fixture");
     }

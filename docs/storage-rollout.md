@@ -2,8 +2,10 @@
 
 This procedure is deliberately offline. It preserves one known-good data root
 before changing schema/profile markers or replacing inline block and undo
-values. Never run the maintenance command against a node that did not complete
-its clean shutdown.
+values. Never run mutating maintenance commands against a node that did not
+complete its clean shutdown. Recovery-only `fence-inspect` and `fence-clear`
+operations remain available for an unclean store when explicit offline recovery is
+required.
 
 ## Safety invariants
 
@@ -16,7 +18,9 @@ its clean shutdown.
   `hsrd-storage-maintenance-v1\n` is required by the maintenance command.
 - The normal node refuses to start while that marker exists.
 - RocksDB's process lock and the durable clean-shutdown byte must both agree
-  that the node is offline.
+  that the node is offline for all mutating maintenance commands (`backup`,
+  `inventory`, `compact`, `migrate-inline`), while `fence-inspect` and
+  `fence-clear` are explicitly allowed on an unclean store.
 - A fallback backup publishes `.hsrd-storage-fallback.json` last. Its absence
   means the backup is incomplete and must not be used.
 - The RocksDB portion is a native consistent checkpoint. External name-page
@@ -105,6 +109,29 @@ cutover. Schema 16 runs the resumable, backup-first interval-accumulator
 migration. Existing schema-18 pages remain readable; all new name pages use
 authenticated subpages. The node bootstraps missing name pages and block/undo
 manifests. Ambiguous marker combinations fail closed.
+
+## 2b. Inspect and clear production safety fences on an unclean store
+
+An unclean restart can leave a production safety fence in place. This recovery
+path inspects and optionally clears only the exact inspected fence:
+
+```sh
+target/release/hsrd-storage-maintenance \
+  --data-dir "$DATA" \
+  fence-inspect
+
+target/release/hsrd-storage-maintenance \
+  --data-dir "$DATA" \
+  fence-clear \
+  --network mainnet \
+  --expected-digest <digest-from-inspect> \
+  --acknowledge-offline-recovery
+```
+
+`fence-clear` still requires the exact inspected digest, explicit
+`--acknowledge-offline-recovery`, correct network identity, and kind-specific
+validation. For name-page fences it reopens the canonical `name-pages` directory
+and performs authoritative validation before deleting the exact fence.
 
 ## 3. Audit the current layout
 
