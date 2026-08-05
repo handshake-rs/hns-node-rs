@@ -3094,6 +3094,22 @@ impl NodeService {
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
                     }
+                    if active_state_task.is_some() {
+                        // Active-state slices move canonical generation; defer maintenance reads
+                        // that may race the writer while it is still in-flight.
+                        consecutive_maintenance_busy = consecutive_maintenance_busy
+                            .saturating_add(1);
+                        let retry_after = active_state_contention_retry_interval(
+                            consecutive_maintenance_busy,
+                        );
+                        reset_native_supervisor_poll(&mut poll, retry_after);
+                        tracing::debug!(
+                            consecutive = consecutive_maintenance_busy,
+                            retry_millis = retry_after.as_millis(),
+                            "deferred maintenance while canonical active-state commit is in flight"
+                        );
+                        continue;
+                    }
                     if listener_task.as_ref().is_some_and(|task| task.is_finished()) {
                         let message = "Native sync P2P listener terminated unexpectedly".to_owned();
                         record_error(&diagnostics, message.clone()).await;
