@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 #[cfg(unix)]
 use std::{sync::mpsc, thread::JoinHandle};
@@ -65,6 +65,17 @@ pub struct NamePageValidationLimits {
     pub max_published_roots: u64,
     pub minimum_filesystem_reserve_bytes: u64,
     pub deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NamePageValidationProgress {
+    pub segments_completed: u64,
+    pub segments_total: u64,
+    pub pages_completed: u64,
+    pub pages_total: u64,
+    pub records_completed: u64,
+    pub bytes_completed: u64,
+    pub bytes_total: u64,
 }
 
 /// Absolute resource envelope for one direct name-tree generation stream.
@@ -1518,7 +1529,21 @@ struct ValidatedPageRecord {
     maximum_path_bits: u16,
 }
 
-const VALIDATED_PAGE_RECORD_BYTES: usize = 32 + 2;
+/// One temporary authenticated-page audit summary:
+///
+/// - 32-byte TreeRoot
+/// - 2-byte maximum path depth
+pub const NAME_PAGE_VALIDATION_RECORD_BYTES: usize = 32 + std::mem::size_of::<u16>();
+
+/// Maximum number of complete validation records that fit in the spill file.
+///
+/// Any remaining partial-record bytes are intentionally unusable.
+pub const fn maximum_name_page_validation_records(
+    maximum_spill_bytes: u64,
+) -> u64 {
+    maximum_spill_bytes / NAME_PAGE_VALIDATION_RECORD_BYTES as u64
+}
+
 const VALIDATED_PAGE_CACHE_PAGES: usize = 4_096;
 static VALIDATION_SPILL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1587,7 +1612,7 @@ impl ValidatedPageSpill {
             .checked_add(u64::from(record_count))
             .ok_or(PageTreeError::OffsetOverflow)?;
         let next_bytes = next_record_count
-            .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
+            .checked_mul(NAME_PAGE_VALIDATION_RECORD_BYTES as u64)
             .ok_or(PageTreeError::OffsetOverflow)?;
         if next_bytes > self.maximum_bytes {
             return Err(PageTreeError::ResourceLimit {
@@ -1597,12 +1622,12 @@ impl ValidatedPageSpill {
             });
         }
         let offset = first_record
-            .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
+            .checked_mul(NAME_PAGE_VALIDATION_RECORD_BYTES as u64)
             .ok_or(PageTreeError::OffsetOverflow)?;
         let mut encoded = Vec::with_capacity(
             records
                 .len()
-                .checked_mul(VALIDATED_PAGE_RECORD_BYTES)
+                .checked_mul(NAME_PAGE_VALIDATION_RECORD_BYTES)
                 .ok_or(PageTreeError::OffsetOverflow)?,
         );
         for record in records {
@@ -1639,11 +1664,11 @@ impl ValidatedPageSpill {
             .is_some_and(|entry| entry.key == key);
         if !cache_hit {
             let bytes = usize::from(span.record_count)
-                .checked_mul(VALIDATED_PAGE_RECORD_BYTES)
+                .checked_mul(NAME_PAGE_VALIDATION_RECORD_BYTES)
                 .ok_or(PageTreeError::OffsetOverflow)?;
             let offset = span
                 .first_record
-                .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
+                .checked_mul(NAME_PAGE_VALIDATION_RECORD_BYTES as u64)
                 .ok_or(PageTreeError::OffsetOverflow)?;
             let mut encoded = vec![0u8; bytes];
             self.file
@@ -1651,7 +1676,7 @@ impl ValidatedPageSpill {
                 .and_then(|_| self.file.read_exact(&mut encoded))
                 .map_err(PageTreeError::io)?;
             let mut records = Vec::with_capacity(usize::from(span.record_count));
-            for record in encoded.chunks_exact(VALIDATED_PAGE_RECORD_BYTES) {
+            for record in encoded.chunks_exact(NAME_PAGE_VALIDATION_RECORD_BYTES) {
                 let mut root = [0u8; 32];
                 root.copy_from_slice(&record[..32]);
                 records.push(ValidatedPageRecord {
@@ -2338,7 +2363,7 @@ impl NamePageTreeReader {
                 max_frontier: 1_000_000,
                 max_known_addresses: 100_000_000,
                 deadline: now
-                    .checked_add(std::time::Duration::from_secs(60 * 60))
+                    .checked_add(Duration::from_secs(60 * 60))
                     .unwrap_or(now),
             },
         )
@@ -2422,7 +2447,7 @@ impl NamePageTreeReader {
             max_published_roots: 1_000_000,
             minimum_filesystem_reserve_bytes: 0,
             deadline: now
-                .checked_add(std::time::Duration::from_secs(60 * 60))
+                .checked_add(Duration::from_secs(60 * 60))
                 .unwrap_or(now),
         })
     }
@@ -2431,6 +2456,22 @@ impl NamePageTreeReader {
         &self,
         limits: NamePageValidationLimits,
     ) -> Result<NamePageValidation, PageTreeError> {
+        self.validate_committed_pages_with_limits_and_progress(
+            limits,
+            Duration::MAX,
+            |_| {},
+        )
+    }
+
+    pub fn validate_committed_pages_with_limits_and_progress<F>(
+        &self,
+        limits: NamePageValidationLimits,
+        progress_interval: Duration,
+        mut progress: F,
+    ) -> Result<NamePageValidation, PageTreeError>
+    where
+        F: FnMut(NamePageValidationProgress),
+    {
         ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
         let segment_count = self.segments.segment_count();
         if segment_count > limits.max_segments {
@@ -2473,7 +2514,7 @@ impl NamePageTreeReader {
         }
         ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
         let minimum_spill_bytes = planned_pages
-            .checked_mul(VALIDATED_PAGE_RECORD_BYTES as u64)
+            .checked_mul(NAME_PAGE_VALIDATION_RECORD_BYTES as u64)
             .ok_or(PageTreeError::OffsetOverflow)?;
         if minimum_spill_bytes > limits.max_spill_bytes {
             return Err(PageTreeError::ResourceLimit {
@@ -2490,11 +2531,25 @@ impl NamePageTreeReader {
             limits.max_spill_bytes,
             limits.minimum_filesystem_reserve_bytes,
         )?;
+        let total_segments = u64::try_from(layouts.len()).unwrap_or(u64::MAX);
+        progress(NamePageValidationProgress {
+            segments_completed: 0,
+            segments_total: total_segments,
+            pages_completed: 0,
+            pages_total: planned_pages,
+            records_completed: 0,
+            bytes_completed: 0,
+            bytes_total: byte_count,
+        });
+
+        // Existing spill-capacity setup remains here.
         let mut spill = ValidatedPageSpill::create(&self.audit_directory, limits.max_spill_bytes)?;
         let mut indexed = BTreeMap::<u32, Vec<ValidatedPageSpan>>::new();
         let mut page_count = 0u64;
         let mut record_count = 0u64;
+        let mut segments_completed = 0_u64;
         let mut encoded = vec![0u8; NAME_PAGE_BYTES];
+        let mut last_progress = Instant::now();
 
         for (segment, pages_u32) in layouts {
             ensure_page_tree_deadline(limits.deadline, "name-page physical validation")?;
@@ -2616,9 +2671,34 @@ impl NamePageTreeReader {
                     limits.max_pages,
                     "name-page validation pages",
                 )?;
+
+                if progress_interval.is_zero()
+                    || last_progress.elapsed() >= progress_interval
+                {
+                    progress(NamePageValidationProgress {
+                        segments_completed,
+                        segments_total: total_segments,
+                        pages_completed: page_count,
+                        pages_total: planned_pages,
+                        records_completed: record_count,
+                        bytes_completed: page_count.saturating_mul(NAME_PAGE_BYTES as u64),
+                        bytes_total: byte_count,
+                    });
+                    last_progress = Instant::now();
+                }
             }
             indexed.insert(segment, segment_pages);
+            segments_completed = segments_completed.saturating_add(1);
         }
+        progress(NamePageValidationProgress {
+            segments_completed,
+            segments_total: total_segments,
+            pages_completed: page_count,
+            pages_total: planned_pages,
+            records_completed: record_count,
+            bytes_completed: page_count.saturating_mul(NAME_PAGE_BYTES as u64),
+            bytes_total: byte_count,
+        });
         debug_assert_eq!(page_count, planned_pages);
         drop(files);
 
@@ -3130,7 +3210,7 @@ fn default_name_page_stream_limits() -> NamePageStreamLimits {
         max_known_addresses: 100_000_000,
         minimum_filesystem_reserve_bytes: 0,
         deadline: now
-            .checked_add(std::time::Duration::from_secs(60 * 60))
+            .checked_add(Duration::from_secs(60 * 60))
             .unwrap_or(now),
     }
 }
@@ -3588,7 +3668,7 @@ mod tests {
             max_known_addresses: 1,
             minimum_filesystem_reserve_bytes: 0,
             deadline: now
-                .checked_add(std::time::Duration::from_secs(30))
+                .checked_add(Duration::from_secs(30))
                 .unwrap_or(now),
         };
 

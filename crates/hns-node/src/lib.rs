@@ -125,7 +125,7 @@ use hns_state::{
     decode_name_state, disconnect_block_to_batch, encode_outpoint_key,
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
     load_stored_name_tree_root, migrate_name_tree_interval_accumulator_bounded, name_page_root_key,
-    name_tree_snapshot_pin_key, pack_name_page_records,
+    maximum_name_page_validation_records, name_tree_snapshot_pin_key, pack_name_page_records,
     plan_name_tree_interval_accumulator_migration_bounded, retained_name_tree_roots_bounded,
     stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits,
     stream_name_page_tree_with_limits, validate_persisted_name_tree_overlays,
@@ -214,10 +214,12 @@ const PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES: u64 = 256 * 1024 * 1024;
 const NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD: u32 = 16;
 const MAX_NAME_PAGE_GENERATION_BYTES: u64 = 150_000_000_000;
 const MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES: u64 = 10_000_000_000;
-const MAX_NAME_PAGE_VALIDATION_SPILL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const MAX_NAME_PAGE_VALIDATION_RECORDS: u64 = 100_000_000;
+const MAX_NAME_PAGE_VALIDATION_SPILL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_NAME_PAGE_VALIDATION_RECORDS: u64 =
+    maximum_name_page_validation_records(MAX_NAME_PAGE_VALIDATION_SPILL_BYTES);
 const MAX_NAME_PAGE_SEGMENTS: u64 = 1_000_000;
-const MAX_NAME_PAGE_VALIDATION_ELAPSED: Duration = Duration::from_secs(30 * 60);
+const MAX_NAME_PAGE_VALIDATION_ELAPSED: Duration = Duration::from_secs(60 * 60);
+const NAME_PAGE_VALIDATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 // Mainnet currently has roughly thirteen million materialized names. A binary
 // authenticated tree can contain almost twice as many leaf/internal records,
 // and retained rollback roots add a bounded delta. These production limits
@@ -225,6 +227,11 @@ const MAX_NAME_PAGE_VALIDATION_ELAPSED: Duration = Duration::from_secs(30 * 60);
 // in-memory maps. The 8 GiB RSS qualification gate remains mandatory whenever
 // these constants or the address-map representation change.
 const MAX_NAME_PAGE_COMPACTION_RECORDS: u64 = 40_000_000;
+
+const _: () = {
+    assert!(MAX_NAME_PAGE_VALIDATION_RECORDS > 100_000_000);
+    assert!(MAX_NAME_PAGE_VALIDATION_RECORDS > MAX_NAME_PAGE_COMPACTION_RECORDS);
+};
 const MAX_NAME_PAGE_COMPACTION_KNOWN_ADDRESSES: u64 = 40_000_000;
 const MAX_NAME_PAGE_COMPACTION_FRONTIER: u64 = 8_192;
 const MAX_NAME_PAGE_ROOT_LOCATORS: u64 = 16_384;
@@ -9173,7 +9180,28 @@ impl NodeState {
             let validation_limits =
                 production_name_page_validation_limits(&raw_snapshot, self.network)?;
             let pages = reader
-                .validate_committed_pages_with_limits(validation_limits)
+                .validate_committed_pages_with_limits_and_progress(
+                    validation_limits,
+                    NAME_PAGE_VALIDATION_PROGRESS_INTERVAL,
+                    |progress| {
+                        let percent = progress
+                            .pages_completed
+                            .saturating_mul(100)
+                            .checked_div(progress.pages_total.max(1))
+                            .unwrap_or(0);
+                        tracing::info!(
+                            segments_completed = progress.segments_completed,
+                            segments_total = progress.segments_total,
+                            pages_completed = progress.pages_completed,
+                            pages_total = progress.pages_total,
+                            records = progress.records_completed,
+                            bytes_completed = progress.bytes_completed,
+                            bytes_total = progress.bytes_total,
+                            percent,
+                            "validating authenticated name pages"
+                        );
+                    },
+                )
                 .map_err(|error| {
                     anyhow::anyhow!("authenticated name-page audit failed: {error}")
                 })?;
