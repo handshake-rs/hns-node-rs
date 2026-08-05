@@ -13906,6 +13906,57 @@ mod tests {
         image
     }
 
+    fn commit_test_name_page_seal(
+        state: &mut NodeState,
+        height: Height,
+    ) -> Result<()> {
+        let store = state.store.clone();
+
+        let pages = state
+            .name_pages
+            .as_mut()
+            .ok_or_else(|| {
+                anyhow::anyhow!("test state has no name-page storage")
+            })?;
+
+        let snapshot = store.snapshot()?;
+
+        let (reader, legacy) = pages.reader_for_roots(
+            &snapshot,
+            std::iter::empty(),
+            false,
+        )?;
+
+        if legacy {
+            anyhow::bail!(
+                "synthetic seal test unexpectedly needs \
+                 legacy name nodes"
+            );
+        }
+
+        let mut batch = store.batch();
+
+        let prepared = pages.prepare_root(
+            &snapshot,
+            &mut batch,
+            &reader,
+            BTreeMap::new(),
+            &[],
+            NamePageRootTarget {
+                root: pages.state.root,
+                height: Some(height),
+            },
+        )?;
+
+        drop(reader);
+        drop(snapshot);
+
+        store.commit(batch)?;
+        pages.commit_prepared(prepared);
+
+        Ok(())
+    }
+
     #[cfg(feature = "rocksdb-backend")]
     fn flat_directory_file_image(directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
         let mut image = std::fs::read_dir(directory)
@@ -14391,6 +14442,65 @@ mod tests {
 
         drop(pages);
         std::fs::remove_dir_all(directory).expect("remove seal rollback fixture");
+    }
+
+    #[test]
+    fn commits_name_page_synthetic_segment_seal() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-name-page-synthetic-seal-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize synthetic seal state");
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("open pages"),
+        );
+
+        let store_before = complete_store_image(&store);
+        let before = state
+            .name_pages
+            .as_ref()
+            .expect("page storage");
+        let before_generation = before.state.manifest.generation;
+        let before_active_segment = before.state.manifest.active_segment;
+        let expected_path = name_page_file_path(
+            &directory,
+            before_generation,
+            before_active_segment + 1,
+        );
+
+        commit_test_name_page_seal(&mut state, NAME_PAGE_SEGMENT_BLOCKS)
+            .expect("commit synthetic segment seal");
+
+        let after = state
+            .name_pages
+            .as_ref()
+            .expect("page storage");
+        let after_active_segment = after.state.manifest.active_segment;
+        assert_eq!(after_active_segment, before_active_segment + 1);
+        assert_eq!(after.state.manifest.generation, before_generation);
+        assert!(expected_path.exists());
+        let snapshot = store.snapshot().expect("store snapshot");
+        assert!(snapshot
+            .get(ColumnFamily::Snapshots, &NAME_PAGE_STATE_KEY)
+            .expect("read page state")
+            .is_some());
+        drop(snapshot);
+
+        assert_ne!(complete_store_image(&store), store_before);
+
+        std::fs::remove_dir_all(directory).expect("remove synthetic seal fixture");
     }
 
     #[test]
