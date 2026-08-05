@@ -3924,7 +3924,19 @@ impl NodeService {
             state.prune_undo_history_to_policy()?;
             if config.data_dir.is_some() {
                 state.compact_pruned_payload_segments_if_due()?;
-                let _ = state.compact_pruned_name_pages_if_due()?;
+                if let Some(report) = state.compact_pruned_name_pages_if_due()? {
+                    tracing::info!(
+                        previous_generation = report.previous_generation,
+                        generation = report.generation,
+                        retained_roots = report.retained_roots,
+                        records_written = report.records_written,
+                        pages_written = report.pages_written,
+                        bytes_before = report.bytes_before,
+                        bytes_after = report.bytes_after,
+                        reclaimed_bytes = report.reclaimed_bytes,
+                        "startup pruned name-page compaction completed"
+                    );
+                }
             }
         }
 
