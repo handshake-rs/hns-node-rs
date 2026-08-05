@@ -220,6 +220,8 @@ const MAX_NAME_PAGE_VALIDATION_RECORDS: u64 =
     maximum_name_page_validation_records(MAX_NAME_PAGE_VALIDATION_SPILL_BYTES);
 const MAX_NAME_PAGE_SEGMENTS: u64 = 1_000_000;
 const MAX_NAME_PAGE_VALIDATION_ELAPSED: Duration = Duration::from_secs(60 * 60);
+const MAX_NAME_PAGE_COMPACTION_ELAPSED: Duration = Duration::from_secs(12 * 60 * 60);
+const MAX_NAME_PAGE_COMPACTION_CLEANUP_ELAPSED: Duration = Duration::from_secs(10 * 60);
 const NAME_PAGE_VALIDATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 // Mainnet currently has roughly thirteen million materialized names. A binary
 // authenticated tree can contain almost twice as many leaf/internal records,
@@ -6301,6 +6303,14 @@ struct ContextualActivationFailure {
     error: anyhow::Error,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "name-page compaction was deferred before publication: {detail}"
+)]
+struct NamePageCompactionDeferred {
+    detail: String,
+}
+
 #[derive(Debug)]
 enum ChainActivationFailure {
     ContextualInvalid(Box<ContextualActivationFailure>),
@@ -6355,16 +6365,45 @@ struct NamePageRootLocatorScanLimits {
     deadline: Instant,
 }
 
-fn production_name_page_filesystem_limits() -> NamePageFilesystemLimits {
+fn production_name_page_filesystem_limits_with_elapsed(
+    maximum_elapsed: Duration,
+) -> NamePageFilesystemLimits {
     let now = Instant::now();
     NamePageFilesystemLimits {
         max_segments: MAX_NAME_PAGE_SEGMENTS,
         max_directory_entries: MAX_NAME_PAGE_SEGMENTS.saturating_add(16),
         max_generation_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
         deadline: now
-            .checked_add(MAX_NAME_PAGE_VALIDATION_ELAPSED)
+            .checked_add(maximum_elapsed)
             .unwrap_or(now),
     }
+}
+
+fn production_name_page_filesystem_limits() -> NamePageFilesystemLimits {
+    production_name_page_filesystem_limits_with_elapsed(
+        MAX_NAME_PAGE_VALIDATION_ELAPSED,
+    )
+}
+
+fn production_name_page_compaction_filesystem_limits() -> NamePageFilesystemLimits {
+    production_name_page_filesystem_limits_with_elapsed(
+        MAX_NAME_PAGE_COMPACTION_ELAPSED,
+    )
+}
+
+fn production_name_page_compaction_cleanup_limits() -> NamePageFilesystemLimits {
+    production_name_page_filesystem_limits_with_elapsed(
+        MAX_NAME_PAGE_COMPACTION_CLEANUP_ELAPSED,
+    )
+}
+
+fn name_page_error_contains_deadline(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<PageTreeError>(),
+            Some(PageTreeError::DeadlineExceeded { .. })
+        )
+    })
 }
 
 fn production_name_page_stream_limits(deadline: Instant) -> NamePageStreamLimits {
@@ -6908,7 +6947,7 @@ impl NamePageStorage {
 
     fn compact_generation(&mut self, store: &StoreHandle) -> Result<NamePageCompactionReport> {
         self.ensure_open()?;
-        let filesystem_limits = production_name_page_filesystem_limits();
+        let filesystem_limits = production_name_page_compaction_filesystem_limits();
         let previous_generation = self.state.manifest.generation;
         let generation = previous_generation
             .checked_add(1)
@@ -7123,13 +7162,28 @@ impl NamePageStorage {
 
         let (next, appender, records_written, pages_written, published) = match staged {
             Ok(staged) => staged,
-            Err(error) => {
-                if !commit_attempted {
-                    let _ =
-                        remove_name_page_generation(&self.directory, generation, filesystem_limits);
-                } else {
-                    self.fence_after_commit_attempt();
+            Err(error) if !commit_attempted => {
+                remove_name_page_generation(
+                    &self.directory,
+                    generation,
+                    production_name_page_compaction_cleanup_limits(),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to discard unpublished name-page generation {generation} after compaction failure: {error:#}"
+                    )
+                })?;
+
+                if name_page_error_contains_deadline(&error) {
+                    return Err(anyhow::Error::new(NamePageCompactionDeferred {
+                        detail: format!("{error:#}"),
+                    }));
                 }
+
+                return Err(error);
+            }
+            Err(error) => {
+                self.fence_after_commit_attempt();
                 return Err(error);
             }
         };
@@ -12337,6 +12391,21 @@ impl NodeState {
         }
         let report = match name_pages.compact_generation(&self.store) {
             Ok(report) => report,
+            Err(error)
+                if error
+                    .downcast_ref::<NamePageCompactionDeferred>()
+                    .is_some() =>
+            {
+                tracing::warn!(
+                    error = %error,
+                    generation =
+                        name_pages.state.manifest.generation,
+                    active_segment =
+                        name_pages.state.manifest.active_segment,
+                    "deferred name-page compaction after its bounded pre-publication deadline; the authoritative generation remains unchanged"
+                );
+                return Ok(None);
+            }
             Err(error) => {
                 if let Some(fence) = production_fence_from_name_page_error(
                     ProductionSafetyFenceKind::NamePageCompaction,

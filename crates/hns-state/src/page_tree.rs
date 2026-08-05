@@ -78,6 +78,13 @@ pub struct NamePageValidationProgress {
     pub bytes_total: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NamePageStreamProgress {
+    pub records_completed: u64,
+    pub pages_completed: u64,
+    pub bytes_completed: u64,
+}
+
 /// Absolute resource envelope for one direct name-tree generation stream.
 ///
 /// Every limit is checked before the corresponding in-memory insertion or
@@ -731,13 +738,16 @@ impl BootstrapTask {
         self.pending_raw.take()
     }
 
-    fn accept(
+    fn accept<P>(
         &mut self,
         raw: Vec<u8>,
         seen: &mut HashSet<TreeRoot>,
-        emitter: &mut StreamingPageEmitter<'_>,
+        emitter: &mut StreamingPageEmitter<'_, P>,
         limits: NamePageStreamLimits,
-    ) -> Result<(), PageTreeError> {
+    ) -> Result<(), PageTreeError>
+    where
+        P: FnMut(NamePageStreamProgress),
+    {
         ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         let root = self.pending_root;
         let depth = self.pending_depth;
@@ -773,13 +783,16 @@ impl BootstrapTask {
         }
     }
 
-    fn complete(
+    fn complete<P>(
         &mut self,
         mut address: NamePageAddress,
         seen: &mut HashSet<TreeRoot>,
-        emitter: &mut StreamingPageEmitter<'_>,
+        emitter: &mut StreamingPageEmitter<'_, P>,
         limits: NamePageStreamLimits,
-    ) -> Result<(), PageTreeError> {
+    ) -> Result<(), PageTreeError>
+    where
+        P: FnMut(NamePageStreamProgress),
+    {
         loop {
             ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
             let Some(parent) = self.parents.last_mut() else {
@@ -801,7 +814,10 @@ impl BootstrapTask {
     }
 }
 
-struct StreamingPageEmitter<'a> {
+struct StreamingPageEmitter<'a, P>
+where
+    P: FnMut(NamePageStreamProgress),
+{
     appender: &'a mut NamePageAppender,
     builder: Option<NamePageBuilder>,
     pending_addresses: Vec<NamePageAddress>,
@@ -809,16 +825,28 @@ struct StreamingPageEmitter<'a> {
     record_count: u64,
     page_count: u64,
     limits: NamePageStreamLimits,
+    progress_interval: Duration,
+    next_progress: Instant,
+    on_progress: P,
 }
 
-impl<'a> StreamingPageEmitter<'a> {
+impl<'a, P> StreamingPageEmitter<'a, P>
+where
+    P: FnMut(NamePageStreamProgress),
+{
     fn new(
         appender: &'a mut NamePageAppender,
         limits: NamePageStreamLimits,
+        progress_interval: Duration,
+        on_progress: P,
     ) -> Result<Self, PageTreeError> {
         ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
         let first_page = appender.next_page();
-        Ok(Self {
+        let now = Instant::now();
+        let next_progress = now
+            .checked_add(progress_interval)
+            .unwrap_or(now);
+        let mut emitter = Self {
             builder: Some(NamePageBuilder::new(appender.segment(), first_page)?),
             appender,
             pending_addresses: Vec::new(),
@@ -826,7 +854,35 @@ impl<'a> StreamingPageEmitter<'a> {
             record_count: 0,
             page_count: 0,
             limits,
-        })
+            progress_interval,
+            next_progress,
+            on_progress,
+        };
+        (emitter.on_progress)(emitter.progress());
+        Ok(emitter)
+    }
+
+    fn progress(&self) -> NamePageStreamProgress {
+        NamePageStreamProgress {
+            records_completed: self.record_count,
+            pages_completed: self.page_count,
+            bytes_completed: self
+                .page_count
+                .saturating_mul(NAME_PAGE_BYTES as u64),
+        }
+    }
+
+    fn emit_progress_if_due(&mut self) {
+        if self.progress_interval == Duration::MAX {
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.next_progress {
+            (self.on_progress)(self.progress());
+            self.next_progress = now
+                .checked_add(self.progress_interval)
+                .unwrap_or(now);
+        }
     }
 
     fn emit(
@@ -892,6 +948,7 @@ impl<'a> StreamingPageEmitter<'a> {
             self.appender.segment(),
             self.appender.next_page(),
         )?);
+        self.emit_progress_if_due();
         Ok(())
     }
 
@@ -910,6 +967,7 @@ impl<'a> StreamingPageEmitter<'a> {
             self.page_count,
             u64::from(self.appender.next_page() - self.first_page)
         );
+        (self.on_progress)(self.progress());
         Ok((manifest, self.record_count, self.page_count))
     }
 }
@@ -928,12 +986,35 @@ pub fn stream_name_page_tree_with_limits<T: ReadSnapshot>(
     appender: &mut NamePageAppender,
     limits: NamePageStreamLimits,
 ) -> Result<StreamedNamePages, PageTreeError> {
-    stream_name_page_tree_with_parallelism_and_limits(
+    stream_name_page_tree_with_limits_and_progress(
+        snapshot,
+        root,
+        appender,
+        limits,
+        Duration::MAX,
+        |_| {},
+    )
+}
+
+pub fn stream_name_page_tree_with_limits_and_progress<T: ReadSnapshot, P>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+    limits: NamePageStreamLimits,
+    progress_interval: Duration,
+    on_progress: P,
+) -> Result<StreamedNamePages, PageTreeError>
+where
+    P: FnMut(NamePageStreamProgress),
+{
+    stream_name_page_tree_with_parallelism_and_limits_and_progress(
         snapshot,
         root,
         appender,
         NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES,
         limits,
+        progress_interval,
+        on_progress,
     )
 }
 
@@ -968,6 +1049,29 @@ pub fn stream_name_page_tree_delta_with_limits<T: ReadSnapshot>(
     known_addresses: &mut HashMap<TreeRoot, NamePageAddress>,
     limits: NamePageStreamLimits,
 ) -> Result<StreamedNamePages, PageTreeError> {
+    stream_name_page_tree_delta_with_limits_and_progress(
+        snapshot,
+        root,
+        appender,
+        known_addresses,
+        limits,
+        Duration::MAX,
+        |_| {},
+    )
+}
+
+pub fn stream_name_page_tree_delta_with_limits_and_progress<T: ReadSnapshot, P>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+    known_addresses: &mut HashMap<TreeRoot, NamePageAddress>,
+    limits: NamePageStreamLimits,
+    progress_interval: Duration,
+    on_progress: P,
+) -> Result<StreamedNamePages, PageTreeError>
+where
+    P: FnMut(NamePageStreamProgress),
+{
     #[derive(Debug)]
     enum Work {
         Visit {
@@ -988,7 +1092,8 @@ pub fn stream_name_page_tree_delta_with_limits<T: ReadSnapshot>(
         limits.max_known_addresses,
         "name-page known addresses",
     )?;
-    let mut emitter = StreamingPageEmitter::new(appender, limits)?;
+    let mut emitter =
+        StreamingPageEmitter::new(appender, limits, progress_interval, on_progress)?;
     if root == TreeRoot::ZERO {
         let (manifest, record_count, page_count) = emitter.finish()?;
         return Ok(StreamedNamePages {
@@ -1135,9 +1240,33 @@ fn stream_name_page_tree_with_parallelism_and_limits<T: ReadSnapshot>(
     target_subtrees: usize,
     limits: NamePageStreamLimits,
 ) -> Result<StreamedNamePages, PageTreeError> {
+    stream_name_page_tree_with_parallelism_and_limits_and_progress(
+        snapshot,
+        root,
+        appender,
+        target_subtrees,
+        limits,
+        Duration::MAX,
+        |_| {},
+    )
+}
+
+fn stream_name_page_tree_with_parallelism_and_limits_and_progress<T: ReadSnapshot, P>(
+    snapshot: &T,
+    root: TreeRoot,
+    appender: &mut NamePageAppender,
+    target_subtrees: usize,
+    limits: NamePageStreamLimits,
+    progress_interval: Duration,
+    on_progress: P,
+) -> Result<StreamedNamePages, PageTreeError>
+where
+    P: FnMut(NamePageStreamProgress),
+{
     ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
     let target_subtrees = target_subtrees.max(1);
-    let mut emitter = StreamingPageEmitter::new(appender, limits)?;
+    let mut emitter =
+        StreamingPageEmitter::new(appender, limits, progress_interval, on_progress)?;
     if root == TreeRoot::ZERO {
         let (manifest, record_count, page_count) = emitter.finish()?;
         return Ok(StreamedNamePages {
