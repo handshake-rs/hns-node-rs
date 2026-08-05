@@ -225,6 +225,7 @@ const MAX_NAME_PAGE_VALIDATION_ELAPSED: Duration = Duration::from_secs(60 * 60);
 const MAX_NAME_PAGE_COMPACTION_ELAPSED: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_NAME_PAGE_COMPACTION_CLEANUP_ELAPSED: Duration = Duration::from_secs(10 * 60);
 const NAME_PAGE_VALIDATION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const NAME_PAGE_COMPACTION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 // Mainnet currently has roughly thirteen million materialized names. A binary
 // authenticated tree can contain almost twice as many leaf/internal records,
 // and retained rollback roots add a bounded delta. These production limits
@@ -5886,6 +5887,29 @@ thread_local! {
     static TEST_REORG_NAME_STATE_WRITES: std::cell::Cell<u64> = const {
         std::cell::Cell::new(0)
     };
+    static TEST_NAME_PAGE_COMPACTION_COMMIT_ERROR: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+struct NamePageCompactionCommitErrorGuard;
+
+#[cfg(test)]
+impl NamePageCompactionCommitErrorGuard {
+    fn enable() -> Self {
+        TEST_NAME_PAGE_COMPACTION_COMMIT_ERROR.with(|enabled| {
+            assert!(!enabled.replace(true), "name-page compaction commit fault already enabled");
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for NamePageCompactionCommitErrorGuard {
+    fn drop(&mut self) {
+        TEST_NAME_PAGE_COMPACTION_COMMIT_ERROR.with(|enabled| enabled.set(false));
+    }
 }
 
 impl ReorgStagedEffectMeter {
@@ -6960,15 +6984,27 @@ impl NamePageStorage {
     }
 
     fn compact_generation(&mut self, store: &StoreHandle) -> Result<NamePageCompactionReport> {
+        self.compact_generation_with_limits(
+            store,
+            production_name_page_compaction_filesystem_limits(),
+            production_name_page_compaction_cleanup_limits(),
+        )
+    }
+
+    fn compact_generation_with_limits(
+        &mut self,
+        store: &StoreHandle,
+        filesystem_limits: NamePageFilesystemLimits,
+        cleanup_limits: NamePageFilesystemLimits,
+    ) -> Result<NamePageCompactionReport> {
         let remaining_deadline_seconds = |deadline: Instant| {
             deadline
                 .checked_duration_since(Instant::now())
                 .map_or(0, |remaining| remaining.as_secs())
         };
-        let progress_interval = Duration::from_secs(5);
+        let progress_interval = NAME_PAGE_COMPACTION_PROGRESS_INTERVAL;
 
         self.ensure_open()?;
-        let filesystem_limits = production_name_page_compaction_filesystem_limits();
         let previous_generation = self.state.manifest.generation;
         let generation = previous_generation
             .checked_add(1)
@@ -7158,7 +7194,7 @@ impl NamePageStorage {
                     .saturating_mul(hns_store::NAME_PAGE_BYTES as u64);
                 let retained_roots_completed = u64::try_from(index + 1)
                     .expect("retained root index fits u64");
-                let delta = stream_name_page_tree_delta_with_limits_and_progress(
+            let delta = stream_name_page_tree_delta_with_limits_and_progress(
                     &source_snapshot,
                     root,
                     &mut appender,
@@ -7276,6 +7312,12 @@ impl NamePageStorage {
             batch.put(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY, &encoded_state)?;
             commit_attempted = true;
             store.commit(batch)?;
+            #[cfg(test)]
+            if TEST_NAME_PAGE_COMPACTION_COMMIT_ERROR.with(|enabled| enabled.get()) {
+                return Err(anyhow::anyhow!(
+                    "injected synthetic name-page compaction commit failure"
+                ));
+            }
             Ok((next, appender, records_written, pages_written, published))
         })();
 
@@ -7285,7 +7327,7 @@ impl NamePageStorage {
                 remove_name_page_generation(
                     &self.directory,
                     generation,
-                    production_name_page_compaction_cleanup_limits(),
+                    cleanup_limits,
                 )
                 .with_context(|| {
                     format!(
@@ -7833,11 +7875,20 @@ fn remove_name_page_generation(
     let mut removed = false;
     let mut entries = 0u64;
     let mut discard = Vec::new();
-    for entry in std::fs::read_dir(directory)
-        .with_context(|| format!("failed to scan {}", directory.display()))?
+    for entry in std::fs::read_dir(directory).map_err(|error| {
+        PageTreeError::Io(format!(
+            "failed to scan name-page generation cleanup directory {}: {error}",
+            directory.display()
+        ))
+    })?
     {
         ensure_name_page_filesystem_deadline(limits, "name-page generation directory scan")?;
-        let entry = entry?;
+        let entry = entry.map_err(|error| {
+            PageTreeError::Io(format!(
+                "failed to read a name-page generation directory entry in {}: {error}",
+                directory.display()
+            ))
+        })?;
         entries = entries
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("name-page directory entry count overflow"))?;
@@ -7861,11 +7912,11 @@ fn remove_name_page_generation(
     }
     for path in discard {
         ensure_name_page_filesystem_deadline(limits, "name-page generation cleanup")?;
-        std::fs::remove_file(&path).with_context(|| {
-            format!(
-                "failed to discard name-page generation file {}",
+        std::fs::remove_file(&path).map_err(|error| {
+            PageTreeError::Io(format!(
+                "failed to discard name-page generation file {}: {error}",
                 path.display()
-            )
+            ))
         })?;
         removed = true;
     }
@@ -8260,6 +8311,7 @@ fn production_fence_from_name_page_error(
                 *available,
             ),
             PageTreeError::DeadlineExceeded { context } => (*context, 1, 2),
+            PageTreeError::Io(_) => ("name-page filesystem access", 1, 2),
             _ => continue,
         };
         return Some(ProductionSafetyFence {
@@ -14911,6 +14963,173 @@ mod tests {
     }
 
     #[test]
+    fn compact_generation_validation_and_compaction_deadlines_are_distinct() {
+        let store = StoreHandle::memory();
+        let snapshot = store.snapshot().expect("deadline snapshot");
+        let validation_limits = production_name_page_validation_limits(
+            &snapshot,
+            Network::Regtest,
+        )
+        .expect("validation limits");
+        let compaction_limits = production_name_page_compaction_filesystem_limits();
+
+        assert_eq!(
+            MAX_NAME_PAGE_VALIDATION_ELAPSED,
+            Duration::from_secs(60 * 60),
+        );
+        assert_eq!(
+            MAX_NAME_PAGE_COMPACTION_ELAPSED,
+            Duration::from_secs(12 * 60 * 60),
+        );
+        assert_eq!(
+            MAX_NAME_PAGE_COMPACTION_CLEANUP_ELAPSED,
+            Duration::from_secs(10 * 60),
+        );
+        assert!(
+            validation_limits.deadline > Instant::now(),
+            "validation deadline should remain in the future",
+        );
+        assert!(
+            compaction_limits.deadline > validation_limits.deadline,
+            "compaction should use a longer deadline than validation",
+        );
+    }
+
+    #[test]
+    fn compact_generation_deferred_on_pre_publication_deadline() {
+        let fixture = build_test_node_page_generation(512);
+        let mut pages = fixture
+            .live_state
+            .name_pages
+            .as_mut()
+            .expect("fixture pages");
+        let previous_generation = pages.state.manifest.generation;
+
+        let limits = production_name_page_filesystem_limits_with_elapsed(Duration::ZERO);
+        let error = pages
+            .compact_generation_with_limits(
+                &fixture.store,
+                limits,
+                production_name_page_compaction_cleanup_limits(),
+            )
+            .expect_err("expired deadline should defer compaction");
+
+        assert!(
+            error.downcast_ref::<NamePageCompactionDeferred>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            production_fence_from_name_page_error(
+                ProductionSafetyFenceKind::NamePageCompaction,
+                &error,
+            )
+            .is_none(),
+            "deferred compaction must not become a production safety fence",
+        );
+        assert_eq!(
+            pages.state.manifest.generation,
+            previous_generation,
+            "authority should remain on pre-publication timeout"
+        );
+        assert!(
+            !name_page_file_path(
+                &fixture.directory,
+                previous_generation.saturating_add(1),
+                0,
+            )
+            .exists(),
+            "deferred compaction must not leave unpublished candidate files"
+        );
+    }
+
+    #[test]
+    fn compact_generation_cleanup_failure_is_a_typed_storage_fence() {
+        let fixture = build_test_node_page_generation(512);
+        let mut pages = fixture
+            .live_state
+            .name_pages
+            .as_mut()
+            .expect("fixture pages");
+        let previous_generation = pages.state.manifest.generation;
+        let tree_root = pages.state.root;
+
+        let mut batch = fixture.store.batch();
+        batch.delete(ColumnFamily::NameTreeNodes, tree_root.as_bytes());
+        fixture
+            .store
+            .commit(batch)
+            .expect("remove fixture root node");
+
+        let compact_limits = production_name_page_compaction_filesystem_limits();
+        let cleanup_limits = production_name_page_filesystem_limits_with_elapsed(Duration::ZERO);
+        let error = pages
+            .compact_generation_with_limits(
+                &fixture.store,
+                compact_limits,
+                cleanup_limits,
+            )
+            .expect_err("cleanup failure should be returned by the compaction path");
+
+        assert!(
+            error.downcast_ref::<NamePageCompactionDeferred>().is_none(),
+            "{error:#}"
+        );
+        assert!(
+            production_fence_from_name_page_error(
+                ProductionSafetyFenceKind::NamePageCompaction,
+                &error,
+            )
+            .is_some(),
+            "cleanup failure should produce typed production fence",
+        );
+        assert_eq!(
+            pages.state.manifest.generation,
+            previous_generation,
+            "failed cleanup should not commit any new generation",
+        );
+    }
+
+    #[test]
+    fn compact_generation_commit_attempt_failure_preserves_fail_closed() {
+        let fixture = build_test_node_page_generation(512);
+        let mut pages = fixture
+            .live_state
+            .name_pages
+            .as_mut()
+            .expect("fixture pages");
+        let previous_generation = pages.state.manifest.generation;
+        let _guard = NamePageCompactionCommitErrorGuard::enable();
+
+        let error = pages
+            .compact_generation_with_limits(
+                &fixture.store,
+                production_name_page_compaction_filesystem_limits(),
+                production_name_page_compaction_cleanup_limits(),
+            )
+            .expect_err("commit-injected compaction should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected synthetic name-page compaction commit failure"),
+            "{error:#}"
+        );
+        assert!(
+            pages.reopen_required,
+            "commit-attempt error should mark storage as requiring reopen",
+        );
+        assert!(
+            pages.appender.is_none(),
+            "commit-attempt error should disable stale appender",
+        );
+        assert_eq!(
+            pages.state.manifest.generation,
+            previous_generation,
+            "commit-attempt error should not update in-memory manifest",
+        );
+    }
+
+    #[test]
     fn near_envelope_generation_audits_compacts_and_reopens() {
         const TEST_RECORDS: u64 = 512;
 
@@ -15000,6 +15219,59 @@ mod tests {
 
         drop(reopened);
         std::fs::remove_dir_all(fixture.directory).expect("remove restart fixture");
+    }
+
+    #[test]
+    fn compact_pruned_name_pages_if_due_returns_compaction_report() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-name-page-compaction-due-report-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize compaction report state");
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
+                .expect("open name pages"),
+        );
+        state.undo_retention_policy = Some(UndoRetentionPolicy::for_network(Network::Regtest));
+
+        let initial_generation = state
+            .name_pages
+            .as_ref()
+            .expect("name pages")
+            .state
+            .manifest
+            .generation;
+        let mut report = None;
+        for seal in 1_u32..=19 {
+            let height = seal
+                .checked_mul(NAME_PAGE_SEGMENT_BLOCKS)
+                .expect("seal height");
+            commit_test_name_page_seal(&mut state, height).expect("commit synthetic seal");
+            if report.is_none() {
+                report = state
+                    .compact_pruned_name_pages_if_due()
+                    .expect("query due compaction");
+            }
+        }
+
+        let report = report.expect("compaction should be due");
+        assert_eq!(report.previous_generation, initial_generation);
+        assert!(report.generation > initial_generation);
+
+        drop(state);
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove compaction report fixture");
     }
 
     #[test]
@@ -15415,6 +15687,87 @@ mod tests {
                 .digest,
             evidence.digest
         );
+    }
+
+    #[test]
+    fn inspect_production_safety_fence_operates_when_store_is_unclean() {
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize inspect store");
+        state
+            .chain
+            .record_external_safety_fence(ProductionSafetyFence {
+                version: PRODUCTION_SAFETY_FENCE_VERSION,
+                kind: ProductionSafetyFenceKind::Storage,
+                context: "unclean inspection".to_owned(),
+                limit: 2,
+                actual: 3,
+                root: None,
+                candidate: None,
+                detail: "inspect despite unclean marker".to_owned(),
+            })
+            .expect("persist production fence");
+
+        let evidence = inspect_production_safety_fence(&store)
+            .expect("inspect fence")
+            .expect("fence");
+
+        mark_unclean_start(&store).expect("mark store unclean");
+        assert!(!was_clean_shutdown(&store).expect("unclean marker"));
+
+        let reread = inspect_production_safety_fence(&store)
+            .expect("inspect unclean fence")
+            .expect("fence remains");
+        assert_eq!(reread.encoded, evidence.encoded);
+        assert_eq!(reread.digest, evidence.digest);
+    }
+
+    #[test]
+    fn clear_production_safety_fence_rejects_wrong_expected_digest() {
+        let store = StoreHandle::memory();
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize wrong-digest clear store");
+        state
+            .chain
+            .record_external_safety_fence(ProductionSafetyFence {
+                version: PRODUCTION_SAFETY_FENCE_VERSION,
+                kind: ProductionSafetyFenceKind::Storage,
+                context: "wrong digest clear".to_owned(),
+                limit: 2,
+                actual: 3,
+                root: None,
+                candidate: None,
+                detail: "typed recovery proof is unavailable".to_owned(),
+            })
+            .expect("persist clear test fence");
+
+        let evidence = inspect_production_safety_fence(&store)
+            .expect("inspect clear test fence")
+            .expect("fence");
+        let mut wrong_digest = evidence.digest;
+        wrong_digest[0] = wrong_digest[0].wrapping_add(1);
+
+        let error = clear_production_safety_fence_validated(
+            &store,
+            Network::Regtest,
+            ProductionSafetyFenceClearRequest {
+                expected_digest: wrong_digest,
+                acknowledgement:
+                    ProductionSafetyFenceClearAcknowledgement::OfflineRecoveryCompletedAndVerified,
+                name_page_directory: None,
+            },
+        )
+        .expect_err("wrong digest should not clear fence");
+        assert!(
+            error.to_string().contains("production safety-fence digest changed"),
+            "{error:#}"
+        );
+
+        let evidence_after = inspect_production_safety_fence(&store)
+            .expect("inspect unchanged clear test fence")
+            .expect("fence remains");
+        assert_eq!(evidence_after.digest, evidence.digest);
+        assert_eq!(evidence_after.encoded, evidence.encoded);
     }
 
     #[test]

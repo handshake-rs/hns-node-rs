@@ -920,4 +920,89 @@ mod tests {
         assert!(parse_digest("11").is_err());
         assert!(parse_digest(&"zz".repeat(32)).is_err());
     }
+
+    #[test]
+    fn maintenance_non_fence_commands_require_clean_store() {
+        let root = test_root("maintenance-clean-gate");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(root.join("name-pages")).expect("create name pages");
+        fs::create_dir_all(root.join("payload-segments")).expect("create payload segments");
+        fs::write(
+            root.join(STORAGE_MAINTENANCE_MARKER),
+            STORAGE_MAINTENANCE_MARKER_BODY,
+        )
+        .expect("write maintenance marker");
+
+        let store = open_store(&StoreConfig {
+            path: root.join("chain"),
+            backend: StoreBackend::RocksDb,
+            durability: DurabilityPolicy::Sync,
+        })
+        .expect("open maintenance store");
+        initialize_schema(&store).expect("initialize schema");
+
+        let requires_clean = |command: &Command| {
+            !matches!(
+                command,
+                Command::FenceInspect | Command::FenceClear { .. }
+            )
+        };
+        let commands = [
+            Command::Inventory,
+            Command::Compact {
+                dry_run: true,
+                max_live_records: SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_RECORDS,
+                max_live_frame_bytes: SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_FRAME_BYTES,
+                max_atomic_locator_bytes: SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_LOCATOR_BYTES,
+                max_physical_output_bytes: SEGMENT_COMPACTION_DEFAULT_MAX_PHYSICAL_OUTPUT_BYTES,
+                max_atomic_publication_bytes:
+                    SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_PUBLICATION_BYTES,
+                minimum_filesystem_reserve_bytes:
+                    SEGMENT_COMPACTION_DEFAULT_FILESYSTEM_RESERVE_BYTES,
+                max_elapsed_seconds: SEGMENT_COMPACTION_DEFAULT_MAX_ELAPSED.as_secs(),
+                scan_page_records: SEGMENT_COMPACTION_DEFAULT_SCAN_RECORDS,
+                scan_page_bytes: SEGMENT_COMPACTION_DEFAULT_SCAN_BYTES,
+                min_reclaim_bytes: DEFAULT_MIN_COMPACTION_RECLAIM_BYTES,
+            },
+            Command::MigrateInline {
+                batch_records: SEGMENT_MIGRATION_MAX_BATCH_RECORDS,
+            },
+            Command::Backup {
+                backup_dir: root.join("backup"),
+            },
+        ];
+        for command in commands.iter() {
+            assert!(requires_clean(command), "non-fence maintenance command {command:?}");
+            assert!(
+                require_clean_store(&store).is_err(),
+                "unclean store should reject {command:?}"
+            );
+        }
+
+        let fence_inspect = Arguments::try_parse_from([
+            "hsrd-storage-maintenance",
+            "--data-dir",
+            root.to_string_lossy().as_ref(),
+            "fence-inspect",
+        ])
+        .expect("parse fence inspect");
+        assert!(!requires_clean(&fence_inspect.command));
+        let expected_digest = "11".repeat(32);
+        let fence_clear = Arguments::try_parse_from([
+            "hsrd-storage-maintenance",
+            "--data-dir",
+            root.to_string_lossy().as_ref(),
+            "fence-clear",
+            "--network",
+            "regtest",
+            "--expected-digest",
+            expected_digest.as_str(),
+            "--acknowledge-offline-recovery",
+        ])
+        .expect("parse fence clear");
+        assert!(!requires_clean(&fence_clear.command));
+
+        drop(store);
+        fs::remove_dir_all(root).expect("remove maintenance clean-gate fixture");
+    }
 }

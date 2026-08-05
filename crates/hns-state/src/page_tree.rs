@@ -3659,6 +3659,156 @@ mod tests {
     }
 
     #[test]
+    fn stream_progress_finishes_at_exact_counts() {
+        let record_count = 512u32;
+        let mut nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-page-stream-progress-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut entries = Vec::new();
+        for index in 0..record_count {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&index.to_le_bytes());
+            entries.push((NameHash::new(key), key.to_vec()));
+        }
+        let tree = MemoryUrkel::from_entries(entries).expect("stream fixture tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("stream fixture records");
+
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        for (record_root, raw) in records {
+            batch
+                .put(
+                    ColumnFamily::NameTreeNodes,
+                    record_root.as_bytes(),
+                    &raw,
+                )
+                .expect("stream fixture node");
+        }
+        store.commit(batch).expect("stream fixture state");
+        let snapshot = store.snapshot().expect("stream fixture snapshot");
+
+        let mut appender = NamePageAppender::create_new(&path, 1, 0).expect("stream fixture appender");
+        let mut progress = Vec::new();
+
+        let streamed = stream_name_page_tree_with_limits_and_progress(
+            &snapshot,
+            root,
+            &mut appender,
+            default_name_page_stream_limits(),
+            Duration::from_secs(0),
+            |event| progress.push(event),
+        )
+        .expect("stream generated pages");
+
+        let final_progress = progress.last().copied().expect("stream progress");
+
+        assert_eq!(
+            final_progress.records_completed,
+            streamed.record_count,
+        );
+        assert_eq!(
+            final_progress.pages_completed,
+            streamed.page_count,
+        );
+        assert_eq!(
+            final_progress.bytes_completed,
+            streamed.page_count.saturating_mul(NAME_PAGE_BYTES as u64),
+        );
+        assert!(
+            progress.windows(2).all(|pair| {
+                pair[0].pages_completed <= pair[1].pages_completed
+                    && pair[0].records_completed <= pair[1].records_completed
+                    && pair[0].bytes_completed <= pair[1].bytes_completed
+            }),
+            "stream progress must be monotonic",
+        );
+
+        drop(snapshot);
+        drop(appender);
+        std::fs::remove_file(&path).expect("remove stream output");
+    }
+
+    #[test]
+    fn stream_progress_does_not_fire_after_failed_page_append_attempt() {
+        let record_count = 2048u32;
+        let mut nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-page-stream-progress-fail-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut entries = Vec::new();
+        for index in 0..record_count {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&index.to_le_bytes());
+            entries.push((NameHash::new(key), key.to_vec()));
+        }
+        let tree = MemoryUrkel::from_entries(entries).expect("stream-failed fixture tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("stream-failed fixture records");
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        for (record_root, raw) in records {
+            batch
+                .put(
+                    ColumnFamily::NameTreeNodes,
+                    record_root.as_bytes(),
+                    &raw,
+                )
+                .expect("stream-failed fixture node");
+        }
+        store.commit(batch).expect("stream-failed fixture state");
+        let snapshot = store.snapshot().expect("stream-failed snapshot");
+
+        let mut appender = NamePageAppender::create_new(&path, 1, 0).expect("stream-failed appender");
+        let mut progress = Vec::new();
+        let mut limits = default_name_page_stream_limits();
+        limits.max_pages = 1;
+        let result = stream_name_page_tree_with_limits_and_progress(
+            &snapshot,
+            root,
+            &mut appender,
+            limits,
+            Duration::from_secs(0),
+            |event| progress.push(event),
+        );
+
+        assert!(result.is_err(), "stream should fail when page budget is exhausted");
+        let final_callback_count = progress.len();
+        assert!(
+            final_callback_count >= 2,
+            "one initial and one successful page append callback expected",
+        );
+        assert_eq!(
+            progress.last().expect("stream progress").pages_completed,
+            1,
+            "callbacks after failure must not include failed page append",
+        );
+        assert!(
+            !progress
+                .iter()
+                .any(|event| event.pages_completed > 1 || event.records_completed > limits.max_records),
+            "failed append should not advance progress",
+        );
+
+        drop(snapshot);
+        drop(appender);
+        std::fs::remove_file(&path).expect("remove stream-failed output");
+    }
+
+    #[test]
     fn validation_spill_reloads_evicted_pages_without_a_visible_temp_file() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
