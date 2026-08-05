@@ -129,7 +129,9 @@ use hns_state::{
     NAME_PAGE_VALIDATION_RECORD_BYTES,
     plan_name_tree_interval_accumulator_migration_bounded, retained_name_tree_roots_bounded,
     stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits,
-    stream_name_page_tree_with_limits, validate_persisted_name_tree_overlays,
+    stream_name_page_tree_delta_with_limits_and_progress,
+    stream_name_page_tree_with_limits, stream_name_page_tree_with_limits_and_progress,
+    validate_persisted_name_tree_overlays,
     validate_persisted_name_tree_root, validate_persisted_name_trees,
     verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
     visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
@@ -6946,15 +6948,35 @@ impl NamePageStorage {
     }
 
     fn compact_generation(&mut self, store: &StoreHandle) -> Result<NamePageCompactionReport> {
+        let remaining_deadline_seconds = |deadline: Instant| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .map_or(0, |remaining| remaining.as_secs())
+        };
+        let progress_interval = Duration::from_secs(5);
+
         self.ensure_open()?;
         let filesystem_limits = production_name_page_compaction_filesystem_limits();
         let previous_generation = self.state.manifest.generation;
         let generation = previous_generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("name-page generation number exhausted"))?;
+        let source_segment_count = self.state.manifest.active_segment.saturating_add(1);
         let bytes_before =
             name_page_generation_bytes(&self.directory, previous_generation, filesystem_limits)?;
         remove_name_page_generation(&self.directory, generation, filesystem_limits)?;
+        let start = Instant::now();
+        tracing::info!(
+            phase = "planning",
+            previous_generation,
+            generation,
+            source_active_segment = self.state.manifest.active_segment,
+            source_segment_count,
+            source_bytes = bytes_before,
+            retained_root_threshold = NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+            compaction_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
+            "starting pruned name-page generation compaction"
+        );
 
         let snapshot = store.snapshot()?;
         let retained_limits = RetainedNameTreeRootLimits {
@@ -7001,15 +7023,43 @@ impl NamePageStorage {
                 let (source_reader, _) =
                     self.reader_for_roots(&snapshot, std::iter::empty(), false)?;
                 let source_snapshot = NamePageSnapshot::new(&snapshot, &source_reader);
-                stream_name_page_tree_with_limits(
+                stream_name_page_tree_with_limits_and_progress(
                     &source_snapshot,
                     self.state.root,
                     &mut appender,
                     production_name_page_stream_limits(filesystem_limits.deadline),
+                    progress_interval,
+                    move |progress| {
+                        tracing::info!(
+                            phase = "streaming-base",
+                            previous_generation,
+                            generation,
+                            records_written = progress.records_completed,
+                            pages_written = progress.pages_completed,
+                            bytes_written = progress.bytes_completed,
+                            elapsed_seconds = start.elapsed().as_secs(),
+                            remaining_deadline_seconds =
+                                remaining_deadline_seconds(filesystem_limits.deadline),
+                            "compacting authenticated name pages"
+                        );
+                    },
                 )
                 .map_err(anyhow::Error::new)
                 .context("failed to stream compacted name-page base")?
             };
+            tracing::info!(
+                phase = "streaming-base",
+                previous_generation,
+                generation,
+                records_written = base.record_count,
+                pages_written = base.page_count,
+                bytes_written = base
+                    .page_count
+                    .saturating_mul(hns_store::NAME_PAGE_BYTES as u64),
+                elapsed_seconds = start.elapsed().as_secs(),
+                remaining_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
+                "completed compacted name-page base stream"
+            );
             let mut manifest = base.manifest;
             let mut records_written = base.record_count;
             let mut pages_written = base.page_count;
@@ -7026,6 +7076,16 @@ impl NamePageStorage {
             );
             let output_reader = NamePageTreeReader::open_segments(&paths, self.state.root, locator)
                 .map_err(|error| anyhow::anyhow!("failed to open compacted name pages: {error}"))?;
+            tracing::info!(
+                phase = "indexing-base",
+                output_generation = generation,
+                base_records = records_written,
+                base_pages = pages_written,
+                resulting_known_addresses = 0_u64,
+                elapsed_seconds = start.elapsed().as_secs(),
+                remaining_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
+                "discovering compacted name-page base addresses"
+            );
             output_reader
                 .discover_tree_addresses_bounded(
                     self.state.root,
@@ -7037,6 +7097,16 @@ impl NamePageStorage {
                 .into_known_addresses()
                 .map_err(anyhow::Error::new)
                 .context("failed to collect compacted name-page addresses")?;
+            tracing::info!(
+                phase = "indexing-base",
+                output_generation = generation,
+                base_records = records_written,
+                base_pages = pages_written,
+                resulting_known_addresses = known.len(),
+                elapsed_seconds = start.elapsed().as_secs(),
+                remaining_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
+                "completed compacted name-page base address indexing"
+            );
 
             let (source_reader, legacy_fallback) =
                 self.reader_for_roots(&snapshot, retained_roots.iter().copied(), true)?;
@@ -7045,11 +7115,13 @@ impl NamePageStorage {
             } else {
                 NamePageSnapshot::new(&snapshot, &source_reader)
             };
-            for root in retained_roots
+            let retained_roots_to_stream = retained_roots
                 .iter()
                 .copied()
                 .filter(|root| *root != TreeRoot::ZERO && *root != self.state.root)
-            {
+                .collect::<Vec<_>>();
+            let retained_roots_total = retained_roots_to_stream.len();
+            for (index, root) in retained_roots_to_stream.iter().copied().enumerate() {
                 let mut stream_limits =
                     production_name_page_stream_limits(filesystem_limits.deadline);
                 stream_limits.max_records = stream_limits
@@ -7068,12 +7140,37 @@ impl NamePageStorage {
                         limit: MAX_NAME_PAGE_GENERATION_BYTES / hns_store::NAME_PAGE_BYTES as u64,
                         actual: pages_written,
                     })?;
-                let delta = stream_name_page_tree_delta_with_limits(
+                let records_before_delta = records_written;
+                let pages_before_delta = pages_written;
+                let bytes_before_delta = pages_before_delta
+                    .saturating_mul(hns_store::NAME_PAGE_BYTES as u64);
+                let retained_roots_completed = u64::try_from(index + 1)
+                    .expect("retained root index fits u64");
+                let delta = stream_name_page_tree_delta_with_limits_and_progress(
                     &source_snapshot,
                     root,
                     &mut appender,
                     &mut known,
                     stream_limits,
+                    progress_interval,
+                    move |progress| {
+                        tracing::info!(
+                            phase = "streaming-retained-roots",
+                            retained_roots_completed,
+                            retained_roots_total,
+                            current_root = ?root,
+                            records_completed = records_before_delta
+                                .saturating_add(progress.records_completed),
+                            pages_completed = pages_before_delta
+                                .saturating_add(progress.pages_completed),
+                            bytes_completed = bytes_before_delta
+                                .saturating_add(progress.bytes_completed),
+                            elapsed_seconds = start.elapsed().as_secs(),
+                            remaining_deadline_seconds =
+                                remaining_deadline_seconds(filesystem_limits.deadline),
+                            "compacting retained name-page roots"
+                        );
+                    },
                 )
                 .map_err(anyhow::Error::new)
                 .with_context(|| format!("failed to stream retained name root {root:?}"))?;
@@ -7109,6 +7206,16 @@ impl NamePageStorage {
                 .iter()
                 .filter(|root| **root != TreeRoot::ZERO)
                 .count();
+            tracing::info!(
+                phase = "publishing",
+                roots_published = published_root_count,
+                records_written,
+                pages_written,
+                output_bytes = pages_written.saturating_mul(hns_store::NAME_PAGE_BYTES as u64),
+                elapsed_seconds = start.elapsed().as_secs(),
+                remaining_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
+                "publishing compacted name-page generation"
+            );
             preflight_name_page_publication(
                 &old_records,
                 published_root_count,
@@ -7193,13 +7300,21 @@ impl NamePageStorage {
         self.file_path = file_path;
         self.state = next;
         self.appender = Some(appender);
+        tracing::info!(
+            phase = "cleaning-old-generation",
+            generation,
+            previous_generation,
+            elapsed_seconds = start.elapsed().as_secs(),
+            remaining_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
+            "cleaning old name-page generation after compacting"
+        );
         remove_name_page_generations_except(&self.directory, generation, filesystem_limits)?;
 
         let bytes_after =
             name_page_generation_bytes(&self.directory, generation, filesystem_limits)?;
         self.committed_generation_bytes = bytes_after;
         self.generation_bytes = bytes_after;
-        Ok(NamePageCompactionReport {
+        let report = NamePageCompactionReport {
             previous_generation,
             generation,
             retained_roots: published.len(),
@@ -7208,7 +7323,22 @@ impl NamePageStorage {
             bytes_before,
             bytes_after,
             reclaimed_bytes: bytes_before.saturating_sub(bytes_after),
-        })
+        };
+        tracing::info!(
+            phase = "complete",
+            previous_generation = report.previous_generation,
+            generation = report.generation,
+            retained_roots = report.retained_roots,
+            records_written = report.records_written,
+            pages_written = report.pages_written,
+            bytes_before = report.bytes_before,
+            bytes_after = report.bytes_after,
+            reclaimed_bytes = report.reclaimed_bytes,
+            elapsed_seconds = start.elapsed().as_secs(),
+            remaining_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
+            "completed pruned name-page generation compaction"
+        );
+        Ok(report)
     }
 
     fn preflight_append_pages(&self, page_count: usize) -> Result<u64> {
