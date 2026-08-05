@@ -1095,7 +1095,7 @@ mod tests {
         );
         fingerprint_receiver.on_ready(now);
         let action = fingerprint_receiver.receive_extension(&fingerprint_hello);
-        assert!(action.response_payload.is_some());
+        assert_eq!(action.response_payload, None);
         assert_eq!(
             fingerprint_receiver.diagnostics.disable_reason,
             Some(DenuoDisableReason::WrongFingerprint)
