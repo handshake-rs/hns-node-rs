@@ -8453,6 +8453,7 @@ pub fn clear_production_safety_fence_validated(
             let pages = NamePageStorage::open_or_bootstrap(directory.to_path_buf(), store, network)
                 .context("failed to reopen name pages for safety-fence validation")?;
             let snapshot = store.snapshot()?;
+            let now = Instant::now();
             let required_roots = [
                 load_stored_name_tree_root(&snapshot).map_err(|error| {
                     anyhow::anyhow!("failed to load working name root: {error}")
@@ -8464,8 +8465,12 @@ pub fn clear_production_safety_fence_validated(
             let (reader, _) = pages.reader_for_roots(&snapshot, required_roots, true)?;
             seed_startup_pin_page_roots(&snapshot, network, &reader)?;
             reader
-                .validate_committed_pages_with_limits(production_name_page_validation_limits(
-                    &snapshot, network,
+                .validate_committed_pages_with_limits(name_page_validation_limits_with_spill(
+                    &snapshot,
+                    network,
+                    MAX_NAME_PAGE_VALIDATION_SPILL_BYTES,
+                    now.checked_add(MAX_NAME_PAGE_COMPACTION_ELAPSED)
+                        .unwrap_or(now),
                 )?)
                 .map_err(|error| {
                     anyhow::anyhow!("name-page safety-fence validation failed: {error}")
