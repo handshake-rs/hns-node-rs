@@ -30,6 +30,7 @@ publish = false
 repository = "https://github.com/handshake-rs/hns-node-rs"
 
 [workspace.dependencies]
+ahash = "0.8"
 anyhow = "1.0"
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }

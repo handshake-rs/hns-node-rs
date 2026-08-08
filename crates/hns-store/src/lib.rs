@@ -668,6 +668,17 @@ pub trait WriteBatch {
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError>;
 }
 
+/// One-level reversible boundary used to keep the largest complete prefix of a
+/// staged multi-block mutation. Implementations journal only operations written
+/// after `begin_checkpoint`; accepted prefixes discard that short journal.
+pub trait CheckpointWriteBatch: WriteBatch {
+    fn begin_checkpoint(&mut self) -> Result<(), StoreError>;
+
+    fn commit_checkpoint(&mut self) -> Result<(), StoreError>;
+
+    fn rollback_checkpoint(&mut self) -> Result<(), StoreError>;
+}
+
 /// The cumulative resource budget shared by a higher-level atomic mutation
 /// and the archive transformation performed during its final store commit.
 ///
@@ -755,6 +766,7 @@ impl StagingOverlay {
             inner,
             changes: Rc::clone(&self.changes),
             defer_name_tree_nodes: false,
+            checkpoint: None,
         }
     }
 
@@ -767,6 +779,7 @@ impl StagingOverlay {
             inner,
             changes: Rc::clone(&self.changes),
             defer_name_tree_nodes: true,
+            checkpoint: None,
         }
     }
 
@@ -780,6 +793,16 @@ impl StagingOverlay {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    /// Remove and transfer one staged column family without cloning its keys or
+    /// values. Callers must finish every read through snapshots backed by this
+    /// overlay before consuming the family.
+    pub fn take_staged_family(&self, family: ColumnFamily) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        self.changes
+            .borrow_mut()
+            .remove(&family)
             .unwrap_or_default()
     }
 }
@@ -1077,6 +1100,7 @@ pub struct StagedBatch<B: WriteBatch> {
     inner: B,
     changes: SharedStagedChanges,
     defer_name_tree_nodes: bool,
+    checkpoint: Option<Vec<(ColumnFamily, Vec<u8>, Option<Option<Vec<u8>>>)>>,
 }
 
 impl<B: WriteBatch> StagedBatch<B> {
@@ -1090,11 +1114,16 @@ impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
         if !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes) {
             self.inner.put(family, key, value)?;
         }
-        self.changes
+        let key = key.to_vec();
+        let previous = self
+            .changes
             .borrow_mut()
             .entry(family)
             .or_default()
-            .insert(key.to_vec(), Some(value.to_vec()));
+            .insert(key.clone(), Some(value.to_vec()));
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint.push((family, key, previous));
+        }
         Ok(())
     }
 
@@ -1102,11 +1131,71 @@ impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
         if !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes) {
             self.inner.delete(family, key)?;
         }
-        self.changes
+        let key = key.to_vec();
+        let previous = self
+            .changes
             .borrow_mut()
             .entry(family)
             .or_default()
-            .insert(key.to_vec(), None);
+            .insert(key.clone(), None);
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint.push((family, key, previous));
+        }
+        Ok(())
+    }
+}
+
+impl<B: CheckpointWriteBatch> CheckpointWriteBatch for StagedBatch<B> {
+    fn begin_checkpoint(&mut self) -> Result<(), StoreError> {
+        if self.checkpoint.is_some() {
+            return Err(StoreError::Backend(
+                "staged batch checkpoint is already active".to_owned(),
+            ));
+        }
+        self.inner.begin_checkpoint()?;
+        self.checkpoint = Some(Vec::new());
+        Ok(())
+    }
+
+    fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
+        if self.checkpoint.is_none() {
+            return Err(StoreError::Backend(
+                "staged batch checkpoint is not active".to_owned(),
+            ));
+        }
+        self.inner.commit_checkpoint()?;
+        self.checkpoint = None;
+        Ok(())
+    }
+
+    fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
+        if self.checkpoint.is_none() {
+            return Err(StoreError::Backend(
+                "staged batch checkpoint is not active".to_owned(),
+            ));
+        }
+        self.inner.rollback_checkpoint()?;
+        let Some(mut journal) = self.checkpoint.take() else {
+            unreachable!("staged checkpoint was checked above");
+        };
+        let mut changes = self.changes.borrow_mut();
+        while let Some((family, key, previous)) = journal.pop() {
+            let family_empty = {
+                let family_changes = changes.entry(family).or_default();
+                match previous {
+                    Some(previous) => {
+                        family_changes.insert(key, previous);
+                    }
+                    None => {
+                        family_changes.remove(&key);
+                    }
+                }
+                family_changes.is_empty()
+            };
+            if family_empty {
+                changes.remove(&family);
+            }
+        }
         Ok(())
     }
 }
@@ -3337,8 +3426,8 @@ impl StoreHandleBatch {
     ) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => {
-                for operation in &batch.operations {
-                    let MemoryOperation::Put { key, value } = operation else {
+                for (key, value) in &batch.operations {
+                    let Some(value) = value else {
                         continue;
                     };
                     visit_archive_payload(key.family, &key.key, value, visitor)?;
@@ -3346,11 +3435,11 @@ impl StoreHandleBatch {
             }
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(batch) => {
-                for operation in &batch.operations {
-                    let RocksOperation::Put { family, key, value } = operation else {
+                for (key, value) in &batch.operations {
+                    let Some(value) = value else {
                         continue;
                     };
-                    visit_archive_payload(*family, key, value, visitor)?;
+                    visit_archive_payload(key.family, &key.key, value, visitor)?;
                 }
             }
         }
@@ -3364,8 +3453,8 @@ impl StoreHandleBatch {
         let mut payloads = Vec::with_capacity(expected_payloads);
         match self {
             Self::Memory(batch) => {
-                for operation in &mut batch.operations {
-                    let MemoryOperation::Put { key, value } = operation else {
+                for (key, value) in &mut batch.operations {
+                    let Some(value) = value else {
                         continue;
                     };
                     collect_archive_payload(key.family, &key.key, value, &mut payloads)?;
@@ -3373,11 +3462,11 @@ impl StoreHandleBatch {
             }
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(batch) => {
-                for operation in &mut batch.operations {
-                    let RocksOperation::Put { family, key, value } = operation else {
+                for (key, value) in &mut batch.operations {
+                    let Some(value) = value else {
                         continue;
                     };
-                    collect_archive_payload(*family, key, value, &mut payloads)?;
+                    collect_archive_payload(key.family, &key.key, value, &mut payloads)?;
                 }
             }
         }
@@ -3397,8 +3486,8 @@ impl StoreHandleBatch {
         let mut locators = locators.iter();
         match self {
             Self::Memory(batch) => {
-                for operation in &mut batch.operations {
-                    let MemoryOperation::Put { key, value } = operation else {
+                for (key, value) in &mut batch.operations {
+                    let Some(value) = value else {
                         continue;
                     };
                     replace_archive_payload(key.family, value, &mut locators)?;
@@ -3406,11 +3495,11 @@ impl StoreHandleBatch {
             }
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(batch) => {
-                for operation in &mut batch.operations {
-                    let RocksOperation::Put { family, value, .. } = operation else {
+                for (key, value) in &mut batch.operations {
+                    let Some(value) = value else {
                         continue;
                     };
-                    replace_archive_payload(*family, value, &mut locators)?;
+                    replace_archive_payload(key.family, value, &mut locators)?;
                 }
             }
         }
@@ -3507,6 +3596,32 @@ impl WriteBatch for StoreHandleBatch {
     }
 }
 
+impl CheckpointWriteBatch for StoreHandleBatch {
+    fn begin_checkpoint(&mut self) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(batch) => batch.begin_checkpoint(),
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(batch) => batch.begin_checkpoint(),
+        }
+    }
+
+    fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(batch) => batch.commit_checkpoint(),
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(batch) => batch.commit_checkpoint(),
+        }
+    }
+
+    fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(batch) => batch.rollback_checkpoint(),
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(batch) => batch.rollback_checkpoint(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
     inner: Arc<RwLock<MemoryStoreState>>,
@@ -3548,17 +3663,7 @@ impl Store for MemoryStore {
     }
 
     fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
-        let mut changes = BTreeMap::<StoreKey, Option<Vec<u8>>>::new();
-        for operation in batch.operations {
-            match operation {
-                MemoryOperation::Put { key, value } => {
-                    changes.insert(key, Some(value));
-                }
-                MemoryOperation::Delete { key } => {
-                    changes.insert(key, None);
-                }
-            }
-        }
+        let changes = batch.operations;
         if changes.is_empty() {
             return Ok(());
         }
@@ -3828,7 +3933,8 @@ fn compact_memory_history(history: &mut Vec<MemoryVersion>, oldest_snapshot: Opt
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBatch {
-    operations: Vec<MemoryOperation>,
+    operations: BTreeMap<StoreKey, Option<Vec<u8>>>,
+    checkpoint: Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
 }
 
 impl MemoryBatch {
@@ -3843,18 +3949,37 @@ impl MemoryBatch {
 
 impl WriteBatch for MemoryBatch {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.operations.push(MemoryOperation::Put {
-            key: StoreKey::new(family, key),
-            value: value.to_vec(),
-        });
+        replace_batch_operation(
+            &mut self.operations,
+            &mut self.checkpoint,
+            StoreKey::new(family, key),
+            Some(value.to_vec()),
+        );
         Ok(())
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
-        self.operations.push(MemoryOperation::Delete {
-            key: StoreKey::new(family, key),
-        });
+        replace_batch_operation(
+            &mut self.operations,
+            &mut self.checkpoint,
+            StoreKey::new(family, key),
+            None,
+        );
         Ok(())
+    }
+}
+
+impl CheckpointWriteBatch for MemoryBatch {
+    fn begin_checkpoint(&mut self) -> Result<(), StoreError> {
+        begin_batch_checkpoint(&mut self.checkpoint)
+    }
+
+    fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
+        commit_batch_checkpoint(&mut self.checkpoint)
+    }
+
+    fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
+        rollback_batch_checkpoint(&mut self.operations, &mut self.checkpoint)
     }
 }
 
@@ -3873,10 +3998,61 @@ impl StoreKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum MemoryOperation {
-    Put { key: StoreKey, value: Vec<u8> },
-    Delete { key: StoreKey },
+fn replace_batch_operation(
+    operations: &mut BTreeMap<StoreKey, Option<Vec<u8>>>,
+    checkpoint: &mut Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
+    key: StoreKey,
+    value: Option<Vec<u8>>,
+) {
+    let previous = operations.insert(key.clone(), value);
+    if let Some(journal) = checkpoint {
+        journal.push((key, previous));
+    }
+}
+
+fn begin_batch_checkpoint(
+    checkpoint: &mut Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
+) -> Result<(), StoreError> {
+    if checkpoint.is_some() {
+        return Err(StoreError::Backend(
+            "write batch checkpoint is already active".to_owned(),
+        ));
+    }
+    *checkpoint = Some(Vec::new());
+    Ok(())
+}
+
+fn commit_batch_checkpoint(
+    checkpoint: &mut Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
+) -> Result<(), StoreError> {
+    if checkpoint.take().is_none() {
+        return Err(StoreError::Backend(
+            "write batch checkpoint is not active".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_batch_checkpoint(
+    operations: &mut BTreeMap<StoreKey, Option<Vec<u8>>>,
+    checkpoint: &mut Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
+) -> Result<(), StoreError> {
+    let Some(mut journal) = checkpoint.take() else {
+        return Err(StoreError::Backend(
+            "write batch checkpoint is not active".to_owned(),
+        ));
+    };
+    while let Some((key, previous)) = journal.pop() {
+        match previous {
+            Some(previous) => {
+                operations.insert(key, previous);
+            }
+            None => {
+                operations.remove(&key);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "rocksdb-backend")]
@@ -4073,16 +4249,11 @@ impl Store for RocksStore {
         self.ensure_operational()?;
         let mut write_batch = rocksdb::WriteBatch::default();
 
-        for operation in batch.operations {
-            match operation {
-                RocksOperation::Put { family, key, value } => {
-                    let cf = Self::cf(&self.db, family)?;
-                    write_batch.put_cf(cf, key, value);
-                }
-                RocksOperation::Delete { family, key } => {
-                    let cf = Self::cf(&self.db, family)?;
-                    write_batch.delete_cf(cf, key);
-                }
+        for (key, value) in batch.operations {
+            let cf = Self::cf(&self.db, key.family)?;
+            match value {
+                Some(value) => write_batch.put_cf(cf, key.key, value),
+                None => write_batch.delete_cf(cf, key.key),
             }
         }
 
@@ -4235,41 +4406,49 @@ impl ReadSnapshot for RocksSnapshot<'_> {
 #[cfg(feature = "rocksdb-backend")]
 #[derive(Clone, Debug, Default)]
 pub struct RocksBatch {
-    operations: Vec<RocksOperation>,
+    // Both the staging overlay and the durable backend are last-write-wins.
+    // Retaining only the final operation avoids allocating and submitting every
+    // intermediate mutation produced by a multi-block activation.
+    operations: BTreeMap<StoreKey, Option<Vec<u8>>>,
+    checkpoint: Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
 }
 
 #[cfg(feature = "rocksdb-backend")]
 impl WriteBatch for RocksBatch {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        self.operations.push(RocksOperation::Put {
-            family,
-            key: key.to_vec(),
-            value: value.to_vec(),
-        });
+        replace_batch_operation(
+            &mut self.operations,
+            &mut self.checkpoint,
+            StoreKey::new(family, key),
+            Some(value.to_vec()),
+        );
         Ok(())
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
-        self.operations.push(RocksOperation::Delete {
-            family,
-            key: key.to_vec(),
-        });
+        replace_batch_operation(
+            &mut self.operations,
+            &mut self.checkpoint,
+            StoreKey::new(family, key),
+            None,
+        );
         Ok(())
     }
 }
 
 #[cfg(feature = "rocksdb-backend")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RocksOperation {
-    Put {
-        family: ColumnFamily,
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    Delete {
-        family: ColumnFamily,
-        key: Vec<u8>,
-    },
+impl CheckpointWriteBatch for RocksBatch {
+    fn begin_checkpoint(&mut self) -> Result<(), StoreError> {
+        begin_batch_checkpoint(&mut self.checkpoint)
+    }
+
+    fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
+        commit_batch_checkpoint(&mut self.checkpoint)
+    }
+
+    fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
+        rollback_batch_checkpoint(&mut self.operations, &mut self.checkpoint)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -4428,6 +4607,108 @@ mod tests {
         assert_eq!(
             snapshot.get(ColumnFamily::Headers, b"hash").expect("get"),
             Some(b"header".to_vec())
+        );
+    }
+
+    #[test]
+    fn memory_batch_retains_only_the_final_operation_per_key() {
+        let mut batch = MemoryBatch::default();
+        batch
+            .put(ColumnFamily::Meta, b"shared", b"first")
+            .expect("first put");
+        batch.delete(ColumnFamily::Meta, b"shared").expect("delete");
+        batch
+            .put(ColumnFamily::Meta, b"shared", b"final")
+            .expect("final put");
+        batch
+            .put(ColumnFamily::Headers, b"shared", b"other-family")
+            .expect("other family");
+
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            batch
+                .operations
+                .get(&StoreKey::new(ColumnFamily::Meta, b"shared")),
+            Some(&Some(b"final".to_vec()))
+        );
+    }
+
+    #[test]
+    fn staged_batch_checkpoint_restores_overlay_and_final_operations() {
+        let store = MemoryStore::new();
+        let base = store.snapshot().expect("checkpoint base");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&base);
+        let mut batch = overlay.batch(store.batch());
+        batch
+            .put(ColumnFamily::Meta, b"retained", b"before")
+            .expect("retained put");
+
+        batch.begin_checkpoint().expect("begin checkpoint");
+        batch
+            .put(ColumnFamily::Meta, b"retained", b"oversized-block")
+            .expect("replacement put");
+        batch
+            .put(ColumnFamily::Meta, b"transient", b"discarded")
+            .expect("transient put");
+        batch.rollback_checkpoint().expect("rollback checkpoint");
+
+        assert_eq!(
+            staged
+                .get(ColumnFamily::Meta, b"retained")
+                .expect("retained staged value"),
+            Some(b"before".to_vec())
+        );
+        assert_eq!(
+            staged
+                .get(ColumnFamily::Meta, b"transient")
+                .expect("transient staged value"),
+            None
+        );
+        let inner = batch.into_inner();
+        assert_eq!(inner.operations.len(), 1);
+        drop(staged);
+        drop(base);
+        drop(overlay);
+        store.commit(inner).expect("commit retained prefix");
+        let committed = store.snapshot().expect("checkpoint committed snapshot");
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Meta, b"retained")
+                .expect("retained committed value"),
+            Some(b"before".to_vec())
+        );
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Meta, b"transient")
+                .expect("transient committed value"),
+            None
+        );
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_batch_retains_only_the_final_operation_per_family_and_key() {
+        let mut batch = RocksBatch::default();
+        batch
+            .put(ColumnFamily::Blocks, &[0x11; 32], b"archived-body")
+            .expect("body put");
+        batch
+            .delete(ColumnFamily::Blocks, &[0x11; 32])
+            .expect("body delete");
+        batch
+            .put(ColumnFamily::Blocks, &[0x11; 32], b"replacement-body")
+            .expect("replacement body");
+        batch
+            .put(ColumnFamily::Undo, &[0x11; 32], b"undo")
+            .expect("undo put");
+
+        assert_eq!(batch.operations.len(), 2);
+        assert_eq!(
+            batch
+                .operations
+                .get(&StoreKey::new(ColumnFamily::Blocks, &[0x11; 32])),
+            Some(&Some(b"replacement-body".to_vec()))
         );
     }
 
@@ -4972,10 +5253,14 @@ mod tests {
                 .expect("staged node"),
             Some(b"canonical".to_vec())
         );
+        drop(staged_snapshot);
         assert_eq!(
-            overlay.staged_family(ColumnFamily::NameTreeNodes),
+            overlay.take_staged_family(ColumnFamily::NameTreeNodes),
             BTreeMap::from([(b"node".to_vec(), Some(b"canonical".to_vec()))])
         );
+        assert!(overlay
+            .staged_family(ColumnFamily::NameTreeNodes)
+            .is_empty());
         store
             .commit(staged_batch.into_inner())
             .expect("commit inner batch");
@@ -5892,6 +6177,73 @@ mod tests {
         );
         drop(reopened);
         std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[test]
+    fn archived_batch_publishes_only_final_block_and_undo_values() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-store-coalesced-archive-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let archived = StoreHandle::memory()
+            .with_segment_archive(directory.clone())
+            .expect("attach coalesced archive");
+        let block_key = [0x51; 32];
+        let undo_key = [0x52; 32];
+        let mut batch = archived.batch();
+        for (family, key, first, final_value) in [
+            (
+                ColumnFamily::Blocks,
+                block_key,
+                b"obsolete block".as_slice(),
+                b"final block".as_slice(),
+            ),
+            (
+                ColumnFamily::Undo,
+                undo_key,
+                b"obsolete undo".as_slice(),
+                b"final undo".as_slice(),
+            ),
+        ] {
+            batch
+                .put(family, &key, first)
+                .expect("stage obsolete value");
+            batch
+                .delete(family, &key)
+                .expect("stage intermediate delete");
+            batch
+                .put(family, &key, final_value)
+                .expect("stage final value");
+        }
+        archived.commit(batch).expect("commit coalesced archive");
+
+        let snapshot = archived.snapshot().expect("coalesced archive snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Blocks, &block_key)
+                .expect("final block"),
+            Some(b"final block".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Undo, &undo_key)
+                .expect("final undo"),
+            Some(b"final undo".to_vec())
+        );
+        drop(snapshot);
+        let inventory = archived
+            .scrub_segment_archive()
+            .expect("scrub final values");
+        assert_eq!(inventory.blocks.records, 1);
+        assert_eq!(inventory.undo.records, 1);
+
+        drop(archived);
+        std::fs::remove_dir_all(directory).expect("remove coalesced archive fixture");
     }
 
     #[test]

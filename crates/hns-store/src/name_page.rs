@@ -305,6 +305,11 @@ impl NamePageBuilder {
         &self.records
     }
 
+    /// Transfer the accepted records without cloning their canonical payloads.
+    pub fn into_records(self) -> Vec<NamePageRecord> {
+        self.records
+    }
+
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }

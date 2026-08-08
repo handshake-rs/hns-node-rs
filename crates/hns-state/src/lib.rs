@@ -5,8 +5,9 @@ mod page_tree;
 pub use hns_urkel::TreeRoot;
 pub use page_tree::{
     maximum_name_page_validation_records, name_page_root_key, pack_name_page_records,
-    stream_name_page_tree, stream_name_page_tree_delta, stream_name_page_tree_delta_with_limits,
-    stream_name_page_tree_delta_with_limits_and_progress, stream_name_page_tree_with_limits,
+    pack_name_page_records_consuming, stream_name_page_tree, stream_name_page_tree_delta,
+    stream_name_page_tree_delta_with_limits, stream_name_page_tree_delta_with_limits_and_progress,
+    stream_name_page_tree_indexed_with_limits_and_progress, stream_name_page_tree_with_limits,
     stream_name_page_tree_with_limits_and_progress, NamePageRootLocator, NamePageRootRecord,
     NamePageSnapshot, NamePageState, NamePageStreamLimits, NamePageStreamProgress,
     NamePageTraversalLimits, NamePageTreeReader, NamePageValidation, NamePageValidationLimits,

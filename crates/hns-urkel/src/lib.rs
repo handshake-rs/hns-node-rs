@@ -20,13 +20,14 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::{Arc, RwLock},
 };
 
 #[cfg(test)]
 use std::collections::BTreeSet;
 
+use ahash::AHashMap;
 use hns_primitives::{blake2b_256, blake2b_256_many, NameHash, MAX_TX_SIZE};
 use serde::{Deserialize, Serialize};
 
@@ -747,11 +748,68 @@ pub enum UrkelNodeRecord {
     },
 }
 
+/// Borrowed canonical Urkel node view. Validation and hashing can operate on
+/// persisted bytes without copying leaf values or compressed prefixes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UrkelNodeRecordRef<'a> {
+    Leaf {
+        key: NameHash,
+        value: &'a [u8],
+    },
+    Internal {
+        prefix: BitPrefixRef<'a>,
+        left: TreeRoot,
+        right: TreeRoot,
+    },
+}
+
+impl UrkelNodeRecordRef<'_> {
+    pub fn root(self) -> TreeRoot {
+        match self {
+            Self::Leaf { key, value } => {
+                TreeRoot::new(hash_leaf(key.as_bytes(), &blake2b_256(value)))
+            }
+            Self::Internal {
+                prefix,
+                left,
+                right,
+            } => TreeRoot::new(hash_internal_parts(
+                prefix.bit_len(),
+                prefix.bytes(),
+                left.as_bytes(),
+                right.as_bytes(),
+            )),
+        }
+    }
+
+    pub fn to_owned(self) -> UrkelNodeRecord {
+        match self {
+            Self::Leaf { key, value } => UrkelNodeRecord::Leaf {
+                key,
+                value: value.to_vec(),
+            },
+            Self::Internal {
+                prefix,
+                left,
+                right,
+            } => UrkelNodeRecord::Internal {
+                prefix: prefix.to_owned(),
+                left,
+                right,
+            },
+        }
+    }
+}
+
 impl UrkelNodeRecord {
     const LEAF_TAG: u8 = 0;
     const INTERNAL_TAG: u8 = 1;
 
     pub fn decode(raw: &[u8]) -> Result<Self, UrkelError> {
+        Ok(Self::decode_ref(raw)?.to_owned())
+    }
+
+    pub fn decode_ref(raw: &[u8]) -> Result<UrkelNodeRecordRef<'_>, UrkelError> {
         if raw.len() > MAX_URKEL_NODE_RECORD_SIZE {
             return Err(UrkelError::Codec(format!(
                 "Urkel node record uses {} bytes, exceeding {MAX_URKEL_NODE_RECORD_SIZE}",
@@ -781,9 +839,9 @@ impl UrkelNodeRecord {
                         payload.len().saturating_sub(36)
                     )));
                 }
-                Ok(Self::Leaf {
+                Ok(UrkelNodeRecordRef::Leaf {
                     key,
-                    value: payload[36..].to_vec(),
+                    value: &payload[36..],
                 })
             }
             Self::INTERNAL_TAG => {
@@ -813,9 +871,9 @@ impl UrkelNodeRecord {
                         payload.len()
                     )));
                 }
-                let prefix = BitPrefix {
+                let prefix = BitPrefixRef {
                     bit_len: bit_len as u16,
-                    bytes: payload[2..2 + prefix_bytes].to_vec(),
+                    bytes: &payload[2..2 + prefix_bytes],
                 };
                 prefix.validate()?;
                 let left = TreeRoot::new(
@@ -833,7 +891,7 @@ impl UrkelNodeRecord {
                         "compressed Urkel internal node has an empty child".to_owned(),
                     ));
                 }
-                Ok(Self::Internal {
+                Ok(UrkelNodeRecordRef::Internal {
                     prefix,
                     left,
                     right,
@@ -931,7 +989,7 @@ where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
     I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
 {
-    apply_record_updates(root, updates, load, BTreeMap::new())
+    apply_record_updates(root, updates, load, AHashMap::new())
 }
 
 /// Apply path-local mutations after loading all affected paths breadth-first.
@@ -988,11 +1046,15 @@ where
     I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
     P: IntoIterator<Item = (TreeRoot, Vec<u8>)>,
 {
-    let mut loaded = BTreeMap::new();
+    let mut loaded = AHashMap::new();
     for (record_root, raw) in prefetched {
         let record = decode_verified_record(record_root, &raw)?;
-        if let Some(existing) = loaded.insert(record_root, record.clone()) {
-            if existing != record {
+        match loaded.entry(record_root) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &record => {}
+            std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(UrkelError::NodeHashCollision(record_root));
             }
         }
@@ -1037,11 +1099,15 @@ where
         });
     }
 
-    let mut loaded = BTreeMap::new();
+    let mut loaded = AHashMap::new();
     for (record_root, raw) in prefetched {
         let record = decode_verified_record(record_root, &raw)?;
-        if let Some(existing) = loaded.insert(record_root, record.clone()) {
-            if existing != record {
+        match loaded.entry(record_root) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+            }
+            std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &record => {}
+            std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(UrkelError::NodeHashCollision(record_root));
             }
         }
@@ -1396,7 +1462,7 @@ fn apply_record_updates<F, I>(
     root: TreeRoot,
     updates: I,
     load: F,
-    loaded: BTreeMap<TreeRoot, UrkelNodeRecord>,
+    loaded: AHashMap<TreeRoot, UrkelNodeRecord>,
 ) -> Result<UrkelRecordUpdate, UrkelError>
 where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
@@ -1434,11 +1500,11 @@ fn prefetch_record_paths<F>(
     keys: &[NameHash],
     batch_size: usize,
     load_many: &mut F,
-) -> Result<BTreeMap<TreeRoot, UrkelNodeRecord>, UrkelError>
+) -> Result<AHashMap<TreeRoot, UrkelNodeRecord>, UrkelError>
 where
     F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
 {
-    let mut loaded = BTreeMap::new();
+    let mut loaded = AHashMap::new();
     if root == TreeRoot::ZERO || keys.is_empty() {
         return Ok(loaded);
     }
@@ -1503,7 +1569,7 @@ where
 
 struct RecordMutationContext<F> {
     load: F,
-    loaded: BTreeMap<TreeRoot, UrkelNodeRecord>,
+    loaded: AHashMap<TreeRoot, UrkelNodeRecord>,
     records: BTreeMap<TreeRoot, Vec<u8>>,
 }
 
@@ -1550,8 +1616,12 @@ where
     fn intern(&mut self, record: UrkelNodeRecord) -> Result<TreeRoot, UrkelError> {
         let root = record.root();
         let raw = record.encode()?;
-        if let Some(existing) = self.records.insert(root, raw.clone()) {
-            if existing != raw {
+        match self.records.entry(root) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(raw);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &raw => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
                 return Err(UrkelError::NodeHashCollision(root));
             }
         }
@@ -1568,8 +1638,12 @@ where
             }
             return Ok(root);
         }
-        if let Some(existing) = self.records.insert(root, raw.clone()) {
-            if existing != raw {
+        match self.records.entry(root) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(raw);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &raw => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
                 return Err(UrkelError::NodeHashCollision(root));
             }
         }
@@ -1994,7 +2068,7 @@ where
 /// used during validation, so compaction does not need a second full hash set.
 #[derive(Debug)]
 pub struct ReachableRecordRoots {
-    primary_depths: HashMap<TreeRoot, u16>,
+    primary_depths: AHashMap<TreeRoot, u16>,
 }
 
 impl ReachableRecordRoots {
@@ -2042,7 +2116,7 @@ where
         ));
     }
 
-    let mut primary_depths = HashMap::<TreeRoot, u16>::new();
+    let mut primary_depths = AHashMap::<TreeRoot, u16>::new();
     let mut alternate_depths = HashSet::<(TreeRoot, u16)>::new();
     let mut pending = roots
         .into_iter()
@@ -2094,7 +2168,7 @@ where
                 unique_roots.len()
             )));
         }
-        let mut records = HashMap::with_capacity(unique_roots.len());
+        let mut records = AHashMap::with_capacity(unique_roots.len());
         for (root, raw) in unique_roots.into_iter().zip(raw_records) {
             let raw = raw.ok_or(UrkelError::MissingNode(root))?;
             records.insert(root, decode_verified_record(root, &raw)?);
@@ -2357,6 +2431,60 @@ pub struct BitPrefix {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BitPrefixRef<'a> {
+    bit_len: u16,
+    bytes: &'a [u8],
+}
+
+impl<'a> BitPrefixRef<'a> {
+    pub fn bit_len(self) -> usize {
+        usize::from(self.bit_len)
+    }
+
+    pub fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    fn bit(self, index: usize) -> u8 {
+        debug_assert!(index < self.bit_len());
+        packed_bit(self.bytes, index)
+    }
+
+    fn count_key(self, key: &[u8; 32], depth: usize) -> usize {
+        let mut count = 0usize;
+        for offset in 0..self.bit_len() {
+            if self.bit(offset) != key_bit(key, depth + offset) {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    pub fn matches_key(self, key: &[u8; 32], depth: usize) -> bool {
+        depth
+            .checked_add(self.bit_len())
+            .is_some_and(|end| end <= URKEL_BITS)
+            && self.count_key(key, depth) == self.bit_len()
+    }
+
+    fn validate(self) -> Result<(), UrkelError> {
+        validate_prefix_encoding(self.bit_len(), self.bytes)
+    }
+
+    pub fn to_owned(self) -> BitPrefix {
+        BitPrefix {
+            bit_len: self.bit_len,
+            bytes: self.bytes.to_vec(),
+        }
+    }
+}
+
 impl BitPrefix {
     fn from_key_range(key: &[u8; 32], start: usize, bit_len: usize) -> Self {
         debug_assert!(start <= URKEL_BITS);
@@ -2461,29 +2589,7 @@ impl BitPrefix {
     }
 
     fn validate(&self) -> Result<(), UrkelError> {
-        let bit_len = self.bit_len();
-        if bit_len > URKEL_BITS {
-            return Err(UrkelError::InvalidProof(
-                "compressed prefix exceeds 256 bits".to_owned(),
-            ));
-        }
-        let expected_len = bit_len.div_ceil(8);
-        if self.bytes.len() != expected_len {
-            return Err(UrkelError::InvalidProof(format!(
-                "compressed prefix uses {} bytes for {bit_len} bits",
-                self.bytes.len()
-            )));
-        }
-        if !bit_len.is_multiple_of(8) && !self.bytes.is_empty() {
-            let used = bit_len % 8;
-            let trailing_mask = (1u8 << (8 - used)) - 1;
-            if self.bytes[self.bytes.len() - 1] & trailing_mask != 0 {
-                return Err(UrkelError::InvalidProof(
-                    "compressed prefix has non-zero trailing bits".to_owned(),
-                ));
-            }
-        }
-        Ok(())
+        validate_prefix_encoding(self.bit_len(), &self.bytes)
     }
 
     fn write_hsd(&self, output: &mut Vec<u8>) {
@@ -2495,6 +2601,31 @@ impl BitPrefix {
         output.push(bit_len as u8);
         output.extend_from_slice(&self.bytes);
     }
+}
+
+fn validate_prefix_encoding(bit_len: usize, bytes: &[u8]) -> Result<(), UrkelError> {
+    if bit_len > URKEL_BITS {
+        return Err(UrkelError::InvalidProof(
+            "compressed prefix exceeds 256 bits".to_owned(),
+        ));
+    }
+    let expected_len = bit_len.div_ceil(8);
+    if bytes.len() != expected_len {
+        return Err(UrkelError::InvalidProof(format!(
+            "compressed prefix uses {} bytes for {bit_len} bits",
+            bytes.len()
+        )));
+    }
+    if !bit_len.is_multiple_of(8) && !bytes.is_empty() {
+        let used = bit_len % 8;
+        let trailing_mask = (1u8 << (8 - used)) - 1;
+        if bytes[bytes.len() - 1] & trailing_mask != 0 {
+            return Err(UrkelError::InvalidProof(
+                "compressed prefix has non-zero trailing bits".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct HsdProofReader<'a> {
@@ -2619,8 +2750,12 @@ impl Node {
         };
         let root = record.root();
         let raw = record.encode()?;
-        if let Some(existing) = records.insert(root, raw.clone()) {
-            if existing != raw {
+        match records.entry(root) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(raw);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &raw => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
                 return Err(UrkelError::NodeHashCollision(root));
             }
         }
@@ -2869,17 +3004,20 @@ fn hash_leaf(key: &[u8; 32], value_hash: &[u8; 32]) -> [u8; 32] {
 }
 
 fn hash_internal(prefix: &BitPrefix, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    if prefix.bit_len() == 0 {
+    hash_internal_parts(prefix.bit_len(), prefix.bytes(), left, right)
+}
+
+fn hash_internal_parts(
+    prefix_bits: usize,
+    prefix_bytes: &[u8],
+    left: &[u8; 32],
+    right: &[u8; 32],
+) -> [u8; 32] {
+    if prefix_bits == 0 {
         return blake2b_256_many([&[0x01][..], &left[..], &right[..]]);
     }
-    let size = (prefix.bit_len() as u16).to_le_bytes();
-    blake2b_256_many([
-        &[0x02][..],
-        &size[..],
-        prefix.bytes(),
-        &left[..],
-        &right[..],
-    ])
+    let size = (prefix_bits as u16).to_le_bytes();
+    blake2b_256_many([&[0x02][..], &size[..], prefix_bytes, &left[..], &right[..]])
 }
 
 fn key_bit(key: &[u8; 32], index: usize) -> u8 {
@@ -3091,6 +3229,43 @@ mod tests {
             .step_by(2)
             .map(|index| u8::from_str_radix(&value[index..index + 2], 16).expect("hex"))
             .collect()
+    }
+
+    #[test]
+    fn borrowed_node_decode_reuses_canonical_payload_bytes() {
+        let leaf = UrkelNodeRecord::Leaf {
+            key: key(7),
+            value: vec![0x5a; 4_096],
+        };
+        let raw = leaf.encode().expect("encode leaf");
+        let borrowed = UrkelNodeRecord::decode_ref(&raw).expect("borrow leaf");
+        match borrowed {
+            UrkelNodeRecordRef::Leaf { key: actual, value } => {
+                assert_eq!(actual, key(7));
+                assert_eq!(value.as_ptr(), raw[37..].as_ptr());
+                assert_eq!(value.len(), 4_096);
+            }
+            UrkelNodeRecordRef::Internal { .. } => panic!("leaf decoded as internal"),
+        }
+        assert_eq!(borrowed.to_owned(), leaf);
+        assert_eq!(borrowed.root(), leaf.root());
+
+        let internal = UrkelNodeRecord::Internal {
+            prefix: BitPrefix::from_key_range(key(7).as_bytes(), 3, 19),
+            left: TreeRoot::new([0x11; 32]),
+            right: TreeRoot::new([0x22; 32]),
+        };
+        let raw = internal.encode().expect("encode internal");
+        let borrowed = UrkelNodeRecord::decode_ref(&raw).expect("borrow internal");
+        match borrowed {
+            UrkelNodeRecordRef::Internal { prefix, .. } => {
+                assert_eq!(prefix.bit_len(), 19);
+                assert_eq!(prefix.as_bytes().as_ptr(), raw[3..].as_ptr());
+            }
+            UrkelNodeRecordRef::Leaf { .. } => panic!("internal decoded as leaf"),
+        }
+        assert_eq!(borrowed.to_owned(), internal);
+        assert_eq!(borrowed.root(), internal.root());
     }
 
     #[derive(Deserialize)]

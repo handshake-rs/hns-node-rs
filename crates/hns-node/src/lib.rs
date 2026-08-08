@@ -126,33 +126,36 @@ use hns_state::{
     load_persisted_name_tree_records, load_stored_name_tree_commit_root,
     load_stored_name_tree_root, maximum_name_page_validation_records,
     migrate_name_tree_interval_accumulator_bounded, name_page_root_key, name_tree_snapshot_pin_key,
-    pack_name_page_records, plan_name_tree_interval_accumulator_migration_bounded,
+    pack_name_page_records_consuming, plan_name_tree_interval_accumulator_migration_bounded,
     retained_name_tree_roots_bounded, stage_remove_name_tree_snapshot_pin,
     stream_name_page_tree_delta_with_limits_and_progress,
+    stream_name_page_tree_indexed_with_limits_and_progress,
     stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
     validate_persisted_name_tree_root, validate_persisted_name_trees,
     verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
     visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
     ConnectBlock, DisconnectBlock, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot,
-    NamePageState, NamePageStreamLimits, NamePageTraversalLimits, NamePageTreeReader,
-    NamePageValidationLimits, NameTreeCompactionSummary, NameTreeIntervalMigrationLimits,
-    NameTreeMaterializationLimits, NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits,
-    PageTreeError, RetainedNameTreeRootLimits, StateError, StateServices, StoredStateEngine,
-    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
-    NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    NamePageState, NamePageStreamLimits, NamePageTreeReader, NamePageValidationLimits,
+    NameTreeCompactionSummary, NameTreeIntervalMigrationLimits, NameTreeMaterializationLimits,
+    NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits,
+    StateError, StateServices, StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX,
+    NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 #[cfg(test)]
-use hns_state::{load_name_tree_snapshot_pins, verify_stored_name_tree_root};
+use hns_state::{
+    load_name_tree_snapshot_pins, pack_name_page_records, verify_stored_name_tree_root,
+};
 use hns_store::{
     decode_u64, encode_u64, filesystem_available_bytes, filesystem_tree_usage_bounded,
     mark_unclean_start, open_store, truncate_name_pages_to_committed_tail, was_clean_shutdown,
-    AtomicWriteEffectBudget, ColumnFamily, DurabilityPolicy, FilesystemTreeUsageLimits, MetaKey,
-    NamePageAppender, NamePageError, PrefixScanBudget, ReadSnapshot, ScanEntry,
-    SegmentArchiveScrubLimits, SegmentCompactionExecutionLimits, SegmentCompactionLimits,
-    StagingOverlay, Store, StoreBackend, StoreConfig, StoreError, StoreHandle, StoreHandleBatch,
-    WriteBatch, SCHEMA_VERSION, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES,
-    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS,
-    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, STORAGE_PROFILE,
+    AtomicWriteEffectBudget, CheckpointWriteBatch, ColumnFamily, DurabilityPolicy,
+    FilesystemTreeUsageLimits, MetaKey, NamePageAppender, NamePageError, PrefixScanBudget,
+    ReadSnapshot, ScanEntry, SegmentArchiveScrubLimits, SegmentCompactionExecutionLimits,
+    SegmentCompactionLimits, StagingOverlay, Store, StoreBackend, StoreConfig, StoreError,
+    StoreHandle, StoreHandleBatch, WriteBatch, SCHEMA_VERSION,
+    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED,
+    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS,
+    STORAGE_PROFILE,
 };
 use hns_wallet_index::{
     decode_index_profile, encode_index_profile, index_profile_is_current,
@@ -277,21 +280,18 @@ const MAX_REORG_STAGED_EFFECT_BYTES: u64 = 256 * 1024 * 1024;
 const REORG_STAGED_OPERATION_FRAMING_BYTES: u64 = 128;
 // During state staging, the write's source encoding coexists with the backend
 // batch and the read-your-writes overlay. Deferred name nodes omit the backend
-// copy, but later coexist in the staged page map and `PackedNamePages` logical
-// records. Packing receives an additional pre-allocation charge below, so the
-// three-copy charge remains deliberately conservative for both routes.
+// copy, and consuming page publication transfers that overlay allocation into
+// its ordered pack without cloning the canonical bytes.
 const REORG_STAGING_OPERATION_COPIES: u64 = 3;
 // After the overlay has been consumed, page publication retains one backend
 // copy while the source encoding is submitted to it.
 const REORG_PUBLICATION_OPERATION_COPIES: u64 = 2;
-// Packing retains the canonical fixed-size page while its byte-identical
-// physical output is appended and synced. Charge both representations plus a
-// conservative per-page framing/allocation allowance before any file write.
-const REORG_NAME_PAGE_OUTPUT_COPIES: u64 = 2;
-// `pack_name_page_records` clones each canonical node once and builds bounded
-// lookup/order/visited/address/page-record metadata before the fixed-size page
-// encoder runs. Precharge the raw clone plus a deliberately ABI-independent
-// 1 KiB per-record envelope before any of those pack allocations.
+// Streaming publication retains only one encoded fixed-size output page beyond
+// the already charged canonical records, independent of the total page count.
+const REORG_NAME_PAGE_OUTPUT_COPIES: u64 = 1;
+// The consuming packer builds bounded lookup/order/visited/address metadata.
+// Precharge a deliberately ABI-independent 1 KiB per-record envelope before
+// those allocations; canonical node bytes were already charged while staging.
 const REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD: u64 = 1024;
 const MAX_REORG_RECONCILIATION_TRANSACTIONS: u64 = 1_000_000;
 
@@ -4500,6 +4500,7 @@ impl NodeService {
                 connected: vec![mutation.record],
             },
             mining: mutation.mining,
+            truncated_direct_connect_limit: None,
         })
     }
 
@@ -5871,14 +5872,14 @@ impl NodeReorgLimits {
     }
 }
 
-/// Cumulative, fail-closed accounting for one reorganization's atomic write.
+/// Fail-closed accounting for one reorganization's atomic write.
 ///
 /// The meter is deliberately attached to the `WriteBatch` boundary instead of
 /// predicting state effects from block bodies. Every key, value, deletion and
 /// operation frame is charged before the underlying batch or overlay may copy
-/// it. Repeated writes to one logical key remain cumulative: the backend batch
-/// still retains each operation even when the overlay replaces its visible
-/// value.
+/// it. Point-operation charges follow the backend's last-write-wins map; page
+/// packing/output scratch remains cumulative because it represents additional
+/// allocations outside that map.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReorgStagedEffectMeter {
     consumed: u64,
@@ -5946,15 +5947,6 @@ impl ReorgStagedEffectMeter {
             .saturating_mul(copies)
     }
 
-    fn charge(
-        &mut self,
-        key_bytes: usize,
-        value_bytes: usize,
-        copies: u64,
-    ) -> std::result::Result<(), StoreError> {
-        self.charge_amount(Self::operation_charge(key_bytes, value_bytes, copies))
-    }
-
     fn charge_amount(&mut self, additional: u64) -> std::result::Result<(), StoreError> {
         let actual = self.consumed.saturating_add(additional);
         if actual > self.limit {
@@ -5969,12 +5961,11 @@ impl ReorgStagedEffectMeter {
     }
 
     fn name_page_output_charge(page_count: usize) -> u64 {
-        u64::try_from(page_count)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(
-                (hns_store::NAME_PAGE_BYTES as u64)
-                    .saturating_add(REORG_STAGED_OPERATION_FRAMING_BYTES),
-            )
+        if page_count == 0 {
+            return 0;
+        }
+        (hns_store::NAME_PAGE_BYTES as u64)
+            .saturating_add(REORG_STAGED_OPERATION_FRAMING_BYTES)
             .saturating_mul(REORG_NAME_PAGE_OUTPUT_COPIES)
     }
 
@@ -5986,13 +5977,9 @@ impl ReorgStagedEffectMeter {
     }
 
     fn name_page_packing_charge(records: &BTreeMap<TreeRoot, Vec<u8>>) -> u64 {
-        records.values().fold(0u64, |total, canonical| {
-            total.saturating_add(
-                u64::try_from(canonical.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD),
-            )
-        })
+        u64::try_from(records.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD)
     }
 
     fn charge_name_page_packing(
@@ -6016,23 +6003,101 @@ impl AtomicWriteEffectBudget for ReorgStagedEffectMeter {
 /// A transparent write-batch decorator carrying the authoritative reorg
 /// budget across both overlay staging and the later name-page publication
 /// writes made after `StagedBatch::into_inner`.
+type ReorgOperationCharges = HashMap<ColumnFamily, HashMap<Vec<u8>, u64>>;
+
 struct ReorgMeteredBatch<B> {
     inner: B,
     meter: ReorgStagedEffectMeter,
     copies: u64,
+    operation_charges: ReorgOperationCharges,
+    checkpoint: Option<ReorgMeterCheckpoint>,
+}
+
+struct ReorgMeterCheckpoint {
+    consumed: u64,
+    operation_journal: Vec<(ColumnFamily, Vec<u8>, Option<u64>)>,
 }
 
 impl<B> ReorgMeteredBatch<B> {
-    const fn new(inner: B, meter: ReorgStagedEffectMeter, copies: u64) -> Self {
+    fn new(inner: B, meter: ReorgStagedEffectMeter, copies: u64) -> Self {
         Self {
             inner,
             meter,
             copies,
+            operation_charges: HashMap::new(),
+            checkpoint: None,
         }
     }
 
-    fn into_parts(self) -> (B, ReorgStagedEffectMeter) {
-        (self.inner, self.meter)
+    fn with_operation_charges(
+        inner: B,
+        meter: ReorgStagedEffectMeter,
+        copies: u64,
+        operation_charges: ReorgOperationCharges,
+    ) -> Self {
+        Self {
+            inner,
+            meter,
+            copies,
+            operation_charges,
+            checkpoint: None,
+        }
+    }
+
+    fn into_parts(self) -> (B, ReorgStagedEffectMeter, ReorgOperationCharges) {
+        (self.inner, self.meter, self.operation_charges)
+    }
+
+    fn replacement_charge(
+        &self,
+        family: ColumnFamily,
+        key: &[u8],
+        value_bytes: usize,
+    ) -> std::result::Result<(u64, u64), StoreError> {
+        let next = ReorgStagedEffectMeter::operation_charge(key.len(), value_bytes, self.copies);
+        let previous = self
+            .operation_charges
+            .get(&family)
+            .and_then(|charges| charges.get(key))
+            .copied()
+            .unwrap_or(0);
+        let actual = self
+            .meter
+            .consumed
+            .saturating_sub(previous)
+            .saturating_add(next);
+        if actual > self.meter.limit {
+            return Err(StoreError::LimitExceeded {
+                context: ReorgStagedEffectMeter::CONTEXT,
+                limit: self.meter.limit,
+                actual,
+            });
+        }
+        Ok((next, actual))
+    }
+
+    fn record_replacement_charge(
+        &mut self,
+        family: ColumnFamily,
+        key: &[u8],
+        charge: u64,
+        consumed: u64,
+    ) {
+        let previous = self
+            .operation_charges
+            .get(&family)
+            .and_then(|charges| charges.get(key))
+            .copied();
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint
+                .operation_journal
+                .push((family, key.to_vec(), previous));
+        }
+        self.operation_charges
+            .entry(family)
+            .or_default()
+            .insert(key.to_vec(), charge);
+        self.meter.consumed = consumed;
     }
 }
 
@@ -6043,8 +6108,9 @@ impl<B: WriteBatch> WriteBatch for ReorgMeteredBatch<B> {
         key: &[u8],
         value: &[u8],
     ) -> std::result::Result<(), StoreError> {
-        self.meter.charge(key.len(), value.len(), self.copies)?;
+        let (charge, consumed) = self.replacement_charge(family, key, value.len())?;
         self.inner.put(family, key, value)?;
+        self.record_replacement_charge(family, key, charge, consumed);
         #[cfg(test)]
         if family == ColumnFamily::Undo {
             TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(|observed| {
@@ -6063,9 +6129,82 @@ impl<B: WriteBatch> WriteBatch for ReorgMeteredBatch<B> {
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> std::result::Result<(), StoreError> {
-        self.meter.charge(key.len(), 0, self.copies)?;
-        self.inner.delete(family, key)
+        let (charge, consumed) = self.replacement_charge(family, key, 0)?;
+        self.inner.delete(family, key)?;
+        self.record_replacement_charge(family, key, charge, consumed);
+        Ok(())
     }
+}
+
+impl<B: CheckpointWriteBatch> CheckpointWriteBatch for ReorgMeteredBatch<B> {
+    fn begin_checkpoint(&mut self) -> std::result::Result<(), StoreError> {
+        if self.checkpoint.is_some() {
+            return Err(StoreError::Backend(
+                "reorganization meter checkpoint is already active".to_owned(),
+            ));
+        }
+        self.inner.begin_checkpoint()?;
+        self.checkpoint = Some(ReorgMeterCheckpoint {
+            consumed: self.meter.consumed,
+            operation_journal: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn commit_checkpoint(&mut self) -> std::result::Result<(), StoreError> {
+        if self.checkpoint.is_none() {
+            return Err(StoreError::Backend(
+                "reorganization meter checkpoint is not active".to_owned(),
+            ));
+        }
+        self.inner.commit_checkpoint()?;
+        self.checkpoint = None;
+        Ok(())
+    }
+
+    fn rollback_checkpoint(&mut self) -> std::result::Result<(), StoreError> {
+        if self.checkpoint.is_none() {
+            return Err(StoreError::Backend(
+                "reorganization meter checkpoint is not active".to_owned(),
+            ));
+        }
+        self.inner.rollback_checkpoint()?;
+        let Some(mut checkpoint) = self.checkpoint.take() else {
+            unreachable!("reorganization checkpoint was checked above");
+        };
+        while let Some((family, key, previous)) = checkpoint.operation_journal.pop() {
+            let family_empty = {
+                let charges = self.operation_charges.entry(family).or_default();
+                match previous {
+                    Some(previous) => {
+                        charges.insert(key, previous);
+                    }
+                    None => {
+                        charges.remove(&key);
+                    }
+                }
+                charges.is_empty()
+            };
+            if family_empty {
+                self.operation_charges.remove(&family);
+            }
+        }
+        self.meter.consumed = checkpoint.consumed;
+        Ok(())
+    }
+}
+
+fn reorg_meter_limit_from_error(error: &anyhow::Error) -> Option<(u64, u64)> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<StoreError>() {
+            Some(StoreError::LimitExceeded {
+                context,
+                limit,
+                actual,
+            }) if *context == ReorgStagedEffectMeter::CONTEXT => Some((*limit, *actual)),
+            _ => None,
+        })
 }
 
 /// The ordinary page-backed connect/disconnect path has no reorganization
@@ -6073,13 +6212,11 @@ impl<B: WriteBatch> WriteBatch for ReorgMeteredBatch<B> {
 /// below so pack scratch, physical page bytes, and database writes share one
 /// cumulative ceiling without duplicating `prepare_root`.
 ///
-/// `PackedNamePages` retains cloned logical records, not encoded 64 KiB page
-/// buffers. `charge_name_page_packing` runs before those logical clones and
-/// their lookup/order/visited/address maps are allocated. After packing reveals
-/// the exact page count, `charge_name_page_output` runs before
-/// `NamePageAppender::append_with_reserve`, whose first step allocates the
-/// fixed-size encoded page. Thus both allocation boundaries reject before the
-/// newly charged representation exists.
+/// `charge_name_page_packing` runs before lookup/order/visited/address maps are
+/// allocated. After planning reveals whether output is nonempty,
+/// `charge_name_page_output` reserves the one fixed-size encoded page used by
+/// the streaming appender. Both allocation boundaries reject before the newly
+/// charged representation exists.
 trait NamePagePublicationBatch: WriteBatch {
     fn charge_name_page_packing(
         &mut self,
@@ -6390,6 +6527,9 @@ impl ChainActivationFailure {
 struct NodeReorgMutation {
     summary: NodeReorgSummary,
     mining: DurableMiningState,
+    /// Set only when a direct-extension transaction committed the largest
+    /// complete prefix that fit its staged-effect budget.
+    truncated_direct_connect_limit: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -6460,15 +6600,6 @@ fn production_name_page_stream_limits(deadline: Instant) -> NamePageStreamLimits
         max_frontier: MAX_NAME_PAGE_COMPACTION_FRONTIER,
         max_known_addresses: MAX_NAME_PAGE_COMPACTION_KNOWN_ADDRESSES,
         minimum_filesystem_reserve_bytes: MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
-        deadline,
-    }
-}
-
-fn production_name_page_traversal_limits(deadline: Instant) -> NamePageTraversalLimits {
-    NamePageTraversalLimits {
-        max_records: MAX_NAME_PAGE_COMPACTION_RECORDS,
-        max_frontier: MAX_NAME_PAGE_COMPACTION_FRONTIER,
-        max_known_addresses: MAX_NAME_PAGE_COMPACTION_KNOWN_ADDRESSES,
         deadline,
     }
 }
@@ -7083,11 +7214,11 @@ impl NamePageStorage {
                 })?;
             sync_directory(&self.directory)?;
 
-            let base = {
+            let (base, mut known) = {
                 let (source_reader, _) =
                     self.reader_for_roots(&snapshot, std::iter::empty(), false)?;
                 let source_snapshot = NamePageSnapshot::new(&snapshot, &source_reader);
-                stream_name_page_tree_with_limits_and_progress(
+                stream_name_page_tree_indexed_with_limits_and_progress(
                     &source_snapshot,
                     self.state.root,
                     &mut appender,
@@ -7127,49 +7258,15 @@ impl NamePageStorage {
             let mut manifest = base.manifest;
             let mut records_written = base.record_count;
             let mut pages_written = base.page_count;
-
-            let paths = BTreeMap::from([(0, file_path.clone())]);
-            let locator = base.root_address.map_or_else(
-                || {
-                    NamePageRootLocator::new(
-                        generation,
-                        hns_store::NamePageAddress::new(0, 0, 0).expect("zero page address fits"),
-                    )
-                },
-                |address| NamePageRootLocator::new(generation, address),
-            );
-            let output_reader = NamePageTreeReader::open_segments(&paths, self.state.root, locator)
-                .map_err(|error| anyhow::anyhow!("failed to open compacted name pages: {error}"))?;
             tracing::info!(
-                phase = "indexing-base",
-                output_generation = generation,
-                base_records = records_written,
-                base_pages = pages_written,
-                resulting_known_addresses = 0_u64,
-                elapsed_seconds = start.elapsed().as_secs(),
-                remaining_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
-                "discovering compacted name-page base addresses"
-            );
-            output_reader
-                .discover_tree_addresses_bounded(
-                    self.state.root,
-                    production_name_page_traversal_limits(filesystem_limits.deadline),
-                )
-                .map_err(anyhow::Error::new)
-                .context("failed to index compacted name-page base")?;
-            let mut known = output_reader
-                .into_known_addresses()
-                .map_err(anyhow::Error::new)
-                .context("failed to collect compacted name-page addresses")?;
-            tracing::info!(
-                phase = "indexing-base",
+                phase = "streaming-base",
                 output_generation = generation,
                 base_records = records_written,
                 base_pages = pages_written,
                 resulting_known_addresses = known.len(),
                 elapsed_seconds = start.elapsed().as_secs(),
                 remaining_deadline_seconds = remaining_deadline_seconds(filesystem_limits.deadline),
-                "completed compacted name-page base address indexing"
+                "collected compacted name-page addresses during streaming"
             );
 
             let (source_reader, legacy_fallback) =
@@ -7442,7 +7539,7 @@ impl NamePageStorage {
         &mut self,
         snapshot: &S,
         batch: &mut B,
-        reader: &NamePageTreeReader,
+        known: HashMap<TreeRoot, hns_store::NamePageAddress>,
         staged_nodes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
         snapshot_pins: &[NameTreeSnapshotPin],
         target: NamePageRootTarget,
@@ -7511,11 +7608,11 @@ impl NamePageStorage {
                         .appender
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
-                    let packed = pack_name_page_records(
+                    let packed = pack_name_page_records_consuming(
                         self.state.manifest.generation,
                         self.state.manifest.active_segment,
                         next_page.next_page(),
-                        &legacy_records,
+                        legacy_records,
                         &HashMap::new(),
                     )
                     .map_err(|error| {
@@ -7539,7 +7636,10 @@ impl NamePageStorage {
                         .as_mut()
                         .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
                     let manifest = packed
-                        .append_with_reserve(appender, MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES)
+                        .append_consuming_with_reserve(
+                            appender,
+                            MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
+                        )
                         .map_err(|error| {
                             anyhow::anyhow!("failed to append restored legacy root: {error}")
                         })?;
@@ -7569,18 +7669,15 @@ impl NamePageStorage {
                 anyhow::anyhow!("non-empty name-page root has no committed height")
             })?;
             batch.charge_name_page_packing(&records)?;
-            let known = reader.known_addresses().map_err(|error| {
-                anyhow::anyhow!("failed to collect traversal page addresses: {error}")
-            })?;
             let next_page = self
                 .appender
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
-            let packed = pack_name_page_records(
+            let packed = pack_name_page_records_consuming(
                 self.state.manifest.generation,
                 self.state.manifest.active_segment,
                 next_page.next_page(),
-                &records,
+                records,
                 &known,
             )
             .map_err(|error| anyhow::anyhow!("failed to pack name-page update: {error}"))?;
@@ -7632,7 +7729,10 @@ impl NamePageStorage {
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
             let manifest = packed
-                .append_with_reserve(appender, MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES)
+                .append_consuming_with_reserve(
+                    appender,
+                    MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
+                )
                 .map_err(|error| anyhow::anyhow!("failed to append name-page update: {error}"))?;
             batch.record_name_page_append(page_count);
             self.generation_bytes = next_generation_bytes;
@@ -11345,10 +11445,14 @@ impl NodeState {
         )?;
         let root = load_stored_name_tree_commit_root(&staged)
             .map_err(|error| anyhow::anyhow!("failed to read staged page root: {error}"))?;
-        let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
         let staged_pins = staged_name_tree_snapshot_pins(&staged, std::iter::once(request.height))?;
         let publication = self.prepare_index_publication(&index_updates)?;
         drop(staged);
+        drop(page_base);
+        let staged_nodes = overlay.take_staged_family(ColumnFamily::NameTreeNodes);
+        let known = reader.into_known_addresses().map_err(|error| {
+            anyhow::anyhow!("failed to transfer traversal page addresses: {error}")
+        })?;
         let mut inner = batch.into_inner();
         let prepared = match self
             .name_pages
@@ -11357,7 +11461,7 @@ impl NodeState {
             .prepare_root(
                 &raw,
                 &mut inner,
-                &reader,
+                known,
                 staged_nodes,
                 &staged_pins,
                 NamePageRootTarget {
@@ -11728,7 +11832,6 @@ impl NodeState {
         )?;
         let root = load_stored_name_tree_commit_root(&staged)
             .map_err(|error| anyhow::anyhow!("failed to read restored page root: {error}"))?;
-        let staged_nodes = overlay.staged_family(ColumnFamily::NameTreeNodes);
         // A disconnect can only remove a snapshot pin; page publication needs
         // newly staged pins, so there is no family-wide overlay clone here.
         let staged_pins = Vec::new();
@@ -11737,6 +11840,11 @@ impl NodeState {
             current,
         }])?;
         drop(staged);
+        drop(page_base);
+        let staged_nodes = overlay.take_staged_family(ColumnFamily::NameTreeNodes);
+        let known = reader.into_known_addresses().map_err(|error| {
+            anyhow::anyhow!("failed to transfer traversal page addresses: {error}")
+        })?;
         let mut inner = batch.into_inner();
         let resulting_height = request_height.checked_sub(1);
         let prepared = match self
@@ -11746,7 +11854,7 @@ impl NodeState {
             .prepare_root(
                 &raw,
                 &mut inner,
-                &reader,
+                known,
                 staged_nodes,
                 &staged_pins,
                 NamePageRootTarget {
@@ -11947,6 +12055,7 @@ impl NodeState {
                 mining: self
                     .durable_mining_state()
                     .map_err(ChainActivationFailure::Internal)?,
+                truncated_direct_connect_limit: None,
             });
         }
         if request.connect.is_empty() {
@@ -12002,11 +12111,8 @@ impl NodeState {
 
         let generation = next_mining_generation(&base).map_err(ChainActivationFailure::Internal)?;
         let chain_epoch = next_chain_epoch(&base).map_err(ChainActivationFailure::Internal)?;
-        let staged_pin_heights = request
-            .connect
-            .iter()
-            .map(NodeBlockImport::height)
-            .collect::<Vec<_>>();
+        let direct_prefix_eligible = request.disconnect.is_empty() && request.connect.len() > 1;
+        let mut staged_pin_heights = Vec::with_capacity(request.connect.len());
         let overlay = StagingOverlay::new();
         let staged = overlay.snapshot(&base);
         let staged_batch = if self.name_pages.is_some() {
@@ -12021,6 +12127,7 @@ impl NodeState {
         );
         let mut summary = NodeReorgSummary::default();
         let mut index_updates = Vec::new();
+        let mut truncated_direct_connect_limit = None;
 
         for disconnect in request.disconnect {
             let previous = previous_block_records
@@ -12082,6 +12189,13 @@ impl NodeState {
                     }),
             }
             .map_err(ChainActivationFailure::Internal)?;
+            if direct_prefix_eligible {
+                batch
+                    .begin_checkpoint()
+                    .map_err(anyhow::Error::from)
+                    .context("failed to begin direct-extension block checkpoint")
+                    .map_err(ChainActivationFailure::Internal)?;
+            }
             let staged_connect = match self.stage_connect(
                 &staged,
                 &mut batch,
@@ -12102,6 +12216,30 @@ impl NodeState {
                         },
                     )));
                 }
+                Err(error)
+                    if direct_prefix_eligible
+                        && !summary.connected.is_empty()
+                        && reorg_meter_limit_from_error(&error).is_some() =>
+                {
+                    let (limit, actual) = reorg_meter_limit_from_error(&error)
+                        .expect("guard authenticated the staged-effect limit");
+                    batch
+                        .rollback_checkpoint()
+                        .map_err(anyhow::Error::from)
+                        .context("failed to roll back oversized direct-extension block")
+                        .map_err(ChainActivationFailure::Internal)?;
+                    let connected = summary.connected.len();
+                    truncated_direct_connect_limit = Some(connected);
+                    tracing::warn!(
+                        connected,
+                        rejected_block = %hash.to_hex(),
+                        rejected_height = connect.height,
+                        limit,
+                        actual,
+                        "committing the largest complete direct-extension prefix within the staged-effect budget"
+                    );
+                    break;
+                }
                 Err(error) => {
                     return Err(ChainActivationFailure::Internal(error.context(format!(
                         "failed to connect stored block {} at height {}",
@@ -12110,6 +12248,13 @@ impl NodeState {
                     ))));
                 }
             };
+            if direct_prefix_eligible {
+                batch
+                    .commit_checkpoint()
+                    .map_err(anyhow::Error::from)
+                    .context("failed to accept direct-extension block checkpoint")
+                    .map_err(ChainActivationFailure::Internal)?;
+            }
             let previous = previous_block_records.get(&hash).cloned().ok_or_else(|| {
                 ChainActivationFailure::Internal(anyhow::anyhow!(
                     "reorganization cache plan omitted block {}",
@@ -12122,9 +12267,12 @@ impl NodeState {
                 current: staged_connect.current,
             });
             index_updates.extend(staged_connect.pruned);
+            staged_pin_heights.push(connect.height);
         }
 
-        if prepared.as_ref().is_some_and(|proofs| !proofs.is_empty()) {
+        if truncated_direct_connect_limit.is_none()
+            && prepared.as_ref().is_some_and(|proofs| !proofs.is_empty())
+        {
             return Err(ChainActivationFailure::Internal(anyhow::anyhow!(
                 "prepared native activation retained an unmatched proof"
             )));
@@ -12176,11 +12324,6 @@ impl NodeState {
         let root = load_stored_name_tree_commit_root(&staged)
             .map_err(anyhow::Error::from)
             .map_err(ChainActivationFailure::Internal)?;
-        let staged_nodes = if self.name_pages.is_some() {
-            overlay.staged_family(ColumnFamily::NameTreeNodes)
-        } else {
-            BTreeMap::new()
-        };
         let staged_pins = if self.name_pages.is_some() {
             staged_name_tree_snapshot_pins(&staged, staged_pin_heights)
                 .map_err(ChainActivationFailure::Internal)?
@@ -12190,20 +12333,36 @@ impl NodeState {
         let publication = self
             .prepare_index_publication(&index_updates)
             .map_err(ChainActivationFailure::Internal)?;
-        let (batch, meter) = batch.into_parts();
-        let mut batch = ReorgMeteredBatch::new(
+        drop(staged);
+        drop(base);
+        let staged_nodes = if self.name_pages.is_some() {
+            overlay.take_staged_family(ColumnFamily::NameTreeNodes)
+        } else {
+            BTreeMap::new()
+        };
+        let known = match page_reader {
+            Some(reader) => Some(
+                reader
+                    .into_known_addresses()
+                    .map_err(anyhow::Error::new)
+                    .map_err(ChainActivationFailure::Internal)?,
+            ),
+            None => None,
+        };
+        let (batch, meter, operation_charges) = batch.into_parts();
+        let mut batch = ReorgMeteredBatch::with_operation_charges(
             batch.into_inner(),
             meter,
             REORG_PUBLICATION_OPERATION_COPIES,
+            operation_charges,
         );
-        drop(staged);
         drop(overlay);
         let prepared_page_state =
-            if let (Some(pages), Some(reader)) = (self.name_pages.as_mut(), page_reader.as_ref()) {
+            if let (Some(pages), Some(known)) = (self.name_pages.as_mut(), known) {
                 match pages.prepare_root(
                     &raw_base,
                     &mut batch,
-                    reader,
+                    known,
                     staged_nodes,
                     &staged_pins,
                     NamePageRootTarget {
@@ -12222,7 +12381,7 @@ impl NodeState {
             } else {
                 None
             };
-        let (batch, mut meter) = batch.into_parts();
+        let (batch, mut meter, _) = batch.into_parts();
         #[cfg(test)]
         {
             let reject = TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT.with(|enabled| enabled.get())
@@ -12274,6 +12433,7 @@ impl NodeState {
             mining: self
                 .durable_mining_state()
                 .map_err(ChainActivationFailure::Internal)?,
+            truncated_direct_connect_limit,
         })
     }
 
@@ -14240,7 +14400,7 @@ mod tests {
         let prepared = pages.prepare_root(
             &snapshot,
             &mut batch,
-            &reader,
+            reader.into_known_addresses().map_err(anyhow::Error::new)?,
             BTreeMap::new(),
             &[],
             NamePageRootTarget {
@@ -14249,7 +14409,6 @@ mod tests {
             },
         )?;
 
-        drop(reader);
         drop(snapshot);
 
         store.commit(batch)?;
@@ -14334,7 +14493,7 @@ mod tests {
             .prepare_root(
                 &snapshot,
                 &mut batch,
-                &reader,
+                reader.into_known_addresses().expect("fixture addresses"),
                 BTreeMap::new(),
                 &[],
                 NamePageRootTarget {
@@ -14346,7 +14505,6 @@ mod tests {
         if prepared.committed_height.is_none() {
             prepared.committed_height = Some(NAME_PAGE_SEGMENT_BLOCKS);
         }
-        drop(reader);
         drop(snapshot);
 
         let prepared_raw = prepared.encode().expect("publish fixture state");
@@ -14540,7 +14698,6 @@ mod tests {
 
         let phase_one_charge = [
             (old_undo_key.len(), 0),
-            (shared_outpoint.len(), 0),
             (shared_outpoint.len(), replacement_coin.len()),
             (new_undo_key.len(), generated_large_undo.len()),
             (tx_index_key.len(), tx_index_value.len()),
@@ -14632,15 +14789,16 @@ mod tests {
             .charge_name_page_packing(&packing_records)
             .expect("exact-limit name-page packing");
 
-        let (batch, meter) = batch.into_parts();
+        let (batch, meter, operation_charges) = batch.into_parts();
         assert_eq!(
             meter.consumed,
             phase_one_charge.saturating_add(packing_charge)
         );
-        let mut batch = ReorgMeteredBatch::new(
+        let mut batch = ReorgMeteredBatch::with_operation_charges(
             batch.into_inner(),
             meter,
             REORG_PUBLICATION_OPERATION_COPIES,
+            operation_charges,
         );
         batch
             .charge_name_page_output(1)
@@ -14662,7 +14820,7 @@ mod tests {
         ));
         assert_eq!(batch.meter.consumed, exact_limit);
 
-        let (inner, _) = batch.into_parts();
+        let (inner, _, _) = batch.into_parts();
         drop(staged);
         drop(base);
         drop(overlay);
@@ -14733,7 +14891,7 @@ mod tests {
         ));
         assert_eq!(batch.meter.consumed, 0);
         assert!(overlay.staged_family(ColumnFamily::Undo).is_empty());
-        let (batch, _) = batch.into_parts();
+        let (batch, _, _) = batch.into_parts();
         store
             .commit(batch.into_inner())
             .expect("rejected batch remains empty");
@@ -14837,7 +14995,9 @@ mod tests {
             .prepare_root(
                 &snapshot,
                 &mut batch,
-                &reader,
+                reader
+                    .into_known_addresses()
+                    .expect("seal rollback addresses"),
                 BTreeMap::new(),
                 &[],
                 NamePageRootTarget {
@@ -14852,7 +15012,6 @@ mod tests {
         );
         assert!(successor_path.exists());
         assert_eq!(pages.file_path, successor_path);
-        drop(reader);
         drop(snapshot);
         drop(batch);
 
@@ -18918,7 +19077,9 @@ mod tests {
             .prepare_root(
                 &raw,
                 &mut batch,
-                &reader,
+                reader
+                    .into_known_addresses()
+                    .expect("physical seal addresses"),
                 BTreeMap::new(),
                 &[],
                 NamePageRootTarget {
@@ -18927,7 +19088,6 @@ mod tests {
                 },
             )
             .expect("prepare physical seal");
-        drop(reader);
         drop(raw);
         store.commit(batch).expect("publish physical seal");
         node.state
@@ -19050,7 +19210,7 @@ mod tests {
             .prepare_root(
                 &raw,
                 &mut batch,
-                &reader,
+                reader.into_known_addresses().expect("base addresses"),
                 staged_nodes,
                 &pins,
                 NamePageRootTarget {
@@ -19059,7 +19219,6 @@ mod tests {
                 },
             )
             .expect("prepare multi-boundary page batch");
-        drop(reader);
         drop(raw);
         store.commit(batch).expect("publish page batch");
         pages.commit_prepared(prepared);
@@ -22910,6 +23069,100 @@ mod tests {
             .blocks
             .load_block(&replacement_hash)
             .expect("replacement lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn oversized_direct_activation_commits_its_largest_complete_prefix() {
+        let mut node = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let first = block_with_commitments(vec![coinbase_transaction_with_address(0xa1, 50)]);
+        let first_hash = first.hash();
+        let mut second = block_with_commitments(vec![coinbase_transaction_with_address(0xa2, 50)]);
+        second.header.prev_block = first_hash;
+        second.header.nonce = 0xa2;
+        let second_hash = second.hash();
+        let first_import = NodeBlockImport::fixture(first, 0, 1);
+        let second_import = NodeBlockImport::fixture(second, 1, 2);
+
+        // Measure the first complete block plus the fixed publication metadata
+        // through the same coalescing meter. The real two-block attempt gets
+        // exactly this allowance, so its second block must be rolled back.
+        let store = node.state.store.clone();
+        let raw = store.snapshot().expect("direct-prefix measurement base");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&raw);
+        let staged_batch = overlay.batch(store.batch());
+        let mut measured = ReorgMeteredBatch::new(
+            staged_batch,
+            ReorgStagedEffectMeter::new(u64::MAX),
+            REORG_STAGING_OPERATION_COPIES,
+        );
+        let validated = node
+            .state
+            .validate_import_against_policy(&staged, &first_import, true, None)
+            .expect("validate measured first block");
+        node.state
+            .stage_connect(&staged, &mut measured, &first_import, validated, true)
+            .expect("stage measured first block");
+        measured
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::MiningGeneration.as_bytes(),
+                &encode_u64(1),
+            )
+            .expect("measure mining generation");
+        measured
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::ChainEpoch.as_bytes(),
+                &encode_u64(1),
+            )
+            .expect("measure chain epoch");
+        let first_commit_limit = measured.meter.consumed;
+        assert!(first_commit_limit > 0);
+        drop(measured);
+        drop(staged);
+        drop(raw);
+        drop(overlay);
+
+        let mutation = node
+            .state
+            .apply_reorg_classified_with_limits(
+                NodeReorg {
+                    disconnect: Vec::new(),
+                    connect: vec![first_import, second_import],
+                },
+                NodeReorgLimits {
+                    maximum_staged_effect_bytes: first_commit_limit,
+                    ..NodeReorgLimits::PRODUCTION
+                },
+            )
+            .expect("commit largest direct prefix");
+        assert_eq!(mutation.truncated_direct_connect_limit, Some(1));
+        assert_eq!(mutation.summary.connected.len(), 1);
+        assert_eq!(mutation.summary.connected[0].hash, first_hash);
+        assert_eq!(
+            node.state.best_block_tip().expect("direct-prefix tip"),
+            Some(ChainTip {
+                hash: first_hash,
+                height: 0,
+                chainwork: Uint256::from_u64(1),
+            })
+        );
+        assert!(node
+            .state
+            .blocks
+            .load_block(&first_hash)
+            .expect("first committed body")
+            .is_some());
+        assert!(node
+            .state
+            .blocks
+            .load_block(&second_hash)
+            .expect("second rolled-back body")
             .is_none());
     }
 

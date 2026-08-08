@@ -1101,6 +1101,9 @@ struct HnsBodyValidator {
 pub(super) struct ActiveStateConnectOutcome {
     pub(super) connected: usize,
     pub(super) disconnected: usize,
+    /// Largest complete direct-extension prefix accepted after the next block
+    /// crossed the staged-effect limit. The slice tuner reuses this bound.
+    pub(super) budget_limited_connect: Option<usize>,
     pub(super) contextual_failure: Option<FailedBlockMutation>,
     pub(super) planning_micros: u64,
     pub(super) state_commit_micros: u64,
@@ -4616,10 +4619,16 @@ impl NodeService {
         drop(reconciliation_snapshot);
         let disconnected_transactions =
             self.disconnected_mempool_transactions(&activation.disconnect)?;
-        let connected_transactions = activation
+        let connected_effects = activation
             .connect
             .iter()
-            .flat_map(|connect| connect.block.transactions.iter().cloned())
+            .map(|connect| {
+                (
+                    connect.block.hash(),
+                    connect.block.transactions.clone(),
+                    ActiveStateWorkload::for_block(&connect.block),
+                )
+            })
             .collect::<Vec<_>>();
         let is_reorg = !activation.disconnect.is_empty();
         if is_reorg {
@@ -4648,6 +4657,23 @@ impl NodeService {
         let post_commit_started = StdInstant::now();
         match mutation {
             Ok(reorg) => {
+                let committed_hashes = reorg
+                    .summary
+                    .connected
+                    .iter()
+                    .map(|record| record.hash)
+                    .collect::<HashSet<_>>();
+                let mut committed_workload = ActiveStateWorkload::default();
+                let connected_transactions = connected_effects
+                    .into_iter()
+                    .filter_map(|(hash, transactions, block_workload)| {
+                        committed_hashes.contains(&hash).then(|| {
+                            committed_workload = committed_workload.saturating_add(block_workload);
+                            transactions
+                        })
+                    })
+                    .flatten()
+                    .collect::<Vec<_>>();
                 let mining_publication = self.publish_durable_mining_state(&reorg.mining);
                 let mempool_generation = self.mining_engine_reconcile_chain_transition(
                     &disconnected_transactions,
@@ -4663,11 +4689,12 @@ impl NodeService {
                 Ok(std::ops::ControlFlow::Continue(ActiveStateConnectOutcome {
                     connected: reorg.summary.connected.len(),
                     disconnected: reorg.summary.disconnected.len(),
+                    budget_limited_connect: reorg.truncated_direct_connect_limit,
                     contextual_failure: None,
                     planning_micros,
                     state_commit_micros,
                     post_commit_micros,
-                    workload,
+                    workload: committed_workload,
                 }))
             }
             Err(ChainActivationFailure::ContextualInvalid(failure)) => {
@@ -7917,12 +7944,13 @@ async fn execute_native_active_state_slice_with_validator(
         match result {
             Ok(std::ops::ControlFlow::Continue(outcome)) => {
                 preparation.stale_retries = stale_retries;
+                let next_connect_limit = outcome.budget_limited_connect.unwrap_or(attempt_limit);
                 return Ok(NativeActiveStateSliceResult {
                     outcome,
                     preparation,
                     wall_millis: u64::try_from(slice_started.elapsed().as_millis())
                         .unwrap_or(u64::MAX),
-                    next_connect_limit: attempt_limit,
+                    next_connect_limit,
                 });
             }
             Ok(std::ops::ControlFlow::Break(DirectStagedEffectLimit {
