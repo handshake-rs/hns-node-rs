@@ -4267,6 +4267,31 @@ impl NodeReadHandle {
         })
     }
 
+    fn native_sync_unsolicited_canonical_body_is_in_horizon(
+        &self,
+        hash: BlockHash,
+        height: Height,
+    ) -> Result<bool> {
+        let horizon = Height::try_from(self.config().native_sync.orphan_blocks)
+            .context("orphan block horizon exceeds the canonical height range")?;
+        self.with_stable_read(|store, headers| {
+            if headers
+                .canonical_hash(height)
+                .context("failed to read canonical native-sync header")?
+                != Some(hash)
+            {
+                return Ok(true);
+            }
+            let snapshot = store.snapshot()?;
+            let contiguous =
+                Self::native_sync_contiguous_body_tip_from_snapshot(&snapshot, headers, None)?;
+            let start = contiguous
+                .as_ref()
+                .map_or(0, |tip| tip.height.saturating_add(1));
+            Ok(horizon != 0 && height >= start && height < start.saturating_add(horizon))
+        })
+    }
+
     fn native_sync_block(&self, hash: &BlockHash) -> Result<Option<Block>> {
         self.with_stable_read(|store, _headers| {
             let snapshot = store.snapshot()?;
@@ -6778,6 +6803,13 @@ async fn accept_peer_block(
         );
     }
     if !scheduler.is_tracked_block(&hash) {
+        if !node.native_sync_unsolicited_canonical_body_is_in_horizon(hash, record.height)? {
+            anyhow::bail!(
+                "peer {:?} sent unsolicited canonical block {} outside the durable body horizon",
+                peer,
+                hash.to_hex()
+            );
+        }
         scheduler
             .announce_block(peer, hash, record.height)
             .map_err(|error| anyhow::anyhow!("failed to queue delivered block: {error}"))?;
@@ -12505,6 +12537,63 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(expanded, vec![1]);
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn unsolicited_canonical_body_outside_orphan_horizon_is_rejected() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            native_sync: NativeSyncConfig {
+                enabled: true,
+                orphan_blocks: 2,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..NativeSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .native_sync_ensure_genesis_header()
+            .expect("genesis");
+        let first = linked_validator_block(1, &genesis.header);
+        let second = linked_validator_block(2, &first.header);
+        service
+            .native_sync_import_headers(vec![first.header.clone(), second.header.clone()])
+            .expect("canonical headers");
+        let second_hash = second.hash();
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+                .expect("peer manager");
+        let (validation, _validation_results) =
+            spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 8)
+                .expect("validation pipeline");
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        scheduler
+            .register_peer(PeerId(1), hns_p2p::SERVICE_NETWORK, 4)
+            .expect("peer");
+
+        let error = accept_peer_block(
+            PeerId(1),
+            second,
+            &node,
+            &writer,
+            &peers,
+            &validation,
+            &mut scheduler,
+        )
+        .await
+        .expect_err("future canonical body must remain outside the durable horizon");
+        assert!(error
+            .to_string()
+            .contains("outside the durable body horizon"));
+        assert!(!scheduler.is_tracked_block(&second_hash));
+        assert!(!node
+            .native_sync_has_block(&second_hash)
+            .expect("second body lookup"));
         runtime.shutdown().await.expect("node runtime shutdown");
     }
 
