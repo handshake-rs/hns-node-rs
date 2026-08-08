@@ -36,6 +36,10 @@ pub const MAX_MEMPOOL_TRANSACTIONS: usize = 250_000;
 pub const MAX_MEMPOOL_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_ORPHANS: usize = 8_192;
 pub const MAX_ORPHAN_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum retained payload that may be copied by an atomic contextual
+/// revalidation. This independently bounds transient rebuild allocations even
+/// when the configured retained-pool limit is much larger.
+pub const MAX_REVALIDATION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PACKAGE_MEMBERS: usize = 1_000;
 pub const MAX_TX_SIGOPS: u32 = MAX_BLOCK_SIGOPS / 5;
 pub const BYTES_PER_SIGOP: usize = 20;
@@ -2400,6 +2404,15 @@ impl MemoryMempool {
         input_verifier: &dyn TransactionInputVerifier,
         contextual_verifier: &dyn ContextualTransactionVerifier,
     ) -> Result<MempoolRevalidation, MempoolError> {
+        let revalidation_bytes = self.bytes.saturating_add(self.orphan_bytes);
+        if revalidation_bytes > MAX_REVALIDATION_BYTES {
+            return Err(MempoolError::LimitExceeded {
+                context: "mempool revalidation memory",
+                limit: MAX_REVALIDATION_BYTES,
+                actual: revalidation_bytes,
+            });
+        }
+
         let previous_transactions = self.entries.keys().copied().collect::<BTreeSet<_>>();
         let previous_orphans = self.orphans.keys().copied().collect::<BTreeSet<_>>();
         let previous_claims = self.claims.keys().copied().collect::<BTreeSet<_>>();
@@ -5960,6 +5973,42 @@ mod tests {
             )
             .expect_err("injected revalidation failure");
         assert!(error.to_string().contains("injected view failure"));
+        assert_eq!(pool.info().generation, previous_generation);
+        assert!(pool.transaction(&txid).is_some());
+    }
+
+    #[test]
+    fn connected_block_revalidation_enforces_transient_memory_budget() {
+        let input = outpoint(0xfa, 0);
+        let view = FixedView::with_coin(input.clone(), 20);
+        let transaction = transaction(input, 9);
+        let txid = transaction.txid();
+        let mut pool = test_mempool();
+        assert!(matches!(
+            submit(&mut pool, transaction, &view),
+            Admission::Accepted(_)
+        ));
+        let previous_generation = pool.info().generation;
+        pool.bytes = MAX_REVALIDATION_BYTES + 1;
+
+        let error = pool
+            .reconcile_connected_with_context(
+                &[],
+                &MempoolContext::testing(3, 3),
+                &view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect_err("oversized revalidation must fail before cloning");
+
+        assert!(matches!(
+            error,
+            MempoolError::LimitExceeded {
+                context: "mempool revalidation memory",
+                limit: MAX_REVALIDATION_BYTES,
+                actual,
+            } if actual == MAX_REVALIDATION_BYTES + 1
+        ));
         assert_eq!(pool.info().generation, previous_generation);
         assert!(pool.transaction(&txid).is_some());
     }
