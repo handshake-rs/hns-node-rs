@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -35,6 +35,9 @@ pub const SEGMENT_MAX_HINTS: usize = 2;
 const MAX_SEGMENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const SEGMENT_PAGE_BYTES: u64 = 64 * 1024;
 pub const SEGMENT_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+/// Keep archive readers well below the process file-descriptor budget. An
+/// evicted file remains usable by any read already holding its `Arc`.
+const SEGMENT_READER_CACHE_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -504,9 +507,46 @@ pub struct SegmentArchive {
     /// access until reopen selects the authoritative manifests.
     commit_outcome_uncertain: AtomicBool,
     writer: Mutex<SegmentArchiveWriter>,
-    readers: Mutex<HashMap<(SegmentKind, u64, u32), Arc<File>>>,
+    readers: Mutex<SegmentReaderCache>,
     #[cfg(all(test, feature = "rocksdb-backend"))]
     poison_readers_on_install: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct SegmentReaderCache {
+    files: HashMap<(SegmentKind, u64, u32), Arc<File>>,
+    least_recent: VecDeque<(SegmentKind, u64, u32)>,
+}
+
+impl SegmentReaderCache {
+    fn open(
+        &mut self,
+        key: (SegmentKind, u64, u32),
+        path: &Path,
+    ) -> Result<Arc<File>, SegmentError> {
+        if let Some(file) = self.files.get(&key).map(Arc::clone) {
+            self.least_recent.retain(|cached| *cached != key);
+            self.least_recent.push_back(key);
+            return Ok(file);
+        }
+
+        // Open before eviction so an open failure does not discard a useful
+        // cached reader. The cache exceeds its bound by at most this local FD.
+        let file = Arc::new(File::open(path).map_err(segment_io)?);
+        if self.files.len() == SEGMENT_READER_CACHE_CAPACITY {
+            if let Some(evicted) = self.least_recent.pop_front() {
+                self.files.remove(&evicted);
+            }
+        }
+        self.files.insert(key, Arc::clone(&file));
+        self.least_recent.push_back(key);
+        Ok(file)
+    }
+
+    fn clear(&mut self) {
+        self.files.clear();
+        self.least_recent.clear();
+    }
 }
 
 pub(crate) struct SegmentArchiveRewrite {
@@ -534,7 +574,7 @@ impl SegmentArchive {
             target_bytes,
             commit_outcome_uncertain: AtomicBool::new(false),
             writer: Mutex::new(SegmentArchiveWriter { block, undo }),
-            readers: Mutex::new(HashMap::new()),
+            readers: Mutex::new(SegmentReaderCache::default()),
             #[cfg(all(test, feature = "rocksdb-backend"))]
             poison_readers_on_install: AtomicBool::new(false),
         })
@@ -553,7 +593,7 @@ impl SegmentArchive {
             target_bytes: SEGMENT_TARGET_BYTES,
             commit_outcome_uncertain: AtomicBool::new(false),
             writer: Mutex::new(SegmentArchiveWriter { block, undo }),
-            readers: Mutex::new(HashMap::new()),
+            readers: Mutex::new(SegmentReaderCache::default()),
             #[cfg(all(test, feature = "rocksdb-backend"))]
             poison_readers_on_install: AtomicBool::new(false),
         })
@@ -666,11 +706,10 @@ impl SegmentArchive {
         );
         let file = {
             let mut readers = self.readers.lock().map_err(|_| SegmentError::Poisoned)?;
-            Arc::clone(
-                readers
-                    .entry((value.kind, value.locator.generation, value.locator.segment))
-                    .or_insert(Arc::new(File::open(&path).map_err(segment_io)?)),
-            )
+            readers.open(
+                (value.kind, value.locator.generation, value.locator.segment),
+                &path,
+            )?
         };
         let mut frame = vec![0u8; value.locator.frame_length as usize];
         read_exact_at(&file, &mut frame, value.locator.offset)?;
@@ -2167,6 +2206,41 @@ mod tests {
             Some(second_payload.to_vec())
         );
         drop(recovered);
+        std::fs::remove_dir_all(directory).expect("remove archive fixture");
+    }
+
+    #[test]
+    fn archive_reader_cache_evicts_old_segments_at_capacity() {
+        let directory = test_file();
+        let _ = std::fs::remove_dir_all(&directory);
+        let archive = SegmentArchive::create_new_with_target(directory.clone(), 1, 180)
+            .expect("create archive");
+        let mut records = Vec::new();
+
+        for index in 0..=SEGMENT_READER_CACHE_CAPACITY {
+            let mut key = [0x91; 32];
+            key[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            let locator = prepare_and_publish(&archive, SegmentKind::Block, key, &[0x41; 64]);
+            records.push((key, locator));
+        }
+        for (key, locator) in &records {
+            assert_eq!(
+                archive
+                    .resolve(SegmentKind::Block, key, &locator.encode())
+                    .expect("resolve archived record"),
+                Some(vec![0x41; 64])
+            );
+        }
+
+        let readers = archive.readers.lock().expect("reader cache");
+        assert_eq!(readers.files.len(), SEGMENT_READER_CACHE_CAPACITY);
+        assert!(!readers.files.contains_key(&(
+            SegmentKind::Block,
+            records[0].1.locator.generation,
+            records[0].1.locator.segment,
+        )));
+        drop(readers);
+        drop(archive);
         std::fs::remove_dir_all(directory).expect("remove archive fixture");
     }
 
