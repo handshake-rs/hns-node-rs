@@ -1763,10 +1763,10 @@ fn consensus_readiness() -> RpcConsensusReadiness {
         validated_reorg_planning: true,
         atomic_reorganizations: true,
         wal_durability: true,
-        // Qualified by the stopped-state pass at height 339,654 plus the
-        // exact read-only 288-block disconnect/reconnect transcript ending at
-        // HISTORICAL_REPLAY_QUALIFICATION_BLOCK.
-        historical_replay: true,
+        // Offline qualification evidence is diagnostic-only: until it is
+        // verified by the runtime authority gate, historical replay must stay
+        // fail-closed so it cannot enable native mining authority.
+        historical_replay: false,
         // Qualified by the independently generated pinned-HSD corpora consumed
         // by hns-consensus and hns-state. The generators cover 24
         // noncontextual transaction/block cases and 12 contextual
@@ -22515,7 +22515,7 @@ mod tests {
     fn mainnet_canary_requires_explicit_hardened_config_and_complete_readiness() {
         let config = mainnet_canary_config();
         validate_node_config(&config).expect("hardened canary config");
-        assert!(authority_can_mine(&config));
+        assert!(!authority_can_mine(&config));
         assert!(authority_can_mine_with_readiness(&config, true));
 
         let mut pruned = config.clone();
@@ -22579,17 +22579,20 @@ mod tests {
     }
 
     #[test]
-    fn native_functional_readiness_is_complete_after_external_qualification() {
+    fn native_functional_readiness_stays_fail_closed_for_offline_qualification() {
         let readiness = consensus_readiness();
         assert!(readiness.scripts);
         assert!(readiness.contextual_covenants);
         assert!(readiness.claims_and_airdrops);
         assert!(readiness.name_state);
         assert!(readiness.urkel_roots);
-        assert!(readiness.historical_replay);
+        assert!(!readiness.historical_replay);
         assert!(readiness.invalid_corpus);
-        assert!(readiness.complete());
-        assert!(readiness_blockers(&readiness).is_empty());
+        assert!(!readiness.complete());
+        assert_eq!(
+            readiness_blockers(&readiness),
+            vec!["complete historical mainnet replay"]
+        );
     }
 
     #[test]
