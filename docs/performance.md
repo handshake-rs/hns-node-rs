@@ -191,6 +191,13 @@ returns between slices for network work and shutdown. A real divergent
 best-work branch retains the configured reorganization bound so disconnect and
 replacement connect remain one transaction.
 
+The atomic staged-effect meter can reduce a direct replay slice when historical
+name activity makes the configured block count too large. After such a retry,
+the adaptive batcher now requires sixteen consecutive full slices before
+probing a larger limit. This keeps the batch near its demonstrated capacity
+instead of immediately oscillating from one block to two and discarding the
+oversized attempt on every following slice.
+
 The state path removes redundant reads at several levels:
 
 - Every non-coinbase input and spendable output collision key in a block is
@@ -340,11 +347,14 @@ publishes all locators plus both manifests. The offline
 `hsrd-storage-maintenance compact` variant adds exhaustive pre/post scrubs.
 
 Page-backed name state is compacted by retained-root union rather than by
-historical replay. Once sixteen physical 360-block segments accumulate, pruned
-startup streams the current tree once. A hash-to-address index terminates
-traversal at already copied subtrees, so each nearby undo/pin root contributes
-only its divergent nodes. Publication swaps the generation and all retained
-root locators atomically before old files are removed.
+historical replay. Once native synchronization is caught up, sixteen physical
+360-block segments trigger routine reclamation. During initial catch-up, and
+before a peer target is known, the node instead uses a 128-segment emergency
+threshold; native-sync startup uses the same threshold so a restart cannot
+force a routine rewrite in the middle of IBD. A hash-to-address index
+terminates traversal at already copied subtrees, so each nearby undo/pin root
+contributes only its divergent nodes. Publication swaps the generation and all
+retained root locators atomically before old files are removed.
 
 ## Current RocksDB boundary
 

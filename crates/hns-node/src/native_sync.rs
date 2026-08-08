@@ -55,7 +55,7 @@ use hns_sync::{
     validation::{spawn_ordered_work_pipeline, OrderedWorkError},
     BlockDownloadRequest, BoundedOrphanPool, OrderedValidationResult, OrphanLimits, OrphanSnapshot,
     StatelessBlockValidator, StoredSyncCheckpoint, SyncAction, SyncCheckpoint, SyncError,
-    SyncLimits, SyncScheduler, SyncSnapshot, ValidatedBlock, ValidationFailure,
+    SyncLimits, SyncScheduler, SyncSnapshot, SyncStage, ValidatedBlock, ValidationFailure,
     ValidationFailureKind, ValidationRejection, ValidationRequest, ValidationSubmitter,
 };
 use serde::{Deserialize, Serialize};
@@ -80,7 +80,7 @@ use super::{
     PreparedNativeActivation, ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits,
     RpcReadContext, RpcRuntimeLimits, ShutdownSignal, StatelessBodyValidation,
     HSRD_DIAGNOSTIC_API_VERSION, MAX_CANONICAL_WRITER_QUEUE_CAPACITY,
-    NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+    NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD, NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
 };
 use super::{wallet_rpc, WalletBackend};
 use crate::peer_bans::{
@@ -1162,26 +1162,41 @@ type NamePageCompactionTask = JoinHandle<Result<Option<NamePageCompactionReport>
 #[derive(Debug)]
 struct ActiveStateBatchTuner {
     next_limit: usize,
+    successful_full_slices: usize,
 }
 
 impl ActiveStateBatchTuner {
+    const GROWTH_SUCCESS_STREAK: usize = 16;
+
     fn new(initial_connect_limit: usize) -> Self {
         Self {
             next_limit: initial_connect_limit.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE),
+            successful_full_slices: 0,
         }
     }
 
     fn record_budget_retry(&mut self, retry_connect: usize) {
-        self.next_limit = retry_connect.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+        let retry_connect = retry_connect.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+        if retry_connect < self.next_limit {
+            self.successful_full_slices = 0;
+        }
+        self.next_limit = retry_connect;
     }
 
     fn record_success(&mut self, connected: usize) {
-        if connected >= self.next_limit {
+        if connected < self.next_limit || self.next_limit == MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE {
+            self.successful_full_slices = 0;
+            return;
+        }
+
+        self.successful_full_slices = self.successful_full_slices.saturating_add(1);
+        if self.successful_full_slices >= Self::GROWTH_SUCCESS_STREAK {
             let increase = (self.next_limit / 8).max(1);
             self.next_limit = self
                 .next_limit
                 .saturating_add(increase)
                 .min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+            self.successful_full_slices = 0;
         }
     }
 }
@@ -1189,20 +1204,23 @@ impl ActiveStateBatchTuner {
 fn schedule_name_page_compaction_if_due(
     node: &NodeReadHandle,
     writer: &CanonicalStateWriter,
+    scheduler: &SyncScheduler,
     task: &mut Option<NamePageCompactionTask>,
 ) -> Result<bool> {
     if task.is_some() {
         return Ok(false);
     }
 
-    let Some(due) = node.name_page_compaction_due()? else {
+    let segment_threshold = online_name_page_compaction_segment_threshold(scheduler.stage());
+    let Some(due) = node.name_page_compaction_due_at(segment_threshold)? else {
         return Ok(false);
     };
 
     tracing::info!(
         generation = due.generation,
         active_segment = due.active_segment,
-        threshold = NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+        threshold = segment_threshold,
+        sync_stage = ?scheduler.stage(),
         "scheduling online pruned name-page compaction"
     );
 
@@ -1219,6 +1237,14 @@ fn schedule_name_page_compaction_if_due(
     }));
 
     Ok(true)
+}
+
+fn online_name_page_compaction_segment_threshold(stage: SyncStage) -> u32 {
+    if stage == SyncStage::Synced {
+        NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD
+    } else {
+        NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD
+    }
 }
 
 struct ActiveStateWorkerPermit {
@@ -3233,6 +3259,7 @@ impl NodeService {
                         match schedule_name_page_compaction_if_due(
                             &node,
                             &writer,
+                            &scheduler,
                             &mut name_page_compaction_task,
                         ) {
                             Ok(_) => {}
@@ -10269,6 +10296,40 @@ mod tests {
     }
 
     #[test]
+    fn active_state_batch_tuner_requires_sustained_success_after_budget_retry() {
+        let mut tuner = ActiveStateBatchTuner::new(2);
+        tuner.record_budget_retry(1);
+
+        for _ in 1..ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK {
+            // Production records the completed attempt limit before recording
+            // its successful connection count.
+            tuner.record_budget_retry(1);
+            tuner.record_success(1);
+            assert_eq!(tuner.next_limit, 1);
+        }
+
+        tuner.record_budget_retry(1);
+        tuner.record_success(1);
+        assert_eq!(tuner.next_limit, 2);
+
+        // If the probe still exceeds the atomic budget, returning to one
+        // block must not immediately schedule another two-block probe.
+        tuner.record_budget_retry(1);
+        tuner.record_success(1);
+        assert_eq!(tuner.next_limit, 1);
+    }
+
+    #[test]
+    fn active_state_batch_tuner_does_not_grow_after_a_partial_slice() {
+        let mut tuner = ActiveStateBatchTuner::new(8);
+        for _ in 0..ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK {
+            tuner.record_budget_retry(8);
+            tuner.record_success(7);
+        }
+        assert_eq!(tuner.next_limit, 8);
+    }
+
+    #[test]
     fn direct_staged_effect_limit_driver_retries_288_as_144_then_succeeds() {
         let mut attempts = Vec::new();
         let connected = drive_active_state_connect_retries(288, |attempted_connect| {
@@ -10384,6 +10445,33 @@ mod tests {
         assert!(
             active_state_work_ready(&scheduler),
             "a same-height divergent stored frontier still requires reorg evaluation"
+        );
+    }
+
+    #[test]
+    fn name_page_compaction_defers_routine_rewrites_until_sync_completes() {
+        for stage in [
+            SyncStage::Idle,
+            SyncStage::Headers,
+            SyncStage::Blocks,
+            SyncStage::Validating,
+            SyncStage::SnapshotImport,
+            SyncStage::BackgroundVerify,
+        ] {
+            assert_eq!(
+                online_name_page_compaction_segment_threshold(stage),
+                NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD,
+                "{stage:?} must retain the catch-up threshold",
+            );
+        }
+        assert_eq!(
+            online_name_page_compaction_segment_threshold(SyncStage::Synced),
+            NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+        );
+        assert_eq!(
+            NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD
+                / NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+            8,
         );
     }
 

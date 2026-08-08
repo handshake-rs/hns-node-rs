@@ -213,6 +213,11 @@ const UNDO_PRUNING_CHECKPOINT_SIZE: usize = UNDO_PRUNING_CHECKPOINT_BODY_SIZE + 
 const MAX_UNDO_PRUNES_PER_BATCH: usize = 1_024;
 const PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES: u64 = 256 * 1024 * 1024;
 const NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD: u32 = 16;
+// Rewriting the complete authenticated name tree every sixteen segments makes
+// initial synchronization spend most of its wall time copying live pages. A
+// larger catch-up threshold still caps one generation at 46,080 blocks while
+// routine reclamation resumes as soon as native sync reaches its peer target.
+const NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD: u32 = 128;
 const MAX_NAME_PAGE_GENERATION_BYTES: u64 = 150_000_000_000;
 const MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES: u64 = 10_000_000_000;
 const MAX_NAME_PAGE_VALIDATION_SPILL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -233,6 +238,9 @@ const NAME_PAGE_COMPACTION_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_NAME_PAGE_COMPACTION_RECORDS: u64 = 40_000_000;
 
 const _: () = {
+    assert!(
+        NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD > NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD
+    );
     assert!(MAX_NAME_PAGE_VALIDATION_RECORDS > 100_000_000);
     assert!(MAX_NAME_PAGE_VALIDATION_RECORDS > MAX_NAME_PAGE_COMPACTION_RECORDS);
 };
@@ -3034,7 +3042,13 @@ impl NodeReadHandle {
         Ok(self.canonical_epoch())
     }
 
-    pub(crate) fn name_page_compaction_due(&self) -> Result<Option<NamePageCompactionDue>> {
+    pub(crate) fn name_page_compaction_due_at(
+        &self,
+        segment_threshold: u32,
+    ) -> Result<Option<NamePageCompactionDue>> {
+        if segment_threshold == 0 {
+            anyhow::bail!("name-page compaction segment threshold must be non-zero");
+        }
         if !self.config.undo_retention.prune_history || self.config.data_dir.is_none() {
             return Ok(None);
         }
@@ -3060,7 +3074,7 @@ impl NodeReadHandle {
             return Ok(None);
         };
 
-        if active_segment < NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD {
+        if active_segment < segment_threshold {
             return Ok(None);
         }
 
@@ -3920,7 +3934,14 @@ impl NodeService {
             state.prune_undo_history_to_policy()?;
             if config.data_dir.is_some() {
                 state.compact_pruned_payload_segments_if_due()?;
-                if let Some(report) = state.compact_pruned_name_pages_if_due()? {
+                let name_page_segment_threshold = if config.native_sync.connect_active_state {
+                    NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD
+                } else {
+                    NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD
+                };
+                if let Some(report) =
+                    state.compact_pruned_name_pages_if_due_at(name_page_segment_threshold)?
+                {
                     tracing::info!(
                         previous_generation = report.previous_generation,
                         generation = report.generation,
@@ -12581,11 +12602,21 @@ impl NodeState {
     }
 
     fn compact_pruned_name_pages_if_due(&mut self) -> Result<Option<NamePageCompactionReport>> {
+        self.compact_pruned_name_pages_if_due_at(NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD)
+    }
+
+    fn compact_pruned_name_pages_if_due_at(
+        &mut self,
+        segment_threshold: u32,
+    ) -> Result<Option<NamePageCompactionReport>> {
+        if segment_threshold == 0 {
+            anyhow::bail!("name-page compaction segment threshold must be non-zero");
+        }
         self.ensure_storage_operational()?;
         let Some(name_pages) = self.name_pages.as_mut() else {
             return Ok(None);
         };
-        if name_pages.state.manifest.active_segment < NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD {
+        if name_pages.state.manifest.active_segment < segment_threshold {
             return Ok(None);
         }
         let report = match name_pages.compact_generation(&self.store) {
@@ -14965,6 +14996,87 @@ mod tests {
         assert_eq!(pages.state.manifest.active_segment, 3);
 
         drop(state);
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn native_sync_startup_defers_routine_name_page_compaction_during_catch_up() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let test_root = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target"));
+        let directory = test_root.join(format!(
+            "hsrd-native-sync-startup-name-page-compaction-{}-{nonce}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let store = StoreHandle::memory();
+        let mut state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("initialize state");
+        state.store = state
+            .store
+            .clone()
+            .with_segment_archive(directory.join("payload-segments"))
+            .expect("attach test segment archive");
+        state.name_pages = Some(
+            NamePageStorage::open_or_bootstrap(
+                directory.join("name-pages"),
+                &state.store,
+                Network::Regtest,
+            )
+            .expect("open name pages"),
+        );
+
+        for seal in 1_u32..=19 {
+            commit_test_name_page_seal(
+                &mut state,
+                seal.checked_mul(NAME_PAGE_SEGMENT_BLOCKS)
+                    .expect("seal height"),
+            )
+            .expect("commit synthetic seal");
+        }
+        let generation_before = state
+            .name_pages
+            .as_ref()
+            .expect("name pages")
+            .state
+            .manifest
+            .generation;
+
+        let node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                data_dir: Some(directory.clone()),
+                authority_mode: AuthorityMode::Disabled,
+                acknowledge_incomplete_consensus: true,
+                undo_retention: UndoRetentionConfig {
+                    prune_history: true,
+                },
+                native_sync: NativeSyncConfig {
+                    enabled: true,
+                    connect_active_state: true,
+                    listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+                    ..NativeSyncConfig::default()
+                },
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("initialize native-sync node");
+        let pages = node.state.name_pages.as_ref().expect("name pages");
+        assert_eq!(pages.state.manifest.generation, generation_before);
+        assert_eq!(pages.state.manifest.active_segment, 19);
+        assert!(pages.state.manifest.active_segment >= NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD);
+        assert!(
+            pages.state.manifest.active_segment < NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD
+        );
+
+        drop(node);
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove test directory");
     }
@@ -23766,7 +23878,10 @@ mod tests {
                 .await
                 .expect("commit synthetic seal");
 
-            if let Some(due) = read.name_page_compaction_due().expect("read due state") {
+            if let Some(due) = read
+                .name_page_compaction_due_at(NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD)
+                .expect("read due state")
+            {
                 let report = writer
                     .execute_at_chain(due.epoch, "test online name-page compaction", |service| {
                         service.state.compact_pruned_name_pages_if_due()

@@ -694,14 +694,17 @@ cannot remove the manifest-selected new generation; it is still reopen-only and
 must not be retried in process.
 
 Append-only name pages use the same publish-then-retire generation discipline.
-At sixteen sealed 360-block segments, pruned startup streams the current tree
-once, builds its authenticated hash-to-address index, and appends only
-divergent subtrees for the other roots still required by undo and interval
-pins. One RocksDB batch replaces `name-page-state/v1`, publishes every retained
-root locator in the new generation, and deletes stale locators. Only then are
-the old files removed. Recovery follows the manifest-selected generation, so a
-crash before publication removes the future generation and a crash after
-publication removes the superseded one.
+At sixteen sealed 360-block segments, a synchronized pruned node streams the
+current tree once, builds its authenticated hash-to-address index, and appends
+only divergent subtrees for the other roots still required by undo and
+interval pins. Initial native-sync catch-up and native-sync startup defer that
+routine rewrite until the scheduler reaches `Synced`; a 128-segment emergency
+threshold continues to bound a catch-up generation. One RocksDB batch replaces
+`name-page-state/v1`, publishes every retained root locator in the new
+generation, and deletes stale locators. Only then are the old files removed.
+Recovery follows the manifest-selected generation, so a crash before
+publication removes the future generation and a crash after publication
+removes the superseded one.
 
 Production closure still requires deployment-scale performance and priority
 isolation plus repeated external RocksDB process-kill campaigns without

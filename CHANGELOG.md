@@ -45,6 +45,13 @@ qualification or authorize deployment.
 - Reclaim never-confirmed contract capacity and safely retire completed tracked
   contracts only after canonical evidence is validated.
 - Commit single-block native replay atomically.
+- Defer routine full name-page generation rewrites while native sync is
+  catching up. Synchronized nodes retain the sixteen-segment reclamation
+  cadence, while IBD and native-sync startup use a 128-segment emergency bound
+  instead of repeatedly pausing replay every 5,760 blocks.
+- Keep an active-state batch limit stable for sixteen full successful slices
+  after an atomic-effect-budget retry, avoiding the one-block/two-block
+  oscillation that repeatedly discarded expensive replay work.
 - Retain the v0.3.4 resolver release-CI port correction.
 
 The current source remains a release candidate until its consolidated current-
