@@ -1456,6 +1456,12 @@ where
             );
             continue;
         }
+        // Unsupported packet types have no consumer. Do not decode and forward
+        // their attacker-controlled payload into the shared event queue: a
+        // count-bounded queue can otherwise retain many maximum-sized frames.
+        if matches!(frame.packet_type, PacketType::Unknown(_)) {
+            continue;
+        }
         let packet = frame.decode_packet()?;
         if let Packet::Pong(nonce) = &packet {
             if let Some((expected, sent)) = challenge {
@@ -2677,11 +2683,11 @@ mod tests {
             .expect("ready event");
         assert!(matches!(ready, PeerEvent::Ready { peer: target, .. } if target == peer));
 
-        let packet = Packet::Unknown {
+        let ignored = Packet::Unknown {
             packet_type: PacketType::Unknown(250),
             payload: vec![0x5a; 128 * 1024],
         };
-        let frame = Frame::from_packet(&packet).expect("large frame");
+        let frame = Frame::from_packet(&ignored).expect("large frame");
         let encoded = encode_frame(NetworkMagic::Regtest, &frame).expect("large frame bytes");
         let split = crate::constants::FRAME_HEADER_SIZE + 64;
         remote_io
@@ -2693,6 +2699,13 @@ mod tests {
             .write_all(&encoded[split..])
             .await
             .expect("finish partial frame");
+
+        let packet = Packet::GetAddr;
+        let frame = Frame::from_packet(&packet).expect("ordinary frame");
+        remote_io
+            .write_all(&encode_frame(NetworkMagic::Regtest, &frame).expect("ordinary frame bytes"))
+            .await
+            .expect("write ordinary frame");
 
         let received = tokio::time::timeout(Duration::from_secs(1), events_rx.recv())
             .await
