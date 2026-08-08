@@ -1056,6 +1056,11 @@ impl SyncScheduler {
                 attempts,
             },
         );
+        // Receiving a pending block removes it from `pending`, but leaves its
+        // lazy queue entry behind. Drop that stale entry before requeueing so
+        // repeated local admission failures cannot grow the ordering queue.
+        self.pending_order
+            .retain(|pending_hash| *pending_hash != hash);
         self.pending_order.push_back(hash);
     }
 
@@ -1940,6 +1945,35 @@ mod tests {
         assert_eq!(snapshot.inflight_blocks, 0);
         assert_eq!(snapshot.failed_blocks, 0);
         assert!(!scheduler.queue_block(first, 1).expect("duplicate"));
+    }
+
+    #[test]
+    fn repeated_validation_admission_requeues_keep_pending_order_bounded() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_pending_blocks: 1,
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        let peer = PeerId(1);
+        let hash = BlockHash::new([16; 32]);
+        scheduler
+            .register_peer(peer, SERVICE_NETWORK, 5)
+            .expect("peer");
+        scheduler.announce_block(peer, hash, 5).expect("queue");
+
+        for _ in 0..100 {
+            scheduler
+                .receive_block(peer, hash, now)
+                .expect("receive pending block");
+            scheduler
+                .requeue_tracked_block(hash, 5)
+                .expect("requeue after admission failure");
+        }
+
+        assert_eq!(scheduler.pending.len(), 1);
+        assert_eq!(scheduler.pending_order.len(), 1);
+        assert_eq!(scheduler.tracked.len(), 1);
     }
 
     #[test]
