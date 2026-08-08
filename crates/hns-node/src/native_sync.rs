@@ -4267,10 +4267,11 @@ impl NodeReadHandle {
         })
     }
 
-    fn native_sync_unsolicited_canonical_body_is_in_horizon(
+    fn native_sync_canonical_body_is_in_horizon(
         &self,
         hash: BlockHash,
         height: Height,
+        stored_tip_hint: Option<&ChainTip>,
     ) -> Result<bool> {
         let horizon = Height::try_from(self.config().native_sync.orphan_blocks)
             .context("orphan block horizon exceeds the canonical height range")?;
@@ -4283,8 +4284,11 @@ impl NodeReadHandle {
                 return Ok(true);
             }
             let snapshot = store.snapshot()?;
-            let contiguous =
-                Self::native_sync_contiguous_body_tip_from_snapshot(&snapshot, headers, None)?;
+            let contiguous = Self::native_sync_contiguous_body_tip_from_snapshot(
+                &snapshot,
+                headers,
+                stored_tip_hint,
+            )?;
             let start = contiguous
                 .as_ref()
                 .map_or(0, |tip| tip.height.saturating_add(1));
@@ -5958,11 +5962,13 @@ async fn handle_peer_event(
                         Some(record) if !headers_only => {
                             let has_body = node.native_sync_has_block(&hash)?;
                             if !has_body {
-                                scheduler
-                                    .announce_block(peer, hash, record.height)
-                                    .map_err(|error| {
-                                        anyhow::anyhow!("failed to queue announced block: {error}")
-                                    })?;
+                                announce_peer_block_if_in_horizon(
+                                    peer,
+                                    hash,
+                                    record.height,
+                                    node,
+                                    scheduler,
+                                )?;
                             }
                         }
                         Some(_) => {}
@@ -6802,14 +6808,23 @@ async fn accept_peer_block(
             hash.to_hex()
         );
     }
-    if !scheduler.is_tracked_block(&hash) {
-        if !node.native_sync_unsolicited_canonical_body_is_in_horizon(hash, record.height)? {
-            anyhow::bail!(
-                "peer {:?} sent unsolicited canonical block {} outside the durable body horizon",
-                peer,
-                hash.to_hex()
-            );
+    if !node.native_sync_canonical_body_is_in_horizon(
+        hash,
+        record.height,
+        scheduler.stored_tip(),
+    )? {
+        // A persisted reservation from an older runtime or a future scheduler
+        // call site must not become an alternate authorization path.
+        if scheduler.is_tracked_block(&hash) {
+            scheduler.reject_block(None, hash, false, StdInstant::now());
         }
+        anyhow::bail!(
+            "peer {:?} sent canonical block {} outside the durable body horizon",
+            peer,
+            hash.to_hex()
+        );
+    }
+    if !scheduler.is_tracked_block(&hash) {
         scheduler
             .announce_block(peer, hash, record.height)
             .map_err(|error| anyhow::anyhow!("failed to queue delivered block: {error}"))?;
@@ -6829,6 +6844,24 @@ async fn accept_peer_block(
         return Err(anyhow::anyhow!("validation queue rejected block: {error}"));
     }
     Ok(())
+}
+
+fn announce_peer_block_if_in_horizon(
+    peer: PeerId,
+    hash: BlockHash,
+    height: Height,
+    node: &NodeReadHandle,
+    scheduler: &mut SyncScheduler,
+) -> Result<bool> {
+    // An inventory announcement is peer-controlled and must not turn a future
+    // canonical body into scheduler-authorized work outside the durable
+    // out-of-order window.
+    if !node.native_sync_canonical_body_is_in_horizon(hash, height, scheduler.stored_tip())? {
+        return Ok(false);
+    }
+    scheduler
+        .announce_block(peer, hash, height)
+        .map_err(|error| anyhow::anyhow!("failed to queue announced block: {error}"))
 }
 
 async fn request_headers_from_peer(
@@ -12541,7 +12574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsolicited_canonical_body_outside_orphan_horizon_is_rejected() {
+    async fn canonical_body_outside_horizon_cannot_be_authorized_by_inventory_or_reservation() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             native_sync: NativeSyncConfig {
@@ -12575,6 +12608,19 @@ mod tests {
         scheduler
             .register_peer(PeerId(1), hns_p2p::SERVICE_NETWORK, 4)
             .expect("peer");
+
+        assert!(!announce_peer_block_if_in_horizon(
+            PeerId(1),
+            second_hash,
+            2,
+            &node,
+            &mut scheduler,
+        )
+        .expect("inventory announcement"));
+        assert!(!scheduler.is_tracked_block(&second_hash));
+        scheduler
+            .announce_block(PeerId(1), second_hash, 2)
+            .expect("simulate a stale scheduler reservation");
 
         let error = accept_peer_block(
             PeerId(1),

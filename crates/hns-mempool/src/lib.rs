@@ -36,9 +36,9 @@ pub const MAX_MEMPOOL_TRANSACTIONS: usize = 250_000;
 pub const MAX_MEMPOOL_BYTES: usize = 1024 * 1024 * 1024;
 pub const MAX_ORPHANS: usize = 8_192;
 pub const MAX_ORPHAN_BYTES: usize = 256 * 1024 * 1024;
-/// Maximum retained payload that may be copied by an atomic contextual
-/// revalidation. This independently bounds transient rebuild allocations even
-/// when the configured retained-pool limit is much larger.
+/// Maximum retained or disconnected payload that may be copied by an atomic
+/// contextual revalidation. This independently bounds transient rebuild
+/// allocations even when the configured retained-pool limit is much larger.
 pub const MAX_REVALIDATION_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PACKAGE_MEMBERS: usize = 1_000;
 pub const MAX_TX_SIGOPS: u32 = MAX_BLOCK_SIGOPS / 5;
@@ -2404,7 +2404,13 @@ impl MemoryMempool {
         input_verifier: &dyn TransactionInputVerifier,
         contextual_verifier: &dyn ContextualTransactionVerifier,
     ) -> Result<MempoolRevalidation, MempoolError> {
-        let revalidation_bytes = self.bytes.saturating_add(self.orphan_bytes);
+        // Reorg candidates are cloned into the rebuild just like retained
+        // transactions. Include them in the preflight budget so a deep reorg
+        // cannot bypass the bound with a small or empty current mempool.
+        let revalidation_bytes = disconnected_transactions.iter().fold(
+            self.bytes.saturating_add(self.orphan_bytes),
+            |total, transaction| total.saturating_add(transaction.encode().len()),
+        );
         if revalidation_bytes > MAX_REVALIDATION_BYTES {
             return Err(MempoolError::LimitExceeded {
                 context: "mempool revalidation memory",
@@ -6011,6 +6017,43 @@ mod tests {
         ));
         assert_eq!(pool.info().generation, previous_generation);
         assert!(pool.transaction(&txid).is_some());
+    }
+
+    #[test]
+    fn chain_transition_budget_includes_disconnected_transactions() {
+        let input = outpoint(0xfb, 0);
+        let view = FixedView::with_coin(input.clone(), 20);
+        let retained = transaction(input, 9);
+        let disconnected = transaction(outpoint(0xfc, 0), 8);
+        let disconnected_bytes = disconnected.encode().len();
+        let mut pool = test_mempool();
+        assert!(matches!(
+            submit(&mut pool, retained, &view),
+            Admission::Accepted(_)
+        ));
+        pool.bytes = MAX_REVALIDATION_BYTES
+            .saturating_sub(disconnected_bytes)
+            .saturating_add(1);
+
+        let error = pool
+            .reconcile_chain_transition_with_context(
+                &[],
+                &[disconnected],
+                &MempoolContext::testing(3, 3),
+                &view,
+                &AllowInputs,
+                &AllowContext,
+            )
+            .expect_err("disconnected payload must count toward the revalidation budget");
+
+        assert!(matches!(
+            error,
+            MempoolError::LimitExceeded {
+                context: "mempool revalidation memory",
+                limit: MAX_REVALIDATION_BYTES,
+                actual,
+            } if actual == MAX_REVALIDATION_BYTES + 1
+        ));
     }
 
     #[test]
