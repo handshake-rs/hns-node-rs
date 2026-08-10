@@ -67,6 +67,15 @@ qualification or authorize deployment.
 - Keep an active-state batch limit stable for sixteen full successful slices
   after an atomic-effect-budget retry, avoiding the one-block/two-block
   oscillation that repeatedly discarded expensive replay work.
+- Record only net `NameState` changes in new block undo and the pending
+  interval accumulator. Older 0.3.5 candidate builds could record valid
+  no-op `BID`/`REDEEM` touches in undo without counting them in the
+  accumulator, causing a later restart audit to fail. Startup now recognizes
+  only the strictly validated accumulator-subset form of that mismatch,
+  reconstructs the canonical raw-undo counts under the existing resource
+  limits, verifies the committed boundary root, and atomically replaces only
+  the accumulator key so legacy disconnect remains exact. It does not rewrite
+  undo, `NameState`, authenticated-tree, or chain-index records.
 - Retain the v0.3.4 resolver release-CI port correction.
 
 The current source remains a release candidate until its consolidated current-

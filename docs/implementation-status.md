@@ -698,6 +698,13 @@ existing snapshots namespace; once present, `--prune-undo-history` is required
 on subsequent opens. Schema/profile combinations older than 16 or otherwise
 ambiguous still fail closed and require an explicit reindex.
 
+New version-7 undo records contain only net `NameState` changes, matching the
+pending interval accumulator exactly. A bounded startup bridge repairs the
+earlier candidate-only no-op-touch mismatch only when the stored accumulator
+is a subset of canonical pending-interval undo and independent boundary-root
+reconstruction succeeds. The bridge atomically replaces one accumulator key;
+legacy undo remains unchanged so restart and disconnect use the same counts.
+
 The reviewed offline backup, bounded inline-payload conversion, verification,
 and non-destructive fallback procedure is
 [`storage-rollout.md`](storage-rollout.md). The maintenance marker

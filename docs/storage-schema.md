@@ -25,6 +25,12 @@ publication schema plus the optimized storage tiers:
   interval-accumulator state, and airdrop positions to clear on disconnect;
 - a checksummed accumulator that composes per-block name changes and commits
   the authenticated tree only at HSD's network `treeInterval` cadence;
+- exact changed-name undo for new blocks. A startup compatibility bridge for
+  earlier candidate data accepts only an accumulator whose counts are a
+  subset of the complete canonical pending-interval undo counts, validates
+  every height/root transition and the reconstructed committed boundary root,
+  then atomically replaces only the accumulator key. This preserves the raw
+  legacy counts needed by disconnect without rewriting undo or name state;
 - mandatory 32-byte `name-tree-root` metadata equal to the last committed root;
 - mandatory 32-byte `name-tree-commit-root` binding for HSD's last
   `treeInterval` commitment used by candidate headers and mining templates;

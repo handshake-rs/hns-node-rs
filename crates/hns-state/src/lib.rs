@@ -259,6 +259,19 @@ pub struct NameTreeAccumulator {
     pub names: BTreeMap<NameHash, u16>,
 }
 
+/// Evidence for the one-key startup reconciliation of accumulators written by
+/// the legacy touched-name undo contract. No undo, NameState, authenticated
+/// tree, or chain-index record is rewritten by this compatibility bridge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NameTreeAccumulatorReconciliationSummary {
+    pub first_height: Height,
+    pub last_height: Height,
+    pub previous_names: usize,
+    pub reconciled_names: usize,
+    pub previous_references: u64,
+    pub reconciled_references: u64,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NameTreeIntervalMigrationSummary {
     pub active_heights: usize,
@@ -2220,8 +2233,19 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         let state = name_state_changes.current.get(name_hash).ok_or_else(|| {
             StateError::Codec("changed name is missing from transaction cache".to_owned())
         })?;
+        let resulting = (!state.is_null()).then_some(state.clone());
+        let previous = name_state_changes.previous.get(name_hash).ok_or_else(|| {
+            StateError::Codec("changed name is missing its pre-block state".to_owned())
+        })?;
+        // Persist only a net state change. Besides excluding ordinary
+        // BID/REDEEM no-ops, this makes a same-block transition sequence that
+        // returns to its exact pre-state unambiguously absent from both undo
+        // and the interval accumulator.
+        if previous == &resulting {
+            continue;
+        }
         write_name_state_to_batch(batch, state)?;
-        name_overrides.insert(*name_hash, (!state.is_null()).then_some(state.clone()));
+        name_overrides.insert(*name_hash, resulting);
     }
 
     let interval_boundary = request.height.is_multiple_of(tree_interval);
@@ -2283,14 +2307,25 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         resulting_committed_tree_root.as_bytes(),
     )?;
 
-    let previous_name_states = name_state_changes
-        .previous
-        .into_iter()
-        .map(|(name_hash, previous)| NameUndo {
-            name_hash,
-            previous,
+    // BID and REDEEM can be contextually valid without changing NameState.
+    // Keep undo keyed to the exact changed-name set used by the interval
+    // accumulator; otherwise a clean restart reconstructs extra names from
+    // undo and rejects the accumulator written by this block.
+    let mut previous_name_states_by_hash = name_state_changes.previous;
+    let previous_name_states = name_overrides
+        .keys()
+        .map(|name_hash| {
+            let previous = previous_name_states_by_hash
+                .remove(name_hash)
+                .ok_or_else(|| {
+                    StateError::Codec("changed name is missing its pre-block state".to_owned())
+                })?;
+            Ok(NameUndo {
+                name_hash: *name_hash,
+                previous,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, StateError>>()?;
     let undo = BlockUndo {
         block_hash: request.block_hash,
         height: request.height,
@@ -5861,6 +5896,21 @@ struct NameTreeStreamingPreparation {
     stored: TreeRoot,
     overrides: BTreeMap<NameHash, Option<Vec<u8>>>,
     override_working_set_bytes: u64,
+    reconciliation: Option<NameTreeAccumulatorReconciliation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NameTreeAccumulatorCountPolicy {
+    Exact,
+    LegacySubset,
+}
+
+#[derive(Debug)]
+struct NameTreeAccumulatorReconciliation {
+    previous_raw: Vec<u8>,
+    previous_names: usize,
+    previous_references: u64,
+    reconciled: NameTreeAccumulator,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -6118,6 +6168,22 @@ fn prepare_name_tree_streaming_overrides<T: ReadSnapshot>(
     tip_height: Height,
     limits: NameTreeMaterializationLimits,
 ) -> Result<NameTreeStreamingPreparation, StateError> {
+    prepare_name_tree_streaming_overrides_with_count_policy(
+        snapshot,
+        tree_interval,
+        tip_height,
+        limits,
+        NameTreeAccumulatorCountPolicy::Exact,
+    )
+}
+
+fn prepare_name_tree_streaming_overrides_with_count_policy<T: ReadSnapshot>(
+    snapshot: &T,
+    tree_interval: Height,
+    tip_height: Height,
+    limits: NameTreeMaterializationLimits,
+    count_policy: NameTreeAccumulatorCountPolicy,
+) -> Result<NameTreeStreamingPreparation, StateError> {
     limits.page_budget.validate()?;
     ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
     if tree_interval == 0 {
@@ -6146,6 +6212,7 @@ fn prepare_name_tree_streaming_overrides<T: ReadSnapshot>(
             stored,
             overrides: BTreeMap::new(),
             override_working_set_bytes: 0,
+            reconciliation: None,
         });
     };
 
@@ -6301,17 +6368,69 @@ fn prepare_name_tree_streaming_overrides<T: ReadSnapshot>(
             )));
         }
     }
-    if accumulator.names != expected_counts {
-        return Err(StateError::Codec(
-            "name-tree accumulator names disagree with canonical undo".to_owned(),
-        ));
-    }
+    let reconciliation = match count_policy {
+        NameTreeAccumulatorCountPolicy::Exact => {
+            if accumulator.names != expected_counts {
+                return Err(StateError::Codec(
+                    "name-tree accumulator names disagree with canonical undo".to_owned(),
+                ));
+            }
+            None
+        }
+        NameTreeAccumulatorCountPolicy::LegacySubset => {
+            let is_subset = accumulator.names.iter().all(|(name_hash, count)| {
+                expected_counts
+                    .get(name_hash)
+                    .is_some_and(|expected| count <= expected)
+            });
+            if !is_subset {
+                return Err(StateError::Codec(
+                    "name-tree accumulator cannot be safely reconciled because its names are not a subset of canonical undo"
+                        .to_owned(),
+                ));
+            }
+            if accumulator.names == expected_counts {
+                None
+            } else {
+                let maximum_raw_bytes = |names: usize| {
+                    (4 + 32 + 4 + 4 + 9 + 32u64).saturating_add(
+                        u64::try_from(names)
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(NAME_TREE_ACCUMULATOR_ENTRY_BYTES as u64),
+                    )
+                };
+                let repair_raw_bytes = maximum_raw_bytes(accumulator.names.len())
+                    .saturating_add(maximum_raw_bytes(expected_counts.len()));
+                ensure_name_tree_streaming_working_set(
+                    audit_working_set_bytes,
+                    repair_raw_bytes,
+                    limits,
+                )?;
+                let previous_raw = accumulator.encode()?;
+                let previous_names = accumulator.names.len();
+                let previous_references = accumulator
+                    .names
+                    .values()
+                    .map(|count| u64::from(*count))
+                    .sum();
+                let mut reconciled = accumulator;
+                reconciled.names = expected_counts;
+                Some(NameTreeAccumulatorReconciliation {
+                    previous_raw,
+                    previous_names,
+                    previous_references,
+                    reconciled,
+                })
+            }
+        }
+    };
     ensure_retained_root_deadline(limits.deadline, "name-tree streaming verification")?;
 
     Ok(NameTreeStreamingPreparation {
         stored,
         overrides: boundary_overrides,
         override_working_set_bytes,
+        reconciliation,
     })
 }
 
@@ -6544,6 +6663,112 @@ pub fn verify_name_tree_interval_state_bounded<T: ReadSnapshot>(
         });
     }
     Ok(audit.root)
+}
+
+/// Reconcile the sole legacy accumulator mismatch that is safe to repair at
+/// startup: every stored count must be less than or equal to the raw count in
+/// the exact canonical pending-interval undo sequence. The sequence metadata,
+/// heights, roots, and accumulator identity are validated before any write,
+/// and rewinding the current NameState view through the earliest raw undo for
+/// each name must reconstruct the committed boundary root.
+///
+/// This API must run before concurrent state writers are started. Its only
+/// mutation is one atomic replacement of [`NAME_TREE_ACCUMULATOR_KEY`]. A
+/// fresh bounded invariant audit and exact readback follow the commit.
+pub fn reconcile_legacy_name_tree_interval_accumulator_bounded<S: Store>(
+    store: &S,
+    tree_interval: Height,
+    tip_height: Height,
+    limits: NameTreeMaterializationLimits,
+) -> Result<Option<NameTreeAccumulatorReconciliationSummary>, StateError> {
+    let snapshot = store.snapshot()?;
+    let preparation = prepare_name_tree_streaming_overrides_with_count_policy(
+        &snapshot,
+        tree_interval,
+        tip_height,
+        limits,
+        NameTreeAccumulatorCountPolicy::LegacySubset,
+    )?;
+    let Some(reconciliation) = preparation.reconciliation else {
+        return Ok(None);
+    };
+    let boundary_audit = stream_name_state_root_with_overrides_bounded(
+        &snapshot,
+        &preparation.overrides,
+        preparation.override_working_set_bytes,
+        limits,
+    )?;
+    if preparation.stored != boundary_audit.root {
+        return Err(StateError::StoredTreeRootMismatch {
+            stored: preparation.stored,
+            actual: boundary_audit.root,
+        });
+    }
+
+    let reconciled_raw = reconciliation.reconciled.encode()?;
+    let summary = NameTreeAccumulatorReconciliationSummary {
+        first_height: reconciliation.reconciled.first_height,
+        last_height: reconciliation.reconciled.last_height,
+        previous_names: reconciliation.previous_names,
+        reconciled_names: reconciliation.reconciled.names.len(),
+        previous_references: reconciliation.previous_references,
+        reconciled_references: reconciliation
+            .reconciled
+            .names
+            .values()
+            .map(|count| u64::from(*count))
+            .sum(),
+    };
+    let original_raw = reconciliation.previous_raw;
+    drop(snapshot);
+
+    // Refuse to publish a plan derived from an accumulator that changed after
+    // its immutable snapshot was acquired. Startup owns the only writer; this
+    // readback makes that precondition explicit and fail-closed.
+    let current_snapshot = store.snapshot()?;
+    if current_snapshot.get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?
+        != Some(original_raw)
+    {
+        return Err(StateError::Codec(
+            "name-tree accumulator changed while startup reconciliation was prepared".to_owned(),
+        ));
+    }
+    drop(current_snapshot);
+
+    let mut batch = store.batch();
+    batch.put(
+        ColumnFamily::Snapshots,
+        NAME_TREE_ACCUMULATOR_KEY,
+        &reconciled_raw,
+    )?;
+    store.commit(batch)?;
+
+    let verified_snapshot = store.snapshot()?;
+    let verified = verify_name_tree_interval_state_bounded(
+        &verified_snapshot,
+        tree_interval,
+        tip_height,
+        limits,
+    )?;
+    if verified != preparation.stored {
+        return Err(StateError::StoredTreeRootMismatch {
+            stored: preparation.stored,
+            actual: verified,
+        });
+    }
+    let readback = verified_snapshot
+        .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?
+        .ok_or_else(|| {
+            StateError::Codec(
+                "name-tree accumulator disappeared after startup reconciliation".to_owned(),
+            )
+        })?;
+    if readback != reconciled_raw {
+        return Err(StateError::Codec(
+            "name-tree accumulator readback disagrees with startup reconciliation".to_owned(),
+        ));
+    }
+    Ok(Some(summary))
 }
 
 pub fn encode_coin(coin: &Coin) -> Vec<u8> {
@@ -8794,6 +9019,503 @@ mod tests {
             load_stored_name_tree_commit_root(&snapshot).expect("commit root"),
             pending_root
         );
+    }
+
+    fn seed_committed_interval_name(store: &MemoryStore, state: &NameState) -> TreeRoot {
+        let snapshot = store.snapshot().expect("seed snapshot");
+        let mut batch = store.batch();
+        write_name_state_to_batch(&mut batch, state).expect("seed name state");
+        let root = stage_name_tree_with_overrides(
+            &snapshot,
+            &mut batch,
+            TreeRoot::ZERO,
+            &BTreeMap::from([(state.name_hash, Some(state.clone()))]),
+        )
+        .expect("seed committed name root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                root.as_bytes(),
+            )
+            .expect("bind seeded root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                root.as_bytes(),
+            )
+            .expect("bind seeded committed root");
+        drop(snapshot);
+        store.commit(batch).expect("commit seeded name state");
+        root
+    }
+
+    fn install_legacy_noop_interval_undo(
+        store: &MemoryStore,
+        block_hash: BlockHash,
+        height: Height,
+        root: TreeRoot,
+        previous: NameState,
+    ) {
+        let undo = BlockUndo {
+            block_hash,
+            height,
+            previous_tree_root: root,
+            resulting_tree_root: root,
+            previous_committed_tree_root: root,
+            resulting_committed_tree_root: root,
+            spent_coins: Vec::new(),
+            created_coins: Vec::new(),
+            airdrop_positions: Vec::new(),
+            previous_name_states: vec![NameUndo {
+                name_hash: previous.name_hash,
+                previous: Some(previous),
+            }],
+            name_tree_interval_boundary: false,
+            previous_name_tree_accumulator_last_height: None,
+            previous_name_tree_accumulator: None,
+        };
+        let accumulator = NameTreeAccumulator::new(root, height);
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Undo,
+                block_hash.as_bytes(),
+                &undo.encode().expect("encode legacy no-op undo"),
+            )
+            .expect("stage legacy no-op undo");
+        write_canonical_height_to_batch(&mut batch, height, block_hash)
+            .expect("stage legacy canonical height");
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                NAME_TREE_ACCUMULATOR_KEY,
+                &accumulator.encode().expect("encode legacy accumulator"),
+            )
+            .expect("stage legacy accumulator");
+        store.commit(batch).expect("commit legacy interval fixture");
+    }
+
+    #[test]
+    fn legacy_noop_undo_reconciliation_survives_restart_and_disconnect() {
+        let store = MemoryStore::new();
+        let mut engine = engine(store.clone());
+        let name_hash = hash_name("legacy-noop").expect("legacy name hash");
+        let mut state = NameState::null(name_hash);
+        state.initialize(b"legacy-noop".to_vec(), 5);
+        let root = seed_committed_interval_name(&store, &state);
+        let block_hash = BlockHash::new([0xa1; 32]);
+        let height = 11;
+        install_legacy_noop_interval_undo(&store, block_hash, height, root, state.clone());
+
+        let snapshot = store.snapshot().expect("affected restart snapshot");
+        let undo_before = snapshot
+            .get(ColumnFamily::Undo, block_hash.as_bytes())
+            .expect("read legacy undo")
+            .expect("legacy undo");
+        let accumulator_before = snapshot
+            .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)
+            .expect("read legacy accumulator")
+            .expect("legacy accumulator");
+        assert!(matches!(
+            verify_name_tree_interval_state_bounded(
+                &snapshot,
+                Network::Regtest.params().names.tree_interval,
+                height,
+                NameTreeMaterializationLimits::default(),
+            ),
+            Err(StateError::Codec(message))
+                if message == "name-tree accumulator names disagree with canonical undo"
+        ));
+        drop(snapshot);
+
+        let reconciliation = reconcile_legacy_name_tree_interval_accumulator_bounded(
+            &store,
+            Network::Regtest.params().names.tree_interval,
+            height,
+            NameTreeMaterializationLimits::default(),
+        )
+        .expect("reconcile affected legacy accumulator")
+        .expect("legacy accumulator requires reconciliation");
+        assert_eq!(reconciliation.first_height, height);
+        assert_eq!(reconciliation.last_height, height);
+        assert_eq!(reconciliation.previous_names, 0);
+        assert_eq!(reconciliation.reconciled_names, 1);
+        assert_eq!(reconciliation.previous_references, 0);
+        assert_eq!(reconciliation.reconciled_references, 1);
+
+        let snapshot = store.snapshot().expect("reconciled restart snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Undo, block_hash.as_bytes())
+                .expect("read reconciled undo")
+                .expect("reconciled undo"),
+            undo_before,
+            "reconciliation must not rewrite canonical undo"
+        );
+        let accumulator_after = snapshot
+            .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)
+            .expect("read reconciled accumulator")
+            .expect("reconciled accumulator");
+        assert_ne!(accumulator_after, accumulator_before);
+        assert_eq!(
+            verify_name_tree_interval_state_bounded(
+                &snapshot,
+                Network::Regtest.params().names.tree_interval,
+                height,
+                NameTreeMaterializationLimits::default(),
+            )
+            .expect("reconciled restart audit"),
+            root
+        );
+        drop(snapshot);
+
+        engine
+            .disconnect_block(DisconnectBlock { block_hash, height })
+            .expect("disconnect reconciled legacy no-op");
+        let snapshot = store.snapshot().expect("post-disconnect snapshot");
+        assert!(load_name_tree_accumulator(&snapshot)
+            .expect("load post-disconnect accumulator")
+            .is_none());
+        assert_eq!(
+            load_name_state(&snapshot, &name_hash).expect("load restored no-op name"),
+            Some(state)
+        );
+    }
+
+    #[test]
+    fn legacy_accumulator_reconciliation_rejects_counts_above_canonical_undo() {
+        let store = MemoryStore::new();
+        let _engine = engine(store.clone());
+        let name_hash = hash_name("legacy-overcount").expect("legacy name hash");
+        let mut state = NameState::null(name_hash);
+        state.initialize(b"legacy-overcount".to_vec(), 5);
+        let root = seed_committed_interval_name(&store, &state);
+        let block_hash = BlockHash::new([0xa2; 32]);
+        install_legacy_noop_interval_undo(&store, block_hash, 11, root, state);
+
+        let overcounted = NameTreeAccumulator {
+            base_root: root,
+            first_height: 11,
+            last_height: 11,
+            names: BTreeMap::from([(name_hash, 2)]),
+        }
+        .encode()
+        .expect("encode overcounted accumulator");
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Snapshots,
+                NAME_TREE_ACCUMULATOR_KEY,
+                &overcounted,
+            )
+            .expect("stage overcounted accumulator");
+        store.commit(batch).expect("commit overcounted accumulator");
+
+        assert!(matches!(
+            reconcile_legacy_name_tree_interval_accumulator_bounded(
+                &store,
+                Network::Regtest.params().names.tree_interval,
+                11,
+                NameTreeMaterializationLimits::default(),
+            ),
+            Err(StateError::Codec(message))
+                if message.contains("not a subset of canonical undo")
+        ));
+        let snapshot = store.snapshot().expect("rejected repair snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)
+                .expect("read rejected accumulator")
+                .expect("rejected accumulator"),
+            overcounted
+        );
+    }
+
+    #[test]
+    fn reconciled_legacy_noop_and_filtered_new_undo_disconnect_in_order() {
+        let store = MemoryStore::new();
+        let mut engine = engine(store.clone());
+        let legacy_hash = hash_name("mixed-legacy-noop").expect("legacy name hash");
+        let mut legacy_state = NameState::null(legacy_hash);
+        legacy_state.initialize(b"mixed-legacy-noop".to_vec(), 5);
+        let root = seed_committed_interval_name(&store, &legacy_state);
+        let legacy_block_hash = BlockHash::new([0xb1; 32]);
+        install_legacy_noop_interval_undo(
+            &store,
+            legacy_block_hash,
+            101,
+            root,
+            legacy_state.clone(),
+        );
+        reconcile_legacy_name_tree_interval_accumulator_bounded(
+            &store,
+            Network::Regtest.params().names.tree_interval,
+            101,
+            NameTreeMaterializationLimits::default(),
+        )
+        .expect("reconcile mixed legacy accumulator")
+        .expect("mixed legacy accumulator requires reconciliation");
+
+        let new_name = b"mixed-filtered-new";
+        let new_hash = NameHash::new(hns_primitives::sha3_256(new_name));
+        let mut candidate = block(0xb2, vec![coinbase(vec![open_output(new_name)])]);
+        candidate.header.tree_root = *root.as_bytes();
+        let new_block_hash = candidate.hash();
+        let summary = engine
+            .connect_block(ConnectBlock {
+                block_hash: new_block_hash,
+                height: 102,
+                coinbase_maturity: 0,
+                block_reward: 0,
+                block: &candidate,
+            })
+            .expect("connect new filtered undo block");
+        assert_eq!(summary.names_changed, 1);
+        let new_undo = engine
+            .load_undo(&new_block_hash)
+            .expect("load new undo")
+            .expect("new undo");
+        assert_eq!(new_undo.previous_name_states.len(), 1);
+        assert_eq!(new_undo.previous_name_states[0].name_hash, new_hash);
+
+        let mut canonical = store.batch();
+        write_canonical_height_to_batch(&mut canonical, 102, new_block_hash)
+            .expect("stage new canonical height");
+        store
+            .commit(canonical)
+            .expect("commit new canonical height");
+        let snapshot = store.snapshot().expect("mixed restart snapshot");
+        let accumulator = load_name_tree_accumulator(&snapshot)
+            .expect("load mixed accumulator")
+            .expect("mixed accumulator");
+        assert_eq!(
+            accumulator.names,
+            BTreeMap::from([(legacy_hash, 1), (new_hash, 1)])
+        );
+        assert_eq!(
+            verify_name_tree_interval_state_bounded(
+                &snapshot,
+                Network::Regtest.params().names.tree_interval,
+                102,
+                NameTreeMaterializationLimits::default(),
+            )
+            .expect("mixed restart audit"),
+            root
+        );
+        drop(snapshot);
+        assert!(reconcile_legacy_name_tree_interval_accumulator_bounded(
+            &store,
+            Network::Regtest.params().names.tree_interval,
+            102,
+            NameTreeMaterializationLimits::default(),
+        )
+        .expect("exact mixed accumulator")
+        .is_none());
+
+        engine
+            .disconnect_block(DisconnectBlock {
+                block_hash: new_block_hash,
+                height: 102,
+            })
+            .expect("disconnect new filtered undo");
+        let snapshot = store.snapshot().expect("legacy-only snapshot");
+        let accumulator = load_name_tree_accumulator(&snapshot)
+            .expect("load legacy-only accumulator")
+            .expect("legacy-only accumulator");
+        assert_eq!(accumulator.last_height, 101);
+        assert_eq!(accumulator.names, BTreeMap::from([(legacy_hash, 1)]));
+        assert_eq!(
+            verify_name_tree_interval_state_bounded(
+                &snapshot,
+                Network::Regtest.params().names.tree_interval,
+                101,
+                NameTreeMaterializationLimits::default(),
+            )
+            .expect("legacy-only restart audit"),
+            root
+        );
+        drop(snapshot);
+
+        engine
+            .disconnect_block(DisconnectBlock {
+                block_hash: legacy_block_hash,
+                height: 101,
+            })
+            .expect("disconnect legacy no-op after new undo");
+        let snapshot = store.snapshot().expect("fully disconnected snapshot");
+        assert!(load_name_tree_accumulator(&snapshot)
+            .expect("load final accumulator")
+            .is_none());
+        assert_eq!(
+            load_name_state(&snapshot, &legacy_hash).expect("load legacy state"),
+            Some(legacy_state)
+        );
+        assert!(load_name_state(&snapshot, &new_hash)
+            .expect("load removed new name")
+            .is_none());
+    }
+
+    #[test]
+    fn unchanged_bid_and_redeem_keep_restart_accumulator_audit_consistent() {
+        for kind in [CovenantKind::Bid, CovenantKind::Redeem] {
+            let store = MemoryStore::new();
+            let mut engine = engine(store.clone());
+            let name = match kind {
+                CovenantKind::Bid => b"unchangedbid".as_slice(),
+                CovenantKind::Redeem => b"unchangedredeem".as_slice(),
+                _ => unreachable!("fixture contains only unchanged covenants"),
+            };
+            let name_hash = NameHash::new(hns_primitives::sha3_256(name));
+            let start_height = 5;
+            let candidate_height = match kind {
+                CovenantKind::Bid => 11,
+                CovenantKind::Redeem => 26,
+                _ => unreachable!("fixture contains only unchanged covenants"),
+            };
+            let mut seeded = NameState::null(name_hash);
+            seeded.initialize(name.to_vec(), start_height);
+
+            let losing_reveal = Outpoint {
+                txid: Txid::new([0x91; 32]),
+                index: 0,
+            };
+            if kind == CovenantKind::Redeem {
+                seeded.owner = Outpoint {
+                    txid: Txid::new([0x92; 32]),
+                    index: 1,
+                };
+            }
+
+            let snapshot = store.snapshot().expect("seed snapshot");
+            let mut seed_batch = store.batch();
+            write_name_state_to_batch(&mut seed_batch, &seeded).expect("seed name state");
+            let committed_root = stage_name_tree_with_overrides(
+                &snapshot,
+                &mut seed_batch,
+                TreeRoot::ZERO,
+                &BTreeMap::from([(name_hash, Some(seeded.clone()))]),
+            )
+            .expect("seed committed name root");
+            seed_batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::NameTreeRoot.as_bytes(),
+                    committed_root.as_bytes(),
+                )
+                .expect("bind seeded root");
+            seed_batch
+                .put(
+                    ColumnFamily::Meta,
+                    MetaKey::NameTreeCommitRoot.as_bytes(),
+                    committed_root.as_bytes(),
+                )
+                .expect("bind seeded committed root");
+            if kind == CovenantKind::Redeem {
+                write_coin_to_batch(
+                    &mut seed_batch,
+                    &Coin {
+                        outpoint: losing_reveal.clone(),
+                        value: 0,
+                        height: 1,
+                        coinbase: false,
+                        address: address(),
+                        covenant: Covenant {
+                            kind: CovenantKind::Reveal,
+                            items: vec![
+                                name_hash.as_bytes().to_vec(),
+                                start_height.to_le_bytes().to_vec(),
+                                vec![0x93; 32],
+                            ],
+                        },
+                    },
+                )
+                .expect("seed losing reveal coin");
+            }
+            drop(snapshot);
+            store.commit(seed_batch).expect("commit seeded name state");
+
+            let action = Transaction {
+                version: 1,
+                inputs: (kind == CovenantKind::Redeem)
+                    .then(|| Input {
+                        previous_output: losing_reveal,
+                        sequence: u32::MAX,
+                        witness: Witness::default(),
+                    })
+                    .into_iter()
+                    .collect(),
+                outputs: vec![Output {
+                    value: 0,
+                    address: address(),
+                    covenant: Covenant {
+                        kind,
+                        items: match kind {
+                            CovenantKind::Bid => vec![
+                                name_hash.as_bytes().to_vec(),
+                                start_height.to_le_bytes().to_vec(),
+                                name.to_vec(),
+                                vec![0x94; 32],
+                            ],
+                            CovenantKind::Redeem => vec![
+                                name_hash.as_bytes().to_vec(),
+                                start_height.to_le_bytes().to_vec(),
+                            ],
+                            _ => unreachable!("fixture contains only unchanged covenants"),
+                        },
+                    },
+                }],
+                locktime: 0,
+            };
+            let mut candidate = block(0x95 + candidate_height, vec![coinbase(Vec::new()), action]);
+            candidate.header.tree_root = *committed_root.as_bytes();
+            let block_hash = candidate.hash();
+            let summary = engine
+                .connect_block(ConnectBlock {
+                    block_hash,
+                    height: candidate_height,
+                    coinbase_maturity: 0,
+                    block_reward: 0,
+                    block: &candidate,
+                })
+                .expect("connect unchanged name covenant");
+            assert_eq!(summary.names_changed, 0, "{kind:?}");
+
+            let undo = engine
+                .load_undo(&block_hash)
+                .expect("load unchanged-covenant undo")
+                .expect("unchanged-covenant undo");
+            assert!(undo.previous_name_states.is_empty(), "{kind:?}");
+            let snapshot = store.snapshot().expect("connected snapshot");
+            let accumulator = load_name_tree_accumulator(&snapshot)
+                .expect("load accumulator")
+                .expect("pending interval accumulator");
+            assert!(accumulator.names.is_empty(), "{kind:?}");
+            drop(snapshot);
+
+            let mut canonical = store.batch();
+            write_canonical_height_to_batch(&mut canonical, candidate_height, block_hash)
+                .expect("stage canonical height");
+            store.commit(canonical).expect("commit canonical height");
+            let snapshot = store.snapshot().expect("restart-audit snapshot");
+            assert_eq!(
+                verify_name_tree_interval_state_bounded(
+                    &snapshot,
+                    Network::Regtest.params().names.tree_interval,
+                    candidate_height,
+                    NameTreeMaterializationLimits::default(),
+                )
+                .expect("restart interval audit"),
+                committed_root,
+                "{kind:?}"
+            );
+            assert_eq!(
+                load_name_state(&snapshot, &name_hash).expect("load unchanged name"),
+                Some(seeded),
+                "{kind:?}"
+            );
+        }
     }
 
     fn address() -> Address {

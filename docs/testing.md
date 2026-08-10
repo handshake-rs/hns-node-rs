@@ -261,6 +261,10 @@ Current evidence includes:
 - network-interval snapshot-pin codec/connect/disconnect/restart invariants and
   retained-root compaction that preserves current, retained-undo, and pinned
   proof bytes while deleting roots whose pins and rollback authority expired;
+- no-op `BID`/`REDEEM` exclusion from new undo, bounded reconciliation of an
+  earlier under-counted interval accumulator without rewriting canonical undo,
+  restart verification, legacy disconnect, and mixed legacy/new undo
+  disconnect ordering;
 - malformed-pin and failed-compaction-commit cases that leave the complete node
   set unchanged, followed by an idempotent successful retry;
 - startup compaction due/not-due scheduling, nonzero interval validation,

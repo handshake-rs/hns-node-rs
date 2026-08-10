@@ -127,8 +127,8 @@ use hns_state::{
     load_stored_name_tree_root, maximum_name_page_validation_records,
     migrate_name_tree_interval_accumulator_bounded, name_page_root_key, name_tree_snapshot_pin_key,
     pack_name_page_records_consuming, plan_name_tree_interval_accumulator_migration_bounded,
-    retained_name_tree_roots_bounded, stage_remove_name_tree_snapshot_pin,
-    stream_name_page_tree_delta_with_limits_and_progress,
+    reconcile_legacy_name_tree_interval_accumulator_bounded, retained_name_tree_roots_bounded,
+    stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits_and_progress,
     stream_name_page_tree_indexed_with_limits_and_progress,
     stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
     validate_persisted_name_tree_root, validate_persisted_name_trees,
@@ -9305,6 +9305,35 @@ impl NodeState {
         // clean marker and incorrectly authorize the next fast path.
         mark_unclean_start(&store)
             .map_err(|error| anyhow::anyhow!("failed to mark running store unclean: {error}"))?;
+
+        // Versions before the exact changed-name undo contract could persist
+        // ordinary BID/REDEEM touches in undo without counting them in the
+        // pending interval accumulator. Repair only that strictly validated
+        // subset case before any state writer or startup checkpoint fast path
+        // is admitted.
+        let active_tip_height = {
+            let snapshot = store.snapshot()?;
+            best_block_tip_from_snapshot(&snapshot)?.map_or(0, |tip| tip.height)
+        };
+        if let Some(reconciliation) = reconcile_legacy_name_tree_interval_accumulator_bounded(
+            &store,
+            config.network.params().names.tree_interval,
+            active_tip_height,
+            NameTreeMaterializationLimits::default(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("failed to reconcile legacy name-tree interval accumulator: {error}")
+        })? {
+            tracing::warn!(
+                first_height = reconciliation.first_height,
+                last_height = reconciliation.last_height,
+                previous_names = reconciliation.previous_names,
+                reconciled_names = reconciliation.reconciled_names,
+                previous_references = reconciliation.previous_references,
+                reconciled_references = reconciliation.reconciled_references,
+                "reconciled legacy name-tree accumulator from canonical undo"
+            );
+        }
 
         let (checkpoint, checkpoint_warning) = if previous_shutdown_clean {
             let snapshot = store.snapshot()?;
