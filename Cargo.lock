@@ -1130,7 +1130,7 @@ dependencies = [
 [[package]]
 name = "hns-chat-protocol"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "hex",
  "hns-covenants",
@@ -1157,7 +1157,7 @@ dependencies = [
 [[package]]
 name = "hns-covenants"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -1177,7 +1177,7 @@ dependencies = [
 [[package]]
 name = "hns-dns-relay-protocol"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "hns-encoding",
  "thiserror",
@@ -1186,7 +1186,7 @@ dependencies = [
 [[package]]
 name = "hns-encoding"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "thiserror",
 ]
@@ -1202,7 +1202,7 @@ dependencies = [
 [[package]]
 name = "hns-hnsr-protocol"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "blake2",
  "getrandom 0.4.3",
@@ -1273,7 +1273,7 @@ dependencies = [
 [[package]]
 name = "hns-odoh-protocol"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "aes-gcm 0.10.3",
  "blake2",
@@ -1308,7 +1308,7 @@ dependencies = [
 [[package]]
 name = "hns-p2p-experimental"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "hex",
  "hns-encoding",
@@ -1322,7 +1322,7 @@ dependencies = [
 [[package]]
 name = "hns-primitives"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "hex",
  "thiserror",
@@ -1390,7 +1390,7 @@ dependencies = [
 [[package]]
 name = "hns-service-authority"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -1450,7 +1450,7 @@ dependencies = [
 [[package]]
 name = "hns-transaction"
 version = "0.2.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=29e4b473bd2cfee460b56d5092b7bc28da5ec5dc#29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=4331eee2265ebc43a28390517c24a958fa4b7733#4331eee2265ebc43a28390517c24a958fa4b7733"
 dependencies = [
  "blake2",
  "hns-covenants",

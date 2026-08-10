@@ -44,7 +44,18 @@ qualification or authorize deployment.
 - Bind wallet snapshots and name-action contexts to consensus median time past.
 - Reclaim never-confirmed contract capacity and safely retire completed tracked
   contracts only after canonical evidence is validated.
+- Consume canonical HNS resource parsing from the exact `hns-rs` source rather
+  than retaining a second resolver-local codec. Advance that coherent source
+  to `4331eee`, including the HNSA/HNSR selection/admission correction and
+  linked-covenant output validation. Endpoint and rendezvous roles remain
+  unavailable; a newer protocol pin does not enable either role.
 - Commit single-block native replay atomically.
+- Streamline bounded active-state persistence across the store, name-page,
+  state, and Urkel layers. Only committed blocks contribute workload and
+  mempool effects, and a staged-effect truncation feeds its accepted direct-
+  extension prefix back to the native-sync slice tuner instead of retrying a
+  known-excessive span. This is a persistence/performance change, not a change
+  to consensus rules or release status.
 - Defer routine full name-page generation rewrites while native sync is
   catching up. Synchronized nodes retain the sixteen-segment reclamation
   cadence, while IBD and native-sync startup use a 128-segment emergency bound
