@@ -11448,7 +11448,6 @@ impl NodeState {
         let staged_pins = staged_name_tree_snapshot_pins(&staged, std::iter::once(request.height))?;
         let publication = self.prepare_index_publication(&index_updates)?;
         drop(staged);
-        drop(page_base);
         let staged_nodes = overlay.take_staged_family(ColumnFamily::NameTreeNodes);
         let known = reader.into_known_addresses().map_err(|error| {
             anyhow::anyhow!("failed to transfer traversal page addresses: {error}")
@@ -11840,7 +11839,6 @@ impl NodeState {
             current,
         }])?;
         drop(staged);
-        drop(page_base);
         let staged_nodes = overlay.take_staged_family(ColumnFamily::NameTreeNodes);
         let known = reader.into_known_addresses().map_err(|error| {
             anyhow::anyhow!("failed to transfer traversal page addresses: {error}")
@@ -12334,7 +12332,6 @@ impl NodeState {
             .prepare_index_publication(&index_updates)
             .map_err(ChainActivationFailure::Internal)?;
         drop(staged);
-        drop(base);
         let staged_nodes = if self.name_pages.is_some() {
             overlay.take_staged_family(ColumnFamily::NameTreeNodes)
         } else {
