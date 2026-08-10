@@ -103,6 +103,13 @@ pub struct NamePageStreamLimits {
     pub deadline: Instant,
 }
 
+struct ParallelNamePageStreamOptions<'a> {
+    target_subtrees: usize,
+    limits: NamePageStreamLimits,
+    progress_interval: Duration,
+    address_index: Option<&'a mut HashMap<TreeRoot, NamePageAddress>>,
+}
+
 /// Absolute resource envelope for discovering the physical address index of
 /// one retained page-tree root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1031,11 +1038,13 @@ where
         snapshot,
         root,
         appender,
-        NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES,
-        limits,
-        progress_interval,
+        ParallelNamePageStreamOptions {
+            target_subtrees: NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES,
+            limits,
+            progress_interval,
+            address_index: None,
+        },
         on_progress,
-        None,
     )
 }
 
@@ -1058,11 +1067,13 @@ where
         snapshot,
         root,
         appender,
-        NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES,
-        limits,
-        progress_interval,
+        ParallelNamePageStreamOptions {
+            target_subtrees: NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES,
+            limits,
+            progress_interval,
+            address_index: Some(&mut addresses),
+        },
         on_progress,
-        Some(&mut addresses),
     )?;
     Ok((streamed, addresses))
 }
@@ -1293,11 +1304,13 @@ fn stream_name_page_tree_with_parallelism_and_limits<T: ReadSnapshot>(
         snapshot,
         root,
         appender,
-        target_subtrees,
-        limits,
-        Duration::MAX,
+        ParallelNamePageStreamOptions {
+            target_subtrees,
+            limits,
+            progress_interval: Duration::MAX,
+            address_index: None,
+        },
         |_| {},
-        None,
     )
 }
 
@@ -1305,15 +1318,18 @@ fn stream_name_page_tree_with_parallelism_and_limits_and_progress<T: ReadSnapsho
     snapshot: &T,
     root: TreeRoot,
     appender: &mut NamePageAppender,
-    target_subtrees: usize,
-    limits: NamePageStreamLimits,
-    progress_interval: Duration,
+    options: ParallelNamePageStreamOptions<'_>,
     on_progress: P,
-    address_index: Option<&mut HashMap<TreeRoot, NamePageAddress>>,
 ) -> Result<StreamedNamePages, PageTreeError>
 where
     P: FnMut(NamePageStreamProgress),
 {
+    let ParallelNamePageStreamOptions {
+        target_subtrees,
+        limits,
+        progress_interval,
+        address_index,
+    } = options;
     ensure_page_tree_deadline(limits.deadline, "name-page generation streaming")?;
     let target_subtrees = target_subtrees.max(1);
     let mut emitter = StreamingPageEmitter::new_with_address_index(
@@ -3390,18 +3406,17 @@ fn validate_loaded_name_page_record(
     })
 }
 
-fn validate_name_page_record_parts<'a>(
+type ValidatedNamePageRecordParts<'a> = (
+    [Option<(TreeRoot, NamePageAddress)>; 2],
+    UrkelNodeRecordRef<'a>,
+);
+
+fn validate_name_page_record_parts(
     key: [u8; 32],
     children: [Option<NamePageAddress>; 2],
-    canonical: &'a [u8],
+    canonical: &[u8],
     expected: TreeRoot,
-) -> Result<
-    (
-        [Option<(TreeRoot, NamePageAddress)>; 2],
-        UrkelNodeRecordRef<'a>,
-    ),
-    PageTreeError,
-> {
+) -> Result<ValidatedNamePageRecordParts<'_>, PageTreeError> {
     if key != *expected.as_bytes() {
         return Err(PageTreeError::RecordKeyMismatch {
             expected,
