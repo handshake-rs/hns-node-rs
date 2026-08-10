@@ -33,9 +33,10 @@ service unit from this repository. The original remains at
 
 MeshMine's `meshmine-hsrd-bridge`, unified miner, CI job, HSD-oracle
 generators, and source-handoff/comparison scripts were outside `hsrd/` and are
-not included here. MeshMine was subsequently rewired to consume this repository
-and currently pins
-`504d3fed035feb8a637ca09c4e0816b6e1144622`. Committed Rust fixtures,
+not included here. MeshMine was subsequently rewired to consume this
+repository. The initial external-node handoff pinned
+`504d3fed035feb8a637ca09c4e0816b6e1144622`; current MeshMine source pins
+`8bbcd61d96293ca5d895fe60845f180a94e5c38e`. Committed Rust fixtures,
 qualification artifacts, vendored cryptographic sources, and the independent
 fuzz workspace were inside the prefix and are preserved.
 
@@ -57,11 +58,15 @@ live native RPC replaces it with a configuration-specific diagnostic stage.
 Functional readiness and a conditional permit therefore do not imply
 independent production endorsement.
 
-MeshMine's pinned `504d3fed035feb8a637ca09c4e0816b6e1144622` revision
-already includes the promoted historical-replay and invalid-corpus readiness
-but predates the later standalone Denuo/HIP-76 commits. Consumers must describe
-features against the revision they actually pin rather than against either the
-old embedded snapshot or an unconsumed standalone HEAD.
+MeshMine's original external-node pin
+`504d3fed035feb8a637ca09c4e0816b6e1144622` already included the promoted
+historical-replay and invalid-corpus readiness but predated the later
+standalone Denuo/HIP-76 commits. Its current pin,
+`8bbcd61d96293ca5d895fe60845f180a94e5c38e`, is the actual integration
+boundary and still must not be described as consuming unpinned standalone HEAD
+features. Consumers must describe features against the revision they actually
+pin rather than against either the old embedded snapshot or an unconsumed
+standalone HEAD.
 
 ## Storage compatibility
 
