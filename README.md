@@ -39,8 +39,9 @@ a RocksDB reopen, live restart/reorg, adversarial topology, performance
 measurement, or the full qualification gate. Tombstones have a separate finite
 lifetime cap; later matching funding is deliberately untracked after explicit
 permanent abandonment, and registration remains absent from untrusted wallet
-RPC. The repository also awaits its independent wallet adapter,
-canonical `hns-swap` pin, and cross-project qualification. See the
+RPC. `hns-wallet-rs` now contains a concrete node-RPC adapter boundary; what
+remains is cross-repository qualification, product integration, and a released
+canonical `hns-swap` dependency rather than initial adapter implementation. See the
 [wallet-index status](docs/HNS_NODE_WALLET_INDEX.md) and
 [wire contract](docs/WALLET_RPC_V1.md).
 

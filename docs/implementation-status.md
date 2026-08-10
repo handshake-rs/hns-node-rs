@@ -201,10 +201,11 @@ Implemented:
   block authority. Retired IDs cannot be reused. Legacy-unknown records remain
   non-retirable. The finite tombstone/event limits and permanent-abandonment
   semantics remain a narrower production-availability blocker and untrusted
-  registration remains absent. This implementation is awaiting the
-  repository's full gate, an independent wallet transport adapter, a published
-  and pinned canonical `hns-swap` commit, and cross-repository adapter
-  qualification; local script duplication and frozen vectors are not protocol
+  registration remains absent. A concrete adapter boundary now exists in
+  `hns-wallet-rs`; this implementation is awaiting the repository's full gate,
+  product integration, a published and pinned canonical `hns-swap` release,
+  and cross-repository adapter qualification. Local script duplication and
+  frozen vectors are not protocol
   authority and no release-readiness claim is made by this source status
   update. The focused NVMe command
   `cargo test --locked -p hns-consensus wallet_name_action -- --test-threads=1`

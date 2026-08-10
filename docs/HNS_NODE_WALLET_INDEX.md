@@ -478,9 +478,10 @@ never drops an internally retained revealed preimage.
 ## Remaining integration work
 
 This source implementation now has a bounded authenticated process transport,
-but still needs the repository's full qualification gate and an independent
-cross-repository wallet adapter implementation/qualification, including the
-canonical `hns-swap` pin described above, before it is release-qualified.
+and `hns-wallet-rs` has a concrete adapter boundary. The remaining work is the
+repository's full qualification gate, cross-repository adapter integration and
+qualification, and the released canonical `hns-swap` pin described above;
+initial adapter implementation is no longer the blocker.
 Completed-contract active-slot reclamation passed its four focused
 `production_next_` wallet-index tests at exact local revision
 `fd0c9b00114e3fa0a293972de7d4538dcd959ce0`; the test filter covered bounded
