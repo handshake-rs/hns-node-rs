@@ -358,6 +358,12 @@ Fixtures are evidence, not authority.
   full tip and exact admission time. Wallet adapters retain an explicit reverse map to
   derivation-order records and discard partial scans when either binding
   changes.
+- The wallet can acquire a script-free initial binding: one immutable backend
+  read returns the durable chain epoch and exact tip, then a height-zero lookup
+  under that epoch authenticates the configured network before derived ScriptIds
+  cross the process boundary. A reorganization between those reads fails stale;
+  a null uninitialized tip cannot authorize a scan. The frozen tip-only method
+  remains available but cannot establish an epoch.
 - Combined transaction evidence binds status, inclusion, payload availability,
   chain epoch, tip, and mempool instance/generation. The wire requires the
   expected chain epoch and can require the exact prior mempool binding, so a

@@ -43,11 +43,11 @@ pub use wallet_backend::{
     OutpointSpendingEntry, OutpointSpendingEvidence, TrackedContractRetirement,
     TrackedContractRetirementContext, TrackedContractRetirementRequest, TransactionEvidence,
     TransactionFeeQuote, TransactionInclusion, TransactionPayload, TransactionStatus,
-    WalletBackend, WalletBackendError, WalletChainTip, WalletContractEventCursor,
-    WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
-    WalletMempoolCursor, MAX_NAME_ACTION_INELIGIBILITY_REASONS, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
-    MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS, MAX_WALLET_FEE_QUOTE_INPUTS,
-    MAX_WALLET_OUTPOINT_SPEND_BATCH, NAME_ACTION_CONTEXT_VERSION,
+    WalletBackend, WalletBackendError, WalletChainSnapshot, WalletChainTip,
+    WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
+    WalletContractFundingPage, WalletMempoolCursor, MAX_NAME_ACTION_INELIGIBILITY_REASONS,
+    MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS,
+    MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_OUTPOINT_SPEND_BATCH, NAME_ACTION_CONTEXT_VERSION,
 };
 pub use wallet_rpc::WALLET_RPC_API_VERSION;
 

@@ -230,6 +230,7 @@ affected read path and direct the operator to the explicit rebuild procedure.
 and the live peer manager. It implements:
 
 - `get_chain_tip`
+- `get_chain_snapshot`
 - `get_block_hash`
 - `get_block_hash_evidence`
 - `get_raw_transaction`
@@ -264,6 +265,10 @@ and the live peer manager. It implements:
 `WalletChainTip` contains the active hash, height, HSD-compatible
 median-time-past computed over the tip and up to ten ancestors, and the exact
 authenticated name-tree root used for current persisted proofs.
+`WalletChainSnapshot` adds the durable chain epoch and captures it with that
+complete tip in one immutable, publication-fenced point read. It accepts no
+script identity and is the initial binding source for an external wallet;
+`get_chain_tip` remains the unchanged tip-only convenience projection.
 `get_transaction_evidence`
 captures status, inclusion, retained-or-pruned payload state, active tip,
 durable chain epoch, and immutable mempool instance/generation together, then rejects
@@ -272,8 +277,11 @@ inclusion, and raw-transaction calls are projections of that combined read;
 wallet adapters should consume the combined result when several fields must
 agree across a reorganization.
 
-Block-hash evidence and ordered outpoint-spend evidence return the durable
-chain epoch and complete tip from the same immutable snapshot. The spending
+The script-free chain snapshot followed by height-zero block-hash evidence lets
+an adapter bind both epoch and configured network before it submits derived
+script identities. Block-hash evidence and ordered outpoint-spend evidence
+return the durable chain epoch and complete tip from the same immutable
+snapshot. The spending
 batch contains exactly one result per requested outpoint in request order and
 is capped at 4,096 entries internally (256 on wallet RPC). Confirmed inclusion
 contains an exact optional transaction position: retained block bytes make the
@@ -340,11 +348,15 @@ no wallet request is parsed and no wallet read or write begins.
 
 The v1 request/response envelope uses canonical hexadecimal identities and raw
 transactions. Continuations are bounded behaviorally opaque hexadecimal
-tokens, not secrets or authenticated capabilities. Confirmed responses
-preserve chain epoch, tip, and script-set binding; mempool responses preserve
-the chain epoch/tip plus explicit process instance nonce, generation, and query
-binding. Mempool requests supply their confirmed restore epoch, and mempool
-cursors bind that epoch as well as the process-local generation.
+tokens, not secrets or authenticated capabilities. The additive
+`chain_snapshot` method projects epoch and exact tip from one immutable
+typed-backend read and takes no parameters. Together with a bound height-zero
+`block_hash` read, it establishes chain and network identity before the first
+script query. The older `chain_tip` result remains unchanged. Confirmed
+responses preserve chain epoch, tip, and script-set binding; mempool responses
+preserve the chain epoch/tip plus explicit process instance nonce, generation,
+and query binding. Mempool requests supply their confirmed restore epoch, and
+mempool cursors bind that epoch as well as the process-local generation.
 Transaction/raw point requests also require that chain epoch and optionally
 require the exact nonce/generation learned from a prior mempool page; omission
 means an explicitly independent current mempool capture.

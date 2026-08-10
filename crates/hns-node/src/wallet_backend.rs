@@ -434,6 +434,19 @@ pub struct WalletChainTip {
     pub tree_root: TreeRoot,
 }
 
+/// Durable chain generation and exact active tip from one immutable read.
+///
+/// This is the script-free initial binding a separate wallet can capture before
+/// disclosing any derived script identities to the node.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WalletChainSnapshot {
+    /// Durable monotonic canonical-chain generation.
+    pub chain_epoch: u64,
+    /// Exact active tip captured with `chain_epoch`, or `None` before the chain
+    /// has initialized.
+    pub tip: Option<WalletChainTip>,
+}
+
 /// Active-chain hash lookup captured with its immutable chain binding.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockHashEvidence {
@@ -881,6 +894,22 @@ impl WalletBackend {
     pub async fn get_chain_tip(&self) -> Result<Option<WalletChainTip>, WalletBackendError> {
         let read = self.read.clone();
         blocking_chain_read(read, move |_, snapshot| wallet_chain_tip(snapshot)).await
+    }
+
+    /// Read the durable chain generation and exact active tip atomically.
+    ///
+    /// Unlike script restoration, this operation takes no wallet-derived
+    /// identities. It is suitable for establishing a complete initial wallet
+    /// snapshot binding before any script query.
+    pub async fn get_chain_snapshot(&self) -> Result<WalletChainSnapshot, WalletBackendError> {
+        let read = self.read.clone();
+        blocking_chain_read(read, move |_, snapshot| {
+            Ok(WalletChainSnapshot {
+                chain_epoch: chain_epoch_from_snapshot(snapshot).map_err(node_error)?,
+                tip: wallet_chain_tip(snapshot)?,
+            })
+        })
+        .await
     }
 
     /// Read the active-chain hash at one exact height.
@@ -3306,6 +3335,13 @@ mod tests {
         let backend = runtime.wallet_backend(peers);
 
         assert_eq!(backend.get_chain_tip().await.unwrap(), None);
+        assert_eq!(
+            backend.get_chain_snapshot().await.unwrap(),
+            WalletChainSnapshot {
+                chain_epoch: 0,
+                tip: None,
+            }
+        );
         assert_eq!(backend.get_block_hash(0).await.unwrap(), None);
         assert_eq!(
             backend.estimate_fee_rate(6).await.unwrap(),

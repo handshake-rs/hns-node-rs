@@ -35,7 +35,7 @@ Requests use an exact v1 envelope:
   "api_version": 1,
   "request_id": "wallet-local-correlation-id",
   "call": {
-    "method": "chain_tip"
+    "method": "chain_snapshot"
   }
 }
 ```
@@ -84,7 +84,8 @@ wire. Transaction policy rejection text is bounded to 256 characters.
 | Method | Parameters | Result and binding |
 | --- | --- | --- |
 | `capabilities` | none | Hard bounds and explicit unavailable protocol surfaces. |
-| `chain_tip` | none | Active hash, height, HSD-compatible median-time-past, and exact proof tree root. |
+| `chain_tip` | none | Frozen tip-only projection: active hash, height, HSD-compatible median-time-past, and exact proof tree root. It carries no chain epoch. |
+| `chain_snapshot` | none | Durable chain epoch and the exact active tip from one immutable read, without accepting script identities. |
 | `block_hash` | `height`, required `expected_chain_epoch` | Requested height and active-chain hash or `null`, bound to the chain epoch and full tip captured in the same immutable read. |
 | `confirmed_scripts_page` | sorted-unique `script_ids`, opaque `cursor`, `limit` (1..=256) | Combined history (including canonical block time when retained in the header index) then UTXOs, chain epoch, tip, work count, continuation. |
 | `mempool_scripts_page` | same script set, required `expected_chain_epoch`, opaque `cursor`, `scan_limit` (1..=1,024) | Relevant transactions with exact admission times, chain epoch/tip, process `instance_nonce`, and immutable `generation`. A mismatched expected epoch fails stale. |
@@ -101,6 +102,16 @@ wire. Transaction policy rejection text is bounded to 256 characters.
 | `tracked_contract_fundings` | `contract_id`, required `expected_chain_epoch`, opaque `cursor`, `limit` (1..=256) | Active confirmed funding evidence bound to contract and chain epoch. |
 | `tracked_contract_events` | same | Confirmed funding/spend classifications bound to contract and chain epoch. |
 | `mempool_tracked_contract` | `contract_id`, required `expected_chain_epoch`, opaque `cursor`, `scan_limit` (1..=1,024) | Unconfirmed funding/spend evidence with exact admission time, chain epoch/tip, and explicit mempool instance nonce/generation. |
+
+An initialized wallet should begin with `chain_snapshot`, which returns exactly
+`{"chain_epoch":N,"tip":{...}}`. `tip` is `null` only while the active chain is
+uninitialized and cannot form a wallet snapshot binding. The wallet can next
+request `block_hash` at height zero under that epoch and compare the returned
+full binding and genesis hash with its selected network. Both requests are
+script-free, so network identity can be established before any derived ScriptId
+is disclosed. A chain change between them produces `stale_snapshot`; the wallet
+restarts the two-step capture. `chain_tip` retains its existing nullable tip-only
+result for compatibility and is not a substitute for this initial binding.
 
 Script IDs are BLAKE2b-256 identities of canonical Handshake output-address
 encodings. Clients must preserve their own reverse map from each sorted request
@@ -131,11 +142,13 @@ pair and any restart or generation change fails with `stale_snapshot`. Omitting
 `expected_mempool` explicitly requests an independently stable current mempool
 capture; the response still returns its actual nonce and generation.
 
-After the first confirmed restoration page establishes the durable epoch,
-`block_hash`, name evidence, spender evidence, and confirmed tracked-contract
-pages also require `expected_chain_epoch`. A mismatch is rejected before wire
-projection. Every response retains the complete captured tip so the adapter can
-also require exact tip equality.
+After `chain_snapshot` establishes the durable epoch, `block_hash`, name
+evidence, spender evidence, and confirmed tracked-contract pages require
+`expected_chain_epoch`. A mismatch is rejected before wire projection. Every
+response retains the complete captured tip so the adapter can also require exact
+tip equality. Confirmed restoration still returns the same binding on every
+page and rejects a pre-scan reorganization; it no longer needs to be the first
+request that reveals the epoch.
 
 Every non-null `tip` object contains `hash`, `height`, `median_time_past`, and
 `tree_root`. `median_time_past` is the median timestamp of the active tip and up

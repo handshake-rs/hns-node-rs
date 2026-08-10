@@ -22,11 +22,12 @@ use super::wallet_backend::{
     FeeEstimateSource, MempoolContractEvent, MempoolContractPage, MempoolScriptPage, NameAction,
     NameActionContext, NameActionIneligibility, NameEvidence, NameOwnerTransaction,
     OutpointSpendingEvidence, TransactionEvidence, TransactionFeeQuote, TransactionPayload,
-    TransactionStatus, WalletBackend, WalletBackendError, WalletContractEventCursor,
-    WalletContractEventPage, WalletContractFundingCursor, WalletContractFundingPage,
-    WalletMempoolCursor, MAX_FEE_ESTIMATE_TARGET_BLOCKS, MAX_NAME_ACTION_INELIGIBILITY_REASONS,
-    MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_MEMPOOL_SCAN,
-    MAX_WALLET_OUTPOINT_SPEND_BATCH, MAX_WALLET_RESTORE_SCRIPTS, NAME_ACTION_CONTEXT_VERSION,
+    TransactionStatus, WalletBackend, WalletBackendError, WalletChainSnapshot,
+    WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
+    WalletContractFundingPage, WalletMempoolCursor, MAX_FEE_ESTIMATE_TARGET_BLOCKS,
+    MAX_NAME_ACTION_INELIGIBILITY_REASONS, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
+    MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_MEMPOOL_SCAN, MAX_WALLET_OUTPOINT_SPEND_BATCH,
+    MAX_WALLET_RESTORE_SCRIPTS, NAME_ACTION_CONTEXT_VERSION,
 };
 
 pub const WALLET_RPC_API_VERSION: u16 = 1;
@@ -56,6 +57,7 @@ struct WalletRpcRequest {
 enum WalletRpcCall {
     Capabilities,
     ChainTip,
+    ChainSnapshot,
     BlockHash {
         height: u32,
         expected_chain_epoch: u64,
@@ -315,6 +317,7 @@ async fn dispatch_call(
             "consensus_maximum_transaction_bytes": MAX_TX_SIZE,
             "transaction_request_also_bound_by_hex_envelope_and_listener_body_limit": true,
             "confirmed_cursor_binding": "chain_epoch_and_script_set",
+            "initial_chain_binding": "script_free_chain_snapshot_epoch_and_exact_tip",
             "post_binding_reads_require_expected_chain_epoch": true,
             "mempool_cursor_binding": "chain_epoch_process_instance_nonce_generation_and_query",
             "mempool_page_binding": "chain_epoch_tip_instance_nonce_and_generation",
@@ -348,6 +351,9 @@ async fn dispatch_call(
             "tracked_contract_evidence": "node_local_profile_only_not_protocol_authority"
         }),
         WalletRpcCall::ChainTip => value(&wire_tip(backend.get_chain_tip().await?))?,
+        WalletRpcCall::ChainSnapshot => value(&WireChainSnapshot::from(
+            backend.get_chain_snapshot().await?,
+        ))?,
         WalletRpcCall::BlockHash {
             height,
             expected_chain_epoch,
@@ -955,6 +961,21 @@ fn wire_tip(tip: Option<super::wallet_backend::WalletChainTip>) -> Option<WireTi
         median_time_past: tip.median_time_past,
         tree_root: hex_encode(tip.tree_root.as_bytes()),
     })
+}
+
+#[derive(Serialize)]
+struct WireChainSnapshot {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+}
+
+impl From<WalletChainSnapshot> for WireChainSnapshot {
+    fn from(snapshot: WalletChainSnapshot) -> Self {
+        Self {
+            chain_epoch: snapshot.chain_epoch,
+            tip: wire_tip(snapshot.tip),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1880,7 +1901,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chain_tip_wire_projection_includes_median_time_past() {
+    fn chain_tip_wire_projection_remains_exact() {
         let projected = serde_json::to_value(
             wire_tip(Some(crate::wallet_backend::WalletChainTip {
                 hash: hns_primitives::BlockHash::new([0x11; 32]),
@@ -1891,7 +1912,73 @@ mod tests {
             .expect("present tip"),
         )
         .expect("serialize tip");
-        assert_eq!(projected["median_time_past"], 1_700_000_123u64);
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "hash": "11".repeat(32),
+                "height": 42,
+                "median_time_past": 1_700_000_123u64,
+                "tree_root": "22".repeat(32),
+            })
+        );
+    }
+
+    #[test]
+    fn chain_snapshot_request_and_response_are_strict_and_exactly_bound() {
+        let request: WalletRpcRequest = serde_json::from_value(serde_json::json!({
+            "api_version": 1,
+            "request_id": "initial-binding-1",
+            "call": {
+                "method": "chain_snapshot"
+            }
+        }))
+        .expect("strict chain-snapshot request");
+        assert!(matches!(request.call, WalletRpcCall::ChainSnapshot));
+
+        assert!(
+            serde_json::from_value::<WalletRpcRequest>(serde_json::json!({
+                "api_version": 1,
+                "call": {
+                    "method": "chain_snapshot",
+                    "params": {
+                        "script_ids": []
+                    }
+                }
+            }))
+            .is_err()
+        );
+
+        let result = value(&WireChainSnapshot::from(WalletChainSnapshot {
+            chain_epoch: 17,
+            tip: Some(crate::wallet_backend::WalletChainTip {
+                hash: hns_primitives::BlockHash::new([0x33; 32]),
+                height: 42,
+                median_time_past: 1_700_000_123,
+                tree_root: hns_state::TreeRoot::new([0x44; 32]),
+            }),
+        }))
+        .expect("bounded chain-snapshot result");
+        let response = serde_json::to_value(WalletRpcResponse::success(
+            Some("initial-binding-1".to_owned()),
+            result,
+        ))
+        .expect("serialize chain-snapshot response");
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "api_version": 1,
+                "request_id": "initial-binding-1",
+                "result": {
+                    "chain_epoch": 17,
+                    "tip": {
+                        "hash": "33".repeat(32),
+                        "height": 42,
+                        "median_time_past": 1_700_000_123u64,
+                        "tree_root": "44".repeat(32),
+                    }
+                }
+            })
+        );
     }
 
     #[test]

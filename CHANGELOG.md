@@ -42,6 +42,10 @@ qualification or authorize deployment.
   ChaCha20-Poly1305; standalone `hns-p2p` no longer enables OpenSSL consensus
   verifiers.
 - Bind wallet snapshots and name-action contexts to consensus median time past.
+- Add a script-free authenticated wallet `chain_snapshot` read that atomically
+  returns the durable chain epoch and exact tip, allowing a bound genesis check
+  before any derived script identity is disclosed. The existing `chain_tip`
+  result is unchanged.
 - Reclaim never-confirmed contract capacity and safely retire completed tracked
   contracts only after canonical evidence is validated.
 - Consume canonical HNS resource parsing from the exact `hns-rs` source rather
