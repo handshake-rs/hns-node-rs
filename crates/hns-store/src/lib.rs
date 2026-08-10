@@ -716,6 +716,8 @@ pub trait Store {
 /// every staged operation has validated successfully.
 type StagedChanges = HashMap<ColumnFamily, BTreeMap<Vec<u8>, Option<Vec<u8>>>>;
 type SharedStagedChanges = Rc<RefCell<StagedChanges>>;
+type StagedCheckpointEntry = (ColumnFamily, Vec<u8>, Option<Option<Vec<u8>>>);
+type StagedCheckpoint = Vec<StagedCheckpointEntry>;
 type NameNodeReadCache = HashMap<Vec<u8>, Vec<u8>>;
 type StatePointReadCache = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
 /// Bound one active-state transaction's positive cache for content-addressed
@@ -1100,7 +1102,7 @@ pub struct StagedBatch<B: WriteBatch> {
     inner: B,
     changes: SharedStagedChanges,
     defer_name_tree_nodes: bool,
-    checkpoint: Option<Vec<(ColumnFamily, Vec<u8>, Option<Option<Vec<u8>>>)>>,
+    checkpoint: Option<StagedCheckpoint>,
 }
 
 impl<B: WriteBatch> StagedBatch<B> {
@@ -3931,10 +3933,15 @@ fn compact_memory_history(history: &mut Vec<MemoryVersion>, oldest_snapshot: Opt
     }
 }
 
+type BatchOperation = Option<Vec<u8>>;
+type BatchOperations = BTreeMap<StoreKey, BatchOperation>;
+type BatchCheckpointEntry = (StoreKey, Option<BatchOperation>);
+type BatchCheckpoint = Vec<BatchCheckpointEntry>;
+
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBatch {
-    operations: BTreeMap<StoreKey, Option<Vec<u8>>>,
-    checkpoint: Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
+    operations: BatchOperations,
+    checkpoint: Option<BatchCheckpoint>,
 }
 
 impl MemoryBatch {
@@ -3999,10 +4006,10 @@ impl StoreKey {
 }
 
 fn replace_batch_operation(
-    operations: &mut BTreeMap<StoreKey, Option<Vec<u8>>>,
-    checkpoint: &mut Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
+    operations: &mut BatchOperations,
+    checkpoint: &mut Option<BatchCheckpoint>,
     key: StoreKey,
-    value: Option<Vec<u8>>,
+    value: BatchOperation,
 ) {
     let previous = operations.insert(key.clone(), value);
     if let Some(journal) = checkpoint {
@@ -4010,9 +4017,7 @@ fn replace_batch_operation(
     }
 }
 
-fn begin_batch_checkpoint(
-    checkpoint: &mut Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
-) -> Result<(), StoreError> {
+fn begin_batch_checkpoint(checkpoint: &mut Option<BatchCheckpoint>) -> Result<(), StoreError> {
     if checkpoint.is_some() {
         return Err(StoreError::Backend(
             "write batch checkpoint is already active".to_owned(),
@@ -4022,9 +4027,7 @@ fn begin_batch_checkpoint(
     Ok(())
 }
 
-fn commit_batch_checkpoint(
-    checkpoint: &mut Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
-) -> Result<(), StoreError> {
+fn commit_batch_checkpoint(checkpoint: &mut Option<BatchCheckpoint>) -> Result<(), StoreError> {
     if checkpoint.take().is_none() {
         return Err(StoreError::Backend(
             "write batch checkpoint is not active".to_owned(),
@@ -4034,8 +4037,8 @@ fn commit_batch_checkpoint(
 }
 
 fn rollback_batch_checkpoint(
-    operations: &mut BTreeMap<StoreKey, Option<Vec<u8>>>,
-    checkpoint: &mut Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
+    operations: &mut BatchOperations,
+    checkpoint: &mut Option<BatchCheckpoint>,
 ) -> Result<(), StoreError> {
     let Some(mut journal) = checkpoint.take() else {
         return Err(StoreError::Backend(
@@ -4409,8 +4412,8 @@ pub struct RocksBatch {
     // Both the staging overlay and the durable backend are last-write-wins.
     // Retaining only the final operation avoids allocating and submitting every
     // intermediate mutation produced by a multi-block activation.
-    operations: BTreeMap<StoreKey, Option<Vec<u8>>>,
-    checkpoint: Option<Vec<(StoreKey, Option<Option<Vec<u8>>>)>>,
+    operations: BatchOperations,
+    checkpoint: Option<BatchCheckpoint>,
 }
 
 #[cfg(feature = "rocksdb-backend")]
