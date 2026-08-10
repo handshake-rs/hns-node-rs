@@ -135,6 +135,21 @@ toolchain, architecture-scoped compiler caches, and digest-pinned Debian base
 indexes. The runtime image contains neither Cargo nor the native build
 toolchain.
 
+## Exact-commit recovery candidate
+
+The manual **hsrd arm64 recovery candidate** workflow exports the exact current
+`main` source as a `linux/arm64` OCI archive for the narrowly guarded legacy
+interval-accumulator recovery. It fails closed if the requested full commit,
+checked-out `HEAD`, workflow definition, and current canonical `origin/main`
+are not identical. The seven-day GitHub Actions artifact also contains
+checksums and provenance binding the full source tree and imported image ID.
+
+This workflow never publishes an image, tag, GitHub Release, or GHCR package;
+it is not a substitute for release qualification. The archive requires an
+explicit local `skopeo` import. Follow the complete stop, whole-root cold
+backup, one-shot start, success, and rollback procedure in
+[Legacy interval-accumulator recovery](interval-accumulator-recovery.md).
+
 ## Release publication
 
 Pull requests and `main` changes build and execute both images independently on

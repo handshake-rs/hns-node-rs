@@ -56,6 +56,13 @@ loss of custody invalidates the rollout evidence: preserve the store, withhold
 authority, and rebuild through a full trusted replay (or a future qualified,
 separately protected complete-state commitment).
 
+The older-candidate `name-tree accumulator names disagree with canonical undo`
+startup failure is an unclean compatibility incident, not this normal clean
+rollout. Do not create a maintenance marker or claim a checkpoint backup for
+that store. Stop its restart loop and follow
+[Legacy interval-accumulator recovery](interval-accumulator-recovery.md), which
+requires a cold whole-root rollback copy before the guarded one-shot start.
+
 ## 1. Build and identify the rollout binary
 
 From a clean, reviewed source revision:

@@ -1,0 +1,351 @@
+name: hsrd arm64 recovery candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full current main commit to build as the recovery candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hsrd-arm64-recovery-${{ inputs.expected_commit }}
+  cancel-in-progress: false
+
+env:
+  REPAIR_FLOOR_COMMIT: d73c0894564503ad04d6783e831a311603ae302f
+
+jobs:
+  build-candidate:
+    name: Build exact linux/arm64 recovery candidate
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: false
+      DOCKER_BUILD_SUMMARY: false
+    steps:
+      - name: Check out the requested source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.expected_commit }}
+
+      - name: Validate exact canonical source
+        id: source
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'expected_commit must be a full lowercase 40-character commit ID' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REPOSITORY" != 'handshake-rs/hns-node-rs' ]]; then
+            echo "recovery candidates may only be built in handshake-rs/hns-node-rs" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
+            echo "workflow must be dispatched from refs/heads/main, not $GITHUB_REF" >&2
+            exit 1
+          fi
+          expected_workflow_ref="$GITHUB_REPOSITORY/.github/workflows/hsrd-recovery-candidate.yml@refs/heads/main"
+          if [[ "$GITHUB_WORKFLOW_REF" != "$expected_workflow_ref" ]]; then
+            echo "unexpected workflow file/ref identity: $GITHUB_WORKFLOW_REF" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          head_commit=$(git rev-parse --verify 'HEAD^{commit}')
+          origin_main_commit=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
+          if [[ "$head_commit" != "$EXPECTED_COMMIT" ]]; then
+            echo "checked-out HEAD $head_commit does not equal expected_commit $EXPECTED_COMMIT" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$origin_main_commit" ]]; then
+            echo "workflow definition commit $GITHUB_SHA is not current origin/main $origin_main_commit" >&2
+            exit 1
+          fi
+          if [[ "$EXPECTED_COMMIT" != "$origin_main_commit" ]]; then
+            echo "expected_commit $EXPECTED_COMMIT is not current origin/main $origin_main_commit" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$REPAIR_FLOOR_COMMIT" "$EXPECTED_COMMIT"; then
+            echo "expected_commit predates the guarded interval-accumulator repair" >&2
+            exit 1
+          fi
+
+          source_tree=$(git rev-parse --verify 'HEAD^{tree}')
+          short_commit=${EXPECTED_COMMIT:0:12}
+          version_label="recovery-${EXPECTED_COMMIT}"
+          {
+            echo "commit=$EXPECTED_COMMIT"
+            echo "origin_main_commit=$origin_main_commit"
+            echo "source_tree=$source_tree"
+            echo "short_commit=$short_commit"
+            echo "version_label=$version_label"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare candidate bundle
+        run: mkdir -p "$RUNNER_TEMP/recovery-candidate/bundle"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build arm64 OCI archive
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          build-args: |
+            VCS_REF=${{ steps.source.outputs.commit }}
+            VERSION=${{ steps.source.outputs.version_label }}
+          cache-from: type=gha,scope=hsrd-arm64
+          cache-to: type=gha,mode=max,scope=hsrd-arm64
+          context: .
+          outputs: type=oci,dest=${{ runner.temp }}/recovery-candidate/bundle/hsrd-recovery-linux-arm64-${{ steps.source.outputs.commit }}.oci.tar,oci-mediatypes=true
+          platforms: linux/arm64
+          provenance: false
+          push: false
+          sbom: false
+          target: hsrd-runtime
+
+      - name: Install OCI inspection tool
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends skopeo
+
+      - name: Verify archive structure, labels, and runtime
+        id: verify
+        env:
+          BUILDX_DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_COMMIT: ${{ steps.source.outputs.commit }}
+          VERSION_LABEL: ${{ steps.source.outputs.version_label }}
+        run: |
+          set -euo pipefail
+
+          bundle="$RUNNER_TEMP/recovery-candidate/bundle"
+          archive_name="hsrd-recovery-linux-arm64-${EXPECTED_COMMIT}.oci.tar"
+          archive="$bundle/$archive_name"
+          inspect_dir="$RUNNER_TEMP/recovery-candidate/oci-layout"
+          image_ref="hsrd-recovery-candidate:${EXPECTED_COMMIT:0:12}"
+          test -s "$archive"
+          mkdir -p "$inspect_dir"
+          tar -xf "$archive" -C "$inspect_dir"
+
+          jq -e '.imageLayoutVersion == "1.0.0"' \
+            "$inspect_dir/oci-layout" >/dev/null
+          jq -e '
+            .schemaVersion == 2
+            and (.manifests | length == 1)
+            and .manifests[0].mediaType == "application/vnd.oci.image.manifest.v1+json"
+            and .manifests[0].platform.os == "linux"
+            and .manifests[0].platform.architecture == "arm64"
+          ' "$inspect_dir/index.json" >/dev/null
+
+          while IFS= read -r -d '' blob; do
+            expected_blob_sha=$(basename "$blob")
+            actual_blob_sha=$(sha256sum "$blob" | awk '{print $1}')
+            if [[ "$actual_blob_sha" != "$expected_blob_sha" ]]; then
+              echo "OCI blob $blob does not match its content-addressed name" >&2
+              exit 1
+            fi
+          done < <(find "$inspect_dir/blobs/sha256" -type f -print0)
+
+          manifest_digest=$(jq -er '.manifests[0].digest' "$inspect_dir/index.json")
+          if [[ ! "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid OCI manifest digest: $manifest_digest" >&2
+            exit 1
+          fi
+          manifest="$inspect_dir/blobs/sha256/${manifest_digest#sha256:}"
+          test -f "$manifest"
+          config_digest=$(jq -er '.config.digest' "$manifest")
+          if [[ ! "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "invalid OCI configuration digest: $config_digest" >&2
+            exit 1
+          fi
+          config="$inspect_dir/blobs/sha256/${config_digest#sha256:}"
+          test -f "$config"
+          jq -e --arg commit "$EXPECTED_COMMIT" --arg version "$VERSION_LABEL" '
+            .architecture == "arm64"
+            and .os == "linux"
+            and .config.Labels["org.opencontainers.image.revision"] == $commit
+            and .config.Labels["org.opencontainers.image.version"] == $version
+            and .config.Labels["org.opencontainers.image.source"]
+              == "https://github.com/handshake-rs/hns-node-rs"
+            and .config.User == "10001:10001"
+            and .config.WorkingDir == "/var/lib/hsrd"
+            and .config.StopSignal == "SIGTERM"
+            and .config.Entrypoint == ["/usr/local/bin/hsrd-container-entrypoint"]
+            and .config.Cmd == [
+              "--network", "mainnet",
+              "--data-dir", "/var/lib/hsrd",
+              "--rpc-bind", "127.0.0.1:12037",
+              "--native-sync", "--p2p-discovery"
+            ]
+          ' "$config" >/dev/null
+          if [[ -n "$BUILDX_DIGEST" && ! "$BUILDX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Buildx returned an invalid digest: $BUILDX_DIGEST" >&2
+            exit 1
+          fi
+
+          skopeo copy "oci-archive:$archive" "docker-daemon:$image_ref" >/dev/null
+          docker image inspect "$image_ref" | jq -e \
+            --arg commit "$EXPECTED_COMMIT" --arg version "$VERSION_LABEL" '
+              length == 1
+              and .[0].Architecture == "arm64"
+              and .[0].Os == "linux"
+              and .[0].Config.Labels["org.opencontainers.image.revision"] == $commit
+              and .[0].Config.Labels["org.opencontainers.image.version"] == $version
+              and .[0].Config.User == "10001:10001"
+              and .[0].Config.Entrypoint == ["/usr/local/bin/hsrd-container-entrypoint"]
+            ' >/dev/null
+          hsrd_version=$(docker run --rm --network none "$image_ref" --version)
+          test "$(docker run --rm --network none --entrypoint /usr/bin/id "$image_ref" -u)" = 10001
+          docker run --rm --network none "$image_ref" \
+            --network mainnet \
+            --data-dir /var/lib/hsrd \
+            --rpc-bind 127.0.0.1:12037 \
+            --check-config
+
+          archive_sha256=$(sha256sum "$archive" | awk '{print $1}')
+          archive_bytes=$(stat -c '%s' "$archive")
+          image_id=$(docker image inspect "$image_ref" --format '{{.Id}}')
+          if [[ "$image_id" != "$config_digest" ]]; then
+            echo "imported image ID $image_id does not equal OCI configuration digest $config_digest" >&2
+            exit 1
+          fi
+          {
+            echo "archive_name=$archive_name"
+            echo "archive_sha256=$archive_sha256"
+            echo "archive_bytes=$archive_bytes"
+            echo "manifest_digest=$manifest_digest"
+            echo "config_digest=$config_digest"
+            echo "image_id=$image_id"
+            echo "hsrd_version=$hsrd_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write and verify checksums and provenance
+        env:
+          ARCHIVE_BYTES: ${{ steps.verify.outputs.archive_bytes }}
+          ARCHIVE_NAME: ${{ steps.verify.outputs.archive_name }}
+          ARCHIVE_SHA256: ${{ steps.verify.outputs.archive_sha256 }}
+          BUILDX_DIGEST: ${{ steps.build.outputs.digest }}
+          CONFIG_DIGEST: ${{ steps.verify.outputs.config_digest }}
+          EXPECTED_COMMIT: ${{ steps.source.outputs.commit }}
+          HSRD_VERSION: ${{ steps.verify.outputs.hsrd_version }}
+          IMAGE_ID: ${{ steps.verify.outputs.image_id }}
+          MANIFEST_DIGEST: ${{ steps.verify.outputs.manifest_digest }}
+          ORIGIN_MAIN_COMMIT: ${{ steps.source.outputs.origin_main_commit }}
+          SOURCE_TREE: ${{ steps.source.outputs.source_tree }}
+          VERSION_LABEL: ${{ steps.source.outputs.version_label }}
+        run: |
+          set -euo pipefail
+
+          bundle="$RUNNER_TEMP/recovery-candidate/bundle"
+          artifact_name="hsrd-recovery-arm64-${EXPECTED_COMMIT}"
+          generated_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          jq -n \
+            --arg artifact_name "$artifact_name" \
+            --arg archive_name "$ARCHIVE_NAME" \
+            --arg archive_sha256 "$ARCHIVE_SHA256" \
+            --arg buildx_digest "$BUILDX_DIGEST" \
+            --arg config_digest "$CONFIG_DIGEST" \
+            --arg expected_commit "$EXPECTED_COMMIT" \
+            --arg generated_at "$generated_at" \
+            --arg hsrd_version "$HSRD_VERSION" \
+            --arg image_id "$IMAGE_ID" \
+            --arg manifest_digest "$MANIFEST_DIGEST" \
+            --arg origin_main_commit "$ORIGIN_MAIN_COMMIT" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_tree "$SOURCE_TREE" \
+            --arg source_ref "$GITHUB_REF" \
+            --arg version_label "$VERSION_LABEL" \
+            --arg workflow_definition_commit "$GITHUB_SHA" \
+            --arg workflow_file_ref "$GITHUB_WORKFLOW_REF" \
+            --argjson archive_bytes "$ARCHIVE_BYTES" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            '{
+              schema_version: 1,
+              artifact_contract: "hsrd-arm64-recovery-candidate-v1",
+              production_release: false,
+              generated_at: $generated_at,
+              repository: $repository,
+              source: {
+                expected_commit: $expected_commit,
+                tree: $source_tree,
+                origin_main_at_build: $origin_main_commit,
+                workflow_definition_commit: $workflow_definition_commit,
+                workflow_file_ref: $workflow_file_ref,
+                workflow_ref: $source_ref
+              },
+              build: {
+                workflow: "hsrd arm64 recovery candidate",
+                run_id: $run_id,
+                run_attempt: $run_attempt,
+                platform: "linux/arm64",
+                target: "hsrd-runtime",
+                version_label: $version_label,
+                buildx_digest: $buildx_digest,
+                manifest_digest: $manifest_digest,
+                config_digest: $config_digest,
+                imported_image_id: $image_id,
+                hsrd_version: $hsrd_version
+              },
+              archive: {
+                name: $archive_name,
+                sha256: $archive_sha256,
+                bytes: $archive_bytes
+              },
+              distribution: {
+                kind: "github-actions-artifact",
+                artifact_name: $artifact_name,
+                retention_days: 7,
+                registry_published: false
+              }
+            }' > "$bundle/BUILD-PROVENANCE.json"
+
+          (
+            cd "$bundle"
+            sha256sum "$ARCHIVE_NAME" BUILD-PROVENANCE.json > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+          actual_files=$(find "$bundle" -maxdepth 1 -type f -printf '%f\n' | sort)
+          expected_files=$(printf '%s\n' \
+            BUILD-PROVENANCE.json SHA256SUMS "$ARCHIVE_NAME" | sort)
+          if [[ "$actual_files" != "$expected_files" ]]; then
+            echo 'recovery bundle contains unexpected or missing files' >&2
+            printf 'actual:\n%s\nexpected:\n%s\n' "$actual_files" "$expected_files" >&2
+            exit 1
+          fi
+          jq -e --arg commit "$EXPECTED_COMMIT" --arg sha "$ARCHIVE_SHA256" '
+            .schema_version == 1
+            and .artifact_contract == "hsrd-arm64-recovery-candidate-v1"
+            and .production_release == false
+            and .source.expected_commit == $commit
+            and (.source.tree | test("^[0-9a-f]{40}$"))
+            and .source.origin_main_at_build == $commit
+            and .source.workflow_definition_commit == $commit
+            and (.source.workflow_file_ref
+              == "handshake-rs/hns-node-rs/.github/workflows/hsrd-recovery-candidate.yml@refs/heads/main")
+            and .build.platform == "linux/arm64"
+            and .build.target == "hsrd-runtime"
+            and (.build.manifest_digest | test("^sha256:[0-9a-f]{64}$"))
+            and (.build.config_digest | test("^sha256:[0-9a-f]{64}$"))
+            and .build.imported_image_id == .build.config_digest
+            and .archive.sha256 == $sha
+            and .distribution.retention_days == 7
+            and .distribution.registry_published == false
+          ' "$bundle/BUILD-PROVENANCE.json" >/dev/null
+
+      - name: Upload exact-commit recovery candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hsrd-recovery-arm64-${{ steps.source.outputs.commit }}
+          path: ${{ runner.temp }}/recovery-candidate/bundle
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

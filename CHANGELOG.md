@@ -85,6 +85,13 @@ qualification or authorize deployment.
   limits, verifies the committed boundary root, and atomically replaces only
   the accumulator key so legacy disconnect remains exact. It does not rewrite
   undo, `NameState`, authenticated-tree, or chain-index records.
+- Add a manual, nonpublishing `linux/arm64` OCI recovery-candidate workflow for
+  that narrow legacy mismatch. It accepts only the exact current canonical
+  `main` commit, verifies OCI content and runtime identity, and retains a
+  checksummed source/tree/image-bound artifact for seven days without creating
+  a tag, release, or registry package. The linked cold-recovery runbook stops
+  restart loops, requires a whole-root rollback copy, forbids retroactive
+  wallet-index activation, and admits only one isolated no-restart startup.
 - Retain the v0.3.4 resolver release-CI port correction.
 
 The current source remains a release candidate until its consolidated current-

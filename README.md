@@ -174,7 +174,9 @@ block history, start a new data directory with:
 
 A data directory that has pruned history cannot later be changed to the archive
 profile. Storage layout, migration, backup, and recovery procedures are
-documented in [Storage rollout](docs/storage-rollout.md).
+documented in [Storage rollout](docs/storage-rollout.md). The narrow unclean
+older-candidate accumulator mismatch has a separate
+[cold recovery runbook](docs/interval-accumulator-recovery.md).
 
 ## Documentation
 
@@ -195,6 +197,7 @@ documented in [Storage rollout](docs/storage-rollout.md).
 - [Authenticated wallet RPC v1](docs/WALLET_RPC_V1.md)
 - [Bounded Denuo marketplace relay](docs/DENUO_MARKET_RELAY.md)
 - [Docker and GHCR](docs/docker.md)
+- [Legacy interval-accumulator recovery](docs/interval-accumulator-recovery.md)
 - [Native mainnet mining canary](docs/mainnet-canary.md)
 - [Extraction provenance](docs/extraction-provenance.md)
 
