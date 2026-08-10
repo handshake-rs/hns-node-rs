@@ -134,7 +134,7 @@ Further hardening:
 - production-scale pruning and RocksDB crash/fault qualification;
 - sustained live mainnet reorganization/root campaigns.
 
-## Noncustodial wallet and contract indexes — implementation qualification pending
+## Noncustodial wallet and contract indexes — production qualification pending
 
 Implemented in source:
 
@@ -185,10 +185,15 @@ Implemented in source:
   ceiling, and node-local tracked-contract evidence that keeps descriptor
   registration and raw preimages unavailable.
 
-This implementation is not release-qualified until the full repository gate, a
-published and pinned canonical `hns-swap` commit, and an independently
-implemented cross-repository wallet transport adapter plus restart/reorg/
-adversarial qualification pass on its final commit. Local script
+The code-bearing 0.3.5 candidate at
+`2b267ffe7fc6f9929063a18986a83b566d02ae6d` passed the exact-revision CI,
+container, and CodeQL workflows. A cross-repository `hns-wallet-rs` transport
+adapter and fail-closed Android/iOS read projections are also implemented in
+source. This implementation is nevertheless not release- or
+production-qualified until it has a published and pinned canonical `hns-swap`
+commit plus a joined backend/authentication, restart/reorg, lifecycle,
+adversarial, storage-fault, and deployment-scale qualification pass on the
+selected final revisions. Local script
 duplication and frozen vectors are cross-boundary qualification checks, not
 protocol authority. It stores no wallet key or unrevealed preimage and remains
 disabled by default. Exact never-confirmed registrations now have a monotonic,
@@ -214,14 +219,16 @@ advertisement separately awaits the
 published, revision-pinned canonical `hns-rs` 0.2 Denuo V2 dependency and
 adapter gate.
 
-The local evidence is intentionally narrow: the NVMe `hns-consensus`
+The focused local evidence is intentionally narrow: the NVMe `hns-consensus`
 `wallet_name_action` filter passed 2 tests with 0 failures and 75 filtered. At
 exact local revision `fd0c9b00114e3fa0a293972de7d4538dcd959ce0`, the separate
 `production_next_` filter passed all four matching completed-retirement/profile
 wallet-index tests with zero failures and 15 filtered; no `hns-node` test
 matched the filter. No RocksDB reopen, full gate, network, live restart/reorg,
 adversarial topology, performance, or resource qualification ran for this
-tranche.
+tranche. The later exact-revision remote repository gates above cover the
+current code-bearing candidate, but they do not add the live qualification
+campaigns listed here.
 
 Fee-quote source tests and documentation are present but were not executed in
 the source-only tranche that introduced the method. A quote is exact only for

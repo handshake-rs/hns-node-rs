@@ -46,6 +46,11 @@ qualification or authorize deployment.
   returns the durable chain epoch and exact tip, allowing a bound genesis check
   before any derived script identity is disclosed. The existing `chain_tip`
   result is unchanged.
+- Record that the code-bearing 0.3.5 candidate at
+  `2b267ffe7fc6f9929063a18986a83b566d02ae6d` passed its exact-revision CI,
+  container, and CodeQL workflows. Release and production availability remain
+  blocked on the documented live storage/reorganization, adversarial,
+  deployment-scale, joined-wallet, and canonical dependency gates.
 - Reclaim never-confirmed contract capacity and safely retire completed tracked
   contracts only after canonical evidence is validated.
 - Consume canonical HNS resource parsing from the exact `hns-rs` source rather

@@ -22,8 +22,13 @@ Shakedex-v2/HNS-HTLC-v1 event tracking.
 Authenticated wallet RPC v1 now projects the safe subset through the native
 node process boundary without a sibling dependency. It requires explicit
 listener Authorization and `--wallet-index`; loopback alone never enables it.
-The subsystem is disabled by default and is not release-qualified: the
-typed in-process backend can reclaim registrations that authoritative durable
+The subsystem is disabled by default and is not production-qualified. The
+code-bearing 0.3.5 candidate at
+`2b267ffe7fc6f9929063a18986a83b566d02ae6d` passed the repository CI,
+container, and CodeQL workflows on that exact revision, but those source and
+build gates do not replace live restart/reorganization, storage-fault,
+adversarial-topology, or deployment-scale qualification. The typed in-process
+backend can reclaim registrations that authoritative durable
 state proves were never confirmed, provided the caller permanently abandons
 every prior funding broadcast, the exact current accepted ordinary/airdrop pool
 has no matching funding, and the bound pool retains no transaction orphans.
@@ -34,14 +39,17 @@ The tombstone retains the complete descriptor, terminal spend and revealed
 preimages, min/max heights, and an ordered event commitment while reclaiming
 active global/per-address slots. At exact local revision
 `fd0c9b00114e3fa0a293972de7d4538dcd959ce0`, this path passed all four matching
-focused `production_next_` wallet-index tests with zero failures. It has not run
-a RocksDB reopen, live restart/reorg, adversarial topology, performance
-measurement, or the full qualification gate. Tombstones have a separate finite
-lifetime cap; later matching funding is deliberately untracked after explicit
-permanent abandonment, and registration remains absent from untrusted wallet
-RPC. `hns-wallet-rs` now contains a concrete node-RPC adapter boundary; what
-remains is cross-repository qualification, product integration, and a released
-canonical `hns-swap` dependency rather than initial adapter implementation. See the
+focused `production_next_` wallet-index tests with zero failures. That narrow
+historical test record has not run a RocksDB reopen, live restart/reorg,
+adversarial topology, or performance measurement. Tombstones have a separate
+finite lifetime cap; later matching funding is deliberately untracked after
+explicit permanent abandonment, and registration remains absent from
+untrusted wallet RPC. `hns-wallet-rs` now contains a concrete node-RPC adapter
+boundary and the mobile repository contains fail-closed Android and iOS read
+projections. What
+remains is joined backend/authentication and lifecycle qualification, explicit
+product enablement, and a released canonical `hns-swap` dependency rather than
+initial adapter implementation. See the
 [wallet-index status](docs/HNS_NODE_WALLET_INDEX.md) and
 [wire contract](docs/WALLET_RPC_V1.md).
 

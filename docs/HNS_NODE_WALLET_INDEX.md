@@ -288,6 +288,15 @@ contains an exact optional transaction position: retained block bytes make the
 position derivable, while pruned legacy transaction-index rows retain valid
 inclusion without an ordinal. No layer substitutes zero.
 
+A pruned data directory can therefore still return indexed confirmation and
+status evidence while `raw_transaction` reports `PayloadPruned` for removed
+block bytes. A wallet that must reconstruct or sign from historical raw
+transactions needs those bytes from an archive synchronization or from its own
+durable wallet store. Enabling `--wallet-index` after unindexed history, or
+switching an already-pruned directory to archive mode, does not reconstruct
+that evidence; use the fresh-directory or qualified offline-reindex procedure
+described above.
+
 `get_name_evidence` returns one durable chain epoch containing the active tip,
 current NameState, interval-root-authenticated NameState, proof, and both
 corresponding owner transactions. Pending interval changes can make the
@@ -490,10 +499,14 @@ never drops an internally retained revealed preimage.
 ## Remaining integration work
 
 This source implementation now has a bounded authenticated process transport,
-and `hns-wallet-rs` has a concrete adapter boundary. The remaining work is the
-repository's full qualification gate, cross-repository adapter integration and
-qualification, and the released canonical `hns-swap` pin described above;
-initial adapter implementation is no longer the blocker.
+`hns-wallet-rs` has a concrete adapter boundary, and the mobile repository has
+fail-closed Android and iOS read projections. The code-bearing node candidate
+at `2b267ffe7fc6f9929063a18986a83b566d02ae6d` passed exact-revision CI,
+container, and CodeQL workflows. The remaining work is joined
+backend/authentication and mobile lifecycle qualification, live
+restart/reorganization and adversarial qualification, product enablement, and
+the released canonical `hns-swap` pin described above; initial adapter
+implementation is no longer the blocker.
 Completed-contract active-slot reclamation passed its four focused
 `production_next_` wallet-index tests at exact local revision
 `fd0c9b00114e3fa0a293972de7d4538dcd959ce0`; the test filter covered bounded
