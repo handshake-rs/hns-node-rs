@@ -21,7 +21,8 @@ use hickory_server::{
     zone_handler::MessageResponseBuilder,
 };
 use hns_consensus::reserved_name;
-use hns_primitives::{verify_name, DecodedResourceRecord, Resource};
+use hns_covenants::{Resource, ResourceName, ResourceRecord};
+use hns_primitives::verify_name;
 use tracing::{debug, warn};
 
 use crate::{dnssec::RootDnssec, IcannLookup, IcannReferral, NameResourceSource};
@@ -170,14 +171,13 @@ impl HandshakeRoot {
                 return RootAnswer::servfail();
             }
         };
-        let records = match resource.decoded_records() {
-            Ok(records) => records,
-            Err(error) => {
-                warn!(%error, %qname, "failed to decode typed Handshake resource records");
-                return RootAnswer::servfail();
-            }
-        };
-        match resource_answer(qname, qtype, &tld, &records, response.context.active_height) {
+        match resource_answer(
+            qname,
+            qtype,
+            &tld,
+            resource.records(),
+            response.context.active_height,
+        ) {
             Ok(answer) => answer,
             Err(error) => {
                 warn!(%error, %qname, "failed to project Handshake resource into DNS");
@@ -264,18 +264,18 @@ fn resource_answer(
     qname: &Name,
     qtype: RecordType,
     tld: &str,
-    records: &[DecodedResourceRecord],
+    records: &[ResourceRecord],
     height: Option<u32>,
 ) -> Result<RootAnswer, ProjectionError> {
     let owner = Name::from_ascii(format!("{tld}."))?;
     let has_ns = records.iter().any(|record| {
         matches!(
             record,
-            DecodedResourceRecord::Ns { .. }
-                | DecodedResourceRecord::Glue4 { .. }
-                | DecodedResourceRecord::Glue6 { .. }
-                | DecodedResourceRecord::Synth4 { .. }
-                | DecodedResourceRecord::Synth6 { .. }
+            ResourceRecord::Ns { .. }
+                | ResourceRecord::Glue4 { .. }
+                | ResourceRecord::Glue6 { .. }
+                | ResourceRecord::Synth4 { .. }
+                | ResourceRecord::Synth6 { .. }
         )
     });
     let mut ns_records = Vec::new();
@@ -286,7 +286,7 @@ fn resource_answer(
 
     for record in records {
         match record {
-            DecodedResourceRecord::Ds {
+            ResourceRecord::Ds {
                 key_tag,
                 algorithm,
                 digest_type,
@@ -301,12 +301,15 @@ fn resource_answer(
                     digest.clone(),
                 ))),
             )),
-            DecodedResourceRecord::Ns { ns } => {
-                let ns = Name::from_ascii(ns)?;
+            ResourceRecord::Ns { name_server } => {
+                let ns = projected_name(name_server)?;
                 push_ns(&owner, ns, &mut seen_ns, &mut ns_records);
             }
-            DecodedResourceRecord::Glue4 { ns, address } => {
-                let ns = Name::from_ascii(ns)?;
+            ResourceRecord::Glue4 {
+                name_server,
+                address,
+            } => {
+                let ns = projected_name(name_server)?;
                 push_ns(&owner, ns.clone(), &mut seen_ns, &mut ns_records);
                 if owner.zone_of(&ns) {
                     glue_records.push(Record::from_rdata(
@@ -316,8 +319,11 @@ fn resource_answer(
                     ));
                 }
             }
-            DecodedResourceRecord::Glue6 { ns, address } => {
-                let ns = Name::from_ascii(ns)?;
+            ResourceRecord::Glue6 {
+                name_server,
+                address,
+            } => {
+                let ns = projected_name(name_server)?;
                 push_ns(&owner, ns.clone(), &mut seen_ns, &mut ns_records);
                 if owner.zone_of(&ns) {
                     glue_records.push(Record::from_rdata(
@@ -327,7 +333,7 @@ fn resource_answer(
                     ));
                 }
             }
-            DecodedResourceRecord::Synth4 { address } => {
+            ResourceRecord::Synth4 { address } => {
                 let ns = synth_name(address);
                 push_ns(&owner, ns.clone(), &mut seen_ns, &mut ns_records);
                 glue_records.push(Record::from_rdata(
@@ -336,7 +342,7 @@ fn resource_answer(
                     RData::A(A(Ipv4Addr::from(*address))),
                 ));
             }
-            DecodedResourceRecord::Synth6 { address } => {
+            ResourceRecord::Synth6 { address } => {
                 let ns = synth_name(address);
                 push_ns(&owner, ns.clone(), &mut seen_ns, &mut ns_records);
                 glue_records.push(Record::from_rdata(
@@ -345,12 +351,11 @@ fn resource_answer(
                     RData::AAAA(AAAA(Ipv6Addr::from(*address))),
                 ));
             }
-            DecodedResourceRecord::Txt { txt } => txt_records.push(Record::from_rdata(
+            ResourceRecord::Txt { strings } => txt_records.push(Record::from_rdata(
                 owner.clone(),
                 DEFAULT_RESOURCE_TTL,
-                RData::TXT(TXT::from_bytes(txt.iter().map(Vec::as_slice).collect())),
+                RData::TXT(TXT::from_bytes(strings.iter().map(Vec::as_slice).collect())),
             )),
-            DecodedResourceRecord::Unknown { .. } => {}
         }
     }
 
@@ -406,6 +411,10 @@ fn resource_answer(
         &[RecordType::RRSIG, RecordType::NSEC],
     ));
     Ok(answer)
+}
+
+fn projected_name(name: &ResourceName) -> Result<Name, ProjectionError> {
+    Name::from_labels(name.labels().iter().map(Vec::as_slice)).map_err(ProjectionError::from)
 }
 
 fn icann_answer(

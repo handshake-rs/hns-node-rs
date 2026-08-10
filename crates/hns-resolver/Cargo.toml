@@ -13,6 +13,7 @@ clap.workspace = true
 data-encoding = "2.11"
 hickory-server = { version = "0.26.1", features = ["dnssec-ring", "recursor"] }
 hns-consensus = { path = "../hns-consensus" }
+hns-covenants.workspace = true
 hns-primitives = { path = "../hns-primitives" }
 hns-rpc = { path = "../hns-rpc" }
 hex = "0.4"

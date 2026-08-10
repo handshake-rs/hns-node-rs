@@ -1351,6 +1351,7 @@ dependencies = [
  "hex-literal",
  "hickory-server",
  "hns-consensus",
+ "hns-covenants",
  "hns-primitives 0.3.5",
  "hns-rpc",
  "ipnet",
