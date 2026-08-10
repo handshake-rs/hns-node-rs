@@ -221,10 +221,10 @@ Implemented:
 - A bounded hash-first Denuo marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live
-  marketplace wire advertisement remains disabled until the currently
-  unpublished canonical `hns-rs` 0.2 Denuo V2 registry/envelope release is
-  pinned by revision and its adapter is qualified; no live swap engine is
-  claimed.
+  marketplace wire advertisement remains disabled. The exact canonical
+  `hns-rs` 0.2 source is now pinned, but its archives remain unpublished, the
+  active peer transport remains Denuo V1, and no typed marketplace adapter is
+  installed or qualified. No live swap engine is claimed.
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
   block/header undo status and advances a checksummed checkpoint; startup

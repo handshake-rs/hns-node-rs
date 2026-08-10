@@ -399,9 +399,10 @@ storage migration, not a wire shortcut.
 ## Tracked contracts
 
 The v1 boundary intentionally does not accept Shakedex or HNS-HTLC descriptor
-registrations. Those profiles are duplicated locally for derivative tracking
-and the canonical `hns-rs` 0.2 protocol types are not yet a published, pinned
-dependency. The API exposes only evidence for registrations already admitted
+registrations. Those profiles are duplicated locally for derivative tracking.
+The workspace now pins the canonical `hns-rs` 0.2 source, but its packages are
+not yet published and the trusted registration adapter is not installed or
+qualified. The API exposes only evidence for registrations already admitted
 through a trusted in-process boundary and labels it
 `node_local_profile_only_not_protocol_authority`.
 

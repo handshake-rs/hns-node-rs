@@ -84,16 +84,19 @@ before passing exact canonical bytes to `DenuoRelayHandle::put`. The node core:
 - does not hold keys, seeds, liquidity, or funds;
 - does not automatically accept or execute swaps.
 
-The current `hns-node-rs` dependency pin still exposes the Denuo V1 registry
-without marketplace subprotocol assignments. The canonical Denuo V2 registry,
-generated fingerprint, and typed marketplace envelopes now exist in the local
-`hns-rs` 0.2 source, but that release is unpublished. Live marketplace wire
-advertisement must remain disabled until `hns-node-rs` can replace its immutable
-Git V1 pin with the published, revision-qualified 0.2 canonical dependency and
-the node adapter is qualified against that exact fingerprint. No sibling-path
-dependency or unassigned production message ID is used as a workaround.
-Enabling a local role creates only the bounded service for an installed native
-adapter; it does not make this revision advertise a marketplace protocol.
+The workspace now pins the exact `hns-rs` 0.2 source at
+`b24b66c382de53330ec21dd3137e056a2bea3e2d`, which contains the canonical
+Denuo V2 registry, generated fingerprint, and typed marketplace envelopes.
+That source cohort is still unpublished, while the active node transport and
+peer admission deliberately negotiate Denuo V1 and expose no marketplace
+subprotocol. No typed marketplace adapter or live advertisement is installed.
+Live marketplace wire advertisement must therefore remain disabled until the
+0.2 archives are published and verified, the node adopts their exact Denuo V2
+registry/fingerprint in transport admission, and the joined adapter is
+qualified. No sibling-path dependency or unassigned production message ID is
+used as a workaround. Enabling a local role creates only the bounded service
+for an installed native adapter; it does not make this revision advertise a
+marketplace protocol.
 
 The node now has descriptor-bound, restart-durable confirmed Shakedex-v2 and
 HNS-HTLC-v1 funding/spend/preimage tracking plus bounded mempool reconciliation.

@@ -520,7 +520,9 @@ this typed pull API. Durable encrypted workflow state, rebroadcast journals,
 matching decisions, transaction construction/signing, and secret preimages
 remain wallet responsibilities.
 
-The separate Denuo cache remains wire-disabled. Live marketplace advertisement
-requires a canonical dependency re-pin to the currently unpublished `hns-rs`
-0.2 release containing generated Denuo V2 registry assignments and typed
-envelopes; no sibling path or unassigned message ID is permitted.
+The separate Denuo cache remains wire-disabled. The workspace now pins the
+exact `hns-rs` 0.2 source containing generated Denuo V2 registry assignments
+and typed envelopes, so an initial source re-pin is no longer the blocker. Live
+marketplace advertisement still requires publication and verification of that
+archive cohort, active Denuo V2 transport/admission, a typed node adapter, and
+joined qualification; no sibling path or unassigned message ID is permitted.
