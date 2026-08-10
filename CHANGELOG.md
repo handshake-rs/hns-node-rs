@@ -46,7 +46,7 @@ qualification or authorize deployment.
   contracts only after canonical evidence is validated.
 - Consume canonical HNS resource parsing from the exact `hns-rs` source rather
   than retaining a second resolver-local codec. Advance that coherent source
-  to `4331eee`, including the HNSA/HNSR selection/admission correction and
+  to `b33b346`, including the HNSA/HNSR selection/admission correction and
   linked-covenant output validation. Endpoint and rendezvous roles remain
   unavailable; a newer protocol pin does not enable either role.
 - Commit single-block native replay atomically.
