@@ -639,6 +639,59 @@ impl SyncScheduler {
         Ok(())
     }
 
+    /// Release a downloaded body's network reservation after local canonical
+    /// read contention prevented admission. The delivering peer proved body
+    /// availability and must not consume a timeout or retry attempt merely
+    /// because the local writer was publishing another generation.
+    ///
+    /// Returns `true` when an inflight reservation was moved back to pending.
+    /// A response which raced an earlier requeue is already pending and needs
+    /// no ownership change. Tracked validator/orphan work is deliberately left
+    /// alone so a duplicate response cannot resurrect independently owned work.
+    pub fn requeue_block_after_local_contention(
+        &mut self,
+        peer: PeerId,
+        hash: BlockHash,
+        now: Instant,
+    ) -> Result<bool, SyncError> {
+        if let Some(inflight) = self.inflight.remove(&hash) {
+            if let Some(assigned) = inflight.request.peer {
+                if let Some(state) = self.peers.get_mut(&assigned) {
+                    state.inflight.remove(&hash);
+                }
+            }
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.last_block_received_at = Some(now);
+                state.body_available = true;
+            }
+            self.requeue(
+                hash,
+                inflight.request.height,
+                inflight.attempts.saturating_sub(1),
+                None,
+            );
+            self.update_stage();
+            self.bump_sequence();
+            return Ok(true);
+        }
+
+        if self.pending.contains_key(&hash) {
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.last_block_received_at = Some(now);
+                state.body_available = true;
+            }
+            return Ok(false);
+        }
+
+        if self.tracked.contains(&hash) {
+            return Ok(false);
+        }
+        Err(SyncError::UnexpectedBlock(format!(
+            "cannot requeue untracked locally-contended block {}",
+            hash.to_hex()
+        )))
+    }
+
     /// Record an honest `notfound` response for the peer that owns the
     /// corresponding inflight request. The hash is immediately eligible for
     /// another peer, the unavailable peer is excluded for the remainder of
@@ -1282,6 +1335,81 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(retried.len(), 2);
         assert!(retried.iter().all(|request| request.attempt == 1));
+    }
+
+    #[test]
+    fn local_canonical_contention_requeues_without_timeout_or_peer_failure() {
+        let now = Instant::now();
+        let limits = SyncLimits {
+            maximum_inflight_blocks: 1,
+            maximum_inflight_per_peer: 1,
+            block_request_timeout: Duration::from_millis(10),
+            ..SyncLimits::default()
+        };
+        let mut scheduler = SyncScheduler::new(limits, now).expect("scheduler");
+        let peer = PeerId(1);
+        let hash = BlockHash::new([0x51; 32]);
+        scheduler
+            .register_peer(peer, SERVICE_NETWORK, 10)
+            .expect("peer");
+        scheduler.queue_block(hash, 7).expect("body work");
+
+        let first = scheduler
+            .poll(now, &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) => Some(request),
+                _ => None,
+            })
+            .expect("first request");
+        assert_eq!(first.attempt, 1);
+
+        assert!(scheduler
+            .requeue_block_after_local_contention(peer, hash, now + Duration::from_millis(1))
+            .expect("local contention requeue"));
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.tracked_blocks, 1);
+        assert_eq!(snapshot.peers[0].inflight_blocks, 0);
+        assert_eq!(snapshot.peers[0].failures, 0);
+        assert!(snapshot.peers[0].body_available);
+
+        let retried = scheduler
+            .poll(now + Duration::from_millis(1), &[])
+            .into_iter()
+            .find_map(|action| match action {
+                SyncAction::RequestBlock(request) => Some(request),
+                _ => None,
+            })
+            .expect("immediate retry");
+        assert_eq!(retried.hash, hash);
+        assert_eq!(retried.attempt, 1);
+        assert!(!scheduler
+            .poll(now + Duration::from_millis(10), &[])
+            .iter()
+            .any(|action| matches!(action, SyncAction::Disconnect { .. })));
+    }
+
+    #[test]
+    fn local_canonical_contention_does_not_resurrect_validator_owned_work() {
+        let now = Instant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        let peer = PeerId(1);
+        let hash = BlockHash::new([0x52; 32]);
+        scheduler
+            .register_peer(peer, SERVICE_NETWORK, 10)
+            .expect("peer");
+        scheduler.queue_block(hash, 8).expect("body work");
+        scheduler.begin_local_validation(hash);
+
+        assert!(!scheduler
+            .requeue_block_after_local_contention(peer, hash, now)
+            .expect("validator-owned duplicate"));
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 0);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.tracked_blocks, 1);
     }
 
     #[test]

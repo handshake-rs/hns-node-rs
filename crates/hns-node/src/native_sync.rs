@@ -1036,6 +1036,20 @@ pub struct NativeSyncDiagnostics {
     pub active_state_last_worker_micros: u64,
     pub active_state_max_preparation_in_flight: usize,
     pub active_state_stale_retries: u64,
+    /// Stable canonical reads which observed an overlapping writer generation.
+    #[serde(default)]
+    pub canonical_read_contentions: u64,
+    /// Download reservations immediately returned to pending after bounded
+    /// local read contention, without charging the delivering peer.
+    #[serde(default)]
+    pub peer_block_contention_requeues: u64,
+    /// Validated batches returned to pending after bounded local contention.
+    #[serde(default)]
+    pub validated_batch_contention_requeues: u64,
+    /// Durable validated-body commits whose derived scheduler refresh was
+    /// deferred until the next stable maintenance opportunity.
+    #[serde(default)]
+    pub post_store_refresh_deferrals: u64,
     pub active_state_last_transactions: usize,
     pub active_state_last_non_coinbase_inputs: usize,
     pub active_state_last_outputs: usize,
@@ -1375,6 +1389,62 @@ fn native_sync_contention_retry_interval(base: Duration, consecutive: usize) -> 
 
 fn active_state_contention_retry_interval(consecutive: usize) -> Duration {
     native_sync_contention_retry_interval(MIN_NATIVE_SYNC_POLL_INTERVAL, consecutive)
+}
+
+async fn native_sync_stable_read_with_retry<T, F>(
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+    base_delay: Duration,
+    maximum_attempts: usize,
+    mut read: F,
+) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    debug_assert!(maximum_attempts != 0);
+    for attempt in 0..maximum_attempts {
+        match read() {
+            Ok(value) => return Ok(value),
+            Err(error) if canonical_writer_busy(&error) => {
+                update_diagnostics(diagnostics, |state| {
+                    state.canonical_read_contentions =
+                        state.canonical_read_contentions.saturating_add(1);
+                })
+                .await;
+                if attempt + 1 == maximum_attempts {
+                    return Err(error);
+                }
+                tokio::time::sleep(native_sync_contention_retry_interval(
+                    base_delay,
+                    attempt + 1,
+                ))
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("non-zero stable-read attempt bound always returns")
+}
+
+fn trace_recovered_canonical_contention(
+    operation: &'static str,
+    total: u64,
+    error: &anyhow::Error,
+) {
+    if total.is_power_of_two() {
+        tracing::warn!(
+            operation,
+            total,
+            error = %error,
+            "native-sync canonical contention recovered locally"
+        );
+    } else {
+        tracing::debug!(
+            operation,
+            total,
+            error = %error,
+            "native-sync canonical contention recovered locally"
+        );
+    }
 }
 
 fn trace_native_sync_contention_retry(
@@ -3604,7 +3674,22 @@ impl NodeService {
                             terminal_error = Some(error);
                             break;
                         }
-                        record_warning(format!("{error:#}"));
+                        if canonical_writer_contention(&error) {
+                            let total = {
+                                let mut state = diagnostics.write().await;
+                                state.validated_batch_contention_requeues = state
+                                    .validated_batch_contention_requeues
+                                    .saturating_add(1);
+                                state.validated_batch_contention_requeues
+                            };
+                            trace_recovered_canonical_contention(
+                                "validated block batch",
+                                total,
+                                &error,
+                            );
+                        } else {
+                            record_warning(format!("{error:#}"));
+                        }
                     }
                     if let Err(error) = drain_orphan_work(
                         MAX_VALIDATED_BODY_COMMIT_BATCH,
@@ -4288,12 +4373,29 @@ impl NodeReadHandle {
         load_header_record(snapshot, hash).context("failed to load native-sync header")
     }
 
-    fn native_sync_is_canonical_header(&self, hash: BlockHash, height: Height) -> Result<bool> {
-        self.with_stable_read(|_store, headers| {
-            headers
-                .canonical_hash(height)
-                .map(|canonical| canonical == Some(hash))
-                .context("failed to read canonical native-sync header")
+    fn native_sync_classify_validated_blocks(
+        &self,
+        validated: &[ValidatedBlock],
+    ) -> Result<Vec<(bool, bool)>> {
+        let genesis = self.network().params().genesis_header();
+        self.with_stable_read(|store, headers| {
+            let snapshot = store.snapshot()?;
+            validated
+                .iter()
+                .map(|validated| {
+                    let hash = validated.block.hash();
+                    let parent_available = validated.block.header == genesis
+                        || Self::native_sync_has_block_from_snapshot(
+                            &snapshot,
+                            &validated.block.header.prev_block,
+                        )?;
+                    let canonical = headers
+                        .canonical_hash(validated.height)
+                        .map(|canonical| canonical == Some(hash))
+                        .context("failed to read canonical native-sync header")?;
+                    Ok((parent_available, canonical))
+                })
+                .collect()
         })
     }
 
@@ -6061,8 +6163,17 @@ async fn handle_peer_event(
                 })
                 .await;
                 if !headers_only {
-                    accept_peer_block(peer, block, node, writer, peers, validation, scheduler)
-                        .await?;
+                    accept_peer_block(
+                        peer,
+                        block,
+                        node,
+                        writer,
+                        peers,
+                        validation,
+                        scheduler,
+                        diagnostics,
+                    )
+                    .await?;
                 }
             }
             Packet::GetHeaders(locator) => {
@@ -6615,7 +6726,17 @@ async fn handle_compact_block(
             state.received_blocks = state.received_blocks.saturating_add(1);
         })
         .await;
-        return accept_peer_block(peer, block, node, writer, peers, validation, scheduler).await;
+        return accept_peer_block(
+            peer,
+            block,
+            node,
+            writer,
+            peers,
+            validation,
+            scheduler,
+            diagnostics,
+        )
+        .await;
     }
 
     let request = reconstruction.missing_request();
@@ -6680,7 +6801,17 @@ async fn handle_block_transactions(
         state.received_blocks = state.received_blocks.saturating_add(1);
     })
     .await;
-    accept_peer_block(peer, block, node, writer, peers, validation, scheduler).await
+    accept_peer_block(
+        peer,
+        block,
+        node,
+        writer,
+        peers,
+        validation,
+        scheduler,
+        diagnostics,
+    )
+    .await
 }
 
 async fn request_full_block_fallback(
@@ -6771,14 +6902,76 @@ async fn accept_peer_block(
     peers: &LivePeerManager,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let hash = block.hash();
-    let (mut record, has_body) = node.with_stable_read(|store, _headers| {
-        let snapshot = store.snapshot()?;
-        let record = NodeReadHandle::native_sync_header_record_from_snapshot(&snapshot, &hash)?;
-        let has_body = NodeReadHandle::native_sync_has_block_from_snapshot(&snapshot, &hash)?;
-        Ok((record, has_body))
-    })?;
+    let result = accept_peer_block_inner(
+        peer,
+        block,
+        node,
+        writer,
+        peers,
+        validation,
+        scheduler,
+        diagnostics,
+    )
+    .await;
+    let Err(error) = result else {
+        return Ok(());
+    };
+    if !canonical_writer_contention(&error) {
+        return Err(error);
+    }
+
+    let requeued = scheduler
+        .requeue_block_after_local_contention(peer, hash, StdInstant::now())
+        .context("failed to preserve peer block after local canonical contention")?;
+    let total = {
+        let mut state = diagnostics.write().await;
+        if requeued {
+            state.peer_block_contention_requeues =
+                state.peer_block_contention_requeues.saturating_add(1);
+        }
+        state.peer_block_contention_requeues
+    };
+    if requeued {
+        trace_recovered_canonical_contention("peer block admission", total, &error);
+    } else {
+        tracing::debug!(
+            ?peer,
+            block = %hash.to_hex(),
+            %error,
+            "discarded duplicate block after bounded local canonical contention"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn accept_peer_block_inner(
+    peer: PeerId,
+    block: Block,
+    node: &NodeReadHandle,
+    writer: &CanonicalStateWriter,
+    peers: &LivePeerManager,
+    validation: &ValidationSubmitter,
+    scheduler: &mut SyncScheduler,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+) -> Result<()> {
+    let hash = block.hash();
+    let retry_delay = node.config().native_sync.poll_interval;
+    let (mut record, has_body) =
+        native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
+            node.with_stable_read(|store, _headers| {
+                let snapshot = store.snapshot()?;
+                let record =
+                    NodeReadHandle::native_sync_header_record_from_snapshot(&snapshot, &hash)?;
+                let has_body =
+                    NodeReadHandle::native_sync_has_block_from_snapshot(&snapshot, &hash)?;
+                Ok((record, has_body))
+            })
+        })
+        .await?;
     if record.as_ref().is_some_and(|record| record.status.failed) {
         scheduler.reject_block(Some(peer), hash, false, StdInstant::now());
         penalize_peer(peers, peer, 100, "known invalid block branch").await?;
@@ -6794,8 +6987,11 @@ async fn accept_peer_block(
             if block.header == config.network.params().genesis_header() {
                 true
             } else {
-                node.native_sync_header_record(&block.header.prev_block)?
-                    .is_some()
+                native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
+                    node.native_sync_header_record(&block.header.prev_block)
+                })
+                .await?
+                .is_some()
             }
         };
         if !parent_known {
@@ -6825,9 +7021,8 @@ async fn accept_peer_block(
             Ok(imported) => imported.into_iter().next(),
             Err(error) if canonical_writer_contention(&error) => {
                 // Height is not authoritative until the header import
-                // succeeds, so leave the existing bounded body reservation
-                // in flight for scheduler timeout/reassignment. The body can
-                // be requested again without scoring the delivering peer.
+                // succeeds. The outer admission wrapper immediately restores
+                // the existing bounded reservation without scoring the peer.
                 tracing::debug!(
                     ?peer,
                     block = %hash.to_hex(),
@@ -6848,8 +7043,15 @@ async fn accept_peer_block(
                 );
             }
         };
-        scheduler.set_best_header(node.native_sync_best_header_tip()?);
-        node.native_sync_queue_missing_canonical_bodies(scheduler)?;
+        let best_header = native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
+            node.native_sync_best_header_tip()
+        })
+        .await?;
+        scheduler.set_best_header(best_header);
+        native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
+            node.native_sync_queue_missing_canonical_bodies(scheduler)
+        })
+        .await?;
     }
 
     let record = record.ok_or_else(|| anyhow::anyhow!("imported block header has no record"))?;
@@ -6862,11 +7064,11 @@ async fn accept_peer_block(
             hash.to_hex()
         );
     }
-    if !node.native_sync_canonical_body_is_in_horizon(
-        hash,
-        record.height,
-        scheduler.stored_tip(),
-    )? {
+    let in_horizon = native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
+        node.native_sync_canonical_body_is_in_horizon(hash, record.height, scheduler.stored_tip())
+    })
+    .await?;
+    if !in_horizon {
         // A persisted reservation from an older runtime or a future scheduler
         // call site must not become an alternate authorization path.
         if scheduler.is_tracked_block(&hash) {
@@ -7372,6 +7574,39 @@ fn reconcile_validated_reservations(
     Ok(())
 }
 
+async fn refresh_scheduler_after_validated_store(
+    node: &NodeReadHandle,
+    scheduler: &mut SyncScheduler,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+) -> Result<()> {
+    let refresh_result = (|| -> Result<()> {
+        let stored_tip = node.native_sync_contiguous_body_tip(scheduler.stored_tip())?;
+        if scheduler.stored_tip() != stored_tip.as_ref() {
+            scheduler.set_stored_tip(stored_tip);
+        }
+        node.native_sync_queue_missing_canonical_bodies(scheduler)?;
+        Ok(())
+    })();
+    if let Err(error) = refresh_result {
+        if !canonical_writer_busy(&error) {
+            return Err(error);
+        }
+        let total = {
+            let mut diagnostics = diagnostics.write().await;
+            diagnostics.post_store_refresh_deferrals =
+                diagnostics.post_store_refresh_deferrals.saturating_add(1);
+            diagnostics.post_store_refresh_deferrals
+        };
+        tracing::debug!(
+            operation = "validated-body post-store scheduler refresh",
+            total,
+            error = %error,
+            "deferred scheduler refresh after durable validated-body commit"
+        );
+    }
+    Ok(())
+}
+
 fn retain_validated_orphan(
     block: Block,
     height: Height,
@@ -7447,21 +7682,37 @@ async fn handle_validated_blocks_inner(
     deferred_orphan_discards: &mut DeferredOrphanDiscards,
 ) -> Result<()> {
     let node = context.node;
-    let mut eligible = Vec::with_capacity(validated.len());
-    for validated in validated {
-        let hash = validated.block.hash();
-        if !scheduler.is_tracked_block(&hash) {
-            continue;
-        }
-        if deferred_orphan_discards.contains(hash)
-            || deferred_orphan_discards.contains(validated.block.header.prev_block)
-        {
-            scheduler.reject_block(None, hash, false, StdInstant::now());
-            continue;
-        }
-        let parent_available = validated.block.header == node.network().params().genesis_header()
-            || node.native_sync_has_block(&validated.block.header.prev_block)?;
-        let canonical = node.native_sync_is_canonical_header(hash, validated.height)?;
+    let candidates = validated
+        .into_iter()
+        .filter_map(|validated| {
+            let hash = validated.block.hash();
+            if !scheduler.is_tracked_block(&hash) {
+                return None;
+            }
+            if deferred_orphan_discards.contains(hash)
+                || deferred_orphan_discards.contains(validated.block.header.prev_block)
+            {
+                scheduler.reject_block(None, hash, false, StdInstant::now());
+                return None;
+            }
+            Some(validated)
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // Retain the owned, statelessly validated bodies while a concurrent
+    // active-state slice publishes. One stable batch read prevents a transient
+    // generation overlap from throwing away completed validation work.
+    let classifications = native_sync_stable_read_with_retry(
+        context.diagnostics,
+        MIN_NATIVE_SYNC_POLL_INTERVAL,
+        MAX_CANONICAL_STALE_RETRIES,
+        || node.native_sync_classify_validated_blocks(&candidates),
+    )
+    .await?;
+    let mut eligible = Vec::with_capacity(candidates.len());
+    for (validated, (parent_available, canonical)) in candidates.into_iter().zip(classifications) {
         if parent_available || canonical {
             eligible.push((validated, canonical));
             continue;
@@ -7492,9 +7743,27 @@ async fn handle_validated_blocks_inner(
     let mut stored = None;
     for attempt in 0..MAX_CANONICAL_STALE_RETRIES {
         if attempt != 0 {
-            for (validated, canonical) in &mut eligible {
-                *canonical =
-                    node.native_sync_is_canonical_header(validated.block.hash(), validated.height)?;
+            let canonical = native_sync_stable_read_with_retry(
+                context.diagnostics,
+                MIN_NATIVE_SYNC_POLL_INTERVAL,
+                MAX_CANONICAL_STALE_RETRIES,
+                || {
+                    node.with_stable_read(|_store, headers| {
+                        eligible
+                            .iter()
+                            .map(|(validated, _)| {
+                                headers
+                                    .canonical_hash(validated.height)
+                                    .map(|candidate| candidate == Some(validated.block.hash()))
+                                    .context("failed to refresh canonical native-sync header")
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                },
+            )
+            .await?;
+            for ((_, current), refreshed) in eligible.iter_mut().zip(canonical) {
+                *current = refreshed;
             }
         }
         let epoch = node.canonical_epoch();
@@ -7551,11 +7820,7 @@ async fn handle_validated_blocks_inner(
             ready_orphan_parents,
         )?;
     }
-    let stored_tip = node.native_sync_contiguous_body_tip(scheduler.stored_tip())?;
-    if scheduler.stored_tip() != stored_tip.as_ref() {
-        scheduler.set_stored_tip(stored_tip);
-    }
-    node.native_sync_queue_missing_canonical_bodies(scheduler)?;
+    refresh_scheduler_after_validated_store(node, scheduler, context.diagnostics).await?;
     Ok(())
 }
 
@@ -12070,6 +12335,124 @@ mod tests {
         runtime.shutdown().await.expect("node runtime shutdown");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validated_body_survives_preflight_contention_and_defers_post_store_refresh() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            native_sync: NativeSyncConfig {
+                enabled: true,
+                connect: vec!["127.0.0.1:14038".parse().expect("peer")],
+                ..NativeSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .native_sync_ensure_genesis_header()
+            .expect("genesis");
+        let block = linked_validator_block(1, &genesis.header);
+        let hash = block.hash();
+        service
+            .native_sync_import_headers(vec![block.header.clone()])
+            .expect("canonical header");
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+                .expect("peer manager");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
+        let mut scheduler =
+            SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
+        scheduler.queue_block(hash, 1).expect("body reservation");
+        scheduler.begin_local_validation(hash);
+        let mut orphans = OwnedOrphanPool::new(OrphanLimits {
+            maximum_blocks: 8,
+            maximum_bytes: 1_024 * 1_024,
+        })
+        .expect("orphan pool");
+        let mut ready = ReadyOrphanParents::new(8);
+        let mut discards = DeferredOrphanDiscards::new(8);
+        let context = ValidationResultContext {
+            node: &node,
+            writer: &writer,
+            peers: &peers,
+            diagnostics: &diagnostics,
+        };
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_writer = writer.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_writer
+                .execute(None, "validated preflight overlap", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            release_tx.send(()).expect("release writer");
+        });
+
+        handle_validated_blocks(
+            vec![ValidatedBlock {
+                sequence: 0,
+                peer: PeerId(1),
+                height: 1,
+                block,
+            }],
+            &context,
+            &mut scheduler,
+            &mut orphans,
+            &mut ready,
+            &mut discards,
+        )
+        .await
+        .expect("retained validated body");
+        release.await.expect("release join");
+        blocked.await.expect("writer join").expect("writer command");
+
+        assert!(node.native_sync_has_block(&hash).expect("durable body"));
+        assert!(!scheduler.is_tracked_block(&hash));
+        assert!(diagnostics.read().await.canonical_read_contentions >= 1);
+
+        // Once the body is durable and its reservation is complete, another
+        // writer overlap may defer derived scheduler state but must not turn
+        // the completed batch back into retry work.
+        scheduler.set_stored_tip(None);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_writer = writer.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_writer
+                .execute(None, "post-store refresh overlap", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+        refresh_scheduler_after_validated_store(&node, &mut scheduler, &diagnostics)
+            .await
+            .expect("deferred post-store refresh");
+        assert!(scheduler.stored_tip().is_none());
+        assert!(!scheduler.is_tracked_block(&hash));
+        assert_eq!(diagnostics.read().await.post_store_refresh_deferrals, 1);
+
+        release_tx.send(()).expect("release writer");
+        blocked.await.expect("writer join").expect("writer command");
+        refresh_scheduler_after_validated_store(&node, &mut scheduler, &diagnostics)
+            .await
+            .expect("stable post-store refresh");
+        assert!(scheduler.is_tracked_block(&Network::Regtest.params().genesis_hash));
+        assert!(!scheduler.is_tracked_block(&hash));
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
     #[tokio::test]
     async fn split_validation_runs_share_one_32_unit_orphan_budget() {
         const CHILDREN_PER_PARENT: Height = 20;
@@ -12719,6 +13102,7 @@ mod tests {
         let (validation, _validation_results) =
             spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 8)
                 .expect("validation pipeline");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
         let mut scheduler =
             SyncScheduler::new(SyncLimits::default(), StdInstant::now()).expect("scheduler");
         scheduler
@@ -12746,6 +13130,7 @@ mod tests {
             &peers,
             &validation,
             &mut scheduler,
+            &diagnostics,
         )
         .await
         .expect_err("future canonical body must remain outside the durable horizon");
@@ -12756,6 +13141,171 @@ mod tests {
         assert!(!node
             .native_sync_has_block(&second_hash)
             .expect("second body lookup"));
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_block_retains_body_across_bounded_canonical_read_retry() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            native_sync: NativeSyncConfig {
+                poll_interval: Duration::from_millis(25),
+                ..NativeSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .native_sync_ensure_genesis_header()
+            .expect("genesis");
+        let block = linked_validator_block(1, &genesis.header);
+        let hash = block.hash();
+        service
+            .native_sync_import_headers(vec![block.header.clone()])
+            .expect("canonical header");
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+                .expect("peer manager");
+        let (validation, _validation_results) =
+            spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 8)
+                .expect("validation pipeline");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
+        let now = StdInstant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        let peer = PeerId(1);
+        scheduler
+            .register_peer(peer, hns_p2p::SERVICE_NETWORK, 4)
+            .expect("peer");
+        scheduler.queue_block(hash, 1).expect("body work");
+        assert!(scheduler.poll(now, &[]).iter().any(
+            |action| matches!(action, SyncAction::RequestBlock(request) if request.hash == hash)
+        ));
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_writer = writer.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_writer
+                .execute(None, "peer block stable-read overlap", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            release_tx.send(()).expect("release writer");
+        });
+
+        accept_peer_block(
+            peer,
+            block,
+            &node,
+            &writer,
+            &peers,
+            &validation,
+            &mut scheduler,
+            &diagnostics,
+        )
+        .await
+        .expect("retained block admission");
+        release.await.expect("release join");
+        blocked.await.expect("writer join").expect("writer command");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 0);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.tracked_blocks, 1);
+        let diagnostics = diagnostics.read().await;
+        assert!(diagnostics.canonical_read_contentions >= 1);
+        assert_eq!(diagnostics.peer_block_contention_requeues, 0);
+        drop(diagnostics);
+        runtime.shutdown().await.expect("node runtime shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_block_exhausted_contention_requeues_without_peer_timeout() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            native_sync: NativeSyncConfig {
+                poll_interval: Duration::from_millis(10),
+                ..NativeSyncConfig::default()
+            },
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .native_sync_ensure_genesis_header()
+            .expect("genesis");
+        let block = linked_validator_block(1, &genesis.header);
+        let hash = block.hash();
+        service
+            .native_sync_import_headers(vec![block.header.clone()])
+            .expect("canonical header");
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let (peers, _peer_events) =
+            LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
+                .expect("peer manager");
+        let (validation, _validation_results) =
+            spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 8)
+                .expect("validation pipeline");
+        let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
+        let now = StdInstant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        let peer = PeerId(1);
+        scheduler
+            .register_peer(peer, hns_p2p::SERVICE_NETWORK, 4)
+            .expect("peer");
+        scheduler.queue_block(hash, 1).expect("body work");
+        assert!(scheduler.poll(now, &[]).iter().any(
+            |action| matches!(action, SyncAction::RequestBlock(request) if request.hash == hash)
+        ));
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked_writer = writer.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_writer
+                .execute(None, "peer block retry exhaustion", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+
+        accept_peer_block(
+            peer,
+            block,
+            &node,
+            &writer,
+            &peers,
+            &validation,
+            &mut scheduler,
+            &diagnostics,
+        )
+        .await
+        .expect("locally requeued block");
+        release_tx.send(()).expect("release writer");
+        blocked.await.expect("writer join").expect("writer command");
+
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.tracked_blocks, 1);
+        assert_eq!(snapshot.peers[0].failures, 0);
+        assert_eq!(snapshot.peers[0].inflight_blocks, 0);
+        assert!(snapshot.peers[0].body_available);
+        let diagnostics = diagnostics.read().await;
+        assert_eq!(diagnostics.canonical_read_contentions, 3);
+        assert_eq!(diagnostics.peer_block_contention_requeues, 1);
+        drop(diagnostics);
         runtime.shutdown().await.expect("node runtime shutdown");
     }
 
