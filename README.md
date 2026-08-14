@@ -195,6 +195,7 @@ older-candidate accumulator mismatch has a separate
 - [Storage schema and complexity](docs/storage-schema.md)
 - [Wallet indexes and typed backend](docs/HNS_NODE_WALLET_INDEX.md)
 - [Authenticated wallet RPC v1](docs/WALLET_RPC_V1.md)
+- [Mainnet pruned wallet-index node](docs/mainnet-pruned-wallet-node.md)
 - [Bounded Denuo marketplace relay](docs/DENUO_MARKET_RELAY.md)
 - [Docker and GHCR](docs/docker.md)
 - [Legacy interval-accumulator recovery](docs/interval-accumulator-recovery.md)
