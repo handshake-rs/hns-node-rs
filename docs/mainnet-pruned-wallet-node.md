@@ -394,10 +394,28 @@ proofs, and wallet read operations are available while the chain synchronizes.
 tranche enables both flags. Transaction relay must never be mistaken for
 mainnet mining authority; keep `--mainnet-canary` absent.
 
-The wallet indexes preserve confirmations, script history, UTXOs, spenders,
-name state, and proofs. Pruning can make raw or owner transactions older than
-the 288-block payload horizon unavailable. The wallet must retain every signed
-transaction and the raw/owner transactions needed for future name actions.
+Profile-v4 wallet indexes retain compact canonical source-inclusion metadata
+for active incoming TRANSFER covenants until the spender rollback horizon
+retires. They never retain the raw owner transaction or its witness. Raw owner
+transactions older than the 288-block payload horizon can therefore be
+unavailable, so the wallet must retain every signed transaction and any raw
+owner transactions needed to construct future name actions. A later bounded
+incoming-transfer query is explicitly a Coin-based node evidence/projection and
+cannot satisfy APIs or security contracts that require those raw transaction
+preimages. After body pruning it is a trusted-node assertion, not a
+cryptographic binding of output bytes to txid;
+the future query must perform the same-snapshot TxIndex, active-chain/position,
+evidence-state, and byte-exact active-UTXO corroboration documented in
+`HNS_NODE_WALLET_INDEX.md`, plus an exact output check whenever the body is
+available.
+
+Do not point a profile-v4 binary at this deployment's non-empty, wallet-enabled
+profile-v3 data directory. Normal startup deliberately rejects that unsafe
+upgrade because pruning may already have removed exact source inclusion data.
+Provision a fresh v4 data directory and resynchronize unless a later
+version-matched offline migration is separately qualified and reconstructs
+every active TRANSFER's canonical transaction ordinal and total output count
+from verified archive data.
 
 ## Stop before maintenance or builds
 

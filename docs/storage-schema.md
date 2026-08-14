@@ -378,6 +378,45 @@ cannot promote a block or grant authority.
   transaction keys. Every derivative value is checksummed against its exact
   key; UTXO reads reconstruct the script/outpoint key and contract reads verify
   descriptor/content/address topology, so relocated values fail closed. The
+  complete wallet profile also owns a separate
+  `wallet-index/v1/name-transfer/` derivative namespace. `active/` rows are
+  sorted by covenant-recipient ID, confirmation height, transaction position,
+  txid, and output index; they never enter script history, script UTXOs,
+  spenders, or balances. `evidence/<txid>` retains one fixed 77-byte source
+  inclusion record (block hash, height, transaction ordinal, and total output
+  count, with txid key/checksum binding). The count is nonzero and bounded by a
+  conservative ceiling from the minimum canonical output encoding and
+  transaction base-size limit (71,428), independently of the 600 live-reference
+  limit.
+  `evidence-state/<txid>` stores its sorted live TRANSFER output indices under
+  the consensus 600-update bound, and every wallet-indexed block writes an
+  `undo/<block-hash>` marker containing created/spent row counts and separate
+  domain-separated digests of the canonical sorted key/value effects. The
+  marker is a fixed 141 bytes. Created effects are capped at the 600 update
+  bucket; spent effects and the combined marker count are each capped at the
+  checked 1,200 sum of the independent update and renewal buckets. It never
+  duplicates Coins or active rows. Neither evidence nor marker retains the raw
+  source transaction or witness. Empty markers use canonical nonzero digests,
+  making a block
+  with no TRANSFER activity distinguishable from a lost or semantically wrong
+  derivative marker. Any spend of a TRANSFER removes the active row regardless
+  of successor.
+  Disconnect reconstructs and verifies created effects from the authenticated
+  block and spent effects from consensus undo Coins plus retained evidence,
+  restoring only pre-block spent coins. Pruning independently reconstructs and
+  verifies the spent commitment from consensus undo before retiring evidence.
+  Evidence whose last output was spent remains until that exact spender undo is
+  atomically pruned; a missing or mismatched marker fails closed.
+  After body pruning this compact Coin-based node evidence is a trusted-node
+  projection, not a cryptographic binding of the `Coin` output bytes to txid.
+  A future query must corroborate the canonical `TxIndexEntry`
+  txid/hash/height/output count, active-chain block and retained transaction
+  position, evidence-state membership, and byte-exact active UTXO in one
+  durable snapshot; when the body exists it must also verify the exact txid,
+  position, output count, and referenced output bytes.
+  Every value and its full key are checksum-bound and all decoders enforce hard
+  byte/count bounds.
+  The
   public contract ID uses a domain-separated, versioned canonical binary
   encoding with a fixed kind tag and big-endian integer fields; JSON/serde is
   used only as a checksummed record payload and never defines durable identity.
@@ -427,12 +466,23 @@ cannot promote a block or grant authority.
   indexed history
   from being enabled after startup; see
   [Handshake wallet indexes](HNS_NODE_WALLET_INDEX.md).
-  Profile payload version 3 is a downgrade fence for immutable retirement
-  tombstones. Current startup reads versions 1 and 2 only to validate all
-  lifecycle/retirement topology and atomically rewrite the profile to version 3
-  before enabling writers. Older binaries reject version 3 instead of silently
-  allowing a retired descriptor identity to be registered or ignoring its
-  startup proof.
+  Profile payload version 4 is a downgrade fence for confirmed incoming
+  TRANSFER indexing and compact source-inclusion evidence. Versions 1 through
+  3 remain decodable for diagnosis, but a legacy profile with the complete
+  `wallet` component enabled and any chain history or existing wallet-index
+  keys is never rewritten during normal startup. It requires a fresh v4 sync
+  unless a future separately qualified offline migration proves every active
+  TRANSFER and reconstructs its exact canonical transaction ordinal and total
+  output count. History-only and spender-only legacy profiles may
+  update the version fence because they never claimed wallet TRANSFER evidence.
+  Older binaries reject version 4 rather than silently ignoring
+  recipient/evidence state or pruning it incorrectly.
+  Effective transaction-index, script-history, spender, and wallet capabilities
+  are immutable once chain history or relevant index keys exist. Startup
+  rejects both additions and removals; redundant raw flags with identical
+  effective capabilities remain acceptable. Index-mode and profile changes are
+  preflighted and published in one atomic batch only after storage-mode
+  compatibility checks pass.
 - `utxo`: `outpoint -> Coin { value, height, coinbase, address, covenant }`.
 - `name_state`: HSD-compatible non-null `NameState` value records keyed by
   32-byte name hash.

@@ -66,15 +66,25 @@ The checksummed `wallet-index-profile/v1` record in `snapshots` binds the data
 directory to its built components. Startup fails closed when:
 
 - a requested component was not built for existing active-chain history;
+- a requested profile would remove a component from non-empty indexed history;
 - wallet-index keys exist without a profile record;
 - a checksummed profile is corrupt;
 - `--wallet-index` would implicitly enable a transaction index after unindexed
   history already exists.
+- a version 1, 2, or 3 profile with the complete `wallet` component enabled has
+  any chain history or existing wallet-index keys. Profile version 4 adds
+  confirmed TRANSFER-recipient and exact source-inclusion metadata that those
+  wallet writers never built, so normal startup cannot truthfully backfill it.
+  Legacy history-only and spender-only profiles can update the profile fence
+  because they do not claim this state.
 
-Disabling a component is allowed and stops future writes. Its old keys are not
-silently treated as current. Re-enabling it after the chain advances fails and
-requires an offline reindex. This prevents a partially indexed history from
-appearing complete.
+Once chain history or relevant index keys exist, effective transaction,
+history, spender, and wallet capabilities are immutable in both directions.
+Startup accepts redundant raw flags with the same effective capabilities, but
+it neither stops writes to a built component nor enables an unbuilt one. This
+prevents a failed startup or a partially indexed interval from stranding an
+otherwise complete index. Use a new data directory or a separately qualified
+offline reindex to change capabilities.
 
 There is no in-place backfill during normal startup. For an existing data
 directory, use one of these explicit procedures:
@@ -86,7 +96,13 @@ directory, use one of these explicit procedures:
 Do not copy `tx_index` keys between data directories. The active-chain binding,
 network identity, store schema, and profile record must move as one qualified
 backup. At this revision no online profile migration or resume checkpoint is
-claimed.
+claimed. In particular, a pruned version-3 database cannot in general recover
+the exact transaction ordinal and total source-output count required by
+version-4 TRANSFER evidence, even when its active UTXO still identifies the
+recipient covenant. Use a fresh version-4 data directory. A future offline
+migration may be used only after it verifies the network/genesis/canonical
+binding and reconstructs every active TRANSFER's exact canonical source
+inclusion from separately verified archive data.
 
 Contract tracking does not require an index-profile migration for a store that
 already has `--wallet-index`: it adds versioned derivative keys under that
@@ -100,6 +116,23 @@ new funding outpoint is required.
 Every active transaction adds one history row for each distinct touched
 script. Every spent input adds one fixed spender row. The complete wallet
 profile additionally keeps one encoded `Coin` row for each active script UTXO.
+It separately stores one compact row per active covenant TRANSFER recipient,
+one fixed 77-byte source-inclusion record per source txid, one sorted live
+output-reference state per source txid (at most the consensus 600-update
+bound), and one fixed 141-byte rollback marker per wallet-indexed block. The
+source record contains only block hash, height, transaction ordinal, and total
+output count; its txid is key- and checksum-bound. The count is nonzero and
+self-canonicalized to the conservative transaction base-size-derived ceiling
+of 71,428; it is not the 600 live-reference bound. The record never retains the
+raw source transaction or witness. The marker commits separate counts and
+domain-separated digests for canonically sorted created and spent key/value
+effects. Created effects are capped by the 600 update bucket; spent effects may
+use the checked 1,200 sum of the independent update and renewal buckets; and
+the combined marker count is also capped at 1,200. It contains no duplicate
+rows or Coins. Empty effect sets have canonical computed digests. Disconnect
+reconstructs both commitments from the block, consensus undo, and retained
+evidence; pruning reconstructs the spent commitment without needing the raw
+block.
 Exact disk use therefore depends on transaction fan-out, address reuse,
 covenant size, RocksDB compression, and reorganization history. Operators must
 measure their own chain snapshot; no mainnet byte estimate has been qualified
@@ -173,14 +206,38 @@ Manual key deletion remains corruption, not reclamation.
 ## Pruning
 
 Wallet index rows are active-chain metadata and are not automatically deleted
-by raw block/undo pruning. The only coupling is explicit completed retirement,
-which may replace a fully spent contract history with its immutable tombstone
-after the corresponding undo is already gone. Therefore:
+by raw block pruning. Incoming TRANSFER source-inclusion metadata is retained
+independently of the raw block. Spending any TRANSFER removes its active
+recipient row, but the compact evidence and fixed-size rollback marker remain
+until the spending block's consensus undo is pruned. At that same atomic
+boundary, evidence whose
+last output was retired by that exact block is deleted. Every wallet-indexed
+block has a fixed-size TRANSFER undo marker, including blocks with no TRANSFER
+activity, so a missing or semantically mismatched marker cannot be mistaken
+for an empty one at this boundary. The other coupling is explicit completed
+contract retirement, which may replace fully spent contract history with its
+immutable tombstone after corresponding undo is gone.
+Therefore:
 
 - transaction inclusion, confirmation, script history, script UTXOs, spender
   lookup, name state, and current name proof continue to work;
-- raw confirmed transaction and current owner-transaction retrieval require
-  the containing raw block and return `PayloadPruned` when it is gone;
+- raw confirmed transactions generally require the containing raw block and
+  return `PayloadPruned` when it is gone. Profile-v4 incoming-TRANSFER evidence
+  deliberately does not retain or reconstruct the raw owner transaction;
+- a later bounded incoming-TRANSFER query must return Coin-based node evidence,
+  or a projection: the exact active `Coin`, canonical covenant
+  recipient/source fields, txid, inclusion block/height/ordinal, and total
+  output count. This compact shape is suitable for mobile browsers and
+  extensions, but is not a transaction preimage and cannot satisfy an API or
+  security contract that requires that preimage;
+- after body pruning, that projection crosses a trusted-node boundary: it is
+  not a cryptographic binding of the `Coin` output bytes to the txid. A future
+  query must use one durable snapshot to corroborate the canonical
+  `TxIndexEntry` txid/hash/height/output count, active-chain block and retained
+  transaction position, evidence-state membership, and byte-exact active UTXO.
+  When the body is available it must additionally verify the txid, exact
+  transaction position/output count, and exact referenced output bytes. This
+  tranche stores those bounded inputs; it does not yet define that query API;
 - the archive storage profile is required for guaranteed historical raw
   transaction and owner-transaction retrieval;
 - reorganization remains limited by the node's retained undo horizon, exactly
@@ -190,8 +247,9 @@ Pruning never converts an unavailable payload into a fabricated transaction.
 
 ## Corruption handling
 
-Profile records, history values, spender values, and wallet-index UTXO
-envelopes carry versions and checksums. Every history, spender, and UTXO
+Profile records, history values, spender values, wallet-index UTXO envelopes,
+and incoming TRANSFER rows, evidence, reference state, and undo markers carry
+versions and checksums. Every history, spender, UTXO, and TRANSFER
 checksum includes its full versioned database key. UTXO decoding additionally
 reconstructs the key from the decoded outpoint and verifies that the encoded
 address hashes to the requested script identity. Copying an otherwise valid

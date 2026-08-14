@@ -158,10 +158,10 @@ use hns_store::{
     STORAGE_PROFILE,
 };
 use hns_wallet_index::{
-    decode_index_profile, encode_index_profile, index_profile_is_current,
+    decode_index_profile, encode_index_profile, index_profile_is_current, index_profile_version,
     register_tracked_contract, retire_completed_tracked_contract,
     retire_never_confirmed_tracked_contract, stage_connect as stage_wallet_index_connect,
-    stage_disconnect as stage_wallet_index_disconnect,
+    stage_disconnect as stage_wallet_index_disconnect, stage_prune_incoming_transfer_undo,
     validate_completed_tracked_contract_retirements, validate_tracked_contract_registry,
     INDEX_PROFILE_MODE_KEY,
 };
@@ -1524,7 +1524,7 @@ pub struct NodeConfig {
     /// Maintain active-chain outpoint-to-spending-transaction mappings.
     pub spender_index: bool,
     /// Maintain the complete wallet restoration profile (script history,
-    /// spender lookup, and script UTXOs).
+    /// spender lookup, script UTXOs, and confirmed incoming TRANSFER evidence).
     pub wallet_index: bool,
     /// Explicit Denuo marketplace relay roles. Empty is requester-only.
     pub denuo_relay_roles: DenuoRelayRoles,
@@ -3889,8 +3889,6 @@ impl NodeService {
                 config.network
             );
         }
-        state.configure_transaction_index(config.transaction_index || config.wallet_index)?;
-        state.configure_wallet_indexes(config.wallet_index_profile())?;
         let pruning_checkpoint = {
             let snapshot = state.store.snapshot()?;
             load_undo_pruning_checkpoint(&snapshot)?
@@ -3900,6 +3898,10 @@ impl NodeService {
                 "block/undo history was previously pruned; storage mode cannot be changed to archive"
             );
         }
+        state.configure_indexes(
+            config.transaction_index || config.wallet_index,
+            config.wallet_index_profile(),
+        )?;
         state.undo_retention_policy = config
             .undo_retention
             .prune_history
@@ -10241,55 +10243,56 @@ impl NodeState {
         })
     }
 
-    fn configure_transaction_index(&mut self, enabled: bool) -> Result<()> {
+    fn configure_indexes(
+        &mut self,
+        transaction_index: bool,
+        profile: WalletIndexProfile,
+    ) -> Result<()> {
         self.ensure_storage_operational()?;
         let snapshot = self.store.snapshot()?;
-        let persisted = snapshot
+        let persisted_transaction_index = snapshot
             .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
             .context("failed to read transaction-index mode")?
             .map(|raw| decode_transaction_index_mode(&raw))
             .transpose()?;
-        if persisted == Some(false)
-            && enabled
-            && (best_block_tip_from_snapshot(&snapshot)?.is_some()
-                || !snapshot
-                    .scan_prefix_page(
-                        ColumnFamily::TxIndex,
-                        b"",
-                        None,
-                        PrefixScanBudget {
-                            max_entries: 1,
-                            max_bytes: 4 * 1024,
-                        },
-                    )
-                    .context("failed to inspect disabled transaction index")?
-                    .entries
-                    .is_empty())
+        let has_chain_history = best_block_tip_from_snapshot(&snapshot)?.is_some();
+        let has_tx_index_keys = !snapshot
+            .scan_prefix_page(
+                ColumnFamily::TxIndex,
+                b"",
+                None,
+                PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: 4 * 1024,
+                },
+            )
+            .context("failed to inspect disabled transaction index")?
+            .entries
+            .is_empty();
+        if persisted_transaction_index != Some(true)
+            && transaction_index
+            && (has_chain_history || has_tx_index_keys)
         {
             anyhow::bail!(
                 "transaction index cannot be enabled after unindexed blocks exist; rebuild it offline or use a new data directory"
             );
         }
-        drop(snapshot);
-        if persisted != Some(enabled) {
-            let mut batch = self.store.batch();
-            batch.put(
-                ColumnFamily::Snapshots,
-                TRANSACTION_INDEX_MODE_KEY,
-                &encode_transaction_index_mode(enabled),
-            )?;
-            self.store.commit(batch)?;
+        if persisted_transaction_index == Some(true)
+            && !transaction_index
+            && (has_chain_history || has_tx_index_keys)
+        {
+            anyhow::bail!(
+                "transaction index cannot be disabled after indexed blocks exist; retain the built capability or use a new data directory"
+            );
         }
-        self.transaction_index = enabled;
-        Ok(())
-    }
-
-    fn configure_wallet_indexes(&mut self, profile: WalletIndexProfile) -> Result<()> {
-        self.ensure_storage_operational()?;
-        let snapshot = self.store.snapshot()?;
         let persisted_raw = snapshot
             .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
             .context("failed to read wallet-index profile")?;
+        let persisted_version = persisted_raw
+            .as_deref()
+            .map(index_profile_version)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!(error))?;
         let profile_is_current = persisted_raw
             .as_deref()
             .map(index_profile_is_current)
@@ -10304,6 +10307,8 @@ impl NodeState {
         let adds_unbuilt_component = persisted.map_or(profile.enabled(), |available| {
             !profile.is_satisfied_by(available)
         });
+        let removes_built_component =
+            persisted.is_some_and(|available| !available.is_satisfied_by(profile));
         let has_wallet_keys = !snapshot
             .scan_prefix_page(
                 ColumnFamily::TxIndex,
@@ -10317,11 +10322,25 @@ impl NodeState {
             .context("failed to inspect wallet indexes")?
             .entries
             .is_empty();
-        if adds_unbuilt_component
-            && (best_block_tip_from_snapshot(&snapshot)?.is_some() || has_wallet_keys)
+        if persisted_version.is_some_and(|version| version < hns_wallet_index::PROFILE_VERSION)
+            && persisted.is_some_and(|available| available.wallet)
+            && (has_chain_history || has_wallet_keys)
         {
+            let legacy_version = persisted_version
+                .ok_or_else(|| anyhow::anyhow!("legacy wallet-index profile version is missing"))?;
+            anyhow::bail!(
+                "legacy wallet-index profile v{} cannot be upgraded with existing chain history or wallet-index keys: v4 adds confirmed TRANSFER-recipient/source evidence; use a fresh v4 data directory unless a separately qualified offline migration verifies every active TRANSFER and reconstructs its exact canonical source inclusion",
+                legacy_version
+            );
+        }
+        if adds_unbuilt_component && (has_chain_history || has_wallet_keys) {
             anyhow::bail!(
                 "wallet index profile cannot add components after indexed chain history exists; run the documented offline reindex or use a new data directory"
+            );
+        }
+        if removes_built_component && (has_chain_history || has_wallet_keys) {
+            anyhow::bail!(
+                "wallet index profile cannot remove components after indexed chain history exists; retain the built capabilities or use a new data directory"
             );
         }
         if persisted.is_none() && !profile.enabled() && has_wallet_keys {
@@ -10351,16 +10370,28 @@ impl NodeState {
         )
         .map_err(anyhow::Error::new)
         .context("failed to validate completed wallet contract retirements")?;
+        let update_transaction_index = persisted_transaction_index != Some(transaction_index);
+        let update_wallet_profile = persisted != Some(profile) || !profile_is_current;
         drop(snapshot);
-        if persisted != Some(profile) || !profile_is_current {
+        if update_transaction_index || update_wallet_profile {
             let mut batch = self.store.batch();
-            batch.put(
-                ColumnFamily::Snapshots,
-                INDEX_PROFILE_MODE_KEY,
-                &encode_index_profile(profile),
-            )?;
+            if update_transaction_index {
+                batch.put(
+                    ColumnFamily::Snapshots,
+                    TRANSACTION_INDEX_MODE_KEY,
+                    &encode_transaction_index_mode(transaction_index),
+                )?;
+            }
+            if update_wallet_profile {
+                batch.put(
+                    ColumnFamily::Snapshots,
+                    INDEX_PROFILE_MODE_KEY,
+                    &encode_index_profile(profile),
+                )?;
+            }
             self.store.commit(batch)?;
         }
+        self.transaction_index = transaction_index;
         self.wallet_index_profile = profile;
         Ok(())
     }
@@ -11720,6 +11751,7 @@ impl NodeState {
                 policy,
                 request.height,
                 self.network.params().names.tree_interval,
+                self.wallet_index_profile.wallet,
             )?
         } else {
             Vec::new()
@@ -12657,8 +12689,12 @@ impl NodeState {
             let mut last_hash = None;
             let mut index_updates = Vec::new();
             for height in start..=batch_end {
-                let (update, undo_pruned, block_pruned) =
-                    stage_prune_payload_height(&snapshot, &mut batch, height)?;
+                let (update, undo_pruned, block_pruned) = stage_prune_payload_height(
+                    &snapshot,
+                    &mut batch,
+                    height,
+                    self.wallet_index_profile.wallet,
+                )?;
                 let hash = update.current.block.hash;
                 if undo_pruned {
                     pruned_undos = pruned_undos
@@ -13165,6 +13201,7 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
     policy: UndoRetentionPolicy,
     tip_height: Height,
     tree_interval: Height,
+    require_incoming_transfer_marker: bool,
 ) -> Result<Vec<IndexStatusUpdate>> {
     policy.validate()?;
     let Some(target) = undo_prune_target(
@@ -13212,7 +13249,7 @@ fn stage_due_undo_prune<T: ReadSnapshot, B: WriteBatch>(
     let mut pruned_blocks = previous.as_ref().map_or(0, |state| state.pruned_blocks);
     for height in expected..=target {
         let (update, undo_pruned, block_pruned) =
-            stage_prune_payload_height(snapshot, batch, height)?;
+            stage_prune_payload_height(snapshot, batch, height, require_incoming_transfer_marker)?;
         let hash = update.current.block.hash;
         pruned_undos = pruned_undos
             .checked_add(u64::from(undo_pruned))
@@ -13245,6 +13282,7 @@ fn stage_prune_payload_height<T: ReadSnapshot, B: WriteBatch>(
     snapshot: &T,
     batch: &mut B,
     height: Height,
+    require_incoming_transfer_marker: bool,
 ) -> Result<(IndexStatusUpdate, bool, bool)> {
     let hash = read_canonical_hash(snapshot, height)?
         .ok_or_else(|| anyhow::anyhow!("undo-pruning height {height} is not canonical"))?;
@@ -13315,6 +13353,19 @@ fn stage_prune_payload_height<T: ReadSnapshot, B: WriteBatch>(
                     hash.to_hex()
                 )
             })?;
+        stage_prune_incoming_transfer_undo(
+            snapshot,
+            batch,
+            &undo,
+            require_incoming_transfer_marker,
+        )
+        .map_err(anyhow::Error::new)
+        .with_context(|| {
+            format!(
+                "undo-pruning target {} could not retire incoming TRANSFER rollback evidence",
+                hash.to_hex()
+            )
+        })?;
         block.status.undo_present = false;
         header.status.undo_present = false;
         batch.delete(ColumnFamily::Undo, hash.as_bytes())?;
@@ -14331,15 +14382,15 @@ mod tests {
         block_merkle_root, block_witness_root, ConsensusError, TransactionInputVerifier,
     };
     use hns_primitives::{
-        sha3_256, Address, Amount, Covenant, CovenantKind, Header, Input, Outpoint, Output,
-        Transaction, Txid, Witness,
+        sha3_256, Address, Amount, Covenant, CovenantKind, Header, Input, NameHash, Outpoint,
+        Output, Transaction, Txid, Witness,
     };
     use hns_rpc::{JsonRpcRequest, RpcService};
     #[cfg(feature = "rocksdb-backend")]
     use hns_state::StateEngine;
     use hns_state::{
-        name_tree_snapshot_pin_key, write_coin_to_batch, RejectSpecialCoinbaseIssuance, StateView,
-        NAME_PAGE_VALIDATION_RECORD_BYTES,
+        name_tree_snapshot_pin_key, write_coin_to_batch, write_name_state_to_batch,
+        RejectSpecialCoinbaseIssuance, StateView, NAME_PAGE_VALIDATION_RECORD_BYTES,
     };
     use hns_store::ReadSnapshot;
     use hns_urkel::MemoryUrkel;
@@ -14666,7 +14717,7 @@ mod tests {
             REORG_STAGING_OPERATION_COPIES,
         );
 
-        let error = stage_prune_payload_height(&snapshot, &mut batch, 0)
+        let error = stage_prune_payload_height(&snapshot, &mut batch, 0, false)
             .expect_err("name-tree pin deletion must exceed the staged-effect budget");
 
         assert!(
@@ -14695,6 +14746,568 @@ mod tests {
             other => panic!("unexpected typed store error: {other}"),
         }
         assert_eq!(batch.meter.consumed, body_delete_charge);
+    }
+
+    #[test]
+    fn legacy_wallet_profiles_with_indexed_history_require_fresh_v4_sync() {
+        let config = NodeConfig {
+            network: Network::Regtest,
+            transaction_index: true,
+            wallet_index: true,
+            ..NodeConfig::default()
+        };
+        for legacy_version in 1..hns_wallet_index::PROFILE_VERSION {
+            let mut node = NodeService::new(config.clone());
+            let genesis = block_with_commitments(vec![coinbase_transaction()]);
+            node.connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+                .expect("connect indexed genesis");
+            let store = node.state.store.clone();
+
+            let snapshot = store.snapshot().expect("profile snapshot");
+            let mut legacy = snapshot
+                .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+                .expect("read profile")
+                .expect("profile present");
+            drop(snapshot);
+            legacy[0] = legacy_version;
+            let checksum = hns_primitives::blake2b_256(&legacy[..2]);
+            legacy[2..].copy_from_slice(&checksum);
+            let mut rewrite = store.batch();
+            rewrite
+                .put(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY, &legacy)
+                .expect("stage legacy profile");
+            store.commit(rewrite).expect("commit legacy profile");
+            let transaction_mode_before = store
+                .snapshot()
+                .expect("transaction-mode snapshot")
+                .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+                .expect("read transaction mode")
+                .expect("transaction mode present");
+            drop(node);
+
+            let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+                .expect("reopen legacy store state");
+            let disabled_config = NodeConfig {
+                network: Network::Regtest,
+                transaction_index: true,
+                ..NodeConfig::default()
+            };
+            let error = match NodeService::try_with_state(disabled_config, state) {
+                Ok(_) => panic!("legacy non-empty wallet profile must fail closed"),
+                Err(error) => error,
+            };
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("legacy wallet-index profile v{legacy_version}")),
+                "{message}"
+            );
+            assert!(message.contains("fresh v4 data directory"), "{message}");
+            let transaction_mode_after = store
+                .snapshot()
+                .expect("post-failure transaction-mode snapshot")
+                .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+                .expect("read post-failure transaction mode")
+                .expect("post-failure transaction mode present");
+            assert_eq!(transaction_mode_after, transaction_mode_before);
+        }
+    }
+
+    #[test]
+    fn non_wallet_legacy_profile_with_indexed_history_upgrades_to_v4() {
+        let config = NodeConfig {
+            network: Network::Regtest,
+            script_history_index: true,
+            ..NodeConfig::default()
+        };
+        let mut node = NodeService::new(config.clone());
+        let genesis = block_with_commitments(vec![coinbase_transaction()]);
+        node.connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("connect script-history genesis");
+        let store = node.state.store.clone();
+
+        let snapshot = store.snapshot().expect("profile snapshot");
+        let mut legacy = snapshot
+            .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+            .expect("read profile")
+            .expect("profile present");
+        drop(snapshot);
+        legacy[0] = 3;
+        let checksum = hns_primitives::blake2b_256(&legacy[..2]);
+        legacy[2..].copy_from_slice(&checksum);
+        let mut rewrite = store.batch();
+        rewrite
+            .put(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY, &legacy)
+            .expect("stage legacy profile");
+        store.commit(rewrite).expect("commit legacy profile");
+        drop(node);
+
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("reopen legacy store state");
+        let node = NodeService::try_with_state(config, state)
+            .expect("non-wallet legacy profile can be upgraded");
+        let snapshot = store.snapshot().expect("upgraded profile snapshot");
+        let upgraded = snapshot
+            .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+            .expect("read upgraded profile")
+            .expect("upgraded profile present");
+        assert_eq!(
+            index_profile_version(&upgraded).expect("valid upgraded profile"),
+            hns_wallet_index::PROFILE_VERSION
+        );
+        assert!(!node.state.wallet_index_profile.wallet);
+    }
+
+    #[test]
+    fn nonempty_index_capabilities_cannot_be_removed_or_stranded() {
+        let cases = [
+            (
+                "transaction",
+                NodeConfig {
+                    network: Network::Regtest,
+                    transaction_index: true,
+                    ..NodeConfig::default()
+                },
+                NodeConfig {
+                    network: Network::Regtest,
+                    ..NodeConfig::default()
+                },
+                "transaction index cannot be disabled",
+            ),
+            (
+                "wallet",
+                NodeConfig {
+                    network: Network::Regtest,
+                    wallet_index: true,
+                    ..NodeConfig::default()
+                },
+                NodeConfig {
+                    network: Network::Regtest,
+                    transaction_index: true,
+                    ..NodeConfig::default()
+                },
+                "wallet index profile cannot remove components",
+            ),
+            (
+                "script-history",
+                NodeConfig {
+                    network: Network::Regtest,
+                    script_history_index: true,
+                    ..NodeConfig::default()
+                },
+                NodeConfig {
+                    network: Network::Regtest,
+                    ..NodeConfig::default()
+                },
+                "wallet index profile cannot remove components",
+            ),
+            (
+                "spender",
+                NodeConfig {
+                    network: Network::Regtest,
+                    spender_index: true,
+                    ..NodeConfig::default()
+                },
+                NodeConfig {
+                    network: Network::Regtest,
+                    ..NodeConfig::default()
+                },
+                "wallet index profile cannot remove components",
+            ),
+        ];
+
+        for (label, original, reduced, expected) in cases {
+            let mut node = NodeService::new(original.clone());
+            let genesis = block_with_commitments(vec![coinbase_transaction()]);
+            node.connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+                .unwrap_or_else(|error| panic!("connect {label} genesis: {error:#}"));
+            let store = node.state.store.clone();
+            let before = store.snapshot().expect("pre-removal snapshot");
+            let transaction_mode_before = before
+                .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+                .expect("read transaction mode");
+            let profile_before = before
+                .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+                .expect("read wallet profile");
+            drop(before);
+            drop(node);
+
+            let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+                .expect("reopen state for rejected capability removal");
+            let error = NodeService::try_with_state(reduced, state)
+                .expect_err("nonempty index capability removal must fail");
+            assert!(error.to_string().contains(expected), "{label}: {error:#}");
+
+            let after = store.snapshot().expect("post-removal snapshot");
+            assert_eq!(
+                after
+                    .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+                    .expect("reread transaction mode"),
+                transaction_mode_before,
+                "{label} transaction mode changed after rejection"
+            );
+            assert_eq!(
+                after
+                    .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+                    .expect("reread wallet profile"),
+                profile_before,
+                "{label} wallet profile changed after rejection"
+            );
+            drop(after);
+
+            let state = NodeState::from_store_for_network(store, Network::Regtest)
+                .expect("reopen state with original capabilities");
+            NodeService::try_with_state(original, state)
+                .unwrap_or_else(|error| panic!("reopen {label} original profile: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn missing_transaction_mode_cannot_enable_nonempty_history() {
+        let original = NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        };
+        let mut node = NodeService::new(original.clone());
+        let genesis = block_with_commitments(vec![coinbase_transaction()]);
+        node.connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("connect unindexed genesis");
+        let store = node.state.store.clone();
+        let profile_before = store
+            .snapshot()
+            .expect("profile snapshot")
+            .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+            .expect("read profile");
+        let mut remove_mode = store.batch();
+        remove_mode
+            .delete(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+            .expect("remove transaction mode fixture");
+        store
+            .commit(remove_mode)
+            .expect("commit missing transaction mode fixture");
+        drop(node);
+
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("reopen missing-mode state");
+        let error = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                transaction_index: true,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect_err("missing mode must not enable transaction indexing");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be enabled after unindexed blocks exist"),
+            "{error:#}"
+        );
+        let snapshot = store.snapshot().expect("post-rejection snapshot");
+        assert!(snapshot
+            .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+            .expect("reread missing transaction mode")
+            .is_none());
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+                .expect("reread profile"),
+            profile_before
+        );
+        drop(snapshot);
+
+        let state = NodeState::from_store_for_network(store, Network::Regtest)
+            .expect("reopen original unindexed state");
+        NodeService::try_with_state(original, state)
+            .expect("original unindexed profile remains usable");
+    }
+
+    #[test]
+    fn redundant_wallet_flags_preserve_effective_nonempty_capabilities() {
+        let original = NodeConfig {
+            network: Network::Regtest,
+            wallet_index: true,
+            ..NodeConfig::default()
+        };
+        let mut node = NodeService::new(original.clone());
+        let genesis = block_with_commitments(vec![coinbase_transaction()]);
+        node.connect_block(NodeBlockImport::fixture(genesis, 0, 1))
+            .expect("connect wallet-indexed genesis");
+        let store = node.state.store.clone();
+        drop(node);
+
+        let redundant = NodeConfig {
+            network: Network::Regtest,
+            script_history_index: true,
+            spender_index: true,
+            wallet_index: true,
+            ..NodeConfig::default()
+        };
+        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
+            .expect("reopen for redundant flags");
+        let node = NodeService::try_with_state(redundant, state)
+            .expect("redundant flags preserve effective wallet capabilities");
+        assert!(node.state.wallet_index_profile.wallet);
+        assert!(node.state.wallet_index_profile.script_history);
+        assert!(node.state.wallet_index_profile.spender);
+        drop(node);
+
+        let state = NodeState::from_store_for_network(store, Network::Regtest)
+            .expect("reopen redundant flags with minimal form");
+        NodeService::try_with_state(original, state)
+            .expect("minimal wallet flag remains effectively equivalent");
+    }
+
+    #[test]
+    fn node_transfer_storage_connect_spend_disconnect_reconnect_and_prune_is_exact() {
+        fn checkpoint_validated(chainwork: u64) -> ValidatedImport {
+            ValidatedImport {
+                chainwork: Uint256::from(chainwork),
+                status: BlockStatus {
+                    header_context_valid: true,
+                    checkpoint_valid: true,
+                    body_present: true,
+                    body_syntax_valid: true,
+                    absolute_finality_valid: true,
+                    ..BlockStatus::default()
+                },
+                historical_validation: HistoricalValidationPlan::hsd_checkpointed(),
+            }
+        }
+
+        fn transfer_snapshot_image(snapshot: &impl ReadSnapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
+            snapshot
+                .scan_prefix(ColumnFamily::TxIndex, b"wallet-index/v1/name-transfer/")
+                .expect("scan TRANSFER image")
+        }
+
+        fn transfer_image(store: &StoreHandle) -> Vec<(Vec<u8>, Vec<u8>)> {
+            let snapshot = store.snapshot().expect("TRANSFER image snapshot");
+            transfer_snapshot_image(&snapshot)
+        }
+
+        let config = NodeConfig {
+            network: Network::Regtest,
+            wallet_index: true,
+            ..NodeConfig::default()
+        };
+        let mut node = NodeService::new(config);
+        let store = node.state.store.clone();
+        node.state.state_engine = StoredStateEngine::with_services(
+            store.clone(),
+            Network::Regtest,
+            NameFlags::NONE,
+            true,
+            Arc::new(AllowAllInputVerifier),
+            Arc::new(RejectSpecialCoinbaseIssuance),
+        )
+        .expect("fixture state engine");
+
+        let funding_outpoint = Outpoint {
+            txid: Txid::new([0x41; 32]),
+            index: 0,
+        };
+        let funding_coin = Coin {
+            outpoint: funding_outpoint.clone(),
+            value: 100,
+            height: 0,
+            coinbase: false,
+            address: Address::new(0, vec![7; 20]).expect("funding address"),
+            covenant: Covenant {
+                kind: CovenantKind::None,
+                items: Vec::new(),
+            },
+        };
+        let mut seed = store.batch();
+        write_coin_to_batch(&mut seed, &funding_coin).expect("seed funding coin");
+        store.commit(seed).expect("commit funding coin");
+
+        let genesis = block_with_commitments(vec![coinbase_transaction_with_tag(100, 50)]);
+        let genesis_hash = genesis.hash();
+        node.state
+            .commit_staged_block(
+                NodeBlockImport::fixture(genesis, 0, 1),
+                checkpoint_validated(1),
+                true,
+            )
+            .expect("connect fixture genesis through node storage boundary");
+        let mut filler = block_with_commitments(vec![coinbase_transaction_with_tag(101, 50)]);
+        filler.header.prev_block = genesis_hash;
+        let filler_hash = filler.hash();
+        node.state
+            .commit_staged_block(
+                NodeBlockImport::fixture(filler, 1, 2),
+                checkpoint_validated(2),
+                true,
+            )
+            .expect("connect fixture filler through node storage boundary");
+        let base_image = transfer_image(&store);
+
+        // The canonical checkpoint route still applies contextual covenant
+        // validation. Seed the smallest closed registered name state needed by
+        // this storage-boundary fixture; the TRANSFER below begins at height 2,
+        // after regtest's two-block claimed-name lockup.
+        let name_hash = NameHash::new([3; 32]);
+        let mut name_state = NameState::null(name_hash);
+        name_state.name = b"transfer-storage-fixture".to_vec();
+        name_state.owner = funding_outpoint.clone();
+        name_state.claimed = 1;
+        name_state.registered = true;
+        let mut seed_name = store.batch();
+        write_name_state_to_batch(&mut seed_name, &name_state).expect("seed closed name state");
+        store.commit(seed_name).expect("commit closed name state");
+
+        let transfer = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: funding_outpoint,
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 90,
+                address: Address::new(0, vec![7; 20]).expect("old owner address"),
+                covenant: Covenant {
+                    kind: CovenantKind::Transfer,
+                    items: vec![
+                        name_hash.as_bytes().to_vec(),
+                        0_u32.to_le_bytes().to_vec(),
+                        vec![0],
+                        vec![9; 20],
+                    ],
+                },
+            }],
+            locktime: 0,
+        };
+        let transfer_outpoint = Outpoint {
+            txid: transfer.txid(),
+            index: 0,
+        };
+        let mut source =
+            block_with_commitments(vec![coinbase_transaction_with_tag(1, 50), transfer]);
+        source.header.prev_block = filler_hash;
+        let source_hash = source.hash();
+        let source_request = NodeBlockImport::fixture(source.clone(), 2, 3);
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: transfer_outpoint,
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 80,
+                address: Address::new(0, vec![7; 20]).expect("spend address"),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: 0,
+        };
+        let mut spender = block_with_commitments(vec![coinbase_transaction_with_tag(2, 50), spend]);
+        spender.header.prev_block = source_hash;
+        spender.header.nonce = 11;
+        let spender_hash = spender.hash();
+        let spender_request = NodeBlockImport::fixture(spender.clone(), 3, 4);
+
+        // Exercise the exact multi-block reorg staging primitive before the
+        // durable lifecycle below. The spender must resolve the TRANSFER coin,
+        // active recipient row, and compact source evidence written by the
+        // source block through StagingOverlay rather than the base store.
+        let raw = store.snapshot().expect("atomic staging base snapshot");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&raw);
+        let mut staged_batch = overlay.batch(store.batch());
+        node.state
+            .stage_connect(
+                &staged,
+                &mut staged_batch,
+                &source_request,
+                checkpoint_validated(3),
+                true,
+            )
+            .expect("stage source through node reorg overlay");
+        node.state
+            .stage_connect(
+                &staged,
+                &mut staged_batch,
+                &spender_request,
+                checkpoint_validated(4),
+                true,
+            )
+            .expect("stage spender through node reorg overlay");
+        let atomic_spent_image = transfer_snapshot_image(&staged);
+        assert!(!atomic_spent_image.is_empty());
+        assert!(atomic_spent_image
+            .iter()
+            .all(|(key, _)| !key.starts_with(b"wallet-index/v1/name-transfer/active/")));
+        drop(staged_batch);
+        drop(staged);
+        drop(overlay);
+        drop(raw);
+        assert_eq!(transfer_image(&store), base_image);
+
+        node.state
+            .commit_staged_block(source_request.clone(), checkpoint_validated(3), true)
+            .expect("connect source through node storage boundary");
+        let source_image = transfer_image(&store);
+        assert_eq!(
+            source_image
+                .iter()
+                .filter(|(key, _)| key.starts_with(b"wallet-index/v1/name-transfer/active/"))
+                .count(),
+            1
+        );
+
+        node.state
+            .disconnect_block(NodeBlockDisconnect {
+                block_hash: source_hash,
+                height: 2,
+            })
+            .expect("disconnect source through node storage boundary");
+        assert_eq!(transfer_image(&store), base_image);
+        node.state
+            .commit_staged_block(source_request, checkpoint_validated(3), true)
+            .expect("reconnect source through node storage boundary");
+        assert_eq!(transfer_image(&store), source_image);
+        node.state
+            .commit_staged_block(spender_request.clone(), checkpoint_validated(4), true)
+            .expect("connect spender through node storage boundary");
+        let spent_image = transfer_image(&store);
+        assert_eq!(spent_image, atomic_spent_image);
+        assert!(!spent_image.is_empty());
+        assert!(spent_image
+            .iter()
+            .all(|(key, _)| !key.starts_with(b"wallet-index/v1/name-transfer/active/")));
+
+        node.state
+            .disconnect_block(NodeBlockDisconnect {
+                block_hash: spender_hash,
+                height: 3,
+            })
+            .expect("disconnect spender through node storage boundary");
+        assert_eq!(transfer_image(&store), source_image);
+        node.state
+            .commit_staged_block(spender_request, checkpoint_validated(4), true)
+            .expect("reconnect spender through node storage boundary");
+        assert_eq!(transfer_image(&store), spent_image);
+
+        for height in 0..=3 {
+            let snapshot = store.snapshot().expect("prune snapshot");
+            let mut batch = store.batch();
+            let (_, undo_pruned, block_pruned) =
+                stage_prune_payload_height(&snapshot, &mut batch, height, true)
+                    .unwrap_or_else(|error| panic!("prune height {height}: {error:#}"));
+            assert!(undo_pruned);
+            assert!(block_pruned);
+            drop(snapshot);
+            store.commit(batch).expect("commit payload prune");
+            if height == 0 {
+                assert!(!transfer_image(&store).is_empty());
+            }
+        }
+        assert!(transfer_image(&store).is_empty());
     }
 
     #[test]
@@ -20099,6 +20712,75 @@ mod tests {
             .expect("current tree survives compaction");
         drop(snapshot);
 
+        // Exercise the predictable archive/pruned startup decision before
+        // introducing the deliberately higher-work alternate branch below.
+        // That branch is retained as rejection evidence and is expected to be
+        // unactivatable after its fork undo has been pruned.
+        drop(node);
+        NodeState::from_store_for_network_with_undo_policy(
+            store.clone(),
+            Network::Regtest,
+            Some(policy),
+        )
+        .expect("pruned state reopens");
+        let before_failed_start = store.snapshot().expect("pre-failure index modes");
+        let transaction_mode_before = before_failed_start
+            .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+            .expect("read pre-failure transaction mode");
+        let profile_before = before_failed_start
+            .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+            .expect("read pre-failure wallet profile");
+        drop(before_failed_start);
+        let state = NodeState::from_store_for_network_with_undo_policy(
+            store.clone(),
+            Network::Regtest,
+            Some(policy),
+        )
+        .expect("state for disabled-policy check");
+        let error = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect_err("disabled pruning after retirement");
+        assert!(
+            error.to_string().contains("cannot be changed to archive"),
+            "{error}"
+        );
+        let after_failed_start = store.snapshot().expect("post-failure index modes");
+        assert_eq!(
+            after_failed_start
+                .get(ColumnFamily::Snapshots, TRANSACTION_INDEX_MODE_KEY)
+                .expect("read post-failure transaction mode"),
+            transaction_mode_before
+        );
+        assert_eq!(
+            after_failed_start
+                .get(ColumnFamily::Snapshots, INDEX_PROFILE_MODE_KEY)
+                .expect("read post-failure wallet profile"),
+            profile_before
+        );
+        drop(after_failed_start);
+        let state = NodeState::from_store_for_network_with_undo_policy(
+            store.clone(),
+            Network::Regtest,
+            Some(policy),
+        )
+        .expect("state for correct pruned-policy reopen");
+        let mut node = NodeService::try_with_state(
+            NodeConfig {
+                network: Network::Regtest,
+                undo_retention: UndoRetentionConfig {
+                    prune_history: true,
+                },
+                ..NodeConfig::default()
+            },
+            state,
+        )
+        .expect("correct pruned policy still reopens after rejected startup");
+
         let mut side_parent = records[199].hash;
         for height in 200..=203 {
             let mut block =
@@ -20141,30 +20823,8 @@ mod tests {
         );
         drop(node);
 
-        NodeState::from_store_for_network_with_undo_policy(
-            store.clone(),
-            Network::Regtest,
-            Some(policy),
-        )
-        .expect("pruned state reopens");
-        let state = NodeState::from_store_for_network_with_undo_policy(
-            store,
-            Network::Regtest,
-            Some(policy),
-        )
-        .expect("state for disabled-policy check");
-        let error = NodeService::try_with_state(
-            NodeConfig {
-                network: Network::Regtest,
-                ..NodeConfig::default()
-            },
-            state,
-        )
-        .expect_err("disabled pruning after retirement");
-        assert!(
-            error.to_string().contains("cannot be changed to archive"),
-            "{error}"
-        );
+        NodeState::from_store_for_network_with_undo_policy(store, Network::Regtest, Some(policy))
+            .expect("pruned state reopens with the rejected alternate retained");
     }
 
     #[test]

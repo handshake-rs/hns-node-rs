@@ -24,7 +24,12 @@ use hns_store::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod incoming_transfer;
 mod swap;
+
+pub use incoming_transfer::{
+    stage_prune_undo as stage_prune_incoming_transfer_undo, IncomingTransferEntry,
+};
 
 pub use swap::{
     completed_tracked_contract_retirement, register_tracked_contract,
@@ -51,7 +56,10 @@ pub const MAX_QUERY_BYTES: usize = 16 * 1024 * 1024;
 
 const ORIGINAL_PROFILE_VERSION: u8 = 1;
 const LIFECYCLE_PROFILE_VERSION: u8 = 2;
-const PROFILE_VERSION: u8 = 3;
+const COMPLETED_RETIREMENT_PROFILE_VERSION: u8 = 3;
+/// Current wallet-index profile version. Version four adds confirmed
+/// TRANSFER-recipient indexing and compact source-inclusion evidence.
+pub const PROFILE_VERSION: u8 = 4;
 const PROFILE_SCRIPT_HISTORY: u8 = 1 << 0;
 const PROFILE_SPENDER: u8 = 1 << 1;
 const PROFILE_WALLET: u8 = 1 << 2;
@@ -78,7 +86,8 @@ pub struct WalletIndexProfile {
     pub script_history: bool,
     /// Retain active-chain output-to-spending-transaction mappings.
     pub spender: bool,
-    /// Retain script UTXOs and imply history/spender support.
+    /// Retain script UTXOs and incoming TRANSFER-recipient/source evidence, and
+    /// imply history/spender support.
     pub wallet: bool,
 }
 
@@ -140,6 +149,7 @@ pub fn decode_index_profile(raw: &[u8]) -> Result<WalletIndexProfile, IndexError
             raw.first().copied(),
             Some(ORIGINAL_PROFILE_VERSION)
                 | Some(LIFECYCLE_PROFILE_VERSION)
+                | Some(COMPLETED_RETIREMENT_PROFILE_VERSION)
                 | Some(PROFILE_VERSION)
         )
         || raw
@@ -157,12 +167,21 @@ pub fn decode_index_profile(raw: &[u8]) -> Result<WalletIndexProfile, IndexError
     })
 }
 
-/// Whether a valid persistent profile carries the current downgrade-fencing
-/// version. Version one remains readable only so startup can atomically upgrade
-/// it before any lifecycle-aware writer becomes available.
-pub fn index_profile_is_current(raw: &[u8]) -> Result<bool, IndexError> {
+/// Decode and return the downgrade-fencing profile version.
+pub fn index_profile_version(raw: &[u8]) -> Result<u8, IndexError> {
     let _ = decode_index_profile(raw)?;
-    Ok(raw.first().copied() == Some(PROFILE_VERSION))
+    raw.first()
+        .copied()
+        .ok_or(IndexError::Corrupt("invalid wallet-index profile record"))
+}
+
+/// Whether a valid persistent profile carries the current downgrade-fencing
+/// version. Versions one through three remain readable for diagnosis and safe
+/// initialization of profiles that did not enable the wallet component. A
+/// non-empty wallet-enabled legacy profile must not be upgraded by normal
+/// startup because it lacks v4 TRANSFER-recipient/source evidence.
+pub fn index_profile_is_current(raw: &[u8]) -> Result<bool, IndexError> {
+    Ok(index_profile_version(raw)? == PROFILE_VERSION)
 }
 
 /// Stable content identity for the canonical Handshake output address script.
@@ -405,6 +424,12 @@ pub enum IndexError {
     /// A position exceeds the persisted fixed-width schema.
     #[error("wallet index position exceeds u32")]
     PositionOverflow,
+    /// A TRANSFER-kind covenant is not the exact pinned canonical shape.
+    #[error("wallet incoming TRANSFER covenant is malformed")]
+    InvalidTransferCovenant,
+    /// Incoming-TRANSFER derivative data exceeds a hard persistence bound.
+    #[error("wallet incoming TRANSFER capacity exceeded: {0}")]
+    TransferCapacity(&'static str),
     /// A public Shakedex/HTLC descriptor is malformed or unsupported.
     #[error("wallet tracked-contract descriptor is invalid")]
     InvalidContract,
@@ -536,6 +561,9 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
             )?;
         }
     }
+    if profile.wallet {
+        incoming_transfer::stage_connect(snapshot, batch, block, height)?;
+    }
     swap::stage_connect(snapshot, batch, block, height, profile)?;
     Ok(())
 }
@@ -640,6 +668,9 @@ pub fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
                 &encode_utxo_value(script, coin),
             )?;
         }
+    }
+    if profile.wallet {
+        incoming_transfer::stage_disconnect(snapshot, batch, block, undo)?;
     }
     swap::stage_disconnect(snapshot, batch, block, undo, profile)?;
     Ok(())
@@ -1028,6 +1059,22 @@ mod tests {
         }
     }
 
+    fn transfer_output(owner: u8, recipient: u8, value: u64) -> Output {
+        Output {
+            value,
+            address: address(owner),
+            covenant: Covenant {
+                kind: CovenantKind::Transfer,
+                items: vec![
+                    vec![3; 32],
+                    2_u32.to_le_bytes().to_vec(),
+                    vec![0],
+                    vec![recipient; 20],
+                ],
+            },
+        }
+    }
+
     fn block(transactions: Vec<Transaction>) -> Block {
         Block {
             header: hns_primitives::Header::default(),
@@ -1070,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn production_next_completed_retirement_profile_version_fences_downgrade() {
+    fn incoming_transfer_profile_version_fences_all_prior_writers() {
         let profile = WalletIndexProfile {
             script_history: true,
             spender: true,
@@ -1080,7 +1127,11 @@ mod tests {
         assert_eq!(current[0], PROFILE_VERSION);
         assert!(index_profile_is_current(&current).expect("current profile"));
 
-        for prior_version in [ORIGINAL_PROFILE_VERSION, LIFECYCLE_PROFILE_VERSION] {
+        for prior_version in [
+            ORIGINAL_PROFILE_VERSION,
+            LIFECYCLE_PROFILE_VERSION,
+            COMPLETED_RETIREMENT_PROFILE_VERSION,
+        ] {
             let mut legacy = current;
             legacy[0] = prior_version;
             let legacy_checksum = blake2b_256(&legacy[..2]);
@@ -1090,7 +1141,20 @@ mod tests {
                 profile
             );
             assert!(!index_profile_is_current(&legacy).expect("legacy version"));
+            assert_eq!(
+                index_profile_version(&legacy).expect("legacy version number"),
+                prior_version
+            );
         }
+
+        let mut future = current;
+        future[0] = PROFILE_VERSION + 1;
+        let future_checksum = blake2b_256(&future[..2]);
+        future[2..].copy_from_slice(&future_checksum);
+        assert!(matches!(
+            decode_index_profile(&future),
+            Err(IndexError::Corrupt(_))
+        ));
     }
 
     #[test]
@@ -1277,6 +1341,57 @@ mod tests {
         assert_eq!(history.entries.len(), 2);
         assert!(history.entries[0].direction.received);
         assert!(history.entries[1].direction.spent);
+    }
+
+    #[test]
+    fn transfer_recipient_never_changes_ordinary_script_ownership() {
+        let transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![transfer_output(7, 9, 50)],
+            locktime: 0,
+        };
+        let block = block(vec![transaction]);
+        let store = MemoryStore::new();
+        let profile = WalletIndexProfile {
+            wallet: true,
+            ..WalletIndexProfile::default()
+        };
+        let snapshot = store.snapshot().unwrap();
+        let mut batch = store.batch();
+        stage_connect(&snapshot, &mut batch, &block, 8, profile).unwrap();
+        drop(snapshot);
+        store.commit(batch).unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let owner = ScriptId::from_address(&address(7));
+        let recipient = ScriptId::from_address(&address(9));
+        assert_eq!(
+            script_history(&snapshot, profile, owner, None, 10)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        assert_eq!(
+            script_utxos(&snapshot, profile, owner, None, 10)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        assert!(script_history(&snapshot, profile, recipient, None, 10)
+            .unwrap()
+            .entries
+            .is_empty());
+        assert!(script_utxos(&snapshot, profile, recipient, None, 10)
+            .unwrap()
+            .entries
+            .is_empty());
     }
 
     #[test]
