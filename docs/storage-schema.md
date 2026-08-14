@@ -62,7 +62,12 @@ publication schema plus the optimized storage tiers:
 - an optional versioned, checksummed `name-tree-compaction/v1` checkpoint that
   binds the last compacted active height/tip and exact retained/deleted counts;
 - an optional versioned, checksummed `undo-pruning/v1` checkpoint that binds
-  the last retired canonical height/block and cumulative retired undo count.
+  the last retired canonical height/block and cumulative retired undo count;
+- optional, bounded, fenced complete-state namespaces. A namespace stores a
+  fixed checksummed control record under
+  `authenticated-namespace-control/v1/<namespace-id>` in `meta` and at most
+  16 MiB of complete canonical state under
+  `authenticated-namespace-state/v1/<namespace-id>` in `snapshots`.
 
 A schema/profile mismatch outside the two reviewed migrations, nonempty
 unversioned database, missing/malformed root or airdrop-field binding, or
@@ -75,6 +80,53 @@ Durable identity binds:
 - schema version;
 - storage profile;
 - chain epoch.
+
+### Fenced complete-state namespaces
+
+The namespace ID is a nonzero, embedding-derived 32-byte identity for one
+logical state lineage. Acquisition requires an already initialized current
+schema and `sync` durability. It durably increments a checked, nonzero `u64`
+fencing epoch before exposing a non-cloneable sole-owner lease. Live owner
+cells are shared by every clone of the physical Memory or RocksDB backend, but
+unrelated namespaces do not retain the registry lock during durable I/O.
+
+The fixed control record binds its format version, namespace ID, fencing epoch,
+initialized flag, minimum accepted revision, and domain-separated complete
+state digest; a second domain-separated digest checks the control body. A
+replacement compares both the exact prior revision and exact prior complete
+bytes under the same backend publication lock that atomically writes the new
+control and complete state. Revisions may start at zero but must strictly
+advance on replacement. Retrying an exact proposal already present at the same
+revision returns an idempotent committed result. Partial topology, malformed
+control, digest mismatch, zero/exhausted epochs, stale fencing, empty state,
+and over-capacity state fail closed.
+
+Ordinary batches reject both reserved prefixes when staging and recheck them at
+commit. RocksDB reads the state as a pinned slice and checks its limit before a
+Rust-owned copy. A known injected failure before `write_opt` retains a usable
+lease; a backend write error or post-write acknowledgement failure fences every
+backend clone until a true close/reopen resolves the atomic old/new outcome.
+
+When a segment archive has been attached, its weak registration is shared by the
+physical backend. Namespace operations through the archive retain the order
+registration, archive writer, then backend publication. A surviving raw alias
+remains rejected even between wrapper instances, a lease obtained before
+attachment is fenced on its next operation, and a second live archive wrapper
+is rejected. After process restart, durable block/undo manifests likewise
+prevent raw namespace acquisition until archive recovery is attached.
+Namespace publication never appends or rewrites segment files.
+This registration protects the namespace API and its reserved records; it does
+not retrofit generic raw `Store` aliases. Embeddings must continue to move the
+physical handle into the archive wrapper and retain no generic raw alias after
+attachment.
+
+The state digest and checksum detect corruption; they do not authenticate an
+offline writer or detect replay of an older whole-database checkpoint. HRM,
+HNSA, or HNSR authority must remain disabled until the embedding also maintains
+and validates the required minimum revision in separately protected storage,
+with an explicit reset/recovery procedure. These additive optional records do
+not by themselves change schema 19 or storage profile `hsrd-mining-v15`; making
+one mandatory is a later reviewed profile boundary.
 
 ## Backend and durability
 

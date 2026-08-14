@@ -422,7 +422,12 @@ Tests must cover:
   active-height hashes, and one-snapshot current/proof-state/owner name
   evidence;
 - bounded aggregate RocksDB WAL retention across all column families;
-- WAL/sync restart points and fault-injected batch failure.
+- WAL/sync restart points and fault-injected batch failure;
+- complete-state namespace schema/durability admission, exact revision-and-byte
+  CAS, nonzero fencing and exhaustion, maximum-size acceptance, reserved-key
+  rejection, corruption topology, unwind release, clone ownership, raw/archive
+  exclusion, durable-manifest reopen binding, and before/after-write RocksDB
+  recovery through both raw and archived backends.
 
 ## Network and synchronization tests
 

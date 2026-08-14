@@ -6,6 +6,14 @@ qualification or authorize deployment.
 
 ## 0.3.5 - unreleased
 
+- Add a sync-only, backend-shared complete-state namespace primitive for the
+  future HRM/HNSA/HNSR authority broker. It reserves ordinary-batch prefixes,
+  durably fences sole-owner leases, compares the exact prior revision and state
+  bytes in one atomic publication, bounds state at 16 MiB, rejects namespace
+  use through raw aliases after archive attachment, and fail-stops every RocksDB
+  clone after an ambiguous write until true reopen. Checksums are corruption
+  evidence only;
+  authority still requires a separately protected anti-rollback floor.
 - Enable outbound standard Handshake P2P, active-state synchronization, and
   fixed-seed/GETADDR discovery in the standalone process by default, with
   explicit `--no-native-sync` and `--no-p2p-discovery` opt-outs. HIP-76

@@ -1,8 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod authenticated_namespace;
 mod name_page;
 mod segment;
 
+pub use authenticated_namespace::{
+    AuthenticatedNamespaceError, AuthenticatedNamespaceLease, AuthenticatedNamespaceState,
+    AuthenticatedNamespaceWrite, OperationNamespaceId, StateExpectation,
+    AUTHENTICATED_NAMESPACE_MAX_STATE_BYTES,
+};
 pub use name_page::{
     decode_name_page, encode_name_page, encode_name_subpage_page, inspect_name_page_file,
     plan_name_page_reads, read_name_page_directory, read_name_page_record,
@@ -42,10 +48,9 @@ use std::{
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use std::sync::atomic::AtomicU8;
 #[cfg(feature = "rocksdb-backend")]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Mutex,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "rocksdb-backend")]
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -1675,6 +1680,23 @@ impl StoreHandle {
                 "segment archive is already attached".to_owned(),
             ));
         }
+        let mut namespace_archive_registration = self
+            .authenticated_namespace_archive_registration()
+            .lock()
+            .map_err(|_| {
+                StoreError::Backend(
+                    "authenticated namespace archive registry is poisoned".to_owned(),
+                )
+            })?;
+        if namespace_archive_registration
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some()
+        {
+            return Err(StoreError::Schema(
+                "a live segment archive is already attached to this physical backend".to_owned(),
+            ));
+        }
         let database_directory = match &self {
             #[cfg(feature = "rocksdb-backend")]
             Self::Rocks(store) => store.path.clone(),
@@ -1717,9 +1739,12 @@ impl StoreHandle {
                 ))
             }
         };
+        let archive = Arc::new(archive);
+        *namespace_archive_registration = Some(Arc::downgrade(&archive));
+        drop(namespace_archive_registration);
         Ok(Self::Archived {
             inner: Box::new(self),
-            archive: Arc::new(archive),
+            archive,
             archive_directory,
             database_directory,
         })
@@ -3627,6 +3652,8 @@ impl CheckpointWriteBatch for StoreHandleBatch {
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
     inner: Arc<RwLock<MemoryStoreState>>,
+    authenticated_namespaces: authenticated_namespace::SharedNamespaceOwners,
+    authenticated_namespace_archive: authenticated_namespace::SharedNamespaceArchiveRegistration,
 }
 
 impl MemoryStore {
@@ -3670,68 +3697,82 @@ impl Store for MemoryStore {
             return Ok(());
         }
 
+        for key in changes.keys() {
+            authenticated_namespace::ensure_ordinary_key(key.family, &key.key)?;
+        }
+
         let mut state = self
             .inner
             .write()
             .map_err(|_| StoreError::Io("memory store write lock poisoned".to_owned()))?;
-        let generation = state
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| StoreError::Schema("memory store generation exhausted".to_owned()))?;
-        let oldest_snapshot = state
-            .active_snapshots
-            .first_key_value()
-            .map(|(value, _)| *value);
-        let change_count = changes.len();
-        let mut gc_candidates = Vec::with_capacity(change_count);
-
-        for (key, value) in changes {
-            if oldest_snapshot.is_none() {
-                match value {
-                    Some(value) => {
-                        state.data.insert(
-                            key,
-                            vec![MemoryVersion {
-                                generation,
-                                value: Some(value),
-                            }],
-                        );
-                    }
-                    None => {
-                        state.data.remove(&key);
-                    }
-                }
-                continue;
-            }
-            let history = state.data.entry(key.clone()).or_default();
-            compact_memory_history(history, oldest_snapshot);
-            history.push(MemoryVersion { generation, value });
-            gc_candidates.push(key);
-        }
-        state.generation = generation;
-        state.gc_candidates.extend(gc_candidates);
-        let gc_budget = change_count.saturating_add(64);
-        let pending_gc = (0..gc_budget)
-            .filter_map(|_| state.gc_candidates.pop_first())
-            .collect::<Vec<_>>();
-        for key in pending_gc {
-            let remove = state.data.get_mut(&key).is_some_and(|history| {
-                compact_memory_history(history, oldest_snapshot);
-                history.is_empty()
-            });
-            if remove {
-                state.data.remove(&key);
-            } else if state.data.get(&key).is_some_and(|history| {
-                history.len() > 1
-                    || history
-                        .last()
-                        .is_some_and(|version| version.value.is_none())
-            }) {
-                state.gc_candidates.insert(key);
-            }
-        }
-        Ok(())
+        apply_memory_changes(&mut state, changes)
     }
+}
+
+fn apply_memory_changes(
+    state: &mut MemoryStoreState,
+    changes: BatchOperations,
+) -> Result<(), StoreError> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let generation = state
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| StoreError::Schema("memory store generation exhausted".to_owned()))?;
+    let oldest_snapshot = state
+        .active_snapshots
+        .first_key_value()
+        .map(|(value, _)| *value);
+    let change_count = changes.len();
+    let mut gc_candidates = Vec::with_capacity(change_count);
+
+    for (key, value) in changes {
+        if oldest_snapshot.is_none() {
+            match value {
+                Some(value) => {
+                    state.data.insert(
+                        key,
+                        vec![MemoryVersion {
+                            generation,
+                            value: Some(value),
+                        }],
+                    );
+                }
+                None => {
+                    state.data.remove(&key);
+                }
+            }
+            continue;
+        }
+        let history = state.data.entry(key.clone()).or_default();
+        compact_memory_history(history, oldest_snapshot);
+        history.push(MemoryVersion { generation, value });
+        gc_candidates.push(key);
+    }
+    state.generation = generation;
+    state.gc_candidates.extend(gc_candidates);
+    let gc_budget = change_count.saturating_add(64);
+    let pending_gc = (0..gc_budget)
+        .filter_map(|_| state.gc_candidates.pop_first())
+        .collect::<Vec<_>>();
+    for key in pending_gc {
+        let remove = state.data.get_mut(&key).is_some_and(|history| {
+            compact_memory_history(history, oldest_snapshot);
+            history.is_empty()
+        });
+        if remove {
+            state.data.remove(&key);
+        } else if state.data.get(&key).is_some_and(|history| {
+            history.len() > 1
+                || history
+                    .last()
+                    .is_some_and(|version| version.value.is_none())
+        }) {
+            state.gc_candidates.insert(key);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -3956,6 +3997,7 @@ impl MemoryBatch {
 
 impl WriteBatch for MemoryBatch {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        authenticated_namespace::ensure_ordinary_key(family, key)?;
         replace_batch_operation(
             &mut self.operations,
             &mut self.checkpoint,
@@ -3966,6 +4008,7 @@ impl WriteBatch for MemoryBatch {
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
+        authenticated_namespace::ensure_ordinary_key(family, key)?;
         replace_batch_operation(
             &mut self.operations,
             &mut self.checkpoint,
@@ -4073,6 +4116,8 @@ pub struct RocksStore {
     /// Linearizes snapshot creation and atomic publication without holding a
     /// lock for the snapshot's subsequent reads.
     publication_lock: Arc<Mutex<()>>,
+    authenticated_namespaces: authenticated_namespace::SharedNamespaceOwners,
+    authenticated_namespace_archive: authenticated_namespace::SharedNamespaceArchiveRegistration,
     #[cfg(test)]
     commit_fault: Arc<AtomicU8>,
 }
@@ -4132,6 +4177,8 @@ impl RocksStore {
             bulk_cache,
             reopen_required: Arc::new(AtomicBool::new(false)),
             publication_lock: Arc::new(Mutex::new(())),
+            authenticated_namespaces: Arc::new(Mutex::new(BTreeMap::new())),
+            authenticated_namespace_archive: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             commit_fault: Arc::new(AtomicU8::new(RocksCommitFault::None as u8)),
         })
@@ -4199,6 +4246,53 @@ impl RocksStore {
             _ => RocksCommitFault::None,
         }
     }
+
+    /// Publish already validated operations while the caller retains the
+    /// backend's publication lock. Namespace CAS uses this private path so its
+    /// live reads, fence comparison, and write form one critical section.
+    fn commit_operations_locked(&self, operations: BatchOperations) -> Result<(), StoreError> {
+        let mut write_batch = rocksdb::WriteBatch::default();
+        for (key, value) in operations {
+            let cf = Self::cf(&self.db, key.family)?;
+            match value {
+                Some(value) => write_batch.put_cf(cf, key.key, value),
+                None => write_batch.delete_cf(cf, key.key),
+            }
+        }
+
+        let mut options = rocksdb::WriteOptions::default();
+        options.disable_wal(false);
+        options.set_sync(matches!(self.durability, DurabilityPolicy::Sync));
+
+        #[cfg(test)]
+        let fault = self.take_commit_fault();
+        #[cfg(test)]
+        if fault == RocksCommitFault::BeforeWrite {
+            return Err(StoreError::Io(
+                "injected RocksDB failure before atomic write".to_owned(),
+            ));
+        }
+
+        if let Err(error) = self.db.write_opt(write_batch, &options) {
+            // RocksDB's error acknowledgement does not prove that an atomic
+            // WAL/memtable publication is absent. Fence every clone before
+            // releasing the publication lock; reopen establishes the actual
+            // durable sequence.
+            self.mark_commit_outcome_uncertain();
+            return Err(StoreError::Backend(format!(
+                "RocksDB atomic write outcome is uncertain; reopen required: {error}"
+            )));
+        }
+
+        #[cfg(test)]
+        if fault == RocksCommitFault::AfterWrite {
+            self.mark_commit_outcome_uncertain();
+            return Err(StoreError::Io(
+                "injected RocksDB failure after atomic write; reopen required".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "rocksdb-backend"))]
@@ -4250,51 +4344,16 @@ impl Store for RocksStore {
 
     fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
         self.ensure_operational()?;
-        let mut write_batch = rocksdb::WriteBatch::default();
-
-        for (key, value) in batch.operations {
-            let cf = Self::cf(&self.db, key.family)?;
-            match value {
-                Some(value) => write_batch.put_cf(cf, key.key, value),
-                None => write_batch.delete_cf(cf, key.key),
-            }
+        if batch.operations.is_empty() {
+            return Ok(());
         }
-
-        let mut options = rocksdb::WriteOptions::default();
-        options.disable_wal(false);
-        options.set_sync(matches!(self.durability, DurabilityPolicy::Sync));
+        for key in batch.operations.keys() {
+            authenticated_namespace::ensure_ordinary_key(key.family, &key.key)?;
+        }
 
         let _publication = self.lock_publication()?;
         self.ensure_operational()?;
-
-        #[cfg(test)]
-        let fault = self.take_commit_fault();
-        #[cfg(test)]
-        if fault == RocksCommitFault::BeforeWrite {
-            return Err(StoreError::Io(
-                "injected RocksDB failure before atomic write".to_owned(),
-            ));
-        }
-
-        if let Err(error) = self.db.write_opt(write_batch, &options) {
-            // RocksDB's error acknowledgement does not prove that an atomic
-            // WAL/memtable publication is absent. Fence every clone before
-            // releasing the publication lock; reopen establishes the actual
-            // durable sequence.
-            self.mark_commit_outcome_uncertain();
-            return Err(StoreError::Backend(format!(
-                "RocksDB atomic write outcome is uncertain; reopen required: {error}"
-            )));
-        }
-
-        #[cfg(test)]
-        if fault == RocksCommitFault::AfterWrite {
-            self.mark_commit_outcome_uncertain();
-            return Err(StoreError::Io(
-                "injected RocksDB failure after atomic write; reopen required".to_owned(),
-            ));
-        }
-        Ok(())
+        self.commit_operations_locked(batch.operations)
     }
 }
 
@@ -4419,6 +4478,7 @@ pub struct RocksBatch {
 #[cfg(feature = "rocksdb-backend")]
 impl WriteBatch for RocksBatch {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
+        authenticated_namespace::ensure_ordinary_key(family, key)?;
         replace_batch_operation(
             &mut self.operations,
             &mut self.checkpoint,
@@ -4429,6 +4489,7 @@ impl WriteBatch for RocksBatch {
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
+        authenticated_namespace::ensure_ordinary_key(family, key)?;
         replace_batch_operation(
             &mut self.operations,
             &mut self.checkpoint,

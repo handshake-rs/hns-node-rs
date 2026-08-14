@@ -45,6 +45,14 @@ required.
 - Compaction creates no rewrite generation until a read-only plan has passed
   record, live-frame-byte, atomic-locator-byte, cursor-record, and cursor-byte
   budgets.
+- Authority-bearing complete-state namespaces require `sync` durability, an
+  initialized current schema, and one live archived wrapper when segment
+  storage is attached. Namespace access through raw aliases and duplicate live
+  wrappers is rejected; a dropped wrapper must be recovered or reattached.
+  An ambiguous RocksDB namespace write is reopen-only. The database checksum
+  is not an anti-rollback oracle: retain the embedding's authenticated minimum
+  revision outside the database, and withhold HRM/HNSA/HNSR authority if it is
+  absent, stale, corrupt, or below the namespace revision.
 - No maintenance command deletes the source data root or a fallback backup.
 
 Before production cutover, retain the numeric owner/group, modes, ACLs,

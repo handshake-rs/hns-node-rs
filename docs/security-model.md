@@ -97,6 +97,10 @@ The current foundation verifies or records evidence for:
   packages, deterministic future templates, and HSD-derived coinbase behavior;
 - versioned checksummed solved-block publication intents, local candidate
   admission before fan-out, and parallel reserved critical publication queues;
+- sync-only sole-owner complete-state namespaces with durable nonzero fencing,
+  exact prior-revision/byte CAS, reserved storage prefixes, bounded pinned
+  reads, namespace-specific archive/raw-alias exclusion, and reopen-only
+  ambiguous-write recovery;
 - granular validation, authority, readiness, parity, peer, synchronization, and
   mining-engine diagnostics.
 
