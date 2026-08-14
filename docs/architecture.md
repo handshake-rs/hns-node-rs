@@ -246,12 +246,13 @@ Urkel/liburkel are comparison oracles, not runtime architectural dependencies.
 Ordinary VERSION/VERACK precedes the connection-local Denuo Experimental V1
 registry exchange; typed HIP-76 `f0`/`f1` traffic is admitted only after that
 agreement and under separate requester/provider role policy. These extensions
-do not enter consensus or authority. The workspace already pins the canonical
-`hns-rs` 0.2 source, but that cohort remains unpublished and the active
-transport deliberately remains Denuo V1. Marketplace roles stay locally
-bounded and wire-disabled until the 0.2 archives are published and verified,
-Denuo V2 transport/admission and a typed adapter are joined, and the result is
-qualified; a sibling path is not an acceptable dependency substitute.
+do not enter consensus or authority. The prior 0.2 package cohort is published
+and the workspace now pins immutable reachable `hns-rs` 0.3 source, while the
+active transport deliberately remains Denuo V1.
+Marketplace roles stay locally bounded and wire-disabled until the exact 0.3
+archives are published and provenance-verified, Denuo V2 transport/admission
+and a typed adapter are joined, and the result is qualified; a sibling path is
+not an acceptable dependency substitute.
 
 The authority and production-hardening boundary is governed by
 [`mining-node-scope.md`](mining-node-scope.md).

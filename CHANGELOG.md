@@ -63,13 +63,14 @@ qualification or authorize deployment.
   contracts only after canonical evidence is validated.
 - Consume canonical HNS resource parsing from the exact `hns-rs` source rather
   than retaining a second resolver-local codec. Advance that coherent source
-  to the dated 0.2.0 publication-source commit
-  `b24b66c382de53330ec21dd3137e056a2bea3e2d`, including the HNSA/HNSR
-  selection/admission correction and linked-covenant output validation. The
-  source passed its consolidated CI, CodeQL, and 17-crate publication
-  preflight; its crates and release tag remain unpublished. Endpoint and
-  rendezvous roles remain unavailable; a newer protocol pin does not enable
-  either role.
+  to immutable remote 0.3.0 commit
+  `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`, including HRM Core, HRM-backed
+  HNSA/HNSR v3 state, the external rollback-journal contract, the earlier
+  HNSA/HNSR admission corrections, and linked-covenant output validation. The
+  17-package 0.2.0 cohort is published and provenance-verified; the 19-package
+  0.3.0 line remains unpublished and is consumed by exact Git revision.
+  Endpoint and rendezvous roles remain unavailable; a newer protocol pin does
+  not enable either role.
 - Commit single-block native replay atomically.
 - Streamline bounded active-state persistence across the store, name-page,
   state, and Urkel layers. Only committed blocks contribute workload and

@@ -84,19 +84,20 @@ before passing exact canonical bytes to `DenuoRelayHandle::put`. The node core:
 - does not hold keys, seeds, liquidity, or funds;
 - does not automatically accept or execute swaps.
 
-The workspace now pins the exact `hns-rs` 0.2 source at
-`b24b66c382de53330ec21dd3137e056a2bea3e2d`, which contains the canonical
-Denuo V2 registry, generated fingerprint, and typed marketplace envelopes.
-That source cohort is still unpublished, while the active node transport and
-peer admission deliberately negotiate Denuo V1 and expose no marketplace
-subprotocol. No typed marketplace adapter or live advertisement is installed.
-Live marketplace wire advertisement must therefore remain disabled until the
-0.2 archives are published and verified, the node adopts their exact Denuo V2
-registry/fingerprint in transport admission, and the joined adapter is
-qualified. No sibling-path dependency or unassigned production message ID is
-used as a workaround. Enabling a local role creates only the bounded service
-for an installed native adapter; it does not make this revision advertise a
-marketplace protocol.
+The workspace now pins exact reachable `hns-rs` 0.3 source at
+`88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`, which contains the canonical
+Denuo V2 registry, generated fingerprint, typed marketplace envelopes, and the
+new HRM-backed authority contracts. The prior 0.2 package cohort is published
+and provenance-verified, while 0.3 remains an unpublished exact Git source.
+The active node transport and peer admission deliberately negotiate Denuo V1
+and expose no marketplace subprotocol. No typed marketplace adapter or live
+advertisement is installed. Live marketplace wire advertisement must therefore
+remain disabled until the exact 0.3 archives are published and
+provenance-verified, transport admission adopts the exact Denuo V2 registry and
+fingerprint, and the joined adapter is qualified. No sibling-path dependency or
+unassigned production message ID is used as a workaround. Enabling a local role
+creates only the bounded service for an installed native adapter; it does not
+make this revision advertise a marketplace protocol.
 
 The node now has descriptor-bound, restart-durable confirmed Shakedex-v2 and
 HNS-HTLC-v1 funding/spend/preimage tracking plus bounded mempool reconciliation.

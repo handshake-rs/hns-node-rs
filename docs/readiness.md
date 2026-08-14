@@ -214,10 +214,11 @@ measurement, or the full qualification gate. Its immutable tombstone registry
 has a finite 65,536-entry lifetime cap, and later matching outputs are
 deliberately untracked; untrusted registration therefore remains unavailable
 and production availability remains blocked.
-Live marketplace wire advertisement separately awaits publication and
-immutable archive verification of the already source-pinned canonical
-`hns-rs` 0.2 cohort, active Denuo V2 transport/admission, and the typed adapter
-gate.
+Live marketplace wire advertisement separately awaits active Denuo V2
+transport/admission, publication and provenance verification of the exact 0.3
+archive cohort, the typed adapter gate, and joined qualification. The canonical
+protocol source is now an immutable reachable `hns-rs` 0.3 Git revision; that
+removes source ambiguity but is not product or wire-role qualification.
 
 The focused local evidence is intentionally narrow: the NVMe `hns-consensus`
 `wallet_name_action` filter passed 2 tests with 0 failures and 75 filtered. At

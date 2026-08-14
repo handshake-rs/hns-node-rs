@@ -400,10 +400,11 @@ storage migration, not a wire shortcut.
 
 The v1 boundary intentionally does not accept Shakedex or HNS-HTLC descriptor
 registrations. Those profiles are duplicated locally for derivative tracking.
-The workspace now pins the canonical `hns-rs` 0.2 source, but its packages are
-not yet published and the trusted registration adapter is not installed or
-qualified. The API exposes only evidence for registrations already admitted
-through a trusted in-process boundary and labels it
+The workspace now pins immutable reachable `hns-rs` 0.3 source. The prior 0.2
+package cohort is published, but the current 0.3 archives remain unpublished
+and the trusted registration adapter is still not installed or qualified. The
+API exposes only evidence for registrations already admitted through a trusted
+in-process boundary and labels it
 `node_local_profile_only_not_protocol_authority`.
 
 Confirmed or mempool HTLC redemption is classified, but the revealed preimage
