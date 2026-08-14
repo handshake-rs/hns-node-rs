@@ -1229,6 +1229,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-journaled-namespace"
+version = "0.3.5"
+dependencies = [
+ "hns-rollback-journal",
+ "hns-store",
+ "thiserror",
+]
+
+[[package]]
 name = "hns-mempool"
 version = "0.3.5"
 dependencies = [
@@ -1378,6 +1387,16 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "hns-rollback-journal"
+version = "0.3.0"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+dependencies = [
+ "blake2",
+ "hns-encoding",
+ "thiserror",
 ]
 
 [[package]]

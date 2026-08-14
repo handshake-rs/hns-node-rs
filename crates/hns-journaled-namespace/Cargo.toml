@@ -1,0 +1,13 @@
+[package]
+name = "hns-journaled-namespace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+hns-rollback-journal.workspace = true
+hns-store = { path = "../hns-store", default-features = false }
+thiserror.workspace = true

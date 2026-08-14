@@ -17,6 +17,7 @@ members = [
     "crates/hns-urkel",
     "crates/hns-resolver",
     "crates/hns-wallet-index",
+    "crates/hns-journaled-namespace",
     "crates/hns-denuo-market-relay",
 ]
 exclude = ["fuzz"]
@@ -39,6 +40,7 @@ hns-dns-relay-protocol = { version = "=0.3.0", git = "https://github.com/handsha
 hns-hnsr-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
 hns-odoh-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
 hns-p2p-experimental = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
+hns-rollback-journal = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.9"

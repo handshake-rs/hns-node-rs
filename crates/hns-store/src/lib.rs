@@ -1609,6 +1609,22 @@ impl StoreHandle {
         Self::Memory(MemoryStore::new())
     }
 
+    /// Whether complete state survives process restart in the authoritative
+    /// database backend.
+    ///
+    /// Synchronous durability describes publication ordering, so the memory
+    /// backend intentionally reports `false` even though its in-process write
+    /// policy is represented as [`DurabilityPolicy::Sync`]. Authority-bearing
+    /// consumers must require both restart durability and synchronous writes.
+    pub const fn is_restart_durable(&self) -> bool {
+        match self {
+            Self::Memory(_) => false,
+            #[cfg(feature = "rocksdb-backend")]
+            Self::Rocks(_) => true,
+            Self::Archived { inner, .. } => inner.is_restart_durable(),
+        }
+    }
+
     /// Whether an atomic database publication returned an error whose durable
     /// outcome can only be resolved by closing and reopening the store.
     pub fn reopen_required(&self) -> bool {
@@ -4672,6 +4688,55 @@ mod tests {
             snapshot.get(ColumnFamily::Headers, b"hash").expect("get"),
             Some(b"header".to_vec())
         );
+    }
+
+    #[test]
+    fn restart_durability_rejects_memory_and_delegates_through_memory_archive() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "hsrd-memory-restart-durability-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let memory = StoreHandle::memory();
+        assert!(!memory.is_restart_durable());
+        let archived = memory
+            .with_segment_archive(directory.clone())
+            .expect("attach memory archive");
+        assert!(!archived.is_restart_durable());
+
+        drop(archived);
+        std::fs::remove_dir_all(directory).expect("remove memory archive fixture");
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn restart_durability_accepts_rocks_and_delegates_through_rocks_archive() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hsrd-rocks-restart-durability-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let rocks = RocksStore::open(root.join("chain")).expect("open rocksdb");
+        let raw = StoreHandle::Rocks(rocks.clone());
+        assert!(raw.is_restart_durable());
+        let archived = raw
+            .with_segment_archive(root.join("payloads"))
+            .expect("attach rocks archive");
+        assert!(archived.is_restart_durable());
+
+        drop(archived);
+        drop(rocks);
+        std::fs::remove_dir_all(root).expect("remove rocks archive fixture");
     }
 
     #[test]
