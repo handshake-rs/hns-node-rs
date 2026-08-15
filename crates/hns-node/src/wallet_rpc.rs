@@ -18,14 +18,15 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 use super::wallet_backend::{
-    BlockHashEvidence, BroadcastResult, ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate,
-    FeeEstimateSource, IncomingTransferSourceBinding, IncomingTransfersCursor,
-    IncomingTransfersPage, MempoolContractEvent, MempoolContractPage, MempoolScriptPage,
-    NameAction, NameActionContext, NameActionIneligibility, NameEvidence, NameOwnerTransaction,
-    OutpointSpendingEvidence, TransactionEvidence, TransactionFeeQuote, TransactionPayload,
-    TransactionStatus, WalletBackend, WalletBackendError, WalletChainSnapshot,
-    WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
-    WalletContractFundingPage, WalletMempoolCursor, INCOMING_TRANSFER_PROJECTION_VERSION,
+    ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence,
+    BroadcastResult, ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate, FeeEstimateSource,
+    IncomingTransferSourceBinding, IncomingTransfersCursor, IncomingTransfersPage,
+    MempoolContractEvent, MempoolContractPage, MempoolScriptPage, NameAction, NameActionContext,
+    NameActionIneligibility, NameEvidence, NameOwnerTransaction, OutpointSpendingEvidence,
+    TransactionEvidence, TransactionFeeQuote, TransactionPayload, TransactionStatus, WalletBackend,
+    WalletBackendError, WalletChainSnapshot, WalletContractEventCursor, WalletContractEventPage,
+    WalletContractFundingCursor, WalletContractFundingPage, WalletMempoolCursor,
+    ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION, INCOMING_TRANSFER_PROJECTION_VERSION,
     MAX_FEE_ESTIMATE_TARGET_BLOCKS, MAX_NAME_ACTION_INELIGIBILITY_REASONS,
     MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_FEE_QUOTE_INPUTS,
     MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES,
@@ -107,6 +108,10 @@ enum WalletRpcCall {
         expected_chain_epoch: u64,
     },
     NameEvidence {
+        name_hash: String,
+        expected_chain_epoch: u64,
+    },
+    ActiveNameOwnerCoin {
         name_hash: String,
         expected_chain_epoch: u64,
     },
@@ -366,6 +371,28 @@ async fn dispatch_call(
                 .ok_or(DispatchError::Internal)?;
             for (key, value) in [
                 (
+                    "active_name_owner_coin_projection_version",
+                    Value::from(ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION),
+                ),
+                (
+                    "active_name_owner_coin_source_binding",
+                    Value::from("trusted_node_active_utxo_projection"),
+                ),
+                (
+                    "active_name_owner_coin_binding",
+                    Value::from("mandatory_chain_epoch_and_exact_tip"),
+                ),
+                (
+                    "active_name_owner_coin_transaction_position",
+                    Value::from("always_null_no_raw_block_read"),
+                ),
+                (
+                    "active_name_owner_coin_authority",
+                    Value::from(
+                        "discovery_and_current_active_utxo_evidence_only_not_cryptographic_proof_or_signing_authority",
+                    ),
+                ),
+                (
                     "incoming_transfer_projection_version",
                     Value::from(INCOMING_TRANSFER_PROJECTION_VERSION),
                 ),
@@ -538,6 +565,16 @@ async fn dispatch_call(
             let evidence = backend.get_name_evidence(name_hash).await?;
             require_chain_epoch(expected_chain_epoch, evidence.chain_epoch)?;
             value(&wire_name_evidence(evidence)?)?
+        }
+        WalletRpcCall::ActiveNameOwnerCoin {
+            name_hash,
+            expected_chain_epoch,
+        } => {
+            let name_hash = NameHash::new(decode_hex_32(&name_hash, "name hash")?);
+            let evidence = backend
+                .get_active_name_owner_coin(name_hash, expected_chain_epoch)
+                .await?;
+            value(&wire_active_name_owner_coin(evidence))?
         }
         WalletRpcCall::NameActionContext {
             action,
@@ -822,7 +859,7 @@ fn map_backend_error(
             request_id,
             StatusCode::CONFLICT,
             "chain_uninitialized",
-            "name-action context requires an initialized active chain",
+            "wallet name evidence requires an initialized active chain",
             true,
         ),
         WalletBackendError::OwnerOutputMissing => wallet_rpc_failure(
@@ -1030,13 +1067,19 @@ struct WireTip {
     tree_root: String,
 }
 
+impl From<super::wallet_backend::WalletChainTip> for WireTip {
+    fn from(tip: super::wallet_backend::WalletChainTip) -> Self {
+        Self {
+            hash: tip.hash.to_hex(),
+            height: tip.height,
+            median_time_past: tip.median_time_past,
+            tree_root: hex_encode(tip.tree_root.as_bytes()),
+        }
+    }
+}
+
 fn wire_tip(tip: Option<super::wallet_backend::WalletChainTip>) -> Option<WireTip> {
-    tip.map(|tip| WireTip {
-        hash: tip.hash.to_hex(),
-        height: tip.height,
-        median_time_past: tip.median_time_past,
-        tree_root: hex_encode(tip.tree_root.as_bytes()),
-    })
+    tip.map(WireTip::from)
 }
 
 #[derive(Serialize)]
@@ -1635,6 +1678,37 @@ impl From<&NameState> for WireNameState {
 }
 
 #[derive(Serialize)]
+struct WireActiveNameOwnerCoin {
+    projection_version: u8,
+    chain_epoch: u64,
+    tip: WireTip,
+    current_state_hex: String,
+    current_state: WireNameState,
+    owner_coin: WireCoin,
+    inclusion: WireInclusion,
+    source_binding: &'static str,
+}
+
+const fn wire_active_name_owner_coin_source_binding(
+    binding: ActiveNameOwnerCoinSourceBinding,
+) -> &'static str {
+    binding.as_str()
+}
+
+fn wire_active_name_owner_coin(evidence: ActiveNameOwnerCoinEvidence) -> WireActiveNameOwnerCoin {
+    WireActiveNameOwnerCoin {
+        projection_version: evidence.projection_version,
+        chain_epoch: evidence.chain_epoch,
+        tip: WireTip::from(evidence.tip),
+        current_state_hex: hex_encode(&evidence.current_state_bytes),
+        current_state: WireNameState::from(&evidence.current_state),
+        owner_coin: WireCoin::from(&evidence.owner_coin),
+        inclusion: WireInclusion::from(&evidence.inclusion),
+        source_binding: wire_active_name_owner_coin_source_binding(evidence.source_binding),
+    }
+}
+
+#[derive(Serialize)]
 struct WireNameProof {
     root: String,
     name_hash: String,
@@ -2139,6 +2213,176 @@ mod tests {
                         "tree_root": "44".repeat(32),
                     }
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn active_name_owner_coin_request_requires_epoch_and_rejects_extensions() {
+        let request: WalletRpcRequest = serde_json::from_value(serde_json::json!({
+            "api_version": 1,
+            "request_id": "active-name-owner-1",
+            "call": {
+                "method": "active_name_owner_coin",
+                "params": {
+                    "name_hash": "11".repeat(32),
+                    "expected_chain_epoch": 7
+                }
+            }
+        }))
+        .expect("strict active-name-owner request");
+        let WalletRpcCall::ActiveNameOwnerCoin {
+            name_hash,
+            expected_chain_epoch,
+        } = request.call
+        else {
+            panic!("active-name-owner method");
+        };
+        assert_eq!(name_hash, "11".repeat(32));
+        assert_eq!(expected_chain_epoch, 7);
+
+        for invalid_params in [
+            serde_json::json!({
+                "name_hash": "11".repeat(32)
+            }),
+            serde_json::json!({
+                "name_hash": "11".repeat(32),
+                "expected_chain_epoch": 7,
+                "unbound_extension": true
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<WalletRpcRequest>(serde_json::json!({
+                    "api_version": 1,
+                    "call": {
+                        "method": "active_name_owner_coin",
+                        "params": invalid_params
+                    }
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn active_name_owner_coin_wire_projection_is_exact_and_pruning_safe() {
+        let name_hash = NameHash::new([0x11; 32]);
+        let owner = Outpoint {
+            txid: Txid::new([0x22; 32]),
+            index: 2,
+        };
+        let covenant = Covenant {
+            kind: hns_primitives::CovenantKind::Transfer,
+            items: vec![
+                name_hash.as_bytes().to_vec(),
+                12_u32.to_le_bytes().to_vec(),
+                vec![0],
+                vec![0x44; 20],
+            ],
+        };
+        let mut current_state = NameState::null(name_hash);
+        current_state.name = b"alpha".to_vec();
+        current_state.height = 12;
+        current_state.renewal = 15;
+        current_state.owner = owner.clone();
+        current_state.value = 4_200;
+        current_state.highest = 4_300;
+        current_state.data = vec![0xaa, 0xbb];
+        current_state.transfer = 41;
+        current_state.renewals = 3;
+        current_state.registered = true;
+        let current_state_bytes = encode_name_state(&current_state).expect("encode NameState");
+        let coin = Coin {
+            outpoint: owner,
+            value: 4_200,
+            height: 41,
+            coinbase: false,
+            address: Address::new(0, vec![0x55; 20]).expect("address"),
+            covenant,
+        };
+        let projected =
+            serde_json::to_value(wire_active_name_owner_coin(ActiveNameOwnerCoinEvidence {
+                projection_version: ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION,
+                chain_epoch: 17,
+                tip: crate::wallet_backend::WalletChainTip {
+                    hash: hns_primitives::BlockHash::new([0x33; 32]),
+                    height: 50,
+                    median_time_past: 1_700_000_123,
+                    tree_root: hns_state::TreeRoot::new([0x66; 32]),
+                },
+                current_state_bytes: current_state_bytes.clone(),
+                current_state,
+                owner_coin: coin,
+                inclusion: crate::wallet_backend::TransactionInclusion {
+                    block_hash: hns_primitives::BlockHash::new([0x77; 32]),
+                    height: 41,
+                    transaction_position: None,
+                    confirmations: 10,
+                },
+                source_binding: ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+            }))
+            .expect("serialize active-name-owner projection");
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "projection_version": 1,
+                "chain_epoch": 17,
+                "tip": {
+                    "hash": "33".repeat(32),
+                    "height": 50,
+                    "median_time_past": 1_700_000_123u64,
+                    "tree_root": "66".repeat(32)
+                },
+                "current_state_hex": hex_encode(&current_state_bytes),
+                "current_state": {
+                    "name_hash": "11".repeat(32),
+                    "name_hex": "616c706861",
+                    "height": 12,
+                    "renewal": 15,
+                    "owner": {
+                        "txid": "22".repeat(32),
+                        "index": 2
+                    },
+                    "value": 4_200,
+                    "highest": 4_300,
+                    "data_hex": "aabb",
+                    "transfer": 41,
+                    "revoked": 0,
+                    "claimed": 0,
+                    "renewals": 3,
+                    "registered": true,
+                    "expired": false,
+                    "weak": false
+                },
+                "owner_coin": {
+                    "outpoint": {
+                        "txid": "22".repeat(32),
+                        "index": 2
+                    },
+                    "value": 4_200,
+                    "height": 41,
+                    "coinbase": false,
+                    "address": {
+                        "version": 0,
+                        "hash": "55".repeat(20)
+                    },
+                    "covenant": {
+                        "kind": hns_primitives::CovenantKind::Transfer.as_u8(),
+                        "items": [
+                            "11".repeat(32),
+                            "0c000000",
+                            "00",
+                            "44".repeat(20)
+                        ]
+                    }
+                },
+                "inclusion": {
+                    "block_hash": "77".repeat(32),
+                    "height": 41,
+                    "transaction_index": null,
+                    "confirmations": 10
+                },
+                "source_binding": "trusted_node_active_utxo_projection"
             })
         );
     }

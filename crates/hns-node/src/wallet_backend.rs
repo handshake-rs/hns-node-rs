@@ -19,12 +19,13 @@ use hns_mempool::{
 };
 use hns_p2p::{Inventory, LivePeerManager, OutboundPriority, Packet};
 use hns_primitives::{
-    blake2b_256, Address, Block, BlockHash, Coin, Covenant, CovenantKind, Height, NameHash,
-    NameLifecycleState, NameState, Outpoint, Output, Transaction, Txid, Writer,
+    blake2b_256, hash_name, Address, Block, BlockHash, Coin, Covenant, CovenantKind, Height,
+    NameHash, NameLifecycleState, NameState, Outpoint, Output, Transaction, Txid, Writer,
+    MAX_RESOURCE_SIZE,
 };
 use hns_state::{
-    decode_coin, decode_name_state, encode_coin, encode_outpoint_key, load_stored_name_tree_root,
-    prove_persisted_name_tree, TreeRoot,
+    decode_coin, decode_name_state, encode_coin, encode_name_state, encode_outpoint_key,
+    load_stored_name_tree_root, prove_persisted_name_tree, TreeRoot,
 };
 use hns_store::{ColumnFamily, ReadSnapshot, Store};
 use hns_urkel::UrkelProof;
@@ -65,6 +66,8 @@ pub const MAX_WALLET_CONFIRMED_PAGE_ITEMS: usize = MAX_QUERY_ENTRIES;
 pub const MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS: usize = 256;
 /// Version of the bounded incoming-TRANSFER candidate projection.
 pub const INCOMING_TRANSFER_PROJECTION_VERSION: u8 = 1;
+/// Version of the pruning-safe active NameState-owner Coin projection.
+pub const ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION: u8 = 1;
 /// Maximum script-prefix pages examined by one incoming-TRANSFER call.
 pub const MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS: usize = 256;
 /// Maximum distinct retained block bodies decoded by one incoming-TRANSFER call.
@@ -690,6 +693,52 @@ pub struct NameProofResult {
     pub proof: UrkelProof,
 }
 
+/// Strength of the source binding for an active NameState-owner Coin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActiveNameOwnerCoinSourceBinding {
+    /// The exact Coin was loaded from the active UTXO set and corroborated
+    /// against current NameState, the canonical transaction index, and the
+    /// active chain. No retained transaction body or cryptographic output
+    /// proof is implied.
+    TrustedNodeActiveUtxoProjection,
+}
+
+impl ActiveNameOwnerCoinSourceBinding {
+    /// Stable wallet-RPC vocabulary for this evidence strength.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TrustedNodeActiveUtxoProjection => "trusted_node_active_utxo_projection",
+        }
+    }
+}
+
+/// Pruning-safe current NameState and exact active owner Coin evidence.
+///
+/// This is bounded discovery/current-active-UTXO evidence from a trusted node.
+/// It is neither a cryptographic proof that the output bytes produced the
+/// transaction ID nor signing authority. `transaction_position` remains null
+/// because this projection deliberately never loads a retained block body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveNameOwnerCoinEvidence {
+    /// Projection contract version, independent of the wallet RPC envelope.
+    pub projection_version: u8,
+    /// Durable canonical-chain generation containing every field.
+    pub chain_epoch: u64,
+    /// Exact initialized active tip captured in the same immutable snapshot.
+    pub tip: WalletChainTip,
+    /// Exact canonical bytes stored for the current NameState value.
+    pub current_state_bytes: Vec<u8>,
+    /// Decoded current NameState bound to `current_state_bytes` and its key.
+    pub current_state: NameState,
+    /// Exact active UTXO selected by `current_state.owner`.
+    pub owner_coin: Coin,
+    /// Canonical active-chain inclusion; transaction position is unavailable.
+    pub inclusion: TransactionInclusion,
+    /// Explicit trusted-node projection strength.
+    pub source_binding: ActiveNameOwnerCoinSourceBinding,
+}
+
 /// Current and root-bound name evidence from one immutable chain snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NameEvidence {
@@ -936,8 +985,8 @@ pub enum WalletBackendError {
     /// Requested name has no active state in the current chain snapshot.
     #[error("current name state is absent")]
     NameStateMissing,
-    /// Name-action preparation requires an initialized active chain.
-    #[error("name-action context requires an initialized active chain")]
+    /// Current name evidence requires an initialized active chain.
+    #[error("wallet name evidence requires an initialized active chain")]
     ChainUninitialized,
     /// Current owner output index is absent from its transaction.
     #[error("current name owner output is missing")]
@@ -2550,6 +2599,29 @@ impl WalletBackend {
         .await
     }
 
+    /// Return pruning-safe current NameState and active owner Coin evidence.
+    ///
+    /// The expected durable chain epoch is checked inside the immutable
+    /// snapshot before the NameState, UTXO, or transaction index is read. The
+    /// result never loads a raw block body and therefore remains available
+    /// after payload pruning, with a deliberately unavailable transaction
+    /// position. It is trusted-node discovery/current-UTXO evidence only, not
+    /// a transaction-output proof or authorization to spend the Coin.
+    pub async fn get_active_name_owner_coin(
+        &self,
+        name_hash: NameHash,
+        expected_chain_epoch: u64,
+    ) -> Result<ActiveNameOwnerCoinEvidence, WalletBackendError> {
+        if !self.read.transaction_index {
+            return Err(WalletBackendError::IndexDisabled("transaction"));
+        }
+        let read = self.read.clone();
+        blocking_chain_read(read, move |_, snapshot| {
+            active_name_owner_coin_from_snapshot(snapshot, name_hash, expected_chain_epoch)
+        })
+        .await
+    }
+
     /// Read current active name state by canonical name hash.
     pub async fn get_name_state(
         &self,
@@ -3213,6 +3285,248 @@ fn load_block_time<S: ReadSnapshot>(
         .transpose()?;
     cache.insert(block_hash, time);
     Ok(time)
+}
+
+fn active_name_owner_coin_from_snapshot<S: ReadSnapshot>(
+    snapshot: &S,
+    name_hash: NameHash,
+    expected_chain_epoch: u64,
+) -> Result<ActiveNameOwnerCoinEvidence, WalletBackendError> {
+    // Preserve this ordering: a stale caller must be rejected before the
+    // requested name, owner UTXO, or transaction index is touched.
+    let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+    if chain_epoch != expected_chain_epoch {
+        return Err(WalletBackendError::StaleChainEpoch {
+            expected: expected_chain_epoch,
+            actual: chain_epoch,
+        });
+    }
+
+    let tip = wallet_chain_tip(snapshot)?.ok_or(WalletBackendError::ChainUninitialized)?;
+    let current_state_bytes = snapshot
+        .get(ColumnFamily::NameState, name_hash.as_bytes())
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::NameStateMissing)?;
+    let current_state = decode_name_state(&name_hash, &current_state_bytes).map_err(node_error)?;
+    if current_state.is_null()
+        || current_state.name_hash != name_hash
+        || encode_name_state(&current_state).map_err(node_error)? != current_state_bytes
+    {
+        return Err(WalletBackendError::Corrupt(
+            "current name state is not canonically bound to its requested key",
+        ));
+    }
+    let canonical_name = std::str::from_utf8(&current_state.name)
+        .map_err(|_| WalletBackendError::Corrupt("current name state contains a non-ASCII name"))?;
+    if hash_name(canonical_name)
+        .map_err(|_| WalletBackendError::Corrupt("current name state contains an invalid name"))?
+        != name_hash
+    {
+        return Err(WalletBackendError::Corrupt(
+            "current name state name does not hash to its requested key",
+        ));
+    }
+    if current_state.owner.is_null() {
+        return Err(WalletBackendError::NameHasNoOwner);
+    }
+
+    let raw_coin = snapshot
+        .get(
+            ColumnFamily::Utxo,
+            &encode_outpoint_key(&current_state.owner),
+        )
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "current name owner is absent from the active UTXO set",
+        ))?;
+    let owner_coin = decode_coin(&raw_coin)
+        .map_err(|_| WalletBackendError::Corrupt("current name owner UTXO cannot be decoded"))?;
+    if encode_coin(&owner_coin) != raw_coin {
+        return Err(WalletBackendError::Corrupt(
+            "current name owner UTXO is not canonically encoded",
+        ));
+    }
+
+    let Some((transaction_index, inclusion)) =
+        load_transaction_index_and_inclusion(snapshot, current_state.owner.txid)?
+    else {
+        return Err(WalletBackendError::Corrupt(
+            "current name owner transaction is absent from the active index",
+        ));
+    };
+    if current_state.owner.index >= transaction_index.output_count {
+        return Err(WalletBackendError::OwnerOutputMissing);
+    }
+    validate_active_name_owner_coin(&current_state, &owner_coin, &inclusion)?;
+
+    Ok(ActiveNameOwnerCoinEvidence {
+        projection_version: ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION,
+        chain_epoch,
+        tip,
+        current_state_bytes,
+        current_state,
+        owner_coin,
+        inclusion,
+        source_binding: ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+    })
+}
+
+fn validate_active_name_owner_coin(
+    state: &NameState,
+    coin: &Coin,
+    inclusion: &TransactionInclusion,
+) -> Result<(), WalletBackendError> {
+    if coin.outpoint != state.owner
+        || coin.height != inclusion.height
+        || inclusion.transaction_position.is_some()
+    {
+        return Err(WalletBackendError::Corrupt(
+            "current name state, owner UTXO, and transaction inclusion disagree",
+        ));
+    }
+    if state.registered && coin.value != state.value {
+        return Err(WalletBackendError::Corrupt(
+            "registered current name owner value disagrees with current name state",
+        ));
+    }
+    if !matches!(
+        coin.covenant.kind,
+        CovenantKind::Claim
+            | CovenantKind::Reveal
+            | CovenantKind::Register
+            | CovenantKind::Update
+            | CovenantKind::Renew
+            | CovenantKind::Transfer
+            | CovenantKind::Finalize
+    ) || coin.covenant.item_hash(0) != Some(*state.name_hash.as_bytes())
+        || coin.covenant.item_u32(1) != Some(state.height)
+    {
+        return Err(WalletBackendError::Corrupt(
+            "current name owner covenant identity disagrees with current name state",
+        ));
+    }
+
+    match coin.covenant.kind {
+        CovenantKind::Claim => {
+            if !coin.coinbase
+                || state.registered
+                || coin.covenant.items.len() != 6
+                || coin.covenant.item(2) != Some(state.name.as_slice())
+                || coin
+                    .covenant
+                    .item_u8(3)
+                    .is_none_or(|flags| flags & 1 != u8::from(state.weak))
+                || coin.covenant.item_hash(4).is_none()
+                || coin.covenant.item_u32(5) != Some(state.claimed)
+                || state.renewal != coin.height
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "active CLAIM owner coin disagrees with current name state",
+                ));
+            }
+        }
+        CovenantKind::Reveal => {
+            if coin.coinbase
+                || state.registered
+                || coin.covenant.items.len() != 3
+                || coin.covenant.item_hash(2).is_none()
+                || coin.value != state.highest
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "active REVEAL owner coin disagrees with current name state",
+                ));
+            }
+        }
+        CovenantKind::Register => {
+            if coin.coinbase
+                || coin.covenant.items.len() != 4
+                || coin.covenant.item(2).is_none_or(|data| {
+                    data.len() > MAX_RESOURCE_SIZE || (!data.is_empty() && data != state.data)
+                })
+                || coin.covenant.item_hash(3).is_none()
+                || !state.registered
+                || state.transfer != 0
+                || state.renewal != coin.height
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "active REGISTER owner coin disagrees with current name state",
+                ));
+            }
+        }
+        CovenantKind::Update => {
+            if coin.coinbase
+                || coin.covenant.items.len() != 3
+                || coin.covenant.item(2).is_none_or(|data| {
+                    data.len() > MAX_RESOURCE_SIZE || (!data.is_empty() && data != state.data)
+                })
+                || !state.registered
+                || state.transfer != 0
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "active UPDATE owner coin disagrees with current name state",
+                ));
+            }
+        }
+        CovenantKind::Renew => {
+            if coin.coinbase
+                || coin.covenant.items.len() != 3
+                || coin.covenant.item_hash(2).is_none()
+                || !state.registered
+                || state.transfer != 0
+                || state.renewal != coin.height
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "active RENEW owner coin disagrees with current name state",
+                ));
+            }
+        }
+        CovenantKind::Transfer => {
+            if coin.coinbase
+                || !state.registered
+                || coin.covenant.items.len() != 4
+                || coin.covenant.item_u8(2).is_none_or(|version| version > 31)
+                || coin
+                    .covenant
+                    .item(3)
+                    .is_none_or(|recipient| !(2..=40).contains(&recipient.len()))
+                || state.transfer == 0
+                || state.transfer != coin.height
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "active TRANSFER owner coin disagrees with current name state",
+                ));
+            }
+        }
+        CovenantKind::Finalize => {
+            let prior_renewals = coin.covenant.item_u32(5);
+            if coin.coinbase
+                || !state.registered
+                || coin.covenant.items.len() != 7
+                || coin.covenant.item(2) != Some(state.name.as_slice())
+                || coin
+                    .covenant
+                    .item_u8(3)
+                    .is_none_or(|flags| flags & 1 != u8::from(state.weak))
+                || coin.covenant.item_u32(4) != Some(state.claimed)
+                || prior_renewals.and_then(|renewals| renewals.checked_add(1))
+                    != Some(state.renewals)
+                || coin.covenant.item_hash(6).is_none()
+                || state.transfer != 0
+                || state.renewal != coin.height
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "active FINALIZE owner coin disagrees with current name state",
+                ));
+            }
+        }
+        _ if state.transfer != 0 => {
+            return Err(WalletBackendError::Corrupt(
+                "non-TRANSFER owner coin backs a pending-transfer name state",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn load_current_name_state<S: ReadSnapshot>(
@@ -3929,7 +4243,7 @@ mod tests {
     use hns_mempool::MemoryMempool;
     use hns_p2p::LivePeerConfig;
     use hns_primitives::{Address, CovenantKind, Header, Input, Outpoint, Uint256, Witness};
-    use hns_state::{encode_coin, write_coin_to_batch};
+    use hns_state::{encode_coin, write_coin_to_batch, write_name_state_to_batch};
     use hns_store::{
         encode_u64, MemoryStore, MetaKey, PrefixScanBudget, PrefixScanPage, ReadSnapshot,
         ScanEntry, Store, StoreError, WriteBatch,
@@ -3947,6 +4261,9 @@ mod tests {
         inner: S,
         prefix_pages: Cell<usize>,
         block_gets: Cell<usize>,
+        name_state_gets: Cell<usize>,
+        utxo_gets: Cell<usize>,
+        tx_index_gets: Cell<usize>,
     }
 
     impl<S> IncomingReadCountingSnapshot<S> {
@@ -3955,6 +4272,9 @@ mod tests {
                 inner,
                 prefix_pages: Cell::new(0),
                 block_gets: Cell::new(0),
+                name_state_gets: Cell::new(0),
+                utxo_gets: Cell::new(0),
+                tx_index_gets: Cell::new(0),
             }
         }
     }
@@ -3963,6 +4283,17 @@ mod tests {
         fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
             if family == ColumnFamily::Blocks {
                 self.block_gets.set(self.block_gets.get().saturating_add(1));
+            }
+            if family == ColumnFamily::NameState {
+                self.name_state_gets
+                    .set(self.name_state_gets.get().saturating_add(1));
+            }
+            if family == ColumnFamily::Utxo {
+                self.utxo_gets.set(self.utxo_gets.get().saturating_add(1));
+            }
+            if family == ColumnFamily::TxIndex {
+                self.tx_index_gets
+                    .set(self.tx_index_gets.get().saturating_add(1));
             }
             self.inner.get(family, key)
         }
@@ -4123,6 +4454,245 @@ mod tests {
                 tree_root: TreeRoot::ZERO,
             },
         )
+    }
+
+    #[derive(Clone, Copy)]
+    enum ActiveNameOwnerFixtureKind {
+        Transfer,
+        Finalize,
+    }
+
+    struct ActiveNameOwnerFixture {
+        store: MemoryStore,
+        chain_epoch: u64,
+        name_hash: NameHash,
+        state: NameState,
+        state_bytes: Vec<u8>,
+        coin: Coin,
+        inclusion: TransactionInclusion,
+        owner_block_hash: BlockHash,
+    }
+
+    fn active_name_owner_fixture(
+        kind: ActiveNameOwnerFixtureKind,
+        owner_body_present: bool,
+        write_owner_body: bool,
+    ) -> ActiveNameOwnerFixture {
+        const CHAIN_EPOCH: u64 = 7;
+        const OWNER_HEIGHT: Height = 1;
+        let name = b"alpha".to_vec();
+        let name_hash = hash_name("alpha").expect("fixture name hash");
+        let start_height = 0_u32;
+        let covenant = match kind {
+            ActiveNameOwnerFixtureKind::Transfer => Covenant {
+                kind: CovenantKind::Transfer,
+                items: vec![
+                    name_hash.as_bytes().to_vec(),
+                    start_height.to_le_bytes().to_vec(),
+                    vec![0],
+                    vec![0x41; 20],
+                ],
+            },
+            ActiveNameOwnerFixtureKind::Finalize => Covenant {
+                kind: CovenantKind::Finalize,
+                items: vec![
+                    name_hash.as_bytes().to_vec(),
+                    start_height.to_le_bytes().to_vec(),
+                    name.clone(),
+                    vec![0],
+                    0_u32.to_le_bytes().to_vec(),
+                    0_u32.to_le_bytes().to_vec(),
+                    vec![0x42; 32],
+                ],
+            },
+        };
+        let owner_output = Output {
+            value: 50,
+            address: Address::new(0, vec![0x21; 20]).expect("fixture owner address"),
+            covenant,
+        };
+        let owner_transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    txid: Txid::new([0x17; 32]),
+                    index: 0,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![owner_output.clone()],
+            locktime: 0,
+        };
+
+        let genesis_transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: 1,
+                address: Address::new(0, vec![0x10; 20]).expect("genesis address"),
+                covenant: Covenant {
+                    kind: CovenantKind::None,
+                    items: Vec::new(),
+                },
+            }],
+            locktime: 0,
+        };
+        let mut genesis = Block {
+            header: Header {
+                time: 1,
+                ..Header::default()
+            },
+            transactions: vec![genesis_transaction],
+        };
+        genesis.header.merkle_root = block_merkle_root(&genesis);
+        genesis.header.witness_root = block_witness_root(&genesis);
+        let genesis_hash = genesis.hash();
+
+        let mut owner_block = Block {
+            header: Header {
+                prev_block: genesis_hash,
+                time: 2,
+                ..Header::default()
+            },
+            transactions: vec![owner_transaction.clone()],
+        };
+        owner_block.header.merkle_root = block_merkle_root(&owner_block);
+        owner_block.header.witness_root = block_witness_root(&owner_block);
+        let owner_block_hash = owner_block.hash();
+        let owner_outpoint = Outpoint {
+            txid: owner_transaction.txid(),
+            index: 0,
+        };
+        let coin = Coin {
+            outpoint: owner_outpoint.clone(),
+            value: owner_output.value,
+            height: OWNER_HEIGHT,
+            coinbase: false,
+            address: owner_output.address,
+            covenant: owner_output.covenant,
+        };
+        let mut state = NameState::null(name_hash);
+        state.name = name;
+        state.height = start_height;
+        state.owner = owner_outpoint;
+        state.value = coin.value;
+        state.highest = coin.value;
+        state.registered = true;
+        match kind {
+            ActiveNameOwnerFixtureKind::Transfer => {
+                state.transfer = OWNER_HEIGHT;
+            }
+            ActiveNameOwnerFixtureKind::Finalize => {
+                state.renewal = OWNER_HEIGHT;
+                state.renewals = 1;
+            }
+        }
+        let state_bytes = encode_name_state(&state).expect("encode fixture NameState");
+
+        let genesis_status = incoming_transfer_authoritative_status(true);
+        let owner_status = incoming_transfer_authoritative_status(owner_body_present);
+        let genesis_index = BlockIndexRecord {
+            hash: genesis_hash,
+            height: 0,
+            prev_hash: BlockHash::ZERO,
+            chainwork: Uint256::ONE,
+            status: genesis_status.clone(),
+            tx_count: 1,
+            validated_at: None,
+        };
+        let owner_index = BlockIndexRecord {
+            hash: owner_block_hash,
+            height: OWNER_HEIGHT,
+            prev_hash: genesis_hash,
+            chainwork: Uint256::ONE,
+            status: owner_status.clone(),
+            tx_count: 1,
+            validated_at: None,
+        };
+        let genesis_header = HeaderRecord {
+            hash: genesis_hash,
+            height: 0,
+            chainwork: genesis_index.chainwork,
+            header: genesis.header.clone(),
+            status: genesis_status,
+        };
+        let owner_header = HeaderRecord {
+            hash: owner_block_hash,
+            height: OWNER_HEIGHT,
+            chainwork: owner_index.chainwork,
+            header: owner_block.header.clone(),
+            status: owner_status,
+        };
+
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        write_record_to_batch(&mut batch, &genesis_header).expect("write genesis header");
+        write_record_to_batch(&mut batch, &owner_header).expect("write owner header");
+        write_block_index_to_batch(&mut batch, &genesis_index).expect("write genesis index");
+        write_block_index_to_batch(&mut batch, &owner_index).expect("write owner index");
+        write_canonical_height_to_batch(&mut batch, 0, genesis_hash)
+            .expect("write canonical genesis");
+        write_canonical_height_to_batch(&mut batch, OWNER_HEIGHT, owner_block_hash)
+            .expect("write canonical owner block");
+        write_tx_index_for_block_to_batch(&mut batch, &owner_block, OWNER_HEIGHT)
+            .expect("write owner transaction index");
+        write_coin_to_batch(&mut batch, &coin).expect("write active owner UTXO");
+        write_name_state_to_batch(&mut batch, &state).expect("write current NameState");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::BestBlockHash.as_bytes(),
+                owner_block_hash.as_bytes(),
+            )
+            .expect("write best block");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::ChainEpoch.as_bytes(),
+                &encode_u64(CHAIN_EPOCH),
+            )
+            .expect("write chain epoch");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                TreeRoot::ZERO.as_bytes(),
+            )
+            .expect("write name tree root");
+        write_raw_block_to_batch(
+            &mut batch,
+            &RawBlockRecord::from_block(&genesis, RawBlockSource::Fixture),
+        )
+        .expect("write genesis body");
+        if write_owner_body {
+            write_raw_block_to_batch(
+                &mut batch,
+                &RawBlockRecord::from_block(&owner_block, RawBlockSource::Fixture),
+            )
+            .expect("write owner body");
+        }
+        store.commit(batch).expect("commit active owner fixture");
+
+        ActiveNameOwnerFixture {
+            store,
+            chain_epoch: CHAIN_EPOCH,
+            name_hash,
+            state,
+            state_bytes,
+            coin,
+            inclusion: TransactionInclusion {
+                block_hash: owner_block_hash,
+                height: OWNER_HEIGHT,
+                transaction_position: None,
+                confirmations: 1,
+            },
+            owner_block_hash,
+        }
     }
 
     fn incoming_transfer_recipient_script(recipient: u8) -> ScriptId {
@@ -4633,6 +5203,437 @@ mod tests {
     }
 
     #[test]
+    fn active_name_owner_coin_is_pruning_safe_and_never_reads_blocks() {
+        for kind in [
+            ActiveNameOwnerFixtureKind::Transfer,
+            ActiveNameOwnerFixtureKind::Finalize,
+        ] {
+            for (body_present, write_body) in [(true, true), (false, false)] {
+                let fixture = active_name_owner_fixture(kind, body_present, write_body);
+                let snapshot = IncomingReadCountingSnapshot::new(
+                    fixture.store.snapshot().expect("active owner snapshot"),
+                );
+                let evidence = active_name_owner_coin_from_snapshot(
+                    &snapshot,
+                    fixture.name_hash,
+                    fixture.chain_epoch,
+                )
+                .expect("pruning-safe active owner evidence");
+                assert_eq!(
+                    evidence.projection_version,
+                    ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION
+                );
+                assert_eq!(evidence.chain_epoch, fixture.chain_epoch);
+                assert_eq!(evidence.tip.hash, fixture.owner_block_hash);
+                assert_eq!(evidence.tip.height, fixture.inclusion.height);
+                assert_eq!(evidence.current_state_bytes, fixture.state_bytes);
+                assert_eq!(evidence.current_state, fixture.state);
+                assert_eq!(evidence.owner_coin, fixture.coin);
+                assert_eq!(evidence.inclusion, fixture.inclusion);
+                assert_eq!(evidence.inclusion.transaction_position, None);
+                assert_eq!(
+                    evidence.source_binding,
+                    ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection
+                );
+                assert_eq!(snapshot.block_gets.get(), 0);
+                assert_eq!(snapshot.name_state_gets.get(), 1);
+                assert_eq!(snapshot.utxo_gets.get(), 1);
+                assert_eq!(snapshot.tx_index_gets.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn active_name_owner_coin_checks_epoch_before_authority_reads() {
+        let fixture = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Finalize, true, true);
+        let snapshot = IncomingReadCountingSnapshot::new(
+            fixture.store.snapshot().expect("active owner snapshot"),
+        );
+        assert!(matches!(
+            active_name_owner_coin_from_snapshot(
+                &snapshot,
+                fixture.name_hash,
+                fixture.chain_epoch.saturating_add(1),
+            ),
+            Err(WalletBackendError::StaleChainEpoch {
+                expected,
+                actual,
+            }) if expected == fixture.chain_epoch + 1 && actual == fixture.chain_epoch
+        ));
+        assert_eq!(snapshot.name_state_gets.get(), 0);
+        assert_eq!(snapshot.utxo_gets.get(), 0);
+        assert_eq!(snapshot.tx_index_gets.get(), 0);
+        assert_eq!(snapshot.block_gets.get(), 0);
+    }
+
+    #[test]
+    fn active_name_owner_coin_rejects_missing_or_mismatched_active_utxo_and_name_key() {
+        let missing = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Finalize, false, false);
+        let mut batch = missing.store.batch();
+        batch
+            .delete(
+                ColumnFamily::Utxo,
+                &encode_outpoint_key(&missing.coin.outpoint),
+            )
+            .expect("delete owner UTXO");
+        missing.store.commit(batch).expect("commit missing UTXO");
+        assert!(matches!(
+            active_name_owner_coin_from_snapshot(
+                &missing.store.snapshot().expect("missing UTXO snapshot"),
+                missing.name_hash,
+                missing.chain_epoch,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+
+        let mismatched =
+            active_name_owner_fixture(ActiveNameOwnerFixtureKind::Finalize, false, false);
+        let mut wrong_coin = mismatched.coin.clone();
+        wrong_coin.value = wrong_coin.value.saturating_add(1);
+        let mut batch = mismatched.store.batch();
+        write_coin_to_batch(&mut batch, &wrong_coin).expect("rewrite mismatched owner UTXO");
+        mismatched
+            .store
+            .commit(batch)
+            .expect("commit mismatched owner UTXO");
+        assert!(matches!(
+            active_name_owner_coin_from_snapshot(
+                &mismatched
+                    .store
+                    .snapshot()
+                    .expect("mismatched UTXO snapshot"),
+                mismatched.name_hash,
+                mismatched.chain_epoch,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+
+        let wrong_outpoint =
+            active_name_owner_fixture(ActiveNameOwnerFixtureKind::Finalize, false, false);
+        let mut wrong_coin = wrong_outpoint.coin.clone();
+        wrong_coin.outpoint.index = wrong_coin.outpoint.index.saturating_add(1);
+        let mut batch = wrong_outpoint.store.batch();
+        batch
+            .put(
+                ColumnFamily::Utxo,
+                &encode_outpoint_key(&wrong_outpoint.coin.outpoint),
+                &encode_coin(&wrong_coin),
+            )
+            .expect("rewrite key-mismatched owner UTXO");
+        wrong_outpoint
+            .store
+            .commit(batch)
+            .expect("commit key-mismatched owner UTXO");
+        assert!(matches!(
+            active_name_owner_coin_from_snapshot(
+                &wrong_outpoint
+                    .store
+                    .snapshot()
+                    .expect("key-mismatched UTXO snapshot"),
+                wrong_outpoint.name_hash,
+                wrong_outpoint.chain_epoch,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+
+        let mismatched_name =
+            active_name_owner_fixture(ActiveNameOwnerFixtureKind::Finalize, false, false);
+        let mut wrong_state = mismatched_name.state.clone();
+        wrong_state.name = b"bravo".to_vec();
+        let mut batch = mismatched_name.store.batch();
+        write_name_state_to_batch(&mut batch, &wrong_state)
+            .expect("rewrite name-key-mismatched state");
+        mismatched_name
+            .store
+            .commit(batch)
+            .expect("commit name-key mismatch");
+        assert!(matches!(
+            active_name_owner_coin_from_snapshot(
+                &mismatched_name
+                    .store
+                    .snapshot()
+                    .expect("name-key mismatch snapshot"),
+                mismatched_name.name_hash,
+                mismatched_name.chain_epoch,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn active_name_owner_coin_rejects_noncanonical_transaction_index() {
+        let missing = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        let mut batch = missing.store.batch();
+        batch
+            .delete(ColumnFamily::TxIndex, missing.coin.outpoint.txid.as_bytes())
+            .expect("delete owner transaction index");
+        missing
+            .store
+            .commit(batch)
+            .expect("commit missing transaction index");
+        assert!(matches!(
+            active_name_owner_coin_from_snapshot(
+                &missing
+                    .store
+                    .snapshot()
+                    .expect("missing transaction-index snapshot"),
+                missing.name_hash,
+                missing.chain_epoch,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+
+        let reorged = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        let mut batch = reorged.store.batch();
+        write_canonical_height_to_batch(
+            &mut batch,
+            reorged.coin.height,
+            BlockHash::new([0x91; 32]),
+        )
+        .expect("rewrite canonical owner height");
+        reorged
+            .store
+            .commit(batch)
+            .expect("commit canonical mismatch");
+        assert!(matches!(
+            active_name_owner_coin_from_snapshot(
+                &reorged.store.snapshot().expect("reorged snapshot"),
+                reorged.name_hash,
+                reorged.chain_epoch,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+
+        let wrong_txid =
+            active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        let snapshot = wrong_txid
+            .store
+            .snapshot()
+            .expect("transaction index snapshot");
+        let mut transaction_index = TxIndexEntry::decode(
+            &snapshot
+                .get(
+                    ColumnFamily::TxIndex,
+                    wrong_txid.coin.outpoint.txid.as_bytes(),
+                )
+                .expect("transaction index read")
+                .expect("transaction index"),
+        )
+        .expect("decode transaction index");
+        drop(snapshot);
+        transaction_index.txid = Txid::new([0x92; 32]);
+        let mut batch = wrong_txid.store.batch();
+        batch
+            .put(
+                ColumnFamily::TxIndex,
+                wrong_txid.coin.outpoint.txid.as_bytes(),
+                &transaction_index.encode(),
+            )
+            .expect("rewrite mismatched transaction index");
+        wrong_txid
+            .store
+            .commit(batch)
+            .expect("commit transaction-index mismatch");
+        assert!(matches!(
+            active_name_owner_coin_from_snapshot(
+                &wrong_txid
+                    .store
+                    .snapshot()
+                    .expect("transaction-index mismatch snapshot"),
+                wrong_txid.name_hash,
+                wrong_txid.chain_epoch,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn active_name_owner_coin_binds_transfer_and_finalize_state() {
+        let transfer =
+            active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        assert!(validate_active_name_owner_coin(
+            &transfer.state,
+            &transfer.coin,
+            &transfer.inclusion,
+        )
+        .is_ok());
+        let mut wrong_transfer = transfer.state.clone();
+        wrong_transfer.transfer = 0;
+        assert!(matches!(
+            validate_active_name_owner_coin(&wrong_transfer, &transfer.coin, &transfer.inclusion,),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+        let mut unregistered_transfer = transfer.state.clone();
+        unregistered_transfer.registered = false;
+        assert!(matches!(
+            validate_active_name_owner_coin(
+                &unregistered_transfer,
+                &transfer.coin,
+                &transfer.inclusion,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+        let mut coinbase_transfer = transfer.coin.clone();
+        coinbase_transfer.coinbase = true;
+        assert!(matches!(
+            validate_active_name_owner_coin(
+                &transfer.state,
+                &coinbase_transfer,
+                &transfer.inclusion,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+
+        let finalized =
+            active_name_owner_fixture(ActiveNameOwnerFixtureKind::Finalize, false, false);
+        assert!(validate_active_name_owner_coin(
+            &finalized.state,
+            &finalized.coin,
+            &finalized.inclusion,
+        )
+        .is_ok());
+        let mut invalid = Vec::new();
+
+        let mut state = finalized.state.clone();
+        state.transfer = finalized.coin.height;
+        invalid.push((state, finalized.coin.clone()));
+
+        let mut state = finalized.state.clone();
+        state.renewal = 0;
+        invalid.push((state, finalized.coin.clone()));
+
+        let mut state = finalized.state.clone();
+        state.registered = false;
+        invalid.push((state, finalized.coin.clone()));
+
+        let mut coin = finalized.coin.clone();
+        coin.coinbase = true;
+        invalid.push((finalized.state.clone(), coin));
+
+        let mut coin = finalized.coin.clone();
+        coin.covenant.items[0] = vec![0x93; 32];
+        invalid.push((finalized.state.clone(), coin));
+
+        let mut coin = finalized.coin.clone();
+        coin.covenant.items[1] = 2_u32.to_le_bytes().to_vec();
+        invalid.push((finalized.state.clone(), coin));
+
+        let mut coin = finalized.coin.clone();
+        coin.covenant.items[2] = b"bravo".to_vec();
+        invalid.push((finalized.state.clone(), coin));
+
+        let mut coin = finalized.coin.clone();
+        coin.covenant.items[3] = vec![1];
+        invalid.push((finalized.state.clone(), coin));
+
+        let mut coin = finalized.coin.clone();
+        coin.covenant.items[4] = 1_u32.to_le_bytes().to_vec();
+        invalid.push((finalized.state.clone(), coin));
+
+        let mut coin = finalized.coin.clone();
+        coin.covenant.items[5] = 1_u32.to_le_bytes().to_vec();
+        invalid.push((finalized.state.clone(), coin));
+
+        let mut coin = finalized.coin.clone();
+        coin.value = coin.value.saturating_add(1);
+        invalid.push((finalized.state.clone(), coin));
+
+        for (state, coin) in invalid {
+            assert!(matches!(
+                validate_active_name_owner_coin(&state, &coin, &finalized.inclusion),
+                Err(WalletBackendError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn active_name_owner_coin_enforces_regular_covenant_shapes_and_coinbase_origin() {
+        let fixture = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Finalize, false, false);
+        let name_hash = fixture.name_hash.as_bytes().to_vec();
+        let start = fixture.state.height.to_le_bytes().to_vec();
+        let mut valid = Vec::new();
+
+        let mut state = fixture.state.clone();
+        state.registered = false;
+        state.value = 0;
+        state.highest = 0;
+        state.claimed = 5;
+        state.renewals = 0;
+        state.weak = true;
+        let mut coin = fixture.coin.clone();
+        coin.coinbase = true;
+        coin.covenant = Covenant {
+            kind: CovenantKind::Claim,
+            items: vec![
+                name_hash.clone(),
+                start.clone(),
+                state.name.clone(),
+                vec![1],
+                vec![0x41; 32],
+                state.claimed.to_le_bytes().to_vec(),
+            ],
+        };
+        valid.push((state, coin));
+
+        let mut state = fixture.state.clone();
+        state.registered = false;
+        state.value = 0;
+        state.highest = fixture.coin.value;
+        state.renewal = 0;
+        state.claimed = 0;
+        state.renewals = 0;
+        let mut coin = fixture.coin.clone();
+        coin.covenant = Covenant {
+            kind: CovenantKind::Reveal,
+            items: vec![name_hash.clone(), start.clone(), vec![0x42; 32]],
+        };
+        valid.push((state, coin));
+
+        let mut state = fixture.state.clone();
+        state.renewals = 0;
+        let mut coin = fixture.coin.clone();
+        coin.covenant = Covenant {
+            kind: CovenantKind::Register,
+            items: vec![name_hash.clone(), start.clone(), Vec::new(), vec![0x43; 32]],
+        };
+        valid.push((state, coin));
+
+        let state = fixture.state.clone();
+        let mut coin = fixture.coin.clone();
+        coin.covenant = Covenant {
+            kind: CovenantKind::Update,
+            items: vec![name_hash.clone(), start.clone(), Vec::new()],
+        };
+        valid.push((state, coin));
+
+        let state = fixture.state.clone();
+        let mut coin = fixture.coin.clone();
+        coin.covenant = Covenant {
+            kind: CovenantKind::Renew,
+            items: vec![name_hash, start, vec![0x44; 32]],
+        };
+        valid.push((state, coin));
+
+        for (state, coin) in valid {
+            assert!(validate_active_name_owner_coin(&state, &coin, &fixture.inclusion).is_ok());
+
+            let mut malformed = coin.clone();
+            malformed.covenant.items.push(Vec::new());
+            assert!(matches!(
+                validate_active_name_owner_coin(&state, &malformed, &fixture.inclusion),
+                Err(WalletBackendError::Corrupt(_))
+            ));
+
+            let mut wrong_origin = coin;
+            wrong_origin.coinbase = !wrong_origin.coinbase;
+            assert!(matches!(
+                validate_active_name_owner_coin(&state, &wrong_origin, &fixture.inclusion),
+                Err(WalletBackendError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
     fn name_action_eligibility_uses_fixed_bounded_candidate_reasons() {
         let mut state = NameState::null(NameHash::new([0x31; 32]));
         state.height = 1;
@@ -4720,6 +5721,21 @@ mod tests {
         assert_eq!(unknown.inclusion, None);
         assert_eq!(unknown.payload, TransactionPayload::Absent);
         assert_eq!(unknown.tip, None);
+        assert!(matches!(
+            backend
+                .get_active_name_owner_coin(
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch.saturating_add(1),
+                )
+                .await,
+            Err(WalletBackendError::StaleChainEpoch { .. })
+        ));
+        assert!(matches!(
+            backend
+                .get_active_name_owner_coin(NameHash::new([8; 32]), unknown.chain_epoch)
+                .await,
+            Err(WalletBackendError::ChainUninitialized)
+        ));
         assert!(matches!(
             backend
                 .get_name_action_context(

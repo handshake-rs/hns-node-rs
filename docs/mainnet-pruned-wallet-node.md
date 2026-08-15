@@ -422,6 +422,21 @@ transactions older than the 288-block payload horizon can therefore be
 unavailable, so the wallet must retain every signed transaction and any raw
 owner transactions needed to construct future name actions.
 
+Payload pruning does not prevent a bound point lookup of the current
+NameState-owner Coin. After `chain_snapshot`, call
+`active_name_owner_coin` with the name hash and required
+`expected_chain_epoch`. The node checks the epoch before reading the current
+NameState, active UTXO, or transaction index, and returns projection version 1,
+canonical `current_state_hex`, the exact decoded state and active `owner_coin`,
+canonical inclusion, and the non-null exact tip from one immutable snapshot.
+The method never loads the raw block, so `inclusion.transaction_index` is
+`null` and the source is always
+`trusted_node_active_utxo_projection`. This is trusted-node active-state
+discovery, not a cryptographic Coin-to-txid proof, a recovered owner
+transaction, signing authority, or permission to prepare or publish an action.
+Wallets still need their own retained transaction bytes or an archive source
+whenever transaction construction requires the owner preimage.
+
 The authenticated `incoming_transfers_page` method exposes the retained compact
 state as bounded candidate discovery. After obtaining `chain_epoch` from
 `chain_snapshot`, a wallet requests its complete sorted-unique recipient

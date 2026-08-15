@@ -95,6 +95,7 @@ wire. Transaction policy rejection text is bounded to 256 characters.
 | `spending_transaction` | `txid`, `output_index`, required `expected_chain_epoch` | One-entry ordered active-chain spender evidence bound to one chain epoch/tip. |
 | `spending_transactions` | `outpoints` (1..=256 ordered `{txid, output_index}` values), required `expected_chain_epoch` | Exactly one optional spender entry per requested outpoint, in request order, from one immutable chain snapshot with one epoch/tip binding. |
 | `name_evidence` | `name_hash`, required `expected_chain_epoch` | Canonical encoded current/proof state bytes, separate projected hints and owners, tip/root, and canonical proof hex from one chain snapshot. |
+| `active_name_owner_coin` | `name_hash`, required `expected_chain_epoch` | Version-1 current NameState bytes and exact active owner Coin, canonical inclusion, epoch, and non-null exact tip from one immutable pruning-safe read. |
 | `name_action_context` | `action` (`transfer` or `finalize`), `name_hash`, required `expected_chain_epoch`, required exact `expected_mempool` | Versioned candidate-height context containing stable chain identity, canonical current state and owner, exact owner-mempool-spender evidence, transfer maturity, HSD-selected active-chain renewal block, and a fixed bounded eligibility decision from one chain/mempool generation. |
 | `broadcast_transaction` | `transaction_hex` | Canonical contextual admission followed by actual live-peer inventory fanout counts. The node never signs. |
 | `estimate_fee_rate` | `target_blocks` | Bounded deterministic estimate and its sample/source evidence. |
@@ -144,12 +145,14 @@ pair and any restart or generation change fails with `stale_snapshot`. Omitting
 capture; the response still returns its actual nonce and generation.
 
 After `chain_snapshot` establishes the durable epoch, `block_hash`, name
-evidence, spender evidence, and confirmed tracked-contract pages require
-`expected_chain_epoch`. A mismatch is rejected before wire projection. Every
-response retains the complete captured tip so the adapter can also require exact
-tip equality. Confirmed restoration still returns the same binding on every
-page and rejects a pre-scan reorganization; it no longer needs to be the first
-request that reveals the epoch.
+evidence, active-name-owner Coin evidence, spender evidence, and confirmed
+tracked-contract pages require `expected_chain_epoch`. A mismatch is rejected
+before wire projection. The active-name-owner comparison occurs before its
+NameState, UTXO, or transaction-index authority reads. Every response retains
+the complete captured tip so the adapter can also require exact tip equality.
+Confirmed restoration still returns the same binding on every page and rejects
+a pre-scan reorganization; it no longer needs to be the first request that
+reveals the epoch.
 
 Every non-null `tip` object contains `hash`, `height`, `median_time_past`, and
 `tree_root`. `median_time_past` is the median timestamp of the active tip and up
@@ -366,6 +369,91 @@ hints, `name_hex` is the name and `data_hex` is only the resource-data field,
 not an encoded NameState. Resource semantics remain opaque until a published
 canonical decoder is available.
 
+## Active current name-owner Coin
+
+`active_name_owner_coin` is the pruning-safe point read for the owner outpoint
+named by the current NameState. It requires the epoch already obtained from
+`chain_snapshot`:
+
+```json
+{
+  "api_version": 1,
+  "request_id": "active-owner-alpha-1",
+  "call": {
+    "method": "active_name_owner_coin",
+    "params": {
+      "name_hash": "<64 hex characters>",
+      "expected_chain_epoch": 42
+    }
+  }
+}
+```
+
+A successful version-1 result has this shape:
+
+```json
+{
+  "projection_version": 1,
+  "chain_epoch": 42,
+  "tip": {
+    "hash": "<64 hex characters>",
+    "height": 100000,
+    "median_time_past": 1700000123,
+    "tree_root": "<64 hex characters>"
+  },
+  "current_state_hex": "<canonical encoded current NameState hex>",
+  "current_state": {
+    "name_hash": "<64 hex characters>",
+    "name_hex": "<hex>",
+    "height": 12345,
+    "renewal": 90000,
+    "owner": {"txid": "<64 hex characters>", "index": 0},
+    "value": 1000000,
+    "highest": 1000000,
+    "data_hex": "<hex>",
+    "transfer": 99713,
+    "revoked": 0,
+    "claimed": 0,
+    "renewals": 1,
+    "registered": true,
+    "expired": false,
+    "weak": false
+  },
+  "owner_coin": {
+    "outpoint": {"txid": "<64 hex characters>", "index": 0},
+    "value": 1000000,
+    "height": 99713,
+    "coinbase": false,
+    "address": {"version": 0, "hash": "<hex>"},
+    "covenant": {"kind": 9, "items": ["<canonical covenant item hex>"]}
+  },
+  "inclusion": {
+    "block_hash": "<64 hex characters>",
+    "height": 99713,
+    "transaction_index": null,
+    "confirmations": 288
+  },
+  "source_binding": "trusted_node_active_utxo_projection"
+}
+```
+
+The backend reads all fields from one immutable snapshot and returns an exact,
+non-null tip. It verifies canonical NameState bytes and key/name binding, the
+NameState owner against the byte-exact active UTXO, the UTXO against a
+canonical transaction-index inclusion, and the name hash, start height, locked
+value, and TRANSFER or FINALIZE state/covenant linkage. It never loads a raw
+block or owner transaction. Consequently it remains available after payload
+pruning; `transaction_index` is deliberately `null` because this method does
+not derive a transaction ordinal from retained body bytes.
+
+`trusted_node_active_utxo_projection` identifies a current active-state
+discovery boundary. The result is not an Urkel proof, a cryptographic binding
+of the Coin bytes to its txid, an owner transaction preimage, signing authority,
+or permission to construct, finalize, sign, or broadcast a name action. Preserve
+the source label, compare both epoch and complete tip with the wallet's binding,
+and obtain any required transaction bytes from the wallet's own durable store
+or an archive source.
+
 ## Name-action context
 
 `name_action_context` supplies public construction evidence for exactly one
@@ -524,11 +612,11 @@ never substitutes zero for unavailable time.
 Confirmed transaction inclusion carries `transaction_index` as a nullable
 exact value. The current durable transaction index stores byte offset and
 length, not the transaction ordinal. The node derives the ordinal by enumerating
-retained block transactions; consequently owner evidence always carries it,
-while a pruned transaction remains valid confirmed evidence with
-`transaction_index: null`. A client must preserve that unavailable state and
-must not invent zero. Adding a durable ordinal requires a separately designed
-storage migration, not a wire shortcut.
+retained block transactions. Methods that actually load retained
+owner-transaction bytes carry it; `active_name_owner_coin` deliberately does
+not load those bytes and therefore carries `transaction_index: null`. A client
+must preserve that unavailable state and must not invent zero. Adding a durable
+ordinal requires a separately designed storage migration, not a wire shortcut.
 
 ## Tracked contracts
 

@@ -221,6 +221,12 @@ Therefore:
 
 - transaction inclusion, confirmation, script history, script UTXOs, spender
   lookup, name state, and current name proof continue to work;
+- `WalletBackend::get_active_name_owner_coin` continues to return the canonical
+  current NameState bytes, byte-exact active owner UTXO Coin, canonical
+  transaction-index inclusion, durable epoch, and exact tip. It performs no raw
+  block or owner-transaction read, so its inclusion transaction position is
+  explicitly absent and its source is labeled
+  `trusted_node_active_utxo_projection`;
 - raw confirmed transactions generally require the containing raw block and
   return `PayloadPruned` when it is gone. Profile-v4 incoming-TRANSFER evidence
   deliberately does not retain or reconstruct the raw owner transaction;
@@ -321,6 +327,7 @@ and the live peer manager. It implements:
 - `get_name_state`
 - `get_name_proof`
 - `get_name_evidence`
+- `get_active_name_owner_coin`
 - `get_name_action_context`
 - `get_name_owner_transaction`
 
@@ -366,6 +373,21 @@ current and proof states differ; the API labels both instead of implying that
 the persisted proof authenticates pending state. Owner output and transaction
 inclusion are resolved in the same store snapshot. `get_name_proof` also
 returns its atomically captured tip.
+
+`get_active_name_owner_coin` is the narrower pruning-safe current-owner point
+read. It checks the required epoch inside one immutable snapshot before reading
+NameState, UTXO, or transaction-index authority, and then returns projection
+version 1, the exact epoch/tip, canonical current NameState bytes plus its
+decoded projection, the exact active owner Coin, and canonical inclusion. The
+read rejects a key/name mismatch, noncanonical NameState or Coin bytes, absent
+or mismatched owner UTXO, noncanonical transaction index, reorganization
+mismatch, and inconsistent name-hash/start-height/value or TRANSFER/FINALIZE
+linkage. It never reads the raw block. Its
+`trusted_node_active_utxo_projection` label means active-state discovery, not a
+cryptographic Coin-to-txid proof, transaction preimage, or signing authority.
+This projection uses the existing NameState, UTXO, transaction-index, canonical
+height, block-index, header, and metadata columns; it adds no wallet-index row
+or storage schema.
 
 `get_name_action_context` is the candidate-specific source for TRANSFER and
 FINALIZE preparation. It requires the caller's exact chain epoch and mempool
