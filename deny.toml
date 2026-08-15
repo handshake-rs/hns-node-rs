@@ -22,7 +22,7 @@ allow = [
 [licenses.private]
 # The workspace remains publish=false. Project-authored source is ISC-licensed;
 # private-package exceptions with bundled native terms are documented separately.
-# This gate audits the registry and Git dependency graph.
+# This gate audits the registry graph and rejects every Git dependency.
 ignore = true
 
 [bans]
@@ -32,4 +32,3 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/handshake-rs/hns-rs.git"]

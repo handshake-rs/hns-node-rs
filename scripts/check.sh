@@ -7,6 +7,8 @@ cd "$repo_root"
 rust_toolchain=${RUST_TOOLCHAIN:-1.97.1}
 cargo_target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 
+python3 scripts/test-verify-hns-rs-source.py
+python3 scripts/verify-hns-rs-source.py
 cargo +"$rust_toolchain" metadata --locked --manifest-path Cargo.toml --format-version 1 >/dev/null
 cargo +"$rust_toolchain" metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null
 ./scripts/run-full-sync-qualification.sh self-test

@@ -215,10 +215,10 @@ has a finite 65,536-entry lifetime cap, and later matching outputs are
 deliberately untracked; untrusted registration therefore remains unavailable
 and production availability remains blocked.
 Live marketplace wire advertisement separately awaits active Denuo V2
-transport/admission, publication and provenance verification of the exact 0.3
-archive cohort, the typed adapter gate, and joined qualification. The canonical
-protocol source is now an immutable reachable `hns-rs` 0.3 Git revision; that
-removes source ambiguity but is not product or wire-role qualification.
+transport/admission, the typed adapter gate, and joined qualification. Exact
+crates.io `hns-rs` `=0.3.0` artifacts are pinned from the published, non-yanked,
+provenance-verified 19-package cohort; that removes source ambiguity but is not
+product or wire-role qualification.
 
 The focused local evidence is intentionally narrow: the NVMe `hns-consensus`
 `wallet_name_action` filter passed 2 tests with 0 failures and 75 filtered. At

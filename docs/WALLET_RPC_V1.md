@@ -622,9 +622,9 @@ ordinal requires a separately designed storage migration, not a wire shortcut.
 
 The v1 boundary intentionally does not accept Shakedex or HNS-HTLC descriptor
 registrations. Those profiles are duplicated locally for derivative tracking.
-The workspace now pins immutable reachable `hns-rs` 0.3 source. The prior 0.2
-package cohort is published, but the current 0.3 archives remain unpublished
-and the trusted registration adapter is still not installed or qualified. The
+The workspace now consumes exact crates.io `hns-rs` `=0.3.0` artifacts from
+the published, non-yanked, provenance-verified 19-package cohort. The trusted
+registration adapter is still not installed or qualified. The
 API exposes only evidence for registrations already admitted through a trusted
 in-process boundary and labels it
 `node_local_profile_only_not_protocol_authority`.

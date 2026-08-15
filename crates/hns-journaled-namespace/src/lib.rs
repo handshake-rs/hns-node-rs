@@ -3604,9 +3604,7 @@ mod tests {
                 "forbidden dependency {forbidden}"
             );
         }
-        assert!(workspace.contains(
-            "hns-rollback-journal = { version = \"=0.3.0\", git = \"https://github.com/handshake-rs/hns-rs.git\", rev = \"88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e\" }"
-        ));
+        assert!(workspace.contains("hns-rollback-journal = { version = \"=0.3.0\" }"));
     }
 
     #[test]

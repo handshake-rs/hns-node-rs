@@ -4,8 +4,8 @@
 assignment** for private extension negotiation on mainnet, testnet, regtest,
 and simnet.
 
-The canonical authority is the exact `handshake-rs/hns-rs`
-`hns-p2p-experimental` revision pinned by this repository. The live node never
+The canonical authority is the exact crates.io `hns-p2p-experimental`
+`=0.3.0` artifact pinned by this repository. The live node never
 copies a registry digest or private Hello/Ack message number.
 
 ## Canonical identity

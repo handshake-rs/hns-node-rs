@@ -426,10 +426,9 @@ Fixtures are evidence, not authority.
   nine-reason maximum and unknown reasons fail closed. The context neither
   signs nor proves that a later generation remains unchanged, so the wallet
   must preserve the binding, requote final signed bytes against it, and restart
-  on stale evidence. Contract registration and raw
-  revealed-preimage transport are absent while the canonical protocol release
-  is unpublished; node-local classifications are evidence, not protocol
-  authority.
+  on stale evidence. Contract registration and raw revealed-preimage transport
+  remain absent even though the canonical protocol release is now published;
+  node-local classifications are evidence, not protocol authority.
 - Local Shakedex/HTLC script and branch duplication is not protocol authority.
   The local tracker recognizes only seller-signed Shakedex TRANSFER fulfillment
   (`0x84`) and recovery (`0x83`) shapes; a direct FINALIZE shape is
@@ -441,8 +440,8 @@ Fixtures are evidence, not authority.
   never-confirmed abandonments and for qualified completed lifecycles. The
   completed tombstone registry is itself immutable and capped at 65,536, while
   each atomic proof walk is capped at 4,096 rows. Those finite lifetime limits,
-  the unpublished canonical protocol adapter, and unexecuted qualification for
-  this source tranche remain production-availability threats; untrusted
+  the absent canonical protocol adapter, and unexecuted joined qualification
+  remain production-availability threats; untrusted
   registration therefore remains unavailable.
 
 ## Failure policy

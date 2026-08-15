@@ -221,10 +221,10 @@ Implemented:
 - A bounded hash-first Denuo marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live
-  marketplace wire advertisement remains disabled. Exact reachable `hns-rs`
-  0.3 source is now pinned and the prior 0.2 package cohort is published, but
-  the current 0.3 archive cohort is unpublished, the active peer transport
-  remains Denuo V1, and no typed marketplace adapter is installed or qualified.
+  marketplace wire advertisement remains disabled. Exact crates.io `hns-rs`
+  `=0.3.0` artifacts from the published, non-yanked, provenance-verified
+  19-package cohort are now pinned, but the active peer transport remains
+  Denuo V1 and no typed marketplace adapter is installed or qualified.
   No live swap engine is claimed.
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the

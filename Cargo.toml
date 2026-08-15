@@ -35,12 +35,12 @@ ahash = "0.8"
 anyhow = "1.0"
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
-hns-covenants = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
-hns-dns-relay-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
-hns-hnsr-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
-hns-odoh-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
-hns-p2p-experimental = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
-hns-rollback-journal = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e" }
+hns-covenants = { version = "=0.3.0" }
+hns-dns-relay-protocol = { version = "=0.3.0" }
+hns-hnsr-protocol = { version = "=0.3.0" }
+hns-odoh-protocol = { version = "=0.3.0" }
+hns-p2p-experimental = { version = "=0.3.0" }
+hns-rollback-journal = { version = "=0.3.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.9"

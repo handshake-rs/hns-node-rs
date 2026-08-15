@@ -61,14 +61,15 @@ qualification or authorize deployment.
   deployment-scale, joined-wallet, and canonical dependency gates.
 - Reclaim never-confirmed contract capacity and safely retire completed tracked
   contracts only after canonical evidence is validated.
-- Consume canonical HNS resource parsing from the exact `hns-rs` source rather
-  than retaining a second resolver-local codec. Advance that coherent source
-  to immutable remote 0.3.0 commit
-  `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`, including HRM Core, HRM-backed
+- Consume canonical HNS resource parsing from exact crates.io `hns-rs` 0.3.0
+  artifacts rather than retaining a second resolver-local codec. The coherent
+  19-package release is non-yanked and provenance-verified against source
+  `d0cde9ded6f8f93f96f16daafc094849c6d484bf`, including HRM Core, HRM-backed
   HNSA/HNSR v3 state, the external rollback-journal contract, the earlier
   HNSA/HNSR admission corrections, and linked-covenant output validation. The
-  17-package 0.2.0 cohort is published and provenance-verified; the 19-package
-  0.3.0 line remains unpublished and is consumed by exact Git revision.
+  17-package 0.2.0 and 19-package 0.3.0 cohorts are published and
+  provenance-verified. The node pins `=0.3.0`, its exact registry checksums,
+  and the reviewed archive manifest; Git dependencies are rejected.
   Endpoint and rendezvous roles remain unavailable; a newer protocol pin does
   not enable either role.
 - Commit single-block native replay atomically.

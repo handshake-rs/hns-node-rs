@@ -480,8 +480,9 @@ canonical `encode_name_state` byte strings for both views. Projected
 `data_hex` is only the resource field and remains semantically opaque; an
 adapter never reconstructs consensus bytes from projected fields. The wire exposes existing tracked-contract
 funding/spend classifications by opaque content ID only: it does not expose
-descriptor registration or raw revealed-preimage transport merely because the
-canonical `hns-rs` 0.3 protocol source is now pinned. The exact wire contract is in
+descriptor registration or raw revealed-preimage transport merely because
+exact crates.io `hns-rs` `=0.3.0` artifacts are now pinned. The exact wire
+contract is in
 [`WALLET_RPC_V1.md`](WALLET_RPC_V1.md).
 
 ## Confirmed restoration snapshot
@@ -625,7 +626,8 @@ index from strengthening consensus.
 Frozen script, script-hash, canonical-binary descriptor-identity, and branch
 vectors are cross-boundary qualification evidence against the current `hns-rs`
 implementation. Local duplicated script/profile logic is not protocol
-authority and is not a substitute for a published canonical `hns-swap` commit.
+authority and is not a substitute for the published canonical `hns-swap`
+artifact plus a qualified adapter.
 This tracker cannot be release-qualified until the node pins that canonical
 commit and qualifies an adapter against it.
 
@@ -666,9 +668,9 @@ matching decisions, transaction construction/signing, and secret preimages
 remain wallet responsibilities.
 
 The separate Denuo cache remains wire-disabled. The workspace now pins exact
-reachable `hns-rs` 0.3 source containing generated Denuo V2 registry assignments
-and typed envelopes, so source reachability is no longer the blocker. Live
-marketplace advertisement still requires active Denuo V2 transport/admission,
-publication and provenance verification of the exact 0.3 archive cohort, a
-typed node adapter, and joined qualification; no sibling path or unassigned
-message ID is permitted.
+crates.io `hns-rs` `=0.3.0` artifacts containing generated Denuo V2 registry
+assignments and typed envelopes. The 19-package cohort is published,
+non-yanked, and provenance-verified, so source availability is no longer the
+blocker. Live marketplace advertisement still requires active Denuo V2
+transport/admission, a typed node adapter, and joined qualification; no sibling
+path or unassigned message ID is permitted.
