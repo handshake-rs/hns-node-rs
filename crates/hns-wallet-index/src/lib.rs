@@ -28,7 +28,8 @@ mod incoming_transfer;
 mod swap;
 
 pub use incoming_transfer::{
-    stage_prune_undo as stage_prune_incoming_transfer_undo, IncomingTransferEntry,
+    incoming_transfers, stage_prune_undo as stage_prune_incoming_transfer_undo,
+    IncomingTransferCursor, IncomingTransferEntry, IncomingTransferPage, IncomingTransferRecord,
 };
 
 pub use swap::{

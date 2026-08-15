@@ -15,9 +15,12 @@ use hns_primitives::{
     Writer, MAX_TX_SIZE, MIN_ADDRESS_HASH_SIZE,
 };
 use hns_state::{decode_coin, encode_coin, encode_outpoint_key, BlockUndo};
-use hns_store::{ColumnFamily, ReadSnapshot, WriteBatch};
+use hns_store::{ColumnFamily, PrefixScanBudget, ReadSnapshot, WriteBatch};
+use serde::{Deserialize, Serialize};
 
-use super::{bound_checksum, IndexError, ScriptId};
+use super::{
+    bound_checksum, validate_limit, IndexError, ScriptId, WalletIndexProfile, MAX_QUERY_BYTES,
+};
 
 const ACTIVE_PREFIX: &[u8] = b"wallet-index/v1/name-transfer/active/";
 const EVIDENCE_PREFIX: &[u8] = b"wallet-index/v1/name-transfer/evidence/";
@@ -49,7 +52,7 @@ const UNDO_VALUE_BYTES: usize = 1 + 32 + 4 + 4 + 32 + 4 + 32 + CHECKSUM_BYTES;
 ///
 /// This is ownership evidence only. It is deliberately not a script-history
 /// row or wallet coin.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IncomingTransferEntry {
     /// Covenant recipient witness version.
     pub recipient_version: u8,
@@ -167,7 +170,14 @@ impl IncomingTransferEntry {
             height,
             transaction_position,
         };
-        entry.validate_transfer_fields()?;
+        entry
+            .validate_transfer_fields()
+            .map_err(|error| match error {
+                IndexError::InvalidTransferCovenant => {
+                    IndexError::Corrupt("invalid incoming TRANSFER active covenant")
+                }
+                other => other,
+            })?;
         if key.len() != ACTIVE_KEY_BYTES || key != entry.key()? {
             return Err(IndexError::Corrupt(
                 "incoming TRANSFER active key/value binding mismatch",
@@ -220,6 +230,42 @@ impl IncomingTransferEntry {
         }
         Ok(())
     }
+}
+
+/// Exclusive cursor for active incoming TRANSFER ordering.
+///
+/// The four fields encode the complete suffix of the 113-byte active-row key;
+/// callers do not need to have received the referenced row for the cursor to
+/// be a valid exclusive seek hint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncomingTransferCursor {
+    /// Last returned (or caller-selected) active-chain height.
+    pub height: Height,
+    /// Last returned (or caller-selected) transaction position.
+    pub transaction_position: u32,
+    /// Last returned (or caller-selected) source transaction ID.
+    pub txid: Txid,
+    /// Last returned (or caller-selected) source output position.
+    pub output_index: u32,
+}
+
+/// One verified active incoming TRANSFER projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IncomingTransferRecord {
+    /// Exact active-row data, including the canonical active UTXO coin.
+    pub entry: IncomingTransferEntry,
+    /// Total outputs in the source transaction, retained with its evidence.
+    pub source_output_count: u32,
+}
+
+/// One bounded page of verified active incoming TRANSFER projections.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IncomingTransferPage {
+    /// Active incoming TRANSFERs in height/transaction/output key order.
+    pub entries: Vec<IncomingTransferRecord>,
+    /// Exclusive continuation when another page may exist.
+    pub continuation: Option<IncomingTransferCursor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -631,6 +677,100 @@ struct CreatedTransactionPlan {
 struct ExistingTransactionDelta {
     evidence: TransferEvidence,
     state: EvidenceState,
+}
+
+/// Read one bounded page of active, confirmed TRANSFERs for a covenant
+/// recipient.
+///
+/// Every returned row is re-bound to its retained source evidence, evidence
+/// state, and the byte-exact active UTXO record. The derivative index therefore
+/// fails closed instead of returning a partially corrupted projection.
+pub fn incoming_transfers<S: ReadSnapshot>(
+    snapshot: &S,
+    profile: WalletIndexProfile,
+    recipient: ScriptId,
+    cursor: Option<&IncomingTransferCursor>,
+    limit: usize,
+) -> Result<IncomingTransferPage, IndexError> {
+    if !profile.wallet {
+        return Err(IndexError::Disabled("wallet/incoming-transfer"));
+    }
+    validate_limit(limit)?;
+
+    let prefix = active_prefix(recipient);
+    let start_after = cursor.map(|cursor| active_cursor_key(recipient, cursor));
+    let page = snapshot.scan_prefix_page(
+        ColumnFamily::TxIndex,
+        &prefix,
+        start_after.as_deref(),
+        PrefixScanBudget {
+            max_entries: limit,
+            max_bytes: MAX_QUERY_BYTES,
+        },
+    )?;
+
+    let mut entries = Vec::with_capacity(page.entries.len());
+    let mut cached_evidence = None::<(Txid, TransferEvidence, EvidenceState)>;
+    for (key, raw) in &page.entries {
+        let entry = IncomingTransferEntry::decode(key, raw)?;
+        let txid = entry.coin.outpoint.txid;
+        if cached_evidence
+            .as_ref()
+            .is_none_or(|(cached_txid, _, _)| *cached_txid != txid)
+        {
+            let evidence = load_evidence(snapshot, txid)?.ok_or(IndexError::Corrupt(
+                "active incoming TRANSFER is missing source evidence",
+            ))?;
+            let state = load_evidence_state(snapshot, txid)?.ok_or(IndexError::Corrupt(
+                "active incoming TRANSFER is missing evidence state",
+            ))?;
+            state.validate_evidence(&evidence)?;
+            if state.retired_by.is_some() {
+                return Err(IndexError::Corrupt(
+                    "active incoming TRANSFER uses retired evidence",
+                ));
+            }
+            cached_evidence = Some((txid, evidence, state));
+        }
+
+        let (_, evidence, state) = cached_evidence
+            .as_ref()
+            .expect("incoming TRANSFER evidence cache was populated");
+        entry.validate_evidence(evidence)?;
+        if !state.active_outputs.contains(&entry.coin.outpoint.index) {
+            return Err(IndexError::Corrupt(
+                "active incoming TRANSFER is absent from evidence state",
+            ));
+        }
+
+        let utxo_key = encode_outpoint_key(&entry.coin.outpoint);
+        let stored_coin =
+            snapshot
+                .get(ColumnFamily::Utxo, &utxo_key)?
+                .ok_or(IndexError::Corrupt(
+                    "active incoming TRANSFER coin is missing from active UTXO set",
+                ))?;
+        if stored_coin != encode_coin(&entry.coin) {
+            return Err(IndexError::Corrupt(
+                "active incoming TRANSFER coin disagrees with active UTXO set",
+            ));
+        }
+
+        entries.push(IncomingTransferRecord {
+            entry,
+            source_output_count: evidence.output_count,
+        });
+    }
+
+    let continuation = page
+        .continuation
+        .as_deref()
+        .map(|key| decode_active_cursor(recipient, key))
+        .transpose()?;
+    Ok(IncomingTransferPage {
+        entries,
+        continuation,
+    })
 }
 
 /// Stage the incoming-TRANSFER derivative index for one block connection.
@@ -1245,15 +1385,71 @@ fn recipient_id(version: u8, hash: &[u8]) -> Result<ScriptId, IndexError> {
     Ok(ScriptId::from_descriptor(&writer.finish()))
 }
 
-fn active_key(recipient: ScriptId, entry: &IncomingTransferEntry) -> Vec<u8> {
-    let mut key = Vec::with_capacity(ACTIVE_KEY_BYTES);
+fn active_prefix(recipient: ScriptId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ACTIVE_PREFIX.len() + 32);
     key.extend_from_slice(ACTIVE_PREFIX);
     key.extend_from_slice(recipient.as_bytes());
+    key
+}
+
+fn active_key(recipient: ScriptId, entry: &IncomingTransferEntry) -> Vec<u8> {
+    let mut key = active_prefix(recipient);
     key.extend_from_slice(&entry.height.to_be_bytes());
     key.extend_from_slice(&entry.transaction_position.to_be_bytes());
     key.extend_from_slice(entry.coin.outpoint.txid.as_bytes());
     key.extend_from_slice(&entry.coin.outpoint.index.to_be_bytes());
     key
+}
+
+fn active_cursor_key(recipient: ScriptId, cursor: &IncomingTransferCursor) -> Vec<u8> {
+    let mut key = active_prefix(recipient);
+    key.extend_from_slice(&cursor.height.to_be_bytes());
+    key.extend_from_slice(&cursor.transaction_position.to_be_bytes());
+    key.extend_from_slice(cursor.txid.as_bytes());
+    key.extend_from_slice(&cursor.output_index.to_be_bytes());
+    key
+}
+
+fn decode_active_cursor(
+    recipient: ScriptId,
+    key: &[u8],
+) -> Result<IncomingTransferCursor, IndexError> {
+    let prefix = active_prefix(recipient);
+    if key.len() != ACTIVE_KEY_BYTES || key.get(..prefix.len()) != Some(prefix.as_slice()) {
+        return Err(IndexError::Corrupt(
+            "invalid incoming TRANSFER continuation key",
+        ));
+    }
+    let suffix = &key[prefix.len()..];
+    let bytes = |offset: usize, length: usize| {
+        suffix
+            .get(offset..offset.saturating_add(length))
+            .ok_or(IndexError::Corrupt(
+                "invalid incoming TRANSFER continuation key",
+            ))
+    };
+    Ok(IncomingTransferCursor {
+        height: u32::from_be_bytes(
+            bytes(0, 4)?
+                .try_into()
+                .map_err(|_| IndexError::Corrupt("invalid incoming TRANSFER continuation key"))?,
+        ),
+        transaction_position: u32::from_be_bytes(
+            bytes(4, 4)?
+                .try_into()
+                .map_err(|_| IndexError::Corrupt("invalid incoming TRANSFER continuation key"))?,
+        ),
+        txid: Txid::new(
+            bytes(8, 32)?
+                .try_into()
+                .map_err(|_| IndexError::Corrupt("invalid incoming TRANSFER continuation key"))?,
+        ),
+        output_index: u32::from_be_bytes(
+            bytes(40, 4)?
+                .try_into()
+                .map_err(|_| IndexError::Corrupt("invalid incoming TRANSFER continuation key"))?,
+        ),
+    })
 }
 
 fn evidence_key(txid: Txid) -> Vec<u8> {
@@ -1332,12 +1528,18 @@ fn effect_commitment(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::{
+        cell::Cell,
+        sync::atomic::{AtomicU32, Ordering},
+    };
 
     use super::*;
     use hns_primitives::{Address, Input, Output, Transaction, Witness, MAX_BLOCK_WEIGHT};
     use hns_state::{write_coin_to_batch, TreeRoot};
-    use hns_store::{MemoryStore, PrefixScanBudget, Store, PREFIX_SCAN_MAX_ENTRIES};
+    use hns_store::{
+        MemorySnapshot, MemoryStore, PrefixScanBudget, PrefixScanPage, ScanEntry, Store,
+        StoreError, PREFIX_SCAN_MAX_ENTRIES,
+    };
 
     fn address(byte: u8) -> Address {
         Address::new(0, vec![byte; 20]).expect("valid fixture address")
@@ -1459,6 +1661,131 @@ mod tests {
         store.commit(batch).expect("commit TRANSFER connect");
     }
 
+    fn seed_block_coins(store: &MemoryStore, block: &Block, height: Height) -> Vec<Coin> {
+        let mut coins = Vec::new();
+        let mut batch = store.batch();
+        for (transaction_position, transaction) in block.transactions.iter().enumerate() {
+            for (output_index, output) in transaction.outputs.iter().enumerate() {
+                let coin = Coin {
+                    outpoint: Outpoint {
+                        txid: transaction.txid(),
+                        index: u32::try_from(output_index).expect("fixture output index"),
+                    },
+                    value: output.value,
+                    height,
+                    coinbase: transaction_position == 0,
+                    address: output.address.clone(),
+                    covenant: output.covenant.clone(),
+                };
+                write_coin_to_batch(&mut batch, &coin).expect("seed active coin");
+                coins.push(coin);
+            }
+        }
+        store.commit(batch).expect("commit active coins");
+        coins
+    }
+
+    fn connect_with_coins(store: &MemoryStore, block: &Block, height: Height) -> Vec<Coin> {
+        connect(store, block, height);
+        seed_block_coins(store, block, height)
+    }
+
+    fn wallet_profile() -> WalletIndexProfile {
+        WalletIndexProfile {
+            script_history: false,
+            spender: false,
+            wallet: true,
+        }
+    }
+
+    fn recipient_script(recipient: u8) -> ScriptId {
+        recipient_id(0, &[recipient; 20]).expect("valid fixture recipient")
+    }
+
+    fn single_query_fixture() -> (MemoryStore, ScriptId, Txid, Outpoint, BlockHash) {
+        let store = MemoryStore::new();
+        let transaction = transaction(vec![transfer_output(7, 9, 3, 50), plain_output(8, 10)]);
+        let txid = transaction.txid();
+        let outpoint = Outpoint { txid, index: 0 };
+        let source = block(vec![transaction]);
+        let block_hash = source.hash();
+        connect_with_coins(&store, &source, 8);
+        (store, recipient_script(9), txid, outpoint, block_hash)
+    }
+
+    fn active_raw_unchecked(entry: &IncomingTransferEntry) -> Vec<u8> {
+        let key = entry.key().expect("fixture active key");
+        let coin = encode_coin(&entry.coin);
+        let mut writer = Writer::with_capacity(256 + coin.len());
+        writer.write_u8(ACTIVE_VALUE_VERSION);
+        writer.write_u8(entry.recipient_version);
+        writer.write_varbytes(&entry.recipient_hash);
+        writer.write_bytes(&entry.name_hash);
+        writer.write_u32(entry.start_height);
+        writer.write_bytes(entry.block_hash.as_bytes());
+        writer.write_u32(entry.height);
+        writer.write_u32(entry.transaction_position);
+        writer.write_varbytes(&coin);
+        let mut raw = writer.finish();
+        raw.extend_from_slice(&bound_checksum(
+            b"hns-wallet-index-incoming-transfer-active-v1",
+            &key,
+            &raw,
+        ));
+        raw
+    }
+
+    struct CountingSnapshot {
+        inner: MemorySnapshot,
+        evidence_gets: Cell<usize>,
+        evidence_state_gets: Cell<usize>,
+        utxo_gets: Cell<usize>,
+    }
+
+    impl CountingSnapshot {
+        fn new(inner: MemorySnapshot) -> Self {
+            Self {
+                inner,
+                evidence_gets: Cell::new(0),
+                evidence_state_gets: Cell::new(0),
+                utxo_gets: Cell::new(0),
+            }
+        }
+    }
+
+    impl ReadSnapshot for CountingSnapshot {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            if family == ColumnFamily::TxIndex && key.starts_with(EVIDENCE_PREFIX) {
+                self.evidence_gets.set(self.evidence_gets.get() + 1);
+            } else if family == ColumnFamily::TxIndex && key.starts_with(EVIDENCE_STATE_PREFIX) {
+                self.evidence_state_gets
+                    .set(self.evidence_state_gets.get() + 1);
+            } else if family == ColumnFamily::Utxo {
+                self.utxo_gets.set(self.utxo_gets.get() + 1);
+            }
+            self.inner.get(family, key)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<Vec<ScanEntry>, StoreError> {
+            self.inner.scan_prefix(family, prefix)
+        }
+
+        fn scan_prefix_page(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+            start_after: Option<&[u8]>,
+            budget: PrefixScanBudget,
+        ) -> Result<PrefixScanPage, StoreError> {
+            self.inner
+                .scan_prefix_page(family, prefix, start_after, budget)
+        }
+    }
+
     fn marker_raw_with_counts(
         marker: &TransferUndoMarker,
         created_count: u32,
@@ -1497,6 +1824,372 @@ mod tests {
             &raw,
         ));
         raw
+    }
+
+    #[test]
+    fn query_orders_pages_and_accepts_a_nonexistent_exclusive_hint() {
+        let store = MemoryStore::new();
+        let first = block(vec![transaction(vec![
+            transfer_output(7, 9, 3, 50),
+            transfer_output(7, 9, 4, 40),
+        ])]);
+        connect_with_coins(&store, &first, 8);
+        let second = block(vec![transaction(vec![
+            transfer_output(8, 9, 5, 30),
+            plain_output(8, 20),
+        ])]);
+        connect_with_coins(&store, &second, 10);
+
+        let recipient = recipient_script(9);
+        let snapshot = store.snapshot().expect("snapshot");
+        let first_page = incoming_transfers(&snapshot, wallet_profile(), recipient, None, 2)
+            .expect("first query page");
+        assert_eq!(first_page.entries.len(), 2);
+        assert_eq!(
+            first_page
+                .entries
+                .iter()
+                .map(|record| (
+                    record.entry.height,
+                    record.entry.transaction_position,
+                    record.entry.coin.outpoint.index,
+                    record.source_output_count,
+                ))
+                .collect::<Vec<_>>(),
+            vec![(8, 0, 0, 2), (8, 0, 1, 2)]
+        );
+        let continuation = first_page.continuation.expect("continuation");
+        assert_eq!(continuation.height, 8);
+        assert_eq!(continuation.transaction_position, 0);
+        assert_eq!(continuation.output_index, 1);
+
+        let second_page = incoming_transfers(
+            &snapshot,
+            wallet_profile(),
+            recipient,
+            Some(&continuation),
+            2,
+        )
+        .expect("second query page");
+        assert_eq!(second_page.entries.len(), 1);
+        assert_eq!(second_page.entries[0].entry.height, 10);
+        assert_eq!(second_page.entries[0].source_output_count, 2);
+        assert!(second_page.continuation.is_none());
+
+        let nonexistent_hint = IncomingTransferCursor {
+            height: 9,
+            transaction_position: 0,
+            txid: Txid::ZERO,
+            output_index: 0,
+        };
+        let hinted = incoming_transfers(
+            &snapshot,
+            wallet_profile(),
+            recipient,
+            Some(&nonexistent_hint),
+            2,
+        )
+        .expect("query from arbitrary exclusive hint");
+        assert_eq!(hinted.entries.len(), 1);
+        assert_eq!(hinted.entries[0].entry.height, 10);
+    }
+
+    #[test]
+    fn query_enforces_wallet_profile_and_public_page_bounds() {
+        let store = MemoryStore::new();
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(
+                &snapshot,
+                WalletIndexProfile::default(),
+                recipient_script(9),
+                None,
+                1,
+            ),
+            Err(IndexError::Disabled("wallet/incoming-transfer"))
+        ));
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient_script(9), None, 0),
+            Err(IndexError::InvalidLimit)
+        ));
+        assert!(matches!(
+            incoming_transfers(
+                &snapshot,
+                wallet_profile(),
+                recipient_script(9),
+                None,
+                super::super::MAX_QUERY_ENTRIES + 1,
+            ),
+            Err(IndexError::InvalidLimit)
+        ));
+    }
+
+    #[test]
+    fn active_cursor_is_the_exact_strict_recipient_bound_key() {
+        let recipient = recipient_script(9);
+        let cursor = IncomingTransferCursor {
+            height: 17,
+            transaction_position: 3,
+            txid: Txid::new([7; 32]),
+            output_index: 5,
+        };
+        let key = active_cursor_key(recipient, &cursor);
+        assert_eq!(key.len(), ACTIVE_KEY_BYTES);
+        assert_eq!(ACTIVE_KEY_BYTES, 113);
+        assert_eq!(
+            decode_active_cursor(recipient, &key).expect("cursor round trip"),
+            cursor
+        );
+        assert!(matches!(
+            decode_active_cursor(recipient_script(10), &key),
+            Err(IndexError::Corrupt(
+                "invalid incoming TRANSFER continuation key"
+            ))
+        ));
+        assert!(matches!(
+            decode_active_cursor(recipient, &key[..key.len() - 1]),
+            Err(IndexError::Corrupt(
+                "invalid incoming TRANSFER continuation key"
+            ))
+        ));
+    }
+
+    #[test]
+    fn query_rejects_active_checksum_and_normalizes_durable_covenant_corruption() {
+        let (store, recipient, _, _, _) = single_query_fixture();
+        let snapshot = store.snapshot().expect("snapshot");
+        let (key, mut raw) = snapshot
+            .scan_prefix_page(
+                ColumnFamily::TxIndex,
+                &active_prefix(recipient),
+                None,
+                PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: MAX_QUERY_BYTES,
+                },
+            )
+            .expect("active row")
+            .entries
+            .into_iter()
+            .next()
+            .expect("active row present");
+        drop(snapshot);
+        raw[1] ^= 1;
+        let mut corrupt = store.batch();
+        corrupt
+            .put(ColumnFamily::TxIndex, &key, &raw)
+            .expect("replace active row");
+        store.commit(corrupt).expect("commit checksum corruption");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "invalid incoming TRANSFER active value"
+            ))
+        ));
+
+        let (store, recipient, _, _, _) = single_query_fixture();
+        let snapshot = store.snapshot().expect("snapshot");
+        let (key, raw) = snapshot
+            .scan_prefix_page(
+                ColumnFamily::TxIndex,
+                &active_prefix(recipient),
+                None,
+                PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: MAX_QUERY_BYTES,
+                },
+            )
+            .expect("active row")
+            .entries
+            .into_iter()
+            .next()
+            .expect("active row present");
+        let mut entry = IncomingTransferEntry::decode(&key, &raw).expect("valid active row");
+        drop(snapshot);
+        entry.coin.covenant.items.pop();
+        let malformed = active_raw_unchecked(&entry);
+        let mut corrupt = store.batch();
+        corrupt
+            .put(ColumnFamily::TxIndex, &key, &malformed)
+            .expect("replace active row");
+        store.commit(corrupt).expect("commit covenant corruption");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "invalid incoming TRANSFER active covenant"
+            ))
+        ));
+    }
+
+    #[test]
+    fn query_rejects_missing_or_mismatched_evidence_and_state() {
+        let (store, recipient, txid, _, _) = single_query_fixture();
+        let mut corrupt = store.batch();
+        corrupt
+            .delete(ColumnFamily::TxIndex, &evidence_key(txid))
+            .expect("delete evidence");
+        store.commit(corrupt).expect("commit missing evidence");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "active incoming TRANSFER is missing source evidence"
+            ))
+        ));
+
+        let (store, recipient, txid, _, _) = single_query_fixture();
+        let mut corrupt = store.batch();
+        corrupt
+            .delete(ColumnFamily::TxIndex, &evidence_state_key(txid))
+            .expect("delete evidence state");
+        store
+            .commit(corrupt)
+            .expect("commit missing evidence state");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "active incoming TRANSFER is missing evidence state"
+            ))
+        ));
+
+        let (store, recipient, txid, _, block_hash) = single_query_fixture();
+        let mismatched = TransferEvidence {
+            txid,
+            block_hash,
+            height: 9,
+            transaction_position: 0,
+            output_count: 2,
+        };
+        let mut corrupt = store.batch();
+        corrupt
+            .put(
+                ColumnFamily::TxIndex,
+                &evidence_key(txid),
+                &mismatched.encode().expect("encode mismatched evidence"),
+            )
+            .expect("replace evidence");
+        store.commit(corrupt).expect("commit mismatched evidence");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "incoming TRANSFER active/evidence inclusion mismatch"
+            ))
+        ));
+    }
+
+    #[test]
+    fn query_rejects_absent_membership_and_retired_evidence_state() {
+        let (store, recipient, txid, _, _) = single_query_fixture();
+        let wrong_membership = EvidenceState::active(BTreeSet::from([1]))
+            .expect("valid but mismatched evidence state");
+        let mut corrupt = store.batch();
+        corrupt
+            .put(
+                ColumnFamily::TxIndex,
+                &evidence_state_key(txid),
+                &wrong_membership
+                    .encode(txid)
+                    .expect("encode mismatched evidence state"),
+            )
+            .expect("replace evidence state");
+        store
+            .commit(corrupt)
+            .expect("commit mismatched evidence state");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "active incoming TRANSFER is absent from evidence state"
+            ))
+        ));
+
+        let (store, recipient, txid, _, block_hash) = single_query_fixture();
+        let retired = EvidenceState {
+            active_outputs: BTreeSet::new(),
+            retired_by: Some(block_hash),
+        };
+        let mut corrupt = store.batch();
+        corrupt
+            .put(
+                ColumnFamily::TxIndex,
+                &evidence_state_key(txid),
+                &retired.encode(txid).expect("encode retired evidence state"),
+            )
+            .expect("replace evidence state");
+        store
+            .commit(corrupt)
+            .expect("commit retired evidence state");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "active incoming TRANSFER uses retired evidence"
+            ))
+        ));
+    }
+
+    #[test]
+    fn query_requires_the_byte_exact_active_utxo_coin() {
+        let (store, recipient, _, outpoint, _) = single_query_fixture();
+        let mut corrupt = store.batch();
+        corrupt
+            .delete(ColumnFamily::Utxo, &encode_outpoint_key(&outpoint))
+            .expect("delete active coin");
+        store.commit(corrupt).expect("commit missing active coin");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "active incoming TRANSFER coin is missing from active UTXO set"
+            ))
+        ));
+
+        let (store, recipient, _, outpoint, _) = single_query_fixture();
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut coin = load_coin(&snapshot, &outpoint)
+            .expect("load active coin")
+            .expect("active coin present");
+        drop(snapshot);
+        coin.value += 1;
+        let mut corrupt = store.batch();
+        corrupt
+            .put(
+                ColumnFamily::Utxo,
+                &encode_outpoint_key(&outpoint),
+                &encode_coin(&coin),
+            )
+            .expect("replace active coin");
+        store
+            .commit(corrupt)
+            .expect("commit mismatched active coin");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(
+            incoming_transfers(&snapshot, wallet_profile(), recipient, None, 1),
+            Err(IndexError::Corrupt(
+                "active incoming TRANSFER coin disagrees with active UTXO set"
+            ))
+        ));
+    }
+
+    #[test]
+    fn query_caches_evidence_and_state_for_adjacent_outputs_of_one_txid() {
+        let store = MemoryStore::new();
+        let source = block(vec![transaction(vec![
+            transfer_output(7, 9, 3, 50),
+            transfer_output(7, 9, 4, 40),
+        ])]);
+        connect_with_coins(&store, &source, 8);
+        let snapshot = CountingSnapshot::new(store.snapshot().expect("snapshot"));
+        let page = incoming_transfers(&snapshot, wallet_profile(), recipient_script(9), None, 2)
+            .expect("query active transfers");
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(snapshot.evidence_gets.get(), 1);
+        assert_eq!(snapshot.evidence_state_gets.get(), 1);
+        assert_eq!(snapshot.utxo_gets.get(), 2);
     }
 
     #[test]

@@ -2,12 +2,16 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use hns_chain::{HeaderRecord, TxIndexEntry};
+use hns_chain::{
+    tx_index_entries_for_block, BlockIndexRecord, BlockStatus, HeaderRecord, RawBlockRecord,
+    TxIndexEntry,
+};
 use hns_consensus::{
     hsd_wallet_renewal_height, is_coinbase, is_finalize_source_covenant, is_name_expired,
     is_transfer_mature, is_transfer_source_covenant, name_lifecycle,
     renewal_commitment_height_is_valid, transaction_sigops, transaction_weight,
-    transfer_maturity_height, validate_transaction_sanity, Network, HSD_CONSENSUS_PROFILE,
+    transfer_maturity_height, validate_block_commitments, validate_transaction_sanity, Network,
+    HSD_CONSENSUS_PROFILE,
 };
 use hns_mempool::{
     minimum_policy_fee, sigop_adjusted_virtual_size, Admission, MempoolInfo, MempoolSnapshot,
@@ -15,24 +19,25 @@ use hns_mempool::{
 };
 use hns_p2p::{Inventory, LivePeerManager, OutboundPriority, Packet};
 use hns_primitives::{
-    blake2b_256, Address, BlockHash, Coin, Covenant, CovenantKind, Height, NameHash,
+    blake2b_256, Address, Block, BlockHash, Coin, Covenant, CovenantKind, Height, NameHash,
     NameLifecycleState, NameState, Outpoint, Output, Transaction, Txid, Writer,
 };
 use hns_state::{
-    decode_coin, decode_name_state, encode_outpoint_key, load_stored_name_tree_root,
+    decode_coin, decode_name_state, encode_coin, encode_outpoint_key, load_stored_name_tree_root,
     prove_persisted_name_tree, TreeRoot,
 };
 use hns_store::{ColumnFamily, ReadSnapshot, Store};
 use hns_urkel::UrkelProof;
 use hns_wallet_index::{
-    completed_tracked_contract_retirement, script_history, script_utxos, spending_transaction,
-    tracked_contract, tracked_contract_events, tracked_contract_funding, tracked_contract_fundings,
-    tracked_contract_lifecycle_revision, CompletedContractRetirement,
+    completed_tracked_contract_retirement, incoming_transfers, script_history, script_utxos,
+    spending_transaction, tracked_contract, tracked_contract_events, tracked_contract_funding,
+    tracked_contract_fundings, tracked_contract_lifecycle_revision, CompletedContractRetirement,
     CompletedContractRetirementOutcome, ContractId, ContractRegistration,
-    ContractRegistrationOutcome, ContractRetirementOutcome, ContractRollbackBoundary, IndexError,
-    ScriptHistoryCursor, ScriptHistoryEntry, ScriptHistoryPage, ScriptId, ScriptUtxo,
-    ScriptUtxoCursor, ScriptUtxoPage, SpendingTransaction, TrackedContractCursor,
-    TrackedContractEvent, TrackedContractFunding, TrackedContractSpendKind, MAX_QUERY_ENTRIES,
+    ContractRegistrationOutcome, ContractRetirementOutcome, ContractRollbackBoundary,
+    IncomingTransferCursor, IncomingTransferEntry, IndexError, ScriptHistoryCursor,
+    ScriptHistoryEntry, ScriptHistoryPage, ScriptId, ScriptUtxo, ScriptUtxoCursor, ScriptUtxoPage,
+    SpendingTransaction, TrackedContractCursor, TrackedContractEvent, TrackedContractFunding,
+    TrackedContractSpendKind, WalletIndexProfile, MAX_QUERY_ENTRIES,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -58,6 +63,12 @@ pub const MAX_WALLET_RESTORE_SCRIPTS: usize = 10_000;
 pub const MAX_WALLET_CONFIRMED_PAGE_ITEMS: usize = MAX_QUERY_ENTRIES;
 /// Maximum script-prefix pages examined by one confirmed restoration call.
 pub const MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS: usize = 256;
+/// Version of the bounded incoming-TRANSFER candidate projection.
+pub const INCOMING_TRANSFER_PROJECTION_VERSION: u8 = 1;
+/// Maximum script-prefix pages examined by one incoming-TRANSFER call.
+pub const MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS: usize = 256;
+/// Maximum distinct retained block bodies decoded by one incoming-TRANSFER call.
+pub const MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES: usize = 4;
 /// Maximum outpoints inspected by one immutable spending-evidence capture.
 pub const MAX_WALLET_OUTPOINT_SPEND_BATCH: usize = 4_096;
 /// Maximum input coins resolved by one transaction-bound fee quote.
@@ -68,9 +79,12 @@ pub const NAME_ACTION_CONTEXT_VERSION: u8 = 1;
 pub const MAX_NAME_ACTION_INELIGIBILITY_REASONS: usize = 9;
 
 const CONFIRMED_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-confirmed-script-set/v1";
+const INCOMING_TRANSFER_SCRIPT_SET_DOMAIN: &[u8] =
+    b"hns-node/wallet-incoming-transfer-script-set/v1";
 const MEMPOOL_SCRIPT_SET_DOMAIN: &[u8] = b"hns-node/wallet-mempool-script-set/v1";
 const MEMPOOL_CONTRACT_DOMAIN: &[u8] = b"hns-node/wallet-mempool-contract/v1";
 const CONFIRMED_CURSOR_VERSION: u8 = 1;
+const INCOMING_TRANSFER_CURSOR_VERSION: u8 = 1;
 const MEMPOOL_CURSOR_VERSION: u8 = 1;
 
 /// Opaque query-bound cursor for a single immutable mempool generation.
@@ -140,6 +154,74 @@ pub struct ConfirmedScriptsPage {
     pub script_examinations: usize,
     /// Exclusive continuation, rejected after a chain-generation change.
     pub continuation: Option<ConfirmedScriptsCursor>,
+}
+
+/// Opaque continuation for one exact incoming-TRANSFER candidate query.
+///
+/// This is an unkeyed query binding, not an authentication token or capability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IncomingTransfersCursor {
+    binding_version: u8,
+    chain_epoch: u64,
+    tip: Option<WalletChainTip>,
+    script_set_id: [u8; 32],
+    script_index: usize,
+    inner: Option<IncomingTransferCursor>,
+}
+
+/// Strength of the source-transaction binding for one incoming TRANSFER.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncomingTransferSourceBinding {
+    /// Retained block bytes were decoded and matched at the exact transaction
+    /// and output ordinal, including the header's body commitments.
+    RetainedBodyVerified,
+    /// Compact source evidence was corroborated against active durable node
+    /// indexes and the UTXO set, but the pruned transaction preimage is absent.
+    PrunedTrustedNodeProjection,
+}
+
+impl IncomingTransferSourceBinding {
+    /// Stable wallet-RPC vocabulary for this evidence strength.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetainedBodyVerified => "retained_body_verified",
+            Self::PrunedTrustedNodeProjection => "pruned_trusted_node_projection",
+        }
+    }
+}
+
+/// One active incoming-TRANSFER candidate tied to its sorted request position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalletIncomingTransfer {
+    /// Position in the caller's complete sorted-unique script set.
+    pub script_index: usize,
+    /// Exact active incoming-TRANSFER index row.
+    pub entry: IncomingTransferEntry,
+    /// Total output count of the source transaction.
+    pub source_output_count: u32,
+    /// Exact active-chain inclusion and transaction ordinal.
+    pub inclusion: TransactionInclusion,
+    /// Whether retained source bytes were available for exact verification.
+    pub source_binding: IncomingTransferSourceBinding,
+}
+
+/// One bounded page of active incoming-TRANSFER candidates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingTransfersPage {
+    /// Projection contract version, independent of the wallet RPC envelope.
+    pub projection_version: u8,
+    /// Durable canonical-chain generation shared by the whole page.
+    pub chain_epoch: u64,
+    /// Exact active tip captured in the same immutable snapshot.
+    pub tip: Option<WalletChainTip>,
+    /// Candidates for one traversed recipient script, in durable index order.
+    pub entries: Vec<WalletIncomingTransfer>,
+    /// Script-prefix pages examined by this bounded call.
+    pub script_examinations: usize,
+    /// Exclusive continuation bound to this exact query and chain snapshot.
+    pub continuation: Option<IncomingTransfersCursor>,
 }
 
 /// One unconfirmed output paying a requested script.
@@ -803,9 +885,16 @@ pub enum WalletBackendError {
     /// contains an impossible traversal position.
     #[error("wallet confirmed restoration cursor is invalid")]
     InvalidConfirmedCursor,
+    /// An incoming-TRANSFER continuation belongs to another chain tip, script
+    /// set, or traversal position.
+    #[error("wallet incoming-TRANSFER cursor is invalid")]
+    InvalidIncomingTransferCursor,
     /// A confirmed restoration result bound is invalid.
     #[error("wallet confirmed restoration limit must be between 1 and {MAX_WALLET_CONFIRMED_PAGE_ITEMS}")]
     InvalidConfirmedPageLimit,
+    /// An incoming-TRANSFER result bound is invalid.
+    #[error("wallet incoming-TRANSFER limit must be between 1 and {MAX_QUERY_ENTRIES}")]
+    InvalidIncomingTransferPageLimit,
     /// A point or contract index page bound is invalid.
     #[error("wallet index page limit must be between 1 and {MAX_QUERY_ENTRIES}")]
     InvalidIndexPageLimit,
@@ -1270,6 +1359,48 @@ impl WalletBackend {
                     }
                 }
             }
+        })
+        .await
+    }
+
+    /// Traverse active incoming-TRANSFER candidates for one restoration set.
+    ///
+    /// The caller supplies the durable chain epoch obtained before disclosing
+    /// its complete sorted-unique script set. Every candidate is corroborated
+    /// against the transaction index, active chain, block/header status, and
+    /// byte-exact active UTXO in one immutable snapshot. Retained block bodies
+    /// additionally bind the exact transaction and output bytes; pruned bodies
+    /// are labeled as a weaker trusted-node projection.
+    pub async fn get_incoming_transfers_page(
+        &self,
+        scripts: Vec<ScriptId>,
+        expected_chain_epoch: u64,
+        cursor: Option<IncomingTransfersCursor>,
+        limit: usize,
+    ) -> Result<IncomingTransfersPage, WalletBackendError> {
+        if !(1..=MAX_QUERY_ENTRIES).contains(&limit) {
+            return Err(WalletBackendError::InvalidIncomingTransferPageLimit);
+        }
+        validate_script_set(&scripts)?;
+        let profile = self.read.wallet_index_profile();
+        if !profile.wallet {
+            return Err(WalletBackendError::IndexDisabled("wallet"));
+        }
+        if !self.read.transaction_index {
+            return Err(WalletBackendError::IndexDisabled("transaction"));
+        }
+        let script_set_id = incoming_transfer_script_set_id(&scripts)?;
+        let read = self.read.clone();
+        blocking_chain_collection_read(read, move |_, snapshot| {
+            incoming_transfers_page_from_snapshot(
+                snapshot,
+                profile,
+                &scripts,
+                expected_chain_epoch,
+                script_set_id,
+                cursor,
+                limit,
+            )
         })
         .await
     }
@@ -2537,6 +2668,528 @@ fn wallet_chain_tip<S: ReadSnapshot>(
     }))
 }
 
+struct IncomingTransferBodyCache {
+    hash: BlockHash,
+    retained: Option<RetainedIncomingTransferBody>,
+}
+
+struct RetainedIncomingTransferBody {
+    block: Block,
+    transaction_indexes: Vec<TxIndexEntry>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn incoming_transfers_page_from_snapshot<S: ReadSnapshot>(
+    snapshot: &S,
+    profile: WalletIndexProfile,
+    scripts: &[ScriptId],
+    expected_chain_epoch: u64,
+    script_set_id: [u8; 32],
+    cursor: Option<IncomingTransfersCursor>,
+    limit: usize,
+) -> Result<IncomingTransfersPage, WalletBackendError> {
+    // This request binding deliberately occurs before the first incoming-index
+    // prefix scan or raw-body read. The enclosing canonical-read fence performs
+    // only its own Meta/block-index point reads before entering this helper.
+    let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+    if expected_chain_epoch != chain_epoch {
+        return Err(WalletBackendError::StaleChainEpoch {
+            expected: expected_chain_epoch,
+            actual: chain_epoch,
+        });
+    }
+
+    let tip = wallet_chain_tip(snapshot)?;
+    let (mut script_index, mut inner) = match cursor {
+        Some(cursor) => {
+            if cursor.binding_version != INCOMING_TRANSFER_CURSOR_VERSION {
+                return Err(WalletBackendError::InvalidIncomingTransferCursor);
+            }
+            if cursor.chain_epoch != chain_epoch {
+                return Err(WalletBackendError::StaleChainEpoch {
+                    expected: cursor.chain_epoch,
+                    actual: chain_epoch,
+                });
+            }
+            if cursor.tip != tip
+                || cursor.script_set_id != script_set_id
+                || cursor.script_index >= scripts.len()
+            {
+                return Err(WalletBackendError::InvalidIncomingTransferCursor);
+            }
+            (cursor.script_index, cursor.inner)
+        }
+        None => (0, None),
+    };
+
+    let mut script_examinations = 0usize;
+    let mut body_cache = None;
+    let mut retained_body_decodes = 0usize;
+
+    loop {
+        if script_examinations == MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS {
+            return Ok(IncomingTransfersPage {
+                projection_version: INCOMING_TRANSFER_PROJECTION_VERSION,
+                chain_epoch,
+                tip: tip.clone(),
+                entries: Vec::new(),
+                script_examinations,
+                continuation: Some(incoming_transfers_cursor(
+                    chain_epoch,
+                    &tip,
+                    script_set_id,
+                    script_index,
+                    inner,
+                )),
+            });
+        }
+
+        let script = scripts
+            .get(script_index)
+            .copied()
+            .ok_or(WalletBackendError::InvalidIncomingTransferCursor)?;
+        script_examinations = script_examinations.saturating_add(1);
+        let page = incoming_transfers(snapshot, profile, script, inner.as_ref(), limit)
+            .map_err(wallet_index_error)?;
+        let mut entries = Vec::with_capacity(page.entries.len());
+        let mut last_emitted = inner.clone();
+
+        for record in page.entries {
+            let row_cursor = incoming_transfer_row_cursor(&record.entry);
+            let Some((inclusion, source_binding)) = corroborate_incoming_transfer(
+                snapshot,
+                &record.entry,
+                record.source_output_count,
+                tip.as_ref(),
+                &mut body_cache,
+                &mut retained_body_decodes,
+            )?
+            else {
+                return Ok(IncomingTransfersPage {
+                    projection_version: INCOMING_TRANSFER_PROJECTION_VERSION,
+                    chain_epoch,
+                    tip: tip.clone(),
+                    entries,
+                    script_examinations,
+                    continuation: Some(incoming_transfers_cursor(
+                        chain_epoch,
+                        &tip,
+                        script_set_id,
+                        script_index,
+                        last_emitted,
+                    )),
+                });
+            };
+            last_emitted = Some(row_cursor);
+            entries.push(WalletIncomingTransfer {
+                script_index,
+                entry: record.entry,
+                source_output_count: record.source_output_count,
+                inclusion,
+                source_binding,
+            });
+        }
+
+        let next = if let Some(cursor) = page.continuation {
+            Some((script_index, Some(cursor)))
+        } else if script_index + 1 < scripts.len() {
+            Some((script_index + 1, None))
+        } else {
+            None
+        };
+
+        if entries.is_empty() {
+            let Some((next_script_index, next_inner)) = next else {
+                return Ok(IncomingTransfersPage {
+                    projection_version: INCOMING_TRANSFER_PROJECTION_VERSION,
+                    chain_epoch,
+                    tip,
+                    entries,
+                    script_examinations,
+                    continuation: None,
+                });
+            };
+            script_index = next_script_index;
+            inner = next_inner;
+            continue;
+        }
+
+        return Ok(IncomingTransfersPage {
+            projection_version: INCOMING_TRANSFER_PROJECTION_VERSION,
+            chain_epoch,
+            tip: tip.clone(),
+            entries,
+            script_examinations,
+            continuation: next.map(|(script_index, inner)| {
+                incoming_transfers_cursor(chain_epoch, &tip, script_set_id, script_index, inner)
+            }),
+        });
+    }
+}
+
+fn incoming_transfers_cursor(
+    chain_epoch: u64,
+    tip: &Option<WalletChainTip>,
+    script_set_id: [u8; 32],
+    script_index: usize,
+    inner: Option<IncomingTransferCursor>,
+) -> IncomingTransfersCursor {
+    IncomingTransfersCursor {
+        binding_version: INCOMING_TRANSFER_CURSOR_VERSION,
+        chain_epoch,
+        tip: tip.clone(),
+        script_set_id,
+        script_index,
+        inner,
+    }
+}
+
+fn incoming_transfer_row_cursor(entry: &IncomingTransferEntry) -> IncomingTransferCursor {
+    IncomingTransferCursor {
+        height: entry.height,
+        transaction_position: entry.transaction_position,
+        txid: entry.coin.outpoint.txid,
+        output_index: entry.coin.outpoint.index,
+    }
+}
+
+fn incoming_transfer_source_status_is_authoritative(status: &BlockStatus) -> bool {
+    // `body_present` is the independently corroborated retention branch below,
+    // and `undo_present` is rollback durability rather than source authority.
+    // Every other consensus/state bit must remain satisfied after pruning.
+    status.header_context_valid
+        && status.checkpoint_valid
+        && status.deployment_state_valid
+        && status.body_syntax_valid
+        && status.absolute_finality_valid
+        && status.relative_locks_valid
+        && status.scripts_valid
+        && status.covenant_links_valid
+        && status.covenants_context_valid
+        && status.claims_and_airdrops_valid
+        && status.utxo_connected
+        && status.name_state_connected
+        && status.tree_root_valid
+        && status.active_chain
+        && !status.failed
+}
+
+fn corroborate_incoming_transfer<S: ReadSnapshot>(
+    snapshot: &S,
+    entry: &IncomingTransferEntry,
+    source_output_count: u32,
+    tip: Option<&WalletChainTip>,
+    body_cache: &mut Option<IncomingTransferBodyCache>,
+    retained_body_decodes: &mut usize,
+) -> Result<Option<(TransactionInclusion, IncomingTransferSourceBinding)>, WalletBackendError> {
+    let txid = entry.coin.outpoint.txid;
+    let transaction_index = load_required_incoming_transfer_tx_index(snapshot, txid)?;
+    if transaction_index.block_hash != entry.block_hash
+        || transaction_index.height != entry.height
+        || transaction_index.output_count != source_output_count
+        || entry.coin.height != entry.height
+        || entry.coin.outpoint.index >= source_output_count
+    {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER transaction index disagrees with compact source evidence",
+        ));
+    }
+
+    if read_canonical_hash(snapshot, entry.height).map_err(node_error)? != Some(entry.block_hash) {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER source block is not canonical at its recorded height",
+        ));
+    }
+
+    let block_index = load_required_incoming_transfer_block_index(snapshot, entry.block_hash)?;
+    let header = load_required_incoming_transfer_header(snapshot, entry.block_hash)?;
+    if block_index.height != entry.height
+        || header.height != entry.height
+        || block_index.prev_hash != header.header.prev_block
+        || block_index.chainwork != header.chainwork
+        || block_index.status != header.status
+    {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER block index and header metadata disagree",
+        ));
+    }
+    if !incoming_transfer_source_status_is_authoritative(&block_index.status) {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER source block lacks durable active consensus status",
+        ));
+    }
+    if entry.transaction_position >= block_index.tx_count {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER transaction ordinal exceeds its block transaction count",
+        ));
+    }
+
+    let active_coin = snapshot
+        .get(
+            ColumnFamily::Utxo,
+            &encode_outpoint_key(&entry.coin.outpoint),
+        )
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "incoming TRANSFER active UTXO is missing",
+        ))?;
+    if active_coin != encode_coin(&entry.coin) {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER active UTXO differs from indexed source coin",
+        ));
+    }
+
+    let tip = tip.ok_or(WalletBackendError::Corrupt(
+        "incoming TRANSFER evidence exists without an active tip",
+    ))?;
+    let confirmations = tip
+        .height
+        .checked_sub(entry.height)
+        .and_then(|depth| depth.checked_add(1))
+        .ok_or(WalletBackendError::Corrupt(
+            "incoming TRANSFER source height exceeds the active tip",
+        ))?;
+    let inclusion = TransactionInclusion {
+        block_hash: entry.block_hash,
+        height: entry.height,
+        transaction_position: Some(entry.transaction_position),
+        confirmations,
+    };
+
+    let source_binding = if block_index.status.body_present {
+        let cached = body_cache
+            .as_ref()
+            .filter(|cached| cached.hash == entry.block_hash);
+        if cached.is_some_and(|cached| cached.retained.is_none()) {
+            return Err(WalletBackendError::Corrupt(
+                "incoming TRANSFER block body status changed inside one snapshot",
+            ));
+        }
+        if cached.is_none() {
+            if *retained_body_decodes == MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES {
+                return Ok(None);
+            }
+            let block = load_required_incoming_transfer_block(snapshot, entry.block_hash)?;
+            let transaction_indexes =
+                tx_index_entries_for_block(&block, entry.height).map_err(|_| {
+                    WalletBackendError::Corrupt(
+                        "incoming TRANSFER retained transaction indexes cannot be recomputed",
+                    )
+                })?;
+            *retained_body_decodes = retained_body_decodes.saturating_add(1);
+            *body_cache = Some(IncomingTransferBodyCache {
+                hash: entry.block_hash,
+                retained: Some(RetainedIncomingTransferBody {
+                    block,
+                    transaction_indexes,
+                }),
+            });
+        }
+        let retained = body_cache
+            .as_ref()
+            .and_then(|cached| cached.retained.as_ref())
+            .ok_or(WalletBackendError::Corrupt(
+                "incoming TRANSFER retained block cache is inconsistent",
+            ))?;
+        validate_retained_incoming_transfer(
+            retained,
+            &block_index,
+            &header,
+            &transaction_index,
+            entry,
+            source_output_count,
+        )?;
+        IncomingTransferSourceBinding::RetainedBodyVerified
+    } else {
+        let cached = body_cache
+            .as_ref()
+            .filter(|cached| cached.hash == entry.block_hash);
+        if cached.is_some_and(|cached| cached.retained.is_some()) {
+            return Err(WalletBackendError::Corrupt(
+                "incoming TRANSFER block body status changed inside one snapshot",
+            ));
+        }
+        if cached.is_none() {
+            if snapshot
+                .get(ColumnFamily::Blocks, entry.block_hash.as_bytes())
+                .map_err(node_error)?
+                .is_some()
+            {
+                return Err(WalletBackendError::Corrupt(
+                    "incoming TRANSFER pruned status retains a raw block body",
+                ));
+            }
+            *body_cache = Some(IncomingTransferBodyCache {
+                hash: entry.block_hash,
+                retained: None,
+            });
+        }
+        IncomingTransferSourceBinding::PrunedTrustedNodeProjection
+    };
+
+    Ok(Some((inclusion, source_binding)))
+}
+
+fn load_required_incoming_transfer_tx_index<S: ReadSnapshot>(
+    snapshot: &S,
+    txid: Txid,
+) -> Result<TxIndexEntry, WalletBackendError> {
+    let raw = snapshot
+        .get(ColumnFamily::TxIndex, txid.as_bytes())
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "incoming TRANSFER source transaction index is missing",
+        ))?;
+    let index = TxIndexEntry::decode(&raw).map_err(|_| {
+        WalletBackendError::Corrupt("incoming TRANSFER source transaction index is malformed")
+    })?;
+    if index.txid != txid {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER source transaction index key binding is invalid",
+        ));
+    }
+    Ok(index)
+}
+
+fn load_required_incoming_transfer_block_index<S: ReadSnapshot>(
+    snapshot: &S,
+    hash: BlockHash,
+) -> Result<BlockIndexRecord, WalletBackendError> {
+    let raw = snapshot
+        .get(ColumnFamily::BlockIndex, hash.as_bytes())
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "incoming TRANSFER source block index is missing",
+        ))?;
+    let record = BlockIndexRecord::decode(&raw).map_err(|_| {
+        WalletBackendError::Corrupt("incoming TRANSFER source block index is malformed")
+    })?;
+    if record.hash != hash {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER source block index key binding is invalid",
+        ));
+    }
+    Ok(record)
+}
+
+fn load_required_incoming_transfer_header<S: ReadSnapshot>(
+    snapshot: &S,
+    hash: BlockHash,
+) -> Result<HeaderRecord, WalletBackendError> {
+    let raw = snapshot
+        .get(ColumnFamily::Headers, hash.as_bytes())
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "incoming TRANSFER source header is missing",
+        ))?;
+    let record = HeaderRecord::decode(&raw)
+        .map_err(|_| WalletBackendError::Corrupt("incoming TRANSFER source header is malformed"))?;
+    if record.hash != hash || record.header.hash() != hash {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER source header key binding is invalid",
+        ));
+    }
+    Ok(record)
+}
+
+fn load_required_incoming_transfer_block<S: ReadSnapshot>(
+    snapshot: &S,
+    hash: BlockHash,
+) -> Result<Block, WalletBackendError> {
+    let raw = snapshot
+        .get(ColumnFamily::Blocks, hash.as_bytes())
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "incoming TRANSFER retained block body is missing",
+        ))?;
+    let record = RawBlockRecord::decode(&raw).map_err(|_| {
+        WalletBackendError::Corrupt("incoming TRANSFER raw block record is malformed")
+    })?;
+    if record.hash != hash {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER raw block key binding is invalid",
+        ));
+    }
+    record.decode_block().map_err(|_| {
+        WalletBackendError::Corrupt("incoming TRANSFER retained block body is malformed")
+    })
+}
+
+fn validate_retained_incoming_transfer(
+    retained: &RetainedIncomingTransferBody,
+    block_index: &BlockIndexRecord,
+    header: &HeaderRecord,
+    transaction_index: &TxIndexEntry,
+    entry: &IncomingTransferEntry,
+    source_output_count: u32,
+) -> Result<(), WalletBackendError> {
+    let block = &retained.block;
+    if block.header != header.header {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER retained block header disagrees with the header index",
+        ));
+    }
+    validate_block_commitments(block).map_err(|_| {
+        WalletBackendError::Corrupt("incoming TRANSFER retained block commitments are invalid")
+    })?;
+    let transaction_count = u32::try_from(block.transactions.len()).map_err(|_| {
+        WalletBackendError::Corrupt("incoming TRANSFER retained block transaction count overflows")
+    })?;
+    if transaction_count != block_index.tx_count {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER retained block transaction count disagrees with its index",
+        ));
+    }
+    let transaction_position = usize::try_from(entry.transaction_position).map_err(|_| {
+        WalletBackendError::Corrupt("incoming TRANSFER retained transaction ordinal overflows")
+    })?;
+    let transaction =
+        block
+            .transactions
+            .get(transaction_position)
+            .ok_or(WalletBackendError::Corrupt(
+                "incoming TRANSFER retained transaction ordinal is absent",
+            ))?;
+    if retained.transaction_indexes.get(transaction_position) != Some(transaction_index) {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER durable transaction index differs from retained block offsets",
+        ));
+    }
+    if transaction.txid() != transaction_index.txid {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER retained transaction ordinal has the wrong transaction ID",
+        ));
+    }
+    let output_count = u32::try_from(transaction.outputs.len()).map_err(|_| {
+        WalletBackendError::Corrupt("incoming TRANSFER retained transaction output count overflows")
+    })?;
+    if output_count != source_output_count || output_count != transaction_index.output_count {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER retained transaction output count disagrees with its evidence",
+        ));
+    }
+    let output = usize::try_from(entry.coin.outpoint.index)
+        .ok()
+        .and_then(|position| transaction.outputs.get(position))
+        .ok_or(WalletBackendError::Corrupt(
+            "incoming TRANSFER retained source output is absent",
+        ))?;
+    if output.value != entry.coin.value
+        || output.address != entry.coin.address
+        || output.covenant != entry.coin.covenant
+    {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER retained source output differs from its active coin",
+        ));
+    }
+    if is_coinbase(transaction) != entry.coin.coinbase {
+        return Err(WalletBackendError::Corrupt(
+            "incoming TRANSFER retained transaction coinbase state disagrees with its active coin",
+        ));
+    }
+    Ok(())
+}
+
 fn load_block_time<S: ReadSnapshot>(
     snapshot: &S,
     cache: &mut HashMap<BlockHash, Option<u64>>,
@@ -2862,6 +3515,10 @@ fn validate_script_set(scripts: &[ScriptId]) -> Result<(), WalletBackendError> {
 
 fn confirmed_script_set_id(scripts: &[ScriptId]) -> Result<[u8; 32], WalletBackendError> {
     script_set_id(CONFIRMED_SCRIPT_SET_DOMAIN, scripts)
+}
+
+fn incoming_transfer_script_set_id(scripts: &[ScriptId]) -> Result<[u8; 32], WalletBackendError> {
+    script_set_id(INCOMING_TRANSFER_SCRIPT_SET_DOMAIN, scripts)
 }
 
 fn script_set_id(domain: &[u8], scripts: &[ScriptId]) -> Result<[u8; 32], WalletBackendError> {
@@ -3260,13 +3917,23 @@ fn wallet_writer_error(error: anyhow::Error) -> WalletBackendError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
-    use hns_consensus::Network;
+    use hns_chain::{
+        write_block_index_to_batch, write_canonical_height_to_batch, write_raw_block_to_batch,
+        write_record_to_batch, write_tx_index_for_block_to_batch, write_tx_index_to_batch,
+        BlockStatus, RawBlockSource,
+    };
+    use hns_consensus::{block_merkle_root, block_witness_root, Network};
     use hns_mempool::MemoryMempool;
     use hns_p2p::LivePeerConfig;
-    use hns_primitives::{Address, CovenantKind, Input, Outpoint, Witness};
-    use hns_state::encode_coin;
-    use hns_store::{MemoryStore, Store, WriteBatch};
+    use hns_primitives::{Address, CovenantKind, Header, Input, Outpoint, Uint256, Witness};
+    use hns_state::{encode_coin, write_coin_to_batch};
+    use hns_store::{
+        encode_u64, MemoryStore, MetaKey, PrefixScanBudget, PrefixScanPage, ReadSnapshot,
+        ScanEntry, Store, StoreError, WriteBatch,
+    };
 
     use crate::{NodeConfig, NodeService, DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY};
 
@@ -3275,6 +3942,695 @@ mod tests {
         0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
         0xf8, 0x17, 0x98,
     ];
+
+    struct IncomingReadCountingSnapshot<S> {
+        inner: S,
+        prefix_pages: Cell<usize>,
+        block_gets: Cell<usize>,
+    }
+
+    impl<S> IncomingReadCountingSnapshot<S> {
+        fn new(inner: S) -> Self {
+            Self {
+                inner,
+                prefix_pages: Cell::new(0),
+                block_gets: Cell::new(0),
+            }
+        }
+    }
+
+    impl<S: ReadSnapshot> ReadSnapshot for IncomingReadCountingSnapshot<S> {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            if family == ColumnFamily::Blocks {
+                self.block_gets.set(self.block_gets.get().saturating_add(1));
+            }
+            self.inner.get(family, key)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<Vec<ScanEntry>, StoreError> {
+            self.prefix_pages
+                .set(self.prefix_pages.get().saturating_add(1));
+            self.inner.scan_prefix(family, prefix)
+        }
+
+        fn scan_prefix_page(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+            start_after: Option<&[u8]>,
+            budget: PrefixScanBudget,
+        ) -> Result<PrefixScanPage, StoreError> {
+            self.prefix_pages
+                .set(self.prefix_pages.get().saturating_add(1));
+            self.inner
+                .scan_prefix_page(family, prefix, start_after, budget)
+        }
+    }
+
+    fn complete_wallet_profile() -> WalletIndexProfile {
+        WalletIndexProfile {
+            wallet: true,
+            ..WalletIndexProfile::default()
+        }
+    }
+
+    fn incoming_transfer_authoritative_status(body_present: bool) -> BlockStatus {
+        BlockStatus {
+            header_context_valid: true,
+            checkpoint_valid: true,
+            deployment_state_valid: true,
+            body_present,
+            body_syntax_valid: true,
+            absolute_finality_valid: true,
+            relative_locks_valid: true,
+            scripts_valid: true,
+            covenant_links_valid: true,
+            covenants_context_valid: true,
+            claims_and_airdrops_valid: true,
+            utxo_connected: true,
+            name_state_connected: true,
+            tree_root_valid: true,
+            undo_present: false,
+            active_chain: true,
+            failed: false,
+        }
+    }
+
+    fn incoming_transfer_test_output() -> Output {
+        Output {
+            value: 50,
+            address: Address::new(0, vec![0x21; 20]).expect("fixture owner address"),
+            covenant: Covenant {
+                kind: CovenantKind::Transfer,
+                items: vec![
+                    vec![0x31; 32],
+                    2_u32.to_le_bytes().to_vec(),
+                    vec![0],
+                    vec![0x41; 20],
+                ],
+            },
+        }
+    }
+
+    fn incoming_transfer_chain_fixture(
+        body_present: bool,
+        write_body: bool,
+    ) -> (MemoryStore, IncomingTransferEntry, WalletChainTip) {
+        let transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint::null(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![incoming_transfer_test_output()],
+            locktime: 0,
+        };
+        let mut block = Block {
+            header: Header::default(),
+            transactions: vec![transaction.clone()],
+        };
+        block.header.merkle_root = block_merkle_root(&block);
+        block.header.witness_root = block_witness_root(&block);
+        let hash = block.hash();
+        let status = incoming_transfer_authoritative_status(body_present);
+        let block_index = BlockIndexRecord {
+            hash,
+            height: 0,
+            prev_hash: block.header.prev_block,
+            chainwork: Uint256::ONE,
+            status: status.clone(),
+            tx_count: 1,
+            validated_at: None,
+        };
+        let header = HeaderRecord {
+            hash,
+            height: 0,
+            chainwork: Uint256::ONE,
+            header: block.header.clone(),
+            status,
+        };
+        let coin = Coin {
+            outpoint: Outpoint {
+                txid: transaction.txid(),
+                index: 0,
+            },
+            value: transaction.outputs[0].value,
+            height: 0,
+            coinbase: true,
+            address: transaction.outputs[0].address.clone(),
+            covenant: transaction.outputs[0].covenant.clone(),
+        };
+        let entry = IncomingTransferEntry {
+            recipient_version: 0,
+            recipient_hash: vec![0x41; 20],
+            name_hash: [0x31; 32],
+            start_height: 2,
+            coin: coin.clone(),
+            block_hash: hash,
+            height: 0,
+            transaction_position: 0,
+        };
+
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        write_record_to_batch(&mut batch, &header).expect("write header fixture");
+        write_block_index_to_batch(&mut batch, &block_index).expect("write block-index fixture");
+        write_canonical_height_to_batch(&mut batch, 0, hash).expect("write canonical fixture");
+        write_tx_index_for_block_to_batch(&mut batch, &block, 0)
+            .expect("write transaction-index fixture");
+        write_coin_to_batch(&mut batch, &coin).expect("write UTXO fixture");
+        if write_body {
+            write_raw_block_to_batch(
+                &mut batch,
+                &RawBlockRecord::from_block(&block, RawBlockSource::Fixture),
+            )
+            .expect("write raw-block fixture");
+        }
+        store.commit(batch).expect("commit incoming fixture");
+
+        (
+            store,
+            entry,
+            WalletChainTip {
+                hash,
+                height: 0,
+                median_time_past: block.header.time,
+                tree_root: TreeRoot::ZERO,
+            },
+        )
+    }
+
+    fn incoming_transfer_recipient_script(recipient: u8) -> ScriptId {
+        let mut descriptor = Writer::with_capacity(22);
+        descriptor.write_u8(0);
+        descriptor.write_u8(20);
+        descriptor.write_bytes(&[recipient; 20]);
+        ScriptId::from_descriptor(&descriptor.finish())
+    }
+
+    fn incoming_transfer_retained_chain_fixture(
+        block_count: u32,
+        chain_epoch: u64,
+    ) -> (MemoryStore, Vec<ScriptId>, Vec<Txid>) {
+        let store = MemoryStore::new();
+        let profile = complete_wallet_profile();
+        let recipient = 0x61;
+        let mut previous = BlockHash::ZERO;
+        let mut tip = None;
+        let mut txids = Vec::new();
+
+        for height in 0..block_count {
+            let output = Output {
+                value: 100 + u64::from(height),
+                address: Address::new(0, vec![0x51; 20]).expect("fixture owner address"),
+                covenant: Covenant {
+                    kind: CovenantKind::Transfer,
+                    items: vec![
+                        vec![u8::try_from(height).expect("fixture height"); 32],
+                        2_u32.to_le_bytes().to_vec(),
+                        vec![0],
+                        vec![recipient; 20],
+                    ],
+                },
+            };
+            let transaction = Transaction {
+                version: 0,
+                inputs: vec![Input {
+                    previous_output: Outpoint::null(),
+                    sequence: u32::MAX,
+                    witness: Witness::default(),
+                }],
+                outputs: vec![output.clone()],
+                locktime: 0,
+            };
+            let mut block = Block {
+                header: Header {
+                    nonce: height.saturating_add(1),
+                    time: u64::from(height).saturating_add(1),
+                    prev_block: previous,
+                    ..Header::default()
+                },
+                transactions: vec![transaction.clone()],
+            };
+            block.header.merkle_root = block_merkle_root(&block);
+            block.header.witness_root = block_witness_root(&block);
+            let hash = block.hash();
+            let status = incoming_transfer_authoritative_status(true);
+            let block_index = BlockIndexRecord {
+                hash,
+                height,
+                prev_hash: previous,
+                chainwork: Uint256::from_u64(u64::from(height).saturating_add(1)),
+                status: status.clone(),
+                tx_count: 1,
+                validated_at: None,
+            };
+            let header = HeaderRecord {
+                hash,
+                height,
+                chainwork: block_index.chainwork,
+                header: block.header.clone(),
+                status,
+            };
+            let coin = Coin {
+                outpoint: Outpoint {
+                    txid: transaction.txid(),
+                    index: 0,
+                },
+                value: output.value,
+                height,
+                coinbase: true,
+                address: output.address,
+                covenant: output.covenant,
+            };
+
+            let snapshot = store.snapshot().expect("pre-connect snapshot");
+            let mut batch = store.batch();
+            hns_wallet_index::stage_connect(&snapshot, &mut batch, &block, height, profile)
+                .expect("stage incoming index fixture");
+            write_record_to_batch(&mut batch, &header).expect("write header fixture");
+            write_block_index_to_batch(&mut batch, &block_index)
+                .expect("write block-index fixture");
+            write_canonical_height_to_batch(&mut batch, height, hash)
+                .expect("write canonical fixture");
+            write_tx_index_for_block_to_batch(&mut batch, &block, height)
+                .expect("write transaction-index fixture");
+            write_coin_to_batch(&mut batch, &coin).expect("write UTXO fixture");
+            write_raw_block_to_batch(
+                &mut batch,
+                &RawBlockRecord::from_block(&block, RawBlockSource::Fixture),
+            )
+            .expect("write raw-block fixture");
+            drop(snapshot);
+            store.commit(batch).expect("commit retained fixture block");
+
+            txids.push(transaction.txid());
+            previous = hash;
+            tip = Some(hash);
+        }
+
+        let tip = tip.expect("retained fixture must contain a block");
+        let mut meta = store.batch();
+        meta.put(
+            ColumnFamily::Meta,
+            MetaKey::BestBlockHash.as_bytes(),
+            tip.as_bytes(),
+        )
+        .expect("write best-block binding");
+        meta.put(
+            ColumnFamily::Meta,
+            MetaKey::ChainEpoch.as_bytes(),
+            &encode_u64(chain_epoch),
+        )
+        .expect("write chain epoch");
+        meta.put(
+            ColumnFamily::Meta,
+            MetaKey::NameTreeRoot.as_bytes(),
+            TreeRoot::ZERO.as_bytes(),
+        )
+        .expect("write tree root");
+        store
+            .commit(meta)
+            .expect("commit retained fixture metadata");
+
+        (
+            store,
+            vec![incoming_transfer_recipient_script(recipient)],
+            txids,
+        )
+    }
+
+    #[test]
+    fn incoming_transfer_stale_epoch_precedes_prefix_scans_and_block_reads() {
+        let store = MemoryStore::new();
+        let snapshot = IncomingReadCountingSnapshot::new(store.snapshot().expect("snapshot"));
+        let scripts = vec![ScriptId::from_descriptor(b"incoming-stale")];
+        let result = incoming_transfers_page_from_snapshot(
+            &snapshot,
+            complete_wallet_profile(),
+            &scripts,
+            1,
+            incoming_transfer_script_set_id(&scripts).expect("script-set ID"),
+            None,
+            16,
+        );
+        assert!(matches!(
+            result,
+            Err(WalletBackendError::StaleChainEpoch {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        assert_eq!(snapshot.prefix_pages.get(), 0);
+        assert_eq!(snapshot.block_gets.get(), 0);
+    }
+
+    #[test]
+    fn incoming_transfer_cursor_binds_version_epoch_tip_script_set_and_position() {
+        let store = MemoryStore::new();
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut scripts = vec![
+            ScriptId::from_descriptor(b"incoming-cursor-a"),
+            ScriptId::from_descriptor(b"incoming-cursor-b"),
+        ];
+        scripts.sort_unstable();
+        let script_set_id = incoming_transfer_script_set_id(&scripts).expect("script-set ID");
+        let valid = IncomingTransfersCursor {
+            binding_version: INCOMING_TRANSFER_CURSOR_VERSION,
+            chain_epoch: 0,
+            tip: None,
+            script_set_id,
+            script_index: 0,
+            inner: None,
+        };
+
+        let mut wrong_version = valid.clone();
+        wrong_version.binding_version = INCOMING_TRANSFER_CURSOR_VERSION.saturating_add(1);
+        assert!(matches!(
+            incoming_transfers_page_from_snapshot(
+                &snapshot,
+                complete_wallet_profile(),
+                &scripts,
+                0,
+                script_set_id,
+                Some(wrong_version),
+                16,
+            ),
+            Err(WalletBackendError::InvalidIncomingTransferCursor)
+        ));
+
+        let mut wrong_epoch = valid.clone();
+        wrong_epoch.chain_epoch = 1;
+        assert!(matches!(
+            incoming_transfers_page_from_snapshot(
+                &snapshot,
+                complete_wallet_profile(),
+                &scripts,
+                0,
+                script_set_id,
+                Some(wrong_epoch),
+                16,
+            ),
+            Err(WalletBackendError::StaleChainEpoch {
+                expected: 1,
+                actual: 0
+            })
+        ));
+
+        let mut wrong_tip = valid.clone();
+        wrong_tip.tip = Some(WalletChainTip {
+            hash: BlockHash::ZERO,
+            height: 0,
+            median_time_past: 0,
+            tree_root: TreeRoot::ZERO,
+        });
+        assert!(matches!(
+            incoming_transfers_page_from_snapshot(
+                &snapshot,
+                complete_wallet_profile(),
+                &scripts,
+                0,
+                script_set_id,
+                Some(wrong_tip),
+                16,
+            ),
+            Err(WalletBackendError::InvalidIncomingTransferCursor)
+        ));
+
+        let mut wrong_script_set = valid.clone();
+        wrong_script_set.script_set_id[0] ^= 1;
+        assert!(matches!(
+            incoming_transfers_page_from_snapshot(
+                &snapshot,
+                complete_wallet_profile(),
+                &scripts,
+                0,
+                script_set_id,
+                Some(wrong_script_set),
+                16,
+            ),
+            Err(WalletBackendError::InvalidIncomingTransferCursor)
+        ));
+
+        let mut wrong_position = valid;
+        wrong_position.script_index = scripts.len();
+        assert!(matches!(
+            incoming_transfers_page_from_snapshot(
+                &snapshot,
+                complete_wallet_profile(),
+                &scripts,
+                0,
+                script_set_id,
+                Some(wrong_position),
+                16,
+            ),
+            Err(WalletBackendError::InvalidIncomingTransferCursor)
+        ));
+    }
+
+    #[test]
+    fn incoming_transfer_empty_script_walk_is_bounded_and_resumable() {
+        let store = MemoryStore::new();
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut scripts = (0..=MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS)
+            .map(|index| ScriptId::from_descriptor(&index.to_be_bytes()))
+            .collect::<Vec<_>>();
+        scripts.sort_unstable();
+        let script_set_id = incoming_transfer_script_set_id(&scripts).expect("script-set ID");
+        let first = incoming_transfers_page_from_snapshot(
+            &snapshot,
+            complete_wallet_profile(),
+            &scripts,
+            0,
+            script_set_id,
+            None,
+            16,
+        )
+        .expect("bounded empty page");
+        assert!(first.entries.is_empty());
+        assert_eq!(
+            first.script_examinations,
+            MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS
+        );
+        let continuation = first.continuation.expect("bounded continuation");
+        assert_eq!(continuation.script_index, 256);
+        assert!(continuation.inner.is_none());
+
+        let complete = incoming_transfers_page_from_snapshot(
+            &snapshot,
+            complete_wallet_profile(),
+            &scripts,
+            0,
+            script_set_id,
+            Some(continuation),
+            16,
+        )
+        .expect("empty traversal completion");
+        assert!(complete.entries.is_empty());
+        assert_eq!(complete.script_examinations, 1);
+        assert!(complete.continuation.is_none());
+    }
+
+    #[test]
+    fn incoming_transfer_corroboration_labels_retained_and_pruned_sources() {
+        for (body_present, write_body, expected_binding, expected_decodes) in [
+            (
+                true,
+                true,
+                IncomingTransferSourceBinding::RetainedBodyVerified,
+                1,
+            ),
+            (
+                false,
+                false,
+                IncomingTransferSourceBinding::PrunedTrustedNodeProjection,
+                0,
+            ),
+        ] {
+            let (store, entry, tip) = incoming_transfer_chain_fixture(body_present, write_body);
+            let snapshot = store.snapshot().expect("snapshot");
+            let mut cache = None;
+            let mut retained_decodes = 0;
+            let (inclusion, binding) = corroborate_incoming_transfer(
+                &snapshot,
+                &entry,
+                1,
+                Some(&tip),
+                &mut cache,
+                &mut retained_decodes,
+            )
+            .expect("corroboration")
+            .expect("body budget");
+            assert_eq!(binding, expected_binding);
+            assert_eq!(retained_decodes, expected_decodes);
+            assert_eq!(inclusion.transaction_position, Some(0));
+            assert_eq!(inclusion.confirmations, 1);
+        }
+    }
+
+    #[test]
+    fn incoming_transfer_body_presence_must_match_status_both_directions() {
+        for (body_present, write_body) in [(true, false), (false, true)] {
+            let (store, entry, tip) = incoming_transfer_chain_fixture(body_present, write_body);
+            let snapshot = store.snapshot().expect("snapshot");
+            let mut cache = None;
+            let mut retained_decodes = 0;
+            assert!(matches!(
+                corroborate_incoming_transfer(
+                    &snapshot,
+                    &entry,
+                    1,
+                    Some(&tip),
+                    &mut cache,
+                    &mut retained_decodes,
+                ),
+                Err(WalletBackendError::Corrupt(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn incoming_transfer_requires_pruning_stable_consensus_status() {
+        let (store, entry, tip) = incoming_transfer_chain_fixture(true, true);
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut block_index = BlockIndexRecord::decode(
+            &snapshot
+                .get(ColumnFamily::BlockIndex, entry.block_hash.as_bytes())
+                .expect("block-index read")
+                .expect("block index"),
+        )
+        .expect("decode block index");
+        let mut header = HeaderRecord::decode(
+            &snapshot
+                .get(ColumnFamily::Headers, entry.block_hash.as_bytes())
+                .expect("header read")
+                .expect("header"),
+        )
+        .expect("decode header");
+        block_index.status.scripts_valid = false;
+        header.status.scripts_valid = false;
+        drop(snapshot);
+        let mut batch = store.batch();
+        write_block_index_to_batch(&mut batch, &block_index).expect("rewrite block index");
+        write_record_to_batch(&mut batch, &header).expect("rewrite header");
+        store.commit(batch).expect("commit status corruption");
+
+        let snapshot = store.snapshot().expect("corrupt snapshot");
+        let mut cache = None;
+        let mut retained_decodes = 0;
+        assert!(matches!(
+            corroborate_incoming_transfer(
+                &snapshot,
+                &entry,
+                1,
+                Some(&tip),
+                &mut cache,
+                &mut retained_decodes,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+        assert_eq!(retained_decodes, 0);
+    }
+
+    #[test]
+    fn incoming_transfer_retained_body_binds_tx_index_offset_and_length() {
+        let (store, entry, tip) = incoming_transfer_chain_fixture(true, true);
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut transaction_index = TxIndexEntry::decode(
+            &snapshot
+                .get(ColumnFamily::TxIndex, entry.coin.outpoint.txid.as_bytes())
+                .expect("transaction-index read")
+                .expect("transaction index"),
+        )
+        .expect("decode transaction index");
+        transaction_index.tx_offset = transaction_index.tx_offset.saturating_add(1);
+        drop(snapshot);
+        let mut batch = store.batch();
+        write_tx_index_to_batch(&mut batch, &transaction_index).expect("rewrite transaction index");
+        store.commit(batch).expect("commit offset corruption");
+
+        let snapshot = store.snapshot().expect("corrupt snapshot");
+        let mut cache = None;
+        let mut retained_decodes = 0;
+        assert!(matches!(
+            corroborate_incoming_transfer(
+                &snapshot,
+                &entry,
+                1,
+                Some(&tip),
+                &mut cache,
+                &mut retained_decodes,
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+        assert_eq!(retained_decodes, 1);
+    }
+
+    #[test]
+    fn incoming_transfer_fifth_retained_block_resumes_without_loss_or_duplicate() {
+        let chain_epoch = 9;
+        let (store, scripts, expected_txids) = incoming_transfer_retained_chain_fixture(
+            u32::try_from(MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES)
+                .expect("fixture bound")
+                .saturating_add(1),
+            chain_epoch,
+        );
+        let script_set_id = incoming_transfer_script_set_id(&scripts).expect("script-set ID");
+
+        let first_snapshot =
+            IncomingReadCountingSnapshot::new(store.snapshot().expect("first snapshot"));
+        let first = incoming_transfers_page_from_snapshot(
+            &first_snapshot,
+            complete_wallet_profile(),
+            &scripts,
+            chain_epoch,
+            script_set_id,
+            None,
+            16,
+        )
+        .expect("first retained page");
+        assert_eq!(
+            first.entries.len(),
+            MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES
+        );
+        assert_eq!(
+            first_snapshot.block_gets.get(),
+            MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES
+        );
+        assert!(first.entries.iter().all(|entry| {
+            entry.source_binding == IncomingTransferSourceBinding::RetainedBodyVerified
+        }));
+        let continuation = first.continuation.expect("body-budget continuation");
+
+        let second_snapshot =
+            IncomingReadCountingSnapshot::new(store.snapshot().expect("second snapshot"));
+        let second = incoming_transfers_page_from_snapshot(
+            &second_snapshot,
+            complete_wallet_profile(),
+            &scripts,
+            chain_epoch,
+            script_set_id,
+            Some(continuation),
+            16,
+        )
+        .expect("resumed retained page");
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second_snapshot.block_gets.get(), 1);
+        assert!(second.continuation.is_none());
+
+        let actual_txids = first
+            .entries
+            .iter()
+            .chain(&second.entries)
+            .map(|entry| entry.entry.coin.outpoint.txid)
+            .collect::<Vec<_>>();
+        assert_eq!(actual_txids, expected_txids);
+    }
 
     #[test]
     fn name_action_eligibility_uses_fixed_bounded_candidate_reasons() {

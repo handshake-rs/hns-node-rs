@@ -224,20 +224,23 @@ Therefore:
 - raw confirmed transactions generally require the containing raw block and
   return `PayloadPruned` when it is gone. Profile-v4 incoming-TRANSFER evidence
   deliberately does not retain or reconstruct the raw owner transaction;
-- a later bounded incoming-TRANSFER query must return Coin-based node evidence,
-  or a projection: the exact active `Coin`, canonical covenant
-  recipient/source fields, txid, inclusion block/height/ordinal, and total
-  output count. This compact shape is suitable for mobile browsers and
-  extensions, but is not a transaction preimage and cannot satisfy an API or
-  security contract that requires that preimage;
-- after body pruning, that projection crosses a trusted-node boundary: it is
-  not a cryptographic binding of the `Coin` output bytes to the txid. A future
-  query must use one durable snapshot to corroborate the canonical
-  `TxIndexEntry` txid/hash/height/output count, active-chain block and retained
-  transaction position, evidence-state membership, and byte-exact active UTXO.
-  When the body is available it must additionally verify the txid, exact
-  transaction position/output count, and exact referenced output bytes. This
-  tranche stores those bounded inputs; it does not yet define that query API;
+- the bounded `incoming_transfers` index read and
+  `WalletBackend::get_incoming_transfers_page` return the exact active `Coin`,
+  canonical covenant recipient/source fields, txid, inclusion
+  block/height/ordinal, and total source-output count. This compact shape is
+  suitable for mobile browsers and extensions, but is not a transaction
+  preimage and cannot satisfy an API or security contract that requires that
+  preimage;
+- the backend performs its corroboration in the same immutable snapshot. It
+  checks the active recipient row, source evidence and live-reference state,
+  byte-exact active UTXO, canonical `TxIndexEntry`, active-chain mapping,
+  block/header status, exact transaction position, and captured tip. When the
+  body is retained it also validates the block commitments and exact source
+  transaction/output and labels the row `retained_body_verified`. When the raw
+  block is proven absent it labels the row
+  `pruned_trusted_node_projection`; that projection crosses a trusted-node
+  boundary and is not a cryptographic binding of the `Coin` output bytes to
+  the txid;
 - the archive storage profile is required for guaranteed historical raw
   transaction and owner-transaction retrieval;
 - reorganization remains limited by the node's retained undo horizon, exactly
@@ -298,6 +301,7 @@ and the live peer manager. It implements:
 - `get_script_history`
 - `get_script_utxos`
 - `get_confirmed_scripts_page`
+- `get_incoming_transfers_page`
 - `get_spending_transaction`
 - `get_outpoint_spending_evidence`
 - `register_tracked_contract`
@@ -413,6 +417,12 @@ configured. Loopback alone never enables it. Diagnostic-only mode, a narrower
 index profile, or missing listener authentication leaves the route unrouted;
 no wallet request is parsed and no wallet read or write begins.
 
+`incoming_transfers_page` has exactly those gates. It has no diagnostic,
+headers-only, observe-only, unauthenticated, or partial-index fallback. Once the
+route is installed, the outer middleware requires the byte-exact configured
+Authorization header before dispatch, and the method runs through the bounded
+backend collection-read lane.
+
 The v1 request/response envelope uses canonical hexadecimal identities and raw
 transactions. Continuations are bounded behaviorally opaque hexadecimal
 tokens, not secrets or authenticated capabilities. The additive
@@ -424,6 +434,9 @@ responses preserve chain epoch, tip, and script-set binding; mempool responses
 preserve the chain epoch/tip plus explicit process instance nonce, generation,
 and query binding. Mempool requests supply their confirmed restore epoch, and
 mempool cursors bind that epoch as well as the process-local generation.
+Incoming-TRANSFER continuations bind the actual epoch, exact tip, and complete
+sorted-unique ScriptId set, and their mandatory expected epoch is checked in
+the immutable snapshot before prefix or body work.
 Transaction/raw point requests also require that chain epoch and optionally
 require the exact nonce/generation learned from a prior mempool page; omission
 means an explicitly independent current mempool capture.
@@ -471,6 +484,58 @@ store snapshot. Confirmed history includes optional canonical header
 `block_time`, cached by block hash within that snapshot, and never fabricates a
 timestamp when unavailable. As with mempool results, the adapter must preserve a reverse
 mapping from sorted request position to wallet derivation order.
+
+## Incoming TRANSFER discovery
+
+The lower-level `incoming_transfers` read accepts a `ScriptId`, an optional
+exclusive `IncomingTransferCursor`, and a page limit. It walks only that
+recipient prefix in canonical key order. Each returned
+`IncomingTransferRecord` combines the active recipient entry with the exact
+source-output count after checking its key/checksum binding, compact source
+evidence, active live-reference membership, and byte-exact UTXO Coin. A
+well-formed cursor is only an exclusive traversal hint; the pointed row need
+not still exist, and the cursor grants no authority.
+
+`WalletBackend::get_incoming_transfers_page` is the multi-script public read.
+It accepts one complete sorted-unique set of at most 10,000 ScriptIds, a
+mandatory `expected_chain_epoch`, an optional opaque continuation, and a limit
+of at most 4,096 rows internally (256 through wallet RPC). The epoch comparison
+occurs inside the immutable collection read before any recipient-prefix scan
+or retained-body load. Every candidate is then corroborated in that same store
+snapshot against its transaction-index entry, canonical height mapping,
+block-index/header identity and status, exact transaction ordinal/output
+count, active UTXO, and captured tip. A retained source also requires the raw
+block, valid commitments, the transaction at the recorded ordinal, and the
+exact referenced output. A pruned status requires the raw block to be absent;
+status/payload disagreement is corruption rather than a silent downgrade.
+
+The page uses `projection_version: 1` and returns `script_index`, covenant
+`recipient`, `name_hash`, `start_height`, `transfer_coin`, `inclusion`,
+`source_output_count`, `source_binding`, `script_examinations`, and
+`continuation`. `transfer_coin` is still the old owner's active TRANSFER UTXO;
+it is not a recipient balance. These rows are candidate discovery only, never
+current NameState authority, cryptographic proof, or action authorization.
+`source_binding` is exactly `retained_body_verified` or
+`pruned_trusted_node_projection`. Raw-body pruning can change that label on a
+later page without changing the chain epoch, so consumers preserve it per row
+and do not assume one retention state across a traversal.
+
+The continuation binds its version, actual chain epoch, exact tip, digest of
+the complete sorted-unique ScriptId set, current script index, and exclusive
+low-level cursor. It is transported as a hexadecimal encoding of bounded JSON
+and capped at 4,096 decoded bytes. Its script-set digest is unkeyed: the
+continuation is not a MAC, an authentication token, a secret, or a capability.
+A malformed, cross-query, cross-tip, or stale continuation is rejected.
+
+Each call examines at most 256 recipient prefixes total, and therefore at most
+256 empty prefixes, and reports its work in `script_examinations`. It decodes no
+more than four distinct retained block bodies; pruned rows do not consume that
+decode budget. Reaching the row, prefix-examination, body-decode, or underlying
+4,096-entry/16-MiB page bound yields a continuation after the last emitted row,
+without duplicating or losing the next candidate. The wallet RPC applies its
+stricter 256-row and 8-MiB serialized result limits. Its exact request and wire
+projection are documented in
+[`WALLET_RPC_V1.md`](WALLET_RPC_V1.md#incoming-transfer-discovery).
 
 ## Mempool reconciliation
 

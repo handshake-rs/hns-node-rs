@@ -347,14 +347,35 @@ node_rpc_get /api/v1/sync | jq -e '.stage != null'
 node_rpc_get /api/v1/native-sync | jq -e '.last_error == null'
 node_rpc_wallet \
   '{"api_version":1,"request_id":"deployment-capabilities","call":{"method":"capabilities"}}' \
-  | jq -e '.api_version == 1 and .result.api_version == 1'
+  | jq -e '
+    .api_version == 1 and
+    .result.api_version == 1 and
+    .result.maximum_restore_scripts == 10000 and
+    .result.maximum_wire_page_items == 256 and
+    .result.maximum_wire_result_bytes == 8388608 and
+    .result.maximum_opaque_cursor_bytes == 4096 and
+    .result.incoming_transfer_projection_version == 1 and
+    .result.incoming_transfer_source_bindings == [
+      "retained_body_verified",
+      "pruned_trusted_node_projection"
+    ] and
+    .result.incoming_transfer_cursor_binding ==
+      "chain_epoch_exact_tip_and_complete_sorted_unique_script_set" and
+    .result.incoming_transfer_cursor_authentication ==
+      "none_unkeyed_query_binding_only" and
+    .result.incoming_transfer_authority ==
+      "candidate_discovery_only_not_balance_name_authority_or_cryptographic_proof" and
+    .result.maximum_incoming_transfer_script_examinations == 256 and
+    .result.maximum_incoming_transfer_retained_block_decodes == 4
+  '
 ```
 
 These assertions prove mainnet, pruned storage, synchronous durability, native
 mode without mining authority, default-feature execution, required RPC
 authentication, disabled ODoH/HNSR roles, disabled mining/relay, live sync
 diagnostics, and a v1 wallet `result`. The last condition proves the
-authenticated wallet route was installed from the first start.
+authenticated wallet route was installed from the first start and advertises
+the bounded version-1 incoming-TRANSFER projection.
 
 Bind the running process to the installed artifact:
 
@@ -399,15 +420,63 @@ for active incoming TRANSFER covenants until the spender rollback horizon
 retires. They never retain the raw owner transaction or its witness. Raw owner
 transactions older than the 288-block payload horizon can therefore be
 unavailable, so the wallet must retain every signed transaction and any raw
-owner transactions needed to construct future name actions. A later bounded
-incoming-transfer query is explicitly a Coin-based node evidence/projection and
-cannot satisfy APIs or security contracts that require those raw transaction
-preimages. After body pruning it is a trusted-node assertion, not a
-cryptographic binding of output bytes to txid;
-the future query must perform the same-snapshot TxIndex, active-chain/position,
-evidence-state, and byte-exact active-UTXO corroboration documented in
-`HNS_NODE_WALLET_INDEX.md`, plus an exact output check whenever the body is
-available.
+owner transactions needed to construct future name actions.
+
+The authenticated `incoming_transfers_page` method exposes the retained compact
+state as bounded candidate discovery. After obtaining `chain_epoch` from
+`chain_snapshot`, a wallet requests its complete sorted-unique recipient
+ScriptId set as follows:
+
+```json
+{
+  "api_version": 1,
+  "request_id": "mainnet-incoming-transfer-1",
+  "call": {
+    "method": "incoming_transfers_page",
+    "params": {
+      "script_ids": ["<64 hex characters>"],
+      "expected_chain_epoch": 42,
+      "cursor": null,
+      "limit": 256
+    }
+  }
+}
+```
+
+The expected epoch is checked in the immutable snapshot before any recipient
+prefix or retained body is read. Each version-1 result row identifies its
+sorted `script_index`, covenant `recipient`, `name_hash`, `start_height`, exact
+old-owner `transfer_coin`, canonical `inclusion`, `source_output_count`, and
+`source_binding`; the page also returns the captured epoch/tip,
+`script_examinations`, and `continuation`. The TRANSFER Coin is not part of the
+recipient's spendable HNS balance. A row is not current NameState authority, a
+cryptographic proof, or permission to finalize a name.
+
+`retained_body_verified` means the same snapshot also verified the retained
+block commitments, transaction ordinal/output count, and exact referenced
+output. `pruned_trusted_node_projection` means the raw block was proven absent
+and the Coin-based result is a trusted-node projection, not a cryptographic
+binding of output bytes to txid. Pruning can change this per-row label between
+pages without changing the chain epoch. The method always performs the
+same-snapshot transaction-index, active-chain/position, block/header status,
+evidence-state, and byte-exact active-UTXO checks documented in
+`HNS_NODE_WALLET_INDEX.md`.
+
+The request admits at most 10,000 sorted-unique ScriptIds and 256 wire rows. A
+call examines at most 256 recipient prefixes total, and therefore at most 256
+empty prefixes, and decodes at most four distinct retained block bodies before
+returning a continuation. The underlying index page remains bounded to 4,096
+rows and 16 MiB; the cursor is a hexadecimal encoding of bounded JSON capped at
+4,096 decoded bytes, and the serialized wire result is capped at 8 MiB. The
+continuation binds its version, actual epoch, exact tip, complete script-set
+digest, and traversal position. That digest is unkeyed: the cursor is opaque
+but is not a MAC, authentication token, secret, or capability.
+
+There is no unauthenticated or partial-profile variant. The exact Authorization
+header, complete `--wallet-index` profile, canonical native runtime, listener
+limits, and collection-read admission used by every wallet method also gate
+`incoming_transfers_page`. The exact response schema is in
+[`WALLET_RPC_V1.md`](WALLET_RPC_V1.md#incoming-transfer-discovery).
 
 Do not point a profile-v4 binary at this deployment's non-empty, wallet-enabled
 profile-v3 data directory. Normal startup deliberately rejects that unsafe

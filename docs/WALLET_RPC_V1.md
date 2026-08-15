@@ -88,6 +88,7 @@ wire. Transaction policy rejection text is bounded to 256 characters.
 | `chain_snapshot` | none | Durable chain epoch and the exact active tip from one immutable read, without accepting script identities. |
 | `block_hash` | `height`, required `expected_chain_epoch` | Requested height and active-chain hash or `null`, bound to the chain epoch and full tip captured in the same immutable read. |
 | `confirmed_scripts_page` | sorted-unique `script_ids`, opaque `cursor`, `limit` (1..=256) | Combined history (including canonical block time when retained in the header index) then UTXOs, chain epoch, tip, work count, continuation. |
+| `incoming_transfers_page` | sorted-unique `script_ids`, required `expected_chain_epoch`, opaque `cursor`, `limit` (1..=256) | Version-1 active incoming-TRANSFER candidates, chain epoch, exact tip, bounded work count, per-row source binding, and continuation from one immutable read. |
 | `mempool_scripts_page` | same script set, required `expected_chain_epoch`, opaque `cursor`, `scan_limit` (1..=1,024) | Relevant transactions with exact admission times, chain epoch/tip, process `instance_nonce`, and immutable `generation`. A mismatched expected epoch fails stale. |
 | `raw_transaction` | `txid`, required `expected_chain_epoch`, optional `expected_mempool` | Canonical retained transaction hex or `null` plus chain tip/epoch and mempool instance/generation; pruned payloads are explicit errors. |
 | `transaction_evidence` | `txid`, required `expected_chain_epoch`, optional `expected_mempool` | Status, inclusion, payload availability, optional raw hex, chain epoch, tip, and mempool instance/generation from one stable capture. Inclusion carries the exact `transaction_index` when derivable. |
@@ -155,6 +156,139 @@ Every non-null `tip` object contains `hash`, `height`, `median_time_past`, and
 to ten ancestors, matching the HSD consensus window. The node loads that header
 ancestry from the same immutable snapshot as the tip and proof root; missing or
 inconsistent ancestry fails closed instead of projecting a partial time value.
+
+## Incoming TRANSFER discovery
+
+`incoming_transfers_page` discovers active confirmed TRANSFER covenants whose
+recipient address hashes to one of the requested ScriptIds. The request shape
+is:
+
+```json
+{
+  "api_version": 1,
+  "request_id": "incoming-transfer-17",
+  "call": {
+    "method": "incoming_transfers_page",
+    "params": {
+      "script_ids": ["<64 hex characters>"],
+      "expected_chain_epoch": 42,
+      "cursor": null,
+      "limit": 256
+    }
+  }
+}
+```
+
+The script set must be sorted, contain no duplicates, and contain at most
+10,000 identities. `expected_chain_epoch` is mandatory. The backend compares it
+inside the immutable store read before it scans any recipient prefix or loads
+any retained block body. A mismatch is `stale_snapshot`, so a stale request
+cannot consume index-scan or body-decode work.
+
+A successful nonempty page has this exact projection:
+
+```json
+{
+  "api_version": 1,
+  "request_id": "incoming-transfer-17",
+  "result": {
+    "projection_version": 1,
+    "chain_epoch": 42,
+    "tip": {
+      "hash": "<64 hex characters>",
+      "height": 100000,
+      "median_time_past": 1700000123,
+      "tree_root": "<64 hex characters>"
+    },
+    "entries": [
+      {
+        "script_index": 0,
+        "recipient": {
+          "version": 0,
+          "hash": "<TRANSFER covenant recipient program hex>"
+        },
+        "name_hash": "<64 hex characters>",
+        "start_height": 12345,
+        "transfer_coin": {
+          "outpoint": {
+            "txid": "<64 hex characters>",
+            "index": 0
+          },
+          "value": 1000000,
+          "height": 99713,
+          "coinbase": false,
+          "address": {
+            "version": 0,
+            "hash": "<old-owner output-address hash hex>"
+          },
+          "covenant": {
+            "kind": 9,
+            "items": ["<canonical covenant item hex>"]
+          }
+        },
+        "inclusion": {
+          "block_hash": "<64 hex characters>",
+          "height": 99713,
+          "transaction_index": 1,
+          "confirmations": 288
+        },
+        "source_output_count": 2,
+        "source_binding": "retained_body_verified"
+      }
+    ],
+    "script_examinations": 1,
+    "continuation": "<opaque hexadecimal cursor or null>"
+  }
+}
+```
+
+`script_index` is the position in the submitted sorted-unique set, not wallet
+derivation order. `recipient` is the TRANSFER covenant recipient. In contrast,
+`transfer_coin` is the exact active TRANSFER UTXO and remains addressed to the
+old owner. It must not be added to the recipient's ordinary HNS balance or
+script-UTXO set. The row is a name-receipt candidate only: it is never current
+NameState authority, a cryptographic proof, or authorization to construct,
+sign, finalize, or publish a name action.
+
+Every returned row is corroborated within the page's one immutable snapshot.
+The backend checks the active recipient row, compact source evidence and live
+reference membership, byte-exact active UTXO, transaction-index entry,
+canonical height mapping, block/header status, transaction position, source
+output count, and exact captured tip. For `retained_body_verified`, the node
+also validates the retained block and its commitments and compares the exact
+transaction output at the recorded position. For
+`pruned_trusted_node_projection`, the raw block is proven absent and the result
+is explicitly a trusted-node projection of the durable Coin and index
+evidence, not a cryptographic binding of those output bytes to the txid.
+
+The source binding is a property of each row in a page. Pruning can change a
+row on a later page from `retained_body_verified` to
+`pruned_trusted_node_projection` without changing the chain epoch. Consumers
+must preserve the returned label and must not infer cross-page raw-body
+retention consistency from an unchanged epoch.
+
+The continuation binds its version, actual chain epoch, exact tip, complete
+sorted-unique script-set digest, current script position, and exclusive
+low-level cursor. Its transport representation is a hexadecimal encoding of
+bounded JSON. The digest and cursor are unkeyed: the cursor is not a MAC, an
+authentication token, a secret, or a capability. It grants no chain, index,
+balance, or name authority. Clients treat it as opaque, echo it exactly, and
+restart from `cursor: null` after any stale binding.
+
+One wire page returns at most 256 entries. A call examines at most 256 recipient
+prefixes total, and therefore at most 256 empty prefixes, and reports the
+consumed work in `script_examinations`. It can return an empty page with a
+non-null continuation. It decodes at most four distinct retained block bodies;
+pruned rows consume no retained-body decode slot. Reaching the row,
+prefix-examination, retained-body, or 16-MiB internal index-page bound returns
+an exclusive continuation after the last emitted row.
+The decoded cursor is capped at 4,096 bytes, and the serialized JSON `result`
+is capped at 8 MiB.
+
+This method has no alternate listener or relaxed bootstrap path. The exact
+Authorization middleware, complete `--wallet-index` profile, canonical native
+runtime ownership, listener body/concurrency/timeout limits, and backend
+collection-read admission described above all apply before or during the read.
 
 ## Transaction-bound fee quotes
 

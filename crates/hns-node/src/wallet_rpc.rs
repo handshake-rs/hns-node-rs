@@ -19,15 +19,18 @@ use serde_json::Value;
 
 use super::wallet_backend::{
     BlockHashEvidence, BroadcastResult, ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate,
-    FeeEstimateSource, MempoolContractEvent, MempoolContractPage, MempoolScriptPage, NameAction,
-    NameActionContext, NameActionIneligibility, NameEvidence, NameOwnerTransaction,
+    FeeEstimateSource, IncomingTransferSourceBinding, IncomingTransfersCursor,
+    IncomingTransfersPage, MempoolContractEvent, MempoolContractPage, MempoolScriptPage,
+    NameAction, NameActionContext, NameActionIneligibility, NameEvidence, NameOwnerTransaction,
     OutpointSpendingEvidence, TransactionEvidence, TransactionFeeQuote, TransactionPayload,
     TransactionStatus, WalletBackend, WalletBackendError, WalletChainSnapshot,
     WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
-    WalletContractFundingPage, WalletMempoolCursor, MAX_FEE_ESTIMATE_TARGET_BLOCKS,
-    MAX_NAME_ACTION_INELIGIBILITY_REASONS, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
-    MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_MEMPOOL_SCAN, MAX_WALLET_OUTPOINT_SPEND_BATCH,
-    MAX_WALLET_RESTORE_SCRIPTS, NAME_ACTION_CONTEXT_VERSION,
+    WalletContractFundingPage, WalletMempoolCursor, INCOMING_TRANSFER_PROJECTION_VERSION,
+    MAX_FEE_ESTIMATE_TARGET_BLOCKS, MAX_NAME_ACTION_INELIGIBILITY_REASONS,
+    MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_FEE_QUOTE_INPUTS,
+    MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES,
+    MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS, MAX_WALLET_MEMPOOL_SCAN,
+    MAX_WALLET_OUTPOINT_SPEND_BATCH, MAX_WALLET_RESTORE_SCRIPTS, NAME_ACTION_CONTEXT_VERSION,
 };
 
 pub const WALLET_RPC_API_VERSION: u16 = 1;
@@ -64,6 +67,13 @@ enum WalletRpcCall {
     },
     ConfirmedScriptsPage {
         script_ids: Vec<String>,
+        #[serde(default)]
+        cursor: Option<String>,
+        limit: usize,
+    },
+    IncomingTransfersPage {
+        script_ids: Vec<String>,
+        expected_chain_epoch: u64,
         #[serde(default)]
         cursor: Option<String>,
         limit: usize,
@@ -299,7 +309,8 @@ async fn dispatch_call(
     call: WalletRpcCall,
 ) -> Result<Value, DispatchError> {
     let result = match call {
-        WalletRpcCall::Capabilities => serde_json::json!({
+        WalletRpcCall::Capabilities => {
+            let mut capabilities = serde_json::json!({
             "api_version": WALLET_RPC_API_VERSION,
             "authenticated_listener_required": true,
             "maximum_restore_scripts": MAX_WALLET_RESTORE_SCRIPTS,
@@ -348,8 +359,56 @@ async fn dispatch_call(
             ],
             "tracked_contract_descriptor_registration": "unavailable_unpublished_protocol_boundary",
             "tracked_contract_preimage_transport": "opaque_unavailable",
-            "tracked_contract_evidence": "node_local_profile_only_not_protocol_authority"
-        }),
+                "tracked_contract_evidence": "node_local_profile_only_not_protocol_authority"
+            });
+            let object = capabilities
+                .as_object_mut()
+                .ok_or(DispatchError::Internal)?;
+            for (key, value) in [
+                (
+                    "incoming_transfer_projection_version",
+                    Value::from(INCOMING_TRANSFER_PROJECTION_VERSION),
+                ),
+                (
+                    "incoming_transfer_source_bindings",
+                    Value::Array(vec![
+                        Value::from("retained_body_verified"),
+                        Value::from("pruned_trusted_node_projection"),
+                    ]),
+                ),
+                (
+                    "incoming_transfer_cursor_binding",
+                    Value::from("chain_epoch_exact_tip_and_complete_sorted_unique_script_set"),
+                ),
+                (
+                    "incoming_transfer_cursor_authentication",
+                    Value::from("none_unkeyed_query_binding_only"),
+                ),
+                (
+                    "incoming_transfer_authority",
+                    Value::from(
+                        "candidate_discovery_only_not_balance_name_authority_or_cryptographic_proof",
+                    ),
+                ),
+                (
+                    "incoming_transfer_snapshot_semantics",
+                    Value::from(
+                        "same_snapshot_per_call_retention_label_may_change_across_pages_without_epoch_change",
+                    ),
+                ),
+                (
+                    "maximum_incoming_transfer_script_examinations",
+                    Value::from(MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS),
+                ),
+                (
+                    "maximum_incoming_transfer_retained_block_decodes",
+                    Value::from(MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES),
+                ),
+            ] {
+                object.insert(key.to_owned(), value);
+            }
+            capabilities
+        }
         WalletRpcCall::ChainTip => value(&wire_tip(backend.get_chain_tip().await?))?,
         WalletRpcCall::ChainSnapshot => value(&WireChainSnapshot::from(
             backend.get_chain_snapshot().await?,
@@ -374,6 +433,20 @@ async fn dispatch_call(
                 .get_confirmed_scripts_page(scripts, cursor, limit)
                 .await?;
             value(&wire_confirmed_page(page)?)?
+        }
+        WalletRpcCall::IncomingTransfersPage {
+            script_ids,
+            expected_chain_epoch,
+            cursor,
+            limit,
+        } => {
+            validate_wire_page_limit(limit)?;
+            let scripts = decode_script_ids(script_ids)?;
+            let cursor = decode_cursor::<IncomingTransfersCursor>(cursor)?;
+            let page = backend
+                .get_incoming_transfers_page(scripts, expected_chain_epoch, cursor, limit)
+                .await?;
+            value(&wire_incoming_transfers_page(page)?)?
         }
         WalletRpcCall::MempoolScriptsPage {
             script_ids,
@@ -672,7 +745,9 @@ fn map_backend_error(
             "the bound lifecycle, chain, or mempool generation changed; restart this reconciliation",
             true,
         ),
-        WalletBackendError::InvalidMempoolCursor | WalletBackendError::InvalidConfirmedCursor => {
+        WalletBackendError::InvalidMempoolCursor
+        | WalletBackendError::InvalidConfirmedCursor
+        | WalletBackendError::InvalidIncomingTransferCursor => {
             wallet_rpc_failure(
                 request_id,
                 StatusCode::BAD_REQUEST,
@@ -682,6 +757,7 @@ fn map_backend_error(
             )
         }
         WalletBackendError::InvalidConfirmedPageLimit
+        | WalletBackendError::InvalidIncomingTransferPageLimit
         | WalletBackendError::InvalidIndexPageLimit
         | WalletBackendError::InvalidMempoolScanLimit
         | WalletBackendError::InvalidOutpointBatch
@@ -1155,6 +1231,92 @@ fn wire_confirmed_page(page: ConfirmedScriptsPage) -> Result<WireConfirmedPage, 
                 coin: WireCoin::from(&row.entry.coin),
             })
             .collect(),
+        script_examinations: page.script_examinations,
+        continuation: encode_cursor(page.continuation.as_ref())?,
+    })
+}
+
+#[derive(Serialize)]
+struct WireIncomingTransferRecipient {
+    version: u8,
+    hash: String,
+}
+
+#[derive(Serialize)]
+struct WireIncomingTransferInclusion {
+    block_hash: String,
+    height: u32,
+    transaction_index: u32,
+    confirmations: u32,
+}
+
+#[derive(Serialize)]
+struct WireIncomingTransfer {
+    script_index: usize,
+    recipient: WireIncomingTransferRecipient,
+    name_hash: String,
+    start_height: u32,
+    transfer_coin: WireCoin,
+    inclusion: WireIncomingTransferInclusion,
+    source_output_count: u32,
+    source_binding: &'static str,
+}
+
+#[derive(Serialize)]
+struct WireIncomingTransfersPage {
+    projection_version: u8,
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    entries: Vec<WireIncomingTransfer>,
+    script_examinations: usize,
+    continuation: Option<String>,
+}
+
+const fn wire_incoming_transfer_source_binding(
+    binding: IncomingTransferSourceBinding,
+) -> &'static str {
+    match binding {
+        IncomingTransferSourceBinding::RetainedBodyVerified => "retained_body_verified",
+        IncomingTransferSourceBinding::PrunedTrustedNodeProjection => {
+            "pruned_trusted_node_projection"
+        }
+    }
+}
+
+fn wire_incoming_transfers_page(
+    page: IncomingTransfersPage,
+) -> Result<WireIncomingTransfersPage, DispatchError> {
+    Ok(WireIncomingTransfersPage {
+        projection_version: page.projection_version,
+        chain_epoch: page.chain_epoch,
+        tip: wire_tip(page.tip),
+        entries: page
+            .entries
+            .into_iter()
+            .map(|row| {
+                Ok(WireIncomingTransfer {
+                    script_index: row.script_index,
+                    recipient: WireIncomingTransferRecipient {
+                        version: row.entry.recipient_version,
+                        hash: hex_encode(&row.entry.recipient_hash),
+                    },
+                    name_hash: hex_encode(&row.entry.name_hash),
+                    start_height: row.entry.start_height,
+                    transfer_coin: WireCoin::from(&row.entry.coin),
+                    inclusion: WireIncomingTransferInclusion {
+                        block_hash: row.inclusion.block_hash.to_hex(),
+                        height: row.inclusion.height,
+                        transaction_index: row
+                            .inclusion
+                            .transaction_position
+                            .ok_or(DispatchError::Internal)?,
+                        confirmations: row.inclusion.confirmations,
+                    },
+                    source_output_count: row.source_output_count,
+                    source_binding: wire_incoming_transfer_source_binding(row.source_binding),
+                })
+            })
+            .collect::<Result<Vec<_>, DispatchError>>()?,
         script_examinations: page.script_examinations,
         continuation: encode_cursor(page.continuation.as_ref())?,
     })
@@ -1978,6 +2140,162 @@ mod tests {
                     }
                 }
             })
+        );
+    }
+
+    #[test]
+    fn incoming_transfer_request_requires_epoch_and_rejects_extensions() {
+        let request: WalletRpcRequest = serde_json::from_value(serde_json::json!({
+            "api_version": 1,
+            "request_id": "incoming-transfer-1",
+            "call": {
+                "method": "incoming_transfers_page",
+                "params": {
+                    "script_ids": ["11".repeat(32)],
+                    "expected_chain_epoch": 7,
+                    "cursor": null,
+                    "limit": 32
+                }
+            }
+        }))
+        .expect("strict incoming-transfer request");
+        let WalletRpcCall::IncomingTransfersPage {
+            script_ids,
+            expected_chain_epoch,
+            cursor,
+            limit,
+        } = request.call
+        else {
+            panic!("incoming-transfer method");
+        };
+        assert_eq!(script_ids, vec!["11".repeat(32)]);
+        assert_eq!(expected_chain_epoch, 7);
+        assert_eq!(cursor, None);
+        assert_eq!(limit, 32);
+
+        for invalid_params in [
+            serde_json::json!({
+                "script_ids": ["11".repeat(32)],
+                "limit": 32
+            }),
+            serde_json::json!({
+                "script_ids": ["11".repeat(32)],
+                "expected_chain_epoch": 7,
+                "limit": 32,
+                "unbound_extension": true
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<WalletRpcRequest>(serde_json::json!({
+                    "api_version": 1,
+                    "call": {
+                        "method": "incoming_transfers_page",
+                        "params": invalid_params
+                    }
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn incoming_transfer_wire_projection_is_exact_and_non_authoritative() {
+        let block_hash = hns_primitives::BlockHash::new([0x33; 32]);
+        let coin = Coin {
+            outpoint: Outpoint {
+                txid: Txid::new([0x22; 32]),
+                index: 2,
+            },
+            value: 4_200,
+            height: 41,
+            coinbase: false,
+            address: Address::new(0, vec![0x55; 20]).expect("address"),
+            covenant: Covenant {
+                kind: hns_primitives::CovenantKind::Transfer,
+                items: vec![vec![0xaa, 0xbb]],
+            },
+        };
+        let page = IncomingTransfersPage {
+            projection_version: INCOMING_TRANSFER_PROJECTION_VERSION,
+            chain_epoch: 17,
+            tip: None,
+            entries: vec![crate::wallet_backend::WalletIncomingTransfer {
+                script_index: 2,
+                entry: hns_wallet_index::IncomingTransferEntry {
+                    recipient_version: 0,
+                    recipient_hash: vec![0x44; 20],
+                    name_hash: [0x11; 32],
+                    start_height: 12,
+                    coin,
+                    block_hash,
+                    height: 41,
+                    transaction_position: 7,
+                },
+                source_output_count: 3,
+                inclusion: crate::wallet_backend::TransactionInclusion {
+                    block_hash,
+                    height: 41,
+                    transaction_position: Some(7),
+                    confirmations: 9,
+                },
+                source_binding: IncomingTransferSourceBinding::RetainedBodyVerified,
+            }],
+            script_examinations: 4,
+            continuation: None,
+        };
+        let projected = serde_json::to_value(
+            wire_incoming_transfers_page(page).expect("incoming-transfer projection"),
+        )
+        .expect("serialize incoming-transfer projection");
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "projection_version": 1,
+                "chain_epoch": 17,
+                "tip": null,
+                "entries": [{
+                    "script_index": 2,
+                    "recipient": {
+                        "version": 0,
+                        "hash": "44".repeat(20)
+                    },
+                    "name_hash": "11".repeat(32),
+                    "start_height": 12,
+                    "transfer_coin": {
+                        "outpoint": {
+                            "txid": "22".repeat(32),
+                            "index": 2
+                        },
+                        "value": 4_200,
+                        "height": 41,
+                        "coinbase": false,
+                        "address": {
+                            "version": 0,
+                            "hash": "55".repeat(20)
+                        },
+                        "covenant": {
+                            "kind": hns_primitives::CovenantKind::Transfer.as_u8(),
+                            "items": ["aabb"]
+                        }
+                    },
+                    "inclusion": {
+                        "block_hash": "33".repeat(32),
+                        "height": 41,
+                        "transaction_index": 7,
+                        "confirmations": 9
+                    },
+                    "source_output_count": 3,
+                    "source_binding": "retained_body_verified"
+                }],
+                "script_examinations": 4,
+                "continuation": null
+            })
+        );
+        assert_eq!(
+            wire_incoming_transfer_source_binding(
+                IncomingTransferSourceBinding::PrunedTrustedNodeProjection
+            ),
+            "pruned_trusted_node_projection"
         );
     }
 
