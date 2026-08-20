@@ -22,6 +22,7 @@ hns-mempool = { path = "../hns-mempool" }
 hns-marketplace-protocol.workspace = true
 hns-mining = { path = "../hns-mining" }
 hns-p2p = { path = "../hns-p2p" }
+hns-protocol-primitives.workspace = true
 hns-primitives = { path = "../hns-primitives" }
 hns-rpc = { path = "../hns-rpc" }
 hns-state = { path = "../hns-state" }
@@ -32,13 +33,17 @@ hns-wallet-index = { path = "../hns-wallet-index" }
 hns-denuo-market-relay = { path = "../hns-denuo-market-relay" }
 hns-urkel = { path = "../hns-urkel" }
 hex = "0.4"
+k256.workspace = true
 libc = "0.2"
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 hns-chain = { path = "../hns-chain", features = ["test-fixtures"] }

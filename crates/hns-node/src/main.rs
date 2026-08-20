@@ -11,22 +11,31 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use clap::{ArgAction, Parser, ValueEnum};
 use hns_consensus::Network;
+use hns_marketplace_protocol::{
+    DenuoHnsaEndpointBinding, DenuoHrmRootBinding, DenuoPublicationAcceptancePolicy,
+};
 use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
     init_logging, recommended_template_build_limits, validate_node_config, AuthorityMode,
-    DenuoRelayRoles, MiningEngineConfig, NameTreeCompactionConfig, NativeSyncConfig, NodeConfig,
-    NodeService, RpcAuthorizationHeader, RpcLimits, ShutdownSignal, StorageMode,
-    UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL, DEFAULT_RPC_MAX_COLLECTION_ENTRIES,
-    DEFAULT_RPC_MAX_CONCURRENT_REQUESTS, DEFAULT_RPC_MAX_REQUEST_BYTES,
-    MAX_RPC_AUTHORIZATION_BYTES,
+    DenuoRelayAcceptanceSigner, DenuoRelayRoles, MiningEngineConfig, NameTreeCompactionConfig,
+    NativeSyncConfig, NodeConfig, NodeService, RpcAuthorizationHeader, RpcLimits, ShutdownSignal,
+    StorageMode, UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
+    DEFAULT_RPC_MAX_COLLECTION_ENTRIES, DEFAULT_RPC_MAX_CONCURRENT_REQUESTS,
+    DEFAULT_RPC_MAX_REQUEST_BYTES, MAX_RPC_AUTHORIZATION_BYTES,
 };
+use hns_protocol_primitives::BlockHash as ProtocolBlockHash;
 use hns_store::DurabilityPolicy;
+use hns_swap::NetworkBinding;
+use serde::Deserialize;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_RPC_AUTHORIZATION_FILE_BYTES: usize = MAX_RPC_AUTHORIZATION_BYTES + 2;
+const MAX_DENUO_ACCEPTANCE_POLICY_FILE_BYTES: usize = 8 * 1024;
+const MAX_DENUO_ACCEPTANCE_KEY_FILE_BYTES: usize = 66;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -102,6 +111,16 @@ struct Cli {
     /// Enable the local name-market relay core for an installed native adapter.
     #[arg(long = "denuo-name-market-relay")]
     denuo_name_market_relay: bool,
+
+    /// Mode-0600 JSON policy binding local publication receipts to one exact
+    /// HRM-authorized HNSA endpoint.
+    #[arg(long = "denuo-name-market-acceptance-policy-file")]
+    denuo_name_market_acceptance_policy_file: Option<PathBuf>,
+
+    /// Mode-0600 file containing the endpoint private key as exactly 64 hex
+    /// characters (with one optional trailing newline).
+    #[arg(long = "denuo-name-market-acceptance-key-file")]
+    denuo_name_market_acceptance_key_file: Option<PathBuf>,
 
     /// Enable the local cross-chain relay core for an installed native adapter.
     #[arg(long = "denuo-cross-chain-relay")]
@@ -331,6 +350,16 @@ impl Cli {
         };
         let (recommended_template_workers, recommended_template_queue) =
             recommended_template_build_limits(&mempool_limits, self.template_variants);
+        let denuo_name_market_acceptance_signer = match (
+            self.denuo_name_market_acceptance_policy_file.as_deref(),
+            self.denuo_name_market_acceptance_key_file.as_deref(),
+        ) {
+            (Some(policy), Some(key)) => Some(read_denuo_acceptance_signer(policy, key)?),
+            (None, None) => None,
+            _ => anyhow::bail!(
+                "Denuo name-market acceptance policy and private-key files must be configured together"
+            ),
+        };
         Ok(NodeConfig {
             network: self.network.into(),
             data_dir: self.data_dir,
@@ -358,6 +387,7 @@ impl Cli {
                 self.denuo_rendezvous_relay,
                 self.denuo_swap_status_relay,
             ),
+            denuo_name_market_acceptance_signer,
             name_tree_compaction: NameTreeCompactionConfig {
                 compact_on_startup: self.compact_name_tree_on_startup,
                 startup_interval: self.name_tree_compaction_interval,
@@ -480,6 +510,193 @@ fn read_rpc_authorization(path: &Path) -> anyhow::Result<RpcAuthorizationHeader>
         .or_else(|| value.strip_suffix('\n'))
         .unwrap_or(&value);
     RpcAuthorizationHeader::new(value.to_owned())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenuoAcceptancePolicyFile {
+    network_magic: u32,
+    network_genesis: String,
+    hrm: DenuoHrmPolicyFile,
+    hnsa: DenuoHnsaPolicyFile,
+    maximum_receipt_lifetime_seconds: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenuoHrmPolicyFile {
+    subject: String,
+    sequence: u64,
+    envelope_hash: String,
+    chain_height: u64,
+    chain_work_be: String,
+    chain_anchor: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenuoHnsaPolicyFile {
+    canonical_service_name: String,
+    application_profile_id: u16,
+    service_resource_id: String,
+    service_delegation_id: String,
+    service_generation: u64,
+    endpoint_delegation_id: String,
+    endpoint_sequence: u64,
+    endpoint_public_key: String,
+    effective_not_before_unix: u64,
+    effective_expires_at_unix: u64,
+}
+
+fn read_denuo_acceptance_signer(
+    policy_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<DenuoRelayAcceptanceSigner> {
+    let policy_bytes = read_private_regular_file(
+        policy_path,
+        MAX_DENUO_ACCEPTANCE_POLICY_FILE_BYTES,
+        "Denuo acceptance policy",
+    )?;
+    let wire: DenuoAcceptancePolicyFile = serde_json::from_slice(&policy_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid Denuo acceptance policy JSON: {error}"))?;
+    let policy = DenuoPublicationAcceptancePolicy::new(
+        NetworkBinding {
+            magic: wire.network_magic,
+            genesis: ProtocolBlockHash::new(decode_policy_hex(
+                &wire.network_genesis,
+                "network genesis",
+            )?),
+        },
+        DenuoHrmRootBinding {
+            subject: decode_policy_hex(&wire.hrm.subject, "HRM subject")?,
+            sequence: wire.hrm.sequence,
+            envelope_hash: decode_policy_hex(&wire.hrm.envelope_hash, "HRM envelope hash")?,
+            chain_height: wire.hrm.chain_height,
+            chain_work_be: decode_policy_hex(&wire.hrm.chain_work_be, "HRM chain work")?,
+            chain_anchor: decode_policy_hex(&wire.hrm.chain_anchor, "HRM chain anchor")?,
+        },
+        DenuoHnsaEndpointBinding {
+            canonical_service_name: wire.hnsa.canonical_service_name.into_bytes(),
+            application_profile_id: wire.hnsa.application_profile_id,
+            service_resource_id: decode_policy_hex(
+                &wire.hnsa.service_resource_id,
+                "HNSA service resource ID",
+            )?,
+            service_delegation_id: decode_policy_hex(
+                &wire.hnsa.service_delegation_id,
+                "HNSA service delegation ID",
+            )?,
+            service_generation: wire.hnsa.service_generation,
+            endpoint_delegation_id: decode_policy_hex(
+                &wire.hnsa.endpoint_delegation_id,
+                "HNSA endpoint delegation ID",
+            )?,
+            endpoint_sequence: wire.hnsa.endpoint_sequence,
+            endpoint_public_key: decode_policy_hex(
+                &wire.hnsa.endpoint_public_key,
+                "HNSA endpoint public key",
+            )?,
+            effective_not_before_unix: wire.hnsa.effective_not_before_unix,
+            effective_expires_at_unix: wire.hnsa.effective_expires_at_unix,
+        },
+        wire.maximum_receipt_lifetime_seconds,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid Denuo acceptance policy: {error}"))?;
+
+    let mut key_bytes = Zeroizing::new(read_private_regular_file(
+        key_path,
+        MAX_DENUO_ACCEPTANCE_KEY_FILE_BYTES,
+        "Denuo acceptance private key",
+    )?);
+    while key_bytes
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\n' | b'\r'))
+    {
+        key_bytes.pop();
+    }
+    if key_bytes.len() != 64 || !key_bytes.iter().all(u8::is_ascii_hexdigit) {
+        anyhow::bail!("Denuo acceptance private key must contain exactly 64 hex characters");
+    }
+    let mut endpoint_private_key = [0u8; 32];
+    hex::decode_to_slice(key_bytes.as_slice(), &mut endpoint_private_key)
+        .map_err(|_| anyhow::anyhow!("Denuo acceptance private key is invalid hex"))?;
+    key_bytes.zeroize();
+    let signer = DenuoRelayAcceptanceSigner::new(policy, endpoint_private_key)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    endpoint_private_key.zeroize();
+    Ok(signer)
+}
+
+fn decode_policy_hex<const N: usize>(value: &str, label: &str) -> anyhow::Result<[u8; N]> {
+    if value.len() != N * 2 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        anyhow::bail!(
+            "Denuo acceptance {label} must contain exactly {} hex characters",
+            N * 2
+        );
+    }
+    let mut decoded = [0u8; N];
+    hex::decode_to_slice(value, &mut decoded)
+        .map_err(|_| anyhow::anyhow!("Denuo acceptance {label} is invalid hex"))?;
+    Ok(decoded)
+}
+
+fn read_private_regular_file(
+    path: &Path,
+    maximum_bytes: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("{label} path must be absolute without parent traversal");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() == 0 || opened.len() > maximum_bytes as u64 {
+        anyhow::bail!("{label} must be a nonempty bounded mode-0600 regular file");
+    }
+    #[cfg(unix)]
+    {
+        if opened.permissions().mode() & 0o777 != 0o600
+            || opened.nlink() != 1
+            || opened.uid() != rustix::process::geteuid().as_raw()
+        {
+            anyhow::bail!("{label} must be an owner-only mode-0600 single-link regular file");
+        }
+    }
+    let current = fs::symlink_metadata(path)?;
+    if current.file_type().is_symlink() || !current.is_file() {
+        anyhow::bail!("{label} must not be a symbolic link or special file");
+    }
+    #[cfg(unix)]
+    if current.dev() != opened.dev() || current.ino() != opened.ino() {
+        anyhow::bail!("{label} path changed while it was being opened");
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take((maximum_bytes + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > maximum_bytes {
+        anyhow::bail!("{label} exceeds its hard byte limit");
+    }
+    let after_open = file.metadata()?;
+    let after_path = fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    if after_open.dev() != opened.dev()
+        || after_open.ino() != opened.ino()
+        || after_path.dev() != opened.dev()
+        || after_path.ino() != opened.ino()
+        || after_open.len() != opened.len()
+    {
+        anyhow::bail!("{label} changed while it was being read");
+    }
+    Ok(bytes)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

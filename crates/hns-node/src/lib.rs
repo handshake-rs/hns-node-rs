@@ -9,9 +9,11 @@ mod wallet_rpc;
 
 pub use denuo_market::{
     DenuoNameMarketAdmission, DenuoNameMarketDispatch, DenuoNameMarketEvent,
-    DenuoNameMarketEventKind, DenuoNameMarketEventPage, DenuoNameMarketSend, DenuoRelayHandle,
-    DenuoRelayHandleError, MAX_DENUO_NAME_MARKET_EVENTS, MAX_DENUO_NAME_MARKET_EVENT_PAGE,
-    MAX_DENUO_NAME_MARKET_RECORDS,
+    DenuoNameMarketEventKind, DenuoNameMarketEventPage, DenuoNameMarketSend,
+    DenuoNameMarketSnapshotPage, DenuoNameMarketSnapshotRecord, DenuoRelayAcceptanceSigner,
+    DenuoRelayAcceptanceSignerError, DenuoRelayHandle, DenuoRelayHandleError,
+    MAX_DENUO_NAME_MARKET_EVENTS, MAX_DENUO_NAME_MARKET_EVENT_PAGE, MAX_DENUO_NAME_MARKET_RECORDS,
+    MAX_DENUO_NAME_MARKET_SNAPSHOT_PAGE,
 };
 pub use hns_denuo_market_relay::{
     Announcement as DenuoAnnouncement, AnnouncementAdmission as DenuoAnnouncementAdmission,
@@ -1539,6 +1541,9 @@ pub struct NodeConfig {
     pub wallet_index: bool,
     /// Explicit Denuo marketplace relay roles. Empty is requester-only.
     pub denuo_relay_roles: DenuoRelayRoles,
+    /// Optional HNSA-bound endpoint signer required for authenticated local
+    /// wallet publication acceptance. The secret is redacted and zeroized.
+    pub denuo_name_market_acceptance_signer: Option<DenuoRelayAcceptanceSigner>,
     pub name_tree_compaction: NameTreeCompactionConfig,
     pub undo_retention: UndoRetentionConfig,
     pub native_sync: NativeSyncConfig,
@@ -1563,6 +1568,7 @@ impl Default for NodeConfig {
             spender_index: false,
             wallet_index: false,
             denuo_relay_roles: DenuoRelayRoles::NONE,
+            denuo_name_market_acceptance_signer: None,
             name_tree_compaction: NameTreeCompactionConfig::default(),
             undo_retention: UndoRetentionConfig::default(),
             native_sync: NativeSyncConfig::default(),
@@ -1627,6 +1633,20 @@ fn decode_transaction_index_mode(raw: &[u8]) -> Result<bool> {
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     config.rpc_limits.validate()?;
+
+    if let Some(signer) = &config.denuo_name_market_acceptance_signer {
+        let network = signer.policy().network();
+        if !config
+            .denuo_relay_roles
+            .contains(DenuoRelayKind::NameMarket)
+            || network.magic != config.network.params().packet_magic
+            || network.genesis.as_bytes() != &config.network.params().genesis_hash.into_inner()
+        {
+            anyhow::bail!(
+                "Denuo name-market acceptance requires the name-market relay role and an exact configured network binding"
+            );
+        }
+    }
 
     match config.authority_mode {
         AuthorityMode::Disabled | AuthorityMode::Native => {}
@@ -4039,6 +4059,7 @@ impl NodeService {
             DenuoRelayLimits::default(),
             config.network.params().packet_magic,
             config.network.params().genesis_hash.into_inner(),
+            config.denuo_name_market_acceptance_signer.clone(),
         )
         .map_err(|error| anyhow::anyhow!("failed to initialize Denuo market relay: {error}"))?;
         Ok(Self {

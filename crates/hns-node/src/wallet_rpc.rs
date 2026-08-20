@@ -4,6 +4,9 @@
 //! authority remain in the canonical runtime and [`WalletBackend`].
 
 use axum::{http::StatusCode, Json};
+use hns_marketplace_protocol::{
+    DenuoPublicationAcceptanceExpectation, DenuoPublicationMessageKind,
+};
 use hns_primitives::{
     hex_encode, Address, Coin, Covenant, NameHash, NameLifecycleState, NameState, Outpoint, Output,
     Transaction, Txid, MAX_TX_SIZE,
@@ -143,9 +146,18 @@ enum WalletRpcCall {
     },
     DenuoNameMarketPublish {
         envelope_hex: String,
+        handoff: WireDenuoPublicationHandoff,
     },
     DenuoNameMarketEvents {
+        #[serde(default)]
+        expected_instance_nonce: Option<String>,
         after_revision: u64,
+        limit: usize,
+    },
+    DenuoNameMarketSnapshot {
+        #[serde(default)]
+        expected_revision: Option<u64>,
+        offset: usize,
         limit: usize,
     },
     TrackedContractKnown {
@@ -172,6 +184,47 @@ enum WalletRpcCall {
         cursor: Option<String>,
         scan_limit: usize,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDenuoPublicationHandoff {
+    network_magic: u32,
+    network_genesis: String,
+    attempt_id: String,
+    record_sequence: u64,
+    prepared_at_unix: u64,
+    envelope_id: String,
+    envelope_digest: String,
+    content_id: String,
+    message_kind: String,
+    request_id: u64,
+}
+
+fn decode_denuo_handoff(
+    wire: WireDenuoPublicationHandoff,
+) -> Result<DenuoPublicationAcceptanceExpectation, DispatchError> {
+    let message_kind = match wire.message_kind.as_str() {
+        "offer" => DenuoPublicationMessageKind::Offer,
+        "cancellation" => DenuoPublicationMessageKind::Cancellation,
+        _ => {
+            return Err(DispatchError::Invalid(
+                "Denuo publication handoff kind is invalid",
+            ));
+        }
+    };
+    Ok(DenuoPublicationAcceptanceExpectation {
+        network_magic: wire.network_magic,
+        network_genesis: decode_hex_32(&wire.network_genesis, "Denuo network genesis")?,
+        attempt_id: decode_hex_32(&wire.attempt_id, "Denuo handoff attempt ID")?,
+        record_sequence: wire.record_sequence,
+        prepared_at_unix: wire.prepared_at_unix,
+        envelope_id: decode_hex_32(&wire.envelope_id, "Denuo envelope ID")?,
+        envelope_digest: decode_hex_32(&wire.envelope_digest, "Denuo envelope digest")?,
+        content_id: decode_hex_32(&wire.content_id, "Denuo content ID")?,
+        message_kind,
+        request_id: wire.request_id,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -718,20 +771,27 @@ async fn dispatch_call(
                     .await?,
             ))?
         }
-        WalletRpcCall::DenuoNameMarketPublish { envelope_hex } => {
+        WalletRpcCall::DenuoNameMarketPublish {
+            envelope_hex,
+            handoff,
+        } => {
             let envelope = decode_hex_bounded(
                 &envelope_hex,
                 MAX_WALLET_RPC_DENUO_PUBLICATION_BYTES,
                 "Denuo name-market publication",
             )?;
+            let handoff = decode_denuo_handoff(handoff)?;
             let now = super::current_unix_time().map_err(|_| DispatchError::Internal)?;
-            let (admission, propagation) =
-                backend.publish_denuo_name_market(&envelope, now).await?;
+            let (admission, propagation, receipt) = backend
+                .publish_denuo_name_market(&envelope, handoff, now)
+                .await?;
             serde_json::json!({
                 "revision": admission.revision,
                 "kind": admission.kind.as_str(),
                 "content_hash": hex_encode(&admission.content_hash),
                 "inserted": admission.inserted,
+                "accepted_at_unix": now,
+                "acceptance_receipt_hex": hex_encode(&receipt),
                 "propagation": {
                     "attempted": propagation.attempted,
                     "written": propagation.queued,
@@ -740,6 +800,7 @@ async fn dispatch_call(
             })
         }
         WalletRpcCall::DenuoNameMarketEvents {
+            expected_instance_nonce,
             after_revision,
             limit,
         } => {
@@ -748,8 +809,20 @@ async fn dispatch_call(
                     "Denuo name-market event limit must be within 1..=256",
                 ));
             }
-            let page = backend.get_denuo_name_market_events(after_revision, limit)?;
+            let expected_instance_nonce = expected_instance_nonce
+                .map(|nonce| decode_hex_32(&nonce, "Denuo instance nonce"))
+                .transpose()?;
+            if expected_instance_nonce == Some([0; 32]) {
+                return Err(DispatchError::Invalid("Denuo instance nonce is invalid"));
+            }
+            let page = backend.get_denuo_name_market_events(
+                expected_instance_nonce,
+                after_revision,
+                limit,
+            )?;
             serde_json::json!({
+                "instance_nonce": hex_encode(&page.instance_nonce),
+                "cursor_reset": page.cursor_reset,
                 "oldest_revision": page.oldest_revision,
                 "head_revision": page.head_revision,
                 "events": page.events.into_iter().map(|event| serde_json::json!({
@@ -758,6 +831,28 @@ async fn dispatch_call(
                     "kind": event.kind.as_str(),
                     "content_hash": hex_encode(&event.content_hash),
                     "envelope_hex": hex_encode(&event.envelope_bytes),
+                })).collect::<Vec<_>>()
+            })
+        }
+        WalletRpcCall::DenuoNameMarketSnapshot {
+            expected_revision,
+            offset,
+            limit,
+        } => {
+            if limit == 0 || limit > super::MAX_DENUO_NAME_MARKET_SNAPSHOT_PAGE {
+                return Err(DispatchError::Invalid(
+                    "Denuo name-market snapshot limit must be within 1..=256",
+                ));
+            }
+            let page = backend.get_denuo_name_market_snapshot(expected_revision, offset, limit)?;
+            serde_json::json!({
+                "instance_nonce": hex_encode(&page.instance_nonce),
+                "snapshot_revision": page.snapshot_revision,
+                "next_offset": page.next_offset,
+                "records": page.records.into_iter().map(|record| serde_json::json!({
+                    "kind": record.kind.as_str(),
+                    "content_hash": hex_encode(&record.content_hash),
+                    "envelope_hex": hex_encode(&record.envelope_bytes),
                 })).collect::<Vec<_>>()
             })
         }
