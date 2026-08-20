@@ -6,6 +6,29 @@ qualification or authorize deployment.
 
 ## 0.3.5 - unreleased
 
+- Make full-sync qualification samples crash-consistent with runtime state.
+  Resume now validates the complete sample journal, reconciles only one exact
+  trailing durable sample after binding state to the preceding journal prefix,
+  preserves its resource extrema (including an exact zero available-byte
+  minimum), and refuses every recovered or checkpointed terminal threshold.
+  The private single-link runner lock rejects symbolic links, hard links, and
+  nonregular files before mutation or blocking, while both configuration
+  validation and the node are launched from the exact verified open executable
+  descriptor rather than a second path lookup and remain parent-death-bound.
+  Persisted counters, filesystem baselines, live filesystem/process
+  measurements, and normalized sync counters are exact bounded integers before
+  they enter shell arithmetic or completion decisions. Resume is serialized
+  before state inspection, durably publishes a higher-attempt launch intent
+  before any campaign process, and launches only nonprivileged binaries through
+  parent-death-bound wrappers, so supervisor loss cannot preserve stale verdict
+  authority or an unrecorded child. Sample and state evidence-commit failures
+  are explicit hard stops. A final verdict is authoritative only after a
+  last-published terminal commit manifest binds the final state, canonical and
+  attempt summaries, log manifests, configuration, build provenance, and exact
+  sample-chain digest. `status` binds authority to one stable hashed state
+  snapshot. Deterministic fault coverage exercises every bound-artifact
+  pre/post-install phase, both crash windows, parent-death containment,
+  successful synchronization, incomplete final bundles, and hostile records.
 - Add a sync-only, backend-shared complete-state namespace primitive for the
   future HRM/HNSA/HNSR authority broker. It reserves ordinary-batch prefixes,
   durably fences sole-owner leases, compares the exact prior revision and state

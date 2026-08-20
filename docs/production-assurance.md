@@ -231,11 +231,69 @@ scripts/run-full-sync-qualification.sh stop \
   --evidence-dir /ABS/full-sync-evidence
 ```
 
-`resume` first rejects live or mismatched runner, child, or log-scanner
-processes, changed executable identity, prior terminal integrity failures, and
-ambiguous evidence journals. An abrupt host loss may be resumed only after the
-supervisor has reconciled the durable authorization-scanned log journal; never
-delete, rename, or hand-edit a partial log, counter, state file, or attempt
+`resume` opens and acquires a private, owner-only, single-link regular campaign
+lock before inspecting mutable state. It rejects links and nonregular lock
+objects without following, changing, or blocking on them, then rejects live or
+mismatched runner, child, or log-scanner processes, changed
+executable identity, prior terminal integrity failures, and ambiguous evidence
+journals. After validation it durably publishes a higher-attempt
+`launch_pending` state before running the attempt check or starting the log
+scanner or node. This consumes the attempt and invalidates every older terminal
+marker even if the host stops in the launch window. The scanner and node set a
+Linux parent-death `SIGKILL` and recheck the exact supervisor PID before their
+first campaign action. Both the bounded `--check-config` wrapper and node
+wrapper reopen the executable without following links, verify its complete
+identity and SHA-256 digest, and invoke the already-open descriptor, preventing
+a replacement path lookup between validation and execution. Their timeout and
+execution processes form parent-death-bound chains back to the campaign
+supervisor. Set-ID or file-capability binaries are rejected
+because privileged execution can clear the parent binding. Supervisor loss
+therefore cannot leave an unrecorded live campaign child. Samples form a
+contiguous, campaign-bound journal.
+If abrupt loss occurs after exactly one sample is durably installed but before
+its runtime-state checkpoint, the supervisor first binds state to the complete
+journal prefix, then validates the trailing sample, retains it unchanged, folds
+its maxima and minimum into state, and writes a durable recovery record. Zero
+available bytes is evidence, never an uninitialized sentinel. The validator
+recomputes filesystem delta from the campaign baseline, checks exact sync-status
+and consecutive-count semantics, and requires the explicit decision in current
+journal records (while deriving it for legacy version-one records).
+
+More than one trailing sample, a gap, an unexpected entry, inconsistent sample
+fields, or a sample from another campaign or attempt fails closed. A recovered
+or checkpointed cutoff, filesystem-reserve, or maximum-sample outcome is
+non-resumable; synchronized evidence is never promoted to success without a
+newly observed graceful zero-status shutdown. The post-sample decision is
+durable in the sample before the replaceable state checkpoint, and either
+evidence-commit failure terminates the attempt. If a sample replace reports an
+ambiguous error after installation, the supervisor must re-fsync and strictly
+adopt that exact record; otherwise it refuses to emit a finalized bundle.
+
+Every persisted attempt, sample sequence, resource extremum, filesystem
+baseline, live `df`/`du`/`VmHWM` measurement, and normalized sync counter is
+accepted only as an exact bounded integer before it can enter shell arithmetic
+or a completion decision. Strings, floating-point or exponent forms,
+near-integral decimals, values outside the supported signed operating range,
+and oversized journal integers fail closed. Block-hash byte arrays likewise
+require exact canonical byte integers.
+
+`state.json` and `final-summary.json` are lifecycle/evidence artifacts, not by
+themselves a qualification verdict. The verdict becomes authoritative only
+when the attempt's last-published `*-terminal-commit.json` validates and binds
+the exact final state, canonical and attempt summaries, canonical and attempt
+log manifests, campaign configuration, build provenance, and recomputed sample
+journal count/content-chain digest. `resume` rejects a current summary without
+that commit, any incomplete current terminal bundle, and any hash or semantic
+mismatch. `status` reads one private, stable state snapshot, hashes it, validates
+only the marker for that snapshot's attempt, and reports authority only when the
+marker binds that exact state hash and classification. It never combines a
+newer runtime state with an older authoritative verdict. Post-replace errors are
+adopted only after reopening, hashing, and fsyncing the exact intended file and
+its parent directory.
+
+An abrupt host loss may be resumed only after the supervisor has also reconciled
+the durable authorization-scanned log journal. Never delete, rename, or
+hand-edit a sample, partial log, counter, state file, recovery record, or attempt
 summary. `stop` requests a bounded graceful shutdown and does not turn an
 incomplete attempt into a pass.
 
