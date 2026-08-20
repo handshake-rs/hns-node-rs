@@ -97,6 +97,7 @@ wire. Transaction policy rejection text is bounded to 256 characters.
 | `name_evidence` | `name_hash`, required `expected_chain_epoch` | Canonical encoded current/proof state bytes, separate projected hints and owners, tip/root, and canonical proof hex from one chain snapshot. |
 | `active_name_owner_coin` | `name_hash`, required `expected_chain_epoch` | Version-1 current NameState bytes and exact active owner Coin, canonical inclusion, epoch, and non-null exact tip from one immutable pruning-safe read. |
 | `name_action_context` | `action` (`transfer` or `finalize`), `name_hash`, required `expected_chain_epoch`, required exact `expected_mempool` | Versioned candidate-height context containing stable chain identity, canonical current state and owner, exact owner-mempool-spender evidence, transfer maturity, HSD-selected active-chain renewal block, and a fixed bounded eligibility decision from one chain/mempool generation. |
+| `name_action_context_v2` | same exact parameters as `name_action_context` | Version-2 pruning-safe candidate context. It replaces the retained owner transaction with version-1 active owner Coin evidence and never reads a raw block. It remains public evidence only, not wallet ownership, proof, signing authority, or mutation. |
 | `broadcast_transaction` | `transaction_hex` | Canonical contextual admission followed by actual live-peer inventory fanout counts. The node never signs. |
 | `estimate_fee_rate` | `target_blocks` | Bounded deterministic estimate and its sample/source evidence. |
 | `quote_transaction_fee` | bounded canonical `transaction_hex`, `target_blocks`, required `expected_chain_epoch`, required exact `expected_mempool` | Transaction ID, complete chain/mempool bindings, sampled rate evidence, exact transaction weight and node-resolved sigops, HSD sigop-adjusted policy virtual bytes, minimum and actual fees, shortfall, and a meets-minimum boolean in explicit atomic units. The method never signs or broadcasts. |
@@ -602,6 +603,70 @@ turning that decision into transport success. Missing state/owner, malformed or
 inconsistent owner evidence, stale bindings, and unavailable pruned owner bytes
 remain explicit fail-closed errors.
 
+## Pruning-safe name-action context v2
+
+`name_action_context_v2` is additive. The v1 method and response remain
+unchanged for consumers that explicitly require retained owner-transaction
+bytes. The v2 request uses the same action, name hash, chain epoch, and exact
+mempool instance/generation fields, but the response replaces `owner` with:
+
+```json
+{
+  "active_owner": {
+    "projection_version": 1,
+    "owner_coin": {
+      "outpoint": {"txid": "<64 hex characters>", "index": 0},
+      "value": 1000000,
+      "height": 99713,
+      "coinbase": false,
+      "address": {"version": 0, "hash": "<hex>"},
+      "covenant": {"kind": 9, "items": ["<hex>"]}
+    },
+    "inclusion": {
+      "block_hash": "<64 hex characters>",
+      "height": 99713,
+      "transaction_index": null,
+      "confirmations": 288
+    },
+    "source_binding": "trusted_node_active_utxo_projection"
+  }
+}
+```
+
+Every other chain-identity, tip, candidate-height, mempool, current-state,
+lifecycle, transfer, renewal, and eligibility field has the same meaning and
+shape as v1, while `context_version` is `2`. The exact stored NameState bytes
+remain in `current_state_hex`; projected JSON fields are hints and never a
+replacement for canonical decoding.
+
+The backend rejects the expected chain epoch and mempool binding before it
+reads the requested NameState, owner UTXO, or transaction index. It then
+reuses the active-owner projection's canonical NameState/key/name checks,
+byte-exact active UTXO checks, canonical transaction-index inclusion, and full
+name-covenant linkage. Candidate policy and owner-spender evidence come from
+that same stable chain/mempool capture. The method never loads the owner
+transaction or raw block column, so a valid pruned owner cannot produce
+`payload_pruned` and its transaction position is always `null`.
+
+This is a single bounded point request: there is no limit, cursor, pagination,
+script set, or persistent query registration. The request discloses one name
+hash to the authenticated node and accepts no claimed owner, Coin, address,
+derivation, key, lifecycle, renewal hash, eligibility, or wallet-owned flag.
+The node therefore does not know or assert wallet ownership. A wallet must
+independently compare the returned Coin address with its own derivation state.
+
+`tip.tree_root` does not prove pending current NameState changes, and
+`trusted_node_active_utxo_projection` is not a cryptographic Coin-to-txid or
+transaction-output proof. `eligibility.eligible` is contextual public evidence,
+not an approval or capability. V2 constructs, signs, reserves, fee-quotes,
+admits, relays, and broadcasts nothing; all value and release gates remain
+outside this method.
+
+`capabilities` advertises the v2 context version, mandatory exact binding,
+active-owner projection version/source, absent owner transaction, always-null
+transaction position, and public-evidence-only authority semantics. The
+frozen v1 capability keys and values are unchanged.
+
 ## Time and transaction order
 
 Mempool history carries exact `admitted_at` values from contextual admission.
@@ -614,7 +679,9 @@ exact value. The current durable transaction index stores byte offset and
 length, not the transaction ordinal. The node derives the ordinal by enumerating
 retained block transactions. Methods that actually load retained
 owner-transaction bytes carry it; `active_name_owner_coin` deliberately does
-not load those bytes and therefore carries `transaction_index: null`. A client
+not load those bytes and therefore carries `transaction_index: null`.
+`name_action_context_v2` inherits that same always-null position because it
+also performs no raw block read. A client
 must preserve that unavailable state and must not invent zero. Adding a durable
 ordinal requires a separately designed storage migration, not a wire shortcut.
 

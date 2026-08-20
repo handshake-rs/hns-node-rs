@@ -158,7 +158,11 @@ Implemented in source:
   consensus profile identity, tip-plus-one candidate inclusion, active
   NameState/owner/UTXO consistency, canonical transfer maturity, HSD-selected
   active-chain renewal block, and exact immutable-mempool owner-spender evidence
-  under a fixed nine-reason fail-closed eligibility bound;
+  under a fixed nine-reason fail-closed eligibility bound. Frozen v1 returns a
+  retained owner transaction; additive v2 returns canonical state bytes and a
+  byte-exact active Coin projection without reading a raw block, so it remains
+  available after valid owner-payload pruning. Neither response proves wallet
+  ownership or grants construction, signing, relay, or value authority;
 - immutable public Shakedex-v2 and HNS-HTLC-v1 registrations with pinned
   secp256k1 key parsing, canonical scripts, exact signature-hash profiles, and
   an explicit versioned canonical-binary descriptor identity plus bounded

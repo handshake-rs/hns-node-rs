@@ -426,8 +426,17 @@ Fixtures are evidence, not authority.
   nine-reason maximum and unknown reasons fail closed. The context neither
   signs nor proves that a later generation remains unchanged, so the wallet
   must preserve the binding, requote final signed bytes against it, and restart
-  on stale evidence. Contract registration and raw revealed-preimage transport
-  remain absent even though the canonical protocol release is now published;
+  on stale evidence. The frozen v1 response reads and returns the retained
+  owner transaction. Additive `name_action_context_v2` applies the same early
+  chain/mempool binding and eligibility policy but returns canonical current
+  state bytes with a byte-exact active UTXO Coin and canonical transaction-index
+  inclusion. It never reads a raw block, always leaves transaction position
+  unavailable, and cannot return `PayloadPruned` for an otherwise valid active
+  owner. Its trusted-node projection is not a cryptographic transaction-output
+  proof or an assertion that the caller controls the Coin's address; it grants
+  no construction, signing, relay, or value authority. Contract registration
+  and raw revealed-preimage transport remain absent even though the canonical
+  protocol release is now published;
   node-local classifications are evidence, not protocol authority.
 - Local Shakedex/HTLC script and branch duplication is not protocol authority.
   The local tracker recognizes only seller-signed Shakedex TRANSFER fulfillment

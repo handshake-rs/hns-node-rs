@@ -158,11 +158,16 @@ Implemented:
   transaction position and block time without zero sentinels, canonical encoded
   current/proof NameState bytes and separate owner views, and versioned
   TRANSFER/FINALIZE name-action contexts bound to the exact chain epoch and
-  mempool process generation. Each name-action context echoes stable
-  network/genesis/`hns-consensus/name-policy-v1` identity, candidate tip-plus-one
-  height, the exact active owner and any immutable-mempool owner spender,
+  mempool process generation. The frozen v1 response retains the owner
+  transaction; additive v2 instead returns canonical current-state bytes and
+  the version-1 active owner Coin projection, never reads a raw block, and
+  remains usable after owner-payload pruning. Each name-action context echoes
+  stable network/genesis/`hns-consensus/name-policy-v1` identity, candidate
+  tip-plus-one height, the exact active owner and any immutable-mempool owner spender,
   canonical lockup/maturity evidence, and HSD-selected active-chain renewal
-  block under a fixed nine-reason fail-closed eligibility bound. Contextual
+  block under a fixed nine-reason fail-closed eligibility bound. Both versions
+  are public evidence only and grant no wallet ownership, cryptographic proof,
+  construction, signing, relay, or value authority. Contextual
   signed-transaction broadcast, transaction-bound HSD policy fee quotes, and
   stable redacted errors under the existing HTTP/backend resource bounds plus stricter
   256-row/1,024-scan wire limits and an 8 MiB measured JSON-result ceiling.

@@ -419,8 +419,10 @@ Profile-v4 wallet indexes retain compact canonical source-inclusion metadata
 for active incoming TRANSFER covenants until the spender rollback horizon
 retires. They never retain the raw owner transaction or its witness. Raw owner
 transactions older than the 288-block payload horizon can therefore be
-unavailable, so the wallet must retain every signed transaction and any raw
-owner transactions needed to construct future name actions.
+unavailable. The frozen `name_action_context` v1 read therefore still requires
+retained owner bytes, while the additive `name_action_context_v2` read below
+removes that archive dependency for its supported public TRANSFER/FINALIZE
+preparation evidence. A wallet must still retain every transaction it signs.
 
 Payload pruning does not prevent a bound point lookup of the current
 NameState-owner Coin. After `chain_snapshot`, call
@@ -435,7 +437,19 @@ The method never loads the raw block, so `inclusion.transaction_index` is
 discovery, not a cryptographic Coin-to-txid proof, a recovered owner
 transaction, signing authority, or permission to prepare or publish an action.
 Wallets still need their own retained transaction bytes or an archive source
-whenever transaction construction requires the owner preimage.
+for any separate workflow that explicitly requires the owner preimage.
+
+For candidate-specific TRANSFER or FINALIZE policy evidence, call
+`name_action_context_v2` with the same mandatory chain epoch and exact mempool
+instance/generation binding as v1. It composes the canonical current state and
+active Coin projection above with candidate height, lifecycle, maturity,
+renewal commitment, exact owner-spender lookup, and the same fixed nine-reason
+eligibility decision. It performs no raw block or owner-transaction read and
+therefore remains available after a valid active owner's payload is pruned.
+The result is still public trusted-node evidence only: it neither proves wallet
+ownership nor constructs, approves, signs, fee-quotes, admits, relays, or
+broadcasts an action. The profile's mining, transaction-relay, and every value
+release gate remain unchanged and off.
 
 The authenticated `incoming_transfers_page` method exposes the retained compact
 state as bounded candidate discovery. After obtaining `chain_epoch` from

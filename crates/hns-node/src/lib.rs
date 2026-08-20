@@ -39,12 +39,13 @@ pub use wallet_backend::{
     ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate, FeeEstimateSource,
     IncomingTransferSourceBinding, IncomingTransfersCursor, IncomingTransfersPage,
     MempoolContractActivity, MempoolContractEvent, MempoolContractPage, MempoolScriptActivity,
-    MempoolScriptOutput, MempoolScriptPage, MempoolScriptSpend, NameAction, NameActionContext,
-    NameActionIneligibility, NameEvidence, NameOwnerTransaction, NameProofResult,
-    NameRenewalContext, NameTransferContext, OutpointSpendingEntry, OutpointSpendingEvidence,
-    TrackedContractRetirement, TrackedContractRetirementContext, TrackedContractRetirementRequest,
-    TransactionEvidence, TransactionFeeQuote, TransactionInclusion, TransactionPayload,
-    TransactionStatus, WalletBackend, WalletBackendError, WalletChainSnapshot, WalletChainTip,
+    MempoolScriptOutput, MempoolScriptPage, MempoolScriptSpend, NameAction,
+    NameActionActiveOwnerCoin, NameActionContext, NameActionContextV2, NameActionIneligibility,
+    NameEvidence, NameOwnerTransaction, NameProofResult, NameRenewalContext, NameTransferContext,
+    OutpointSpendingEntry, OutpointSpendingEvidence, TrackedContractRetirement,
+    TrackedContractRetirementContext, TrackedContractRetirementRequest, TransactionEvidence,
+    TransactionFeeQuote, TransactionInclusion, TransactionPayload, TransactionStatus,
+    WalletBackend, WalletBackendError, WalletChainSnapshot, WalletChainTip,
     WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
     WalletContractFundingPage, WalletIncomingTransfer, WalletMempoolCursor,
     ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION, INCOMING_TRANSFER_PROJECTION_VERSION,
@@ -52,7 +53,7 @@ pub use wallet_backend::{
     MAX_WALLET_CONFIRMED_SCRIPT_EXAMINATIONS, MAX_WALLET_FEE_QUOTE_INPUTS,
     MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES,
     MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS, MAX_WALLET_OUTPOINT_SPEND_BATCH,
-    NAME_ACTION_CONTEXT_VERSION,
+    NAME_ACTION_CONTEXT_V2_VERSION, NAME_ACTION_CONTEXT_VERSION,
 };
 pub use wallet_rpc::WALLET_RPC_API_VERSION;
 

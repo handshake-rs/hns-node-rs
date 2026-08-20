@@ -187,7 +187,8 @@ mutation, and strict startup reconstruction refuses an over-budget graph.
 | wallet confirmed/script/contract pages | chain-epoch/query-bound wallet indexes under stricter wire limits | bounded by 256 script-prefix examinations or 256 returned rows | at most 8 MiB projected JSON plus opaque cursor |
 | wallet mempool pages/fee estimate | immutable chain-epoch/tip plus process-instance/generation capture | at most 1,024 inspected transactions per wire page; fee sample remains 4,096 | at most 8 MiB projected JSON |
 | wallet point/batch evidence | fixed metadata/index keys, at most one retained block transaction lookup, or up to 256 ordered spend-index reads | point/collection reads plus selected payload | selected bounded result under one chain epoch/tip |
-| wallet name-action context | fixed network/genesis/name params, current name/UTXO/owner and renewal-height point reads plus immutable mempool spender index | point reads plus O(log M) exact owner-spender lookup; fixed at most nine eligibility reasons | one selected owner transaction under the 8 MiB result ceiling |
+| wallet name-action context v1 | fixed network/genesis/name params, current name/UTXO/retained owner transaction and renewal-height point reads plus immutable mempool spender index | point reads, one retained block transaction lookup, and O(log M) exact owner-spender lookup; fixed at most nine eligibility reasons | one selected owner transaction under the 8 MiB result ceiling |
+| wallet name-action context v2 | fixed network/genesis/name params, current NameState/active UTXO/transaction-index and renewal-height point reads plus immutable mempool spender index; no raw block read | point reads plus O(log M) exact owner-spender lookup; fixed at most nine eligibility reasons | one fixed Coin-backed result under the 8 MiB result ceiling |
 
 Both standalone and native-sync listeners enforce the same fail-closed limits:
 

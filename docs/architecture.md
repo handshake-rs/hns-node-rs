@@ -185,6 +185,14 @@ eligibility bound. It supplies public evidence only: the wallet still owns
 approval, signing, durable workflow state, final fee requote, broadcast, and
 restart/reorg reconciliation.
 
+The frozen v1 response retains the confirmed owner transaction. Additive
+`name_action_context_v2` preserves the same binding and policy fields but uses
+the current NameState plus byte-exact active UTXO Coin and canonical
+transaction-index inclusion instead. It never reads a raw block, so its
+transaction position is explicitly unavailable and a valid pruned owner does
+not fail with `PayloadPruned`. This trusted-node projection is neither a
+Coin-to-txid proof nor wallet-ownership, signing, relay, or value authority.
+
 Wire continuations encode typed cursors as bounded behaviorally opaque tokens,
 not secrets or authenticated capabilities. Binary identities and payloads are
 canonical hexadecimal strings, so an independent wallet process need not link

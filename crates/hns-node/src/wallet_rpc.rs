@@ -22,16 +22,17 @@ use super::wallet_backend::{
     BroadcastResult, ConfirmedScriptsCursor, ConfirmedScriptsPage, FeeEstimate, FeeEstimateSource,
     IncomingTransferSourceBinding, IncomingTransfersCursor, IncomingTransfersPage,
     MempoolContractEvent, MempoolContractPage, MempoolScriptPage, NameAction, NameActionContext,
-    NameActionIneligibility, NameEvidence, NameOwnerTransaction, OutpointSpendingEvidence,
-    TransactionEvidence, TransactionFeeQuote, TransactionPayload, TransactionStatus, WalletBackend,
-    WalletBackendError, WalletChainSnapshot, WalletContractEventCursor, WalletContractEventPage,
-    WalletContractFundingCursor, WalletContractFundingPage, WalletMempoolCursor,
-    ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION, INCOMING_TRANSFER_PROJECTION_VERSION,
-    MAX_FEE_ESTIMATE_TARGET_BLOCKS, MAX_NAME_ACTION_INELIGIBILITY_REASONS,
-    MAX_WALLET_CONFIRMED_PAGE_ITEMS, MAX_WALLET_FEE_QUOTE_INPUTS,
-    MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES,
+    NameActionContextV2, NameActionIneligibility, NameEvidence, NameOwnerTransaction,
+    OutpointSpendingEvidence, TransactionEvidence, TransactionFeeQuote, TransactionPayload,
+    TransactionStatus, WalletBackend, WalletBackendError, WalletChainSnapshot,
+    WalletContractEventCursor, WalletContractEventPage, WalletContractFundingCursor,
+    WalletContractFundingPage, WalletMempoolCursor, ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION,
+    INCOMING_TRANSFER_PROJECTION_VERSION, MAX_FEE_ESTIMATE_TARGET_BLOCKS,
+    MAX_NAME_ACTION_INELIGIBILITY_REASONS, MAX_WALLET_CONFIRMED_PAGE_ITEMS,
+    MAX_WALLET_FEE_QUOTE_INPUTS, MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES,
     MAX_WALLET_INCOMING_TRANSFER_SCRIPT_EXAMINATIONS, MAX_WALLET_MEMPOOL_SCAN,
-    MAX_WALLET_OUTPOINT_SPEND_BATCH, MAX_WALLET_RESTORE_SCRIPTS, NAME_ACTION_CONTEXT_VERSION,
+    MAX_WALLET_OUTPOINT_SPEND_BATCH, MAX_WALLET_RESTORE_SCRIPTS, NAME_ACTION_CONTEXT_V2_VERSION,
+    NAME_ACTION_CONTEXT_VERSION,
 };
 
 pub const WALLET_RPC_API_VERSION: u16 = 1;
@@ -116,6 +117,12 @@ enum WalletRpcCall {
         expected_chain_epoch: u64,
     },
     NameActionContext {
+        action: NameAction,
+        name_hash: String,
+        expected_chain_epoch: u64,
+        expected_mempool: WireExpectedMempool,
+    },
+    NameActionContextV2 {
         action: NameAction,
         name_hash: String,
         expected_chain_epoch: u64,
@@ -393,6 +400,38 @@ async fn dispatch_call(
                     ),
                 ),
                 (
+                    "name_action_context_v2_version",
+                    Value::from(NAME_ACTION_CONTEXT_V2_VERSION),
+                ),
+                (
+                    "name_action_context_v2_binding",
+                    Value::from(
+                        "mandatory_chain_epoch_and_exact_mempool_instance_and_generation",
+                    ),
+                ),
+                (
+                    "name_action_context_v2_owner_projection_version",
+                    Value::from(ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION),
+                ),
+                (
+                    "name_action_context_v2_owner_source_binding",
+                    Value::from("trusted_node_active_utxo_projection"),
+                ),
+                (
+                    "name_action_context_v2_owner_transaction",
+                    Value::from("not_read_or_returned"),
+                ),
+                (
+                    "name_action_context_v2_transaction_position",
+                    Value::from("always_null_no_raw_block_read"),
+                ),
+                (
+                    "name_action_context_v2_authority",
+                    Value::from(
+                        "public_current_state_and_active_utxo_evidence_only_not_wallet_ownership_cryptographic_proof_or_signing_authority",
+                    ),
+                ),
+                (
                     "incoming_transfer_projection_version",
                     Value::from(INCOMING_TRANSFER_PROJECTION_VERSION),
                 ),
@@ -596,6 +635,27 @@ async fn dispatch_call(
                 )
                 .await?;
             value(&wire_name_action_context(context)?)?
+        }
+        WalletRpcCall::NameActionContextV2 {
+            action,
+            name_hash,
+            expected_chain_epoch,
+            expected_mempool,
+        } => {
+            let name_hash = NameHash::new(decode_hex_32(&name_hash, "name hash")?);
+            let expected_mempool = decode_expected_mempool(Some(expected_mempool))?.ok_or(
+                DispatchError::Invalid("expected mempool binding is required"),
+            )?;
+            let context = backend
+                .get_name_action_context_v2(
+                    action,
+                    name_hash,
+                    expected_chain_epoch,
+                    expected_mempool.instance_nonce,
+                    expected_mempool.generation,
+                )
+                .await?;
+            value(&wire_name_action_context_v2(context)?)?
         }
         WalletRpcCall::BroadcastTransaction { transaction_hex } => {
             let raw = decode_hex_bounded(&transaction_hex, MAX_TX_SIZE, "raw transaction")?;
@@ -1906,6 +1966,112 @@ fn wire_name_action_context(
     })
 }
 
+#[derive(Serialize)]
+struct WireNameActionActiveOwnerCoin {
+    projection_version: u8,
+    owner_coin: WireCoin,
+    inclusion: WireInclusion,
+    source_binding: &'static str,
+}
+
+#[derive(Serialize)]
+struct WireNameActionContextV2 {
+    context_version: u8,
+    action: &'static str,
+    chain_identity: WireNameActionChainIdentity,
+    chain_epoch: u64,
+    tip: WireTip,
+    candidate_inclusion_height: u32,
+    mempool: WireNameActionMempool,
+    name_hash: String,
+    current_state_hex: String,
+    current_state: WireNameState,
+    active_owner: WireNameActionActiveOwnerCoin,
+    lifecycle: &'static str,
+    transfer: WireNameActionTransfer,
+    renewal: WireNameActionRenewal,
+    eligibility: WireNameActionEligibility,
+}
+
+fn wire_name_action_context_v2(
+    context: NameActionContextV2,
+) -> Result<WireNameActionContextV2, DispatchError> {
+    let encoded_state =
+        encode_name_state(&context.current_state).map_err(|_| DispatchError::Internal)?;
+    if context.context_version != NAME_ACTION_CONTEXT_V2_VERSION
+        || context.active_owner.projection_version != ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION
+        || context
+            .active_owner
+            .inclusion
+            .transaction_position
+            .is_some()
+        || context.name_hash != context.current_state.name_hash
+        || context.current_state_bytes != encoded_state
+        || context.active_owner.owner_coin.outpoint != context.current_state.owner
+        || context.active_owner.owner_coin.height != context.active_owner.inclusion.height
+        || context.ineligibility_reasons.len() > MAX_NAME_ACTION_INELIGIBILITY_REASONS
+    {
+        return Err(DispatchError::Internal);
+    }
+
+    let eligible = context.eligible();
+    let reasons = context
+        .ineligibility_reasons
+        .iter()
+        .copied()
+        .map(wire_name_action_ineligibility)
+        .collect();
+    Ok(WireNameActionContextV2 {
+        context_version: context.context_version,
+        action: wire_name_action(context.action),
+        chain_identity: WireNameActionChainIdentity {
+            network: context.network.to_string(),
+            network_id: context.network_id,
+            genesis_hash: context.genesis_hash.to_hex(),
+            consensus_profile: context.consensus_profile,
+        },
+        chain_epoch: context.chain_epoch,
+        tip: WireTip {
+            hash: context.tip.hash.to_hex(),
+            height: context.tip.height,
+            median_time_past: context.tip.median_time_past,
+            tree_root: hex_encode(context.tip.tree_root.as_bytes()),
+        },
+        candidate_inclusion_height: context.candidate_inclusion_height,
+        mempool: WireNameActionMempool {
+            instance_nonce: hex_encode(&context.mempool_instance_nonce),
+            generation: context.mempool_generation,
+            owner_spender_txid: context.owner_spender_txid.map(Txid::to_hex),
+        },
+        name_hash: context.name_hash.to_hex(),
+        current_state_hex: hex_encode(&context.current_state_bytes),
+        current_state: WireNameState::from(&context.current_state),
+        active_owner: WireNameActionActiveOwnerCoin {
+            projection_version: context.active_owner.projection_version,
+            owner_coin: WireCoin::from(&context.active_owner.owner_coin),
+            inclusion: WireInclusion::from(&context.active_owner.inclusion),
+            source_binding: wire_active_name_owner_coin_source_binding(
+                context.active_owner.source_binding,
+            ),
+        },
+        lifecycle: wire_name_lifecycle(context.lifecycle),
+        transfer: WireNameActionTransfer {
+            lockup_blocks: context.transfer.lockup_blocks,
+            current_transfer_height: context.transfer.current_transfer_height,
+            finalize_maturity_height: context.transfer.finalize_maturity_height,
+            finalize_eligible_at_candidate: context.transfer.finalize_eligible_at_candidate,
+        },
+        renewal: WireNameActionRenewal {
+            maturity_blocks: context.renewal.maturity_blocks,
+            period_blocks: context.renewal.period_blocks,
+            hsd_selected_height: context.renewal.hsd_selected_height,
+            hsd_selected_hash: context.renewal.hsd_selected_hash.to_hex(),
+            valid_at_candidate: context.renewal.valid_at_candidate,
+        },
+        eligibility: WireNameActionEligibility { eligible, reasons },
+    })
+}
+
 const fn wire_name_action(action: NameAction) -> &'static str {
     match action {
         NameAction::Transfer => "transfer",
@@ -2596,6 +2762,332 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn name_action_context_v2_request_is_additive_strict_and_exactly_bound() {
+        let request: WalletRpcRequest = serde_json::from_value(serde_json::json!({
+            "api_version": 1,
+            "request_id": "name-action-v2-1",
+            "call": {
+                "method": "name_action_context_v2",
+                "params": {
+                    "action": "finalize",
+                    "name_hash": "11".repeat(32),
+                    "expected_chain_epoch": 7,
+                    "expected_mempool": {
+                        "instance_nonce": "22".repeat(32),
+                        "generation": 9
+                    }
+                }
+            }
+        }))
+        .expect("strict name-action-v2 request");
+        let WalletRpcCall::NameActionContextV2 {
+            action,
+            name_hash,
+            expected_chain_epoch,
+            expected_mempool,
+        } = request.call
+        else {
+            panic!("name-action-v2 method");
+        };
+        assert_eq!(action, NameAction::Finalize);
+        assert_eq!(name_hash, "11".repeat(32));
+        assert_eq!(expected_chain_epoch, 7);
+        assert_eq!(expected_mempool.instance_nonce, "22".repeat(32));
+        assert_eq!(expected_mempool.generation, 9);
+
+        for invalid_params in [
+            serde_json::json!({
+                "action": "finalize",
+                "name_hash": "11".repeat(32),
+                "expected_chain_epoch": 7
+            }),
+            serde_json::json!({
+                "action": "finalize",
+                "name_hash": "11".repeat(32),
+                "expected_chain_epoch": 7,
+                "expected_mempool": {
+                    "instance_nonce": "22".repeat(32),
+                    "generation": 9
+                },
+                "wallet_owned": true
+            }),
+            serde_json::json!({
+                "action": "update",
+                "name_hash": "11".repeat(32),
+                "expected_chain_epoch": 7,
+                "expected_mempool": {
+                    "instance_nonce": "22".repeat(32),
+                    "generation": 9
+                }
+            }),
+            serde_json::json!({
+                "action": "transfer",
+                "name_hash": "11".repeat(32),
+                "expected_chain_epoch": 7,
+                "expected_mempool": {
+                    "instance_nonce": "22".repeat(32),
+                    "generation": 9,
+                    "unbound_extension": true
+                }
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<WalletRpcRequest>(serde_json::json!({
+                    "api_version": 1,
+                    "call": {
+                        "method": "name_action_context_v2",
+                        "params": invalid_params
+                    }
+                }))
+                .is_err()
+            );
+        }
+
+        let legacy: WalletRpcRequest = serde_json::from_value(serde_json::json!({
+            "api_version": 1,
+            "call": {
+                "method": "name_action_context",
+                "params": {
+                    "action": "transfer",
+                    "name_hash": "11".repeat(32),
+                    "expected_chain_epoch": 7,
+                    "expected_mempool": {
+                        "instance_nonce": "22".repeat(32),
+                        "generation": 9
+                    }
+                }
+            }
+        }))
+        .expect("legacy name-action request remains valid");
+        assert!(matches!(
+            legacy.call,
+            WalletRpcCall::NameActionContext { .. }
+        ));
+    }
+
+    #[test]
+    fn name_action_context_v2_wire_is_coin_backed_and_contains_no_owner_transaction() {
+        let name_hash = hns_primitives::hash_name("alpha").expect("name hash");
+        let owner = Outpoint {
+            txid: Txid::new([0x22; 32]),
+            index: 3,
+        };
+        let mut current_state = NameState::null(name_hash);
+        current_state.name = b"alpha".to_vec();
+        current_state.height = 2;
+        current_state.renewal = 12;
+        current_state.owner = owner.clone();
+        current_state.value = 4_200;
+        current_state.highest = 4_200;
+        current_state.transfer = 41;
+        current_state.registered = true;
+        let current_state_bytes = encode_name_state(&current_state).expect("name state");
+        let owner_coin = Coin {
+            outpoint: owner,
+            value: 4_200,
+            height: 41,
+            coinbase: false,
+            address: Address::new(0, vec![0x55; 20]).expect("address"),
+            covenant: Covenant {
+                kind: hns_primitives::CovenantKind::Transfer,
+                items: vec![
+                    name_hash.as_bytes().to_vec(),
+                    2_u32.to_le_bytes().to_vec(),
+                    vec![0],
+                    vec![0x44; 20],
+                ],
+            },
+        };
+        let network = hns_consensus::Network::Regtest;
+        let context = NameActionContextV2 {
+            context_version: NAME_ACTION_CONTEXT_V2_VERSION,
+            action: NameAction::Finalize,
+            network,
+            network_id: network.canonical_id(),
+            genesis_hash: network.params().genesis_hash,
+            consensus_profile: hns_consensus::HSD_CONSENSUS_PROFILE.to_owned(),
+            chain_epoch: 17,
+            tip: crate::wallet_backend::WalletChainTip {
+                hash: hns_primitives::BlockHash::new([0x66; 32]),
+                height: 400,
+                median_time_past: 1_700_000_123,
+                tree_root: hns_state::TreeRoot::new([0x77; 32]),
+            },
+            candidate_inclusion_height: 401,
+            mempool_instance_nonce: [0x88; 32],
+            mempool_generation: 9,
+            owner_spender_txid: None,
+            name_hash,
+            current_state_bytes: current_state_bytes.clone(),
+            current_state: current_state.clone(),
+            active_owner: crate::wallet_backend::NameActionActiveOwnerCoin {
+                projection_version: ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION,
+                owner_coin,
+                inclusion: crate::wallet_backend::TransactionInclusion {
+                    block_hash: hns_primitives::BlockHash::new([0x33; 32]),
+                    height: 41,
+                    transaction_position: None,
+                    confirmations: 360,
+                },
+                source_binding: ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+            },
+            lifecycle: NameLifecycleState::Closed,
+            transfer: crate::wallet_backend::NameTransferContext {
+                lockup_blocks: 288,
+                current_transfer_height: Some(41),
+                finalize_maturity_height: Some(329),
+                finalize_eligible_at_candidate: true,
+            },
+            renewal: crate::wallet_backend::NameRenewalContext {
+                maturity_blocks: 10,
+                period_blocks: 50,
+                hsd_selected_height: 380,
+                hsd_selected_hash: hns_primitives::BlockHash::new([0x99; 32]),
+                valid_at_candidate: true,
+            },
+            ineligibility_reasons: Vec::new(),
+        };
+
+        let projected = serde_json::to_value(
+            wire_name_action_context_v2(context.clone()).expect("v2 projection"),
+        )
+        .expect("serialize v2 projection");
+        assert_eq!(projected["context_version"], 2);
+        assert_eq!(projected["action"], "finalize");
+        assert_eq!(projected["chain_epoch"], 17);
+        assert_eq!(projected["name_hash"], name_hash.to_hex());
+        assert_eq!(
+            projected["current_state_hex"],
+            hex_encode(&current_state_bytes)
+        );
+        assert_eq!(projected["active_owner"]["projection_version"], 1);
+        assert_eq!(
+            projected["active_owner"]["owner_coin"]["outpoint"],
+            serde_json::json!({"txid": "22".repeat(32), "index": 3})
+        );
+        assert_eq!(projected["active_owner"]["owner_coin"]["value"], 4_200);
+        assert_eq!(projected["active_owner"]["inclusion"]["height"], 41);
+        assert_eq!(
+            projected["active_owner"]["inclusion"]["transaction_index"],
+            Value::Null
+        );
+        assert_eq!(
+            projected["active_owner"]["source_binding"],
+            "trusted_node_active_utxo_projection"
+        );
+        assert_eq!(
+            projected["eligibility"],
+            serde_json::json!({
+                "eligible": true,
+                "reasons": []
+            })
+        );
+        assert!(projected.get("owner").is_none());
+        let encoded = serde_json::to_string(&projected).expect("wire JSON");
+        assert!(!encoded.contains("transaction_hex"));
+        assert!(!encoded.contains("owner_output"));
+        assert!(!encoded.contains("wallet_owned"));
+
+        let assert_rejected = |candidate| {
+            assert!(matches!(
+                wire_name_action_context_v2(candidate),
+                Err(DispatchError::Internal)
+            ));
+        };
+
+        let mut invalid_version = context.clone();
+        invalid_version.context_version = NAME_ACTION_CONTEXT_VERSION;
+        assert_rejected(invalid_version);
+        let mut invalid_projection = context.clone();
+        invalid_projection.active_owner.projection_version = 2;
+        assert_rejected(invalid_projection);
+        let mut invalid_position = context.clone();
+        invalid_position.active_owner.inclusion.transaction_position = Some(0);
+        assert_rejected(invalid_position);
+        let mut invalid_name_hash = context.clone();
+        invalid_name_hash.name_hash = NameHash::new([0xbb; 32]);
+        assert_rejected(invalid_name_hash);
+        let mut invalid_state = context.clone();
+        invalid_state.current_state_bytes.push(0);
+        assert_rejected(invalid_state);
+        let mut invalid_owner = context.clone();
+        invalid_owner.active_owner.owner_coin.outpoint.index += 1;
+        assert_rejected(invalid_owner);
+        let mut invalid_height = context.clone();
+        invalid_height.active_owner.inclusion.height += 1;
+        assert_rejected(invalid_height);
+        let mut excessive_reasons = context;
+        excessive_reasons.ineligibility_reasons = vec![
+            NameActionIneligibility::NameNotRegistered;
+            MAX_NAME_ACTION_INELIGIBILITY_REASONS + 1
+        ];
+        assert_rejected(excessive_reasons);
+    }
+
+    #[tokio::test]
+    async fn capabilities_freeze_name_action_v1_and_advertise_pruning_safe_v2() {
+        let config = crate::NodeConfig {
+            network: hns_consensus::Network::Regtest,
+            wallet_index: true,
+            ..crate::NodeConfig::default()
+        };
+        let node = crate::NodeService::try_new(config).expect("node");
+        let runtime =
+            crate::NodeRuntime::spawn(node, crate::DEFAULT_CANONICAL_WRITER_QUEUE_CAPACITY)
+                .expect("runtime");
+        let (peers, _events) = hns_p2p::LivePeerManager::new(hns_p2p::LivePeerConfig::for_network(
+            hns_consensus::Network::Regtest,
+        ))
+        .expect("peers");
+        let backend = runtime.wallet_backend(peers);
+        let capabilities = dispatch_call(&backend, WalletRpcCall::Capabilities)
+            .await
+            .expect("capabilities");
+
+        assert_eq!(capabilities["name_action_context_version"], 1);
+        assert_eq!(
+            capabilities["name_action_context_actions"],
+            serde_json::json!(["transfer", "finalize"])
+        );
+        assert_eq!(
+            capabilities["name_action_context_binding"],
+            "mandatory_chain_epoch_and_exact_mempool_instance_and_generation"
+        );
+        assert_eq!(
+            capabilities["name_action_context_maximum_ineligibility_reasons"],
+            9
+        );
+        assert_eq!(capabilities["name_action_context_v2_version"], 2);
+        assert_eq!(
+            capabilities["name_action_context_v2_binding"],
+            "mandatory_chain_epoch_and_exact_mempool_instance_and_generation"
+        );
+        assert_eq!(
+            capabilities["name_action_context_v2_owner_projection_version"],
+            1
+        );
+        assert_eq!(
+            capabilities["name_action_context_v2_owner_source_binding"],
+            "trusted_node_active_utxo_projection"
+        );
+        assert_eq!(
+            capabilities["name_action_context_v2_owner_transaction"],
+            "not_read_or_returned"
+        );
+        assert_eq!(
+            capabilities["name_action_context_v2_transaction_position"],
+            "always_null_no_raw_block_read"
+        );
+        assert_eq!(
+            capabilities["name_action_context_v2_authority"],
+            "public_current_state_and_active_utxo_evidence_only_not_wallet_ownership_cryptographic_proof_or_signing_authority"
+        );
+
+        drop(backend);
+        runtime.shutdown_unclean().await.expect("shutdown");
     }
 
     #[test]

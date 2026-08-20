@@ -78,6 +78,8 @@ pub const MAX_WALLET_OUTPOINT_SPEND_BATCH: usize = 4_096;
 pub const MAX_WALLET_FEE_QUOTE_INPUTS: usize = 4_096;
 /// Version of the immutable name-action preparation evidence contract.
 pub const NAME_ACTION_CONTEXT_VERSION: u8 = 1;
+/// Version of the pruning-safe Coin-backed name-action evidence contract.
+pub const NAME_ACTION_CONTEXT_V2_VERSION: u8 = 2;
 /// Fixed maximum number of distinct name-action ineligibility reasons.
 pub const MAX_NAME_ACTION_INELIGIBILITY_REASONS: usize = 9;
 
@@ -843,6 +845,66 @@ pub struct NameActionContext {
 
 impl NameActionContext {
     /// The action is eligible only when no fixed fail-closed reason applies.
+    #[must_use]
+    pub fn eligible(&self) -> bool {
+        self.ineligibility_reasons.is_empty()
+    }
+}
+
+/// Pruning-safe active-owner projection embedded in a version-2 name action.
+///
+/// The Coin comes from the active UTXO set and is corroborated by the current
+/// NameState and canonical transaction index. It is trusted-node evidence,
+/// not a transaction-output proof or an assertion that a wallet owns the
+/// corresponding private key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NameActionActiveOwnerCoin {
+    /// Projection version shared with [`ActiveNameOwnerCoinEvidence`].
+    pub projection_version: u8,
+    /// Exact active Coin selected by the current NameState owner outpoint.
+    pub owner_coin: Coin,
+    /// Canonical inclusion with an intentionally unavailable transaction
+    /// position because no raw block body is read.
+    pub inclusion: TransactionInclusion,
+    /// Explicit trusted-node projection strength.
+    pub source_binding: ActiveNameOwnerCoinSourceBinding,
+}
+
+/// One pruning-safe, candidate-specific TRANSFER or FINALIZE evidence capture.
+///
+/// This public evidence cannot construct, sign, approve, quote, admit, or
+/// broadcast a transaction. In particular, the node does not know whether the
+/// active Coin's address belongs to the caller; a wallet must establish that
+/// relationship independently from its own derivation state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NameActionContextV2 {
+    pub context_version: u8,
+    pub action: NameAction,
+    pub network: Network,
+    pub network_id: u8,
+    pub genesis_hash: BlockHash,
+    pub consensus_profile: String,
+    pub chain_epoch: u64,
+    pub tip: WalletChainTip,
+    pub candidate_inclusion_height: Height,
+    pub mempool_instance_nonce: [u8; 32],
+    pub mempool_generation: u64,
+    pub owner_spender_txid: Option<Txid>,
+    pub name_hash: NameHash,
+    /// Exact canonical bytes stored for the current NameState value.
+    pub current_state_bytes: Vec<u8>,
+    /// Decoded current state bound to `current_state_bytes` and `name_hash`.
+    pub current_state: NameState,
+    pub active_owner: NameActionActiveOwnerCoin,
+    pub lifecycle: NameLifecycleState,
+    pub transfer: NameTransferContext,
+    pub renewal: NameRenewalContext,
+    pub ineligibility_reasons: Vec<NameActionIneligibility>,
+}
+
+impl NameActionContextV2 {
+    /// The action is contextually eligible only when no fixed reason applies.
+    /// Eligibility remains public evidence and never grants spending authority.
     #[must_use]
     pub fn eligible(&self) -> bool {
         self.ineligibility_reasons.is_empty()
@@ -2599,6 +2661,42 @@ impl WalletBackend {
         .await
     }
 
+    /// Capture pruning-safe public evidence for one TRANSFER or FINALIZE.
+    ///
+    /// Unlike version 1, this method never loads the owner transaction or its
+    /// containing raw block. It binds the current NameState to the exact active
+    /// owner Coin and canonical transaction index, then derives the same
+    /// candidate-height policy and immutable-mempool spender evidence. The
+    /// result is not wallet ownership, signing authority, transaction
+    /// construction, approval, fee evidence, admission, or broadcast.
+    pub async fn get_name_action_context_v2(
+        &self,
+        action: NameAction,
+        name_hash: NameHash,
+        expected_chain_epoch: u64,
+        expected_mempool_instance_nonce: [u8; 32],
+        expected_mempool_generation: u64,
+    ) -> Result<NameActionContextV2, WalletBackendError> {
+        if !self.read.transaction_index {
+            return Err(WalletBackendError::IndexDisabled("transaction"));
+        }
+        let read = self.read.clone();
+        blocking_mempool_read(read, move |read, snapshot, mempool, _, epoch| {
+            name_action_context_v2_from_snapshot(
+                read.network(),
+                snapshot,
+                mempool,
+                epoch.chain_epoch,
+                action,
+                name_hash,
+                expected_chain_epoch,
+                expected_mempool_instance_nonce,
+                expected_mempool_generation,
+            )
+        })
+        .await
+    }
+
     /// Return pruning-safe current NameState and active owner Coin evidence.
     ///
     /// The expected durable chain epoch is checked inside the immutable
@@ -3285,6 +3383,157 @@ fn load_block_time<S: ReadSnapshot>(
         .transpose()?;
     cache.insert(block_hash, time);
     Ok(time)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn name_action_context_v2_from_snapshot<S: ReadSnapshot>(
+    network: Network,
+    snapshot: &S,
+    mempool: &MempoolSnapshot,
+    published_chain_epoch: u64,
+    action: NameAction,
+    name_hash: NameHash,
+    expected_chain_epoch: u64,
+    expected_mempool_instance_nonce: [u8; 32],
+    expected_mempool_generation: u64,
+) -> Result<NameActionContextV2, WalletBackendError> {
+    // Preserve this ordering. A stale caller must be rejected before the
+    // requested NameState, owner UTXO, or transaction index is touched, and
+    // an old process-local mempool binding must not turn this method into a
+    // name-existence oracle.
+    let chain_epoch = chain_epoch_from_snapshot(snapshot).map_err(node_error)?;
+    if chain_epoch != published_chain_epoch {
+        return Err(WalletBackendError::Corrupt(
+            "published and durable chain generations disagree",
+        ));
+    }
+    if chain_epoch != expected_chain_epoch {
+        return Err(WalletBackendError::StaleChainEpoch {
+            expected: expected_chain_epoch,
+            actual: chain_epoch,
+        });
+    }
+    if mempool.instance_nonce() != &expected_mempool_instance_nonce {
+        return Err(WalletBackendError::StaleMempoolInstance);
+    }
+    if mempool.generation() != expected_mempool_generation {
+        return Err(WalletBackendError::StaleMempoolGeneration {
+            expected: expected_mempool_generation,
+            actual: mempool.generation(),
+        });
+    }
+
+    let network_params = network.params();
+    let name_params = network_params.names;
+    let tip = wallet_chain_tip(snapshot)?.ok_or(WalletBackendError::ChainUninitialized)?;
+    let canonical_genesis = read_canonical_hash(snapshot, 0)
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "initialized chain has no canonical genesis",
+        ))?;
+    if canonical_genesis != network_params.genesis_hash {
+        return Err(WalletBackendError::Corrupt(
+            "canonical genesis disagrees with the selected network",
+        ));
+    }
+
+    let active_owner =
+        active_name_owner_coin_from_snapshot(snapshot, name_hash, expected_chain_epoch)?;
+    if active_owner.chain_epoch != chain_epoch || active_owner.tip != tip {
+        return Err(WalletBackendError::Corrupt(
+            "name action active owner has a different chain generation or tip",
+        ));
+    }
+    let candidate_inclusion_height =
+        active_owner
+            .tip
+            .height
+            .checked_add(1)
+            .ok_or(WalletBackendError::Corrupt(
+                "candidate inclusion height overflows u32",
+            ))?;
+
+    let owner_spender_txid = mempool.spending_transaction(&active_owner.owner_coin.outpoint);
+    let lifecycle = name_lifecycle(
+        &active_owner.current_state,
+        candidate_inclusion_height,
+        name_params,
+    );
+    let expired_at_candidate = is_name_expired(
+        &active_owner.current_state,
+        candidate_inclusion_height,
+        name_params,
+    );
+    let current_transfer_height =
+        (active_owner.current_state.transfer != 0).then_some(active_owner.current_state.transfer);
+    let finalize_maturity_height =
+        current_transfer_height.map(|height| transfer_maturity_height(height, name_params));
+    let finalize_eligible_at_candidate = is_transfer_mature(
+        active_owner.current_state.transfer,
+        candidate_inclusion_height,
+        name_params,
+    );
+
+    let hsd_selected_height = hsd_wallet_renewal_height(active_owner.tip.height, name_params);
+    let hsd_selected_hash = read_canonical_hash(snapshot, hsd_selected_height)
+        .map_err(node_error)?
+        .ok_or(WalletBackendError::Corrupt(
+            "HSD-selected renewal height is absent from the active chain",
+        ))?;
+    let renewal_valid_at_candidate = renewal_commitment_height_is_valid(
+        hsd_selected_height,
+        candidate_inclusion_height,
+        name_params,
+    );
+    let ineligibility_reasons = name_action_ineligibility_reasons(
+        action,
+        &active_owner.current_state,
+        active_owner.owner_coin.covenant.kind,
+        lifecycle,
+        expired_at_candidate,
+        finalize_eligible_at_candidate,
+        renewal_valid_at_candidate,
+        owner_spender_txid,
+    )?;
+
+    Ok(NameActionContextV2 {
+        context_version: NAME_ACTION_CONTEXT_V2_VERSION,
+        action,
+        network,
+        network_id: network.canonical_id(),
+        genesis_hash: network_params.genesis_hash,
+        consensus_profile: HSD_CONSENSUS_PROFILE.to_owned(),
+        chain_epoch,
+        tip: active_owner.tip,
+        candidate_inclusion_height,
+        mempool_instance_nonce: *mempool.instance_nonce(),
+        mempool_generation: mempool.generation(),
+        owner_spender_txid,
+        name_hash,
+        current_state_bytes: active_owner.current_state_bytes,
+        current_state: active_owner.current_state,
+        active_owner: NameActionActiveOwnerCoin {
+            projection_version: active_owner.projection_version,
+            owner_coin: active_owner.owner_coin,
+            inclusion: active_owner.inclusion,
+            source_binding: active_owner.source_binding,
+        },
+        lifecycle,
+        transfer: NameTransferContext {
+            lockup_blocks: name_params.transfer_lockup,
+            current_transfer_height,
+            finalize_maturity_height,
+            finalize_eligible_at_candidate,
+        },
+        renewal: NameRenewalContext {
+            maturity_blocks: name_params.renewal_maturity,
+            period_blocks: name_params.renewal_period,
+            hsd_selected_height,
+            hsd_selected_hash,
+            valid_at_candidate: renewal_valid_at_candidate,
+        },
+        ineligibility_reasons,
+    })
 }
 
 fn active_name_owner_coin_from_snapshot<S: ReadSnapshot>(
@@ -4525,38 +4774,14 @@ mod tests {
             locktime: 0,
         };
 
-        let genesis_transaction = Transaction {
-            version: 0,
-            inputs: vec![Input {
-                previous_output: Outpoint::null(),
-                sequence: u32::MAX,
-                witness: Witness::default(),
-            }],
-            outputs: vec![Output {
-                value: 1,
-                address: Address::new(0, vec![0x10; 20]).expect("genesis address"),
-                covenant: Covenant {
-                    kind: CovenantKind::None,
-                    items: Vec::new(),
-                },
-            }],
-            locktime: 0,
-        };
-        let mut genesis = Block {
-            header: Header {
-                time: 1,
-                ..Header::default()
-            },
-            transactions: vec![genesis_transaction],
-        };
-        genesis.header.merkle_root = block_merkle_root(&genesis);
-        genesis.header.witness_root = block_witness_root(&genesis);
-        let genesis_hash = genesis.hash();
+        let genesis_header_value = Network::Regtest.params().genesis_header();
+        let genesis_hash = Network::Regtest.params().genesis_hash;
+        let owner_time = genesis_header_value.time.saturating_add(1);
 
         let mut owner_block = Block {
             header: Header {
                 prev_block: genesis_hash,
-                time: 2,
+                time: owner_time,
                 ..Header::default()
             },
             transactions: vec![owner_transaction.clone()],
@@ -4594,7 +4819,7 @@ mod tests {
         }
         let state_bytes = encode_name_state(&state).expect("encode fixture NameState");
 
-        let genesis_status = incoming_transfer_authoritative_status(true);
+        let genesis_status = incoming_transfer_authoritative_status(false);
         let owner_status = incoming_transfer_authoritative_status(owner_body_present);
         let genesis_index = BlockIndexRecord {
             hash: genesis_hash,
@@ -4618,7 +4843,7 @@ mod tests {
             hash: genesis_hash,
             height: 0,
             chainwork: genesis_index.chainwork,
-            header: genesis.header.clone(),
+            header: genesis_header_value,
             status: genesis_status,
         };
         let owner_header = HeaderRecord {
@@ -4664,11 +4889,6 @@ mod tests {
                 TreeRoot::ZERO.as_bytes(),
             )
             .expect("write name tree root");
-        write_raw_block_to_batch(
-            &mut batch,
-            &RawBlockRecord::from_block(&genesis, RawBlockSource::Fixture),
-        )
-        .expect("write genesis body");
         if write_owner_body {
             write_raw_block_to_batch(
                 &mut batch,
@@ -5244,6 +5464,200 @@ mod tests {
     }
 
     #[test]
+    fn name_action_context_v2_is_coin_backed_and_never_reads_owner_blocks() {
+        let mempool = MemoryMempool::new().unwrap().snapshot();
+        for (kind, action) in [
+            (ActiveNameOwnerFixtureKind::Transfer, NameAction::Finalize),
+            (ActiveNameOwnerFixtureKind::Finalize, NameAction::Transfer),
+        ] {
+            for (body_present, write_body) in [(true, true), (false, false)] {
+                let fixture = active_name_owner_fixture(kind, body_present, write_body);
+                let snapshot = IncomingReadCountingSnapshot::new(
+                    fixture.store.snapshot().expect("name action snapshot"),
+                );
+                let context = name_action_context_v2_from_snapshot(
+                    Network::Regtest,
+                    &snapshot,
+                    &mempool,
+                    fixture.chain_epoch,
+                    action,
+                    fixture.name_hash,
+                    fixture.chain_epoch,
+                    *mempool.instance_nonce(),
+                    mempool.generation(),
+                )
+                .expect("pruning-safe name action context");
+
+                assert_eq!(context.context_version, NAME_ACTION_CONTEXT_V2_VERSION);
+                assert_eq!(context.action, action);
+                assert_eq!(context.network, Network::Regtest);
+                assert_eq!(context.network_id, Network::Regtest.canonical_id());
+                assert_eq!(context.genesis_hash, Network::Regtest.params().genesis_hash);
+                assert_eq!(context.consensus_profile, HSD_CONSENSUS_PROFILE);
+                assert_eq!(context.chain_epoch, fixture.chain_epoch);
+                assert_eq!(context.tip.hash, fixture.owner_block_hash);
+                assert_eq!(context.candidate_inclusion_height, context.tip.height + 1);
+                assert_eq!(context.mempool_instance_nonce, *mempool.instance_nonce());
+                assert_eq!(context.mempool_generation, mempool.generation());
+                assert_eq!(context.name_hash, fixture.name_hash);
+                assert_eq!(context.current_state_bytes, fixture.state_bytes);
+                assert_eq!(context.current_state, fixture.state);
+                assert_eq!(
+                    context.active_owner.projection_version,
+                    ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION
+                );
+                assert_eq!(context.active_owner.owner_coin, fixture.coin);
+                assert_eq!(context.active_owner.inclusion, fixture.inclusion);
+                assert_eq!(context.active_owner.inclusion.transaction_position, None);
+                assert_eq!(
+                    context.active_owner.source_binding,
+                    ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection
+                );
+                assert_eq!(context.owner_spender_txid, None);
+                assert_eq!(
+                    context.transfer.lockup_blocks,
+                    Network::Regtest.params().names.transfer_lockup
+                );
+                assert_eq!(
+                    context.renewal.maturity_blocks,
+                    Network::Regtest.params().names.renewal_maturity
+                );
+                assert_eq!(
+                    context.renewal.period_blocks,
+                    Network::Regtest.params().names.renewal_period
+                );
+                assert_eq!(context.eligible(), context.ineligibility_reasons.is_empty());
+                assert!(
+                    context.ineligibility_reasons.len() <= MAX_NAME_ACTION_INELIGIBILITY_REASONS
+                );
+                assert_eq!(snapshot.block_gets.get(), 0);
+                assert_eq!(snapshot.name_state_gets.get(), 1);
+                assert_eq!(snapshot.utxo_gets.get(), 1);
+                assert_eq!(snapshot.tx_index_gets.get(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn name_action_context_v2_rejects_every_stale_binding_before_authority_reads() {
+        let mempool = MemoryMempool::new().unwrap().snapshot();
+
+        let assert_no_authority_reads = |snapshot: &IncomingReadCountingSnapshot<_>| {
+            assert_eq!(snapshot.name_state_gets.get(), 0);
+            assert_eq!(snapshot.utxo_gets.get(), 0);
+            assert_eq!(snapshot.tx_index_gets.get(), 0);
+            assert_eq!(snapshot.block_gets.get(), 0);
+        };
+
+        let fixture = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        let snapshot = IncomingReadCountingSnapshot::new(
+            fixture.store.snapshot().expect("published epoch snapshot"),
+        );
+        assert!(matches!(
+            name_action_context_v2_from_snapshot(
+                Network::Regtest,
+                &snapshot,
+                &mempool,
+                fixture.chain_epoch.saturating_add(1),
+                NameAction::Finalize,
+                fixture.name_hash,
+                fixture.chain_epoch,
+                *mempool.instance_nonce(),
+                mempool.generation(),
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+        assert_no_authority_reads(&snapshot);
+
+        let fixture = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        let snapshot = IncomingReadCountingSnapshot::new(
+            fixture.store.snapshot().expect("stale chain snapshot"),
+        );
+        assert!(matches!(
+            name_action_context_v2_from_snapshot(
+                Network::Regtest,
+                &snapshot,
+                &mempool,
+                fixture.chain_epoch,
+                NameAction::Finalize,
+                fixture.name_hash,
+                fixture.chain_epoch.saturating_add(1),
+                *mempool.instance_nonce(),
+                mempool.generation(),
+            ),
+            Err(WalletBackendError::StaleChainEpoch { .. })
+        ));
+        assert_no_authority_reads(&snapshot);
+
+        let fixture = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        let snapshot = IncomingReadCountingSnapshot::new(
+            fixture.store.snapshot().expect("stale instance snapshot"),
+        );
+        assert!(matches!(
+            name_action_context_v2_from_snapshot(
+                Network::Regtest,
+                &snapshot,
+                &mempool,
+                fixture.chain_epoch,
+                NameAction::Finalize,
+                fixture.name_hash,
+                fixture.chain_epoch,
+                [0; 32],
+                mempool.generation(),
+            ),
+            Err(WalletBackendError::StaleMempoolInstance)
+        ));
+        assert_no_authority_reads(&snapshot);
+
+        let fixture = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        let snapshot = IncomingReadCountingSnapshot::new(
+            fixture.store.snapshot().expect("stale generation snapshot"),
+        );
+        assert!(matches!(
+            name_action_context_v2_from_snapshot(
+                Network::Regtest,
+                &snapshot,
+                &mempool,
+                fixture.chain_epoch,
+                NameAction::Finalize,
+                fixture.name_hash,
+                fixture.chain_epoch,
+                *mempool.instance_nonce(),
+                mempool.generation().saturating_add(1),
+            ),
+            Err(WalletBackendError::StaleMempoolGeneration { .. })
+        ));
+        assert_no_authority_reads(&snapshot);
+    }
+
+    #[test]
+    fn name_action_context_v2_rejects_wrong_network_before_authority_reads() {
+        let mempool = MemoryMempool::new().unwrap().snapshot();
+        let fixture = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Transfer, false, false);
+        let snapshot = IncomingReadCountingSnapshot::new(
+            fixture.store.snapshot().expect("wrong-network snapshot"),
+        );
+        assert!(matches!(
+            name_action_context_v2_from_snapshot(
+                Network::Mainnet,
+                &snapshot,
+                &mempool,
+                fixture.chain_epoch,
+                NameAction::Finalize,
+                fixture.name_hash,
+                fixture.chain_epoch,
+                *mempool.instance_nonce(),
+                mempool.generation(),
+            ),
+            Err(WalletBackendError::Corrupt(_))
+        ));
+        assert_eq!(snapshot.name_state_gets.get(), 0);
+        assert_eq!(snapshot.utxo_gets.get(), 0);
+        assert_eq!(snapshot.tx_index_gets.get(), 0);
+        assert_eq!(snapshot.block_gets.get(), 0);
+    }
+
+    #[test]
     fn active_name_owner_coin_checks_epoch_before_authority_reads() {
         let fixture = active_name_owner_fixture(ActiveNameOwnerFixtureKind::Finalize, true, true);
         let snapshot = IncomingReadCountingSnapshot::new(
@@ -5775,6 +6189,54 @@ mod tests {
         assert!(matches!(
             backend
                 .get_name_action_context(
+                    NameAction::Transfer,
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch,
+                    unknown.mempool_instance_nonce,
+                    unknown.mempool_generation,
+                )
+                .await,
+            Err(WalletBackendError::ChainUninitialized)
+        ));
+        assert!(matches!(
+            backend
+                .get_name_action_context_v2(
+                    NameAction::Transfer,
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch.saturating_add(1),
+                    unknown.mempool_instance_nonce,
+                    unknown.mempool_generation,
+                )
+                .await,
+            Err(WalletBackendError::StaleChainEpoch { .. })
+        ));
+        assert!(matches!(
+            backend
+                .get_name_action_context_v2(
+                    NameAction::Transfer,
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch,
+                    [0; 32],
+                    unknown.mempool_generation,
+                )
+                .await,
+            Err(WalletBackendError::StaleMempoolInstance)
+        ));
+        assert!(matches!(
+            backend
+                .get_name_action_context_v2(
+                    NameAction::Transfer,
+                    NameHash::new([8; 32]),
+                    unknown.chain_epoch,
+                    unknown.mempool_instance_nonce,
+                    unknown.mempool_generation.saturating_add(1),
+                )
+                .await,
+            Err(WalletBackendError::StaleMempoolGeneration { .. })
+        ));
+        assert!(matches!(
+            backend
+                .get_name_action_context_v2(
                     NameAction::Transfer,
                     NameHash::new([8; 32]),
                     unknown.chain_epoch,

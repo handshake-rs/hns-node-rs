@@ -227,6 +227,10 @@ Therefore:
   block or owner-transaction read, so its inclusion transaction position is
   explicitly absent and its source is labeled
   `trusted_node_active_utxo_projection`;
+- `WalletBackend::get_name_action_context_v2` composes that same current
+  NameState/active Coin evidence with exact immutable-mempool spender and
+  candidate policy evidence. It never needs an owner transaction preimage and
+  cannot return `PayloadPruned` for an otherwise valid active owner;
 - raw confirmed transactions generally require the containing raw block and
   return `PayloadPruned` when it is gone. Profile-v4 incoming-TRANSFER evidence
   deliberately does not retain or reconstruct the raw owner transaction;
@@ -400,6 +404,18 @@ so the exact concurrent spender is an O(log N) lookup rather than a pool scan.
 Eligibility has a fixed maximum of nine reasons and any current spender is a
 fail-closed ineligibility. This evidence does not construct or sign the action,
 and a later chain or mempool generation requires a fresh context.
+
+`get_name_action_context_v2` preserves those policy, chain, mempool, and fixed
+eligibility semantics while replacing the retained owner transaction with the
+version-1 active owner Coin projection. All expected bindings are rejected
+before the requested name, UTXO, or transaction index is read. The method then
+uses only pruning-stable NameState, UTXO, transaction-index, canonical-height,
+header, and metadata reads; it never reads a raw block. Its inclusion position
+is therefore always unavailable. The source remains
+`trusted_node_active_utxo_projection`: the node neither proves the Coin bytes
+against the txid nor knows whether a wallet owns the address. There is no
+cursor or pagination for this one-name point read and no storage/profile
+migration.
 
 Authority-bearing durable reads capture the published canonical epoch, prove
 that the store snapshot has the same durable chain epoch and tip, and recheck

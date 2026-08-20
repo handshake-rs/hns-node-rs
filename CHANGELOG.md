@@ -73,6 +73,13 @@ qualification or authorize deployment.
   ChaCha20-Poly1305; standalone `hns-p2p` no longer enables OpenSSL consensus
   verifiers.
 - Bind wallet snapshots and name-action contexts to consensus median time past.
+- Add pruning-safe authenticated `name_action_context_v2` public evidence. It
+  preserves the frozen v1 chain/mempool binding, candidate policy, and fixed
+  eligibility vocabulary while replacing the retained owner transaction with
+  canonical current NameState bytes and the byte-exact active owner Coin
+  projection. It performs no raw block read, asserts no wallet ownership or
+  cryptographic output proof, and enables no construction, signing, relay, or
+  value role.
 - Add a script-free authenticated wallet `chain_snapshot` read that atomically
   returns the durable chain epoch and exact tip, allowing a bound genesis check
   before any derived script identity is disclosed. The existing `chain_tip`
