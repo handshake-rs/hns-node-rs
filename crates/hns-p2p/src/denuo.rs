@@ -1,4 +1,4 @@
-//! Runtime coordination and bounded diagnostics for Denuo Experimental V1.
+//! Runtime coordination and bounded diagnostics for Denuo Experimental V2.
 //!
 //! The coordinator is deliberately isolated from the ordinary Handshake peer
 //! state machine. An experimental negotiation failure disables Denuo for that
@@ -14,14 +14,18 @@ use std::{
 
 use hns_consensus::Network as ConsensusNetwork;
 use hns_dns_relay_protocol::MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE;
+use hns_marketplace_protocol::{
+    DenuoRegistryVersion, NameMarketHello, NameMarketMessage, MAX_DENUO_MARKET_PAYLOAD,
+};
 use hns_p2p_experimental::{
     DenuoExtensionEnvelope, EnvelopeError, ExperimentalWireProfile, KnownMessage,
-    NegotiatedRegistry, NegotiationError, Network, ProtocolDisposition, RegistryEnvelopeError,
-    RegistryHello, DENUO_EXTENSION_MAX_NESTED_PAYLOAD, DENUO_EXTENSION_MAX_PACKET_PAYLOAD,
-    DENUO_EXTENSION_PACKET, DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT,
-    DENUO_V1_REGISTRY_ID, DENUO_V1_REGISTRY_NAME, DENUO_V1_REGISTRY_PROTOCOL_VERSION,
-    DENUO_V1_REGISTRY_VERSION, DENUO_V1_WIRE_PROFILE, EXPERIMENTAL_STATUS_LABEL,
-    REGISTRY_NEGOTIATION_MAX_PAYLOAD,
+    NegotiatedRegistry, NegotiationError, Network, ProtocolDisposition, ProtocolRange,
+    RegistryEnvelopeError, RegistryHello, ATOMIC_MARKET_PROTOCOL_ID,
+    ATOMIC_MARKET_PROTOCOL_VERSION, DENUO_EXTENSION_MAX_NESTED_PAYLOAD,
+    DENUO_EXTENSION_MAX_PACKET_PAYLOAD, DENUO_EXTENSION_PACKET, DENUO_EXTENSION_SERVICE,
+    DENUO_V2_EXPERIMENTAL_STATUS_LABEL, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_REGISTRY_ID,
+    DENUO_V2_REGISTRY_NAME, DENUO_V2_REGISTRY_PROTOCOL_VERSION, DENUO_V2_REGISTRY_VERSION,
+    DENUO_V2_WIRE_PROFILE, REGISTRY_NEGOTIATION_MAX_PAYLOAD,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -215,13 +219,13 @@ pub struct DenuoRegistryIdentity {
 impl Default for DenuoRegistryIdentity {
     fn default() -> Self {
         Self {
-            name: DENUO_V1_REGISTRY_NAME.to_owned(),
-            registry_id: DENUO_V1_REGISTRY_ID.to_string(),
-            fingerprint: DENUO_V1_REGISTRY_FINGERPRINT.to_string(),
-            registry_version: DENUO_V1_REGISTRY_VERSION,
-            registry_protocol_version: DENUO_V1_REGISTRY_PROTOCOL_VERSION,
-            wire_profile: DENUO_V1_WIRE_PROFILE.to_owned(),
-            status: EXPERIMENTAL_STATUS_LABEL.to_owned(),
+            name: DENUO_V2_REGISTRY_NAME.to_owned(),
+            registry_id: DENUO_V2_REGISTRY_ID.to_string(),
+            fingerprint: DENUO_V2_REGISTRY_FINGERPRINT.to_string(),
+            registry_version: DENUO_V2_REGISTRY_VERSION,
+            registry_protocol_version: DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+            wire_profile: DENUO_V2_WIRE_PROFILE.to_owned(),
+            status: DENUO_V2_EXPERIMENTAL_STATUS_LABEL.to_owned(),
             service_bit: DENUO_EXTENSION_SERVICE.value(),
             packet_type: DENUO_EXTENSION_PACKET.value(),
             maximum_packet_payload: DENUO_EXTENSION_MAX_PACKET_PAYLOAD as u32,
@@ -407,12 +411,21 @@ fn saturating_increment(counter: &AtomicU64) {
 pub(crate) enum DenuoOutboundMessage {
     Hello,
     HelloAck,
+    NameMarket,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DenuoAction {
     pub response_payload: Option<Vec<u8>>,
     pub outbound_message: Option<DenuoOutboundMessage>,
+    pub name_market: Option<DenuoNameMarketInbound>,
+}
+
+/// One canonical name-market message admitted under the exact V2 registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DenuoNameMarketInbound {
+    pub request_id: u64,
+    pub message: NameMarketMessage,
 }
 
 #[derive(Debug)]
@@ -420,6 +433,7 @@ pub(crate) struct DenuoCoordinator {
     direction: PeerDirection,
     local_enabled: bool,
     local_hello: RegistryHello,
+    name_market_hello: NameMarketHello,
     proposed_request_id: u64,
     negotiation_timeout: Duration,
     ready: bool,
@@ -445,10 +459,14 @@ impl DenuoCoordinator {
             ConsensusNetwork::Regtest => Network::Regtest,
             ConsensusNetwork::Simnet => Network::Simnet,
         };
-        let local_hello = RegistryHello::denuo_v1(
+        let local_hello = RegistryHello::denuo_v2(
             experimental_network,
             network.params().genesis_hash.into_inner(),
-            Vec::new(),
+            vec![ProtocolRange {
+                protocol_id: ATOMIC_MARKET_PROTOCOL_ID,
+                minimum_version: ATOMIC_MARKET_PROTOCOL_VERSION,
+                maximum_version: ATOMIC_MARKET_PROTOCOL_VERSION,
+            }],
             u32::try_from(
                 DENUO_EXTENSION_MAX_PACKET_PAYLOAD.max(MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE),
             )
@@ -456,6 +474,13 @@ impl DenuoCoordinator {
             DENUO_DEFAULT_MAXIMUM_LIVE_REQUESTS,
             0,
         )?;
+        let name_market_hello = NameMarketHello {
+            hns_magic: network.params().packet_magic,
+            hns_genesis: network.params().genesis_hash.into_inner().into(),
+            maximum_payload: u32::try_from(MAX_DENUO_MARKET_PAYLOAD)
+                .expect("canonical Denuo marketplace payload ceiling fits u32"),
+            feature_flags: 0,
+        };
         let diagnostics = DenuoPeerDiagnostics {
             phase: if local_services & DENUO_EXTENSION_SERVICE.value() != 0 {
                 DenuoPeerPhase::AwaitingVersion
@@ -468,6 +493,7 @@ impl DenuoCoordinator {
             direction,
             local_enabled: local_services & DENUO_EXTENSION_SERVICE.value() != 0,
             local_hello,
+            name_market_hello,
             proposed_request_id: proposed_request_id.max(1),
             negotiation_timeout,
             ready: false,
@@ -488,7 +514,7 @@ impl DenuoCoordinator {
     ) -> Option<(ExperimentalWireProfile, &NegotiatedRegistry)> {
         self.negotiated
             .as_ref()
-            .map(|negotiated| (ExperimentalWireProfile::DenuoV1, negotiated))
+            .map(|negotiated| (ExperimentalWireProfile::DenuoV2, negotiated))
     }
 
     pub(crate) fn observe_remote_services(&mut self, services: u64) {
@@ -522,6 +548,7 @@ impl DenuoCoordinator {
         DenuoAction {
             response_payload: Some(response_payload),
             outbound_message: Some(DenuoOutboundMessage::Hello),
+            name_market: None,
         }
     }
 
@@ -597,6 +624,9 @@ impl DenuoCoordinator {
                 self.disable(DenuoDisableReason::UnexpectedMessage);
                 DenuoAction::default()
             }
+            ProtocolDisposition::Known(message) if is_name_market_message(message) => {
+                self.receive_name_market(payload)
+            }
             ProtocolDisposition::Known(_) => {
                 self.reject_subprotocol(DenuoDisableReason::UnsupportedProtocol);
                 DenuoAction::default()
@@ -609,6 +639,42 @@ impl DenuoCoordinator {
                 self.reject_subprotocol(DenuoDisableReason::UnsupportedProtocol);
                 DenuoAction::default()
             }
+        }
+    }
+
+    fn receive_name_market(&mut self, payload: &[u8]) -> DenuoAction {
+        let Some(negotiated) = self.negotiated.as_ref() else {
+            self.disable(DenuoDisableReason::UnexpectedMessage);
+            return DenuoAction::default();
+        };
+        if self.diagnostics.phase != DenuoPeerPhase::Negotiated
+            || negotiated.registry_version != DENUO_V2_REGISTRY_VERSION
+            || negotiated.fingerprint != DENUO_V2_REGISTRY_FINGERPRINT
+            || !negotiated
+                .protocols
+                .contains(&(ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION))
+            || payload.len() > usize::try_from(self.local_hello.maximum_receive_size).unwrap_or(0)
+        {
+            self.reject_subprotocol(DenuoDisableReason::UnsupportedProtocol);
+            return DenuoAction::default();
+        }
+        let (registry, request_id, message) = match NameMarketMessage::decode_envelope(payload) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.reject_subprotocol(DenuoDisableReason::MalformedEnvelope);
+                return DenuoAction::default();
+            }
+        };
+        if registry != DenuoRegistryVersion::V2 {
+            self.reject_subprotocol(DenuoDisableReason::IncompatibleVersion);
+            return DenuoAction::default();
+        }
+        DenuoAction {
+            name_market: Some(DenuoNameMarketInbound {
+                request_id,
+                message,
+            }),
+            ..DenuoAction::default()
         }
     }
 
@@ -635,7 +701,7 @@ impl DenuoCoordinator {
         }
 
         let (request_id, remote_hello) =
-            match DenuoExtensionEnvelope::decode_registry_hello(payload) {
+            match DenuoExtensionEnvelope::decode_registry_hello_v2(payload) {
                 Ok(message) => message,
                 Err(error) => {
                     self.disable(map_registry_error(&error));
@@ -662,6 +728,7 @@ impl DenuoCoordinator {
         DenuoAction {
             response_payload: Some(response_payload),
             outbound_message: Some(DenuoOutboundMessage::HelloAck),
+            name_market: None,
         }
     }
 
@@ -684,7 +751,7 @@ impl DenuoCoordinator {
         }
 
         let (request_id, remote_hello) =
-            match DenuoExtensionEnvelope::decode_registry_hello_ack(payload) {
+            match DenuoExtensionEnvelope::decode_registry_hello_ack_v2(payload) {
                 Ok(message) => message,
                 Err(error) => {
                     self.disable(map_registry_error(&error));
@@ -697,10 +764,28 @@ impl DenuoCoordinator {
             return DenuoAction::default();
         }
         match NegotiatedRegistry::negotiate(&self.local_hello, &remote_hello) {
-            Ok(negotiated) => self.install(negotiated),
-            Err(error) => self.disable(map_negotiation_error(&error)),
+            Ok(negotiated) => {
+                self.install(negotiated);
+                let request_id = self.proposed_request_id.checked_add(1).unwrap_or(1);
+                match NameMarketMessage::Hello(self.name_market_hello)
+                    .encode_envelope(DenuoRegistryVersion::V2, request_id)
+                {
+                    Ok(payload) => DenuoAction {
+                        response_payload: Some(payload),
+                        outbound_message: Some(DenuoOutboundMessage::NameMarket),
+                        name_market: None,
+                    },
+                    Err(_) => {
+                        self.disable(DenuoDisableReason::LocalEncodingFailure);
+                        DenuoAction::default()
+                    }
+                }
+            }
+            Err(error) => {
+                self.disable(map_negotiation_error(&error));
+                DenuoAction::default()
+            }
         }
-        DenuoAction::default()
     }
 
     fn install(&mut self, negotiated: NegotiatedRegistry) {
@@ -741,6 +826,7 @@ impl DenuoCoordinator {
                 self.metrics.record_hello_admitted();
             }
             DenuoOutboundMessage::HelloAck => self.metrics.record_hello_ack_admitted(),
+            DenuoOutboundMessage::NameMarket => {}
         }
     }
 
@@ -754,11 +840,25 @@ impl DenuoCoordinator {
     }
 }
 
+fn is_name_market_message(message: KnownMessage) -> bool {
+    matches!(
+        message,
+        KnownMessage::MarketHello
+            | KnownMessage::GetOfferInventory
+            | KnownMessage::OfferInventory
+            | KnownMessage::GetOffers
+            | KnownMessage::Offers
+            | KnownMessage::GetOffer
+            | KnownMessage::Offer
+            | KnownMessage::OfferTombstone
+    )
+}
+
 fn encode_hello(request_id: u64, hello: &RegistryHello, ack: bool) -> Result<Vec<u8>, ()> {
     let envelope = if ack {
-        DenuoExtensionEnvelope::registry_hello_ack(request_id, hello)
+        DenuoExtensionEnvelope::registry_hello_ack_v2(request_id, hello)
     } else {
-        DenuoExtensionEnvelope::registry_hello(request_id, hello)
+        DenuoExtensionEnvelope::registry_hello_v2(request_id, hello)
     }
     .map_err(|_| ())?;
     envelope.encode_canonical().map_err(|_| ())
@@ -835,7 +935,7 @@ pub(crate) fn is_registry_hello_packet(packet: &Packet) -> bool {
             packet_type,
             payload,
         } if is_extension_packet_type(*packet_type) => {
-            DenuoExtensionEnvelope::decode_registry_hello(payload).is_ok()
+            DenuoExtensionEnvelope::decode_registry_hello_v2(payload).is_ok()
         }
         _ => false,
     }
@@ -1033,7 +1133,7 @@ mod tests {
         );
 
         let unknown_subprotocol = DenuoExtensionEnvelope {
-            registry_version: DENUO_V1_REGISTRY_VERSION,
+            registry_version: DENUO_V2_REGISTRY_VERSION,
             protocol_id: 0x7fff,
             protocol_version: 1,
             message_type: 1,
@@ -1123,7 +1223,7 @@ mod tests {
         );
 
         let malformed_hello = DenuoExtensionEnvelope {
-            registry_version: DENUO_V1_REGISTRY_VERSION,
+            registry_version: DENUO_V2_REGISTRY_VERSION,
             protocol_id: 0,
             protocol_version: 1,
             message_type: 1,

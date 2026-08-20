@@ -22,8 +22,8 @@ use hns_odoh_protocol::{
 };
 use hns_p2p_experimental::{
     ExperimentalWireProfile, NegotiatedRegistry, Network as ExperimentalNetwork,
-    DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT, DENUO_V1_REGISTRY_PROTOCOL_VERSION,
-    DENUO_V1_REGISTRY_VERSION, DENUO_V1_WIRE_PROFILE, ODOH_PACKET, ODOH_SERVICE,
+    DENUO_EXTENSION_SERVICE, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+    DENUO_V2_REGISTRY_VERSION, DENUO_V2_WIRE_PROFILE, ODOH_PACKET, ODOH_SERVICE,
     REGISTRY_NEGOTIATION_PROTOCOL_ID,
 };
 use hns_primitives::blake2b_256_many;
@@ -1046,8 +1046,8 @@ impl OdohRequesterRuntime {
             requester_default_enabled: true,
             service_bit: ODOH_SERVICE.value(),
             packet_type: ODOH_PACKET.value(),
-            registry_fingerprint: DENUO_V1_REGISTRY_FINGERPRINT.to_string(),
-            registry_wire_profile: DENUO_V1_WIRE_PROFILE.to_owned(),
+            registry_fingerprint: DENUO_V2_REGISTRY_FINGERPRINT.to_string(),
+            registry_wire_profile: DENUO_V2_WIRE_PROFILE.to_owned(),
             eligible_authenticated_proxies: eligible_authenticated_proxies as u64,
             faulted_proxies: self.faulted_proxies.len() as u64,
             target_slots: self.cache.slots.len() as u16,
@@ -1462,12 +1462,12 @@ impl OdohRequesterRuntime {
             return Err(OdohFailureReason::RemoteServiceNotAdvertised);
         }
         if proxy.remote_services & DENUO_EXTENSION_SERVICE.value() == 0
-            || proxy.wire_profile != ExperimentalWireProfile::DenuoV1
-            || proxy.negotiated.fingerprint != DENUO_V1_REGISTRY_FINGERPRINT
-            || proxy.negotiated.registry_version != DENUO_V1_REGISTRY_VERSION
+            || proxy.wire_profile != ExperimentalWireProfile::DenuoV2
+            || proxy.negotiated.fingerprint != DENUO_V2_REGISTRY_FINGERPRINT
+            || proxy.negotiated.registry_version != DENUO_V2_REGISTRY_VERSION
             || !proxy.negotiated.protocols.contains(&(
                 REGISTRY_NEGOTIATION_PROTOCOL_ID,
-                DENUO_V1_REGISTRY_PROTOCOL_VERSION,
+                DENUO_V2_REGISTRY_PROTOCOL_VERSION,
             ))
             || proxy.negotiated.network != self.binding.network
             || proxy.negotiated.genesis_hash != self.binding.genesis_hash
@@ -1627,11 +1627,11 @@ mod tests {
 
     fn negotiated() -> NegotiatedRegistry {
         NegotiatedRegistry {
-            fingerprint: DENUO_V1_REGISTRY_FINGERPRINT,
-            registry_version: DENUO_V1_REGISTRY_VERSION,
+            fingerprint: DENUO_V2_REGISTRY_FINGERPRINT,
+            registry_version: DENUO_V2_REGISTRY_VERSION,
             protocols: vec![(
                 REGISTRY_NEGOTIATION_PROTOCOL_ID,
-                DENUO_V1_REGISTRY_PROTOCOL_VERSION,
+                DENUO_V2_REGISTRY_PROTOCOL_VERSION,
             )],
             maximum_send_size: MAX_ODOH_PACKET_SIZE as u32,
             maximum_live_requests: 8,
@@ -1651,7 +1651,7 @@ mod tests {
                 authenticated_remote_static: Some(target_key),
             },
             remote_services: DENUO_EXTENSION_SERVICE.value() | ODOH_SERVICE.value(),
-            wire_profile: ExperimentalWireProfile::DenuoV1,
+            wire_profile: ExperimentalWireProfile::DenuoV2,
             negotiated: negotiated(),
         }
     }
@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn production_followup_odoh_requires_exact_denuo_v1_admission_evidence() {
+    fn production_followup_odoh_requires_exact_denuo_v2_admission_evidence() {
         let target_key = AuthenticatedPeerKey::new(locator().target_peer_key);
         let runtime = OdohRequesterRuntime::new(
             binding(),
@@ -1764,7 +1764,7 @@ mod tests {
             ExperimentalWireProfile::Official(1),
             ExperimentalWireProfile::LegacyDraftRegtest,
             ExperimentalWireProfile::Auto,
-            ExperimentalWireProfile::DenuoV2,
+            ExperimentalWireProfile::DenuoV1,
         ] {
             let mut rejected = canonical.clone();
             rejected.wire_profile = profile;
@@ -1788,7 +1788,7 @@ mod tests {
         );
 
         let mut wrong_registry = canonical.clone();
-        wrong_registry.negotiated.fingerprint = DENUO_V2_REGISTRY_FINGERPRINT;
+        wrong_registry.negotiated.fingerprint = hns_p2p_experimental::DENUO_V1_REGISTRY_FINGERPRINT;
         assert_eq!(
             runtime.ensure_proxy(&wrong_registry),
             Err(OdohFailureReason::RegistryNotNegotiated)

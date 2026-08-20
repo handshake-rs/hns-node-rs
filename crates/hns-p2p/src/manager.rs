@@ -12,10 +12,11 @@ use std::{
 
 use hns_consensus::Network;
 use hns_hnsr_protocol::{HNS_NODE_V1, HNS_WEB_V1};
+use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
 use hns_p2p_experimental::{
-    ExperimentalWireProfile, HnsrPolicy, DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT,
-    DENUO_V1_REGISTRY_PROTOCOL_VERSION, DENUO_V1_REGISTRY_VERSION, ODOH_PACKET, ODOH_SERVICE,
-    REGISTRY_NEGOTIATION_PROTOCOL_ID,
+    ExperimentalWireProfile, HnsrPolicy, ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION,
+    DENUO_EXTENSION_SERVICE, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+    DENUO_V2_REGISTRY_VERSION, ODOH_PACKET, ODOH_SERVICE, REGISTRY_NEGOTIATION_PROTOCOL_ID,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -26,7 +27,7 @@ use tokio::{
 use crate::{
     brontide::{inbound_handshake, outbound_handshake, BrontideIdentity, BrontideSession},
     constants::{DEFAULT_USER_AGENT, PROTOCOL_VERSION, SERVICE_NETWORK},
-    denuo::{DenuoRuntimeMetrics, DenuoSummary},
+    denuo::{extension_packet, DenuoRuntimeMetrics, DenuoSummary},
     experimental::{
         ExperimentalExchange, ExperimentalExchangeError, ExperimentalExchangeResponse,
         ExperimentalExchangeRuntime,
@@ -905,6 +906,69 @@ impl LivePeerManager {
         handle.try_send(packet, priority)
     }
 
+    /// Send one canonical name-market message only to a peer with exact V2
+    /// registry and protocol admission. The critical writer confirms that the
+    /// frame reached the socket boundary before this call succeeds.
+    pub async fn send_denuo_name_market(
+        &self,
+        peer: PeerId,
+        request_id: u64,
+        message: &NameMarketMessage,
+    ) -> Result<(), P2pError> {
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        let payload = message
+            .encode_envelope(DenuoRegistryVersion::V2, request_id)
+            .map_err(|error| {
+                P2pError::Protocol(format!(
+                    "canonical Denuo name-market encoding failed: {error}"
+                ))
+            })?;
+        let snapshot = handle.snapshot().await;
+        if !exact_name_market_admission(&snapshot, self.config.network, payload.len()) {
+            return Err(P2pError::Protocol(
+                "peer lacks exact Denuo V2 name-market admission".to_owned(),
+            ));
+        }
+        handle
+            .send_critical(
+                Arc::new(extension_packet(payload)),
+                self.config.critical_broadcast_timeout,
+            )
+            .await
+    }
+
+    /// Broadcast one canonical name-market message to every exactly admitted
+    /// V2 peer. Failures are isolated per connection and returned to the
+    /// caller rather than weakening admission for another peer.
+    pub async fn broadcast_denuo_name_market(
+        &self,
+        request_id: u64,
+        message: &NameMarketMessage,
+    ) -> BroadcastReport {
+        let candidates = self
+            .snapshots()
+            .await
+            .into_iter()
+            .filter(|snapshot| exact_name_market_admission(snapshot, self.config.network, 1))
+            .map(|snapshot| snapshot.id)
+            .collect::<Vec<_>>();
+        let mut report = BroadcastReport::default();
+        for peer in candidates {
+            report.attempted = report.attempted.saturating_add(1);
+            match self.send_denuo_name_market(peer, request_id, message).await {
+                Ok(()) => report.queued = report.queued.saturating_add(1),
+                Err(error) => report.failed.push((peer, error.to_string())),
+            }
+        }
+        report
+    }
+
     pub async fn begin_hip76_request(
         &self,
         peer: PeerId,
@@ -1446,7 +1510,7 @@ impl LivePeerManager {
                     && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
                     && snapshot.services & hns_p2p_experimental::ODOH_SERVICE.value() != 0
                     && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
-                    && wire_profile == hns_p2p_experimental::ExperimentalWireProfile::DenuoV1)
+                    && wire_profile == hns_p2p_experimental::ExperimentalWireProfile::DenuoV2)
                     .then_some(OdohProxyAdmission {
                         provenance: OdohPeerProvenance {
                             peer: snapshot.id,
@@ -1910,7 +1974,7 @@ fn hnsr_admission_from_snapshot(snapshot: PeerSnapshot) -> Option<HnsrPeerAdmiss
         && snapshot.authenticated_remote_static.is_some()
         && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
         && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
-        && wire_profile == ExperimentalWireProfile::DenuoV1)
+        && wire_profile == ExperimentalWireProfile::DenuoV2)
         .then_some(HnsrPeerAdmission {
             peer: snapshot.id,
             address: snapshot.address,
@@ -1950,16 +2014,51 @@ fn exact_experimental_admission(
         && snapshot.transport == crate::PeerTransportKind::Brontide
         && snapshot.authenticated_remote_static.is_some()
         && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
-        && wire_profile == ExperimentalWireProfile::DenuoV1
-        && negotiated.fingerprint == DENUO_V1_REGISTRY_FINGERPRINT
-        && negotiated.registry_version == DENUO_V1_REGISTRY_VERSION
+        && wire_profile == ExperimentalWireProfile::DenuoV2
+        && negotiated.fingerprint == DENUO_V2_REGISTRY_FINGERPRINT
+        && negotiated.registry_version == DENUO_V2_REGISTRY_VERSION
         && negotiated.protocols.contains(&(
             REGISTRY_NEGOTIATION_PROTOCOL_ID,
-            DENUO_V1_REGISTRY_PROTOCOL_VERSION,
+            DENUO_V2_REGISTRY_PROTOCOL_VERSION,
         ))
         && negotiated.network == binding.network
         && negotiated.genesis_hash == binding.genesis_hash
         && negotiated.maximum_send_size != 0
+        && negotiated.maximum_live_requests != 0
+}
+
+fn exact_name_market_admission(
+    snapshot: &PeerSnapshot,
+    network: Network,
+    payload_len: usize,
+) -> bool {
+    let Some(negotiated) = snapshot.denuo_negotiated_registry.as_ref() else {
+        return false;
+    };
+    let authenticated_transport = match network {
+        Network::Mainnet | Network::Testnet => {
+            snapshot.transport == crate::PeerTransportKind::Brontide
+                && snapshot.authenticated_remote_static.is_some()
+        }
+        Network::Regtest | Network::Simnet => true,
+    };
+    snapshot.state == PeerState::Ready
+        && authenticated_transport
+        && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
+        && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
+        && snapshot.denuo_wire_profile == Some(ExperimentalWireProfile::DenuoV2)
+        && negotiated.fingerprint == DENUO_V2_REGISTRY_FINGERPRINT
+        && negotiated.registry_version == DENUO_V2_REGISTRY_VERSION
+        && negotiated.protocols.contains(&(
+            REGISTRY_NEGOTIATION_PROTOCOL_ID,
+            DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+        ))
+        && negotiated
+            .protocols
+            .contains(&(ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION))
+        && negotiated.network == OdohNetworkBinding::for_network(network).network
+        && negotiated.genesis_hash == OdohNetworkBinding::for_network(network).genesis_hash
+        && usize::try_from(negotiated.maximum_send_size).is_ok_and(|maximum| payload_len <= maximum)
         && negotiated.maximum_live_requests != 0
 }
 

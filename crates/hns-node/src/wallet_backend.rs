@@ -17,7 +17,7 @@ use hns_mempool::{
     minimum_policy_fee, sigop_adjusted_virtual_size, Admission, MempoolInfo, MempoolSnapshot,
     HSD_MINIMUM_RELAY_FEE_RATE,
 };
-use hns_p2p::{Inventory, LivePeerManager, OutboundPriority, Packet};
+use hns_p2p::{BroadcastReport, Inventory, LivePeerManager, OutboundPriority, Packet};
 use hns_primitives::{
     blake2b_256, hash_name, Address, Block, BlockHash, Coin, Covenant, CovenantKind, Height,
     NameHash, NameLifecycleState, NameState, Outpoint, Output, Transaction, Txid, Writer,
@@ -46,8 +46,9 @@ use thiserror::Error;
 use super::{
     best_block_tip_from_snapshot, chain_epoch_from_snapshot, load_block, load_header_record,
     load_undo_pruning_checkpoint, median_time_past_with_lookup, read_canonical_hash,
-    CanonicalEpoch, CanonicalStateWriter, CanonicalWriterError,
-    LivePeerManager as ReexportedLivePeerManager, NodeReadHandle, NodeRuntime,
+    CanonicalEpoch, CanonicalStateWriter, CanonicalWriterError, DenuoNameMarketAdmission,
+    DenuoNameMarketEventPage, DenuoRelayHandle, LivePeerManager as ReexportedLivePeerManager,
+    NodeReadHandle, NodeRuntime,
 };
 
 /// Maximum mempool entries sampled by one fee estimate.
@@ -1047,6 +1048,9 @@ pub enum WalletBackendError {
     /// Requested name has no active state in the current chain snapshot.
     #[error("current name state is absent")]
     NameStateMissing,
+    /// Local Denuo relay or typed name-market admission failed.
+    #[error("Denuo name-market operation failed: {0}")]
+    DenuoNameMarket(String),
     /// Current name evidence requires an initialized active chain.
     #[error("wallet name evidence requires an initialized active chain")]
     ChainUninitialized,
@@ -1065,6 +1069,7 @@ pub struct WalletBackend {
     read: NodeReadHandle,
     writer: CanonicalStateWriter,
     peers: LivePeerManager,
+    denuo_relay: DenuoRelayHandle,
 }
 
 impl std::fmt::Debug for WalletBackend {
@@ -1085,11 +1090,46 @@ impl NodeRuntime {
             read: self.read(),
             writer: self.writer(),
             peers,
+            denuo_relay: self.denuo_relay(),
         }
     }
 }
 
 impl WalletBackend {
+    /// Commit one exact canonical local Denuo publication before propagating
+    /// its typed message to every exactly admitted V2 peer.
+    pub async fn publish_denuo_name_market(
+        &self,
+        envelope_bytes: &[u8],
+        now: u64,
+    ) -> Result<(DenuoNameMarketAdmission, BroadcastReport), WalletBackendError> {
+        let admission = self
+            .denuo_relay
+            .submit_name_market_envelope(envelope_bytes, now)
+            .map_err(|error| WalletBackendError::DenuoNameMarket(error.to_string()))?;
+        let report = if let Some(message) = admission.rebroadcast.as_ref() {
+            self.peers
+                .broadcast_denuo_name_market(admission.revision.max(1), message)
+                .await
+        } else {
+            BroadcastReport::default()
+        };
+        Ok((admission, report))
+    }
+
+    /// Read one bounded process-local Denuo event page. Event bytes remain
+    /// untrusted marketplace input; the wallet must verify and reconcile them
+    /// against its current chain authority before use.
+    pub fn get_denuo_name_market_events(
+        &self,
+        after_revision: u64,
+        limit: usize,
+    ) -> Result<DenuoNameMarketEventPage, WalletBackendError> {
+        self.denuo_relay
+            .name_market_events(after_revision, limit)
+            .map_err(|error| WalletBackendError::DenuoNameMarket(error.to_string()))
+    }
+
     /// Read the active chain tip.
     pub async fn get_chain_tip(&self) -> Result<Option<WalletChainTip>, WalletBackendError> {
         let read = self.read.clone();

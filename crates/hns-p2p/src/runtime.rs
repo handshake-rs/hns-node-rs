@@ -9,7 +9,6 @@ use std::{
 use hns_consensus::Network;
 use hns_p2p_experimental::{
     ExperimentalPeerState, ExperimentalWireProfile, NegotiatedRegistry, ServiceMask,
-    DENUO_V1_REGISTRY_FINGERPRINT,
 };
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::{
@@ -23,7 +22,8 @@ use crate::{
     brontide::{AsyncBrontideFrameReader, AsyncBrontideFrameWriter, BrontideSession},
     denuo::{
         extension_packet, is_extension_packet_type, is_registry_hello_packet, DenuoAction,
-        DenuoCoordinator, DenuoPeerDiagnostics, DenuoPeerPhase, DenuoRuntimeMetrics,
+        DenuoCoordinator, DenuoNameMarketInbound, DenuoPeerDiagnostics, DenuoPeerPhase,
+        DenuoRuntimeMetrics,
     },
     experimental::{ExperimentalExchangeError, ExperimentalExchangeRuntime},
     handshake::{PeerDirection, PeerHandshake, PeerState},
@@ -123,6 +123,16 @@ impl<'de> Deserialize<'de> for AuthenticatedPeerKey {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Hip76PeerProvenance {
+    pub peer: PeerId,
+    pub address: SocketAddr,
+    pub direction: PeerDirection,
+    pub transport: PeerTransportKind,
+    pub authenticated_remote_static: Option<AuthenticatedPeerKey>,
+}
+
+/// Connection-bound provenance for one admitted Denuo name-market message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenuoPeerProvenance {
     pub peer: PeerId,
     pub address: SocketAddr,
     pub direction: PeerDirection,
@@ -247,7 +257,7 @@ impl PeerSnapshot {
             profile,
             negotiated.network,
             negotiated.genesis_hash,
-            DENUO_V1_REGISTRY_FINGERPRINT,
+            negotiated.fingerprint,
             ServiceMask::new(self.services),
         );
         state.mark_established();
@@ -366,6 +376,11 @@ pub enum PeerEvent {
     },
     HnsrRequester {
         event: hns_hnsr_protocol::HnsrRequesterEvent,
+    },
+    DenuoNameMarket {
+        provenance: DenuoPeerProvenance,
+        request_id: u64,
+        message: hns_marketplace_protocol::NameMarketMessage,
     },
 }
 
@@ -1319,7 +1334,7 @@ where
         if is_extension_packet_type(frame.packet_type) {
             denuo.expire(Instant::now());
             let action = denuo.receive_extension(&frame.payload);
-            admit_denuo_action(&mut denuo, action, &control_tx);
+            let name_market = admit_denuo_action(&mut denuo, action, &control_tx);
             let revoked = synchronize_hip76_with_denuo(&denuo, &mut hip76);
             if denuo.diagnostics().phase != DenuoPeerPhase::Negotiated {
                 odoh
@@ -1352,6 +1367,24 @@ where
                 &hip76_writer_state_tx,
                 &hip76_status_tx,
             );
+            drop(state);
+            if let Some(DenuoNameMarketInbound {
+                request_id,
+                message,
+            }) = name_market
+            {
+                let _ = events.try_send(PeerEvent::DenuoNameMarket {
+                    provenance: DenuoPeerProvenance {
+                        peer: id,
+                        address: provenance.address,
+                        direction,
+                        transport,
+                        authenticated_remote_static,
+                    },
+                    request_id,
+                    message,
+                });
+            }
             continue;
         }
         if is_hip76_packet_type(frame.packet_type) {
@@ -1521,7 +1554,7 @@ where
                 .await
                 .map_err(|_| P2pError::EventChannelClosed)?;
             let action = denuo.on_ready(Instant::now());
-            admit_denuo_action(&mut denuo, action, &control_tx);
+            let _ = admit_denuo_action(&mut denuo, action, &control_tx);
             let revoked = synchronize_hip76_with_denuo(&denuo, &mut hip76);
             complete_revoked_requesters(
                 &mut pending_requesters,
@@ -2119,8 +2152,13 @@ fn admit_denuo_action(
     denuo: &mut DenuoCoordinator,
     action: DenuoAction,
     control_tx: &mpsc::Sender<Arc<Packet>>,
-) {
-    match (action.response_payload, action.outbound_message) {
+) -> Option<DenuoNameMarketInbound> {
+    let DenuoAction {
+        response_payload,
+        outbound_message,
+        name_market,
+    } = action;
+    match (response_payload, outbound_message) {
         (Some(payload), Some(message)) => {
             if control_tx
                 .try_send(Arc::new(extension_packet(payload)))
@@ -2140,6 +2178,7 @@ fn admit_denuo_action(
             denuo.outbound_rejected();
         }
     }
+    name_market
 }
 
 enum PeerWriterOutbound {
@@ -2467,7 +2506,7 @@ mod tests {
             .try_send(Arc::new(Packet::SendHeaders))
             .expect("fill ordinary control queue");
 
-        admit_denuo_action(&mut denuo, action, &control_tx);
+        let _ = admit_denuo_action(&mut denuo, action, &control_tx);
 
         assert_eq!(denuo.diagnostics().phase, DenuoPeerPhase::Disabled);
         assert_eq!(

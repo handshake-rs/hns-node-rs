@@ -36,9 +36,9 @@ use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
 use hns_p2p::{
     generate_private_key, normalize_peer_ip, peer_address_group, BrontideIdentity, CompactBlock,
     CompactBlockError, CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse,
-    DnsRelayRequesterPolicy, Inventory, InventoryKind, LivePeerConfig, LivePeerManager,
-    LocatorPacket, OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent, PeerId,
-    PeerSnapshot, PeerTransport, SERVICE_NETWORK,
+    DenuoPeerProvenance, DnsRelayRequesterPolicy, Inventory, InventoryKind, LivePeerConfig,
+    LivePeerManager, LocatorPacket, OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent,
+    PeerId, PeerSnapshot, PeerTransport, SERVICE_NETWORK,
 };
 use hns_primitives::{
     blake2b_256, Block, BlockHash, CovenantKind, Header, Height, Reader, Txid, Writer,
@@ -87,6 +87,7 @@ use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
     HSD_BAN_TIME_SECONDS, MAX_PEER_BANS,
 };
+use crate::{DenuoRelayHandle, DenuoRelayHandleError};
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
 const MAX_SERVED_HEADERS: usize = hns_p2p::MAX_HEADERS;
@@ -2610,6 +2611,7 @@ impl NodeService {
         )?;
         let node = runtime.read();
         let writer = runtime.writer();
+        let denuo_relay = runtime.denuo_relay();
         let rpc_read_context = node.rpc_read_context()?;
         writer
             .execute(None, "ensure native-sync genesis header", |node| {
@@ -3595,6 +3597,7 @@ impl NodeService {
                             &node,
                             &writer,
                             &peers,
+                            &denuo_relay,
                             &validation,
                             &mut scheduler,
                             &mut reconnects,
@@ -5892,12 +5895,34 @@ async fn handle_mining_engine_diagnostics(
     Json(diagnostic_method(&state, "getminingengineinfo").await)
 }
 
+fn denuo_peer_identity(network: Network, provenance: DenuoPeerProvenance) -> Result<[u8; 32]> {
+    if let Some(key) = provenance.authenticated_remote_static {
+        let mut material = Vec::with_capacity(64);
+        material.extend_from_slice(b"hns-node/denuo-authenticated-peer/v1");
+        material.extend_from_slice(key.as_bytes());
+        return Ok(blake2b_256(&material));
+    }
+    if !matches!(network, Network::Regtest | Network::Simnet) {
+        anyhow::bail!("public-network Denuo message lacks authenticated Brontide provenance");
+    }
+    let mut material = Vec::with_capacity(96);
+    material.extend_from_slice(b"hns-node/denuo-controlled-peer/v1");
+    material.extend_from_slice(&provenance.peer.0.to_le_bytes());
+    match provenance.address.ip() {
+        IpAddr::V4(address) => material.extend_from_slice(&address.octets()),
+        IpAddr::V6(address) => material.extend_from_slice(&address.octets()),
+    }
+    material.extend_from_slice(&provenance.address.port().to_le_bytes());
+    Ok(blake2b_256(&material))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_peer_event(
     event: PeerEvent,
     node: &NodeReadHandle,
     writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
+    denuo_relay: &DenuoRelayHandle,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
@@ -5997,6 +6022,61 @@ async fn handle_peer_event(
         PeerEvent::HnsrRequester { .. } => {
             // Circuit IDs and opaque application events remain on the typed
             // manager event surface and are deliberately absent from logs.
+        }
+        PeerEvent::DenuoNameMarket {
+            provenance,
+            request_id,
+            message,
+        } => {
+            let peer_identity = denuo_peer_identity(node.network(), provenance)?;
+            match denuo_relay.receive_name_market(
+                peer_identity,
+                provenance.peer,
+                request_id,
+                message,
+                unix_time(),
+            ) {
+                Ok(dispatch) => {
+                    for send in dispatch.sends {
+                        if let Err(error) = peers
+                            .send_denuo_name_market(send.peer, send.request_id, &send.message)
+                            .await
+                        {
+                            tracing::debug!(
+                                peer = ?send.peer,
+                                %error,
+                                "Denuo name-market response was not delivered"
+                            );
+                        }
+                    }
+                    for admission in dispatch
+                        .admissions
+                        .into_iter()
+                        .filter(|admission| admission.inserted)
+                    {
+                        if let Some(message) = admission.rebroadcast {
+                            let report = peers
+                                .broadcast_denuo_name_market(admission.revision.max(1), &message)
+                                .await;
+                            tracing::debug!(
+                                attempted = report.attempted,
+                                delivered = report.queued,
+                                failed = report.failed.len(),
+                                "propagated committed Denuo name-market publication"
+                            );
+                        }
+                    }
+                }
+                Err(DenuoRelayHandleError::NameMarket(reason)) => {
+                    let _ = denuo_relay.penalize_malformed(peer_identity, unix_time());
+                    tracing::debug!(
+                        peer = ?provenance.peer,
+                        %reason,
+                        "rejected malformed Denuo name-market message"
+                    );
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            }
         }
         PeerEvent::Packet { peer, packet } => match packet {
             Packet::Headers(headers) => {

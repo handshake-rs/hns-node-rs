@@ -75,9 +75,10 @@ pub use odoh::{
     ODOH_MAXIMUM_TARGET_CACHE_BLOB_BYTES,
 };
 pub use runtime::{
-    AuthenticatedExperimentalPeerEvidence, AuthenticatedPeerKey, Hip76PeerProvenance,
-    Hip76PendingRequest, Hip76RequestAdmission, Hip76RequestOutcome, OutboundPriority, PeerEvent,
-    PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot, PeerTransportKind,
+    AuthenticatedExperimentalPeerEvidence, AuthenticatedPeerKey, DenuoPeerProvenance,
+    Hip76PeerProvenance, Hip76PendingRequest, Hip76RequestAdmission, Hip76RequestOutcome,
+    OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot,
+    PeerTransportKind,
 };
 pub use seeds::{
     decode_compressed_public_key, hsd_brontide_seed_addresses, hsd_brontide_seed_table,

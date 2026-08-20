@@ -19,12 +19,14 @@ clap.workspace = true
 hns-chain = { path = "../hns-chain" }
 hns-consensus = { path = "../hns-consensus" }
 hns-mempool = { path = "../hns-mempool" }
+hns-marketplace-protocol.workspace = true
 hns-mining = { path = "../hns-mining" }
 hns-p2p = { path = "../hns-p2p" }
 hns-primitives = { path = "../hns-primitives" }
 hns-rpc = { path = "../hns-rpc" }
 hns-state = { path = "../hns-state" }
 hns-store = { path = "../hns-store", default-features = false }
+hns-swap.workspace = true
 hns-sync = { path = "../hns-sync" }
 hns-wallet-index = { path = "../hns-wallet-index" }
 hns-denuo-market-relay = { path = "../hns-denuo-market-relay" }

@@ -26,7 +26,7 @@ pub use hns_dns_relay_protocol::{
 };
 pub use hns_p2p_experimental::{DnsRelayOutputPolicy, DnsRelayRequesterPolicy};
 use hns_p2p_experimental::{
-    DENUO_EXTENSION_SERVICE, DENUO_V1_REGISTRY_FINGERPRINT, DENUO_V1_WIRE_PROFILE,
+    DENUO_EXTENSION_SERVICE, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_WIRE_PROFILE,
     DNS_RELAY_REQUEST_PACKET, DNS_RELAY_RESPONSE_PACKET, DNS_RELAY_SERVICE,
     EXPERIMENTAL_STATUS_LABEL, HIP_76_PROTOCOL_VERSION,
 };
@@ -596,8 +596,8 @@ impl Default for Hip76ProtocolIdentity {
                 .unwrap_or(u32::MAX),
             maximum_response_payload_size: u32::try_from(MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE)
                 .unwrap_or(u32::MAX),
-            registry_fingerprint: DENUO_V1_REGISTRY_FINGERPRINT.to_string(),
-            registry_wire_profile: DENUO_V1_WIRE_PROFILE.to_owned(),
+            registry_fingerprint: DENUO_V2_REGISTRY_FINGERPRINT.to_string(),
+            registry_wire_profile: DENUO_V2_WIRE_PROFILE.to_owned(),
             experimental_status: EXPERIMENTAL_STATUS_LABEL.to_owned(),
             requester_default: "auto".to_owned(),
             provider_default_opted_in: false,

@@ -42,6 +42,7 @@ const MAX_WALLET_RPC_PAGE_ITEMS: usize = 256;
 const MAX_WALLET_RPC_MEMPOOL_SCAN: usize = 1_024;
 const MAX_WALLET_RPC_OUTPOINTS: usize = 256;
 const MAX_WALLET_RPC_RESULT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_WALLET_RPC_DENUO_PUBLICATION_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,6 +140,13 @@ enum WalletRpcCall {
         target_blocks: u32,
         expected_chain_epoch: u64,
         expected_mempool: WireExpectedMempool,
+    },
+    DenuoNameMarketPublish {
+        envelope_hex: String,
+    },
+    DenuoNameMarketEvents {
+        after_revision: u64,
+        limit: usize,
     },
     TrackedContractKnown {
         contract_id: String,
@@ -470,6 +478,24 @@ async fn dispatch_call(
                     "maximum_incoming_transfer_retained_block_decodes",
                     Value::from(MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES),
                 ),
+                (
+                    "denuo_name_market_registry",
+                    Value::from("denuo-v2"),
+                ),
+                (
+                    "denuo_name_market_transport",
+                    Value::from("typed_local_publish_and_monotonic_event_cursor"),
+                ),
+                (
+                    "denuo_name_market_event_authority",
+                    Value::from(
+                        "untrusted_discovery_input_requires_wallet_signature_current_lock_and_chain_revalidation",
+                    ),
+                ),
+                (
+                    "maximum_denuo_name_market_event_page",
+                    Value::from(super::MAX_DENUO_NAME_MARKET_EVENT_PAGE),
+                ),
             ] {
                 object.insert(key.to_owned(), value);
             }
@@ -691,6 +717,49 @@ async fn dispatch_call(
                     )
                     .await?,
             ))?
+        }
+        WalletRpcCall::DenuoNameMarketPublish { envelope_hex } => {
+            let envelope = decode_hex_bounded(
+                &envelope_hex,
+                MAX_WALLET_RPC_DENUO_PUBLICATION_BYTES,
+                "Denuo name-market publication",
+            )?;
+            let now = super::current_unix_time().map_err(|_| DispatchError::Internal)?;
+            let (admission, propagation) =
+                backend.publish_denuo_name_market(&envelope, now).await?;
+            serde_json::json!({
+                "revision": admission.revision,
+                "kind": admission.kind.as_str(),
+                "content_hash": hex_encode(&admission.content_hash),
+                "inserted": admission.inserted,
+                "propagation": {
+                    "attempted": propagation.attempted,
+                    "written": propagation.queued,
+                    "failed": propagation.failed.len(),
+                }
+            })
+        }
+        WalletRpcCall::DenuoNameMarketEvents {
+            after_revision,
+            limit,
+        } => {
+            if limit == 0 || limit > super::MAX_DENUO_NAME_MARKET_EVENT_PAGE {
+                return Err(DispatchError::Invalid(
+                    "Denuo name-market event limit must be within 1..=256",
+                ));
+            }
+            let page = backend.get_denuo_name_market_events(after_revision, limit)?;
+            serde_json::json!({
+                "oldest_revision": page.oldest_revision,
+                "head_revision": page.head_revision,
+                "events": page.events.into_iter().map(|event| serde_json::json!({
+                    "revision": event.revision,
+                    "received_at_unix": event.received_at_unix,
+                    "kind": event.kind.as_str(),
+                    "content_hash": hex_encode(&event.content_hash),
+                    "envelope_hex": hex_encode(&event.envelope_bytes),
+                })).collect::<Vec<_>>()
+            })
         }
         WalletRpcCall::TrackedContractKnown { contract_id } => {
             let id = ContractId::from_bytes(decode_hex_32(&contract_id, "contract ID")?);
@@ -928,6 +997,13 @@ fn map_backend_error(
             "owner_output_missing",
             "the indexed owner transaction does not contain its selected output",
             false,
+        ),
+        WalletBackendError::DenuoNameMarket(_) => wallet_rpc_failure(
+            request_id,
+            StatusCode::CONFLICT,
+            "denuo_name_market_rejected",
+            "the local Denuo V2 relay rejected the publication or event cursor",
+            true,
         ),
         WalletBackendError::Corrupt(_) => wallet_rpc_failure(
             request_id,

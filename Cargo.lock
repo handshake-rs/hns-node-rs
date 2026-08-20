@@ -1244,6 +1244,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-marketplace-protocol"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "901fa458f407510c60dfa1b9d05ae68274edb80096413c879318fd75bc4a6f3d"
+dependencies = [
+ "blake2",
+ "hns-encoding",
+ "hns-p2p-experimental",
+ "hns-primitives 0.3.0",
+ "hns-swap",
+ "k256",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "hns-mempool"
 version = "0.3.5"
 dependencies = [
@@ -1279,6 +1295,7 @@ dependencies = [
  "hns-chain",
  "hns-consensus",
  "hns-denuo-market-relay",
+ "hns-marketplace-protocol",
  "hns-mempool",
  "hns-mining",
  "hns-p2p",
@@ -1286,6 +1303,7 @@ dependencies = [
  "hns-rpc",
  "hns-state",
  "hns-store",
+ "hns-swap",
  "hns-sync",
  "hns-urkel",
  "hns-wallet-index",
@@ -1323,6 +1341,7 @@ dependencies = [
  "hns-consensus",
  "hns-dns-relay-protocol",
  "hns-hnsr-protocol",
+ "hns-marketplace-protocol",
  "hns-odoh-protocol",
  "hns-p2p-experimental",
  "hns-primitives 0.3.5",
@@ -1422,6 +1441,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-script"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f79c7695a7a7b08512286e1bda02d3fd7da8eae169d3cec846026875fcd74ad6"
+dependencies = [
+ "blake2",
+ "hns-encoding",
+ "hns-primitives 0.3.0",
+ "hns-transaction",
+ "k256",
+ "ripemd",
+ "sha1",
+ "sha2 0.10.9",
+ "sha3",
+ "thiserror",
+]
+
+[[package]]
 name = "hns-secp256k1"
 version = "0.3.5"
 dependencies = [
@@ -1466,6 +1503,24 @@ dependencies = [
  "hns-primitives 0.3.5",
  "rocksdb",
  "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "hns-swap"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23255f602102766f00b19780c924151f81f57831654fa49b3a152a913febd842"
+dependencies = [
+ "blake2",
+ "hns-covenants",
+ "hns-encoding",
+ "hns-primitives 0.3.0",
+ "hns-script",
+ "hns-transaction",
+ "k256",
+ "sha2 0.10.9",
+ "sha3",
  "thiserror",
 ]
 
@@ -2485,6 +2540,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ripemd"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd124222d17ad93a644ed9d011a40f4fb64aa54275c08cc216524a9ea82fb09f"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "rocksdb"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2651,6 +2715,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

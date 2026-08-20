@@ -7,7 +7,12 @@ mod peer_bans;
 mod wallet_backend;
 mod wallet_rpc;
 
-pub use denuo_market::{DenuoRelayHandle, DenuoRelayHandleError};
+pub use denuo_market::{
+    DenuoNameMarketAdmission, DenuoNameMarketDispatch, DenuoNameMarketEvent,
+    DenuoNameMarketEventKind, DenuoNameMarketEventPage, DenuoNameMarketSend, DenuoRelayHandle,
+    DenuoRelayHandleError, MAX_DENUO_NAME_MARKET_EVENTS, MAX_DENUO_NAME_MARKET_EVENT_PAGE,
+    MAX_DENUO_NAME_MARKET_RECORDS,
+};
 pub use hns_denuo_market_relay::{
     Announcement as DenuoAnnouncement, AnnouncementAdmission as DenuoAnnouncementAdmission,
     ObjectAdmission as DenuoObjectAdmission, ObjectHash as DenuoObjectHash,
@@ -4029,10 +4034,13 @@ impl NodeService {
         let airdrop_signatures = NativeAirdropSignatureVerifier::new().map_err(|error| {
             anyhow::anyhow!("failed to initialize airdrop relay verifier: {error}")
         })?;
-        let denuo_relay =
-            DenuoRelayHandle::new(config.denuo_relay_roles, DenuoRelayLimits::default()).map_err(
-                |error| anyhow::anyhow!("failed to initialize Denuo market relay: {error}"),
-            )?;
+        let denuo_relay = DenuoRelayHandle::new(
+            config.denuo_relay_roles,
+            DenuoRelayLimits::default(),
+            config.network.params().packet_magic,
+            config.network.params().genesis_hash.into_inner(),
+        )
+        .map_err(|error| anyhow::anyhow!("failed to initialize Denuo market relay: {error}"))?;
         Ok(Self {
             config,
             state,
@@ -24393,14 +24401,14 @@ mod tests {
         assert_eq!(registry["registry_id"], registry["fingerprint"]);
         assert_eq!(
             registry["fingerprint"],
-            "95774db08c569b36fa7b7e4a071930f563b7251fc30934ba986732379a6e542d"
+            "734226e866435821e40be7bde85fb19dd6eb867c5620abb8347ac8cd23da4f2c"
         );
-        assert_eq!(registry["registry_version"], 1);
+        assert_eq!(registry["registry_version"], 2);
         assert_eq!(registry["registry_protocol_version"], 1);
-        assert_eq!(registry["wire_profile"], "denuo-v1");
+        assert_eq!(registry["wire_profile"], "denuo-v2");
         assert_eq!(
             registry["assignment_status"],
-            "Denuo Experimental V1 — Not an official Handshake protocol assignment"
+            "Denuo Experimental V2 — Not an official Handshake protocol assignment"
         );
         assert_eq!(registry["service_bit"], 0x1000_0000_u64);
         assert_eq!(registry["local_service_mask"], 0);
