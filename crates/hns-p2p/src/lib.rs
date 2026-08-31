@@ -56,6 +56,7 @@ pub use hnsr::{
     peer_id_from_hnsr, HnsrCoordinator, HnsrCoordinatorConfig, HnsrCoordinatorError,
     HnsrCoordinatorStatus, HnsrDurableFloor, HnsrIncoming, HnsrNetworkBinding, HnsrPeerAdmission,
     HnsrPolicyUpdate, HnsrProcessTotals, HnsrRelayBackend, HnsrStateSnapshot,
+    HNS_SHAKESCAPE_SWAP_V1,
 };
 pub use manager::{
     normalize_peer_ip, BroadcastReport, Hip76RequesterPolicyUpdate, LivePeerConfig,

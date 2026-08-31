@@ -40,7 +40,7 @@ use crate::{
     },
     hnsr::{
         HnsrCoordinator, HnsrCoordinatorConfig, HnsrDurableFloor, HnsrPeerAdmission,
-        HnsrRelayBackend, HnsrStateSnapshot,
+        HnsrRelayBackend, HnsrStateSnapshot, HNS_SHAKESCAPE_SWAP_V1,
     },
     odoh::{
         DirectTargetLocator, OdohDurableFloor, OdohFailureReason, OdohNetworkBinding,
@@ -236,7 +236,7 @@ impl LivePeerConfig {
         }
         if !crate::hnsr::is_supported_hnsr_profile(self.hnsr_profile) {
             return Err(P2pError::Configuration(format!(
-                "unsupported HNSR profile {}; expected HNS_NODE_V1 ({HNS_NODE_V1}) or HNS_WEB_V1 ({HNS_WEB_V1})",
+                "unsupported HNSR profile {}; expected HNS_NODE_V1 ({HNS_NODE_V1}), HNS_WEB_V1 ({HNS_WEB_V1}), or HNS_SHAKESCAPE_SWAP_V1 ({HNS_SHAKESCAPE_SWAP_V1})",
                 self.hnsr_profile
             )));
         }
@@ -2779,7 +2779,7 @@ mod tests {
     }
 
     #[test]
-    fn hnsr_profile_defaults_to_node_and_web_is_configuration_bound() {
+    fn hnsr_profile_defaults_to_node_and_specialized_profiles_are_configuration_bound() {
         let node = LivePeerConfig::for_network(Network::Regtest);
         assert_eq!(node.hnsr_profile, HNS_NODE_V1);
         let node_coordinator = hnsr_coordinator_config(&node);
@@ -2798,6 +2798,16 @@ mod tests {
             .expect("HNS Web coordinator")
             .status(0);
         assert_eq!(status.profile, HNS_WEB_V1);
+
+        let mut swap = node.clone();
+        swap.hnsr_profile = HNS_SHAKESCAPE_SWAP_V1;
+        swap.validate().expect("Shakescape swap profile");
+        let swap_coordinator = hnsr_coordinator_config(&swap);
+        assert_eq!(swap_coordinator.profile, HNS_SHAKESCAPE_SWAP_V1);
+        assert_ne!(
+            node_coordinator.configuration_hash,
+            swap_coordinator.configuration_hash
+        );
     }
 
     #[test]

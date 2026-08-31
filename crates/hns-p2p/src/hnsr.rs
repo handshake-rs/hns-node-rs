@@ -10,7 +10,8 @@ use hns_hnsr_protocol::{
     HnsrRequesterEvent, HnsrRequesterSnapshot, HnsrRoute, HnsrRuntimeError, HnsrRuntimeStatus,
     HnsrService, OpaqueRelayConfig, OpaqueRelayRuntime, OpaqueRelaySnapshot, QueuedHnsrRoute,
     RelayConfig, RelayLimits, RelayService, RelayTicket, DEFAULT_WINDOW, HNSR_PACKET_TYPE,
-    HNSR_RELAY_SERVICE, HNS_NODE_V1, HNS_WEB_V1, MAX_CIRCUITS, MAX_CIRCUIT_QUEUE, MAX_PACKET_SIZE,
+    HNSR_RELAY_SERVICE, HNS_CHAT_V1, HNS_NODE_V1, HNS_WEB_V1, MAX_CIRCUITS, MAX_CIRCUIT_QUEUE,
+    MAX_PACKET_SIZE,
 };
 use hns_p2p_experimental::{
     ExperimentalWireProfile, HnsrPolicy, NegotiatedRegistry, Network as ExperimentalNetwork,
@@ -30,12 +31,15 @@ const FLOOR_SCHEMA: u16 = 1;
 const CHECKSUM_SIZE: usize = 32;
 const MAXIMUM_STATE_BYTES: usize = 4_096;
 
+/// Canonical experimental HNSR profile for opaque Shakescape swap sessions.
+pub const HNS_SHAKESCAPE_SWAP_V1: u16 = 4;
+
 pub const fn is_hnsr_packet_type(packet_type: PacketType) -> bool {
     matches!(packet_type, PacketType::Unknown(value) if value == HNSR_PACKET_TYPE)
 }
 
 pub const fn is_supported_hnsr_profile(profile: u16) -> bool {
-    matches!(profile, HNS_NODE_V1 | HNS_WEB_V1)
+    matches!(profile, HNS_NODE_V1 | HNS_WEB_V1 | HNS_SHAKESCAPE_SWAP_V1)
 }
 
 pub fn hnsr_peer_id(peer: PeerId) -> Result<HnsrPeerId, HnsrCoordinatorError> {
@@ -885,7 +889,16 @@ fn build_relay_service(
             host,
             port: backend.advertised_address.port(),
             allow_private_address: config.binding.allows_private(),
-            supported_profiles: BTreeSet::from([config.profile]),
+            // The relay never interprets circuit payloads. Admit every
+            // canonical profile independently from the node's own requester
+            // profile so one ordinary relay can carry mobile swap and chat
+            // sessions without assuming either endpoint role.
+            supported_profiles: BTreeSet::from([
+                HNS_NODE_V1,
+                HNS_WEB_V1,
+                HNS_CHAT_V1,
+                HNS_SHAKESCAPE_SWAP_V1,
+            ]),
             limits: config.relay_limits,
         },
         backend.private_key,
@@ -1090,7 +1103,9 @@ pub enum HnsrCoordinatorError {
     UnauthenticatedPeer,
     #[error("HNSR requires exact canonical Shakescape V1 negotiation")]
     RegistryNotNegotiated,
-    #[error("unsupported HNSR profile {0}; expected HNS_NODE_V1 or HNS_WEB_V1")]
+    #[error(
+        "unsupported HNSR profile {0}; expected HNS_NODE_V1, HNS_WEB_V1, or HNS_SHAKESCAPE_SWAP_V1"
+    )]
     UnsupportedProfile(u16),
     #[error("HNSR role is unavailable")]
     RoleUnavailable,
@@ -1118,4 +1133,45 @@ pub enum HnsrCoordinatorError {
     StaleGeneration,
     #[error("HNSR coordinator generation exhausted")]
     GenerationExhausted,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use hns_consensus::Network;
+    use hns_hnsr_protocol::{public_key, EndpointReservation, HnsrOpcode};
+
+    use super::*;
+
+    #[test]
+    fn ordinary_relay_accepts_the_canonical_mobile_swap_profile() {
+        let relay_private = [7_u8; 32];
+        let mut config = HnsrCoordinatorConfig::for_network(Network::Regtest);
+        config.relay_backend = Some(HnsrRelayBackend {
+            advertised_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 14_039),
+            private_key: relay_private,
+        });
+        let relay = build_relay_service(&config)
+            .expect("relay configuration")
+            .expect("enabled relay");
+        let mut relay = HnsrService::new(Some(relay), None);
+        let relay_key = public_key(&relay_private).expect("relay public key");
+        let endpoint =
+            EndpointReservation::new(config.binding.magic, HNS_SHAKESCAPE_SWAP_V1, [9_u8; 32])
+                .expect("swap endpoint");
+        let reserve = endpoint
+            .reserve(&relay_key, [1_u8; 8], 300, 1, 65_536, [2_u8; 16])
+            .expect("signed reservation");
+        let offer = relay
+            .handle_encoded(
+                &reserve.encode().expect("reservation encoding"),
+                "phone-a",
+                1_700_000_000,
+            )
+            .expect("relay admission")
+            .expect("relay offer");
+        let offer = HnsrPacket::decode(&offer).expect("relay offer encoding");
+        assert_eq!(offer.opcode, HnsrOpcode::Offer);
+    }
 }
