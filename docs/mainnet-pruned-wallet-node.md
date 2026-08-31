@@ -3,7 +3,7 @@
 This runbook installs one source-identified `hsrd` binary and starts a fresh,
 outbound-only mainnet node on the mounted 1 TB encrypted volume. The profile is
 pruned, synchronously durable, authenticated, and has `--wallet-index` present
-from genesis. It does not enable mining, transaction relay, inbound P2P, Denuo
+from genesis. It does not enable mining, transaction relay, inbound P2P, Shakescape
 roles, HIP-76, ODoH, HNSR, or the mainnet canary.
 
 The node is a noncustodial chain backend. Wallet seeds and private keys belong

@@ -1,29 +1,22 @@
 #![forbid(unsafe_code)]
 
-mod denuo_market;
 mod mining_engine;
 mod native_sync;
 mod peer_bans;
+mod shakescape_market;
 mod wallet_backend;
 mod wallet_rpc;
 
-pub use denuo_market::{
-    DenuoNameMarketAdmission, DenuoNameMarketDispatch, DenuoNameMarketEvent,
-    DenuoNameMarketEventKind, DenuoNameMarketEventPage, DenuoNameMarketSend,
-    DenuoNameMarketSnapshotPage, DenuoNameMarketSnapshotRecord, DenuoRelayAcceptanceSigner,
-    DenuoRelayAcceptanceSignerError, DenuoRelayHandle, DenuoRelayHandleError,
-    MAX_DENUO_NAME_MARKET_EVENTS, MAX_DENUO_NAME_MARKET_EVENT_PAGE, MAX_DENUO_NAME_MARKET_RECORDS,
-    MAX_DENUO_NAME_MARKET_SNAPSHOT_PAGE,
-};
-pub use hns_denuo_market_relay::{
-    Announcement as DenuoAnnouncement, AnnouncementAdmission as DenuoAnnouncementAdmission,
-    ObjectAdmission as DenuoObjectAdmission, ObjectHash as DenuoObjectHash,
-    RelayError as DenuoRelayError, RelayKind as DenuoRelayKind, RelayLimits as DenuoRelayLimits,
-    RelayObject as DenuoRelayObject, RelayRoles as DenuoRelayRoles,
-    RelayStatus as DenuoRelayStatus, RelayStore as DenuoRelayStore,
-    SignerPolicy as DenuoSignerPolicy,
-};
 pub use hns_p2p::LivePeerManager;
+pub use hns_shakescape_market_relay::{
+    Announcement as ShakescapeAnnouncement,
+    AnnouncementAdmission as ShakescapeAnnouncementAdmission,
+    ObjectAdmission as ShakescapeObjectAdmission, ObjectHash as ShakescapeObjectHash,
+    RelayError as ShakescapeRelayError, RelayKind as ShakescapeRelayKind,
+    RelayLimits as ShakescapeRelayLimits, RelayObject as ShakescapeRelayObject,
+    RelayRoles as ShakescapeRelayRoles, RelayStatus as ShakescapeRelayStatus,
+    RelayStore as ShakescapeRelayStore, SignerPolicy as ShakescapeSignerPolicy,
+};
 pub use hns_wallet_index::{
     CompletedContractRetirement, CompletedContractRetirementOutcome, ContractId,
     ContractRegistration, ContractRegistrationOutcome, ContractRetirementOutcome,
@@ -39,6 +32,15 @@ pub use mining_engine::{
     NativeMiningJobRequest,
 };
 pub use native_sync::{NativeSyncConfig, NativeSyncDiagnostics};
+pub use shakescape_market::{
+    ShakescapeNameMarketAdmission, ShakescapeNameMarketDispatch, ShakescapeNameMarketEvent,
+    ShakescapeNameMarketEventKind, ShakescapeNameMarketEventPage, ShakescapeNameMarketSend,
+    ShakescapeNameMarketSnapshotPage, ShakescapeNameMarketSnapshotRecord,
+    ShakescapeRelayAcceptanceSigner, ShakescapeRelayAcceptanceSignerError, ShakescapeRelayHandle,
+    ShakescapeRelayHandleError, MAX_SHAKESCAPE_NAME_MARKET_EVENTS,
+    MAX_SHAKESCAPE_NAME_MARKET_EVENT_PAGE, MAX_SHAKESCAPE_NAME_MARKET_RECORDS,
+    MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE,
+};
 pub use wallet_backend::{
     ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence,
     BroadcastResult, CompletedTrackedContractRetirement, CompletedTrackedContractRetirementContext,
@@ -118,9 +120,9 @@ use hns_mining::{
     SolvedMiningCandidate, TemplateCoordinator,
 };
 use hns_p2p::{
-    DenuoSummary, Hip76Summary, HnsrCoordinator, HnsrCoordinatorConfig, HnsrCoordinatorStatus,
+    Hip76Summary, HnsrCoordinator, HnsrCoordinatorConfig, HnsrCoordinatorStatus,
     OdohNetworkBinding, OdohRequesterConfig, OdohRequesterRuntime, OdohRequesterStatus,
-    PeerSnapshot,
+    PeerSnapshot, ShakescapeSummary,
 };
 use hns_primitives::{
     blake2b_256, hex_encode, sha3_256, Block, BlockHash, Coin, CompactTarget, Height, NameHash,
@@ -1539,11 +1541,11 @@ pub struct NodeConfig {
     /// Maintain the complete wallet restoration profile (script history,
     /// spender lookup, script UTXOs, and confirmed incoming TRANSFER evidence).
     pub wallet_index: bool,
-    /// Explicit Denuo marketplace relay roles. Empty is requester-only.
-    pub denuo_relay_roles: DenuoRelayRoles,
+    /// Explicit Shakescape marketplace relay roles. Empty is requester-only.
+    pub shakescape_relay_roles: ShakescapeRelayRoles,
     /// Optional HNSA-bound endpoint signer required for authenticated local
     /// wallet publication acceptance. The secret is redacted and zeroized.
-    pub denuo_name_market_acceptance_signer: Option<DenuoRelayAcceptanceSigner>,
+    pub shakescape_name_market_acceptance_signer: Option<ShakescapeRelayAcceptanceSigner>,
     pub name_tree_compaction: NameTreeCompactionConfig,
     pub undo_retention: UndoRetentionConfig,
     pub native_sync: NativeSyncConfig,
@@ -1567,8 +1569,8 @@ impl Default for NodeConfig {
             script_history_index: false,
             spender_index: false,
             wallet_index: false,
-            denuo_relay_roles: DenuoRelayRoles::NONE,
-            denuo_name_market_acceptance_signer: None,
+            shakescape_relay_roles: ShakescapeRelayRoles::NONE,
+            shakescape_name_market_acceptance_signer: None,
             name_tree_compaction: NameTreeCompactionConfig::default(),
             undo_retention: UndoRetentionConfig::default(),
             native_sync: NativeSyncConfig::default(),
@@ -1634,16 +1636,16 @@ fn decode_transaction_index_mode(raw: &[u8]) -> Result<bool> {
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     config.rpc_limits.validate()?;
 
-    if let Some(signer) = &config.denuo_name_market_acceptance_signer {
+    if let Some(signer) = &config.shakescape_name_market_acceptance_signer {
         let network = signer.policy().network();
         if !config
-            .denuo_relay_roles
-            .contains(DenuoRelayKind::NameMarket)
+            .shakescape_relay_roles
+            .contains(ShakescapeRelayKind::NameMarket)
             || network.magic != config.network.params().packet_magic
             || network.genesis.as_bytes() != &config.network.params().genesis_hash.into_inner()
         {
             anyhow::bail!(
-                "Denuo name-market acceptance requires the name-market relay role and an exact configured network binding"
+                "Shakescape name-market acceptance requires the name-market relay role and an exact configured network binding"
             );
         }
     }
@@ -1982,7 +1984,7 @@ fn rpc_mining_engine_info(diagnostics: MiningEngineDiagnostics) -> RpcMiningEngi
 }
 
 pub(crate) fn rpc_experimental_registry_info(
-    summary: &DenuoSummary,
+    summary: &ShakescapeSummary,
 ) -> RpcExperimentalRegistryInfo {
     RpcExperimentalRegistryInfo {
         name: summary.identity.name.clone(),
@@ -2240,7 +2242,7 @@ pub struct NodeService {
     mempool_name_context: Mutex<mining_engine::ActiveMempoolNameCache>,
     claim_dnssec: OpenSslDnssecVerifier,
     airdrop_signatures: NativeAirdropSignatureVerifier,
-    denuo_relay: DenuoRelayHandle,
+    shakescape_relay: ShakescapeRelayHandle,
 }
 
 /// Maximum number of canonical-state commands that may wait behind the
@@ -3386,7 +3388,7 @@ fn decode_canonical_response<T: Send + 'static>(
 pub struct NodeRuntime {
     inner: Arc<NodeRuntimeInner>,
     read: NodeReadHandle,
-    denuo_relay: DenuoRelayHandle,
+    shakescape_relay: ShakescapeRelayHandle,
 }
 
 impl std_fmt::Debug for NodeRuntime {
@@ -3418,7 +3420,7 @@ impl NodeRuntime {
         let headers = node.state.chain.clone();
         let transaction_index = node.state.transaction_index;
         let wallet_index_profile = node.state.wallet_index_profile;
-        let denuo_relay = node.denuo_relay.clone();
+        let shakescape_relay = node.shakescape_relay.clone();
         let mining_events = node.mining_events.clone();
         let mining_engine_templates = Arc::clone(&node.mining_engine_templates);
         let maximum_concurrent_requests = node.config.rpc_limits.maximum_concurrent_requests;
@@ -3463,7 +3465,7 @@ impl NodeRuntime {
         Ok(Self {
             inner,
             read,
-            denuo_relay,
+            shakescape_relay,
         })
     }
 
@@ -3477,10 +3479,10 @@ impl NodeRuntime {
         }
     }
 
-    /// Bounded Denuo marketplace relay capability for native adapters.
+    /// Bounded Shakescape marketplace relay capability for native adapters.
     #[must_use]
-    pub fn denuo_relay(&self) -> DenuoRelayHandle {
-        self.denuo_relay.clone()
+    pub fn shakescape_relay(&self) -> ShakescapeRelayHandle {
+        self.shakescape_relay.clone()
     }
 
     /// Authorize a clean marker only from the crate-owned runtime supervisor.
@@ -4054,14 +4056,16 @@ impl NodeService {
         let airdrop_signatures = NativeAirdropSignatureVerifier::new().map_err(|error| {
             anyhow::anyhow!("failed to initialize airdrop relay verifier: {error}")
         })?;
-        let denuo_relay = DenuoRelayHandle::new(
-            config.denuo_relay_roles,
-            DenuoRelayLimits::default(),
+        let shakescape_relay = ShakescapeRelayHandle::new(
+            config.shakescape_relay_roles,
+            ShakescapeRelayLimits::default(),
             config.network.params().packet_magic,
             config.network.params().genesis_hash.into_inner(),
-            config.denuo_name_market_acceptance_signer.clone(),
+            config.shakescape_name_market_acceptance_signer.clone(),
         )
-        .map_err(|error| anyhow::anyhow!("failed to initialize Denuo market relay: {error}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!("failed to initialize Shakescape market relay: {error}")
+        })?;
         Ok(Self {
             config,
             state,
@@ -4070,7 +4074,7 @@ impl NodeService {
             mempool_name_context: Mutex::new(mining_engine::ActiveMempoolNameCache::default()),
             claim_dnssec: OpenSslDnssecVerifier,
             airdrop_signatures,
-            denuo_relay,
+            shakescape_relay,
         })
     }
 
@@ -4870,7 +4874,7 @@ impl NodeService {
             tip_validation,
             name_tree_compaction,
             undo_retention,
-            experimental_registry: rpc_experimental_registry_info(&DenuoSummary::default()),
+            experimental_registry: rpc_experimental_registry_info(&ShakescapeSummary::default()),
             hip76: rpc_hip76_info(&[]),
             odoh: rpc_inactive_odoh_info(
                 self.config.network,
@@ -16838,10 +16842,10 @@ mod tests {
 
     #[test]
     fn experimental_registry_rpc_projection_preserves_bounded_totals() {
-        let mut summary = DenuoSummary {
+        let mut summary = ShakescapeSummary {
             local_service_mask: 0x1000_0001,
             advertised: true,
-            ..DenuoSummary::default()
+            ..ShakescapeSummary::default()
         };
         summary.live.awaiting_version = 1;
         summary.live.local_disabled = 2;
@@ -24417,19 +24421,19 @@ mod tests {
         let registry = &json["experimental_registry"];
         assert_eq!(
             registry["name"],
-            "Denuo Experimental Handshake P2P Registry"
+            "Shakescape Experimental Handshake P2P Registry"
         );
         assert_eq!(registry["registry_id"], registry["fingerprint"]);
         assert_eq!(
             registry["fingerprint"],
-            "734226e866435821e40be7bde85fb19dd6eb867c5620abb8347ac8cd23da4f2c"
+            "04fce3f12b717c4254bb66ac07474a6c9f61bd2916efc18ebfc79df82a89a66b"
         );
-        assert_eq!(registry["registry_version"], 2);
+        assert_eq!(registry["registry_version"], 1);
         assert_eq!(registry["registry_protocol_version"], 1);
-        assert_eq!(registry["wire_profile"], "denuo-v2");
+        assert_eq!(registry["wire_profile"], "shakescape-v1");
         assert_eq!(
             registry["assignment_status"],
-            "Denuo Experimental V2 — Not an official Handshake protocol assignment"
+            "Shakescape Experimental V1 — Not an official Handshake protocol assignment"
         );
         assert_eq!(registry["service_bit"], 0x1000_0000_u64);
         assert_eq!(registry["local_service_mask"], 0);

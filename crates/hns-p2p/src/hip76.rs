@@ -26,9 +26,9 @@ pub use hns_dns_relay_protocol::{
 };
 pub use hns_p2p_experimental::{DnsRelayOutputPolicy, DnsRelayRequesterPolicy};
 use hns_p2p_experimental::{
-    DENUO_EXTENSION_SERVICE, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_WIRE_PROFILE,
     DNS_RELAY_REQUEST_PACKET, DNS_RELAY_RESPONSE_PACKET, DNS_RELAY_SERVICE,
-    EXPERIMENTAL_STATUS_LABEL, HIP_76_PROTOCOL_VERSION,
+    EXPERIMENTAL_STATUS_LABEL, HIP_76_PROTOCOL_VERSION, SHAKESCAPE_EXTENSION_SERVICE,
+    SHAKESCAPE_V1_REGISTRY_FINGERPRINT, SHAKESCAPE_V1_WIRE_PROFILE,
 };
 use hns_primitives::{blake2b_256, verify_name};
 use serde::{Deserialize, Serialize};
@@ -86,11 +86,11 @@ impl Hip76ProviderPolicy {
 /// Derive the service mask placed in VERSION from explicit provider policy.
 ///
 /// The DNS relay bit is always stripped first. It is restored only when the
-/// output role is opted in, its backend is ready, and Denuo negotiation support
+/// output role is opted in, its backend is ready, and Shakescape negotiation support
 /// is advertised. This makes an accidentally pre-populated base mask safe.
 pub const fn hip76_advertised_services(base_services: u64, provider: Hip76ProviderPolicy) -> u64 {
     let without_provider = base_services & !DNS_RELAY_SERVICE.value();
-    if provider.is_available() && without_provider & DENUO_EXTENSION_SERVICE.value() != 0 {
+    if provider.is_available() && without_provider & SHAKESCAPE_EXTENSION_SERVICE.value() != 0 {
         without_provider | DNS_RELAY_SERVICE.value()
     } else {
         without_provider
@@ -103,7 +103,7 @@ pub struct Hip76SessionConfig {
     pub provider_policy: Hip76ProviderPolicy,
     pub policy_generation: u64,
     /// Per-direction capacity, bounded by `u16` and expected to be no greater
-    /// than the canonical Denuo agreement's `maximum_live_requests`.
+    /// than the canonical Shakescape agreement's `maximum_live_requests`.
     pub maximum_live_requests: u16,
     pub maximum_send_size: u32,
     pub request_timeout: Duration,
@@ -596,8 +596,8 @@ impl Default for Hip76ProtocolIdentity {
                 .unwrap_or(u32::MAX),
             maximum_response_payload_size: u32::try_from(MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE)
                 .unwrap_or(u32::MAX),
-            registry_fingerprint: DENUO_V2_REGISTRY_FINGERPRINT.to_string(),
-            registry_wire_profile: DENUO_V2_WIRE_PROFILE.to_owned(),
+            registry_fingerprint: SHAKESCAPE_V1_REGISTRY_FINGERPRINT.to_string(),
+            registry_wire_profile: SHAKESCAPE_V1_WIRE_PROFILE.to_owned(),
             experimental_status: EXPERIMENTAL_STATUS_LABEL.to_owned(),
             requester_default: "auto".to_owned(),
             provider_default_opted_in: false,
@@ -1889,7 +1889,7 @@ impl Hip76Session {
         self.remote_services = services;
     }
 
-    /// Apply the live-request ceiling agreed by the canonical Denuo registry.
+    /// Apply the live-request ceiling agreed by the canonical Shakescape registry.
     ///
     /// HIP-76 cannot be active before registry negotiation, so this normally
     /// runs with empty books. If a caller attempts to shrink an active session
@@ -1918,7 +1918,7 @@ impl Hip76Session {
     }
 
     /// Apply the symmetric packet ceiling and live-request capacity computed by
-    /// the canonical Denuo agreement.
+    /// the canonical Shakescape agreement.
     pub fn set_negotiated_resource_limits(
         &mut self,
         maximum_send_size: u32,
@@ -1992,7 +1992,7 @@ impl Hip76Session {
         Ok(revoked)
     }
 
-    /// Update the Denuo agreement. Losing it revokes HIP-76 work only.
+    /// Update the Shakescape agreement. Losing it revokes HIP-76 work only.
     pub fn set_registry_negotiated(&mut self, negotiated: bool) -> Hip76RevokedWork {
         self.registry_negotiated = negotiated;
         if negotiated {
@@ -2044,7 +2044,7 @@ impl Hip76Session {
         if self.requester_policy == DnsRelayRequesterPolicy::Disabled {
             return Some(Hip76FailureReason::RequesterDisabled);
         }
-        if self.local_services & DENUO_EXTENSION_SERVICE.value() == 0 {
+        if self.local_services & SHAKESCAPE_EXTENSION_SERVICE.value() == 0 {
             return Some(Hip76FailureReason::RegistryNotNegotiated);
         }
         if !services_advertise_provider(self.remote_services) {
@@ -2235,7 +2235,8 @@ pub const fn is_hip76_packet_type(packet_type: PacketType) -> bool {
 }
 
 fn services_advertise_provider(services: u64) -> bool {
-    services & DENUO_EXTENSION_SERVICE.value() != 0 && services & DNS_RELAY_SERVICE.value() != 0
+    services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0
+        && services & DNS_RELAY_SERVICE.value() != 0
 }
 
 fn hip76_packet(packet_type: u8, payload: Vec<u8>) -> Packet {
@@ -2462,8 +2463,8 @@ mod tests {
     use crate::SERVICE_NETWORK;
     use hns_dns_relay_protocol::{MAX_DNS_RELAY_QUERY_SIZE, MAX_DNS_RELAY_RESPONSE_SIZE};
 
-    const DENUO_SERVICES: u64 = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
-    const PROVIDER_SERVICES: u64 = DENUO_SERVICES | DNS_RELAY_SERVICE.value();
+    const SHAKESCAPE_SERVICES: u64 = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+    const PROVIDER_SERVICES: u64 = SHAKESCAPE_SERVICES | DNS_RELAY_SERVICE.value();
 
     fn config(
         requester_policy: DnsRelayRequesterPolicy,
@@ -2481,7 +2482,7 @@ mod tests {
     fn requester(direction: PeerDirection) -> Hip76Session {
         Hip76Session::new(
             direction,
-            DENUO_SERVICES,
+            SHAKESCAPE_SERVICES,
             PROVIDER_SERVICES,
             true,
             config(
@@ -2496,7 +2497,7 @@ mod tests {
         Hip76Session::new(
             direction,
             PROVIDER_SERVICES,
-            DENUO_SERVICES,
+            SHAKESCAPE_SERVICES,
             true,
             config(
                 DnsRelayRequesterPolicy::Disabled,
@@ -2682,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_advertisement_requires_opt_in_backend_and_denuo() {
+    fn provider_advertisement_requires_opt_in_backend_and_shakescape() {
         let unsafe_base = SERVICE_NETWORK | DNS_RELAY_SERVICE.value();
         assert_eq!(
             hip76_advertised_services(unsafe_base, Hip76ProviderPolicy::opted_in(true)),
@@ -2690,14 +2691,14 @@ mod tests {
         );
         assert_eq!(
             hip76_advertised_services(PROVIDER_SERVICES, Hip76ProviderPolicy::disabled()),
-            DENUO_SERVICES
+            SHAKESCAPE_SERVICES
         );
         assert_eq!(
             hip76_advertised_services(PROVIDER_SERVICES, Hip76ProviderPolicy::opted_in(false)),
-            DENUO_SERVICES
+            SHAKESCAPE_SERVICES
         );
         assert_eq!(
-            hip76_advertised_services(DENUO_SERVICES, Hip76ProviderPolicy::opted_in(true)),
+            hip76_advertised_services(SHAKESCAPE_SERVICES, Hip76ProviderPolicy::opted_in(true)),
             PROVIDER_SERVICES
         );
     }
@@ -2767,7 +2768,7 @@ mod tests {
         let mut opted_out = Hip76Session::new(
             PeerDirection::Inbound,
             PROVIDER_SERVICES,
-            DENUO_SERVICES,
+            SHAKESCAPE_SERVICES,
             true,
             config(
                 DnsRelayRequesterPolicy::Auto,
@@ -2842,7 +2843,7 @@ mod tests {
         let mut busy_provider = Hip76Session::new(
             PeerDirection::Inbound,
             PROVIDER_SERVICES,
-            DENUO_SERVICES,
+            SHAKESCAPE_SERVICES,
             true,
             busy_config,
         )
@@ -2967,7 +2968,7 @@ mod tests {
         config.maximum_live_requests = 1;
         let mut requester = Hip76Session::new(
             PeerDirection::Outbound,
-            DENUO_SERVICES,
+            SHAKESCAPE_SERVICES,
             PROVIDER_SERVICES,
             true,
             config,
@@ -3175,7 +3176,7 @@ mod tests {
         let mut provider = Hip76Session::new(
             PeerDirection::Inbound,
             PROVIDER_SERVICES,
-            DENUO_SERVICES,
+            SHAKESCAPE_SERVICES,
             true,
             provider_config,
         )
@@ -3251,7 +3252,7 @@ mod tests {
         configured.maximum_send_size = 100;
         let mut session = Hip76Session::new(
             PeerDirection::Outbound,
-            DENUO_SERVICES,
+            SHAKESCAPE_SERVICES,
             PROVIDER_SERVICES,
             true,
             configured,

@@ -12,7 +12,6 @@ use hns_primitives::BlockHash;
 
 pub mod brontide;
 pub mod constants;
-pub mod denuo;
 pub mod experimental;
 pub mod handshake;
 pub mod hip76;
@@ -21,6 +20,7 @@ pub mod manager;
 pub mod odoh;
 pub mod runtime;
 pub mod seeds;
+pub mod shakescape;
 pub mod wire;
 
 pub use brontide::{
@@ -28,11 +28,6 @@ pub use brontide::{
     BRONTIDE_ACT_ONE_SIZE, BRONTIDE_ACT_THREE_SIZE, BRONTIDE_ACT_TWO_SIZE, BRONTIDE_HEADER_SIZE,
 };
 pub use constants::*;
-pub use denuo::{
-    DenuoDisableReason, DenuoLiveCounts, DenuoNegotiatedParameters, DenuoNegotiatedProtocol,
-    DenuoPeerDiagnostics, DenuoPeerPhase, DenuoProcessTotals, DenuoReasonCount,
-    DenuoRegistryIdentity, DenuoSummary, DENUO_DEFAULT_MAXIMUM_LIVE_REQUESTS,
-};
 pub use experimental::{
     ExperimentalExchange, ExperimentalExchangeError, ExperimentalExchangeResponse,
     MAXIMUM_EXPERIMENTAL_EXCHANGES,
@@ -75,14 +70,20 @@ pub use odoh::{
     ODOH_MAXIMUM_TARGET_CACHE_BLOB_BYTES,
 };
 pub use runtime::{
-    AuthenticatedExperimentalPeerEvidence, AuthenticatedPeerKey, DenuoPeerProvenance,
-    Hip76PeerProvenance, Hip76PendingRequest, Hip76RequestAdmission, Hip76RequestOutcome,
-    OutboundPriority, PeerEvent, PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot,
-    PeerTransportKind,
+    AuthenticatedExperimentalPeerEvidence, AuthenticatedPeerKey, Hip76PeerProvenance,
+    Hip76PendingRequest, Hip76RequestAdmission, Hip76RequestOutcome, OutboundPriority, PeerEvent,
+    PeerHandle, PeerId, PeerRuntimeConfig, PeerSnapshot, PeerTransportKind,
+    ShakescapePeerProvenance,
 };
 pub use seeds::{
     decode_compressed_public_key, hsd_brontide_seed_addresses, hsd_brontide_seed_table,
     HsdBrontideSeed, HSD_MAINNET_BRONTIDE_SEEDS, HSD_TESTNET_BRONTIDE_SEEDS,
+};
+pub use shakescape::{
+    ShakescapeDisableReason, ShakescapeLiveCounts, ShakescapeNegotiatedParameters,
+    ShakescapeNegotiatedProtocol, ShakescapePeerDiagnostics, ShakescapePeerPhase,
+    ShakescapeProcessTotals, ShakescapeReasonCount, ShakescapeRegistryIdentity, ShakescapeSummary,
+    SHAKESCAPE_DEFAULT_MAXIMUM_LIVE_REQUESTS,
 };
 pub use wire::{
     decode_frame, encode_frame, peer_address_group, AddressHost, AsyncFrameReader,

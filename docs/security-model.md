@@ -220,7 +220,7 @@ clean marker or matching startup checkpoint cannot restore authority.
 - Header-derived deployment diagnostics walk only the validated canonical
   ancestry and bind any historical-script assumption to the exact final
   configured checkpoint; they do not confer body, state, or mining authority.
-- Denuo registry agreement and HIP-76 provider/session state are
+- Shakescape registry agreement and HIP-76 provider/session state are
   connection-local private transport capabilities. HIP-76 requester selection
   is process-wide: a monotonic replacement is serialized with peer admission,
   revokes every live prior-generation request, and is inherited by future
@@ -229,8 +229,8 @@ clean marker or matching startup checkpoint cannot restore authority.
   excluded from that record and still requires explicit opt-in plus a ready
   backend.
 - HIP-77 requester operation defaults on but admits only ready,
-  Brontide-authenticated sessions retaining exact upstream Denuo V1 profile and
-  registry evidence. Both Denuo and ODoH service bits, the canonical
+  Brontide-authenticated sessions retaining exact upstream Shakescape V1 profile and
+  registry evidence. Both Shakescape and ODoH service bits, the canonical
   fingerprint and versions, and the local network and genesis must match. The
   selected authenticated proxy key must differ from the
   target-signed locator key. Correlation binds request ID, policy generation,
@@ -257,7 +257,7 @@ clean marker or matching startup checkpoint cannot restore authority.
   higher layer performs strict DNS parsing, query correlation, and DNSSEC
   validation.
 - HIP-78 requester and opaque-relay policy default on, but each packet still
-  requires an exact live Brontide identity, canonical Denuo V1 registry,
+  requires an exact live Brontide identity, canonical Shakescape V1 registry,
   matching network/genesis, and the explicitly configured `HNS_NODE_V1` or
   `HNS_WEB_V1` profile. Native nodes default to `HNS_NODE_V1`; the profile is
   bound into requester, relay, status, and durable configuration identity.

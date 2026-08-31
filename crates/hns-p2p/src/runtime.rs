@@ -20,11 +20,6 @@ use tokio::{
 
 use crate::{
     brontide::{AsyncBrontideFrameReader, AsyncBrontideFrameWriter, BrontideSession},
-    denuo::{
-        extension_packet, is_extension_packet_type, is_registry_hello_packet, DenuoAction,
-        DenuoCoordinator, DenuoNameMarketInbound, DenuoPeerDiagnostics, DenuoPeerPhase,
-        DenuoRuntimeMetrics,
-    },
     experimental::{ExperimentalExchangeError, ExperimentalExchangeRuntime},
     handshake::{PeerDirection, PeerHandshake, PeerState},
     hip76::{
@@ -38,6 +33,11 @@ use crate::{
     odoh::{
         is_odoh_packet_type, OdohFailureReason, OdohPeerProvenance, OdohProxyAdmission,
         OdohRequesterRuntime,
+    },
+    shakescape::{
+        extension_packet, is_extension_packet_type, is_registry_hello_packet, ShakescapeAction,
+        ShakescapeCoordinator, ShakescapeNameMarketInbound, ShakescapePeerDiagnostics,
+        ShakescapePeerPhase, ShakescapeRuntimeMetrics,
     },
     wire::{
         AsyncFrameReader, AsyncFrameWriter, Frame, NetworkMagic, Packet, PacketType, VersionPacket,
@@ -130,9 +130,9 @@ pub struct Hip76PeerProvenance {
     pub authenticated_remote_static: Option<AuthenticatedPeerKey>,
 }
 
-/// Connection-bound provenance for one admitted Denuo name-market message.
+/// Connection-bound provenance for one admitted Shakescape name-market message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DenuoPeerProvenance {
+pub struct ShakescapePeerProvenance {
     pub peer: PeerId,
     pub address: SocketAddr,
     pub direction: PeerDirection,
@@ -194,15 +194,15 @@ pub struct PeerSnapshot {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub ping_millis: Option<u64>,
-    pub denuo: DenuoPeerDiagnostics,
+    pub shakescape: ShakescapePeerDiagnostics,
     #[serde(skip)]
-    pub(crate) denuo_wire_profile: Option<ExperimentalWireProfile>,
+    pub(crate) shakescape_wire_profile: Option<ExperimentalWireProfile>,
     #[serde(skip)]
-    pub(crate) denuo_negotiated_registry: Option<NegotiatedRegistry>,
+    pub(crate) shakescape_negotiated_registry: Option<NegotiatedRegistry>,
     pub hip76: Hip76SessionDiagnostics,
 }
 
-/// Exact ready Denuo evidence bound to one authenticated live Brontide
+/// Exact ready Shakescape evidence bound to one authenticated live Brontide
 /// connection. Browser and mobile adapters can consume this without
 /// reconstructing registry state from diagnostics strings.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,9 +237,9 @@ impl PeerSnapshot {
             bytes_sent: 0,
             bytes_received: 0,
             ping_millis: None,
-            denuo: DenuoPeerDiagnostics::default(),
-            denuo_wire_profile: None,
-            denuo_negotiated_registry: None,
+            shakescape: ShakescapePeerDiagnostics::default(),
+            shakescape_wire_profile: None,
+            shakescape_negotiated_registry: None,
             hip76: Hip76SessionDiagnostics::awaiting_registry(direction),
         }
     }
@@ -251,8 +251,8 @@ impl PeerSnapshot {
             return None;
         }
         let peer_key = self.authenticated_remote_static?;
-        let profile = self.denuo_wire_profile?;
-        let negotiated = self.denuo_negotiated_registry.clone()?;
+        let profile = self.shakescape_wire_profile?;
+        let negotiated = self.shakescape_negotiated_registry.clone()?;
         let mut state = ExperimentalPeerState::new(
             profile,
             negotiated.network,
@@ -274,16 +274,16 @@ impl PeerSnapshot {
     }
 }
 
-fn refresh_denuo_snapshot(snapshot: &mut PeerSnapshot, denuo: &DenuoCoordinator) {
-    snapshot.denuo = denuo.diagnostics();
-    match denuo.negotiated_evidence() {
+fn refresh_shakescape_snapshot(snapshot: &mut PeerSnapshot, shakescape: &ShakescapeCoordinator) {
+    snapshot.shakescape = shakescape.diagnostics();
+    match shakescape.negotiated_evidence() {
         Some((wire_profile, negotiated)) => {
-            snapshot.denuo_wire_profile = Some(wire_profile);
-            snapshot.denuo_negotiated_registry = Some(negotiated.clone());
+            snapshot.shakescape_wire_profile = Some(wire_profile);
+            snapshot.shakescape_negotiated_registry = Some(negotiated.clone());
         }
         None => {
-            snapshot.denuo_wire_profile = None;
-            snapshot.denuo_negotiated_registry = None;
+            snapshot.shakescape_wire_profile = None;
+            snapshot.shakescape_negotiated_registry = None;
         }
     }
 }
@@ -294,7 +294,7 @@ pub struct PeerRuntimeConfig {
     pub idle_timeout: Duration,
     pub ping_interval: Duration,
     pub pong_timeout: Duration,
-    pub denuo_negotiation_timeout: Duration,
+    pub shakescape_negotiation_timeout: Duration,
     pub critical_queue: usize,
     pub control_queue: usize,
     pub normal_queue: usize,
@@ -307,7 +307,7 @@ impl Default for PeerRuntimeConfig {
             idle_timeout: Duration::from_secs(180),
             ping_interval: Duration::from_secs(30),
             pong_timeout: Duration::from_secs(90),
-            denuo_negotiation_timeout: Duration::from_secs(10),
+            shakescape_negotiation_timeout: Duration::from_secs(10),
             critical_queue: 8,
             control_queue: 64,
             normal_queue: 256,
@@ -321,7 +321,7 @@ impl PeerRuntimeConfig {
             || self.idle_timeout.is_zero()
             || self.ping_interval.is_zero()
             || self.pong_timeout.is_zero()
-            || self.denuo_negotiation_timeout.is_zero()
+            || self.shakescape_negotiation_timeout.is_zero()
         {
             return Err(P2pError::Configuration(
                 "peer timeouts and intervals must be non-zero".to_owned(),
@@ -377,8 +377,8 @@ pub enum PeerEvent {
     HnsrRequester {
         event: hns_hnsr_protocol::HnsrRequesterEvent,
     },
-    DenuoNameMarket {
-        provenance: DenuoPeerProvenance,
+    ShakescapeNameMarket {
+        provenance: ShakescapePeerProvenance,
         request_id: u64,
         message: hns_marketplace_protocol::NameMarketMessage,
     },
@@ -699,7 +699,7 @@ pub(crate) struct PeerRuntimeParameters {
     pub config: PeerRuntimeConfig,
     pub critical_write_timeout: Duration,
     pub events: mpsc::Sender<PeerEvent>,
-    pub denuo_metrics: DenuoRuntimeMetrics,
+    pub shakescape_metrics: ShakescapeRuntimeMetrics,
     pub hip76_config: Hip76SessionConfig,
     pub odoh: Arc<Mutex<OdohRequesterRuntime>>,
     pub experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
@@ -769,7 +769,7 @@ where
         config,
         critical_write_timeout,
         events,
-        denuo_metrics,
+        shakescape_metrics,
         mut hip76_config,
         odoh,
         experimental,
@@ -780,17 +780,17 @@ where
     // Runtime request IDs are unpredictable per connection. The configurable
     // seed remains available only to direct session tests and embeddings.
     hip76_config.first_request_id = rand::random::<u64>().max(1);
-    let denuo = DenuoCoordinator::new(
+    let shakescape = ShakescapeCoordinator::new(
         direction,
         network,
         local_version.services,
-        denuo_request_id(id, local_version.nonce),
-        config.denuo_negotiation_timeout,
-        denuo_metrics,
+        shakescape_request_id(id, local_version.nonce),
+        config.shakescape_negotiation_timeout,
+        shakescape_metrics,
     )
     .map_err(|error| {
         P2pError::Configuration(format!(
-            "canonical Denuo registry hello is invalid: {error}"
+            "canonical Shakescape registry hello is invalid: {error}"
         ))
     })?;
     let hip76 = Hip76Session::new(
@@ -818,7 +818,7 @@ where
     let mut initial_snapshot = PeerSnapshot::new(id, address, direction);
     initial_snapshot.transport = transport;
     initial_snapshot.authenticated_remote_static = authenticated_remote_static;
-    refresh_denuo_snapshot(&mut initial_snapshot, &denuo);
+    refresh_shakescape_snapshot(&mut initial_snapshot, &shakescape);
     initial_snapshot.hip76 = initial_hip76;
     let snapshot = Arc::new(RwLock::new(initial_snapshot));
     let handle = PeerHandle {
@@ -838,7 +838,7 @@ where
         direction,
         magic,
         local_version,
-        denuo,
+        shakescape,
         hip76,
         odoh,
         experimental,
@@ -911,7 +911,7 @@ async fn run_peer<R, W>(
     direction: PeerDirection,
     _magic: NetworkMagic,
     local_version: VersionPacket,
-    denuo: DenuoCoordinator,
+    shakescape: ShakescapeCoordinator,
     hip76: Hip76Session,
     odoh: Arc<Mutex<OdohRequesterRuntime>>,
     experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
@@ -979,7 +979,7 @@ where
         id,
         direction,
         local_version,
-        denuo,
+        shakescape,
         hip76,
         odoh,
         experimental,
@@ -1026,7 +1026,7 @@ async fn peer_reader<R>(
     id: PeerId,
     direction: PeerDirection,
     local_version: VersionPacket,
-    mut denuo: DenuoCoordinator,
+    mut shakescape: ShakescapeCoordinator,
     mut hip76: Hip76Session,
     odoh: Arc<Mutex<OdohRequesterRuntime>>,
     experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
@@ -1188,8 +1188,8 @@ where
                             Err(error) => return Err(error),
                         }
                     },
-                    _ = sleep_until(denuo.pending_deadline().unwrap_or(deadline)), if denuo.pending_deadline().is_some() => {
-                        if denuo.expire(Instant::now()) {
+                    _ = sleep_until(shakescape.pending_deadline().unwrap_or(deadline)), if shakescape.pending_deadline().is_some() => {
+                        if shakescape.expire(Instant::now()) {
                             odoh
                                 .lock()
                                 .await
@@ -1206,13 +1206,13 @@ where
                                 critical_write_timeout,
                             )
                             .await;
-                            let revoked = synchronize_hip76_with_denuo(&denuo, &mut hip76);
+                            let revoked = synchronize_hip76_with_shakescape(&shakescape, &mut hip76);
                             complete_revoked_requesters(
                                 &mut pending_requesters,
                                 &revoked,
                             );
                             let mut state = snapshot.write().await;
-                            refresh_denuo_snapshot(&mut state, &denuo);
+                            refresh_shakescape_snapshot(&mut state, &shakescape);
                             state.hip76 = refresh_hip76_state(
                                 &hip76,
                                 provenance,
@@ -1332,11 +1332,11 @@ where
             continue;
         }
         if is_extension_packet_type(frame.packet_type) {
-            denuo.expire(Instant::now());
-            let action = denuo.receive_extension(&frame.payload);
-            let name_market = admit_denuo_action(&mut denuo, action, &control_tx);
-            let revoked = synchronize_hip76_with_denuo(&denuo, &mut hip76);
-            if denuo.diagnostics().phase != DenuoPeerPhase::Negotiated {
+            shakescape.expire(Instant::now());
+            let action = shakescape.receive_extension(&frame.payload);
+            let name_market = admit_shakescape_action(&mut shakescape, action, &control_tx);
+            let revoked = synchronize_hip76_with_shakescape(&shakescape, &mut hip76);
+            if shakescape.diagnostics().phase != ShakescapePeerPhase::Negotiated {
                 odoh
                     .lock()
                     .await
@@ -1359,7 +1359,7 @@ where
                 &revoked,
             );
             let mut state = snapshot.write().await;
-            refresh_denuo_snapshot(&mut state, &denuo);
+            refresh_shakescape_snapshot(&mut state, &shakescape);
             state.hip76 = refresh_hip76_state(
                 &hip76,
                 provenance,
@@ -1368,13 +1368,13 @@ where
                 &hip76_status_tx,
             );
             drop(state);
-            if let Some(DenuoNameMarketInbound {
+            if let Some(ShakescapeNameMarketInbound {
                 request_id,
                 message,
             }) = name_market
             {
-                let _ = events.try_send(PeerEvent::DenuoNameMarket {
-                    provenance: DenuoPeerProvenance {
+                let _ = events.try_send(PeerEvent::ShakescapeNameMarket {
+                    provenance: ShakescapePeerProvenance {
                         peer: id,
                         address: provenance.address,
                         direction,
@@ -1413,7 +1413,7 @@ where
                 transport,
                 authenticated_remote_static,
                 &handshake,
-                &denuo,
+                &shakescape,
             ) else {
                 let routes = hnsr.lock().await.fault_peer(id);
                 dispatch_hnsr_incoming(
@@ -1465,7 +1465,7 @@ where
             let remote_services = handshake
                 .remote_version()
                 .map_or(0, |version| version.services);
-            let Some((wire_profile, negotiated)) = denuo
+            let Some((wire_profile, negotiated)) = shakescape
                 .negotiated_evidence()
                 .filter(|_| handshake.is_ready())
                 .map(|(wire_profile, negotiated)| (wire_profile, negotiated.clone()))
@@ -1509,7 +1509,7 @@ where
 
         let update = handshake.receive(&packet)?;
         if let Packet::Version(version) = &packet {
-            denuo.observe_remote_services(version.services);
+            shakescape.observe_remote_services(version.services);
             hip76.observe_remote_services(version.services);
         }
         // HSD's inbound side waits for the remote version before sending
@@ -1538,7 +1538,7 @@ where
             state.advertised_height = Some(version.height);
             state.agent = Some(version.agent.clone());
             state.no_relay = version.no_relay;
-            refresh_denuo_snapshot(&mut state, &denuo);
+            refresh_shakescape_snapshot(&mut state, &shakescape);
         }
         if update.became_ready {
             snapshot.write().await.state = PeerState::Ready;
@@ -1553,15 +1553,15 @@ where
                 .send(PeerEvent::Ready { peer: id, version })
                 .await
                 .map_err(|_| P2pError::EventChannelClosed)?;
-            let action = denuo.on_ready(Instant::now());
-            let _ = admit_denuo_action(&mut denuo, action, &control_tx);
-            let revoked = synchronize_hip76_with_denuo(&denuo, &mut hip76);
+            let action = shakescape.on_ready(Instant::now());
+            let _ = admit_shakescape_action(&mut shakescape, action, &control_tx);
+            let revoked = synchronize_hip76_with_shakescape(&shakescape, &mut hip76);
             complete_revoked_requesters(
                 &mut pending_requesters,
                 &revoked,
             );
             let mut state = snapshot.write().await;
-            refresh_denuo_snapshot(&mut state, &denuo);
+            refresh_shakescape_snapshot(&mut state, &shakescape);
             state.hip76 = refresh_hip76_state(
                 &hip76,
                 provenance,
@@ -1628,12 +1628,12 @@ where
     result
 }
 
-fn synchronize_hip76_with_denuo(
-    denuo: &DenuoCoordinator,
+fn synchronize_hip76_with_shakescape(
+    shakescape: &ShakescapeCoordinator,
     hip76: &mut Hip76Session,
 ) -> Hip76RevokedWork {
-    let diagnostics = denuo.diagnostics();
-    if diagnostics.phase == DenuoPeerPhase::Negotiated {
+    let diagnostics = shakescape.diagnostics();
+    if diagnostics.phase == ShakescapePeerPhase::Negotiated {
         if let Some(negotiated) = diagnostics.negotiated {
             let mut revoked = match hip76.set_negotiated_resource_limits(
                 negotiated.maximum_send_size,
@@ -1656,10 +1656,10 @@ fn hnsr_peer_admission(
     transport: PeerTransportKind,
     authenticated_remote_static: Option<AuthenticatedPeerKey>,
     handshake: &PeerHandshake,
-    denuo: &DenuoCoordinator,
+    shakescape: &ShakescapeCoordinator,
 ) -> Option<HnsrPeerAdmission> {
     let remote_services = handshake.remote_version()?.services;
-    let (wire_profile, negotiated) = denuo.negotiated_evidence()?;
+    let (wire_profile, negotiated) = shakescape.negotiated_evidence()?;
     handshake.is_ready().then(|| HnsrPeerAdmission {
         peer,
         address,
@@ -2148,12 +2148,12 @@ const fn severe_hip76_failure(reason: Hip76FailureReason) -> bool {
     )
 }
 
-fn admit_denuo_action(
-    denuo: &mut DenuoCoordinator,
-    action: DenuoAction,
+fn admit_shakescape_action(
+    shakescape: &mut ShakescapeCoordinator,
+    action: ShakescapeAction,
     control_tx: &mpsc::Sender<Arc<Packet>>,
-) -> Option<DenuoNameMarketInbound> {
-    let DenuoAction {
+) -> Option<ShakescapeNameMarketInbound> {
+    let ShakescapeAction {
         response_payload,
         outbound_message,
         name_market,
@@ -2164,18 +2164,18 @@ fn admit_denuo_action(
                 .try_send(Arc::new(extension_packet(payload)))
                 .is_ok()
             {
-                denuo.outbound_admitted(message, Instant::now());
+                shakescape.outbound_admitted(message, Instant::now());
             } else {
-                // Queue pressure or a closed writer is scoped to Denuo. The
+                // Queue pressure or a closed writer is scoped to Shakescape. The
                 // ordinary peer reader remains available and never blocks on
                 // experimental response admission.
-                denuo.outbound_rejected();
+                shakescape.outbound_rejected();
             }
         }
         (None, None) => {}
         _ => {
-            debug_assert!(false, "Denuo action payload/message mismatch");
-            denuo.outbound_rejected();
+            debug_assert!(false, "Shakescape action payload/message mismatch");
+            shakescape.outbound_rejected();
         }
     }
     name_market
@@ -2263,13 +2263,14 @@ where
                     continue;
                 }
                 if is_registry_hello_packet(&packet)
-                    && snapshot.read().await.denuo.phase != DenuoPeerPhase::HelloAdmitted
+                    && snapshot.read().await.shakescape.phase != ShakescapePeerPhase::HelloAdmitted
                 {
                     // HELLO admission starts the negotiation deadline. If it
                     // expires while queued, never put the stale request on wire.
                     if let Some(completion) = completion {
                         let _ = completion.send(Err(
-                            "stale Denuo registry HELLO was dropped before socket write".to_owned(),
+                            "stale Shakescape registry HELLO was dropped before socket write"
+                                .to_owned(),
                         ));
                     }
                     continue;
@@ -2343,7 +2344,7 @@ fn handshake_nonce_seed(peer: PeerId) -> [u8; 8] {
     now.rotate_left(17).wrapping_add(peer.0).to_le_bytes()
 }
 
-fn denuo_request_id(peer: PeerId, local_nonce: [u8; 8]) -> u64 {
+fn shakescape_request_id(peer: PeerId, local_nonce: [u8; 8]) -> u64 {
     let request_id = u64::from_le_bytes(local_nonce) ^ peer.0.rotate_left(29);
     request_id.max(1)
 }
@@ -2378,12 +2379,13 @@ pub(crate) fn unix_time() -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        denuo::DenuoDisableReason,
+        shakescape::ShakescapeDisableReason,
         wire::{encode_frame, Frame, NetAddress, PacketType},
         PROTOCOL_VERSION, SERVICE_NETWORK,
     };
     use hns_p2p_experimental::{
-        DENUO_EXTENSION_MAX_PACKET_PAYLOAD, DENUO_EXTENSION_PACKET, DENUO_EXTENSION_SERVICE,
+        SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD, SHAKESCAPE_EXTENSION_PACKET,
+        SHAKESCAPE_EXTENSION_SERVICE,
     };
     use tokio::io::{duplex, AsyncWriteExt};
 
@@ -2488,44 +2490,47 @@ mod tests {
     }
 
     #[test]
-    fn full_control_queue_disables_only_denuo_admission() {
-        let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
-        let mut denuo = DenuoCoordinator::new(
+    fn full_control_queue_disables_only_shakescape_admission() {
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+        let mut shakescape = ShakescapeCoordinator::new(
             PeerDirection::Outbound,
             Network::Regtest,
             services,
             7,
             Duration::from_secs(1),
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         )
-        .expect("Denuo coordinator");
-        denuo.observe_remote_services(services);
-        let action = denuo.on_ready(Instant::now());
+        .expect("Shakescape coordinator");
+        shakescape.observe_remote_services(services);
+        let action = shakescape.on_ready(Instant::now());
         let (control_tx, _control_rx) = mpsc::channel(1);
         control_tx
             .try_send(Arc::new(Packet::SendHeaders))
             .expect("fill ordinary control queue");
 
-        let _ = admit_denuo_action(&mut denuo, action, &control_tx);
+        let _ = admit_shakescape_action(&mut shakescape, action, &control_tx);
 
-        assert_eq!(denuo.diagnostics().phase, DenuoPeerPhase::Disabled);
         assert_eq!(
-            denuo.diagnostics().disable_reason,
-            Some(DenuoDisableReason::LocalSendUnavailable)
+            shakescape.diagnostics().phase,
+            ShakescapePeerPhase::Disabled
+        );
+        assert_eq!(
+            shakescape.diagnostics().disable_reason,
+            Some(ShakescapeDisableReason::LocalSendUnavailable)
         );
     }
 
     #[tokio::test]
     async fn timed_out_queued_hello_is_dropped_but_ack_still_drains() {
-        let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
         let now = Instant::now();
-        let mut outbound = DenuoCoordinator::new(
+        let mut outbound = ShakescapeCoordinator::new(
             PeerDirection::Outbound,
             Network::Regtest,
             services,
             7,
             Duration::from_millis(1),
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         )
         .expect("outbound coordinator");
         outbound.observe_remote_services(services);
@@ -2539,13 +2544,13 @@ mod tests {
             now,
         );
 
-        let mut inbound = DenuoCoordinator::new(
+        let mut inbound = ShakescapeCoordinator::new(
             PeerDirection::Inbound,
             Network::Regtest,
             services,
             8,
             Duration::from_secs(1),
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         )
         .expect("inbound coordinator");
         inbound.observe_remote_services(services);
@@ -2566,7 +2571,7 @@ mod tests {
             "127.0.0.1:12041".parse().expect("peer address"),
             PeerDirection::Outbound,
         );
-        refresh_denuo_snapshot(&mut initial_snapshot, &outbound);
+        refresh_shakescape_snapshot(&mut initial_snapshot, &outbound);
         let snapshot = Arc::new(RwLock::new(initial_snapshot));
         let (writer_io, reader_io) = duplex(64 * 1024);
         let (critical_tx, critical_rx) = mpsc::channel::<CriticalOutbound>(1);
@@ -2661,15 +2666,15 @@ mod tests {
             pong_timeout: Duration::from_millis(200),
             ..PeerRuntimeConfig::default()
         };
-        let denuo = DenuoCoordinator::new(
+        let shakescape = ShakescapeCoordinator::new(
             PeerDirection::Inbound,
             Network::Regtest,
             SERVICE_NETWORK,
             7,
-            config.denuo_negotiation_timeout,
-            DenuoRuntimeMetrics::default(),
+            config.shakescape_negotiation_timeout,
+            ShakescapeRuntimeMetrics::default(),
         )
-        .expect("Denuo coordinator");
+        .expect("Shakescape coordinator");
         let TestHip76ReaderChannels {
             commands: hip76_rx,
             wire: hip76_wire_tx,
@@ -2687,7 +2692,7 @@ mod tests {
             peer,
             PeerDirection::Inbound,
             test_version([1; 8]),
-            denuo,
+            shakescape,
             test_hip76(PeerDirection::Inbound, SERVICE_NETWORK),
             odoh,
             experimental,
@@ -2769,13 +2774,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_denuo_packet_is_scoped_and_handshake_remains_available() {
+    async fn early_shakescape_packet_is_scoped_and_handshake_remains_available() {
         let (peer_io, mut remote_io) = duplex(64 * 1024);
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let (control_tx, _control_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let peer = PeerId(2);
-        let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
         let snapshot = Arc::new(RwLock::new(PeerSnapshot::new(
             peer,
             "127.0.0.1:12039".parse().expect("peer address"),
@@ -2788,15 +2793,15 @@ mod tests {
             pong_timeout: Duration::from_secs(1),
             ..PeerRuntimeConfig::default()
         };
-        let denuo = DenuoCoordinator::new(
+        let shakescape = ShakescapeCoordinator::new(
             PeerDirection::Inbound,
             Network::Regtest,
             services,
             9,
-            config.denuo_negotiation_timeout,
-            DenuoRuntimeMetrics::default(),
+            config.shakescape_negotiation_timeout,
+            ShakescapeRuntimeMetrics::default(),
         )
-        .expect("Denuo coordinator");
+        .expect("Shakescape coordinator");
         let TestHip76ReaderChannels {
             commands: hip76_rx,
             wire: hip76_wire_tx,
@@ -2814,7 +2819,7 @@ mod tests {
             peer,
             PeerDirection::Inbound,
             test_version_with_services([3; 8], services),
-            denuo,
+            shakescape,
             test_hip76(PeerDirection::Inbound, services),
             odoh,
             experimental,
@@ -2855,10 +2860,10 @@ mod tests {
         assert!(matches!(ready, PeerEvent::Ready { peer: target, .. } if target == peer));
         let state = snapshot.read().await.clone();
         assert_eq!(state.state, PeerState::Ready);
-        assert_eq!(state.denuo.phase, DenuoPeerPhase::Disabled);
+        assert_eq!(state.shakescape.phase, ShakescapePeerPhase::Disabled);
         assert_eq!(
-            state.denuo.disable_reason,
-            Some(DenuoDisableReason::UnexpectedMessage)
+            state.shakescape.disable_reason,
+            Some(ShakescapeDisableReason::UnexpectedMessage)
         );
 
         let ordinary = Packet::GetAddr;
@@ -2887,13 +2892,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_oversized_denuo_frames_do_not_close_a_ready_peer() {
+    async fn repeated_oversized_shakescape_frames_do_not_close_a_ready_peer() {
         let (peer_io, mut remote_io) = duplex(128 * 1024);
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let (control_tx, _control_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let peer = PeerId(3);
-        let services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
         let snapshot = Arc::new(RwLock::new(PeerSnapshot::new(
             peer,
             "127.0.0.1:12040".parse().expect("peer address"),
@@ -2906,16 +2911,16 @@ mod tests {
             pong_timeout: Duration::from_secs(5),
             ..PeerRuntimeConfig::default()
         };
-        let metrics = DenuoRuntimeMetrics::default();
-        let denuo = DenuoCoordinator::new(
+        let metrics = ShakescapeRuntimeMetrics::default();
+        let shakescape = ShakescapeCoordinator::new(
             PeerDirection::Inbound,
             Network::Regtest,
             services,
             10,
-            config.denuo_negotiation_timeout,
+            config.shakescape_negotiation_timeout,
             metrics.clone(),
         )
-        .expect("Denuo coordinator");
+        .expect("Shakescape coordinator");
         let TestHip76ReaderChannels {
             commands: hip76_rx,
             wire: hip76_wire_tx,
@@ -2933,7 +2938,7 @@ mod tests {
             peer,
             PeerDirection::Inbound,
             test_version_with_services([5; 8], services),
-            denuo,
+            shakescape,
             test_hip76(PeerDirection::Inbound, services),
             odoh,
             experimental,
@@ -2972,8 +2977,8 @@ mod tests {
         assert!(matches!(ready, PeerEvent::Ready { peer: target, .. } if target == peer));
 
         let oversized = Frame::new(
-            PacketType::Unknown(DENUO_EXTENSION_PACKET.value()),
-            vec![0; DENUO_EXTENSION_MAX_PACKET_PAYLOAD + 1],
+            PacketType::Unknown(SHAKESCAPE_EXTENSION_PACKET.value()),
+            vec![0; SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD + 1],
         )
         .expect("globally bounded extension frame");
         let oversized =
@@ -3007,16 +3012,16 @@ mod tests {
 
         let state = snapshot.read().await.clone();
         assert_eq!(state.state, PeerState::Ready);
-        assert_eq!(state.denuo.phase, DenuoPeerPhase::Disabled);
+        assert_eq!(state.shakescape.phase, ShakescapePeerPhase::Disabled);
         assert_eq!(
-            state.denuo.disable_reason,
-            Some(DenuoDisableReason::PacketTooLarge)
+            state.shakescape.disable_reason,
+            Some(ShakescapeDisableReason::PacketTooLarge)
         );
-        let summary = metrics.summary(services, &[state.denuo]);
+        let summary = metrics.summary(services, &[state.shakescape]);
         assert_eq!(summary.process.disabled, 1);
         assert_eq!(summary.process.rejected, 2);
         assert_eq!(
-            summary.rejection_reasons[DenuoDisableReason::PacketTooLarge.index()].count,
+            summary.rejection_reasons[ShakescapeDisableReason::PacketTooLarge.index()].count,
             2
         );
 

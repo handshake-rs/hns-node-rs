@@ -60,7 +60,7 @@ readiness bit. See [Native mainnet mining canary](mainnet-canary.md) for
 the runnable sync command and exact runtime qualification boundary.
 
 Live peers also negotiate the collision-detectable
-[Denuo Experimental V1 profile](experimental-mainnet-profile.md) after
+[Shakescape Experimental V1 profile](experimental-mainnet-profile.md) after
 ordinary Handshake readiness. Its service bit advertises only the extension
 envelope; it neither represents nor changes requester, opaque-relayer, output,
 HNSR, or market-role consent.
@@ -76,8 +76,8 @@ remains untrusted input for a separate resolver/DNSSEC validation boundary.
 
 The bounded HIP-77 ODoH requester is likewise wired through live peers and is
 enabled by default with durable opt-out and explicit re-enable. It requires
-exact Brontide proxy authentication, both Denuo and ODoH service advertisements,
-exact Denuo V1 profile/registry/network/genesis evidence, and a proxy key
+exact Brontide proxy authentication, both Shakescape and ODoH service advertisements,
+exact Shakescape V1 profile/registry/network/genesis evidence, and a proxy key
 distinct from the target-signed locator. Request correlation,
 deadlines, negotiated bounds, disconnect cleanup, policy revocation, and
 socket-write acknowledgement are enforced in the live runtime. Only verified
@@ -90,7 +90,7 @@ higher resolver boundary parses, correlates, and DNSSEC-validates them.
 HIP-78 requester and opaque circuit relay are wired through live authenticated
 peers and default on with independent durable opt-outs and explicit re-enable.
 The runtime admits only HNS
-Node v1 over exact Brontide and canonical Denuo V1 evidence, acknowledges real
+Node v1 over exact Brontide and canonical Shakescape V1 evidence, acknowledges real
 destination writes, revokes connection-owned state on lifecycle failure, and
 persists only checksummed policy/counter/generation/time state. Relay service
 advertisement remains unavailable until an explicit valid advertise address
@@ -114,7 +114,7 @@ Implemented:
 
 - Independent root and fuzz-workspace CI for locked metadata and dependency
   policy, formatting, Clippy, feature matrices, tests, release builds, and
-  RustSec checks, followed by a two-node regtest P2P/Denuo qualification.
+  RustSec checks, followed by a two-node regtest P2P/Shakescape qualification.
 - Explicit validation-stage bits rather than coarse `tx_valid` or
   `state_connected` labels.
 - `disabled`, legacy `shadow`, fail-closed `native`, reserved `hsd-verified`, and explicitly gated
@@ -223,13 +223,13 @@ Implemented:
   wallet-index retirement/profile tests with zero failures and 15 filtered,
   using the existing prebuilt RocksDB archive under `ROCKSDB_COMPILE=0`. It was
   not a RocksDB reopen, live restart/reorg, adversarial, or full-gate run.
-- A bounded hash-first Denuo marketplace relay/cache core with five separate
+- A bounded hash-first Shakescape marketplace relay/cache core with five separate
   roles is implemented with pre-validation peer charging, automatic malformed
   strikes, consequential bounded scores/bans, and indexed expiry. Live
   marketplace wire advertisement remains disabled. Exact crates.io `hns-rs`
   `=0.3.0` artifacts from the published, non-yanked, provenance-verified
   19-package cohort are now pinned, but the active peer transport remains
-  Denuo V1 and no typed marketplace adapter is installed or qualified.
+  Shakescape V1 and no typed marketplace adapter is installed or qualified.
   No live swap engine is claimed.
 - Opt-in `--prune-undo-history` retirement at HSD's exact per-network
   `pruneAfterHeight`/`keepBlocks` horizon. Each atomic retirement clears the
@@ -674,7 +674,7 @@ cargo build --locked --release --manifest-path Cargo.toml \
 
 The complete gate ends by launching two isolated regtest `hsrd` processes,
 waiting for both standard Handshake peers to remain ready after canonical
-Denuo registry negotiation, and checking their matching fingerprints and
+Shakescape registry negotiation, and checking their matching fingerprints and
 bidirectional traffic through qname-free local diagnostics. Ports may be
 overridden with `HNS_NODE_RPC_A`, `HNS_NODE_RPC_B`, `HNS_NODE_P2P_A`, and
 `HNS_NODE_P2P_B`.

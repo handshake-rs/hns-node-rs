@@ -16,14 +16,14 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use clap::{ArgAction, Parser, ValueEnum};
 use hns_consensus::Network;
 use hns_marketplace_protocol::{
-    DenuoHnsaEndpointBinding, DenuoHrmRootBinding, DenuoPublicationAcceptancePolicy,
+    ShakescapeHnsaEndpointBinding, ShakescapeHrmRootBinding, ShakescapePublicationAcceptancePolicy,
 };
 use hns_mempool::{MempoolLimits, HSD_MEMPOOL_EXPIRY_TIME};
 use hns_node::{
     init_logging, recommended_template_build_limits, validate_node_config, AuthorityMode,
-    DenuoRelayAcceptanceSigner, DenuoRelayRoles, MiningEngineConfig, NameTreeCompactionConfig,
-    NativeSyncConfig, NodeConfig, NodeService, RpcAuthorizationHeader, RpcLimits, ShutdownSignal,
-    StorageMode, UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
+    MiningEngineConfig, NameTreeCompactionConfig, NativeSyncConfig, NodeConfig, NodeService,
+    RpcAuthorizationHeader, RpcLimits, ShakescapeRelayAcceptanceSigner, ShakescapeRelayRoles,
+    ShutdownSignal, StorageMode, UndoRetentionConfig, DEFAULT_NAME_TREE_COMPACTION_INTERVAL,
     DEFAULT_RPC_MAX_COLLECTION_ENTRIES, DEFAULT_RPC_MAX_CONCURRENT_REQUESTS,
     DEFAULT_RPC_MAX_REQUEST_BYTES, MAX_RPC_AUTHORIZATION_BYTES,
 };
@@ -34,8 +34,8 @@ use serde::Deserialize;
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_RPC_AUTHORIZATION_FILE_BYTES: usize = MAX_RPC_AUTHORIZATION_BYTES + 2;
-const MAX_DENUO_ACCEPTANCE_POLICY_FILE_BYTES: usize = 8 * 1024;
-const MAX_DENUO_ACCEPTANCE_KEY_FILE_BYTES: usize = 66;
+const MAX_SHAKESCAPE_ACCEPTANCE_POLICY_FILE_BYTES: usize = 8 * 1024;
+const MAX_SHAKESCAPE_ACCEPTANCE_KEY_FILE_BYTES: usize = 66;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -109,34 +109,34 @@ struct Cli {
     wallet_index: bool,
 
     /// Enable the local name-market relay core for an installed native adapter.
-    #[arg(long = "denuo-name-market-relay")]
-    denuo_name_market_relay: bool,
+    #[arg(long = "shakescape-name-market-relay")]
+    shakescape_name_market_relay: bool,
 
     /// Mode-0600 JSON policy binding local publication receipts to one exact
     /// HRM-authorized HNSA endpoint.
-    #[arg(long = "denuo-name-market-acceptance-policy-file")]
-    denuo_name_market_acceptance_policy_file: Option<PathBuf>,
+    #[arg(long = "shakescape-name-market-acceptance-policy-file")]
+    shakescape_name_market_acceptance_policy_file: Option<PathBuf>,
 
     /// Mode-0600 file containing the endpoint private key as exactly 64 hex
     /// characters (with one optional trailing newline).
-    #[arg(long = "denuo-name-market-acceptance-key-file")]
-    denuo_name_market_acceptance_key_file: Option<PathBuf>,
+    #[arg(long = "shakescape-name-market-acceptance-key-file")]
+    shakescape_name_market_acceptance_key_file: Option<PathBuf>,
 
     /// Enable the local cross-chain relay core for an installed native adapter.
-    #[arg(long = "denuo-cross-chain-relay")]
-    denuo_cross_chain_relay: bool,
+    #[arg(long = "shakescape-cross-chain-relay")]
+    shakescape_cross_chain_relay: bool,
 
     /// Enable the local price relay core for an installed native adapter.
-    #[arg(long = "denuo-price-relay")]
-    denuo_price_relay: bool,
+    #[arg(long = "shakescape-price-relay")]
+    shakescape_price_relay: bool,
 
     /// Enable the local rendezvous relay core for an installed native adapter.
-    #[arg(long = "denuo-rendezvous-relay")]
-    denuo_rendezvous_relay: bool,
+    #[arg(long = "shakescape-rendezvous-relay")]
+    shakescape_rendezvous_relay: bool,
 
     /// Enable the local swap-status relay core for an installed native adapter.
-    #[arg(long = "denuo-swap-status-relay")]
-    denuo_swap_status_relay: bool,
+    #[arg(long = "shakescape-swap-status-relay")]
+    shakescape_swap_status_relay: bool,
 
     /// Compact retained durable name-tree nodes when the startup height is due.
     #[arg(long)]
@@ -350,14 +350,14 @@ impl Cli {
         };
         let (recommended_template_workers, recommended_template_queue) =
             recommended_template_build_limits(&mempool_limits, self.template_variants);
-        let denuo_name_market_acceptance_signer = match (
-            self.denuo_name_market_acceptance_policy_file.as_deref(),
-            self.denuo_name_market_acceptance_key_file.as_deref(),
+        let shakescape_name_market_acceptance_signer = match (
+            self.shakescape_name_market_acceptance_policy_file.as_deref(),
+            self.shakescape_name_market_acceptance_key_file.as_deref(),
         ) {
-            (Some(policy), Some(key)) => Some(read_denuo_acceptance_signer(policy, key)?),
+            (Some(policy), Some(key)) => Some(read_shakescape_acceptance_signer(policy, key)?),
             (None, None) => None,
             _ => anyhow::bail!(
-                "Denuo name-market acceptance policy and private-key files must be configured together"
+                "Shakescape name-market acceptance policy and private-key files must be configured together"
             ),
         };
         Ok(NodeConfig {
@@ -380,14 +380,14 @@ impl Cli {
             script_history_index: self.script_history_index,
             spender_index: self.spender_index,
             wallet_index: self.wallet_index,
-            denuo_relay_roles: DenuoRelayRoles::new(
-                self.denuo_name_market_relay,
-                self.denuo_cross_chain_relay,
-                self.denuo_price_relay,
-                self.denuo_rendezvous_relay,
-                self.denuo_swap_status_relay,
+            shakescape_relay_roles: ShakescapeRelayRoles::new(
+                self.shakescape_name_market_relay,
+                self.shakescape_cross_chain_relay,
+                self.shakescape_price_relay,
+                self.shakescape_rendezvous_relay,
+                self.shakescape_swap_status_relay,
             ),
-            denuo_name_market_acceptance_signer,
+            shakescape_name_market_acceptance_signer,
             name_tree_compaction: NameTreeCompactionConfig {
                 compact_on_startup: self.compact_name_tree_on_startup,
                 startup_interval: self.name_tree_compaction_interval,
@@ -514,17 +514,17 @@ fn read_rpc_authorization(path: &Path) -> anyhow::Result<RpcAuthorizationHeader>
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DenuoAcceptancePolicyFile {
+struct ShakescapeAcceptancePolicyFile {
     network_magic: u32,
     network_genesis: String,
-    hrm: DenuoHrmPolicyFile,
-    hnsa: DenuoHnsaPolicyFile,
+    hrm: ShakescapeHrmPolicyFile,
+    hnsa: ShakescapeHnsaPolicyFile,
     maximum_receipt_lifetime_seconds: u32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DenuoHrmPolicyFile {
+struct ShakescapeHrmPolicyFile {
     subject: String,
     sequence: u64,
     envelope_hash: String,
@@ -535,7 +535,7 @@ struct DenuoHrmPolicyFile {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DenuoHnsaPolicyFile {
+struct ShakescapeHnsaPolicyFile {
     canonical_service_name: String,
     application_profile_id: u16,
     service_resource_id: String,
@@ -548,18 +548,18 @@ struct DenuoHnsaPolicyFile {
     effective_expires_at_unix: u64,
 }
 
-fn read_denuo_acceptance_signer(
+fn read_shakescape_acceptance_signer(
     policy_path: &Path,
     key_path: &Path,
-) -> anyhow::Result<DenuoRelayAcceptanceSigner> {
+) -> anyhow::Result<ShakescapeRelayAcceptanceSigner> {
     let policy_bytes = read_private_regular_file(
         policy_path,
-        MAX_DENUO_ACCEPTANCE_POLICY_FILE_BYTES,
-        "Denuo acceptance policy",
+        MAX_SHAKESCAPE_ACCEPTANCE_POLICY_FILE_BYTES,
+        "Shakescape acceptance policy",
     )?;
-    let wire: DenuoAcceptancePolicyFile = serde_json::from_slice(&policy_bytes)
-        .map_err(|error| anyhow::anyhow!("invalid Denuo acceptance policy JSON: {error}"))?;
-    let policy = DenuoPublicationAcceptancePolicy::new(
+    let wire: ShakescapeAcceptancePolicyFile = serde_json::from_slice(&policy_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid Shakescape acceptance policy JSON: {error}"))?;
+    let policy = ShakescapePublicationAcceptancePolicy::new(
         NetworkBinding {
             magic: wire.network_magic,
             genesis: ProtocolBlockHash::new(decode_policy_hex(
@@ -567,7 +567,7 @@ fn read_denuo_acceptance_signer(
                 "network genesis",
             )?),
         },
-        DenuoHrmRootBinding {
+        ShakescapeHrmRootBinding {
             subject: decode_policy_hex(&wire.hrm.subject, "HRM subject")?,
             sequence: wire.hrm.sequence,
             envelope_hash: decode_policy_hex(&wire.hrm.envelope_hash, "HRM envelope hash")?,
@@ -575,7 +575,7 @@ fn read_denuo_acceptance_signer(
             chain_work_be: decode_policy_hex(&wire.hrm.chain_work_be, "HRM chain work")?,
             chain_anchor: decode_policy_hex(&wire.hrm.chain_anchor, "HRM chain anchor")?,
         },
-        DenuoHnsaEndpointBinding {
+        ShakescapeHnsaEndpointBinding {
             canonical_service_name: wire.hnsa.canonical_service_name.into_bytes(),
             application_profile_id: wire.hnsa.application_profile_id,
             service_resource_id: decode_policy_hex(
@@ -601,12 +601,12 @@ fn read_denuo_acceptance_signer(
         },
         wire.maximum_receipt_lifetime_seconds,
     )
-    .map_err(|error| anyhow::anyhow!("invalid Denuo acceptance policy: {error}"))?;
+    .map_err(|error| anyhow::anyhow!("invalid Shakescape acceptance policy: {error}"))?;
 
     let mut key_bytes = Zeroizing::new(read_private_regular_file(
         key_path,
-        MAX_DENUO_ACCEPTANCE_KEY_FILE_BYTES,
-        "Denuo acceptance private key",
+        MAX_SHAKESCAPE_ACCEPTANCE_KEY_FILE_BYTES,
+        "Shakescape acceptance private key",
     )?);
     while key_bytes
         .last()
@@ -615,13 +615,13 @@ fn read_denuo_acceptance_signer(
         key_bytes.pop();
     }
     if key_bytes.len() != 64 || !key_bytes.iter().all(u8::is_ascii_hexdigit) {
-        anyhow::bail!("Denuo acceptance private key must contain exactly 64 hex characters");
+        anyhow::bail!("Shakescape acceptance private key must contain exactly 64 hex characters");
     }
     let mut endpoint_private_key = [0u8; 32];
     hex::decode_to_slice(key_bytes.as_slice(), &mut endpoint_private_key)
-        .map_err(|_| anyhow::anyhow!("Denuo acceptance private key is invalid hex"))?;
+        .map_err(|_| anyhow::anyhow!("Shakescape acceptance private key is invalid hex"))?;
     key_bytes.zeroize();
-    let signer = DenuoRelayAcceptanceSigner::new(policy, endpoint_private_key)
+    let signer = ShakescapeRelayAcceptanceSigner::new(policy, endpoint_private_key)
         .map_err(|error| anyhow::anyhow!(error))?;
     endpoint_private_key.zeroize();
     Ok(signer)
@@ -630,13 +630,13 @@ fn read_denuo_acceptance_signer(
 fn decode_policy_hex<const N: usize>(value: &str, label: &str) -> anyhow::Result<[u8; N]> {
     if value.len() != N * 2 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         anyhow::bail!(
-            "Denuo acceptance {label} must contain exactly {} hex characters",
+            "Shakescape acceptance {label} must contain exactly {} hex characters",
             N * 2
         );
     }
     let mut decoded = [0u8; N];
     hex::decode_to_slice(value, &mut decoded)
-        .map_err(|_| anyhow::anyhow!("Denuo acceptance {label} is invalid hex"))?;
+        .map_err(|_| anyhow::anyhow!("Shakescape acceptance {label} is invalid hex"))?;
     Ok(decoded)
 }
 
@@ -775,7 +775,7 @@ async fn main() -> anyhow::Result<()> {
             script_history_index = config.script_history_index,
             spender_index = config.spender_index,
             wallet_index = config.wallet_index,
-            denuo_relay_roles = config.denuo_relay_roles.bits(),
+            shakescape_relay_roles = config.shakescape_relay_roles.bits(),
             rpc_max_request_bytes = config.rpc_limits.maximum_request_bytes,
             rpc_max_concurrent_requests = config.rpc_limits.maximum_concurrent_requests,
             rpc_execution_timeout_ms = config.rpc_limits.execution_timeout.as_millis(),

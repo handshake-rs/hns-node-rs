@@ -1,22 +1,23 @@
-//! Node-owned handle and typed name-market adapter for the bounded Denuo relay.
+//! Node-owned handle and typed name-market adapter for the bounded Shakescape relay.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
 
-use hns_denuo_market_relay::{
+use hns_marketplace_protocol::{
+    sign_shakescape_publication_acceptance, NameMarketHello, NameMarketMessage,
+    ShakescapePublicationAcceptanceExpectation, ShakescapePublicationAcceptancePolicy,
+    ShakescapePublicationMessageKind, ShakescapeRegistryVersion, MAX_NAME_OFFERS_PER_MESSAGE,
+    MAX_SHAKESCAPE_MARKET_PAYLOAD,
+};
+use hns_p2p::PeerId;
+use hns_primitives::blake2b_256;
+use hns_shakescape_market_relay::{
     Announcement, AnnouncementAdmission, ObjectAdmission, ObjectHash, PeerIdentity, RelayError,
     RelayKind, RelayLimits, RelayObject, RelayRoles, RelayStatus, RelayStore, SignerIdentity,
     SignerPolicy,
 };
-use hns_marketplace_protocol::{
-    sign_denuo_publication_acceptance, DenuoPublicationAcceptanceExpectation,
-    DenuoPublicationAcceptancePolicy, DenuoPublicationMessageKind, DenuoRegistryVersion,
-    NameMarketHello, NameMarketMessage, MAX_DENUO_MARKET_PAYLOAD, MAX_NAME_OFFERS_PER_MESSAGE,
-};
-use hns_p2p::PeerId;
-use hns_primitives::blake2b_256;
 use hns_swap::{FixedPriceListing, ListingCancellation};
 use k256::ecdsa::SigningKey;
 use sha2::{Digest, Sha256};
@@ -24,19 +25,19 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 /// Maximum live seller/name rows in the process-local typed adapter.
-pub const MAX_DENUO_NAME_MARKET_RECORDS: usize = 4_096;
+pub const MAX_SHAKESCAPE_NAME_MARKET_RECORDS: usize = 4_096;
 /// Maximum durable-consumer events retained by the process-local adapter.
-pub const MAX_DENUO_NAME_MARKET_EVENTS: usize = 8_192;
+pub const MAX_SHAKESCAPE_NAME_MARKET_EVENTS: usize = 8_192;
 /// Maximum events exposed by one authenticated local wallet RPC call.
-pub const MAX_DENUO_NAME_MARKET_EVENT_PAGE: usize = 256;
+pub const MAX_SHAKESCAPE_NAME_MARKET_EVENT_PAGE: usize = 256;
 /// Maximum latest-state records exposed by one authenticated snapshot page.
-pub const MAX_DENUO_NAME_MARKET_SNAPSHOT_PAGE: usize = 256;
+pub const MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE: usize = 256;
 /// Maximum correlated peer requests retained at once.
-const MAX_DENUO_NAME_MARKET_PENDING_REQUESTS: usize = 1_024;
-const DENUO_NAME_MARKET_REQUEST_LIFETIME_SECONDS: u64 = 15;
+const MAX_SHAKESCAPE_NAME_MARKET_PENDING_REQUESTS: usize = 1_024;
+const SHAKESCAPE_NAME_MARKET_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const LOCAL_WALLET_RELAY_PEER: [u8; 32] = [0x57; 32];
-const NAME_MARKET_IDENTITY_DOMAIN: &[u8] = b"hns-node/denuo-name-market-identity/v1";
-const DENUO_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-denuo-outbox-envelope-v1\0";
+const NAME_MARKET_IDENTITY_DOMAIN: &[u8] = b"hns-node/shakescape-name-market-identity/v1";
+const SHAKESCAPE_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-shakescape-outbox-envelope-v1\0";
 
 /// Endpoint signing authority for exact local wallet handoff receipts.
 ///
@@ -44,26 +45,26 @@ const DENUO_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-denuo-outbox-envelop
 /// accessor. Equality exists only so complete node configurations retain their
 /// established deterministic comparison semantics.
 #[derive(Clone)]
-pub struct DenuoRelayAcceptanceSigner {
-    policy: DenuoPublicationAcceptancePolicy,
+pub struct ShakescapeRelayAcceptanceSigner {
+    policy: ShakescapePublicationAcceptancePolicy,
     endpoint_private_key: Arc<Zeroizing<[u8; 32]>>,
 }
 
-impl DenuoRelayAcceptanceSigner {
+impl ShakescapeRelayAcceptanceSigner {
     pub fn new(
-        policy: DenuoPublicationAcceptancePolicy,
+        policy: ShakescapePublicationAcceptancePolicy,
         endpoint_private_key: [u8; 32],
-    ) -> Result<Self, DenuoRelayAcceptanceSignerError> {
+    ) -> Result<Self, ShakescapeRelayAcceptanceSignerError> {
         let endpoint_private_key = Zeroizing::new(endpoint_private_key);
         let signing_key = SigningKey::from_bytes((&*endpoint_private_key).into())
-            .map_err(|_| DenuoRelayAcceptanceSignerError::InvalidPrivateKey)?;
+            .map_err(|_| ShakescapeRelayAcceptanceSignerError::InvalidPrivateKey)?;
         if signing_key
             .verifying_key()
             .to_encoded_point(true)
             .as_bytes()
             != policy.hnsa().endpoint_public_key
         {
-            return Err(DenuoRelayAcceptanceSignerError::KeyMismatch);
+            return Err(ShakescapeRelayAcceptanceSignerError::KeyMismatch);
         }
         Ok(Self {
             policy,
@@ -71,48 +72,50 @@ impl DenuoRelayAcceptanceSigner {
         })
     }
 
-    pub const fn policy(&self) -> &DenuoPublicationAcceptancePolicy {
+    pub const fn policy(&self) -> &ShakescapePublicationAcceptancePolicy {
         &self.policy
     }
 
     fn sign(
         &self,
-        expectation: DenuoPublicationAcceptanceExpectation,
+        expectation: ShakescapePublicationAcceptanceExpectation,
         accepted_at_unix: u64,
-    ) -> Result<Vec<u8>, DenuoRelayHandleError> {
+    ) -> Result<Vec<u8>, ShakescapeRelayHandleError> {
         let maximum_expiry = accepted_at_unix
             .checked_add(u64::from(self.policy.maximum_receipt_lifetime_seconds()))
-            .ok_or(DenuoRelayHandleError::NameMarket(
-                "Denuo acceptance receipt time overflowed",
+            .ok_or(ShakescapeRelayHandleError::NameMarket(
+                "Shakescape acceptance receipt time overflowed",
             ))?;
         let expires_at_unix = maximum_expiry.min(self.policy.hnsa().effective_expires_at_unix);
         if expires_at_unix <= accepted_at_unix {
-            return Err(DenuoRelayHandleError::NameMarket(
-                "Denuo acceptance endpoint is outside its effective window",
+            return Err(ShakescapeRelayHandleError::NameMarket(
+                "Shakescape acceptance endpoint is outside its effective window",
             ));
         }
-        sign_denuo_publication_acceptance(
+        sign_shakescape_publication_acceptance(
             &self.policy,
             expectation,
             accepted_at_unix,
             expires_at_unix,
             &self.endpoint_private_key,
         )
-        .map_err(|_| DenuoRelayHandleError::NameMarket("failed to sign Denuo acceptance receipt"))
+        .map_err(|_| {
+            ShakescapeRelayHandleError::NameMarket("failed to sign Shakescape acceptance receipt")
+        })
     }
 }
 
-impl std::fmt::Debug for DenuoRelayAcceptanceSigner {
+impl std::fmt::Debug for ShakescapeRelayAcceptanceSigner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("DenuoRelayAcceptanceSigner")
+            .debug_struct("ShakescapeRelayAcceptanceSigner")
             .field("policy", &self.policy)
             .field("endpoint_private_key", &"[REDACTED]")
             .finish()
     }
 }
 
-impl PartialEq for DenuoRelayAcceptanceSigner {
+impl PartialEq for ShakescapeRelayAcceptanceSigner {
     fn eq(&self, other: &Self) -> bool {
         self.policy == other.policy
             && self.endpoint_private_key.as_ref().as_ref()
@@ -120,24 +123,24 @@ impl PartialEq for DenuoRelayAcceptanceSigner {
     }
 }
 
-impl Eq for DenuoRelayAcceptanceSigner {}
+impl Eq for ShakescapeRelayAcceptanceSigner {}
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum DenuoRelayAcceptanceSignerError {
-    #[error("Denuo relay acceptance private key is invalid")]
+pub enum ShakescapeRelayAcceptanceSignerError {
+    #[error("Shakescape relay acceptance private key is invalid")]
     InvalidPrivateKey,
-    #[error("Denuo relay acceptance private key does not match the HNSA endpoint")]
+    #[error("Shakescape relay acceptance private key does not match the HNSA endpoint")]
     KeyMismatch,
 }
 
 /// Public event kind projected to the authenticated local wallet transport.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DenuoNameMarketEventKind {
+pub enum ShakescapeNameMarketEventKind {
     Offer,
     Cancellation,
 }
 
-impl DenuoNameMarketEventKind {
+impl ShakescapeNameMarketEventKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Offer => "offer",
@@ -148,10 +151,10 @@ impl DenuoNameMarketEventKind {
 
 /// One exact canonical singular envelope admitted by the typed adapter.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoNameMarketEvent {
+pub struct ShakescapeNameMarketEvent {
     pub revision: u64,
     pub received_at_unix: u64,
-    pub kind: DenuoNameMarketEventKind,
+    pub kind: ShakescapeNameMarketEventKind,
     pub content_hash: [u8; 32],
     pub envelope_bytes: Vec<u8>,
 }
@@ -159,36 +162,36 @@ pub struct DenuoNameMarketEvent {
 /// One bounded local event page. A consumer behind `oldest_revision` must
 /// rebuild from a fresh active inventory rather than silently skipping rows.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoNameMarketEventPage {
+pub struct ShakescapeNameMarketEventPage {
     pub instance_nonce: [u8; 32],
     pub cursor_reset: bool,
     pub oldest_revision: u64,
     pub head_revision: u64,
-    pub events: Vec<DenuoNameMarketEvent>,
+    pub events: Vec<ShakescapeNameMarketEvent>,
 }
 
 /// One latest seller/name state in a coherent process-local snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoNameMarketSnapshotRecord {
-    pub kind: DenuoNameMarketEventKind,
+pub struct ShakescapeNameMarketSnapshotRecord {
+    pub kind: ShakescapeNameMarketEventKind,
     pub content_hash: [u8; 32],
     pub envelope_bytes: Vec<u8>,
 }
 
 /// A coherent bounded page over the adapter's latest seller/name states.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoNameMarketSnapshotPage {
+pub struct ShakescapeNameMarketSnapshotPage {
     pub instance_nonce: [u8; 32],
     pub snapshot_revision: u64,
     pub next_offset: Option<usize>,
-    pub records: Vec<DenuoNameMarketSnapshotRecord>,
+    pub records: Vec<ShakescapeNameMarketSnapshotRecord>,
 }
 
 /// Result of one local or peer publication admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoNameMarketAdmission {
+pub struct ShakescapeNameMarketAdmission {
     pub revision: u64,
-    pub kind: DenuoNameMarketEventKind,
+    pub kind: ShakescapeNameMarketEventKind,
     pub content_hash: [u8; 32],
     pub inserted: bool,
     pub(crate) rebroadcast: Option<NameMarketMessage>,
@@ -196,7 +199,7 @@ pub struct DenuoNameMarketAdmission {
 
 /// One exact response/request that the native peer event loop must send.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoNameMarketSend {
+pub struct ShakescapeNameMarketSend {
     pub peer: PeerId,
     pub request_id: u64,
     pub message: NameMarketMessage,
@@ -204,9 +207,9 @@ pub struct DenuoNameMarketSend {
 
 /// Complete bounded result of consuming one typed peer message.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DenuoNameMarketDispatch {
-    pub sends: Vec<DenuoNameMarketSend>,
-    pub admissions: Vec<DenuoNameMarketAdmission>,
+pub struct ShakescapeNameMarketDispatch {
+    pub sends: Vec<ShakescapeNameMarketSend>,
+    pub admissions: Vec<ShakescapeNameMarketAdmission>,
 }
 
 #[derive(Clone, Debug)]
@@ -230,19 +233,19 @@ struct PendingNameMarketRequest {
 }
 
 #[derive(Debug)]
-struct DenuoNameMarketState {
+struct ShakescapeNameMarketState {
     network_magic: u32,
     network_genesis: [u8; 32],
     records: BTreeMap<[u8; 32], NameMarketRecord>,
     listing_index: BTreeMap<[u8; 32], [u8; 32]>,
-    events: VecDeque<DenuoNameMarketEvent>,
+    events: VecDeque<ShakescapeNameMarketEvent>,
     revision: u64,
     next_request_id: u64,
     pending: HashMap<(PeerId, u64), PendingNameMarketRequest>,
     hello_peers: BTreeSet<PeerId>,
 }
 
-impl DenuoNameMarketState {
+impl ShakescapeNameMarketState {
     fn new(network_magic: u32, network_genesis: [u8; 32]) -> Self {
         Self {
             network_magic,
@@ -270,50 +273,50 @@ impl DenuoNameMarketState {
 }
 
 #[derive(Debug)]
-struct DenuoRelayService {
+struct ShakescapeRelayService {
     relay: RelayStore,
-    name_market: DenuoNameMarketState,
-    acceptance_signer: Option<DenuoRelayAcceptanceSigner>,
+    name_market: ShakescapeNameMarketState,
+    acceptance_signer: Option<ShakescapeRelayAcceptanceSigner>,
 }
 
-/// Shared bounded Denuo relay service for native runtime extensions.
+/// Shared bounded Shakescape relay service for native runtime extensions.
 ///
 /// The handle exposes only verified canonical object storage and abuse policy;
 /// it has no signing, matching, pricing, or funds interface.
 #[derive(Clone)]
-pub struct DenuoRelayHandle {
-    inner: Arc<Mutex<DenuoRelayService>>,
+pub struct ShakescapeRelayHandle {
+    inner: Arc<Mutex<ShakescapeRelayService>>,
 }
 
-impl std::fmt::Debug for DenuoRelayHandle {
+impl std::fmt::Debug for ShakescapeRelayHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("DenuoRelayHandle")
+            .debug_struct("ShakescapeRelayHandle")
             .finish_non_exhaustive()
     }
 }
 
 /// Node relay-handle failure.
 #[derive(Debug, Error)]
-pub enum DenuoRelayHandleError {
+pub enum ShakescapeRelayHandleError {
     /// Relay policy rejected the operation.
     #[error(transparent)]
     Relay(#[from] RelayError),
     /// A caller panic poisoned the process-local relay lock.
-    #[error("Denuo relay lock poisoned")]
+    #[error("Shakescape relay lock poisoned")]
     LockPoisoned,
     /// Typed name-market semantics or correlation rejected the message.
-    #[error("Denuo name-market message rejected: {0}")]
+    #[error("Shakescape name-market message rejected: {0}")]
     NameMarket(&'static str),
 }
 
-impl DenuoRelayHandle {
+impl ShakescapeRelayHandle {
     pub(crate) fn new(
         roles: RelayRoles,
         limits: RelayLimits,
         network_magic: u32,
         network_genesis: [u8; 32],
-        acceptance_signer: Option<DenuoRelayAcceptanceSigner>,
+        acceptance_signer: Option<ShakescapeRelayAcceptanceSigner>,
     ) -> Result<Self, RelayError> {
         if acceptance_signer.as_ref().is_some_and(|signer| {
             let network = signer.policy().network();
@@ -322,9 +325,9 @@ impl DenuoRelayHandle {
             return Err(RelayError::InvalidLimits);
         }
         Ok(Self {
-            inner: Arc::new(Mutex::new(DenuoRelayService {
+            inner: Arc::new(Mutex::new(ShakescapeRelayService {
                 relay: RelayStore::new(roles, limits)?,
-                name_market: DenuoNameMarketState::new(network_magic, network_genesis),
+                name_market: ShakescapeNameMarketState::new(network_magic, network_genesis),
                 acceptance_signer,
             })),
         })
@@ -336,10 +339,10 @@ impl DenuoRelayHandle {
         peer: PeerIdentity,
         announcement: Announcement,
         now: u64,
-    ) -> Result<AnnouncementAdmission, DenuoRelayHandleError> {
+    ) -> Result<AnnouncementAdmission, ShakescapeRelayHandleError> {
         self.inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?
             .relay
             .announce(peer, announcement, now)
             .map_err(Into::into)
@@ -351,10 +354,10 @@ impl DenuoRelayHandle {
         peer: PeerIdentity,
         object: RelayObject,
         now: u64,
-    ) -> Result<ObjectAdmission, DenuoRelayHandleError> {
+    ) -> Result<ObjectAdmission, ShakescapeRelayHandleError> {
         self.inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?
             .relay
             .put(peer, object, now)
             .map_err(Into::into)
@@ -366,11 +369,11 @@ impl DenuoRelayHandle {
         kind: RelayKind,
         hash: ObjectHash,
         now: u64,
-    ) -> Result<Option<RelayObject>, DenuoRelayHandleError> {
+    ) -> Result<Option<RelayObject>, ShakescapeRelayHandleError> {
         Ok(self
             .inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?
             .relay
             .get(kind, hash, now)
             .cloned())
@@ -381,10 +384,10 @@ impl DenuoRelayHandle {
         &self,
         signer: SignerIdentity,
         policy: SignerPolicy,
-    ) -> Result<(), DenuoRelayHandleError> {
+    ) -> Result<(), ShakescapeRelayHandleError> {
         self.inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?
             .relay
             .set_signer_policy(signer, policy)
             .map_err(Into::into)
@@ -395,21 +398,21 @@ impl DenuoRelayHandle {
         &self,
         peer: PeerIdentity,
         now: u64,
-    ) -> Result<(), DenuoRelayHandleError> {
+    ) -> Result<(), ShakescapeRelayHandleError> {
         self.inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?
             .relay
             .penalize_malformed(peer, now)
             .map_err(Into::into)
     }
 
     /// Read bounded name-free role/cache/abuse status.
-    pub fn status(&self, now: u64) -> Result<RelayStatus, DenuoRelayHandleError> {
+    pub fn status(&self, now: u64) -> Result<RelayStatus, ShakescapeRelayHandleError> {
         Ok(self
             .inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?
             .relay
             .status(now))
     }
@@ -422,26 +425,26 @@ impl DenuoRelayHandle {
         &self,
         envelope_bytes: &[u8],
         now: u64,
-    ) -> Result<DenuoNameMarketAdmission, DenuoRelayHandleError> {
+    ) -> Result<ShakescapeNameMarketAdmission, ShakescapeRelayHandleError> {
         let (registry, request_id, message) = NameMarketMessage::decode_envelope(envelope_bytes)
-            .map_err(|_| DenuoRelayHandleError::NameMarket("invalid canonical envelope"))?;
-        if registry != DenuoRegistryVersion::V2 || request_id == 0 {
-            return Err(DenuoRelayHandleError::NameMarket(
-                "local publication requires Denuo V2 and a nonzero request ID",
+            .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid canonical envelope"))?;
+        if registry != ShakescapeRegistryVersion::V1 || request_id == 0 {
+            return Err(ShakescapeRelayHandleError::NameMarket(
+                "local publication requires Shakescape V1 and a nonzero request ID",
             ));
         }
         let encoded = message
             .encode_envelope(registry, request_id)
-            .map_err(|_| DenuoRelayHandleError::NameMarket("invalid canonical envelope"))?;
+            .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid canonical envelope"))?;
         if encoded != envelope_bytes {
-            return Err(DenuoRelayHandleError::NameMarket(
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "local publication envelope is not canonical",
             ));
         }
         let mut service = self
             .inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?;
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
         match message {
             NameMarketMessage::Offer(listing) => admit_listing(
                 &mut service,
@@ -457,7 +460,7 @@ impl DenuoRelayHandle {
                 request_id,
                 now,
             ),
-            _ => Err(DenuoRelayHandleError::NameMarket(
+            _ => Err(ShakescapeRelayHandleError::NameMarket(
                 "local publication accepts only singular offers and cancellations",
             )),
         }
@@ -468,21 +471,21 @@ impl DenuoRelayHandle {
     pub fn submit_name_market_handoff(
         &self,
         envelope_bytes: &[u8],
-        expectation: DenuoPublicationAcceptanceExpectation,
+        expectation: ShakescapePublicationAcceptanceExpectation,
         now: u64,
-    ) -> Result<(DenuoNameMarketAdmission, Vec<u8>), DenuoRelayHandleError> {
+    ) -> Result<(ShakescapeNameMarketAdmission, Vec<u8>), ShakescapeRelayHandleError> {
         let (registry, request_id, message) = NameMarketMessage::decode_envelope(envelope_bytes)
-            .map_err(|_| DenuoRelayHandleError::NameMarket("invalid canonical envelope"))?;
-        if registry != DenuoRegistryVersion::V2 || request_id == 0 {
-            return Err(DenuoRelayHandleError::NameMarket(
-                "local publication requires Denuo V2 and a nonzero request ID",
+            .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid canonical envelope"))?;
+        if registry != ShakescapeRegistryVersion::V1 || request_id == 0 {
+            return Err(ShakescapeRelayHandleError::NameMarket(
+                "local publication requires Shakescape V1 and a nonzero request ID",
             ));
         }
         let encoded = message
             .encode_envelope(registry, request_id)
-            .map_err(|_| DenuoRelayHandleError::NameMarket("invalid canonical envelope"))?;
+            .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid canonical envelope"))?;
         if encoded != envelope_bytes {
-            return Err(DenuoRelayHandleError::NameMarket(
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "local publication envelope is not canonical",
             ));
         }
@@ -491,13 +494,14 @@ impl DenuoRelayHandle {
         let mut service = self
             .inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?;
-        let signer = service
-            .acceptance_signer
-            .clone()
-            .ok_or(DenuoRelayHandleError::NameMarket(
-                "Denuo publication acceptance signer is not configured",
-            ))?;
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        let signer =
+            service
+                .acceptance_signer
+                .clone()
+                .ok_or(ShakescapeRelayHandleError::NameMarket(
+                    "Shakescape publication acceptance signer is not configured",
+                ))?;
         let admission = match message {
             NameMarketMessage::Offer(listing) => admit_listing(
                 &mut service,
@@ -514,7 +518,7 @@ impl DenuoRelayHandle {
                 now,
             )?,
             _ => {
-                return Err(DenuoRelayHandleError::NameMarket(
+                return Err(ShakescapeRelayHandleError::NameMarket(
                     "local publication accepts only singular offers and cancellations",
                 ));
             }
@@ -532,24 +536,24 @@ impl DenuoRelayHandle {
         request_id: u64,
         message: NameMarketMessage,
         now: u64,
-    ) -> Result<DenuoNameMarketDispatch, DenuoRelayHandleError> {
+    ) -> Result<ShakescapeNameMarketDispatch, ShakescapeRelayHandleError> {
         let mut service = self
             .inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?;
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
         service.name_market.expire_pending(now);
-        let mut dispatch = DenuoNameMarketDispatch::default();
+        let mut dispatch = ShakescapeNameMarketDispatch::default();
         match message {
             NameMarketMessage::Hello(hello) => {
                 validate_market_hello(&service.name_market, hello)?;
                 if service.name_market.hello_peers.insert(peer) {
-                    dispatch.sends.push(DenuoNameMarketSend {
+                    dispatch.sends.push(ShakescapeNameMarketSend {
                         peer,
                         request_id: request_id.max(1),
                         message: NameMarketMessage::Hello(local_market_hello(&service.name_market)),
                     });
                     let inventory_request = service.name_market.next_request_id();
-                    dispatch.sends.push(DenuoNameMarketSend {
+                    dispatch.sends.push(ShakescapeNameMarketSend {
                         peer,
                         request_id: inventory_request,
                         message: NameMarketMessage::GetOfferInventory,
@@ -557,7 +561,7 @@ impl DenuoRelayHandle {
                 }
             }
             NameMarketMessage::GetOfferInventory => {
-                dispatch.sends.push(DenuoNameMarketSend {
+                dispatch.sends.push(ShakescapeNameMarketSend {
                     peer,
                     request_id,
                     message: NameMarketMessage::OfferInventory(active_inventory(
@@ -572,8 +576,10 @@ impl DenuoRelayHandle {
                     .filter(|hash| !active_listing_known(&service.name_market, *hash, now))
                     .collect::<Vec<_>>();
                 for chunk in missing.chunks(MAX_NAME_OFFERS_PER_MESSAGE) {
-                    if service.name_market.pending.len() >= MAX_DENUO_NAME_MARKET_PENDING_REQUESTS {
-                        return Err(DenuoRelayHandleError::NameMarket(
+                    if service.name_market.pending.len()
+                        >= MAX_SHAKESCAPE_NAME_MARKET_PENDING_REQUESTS
+                    {
+                        return Err(ShakescapeRelayHandleError::NameMarket(
                             "name-market peer request capacity reached",
                         ));
                     }
@@ -584,10 +590,10 @@ impl DenuoRelayHandle {
                         PendingNameMarketRequest {
                             hashes: hashes.clone(),
                             expires_at_unix: now
-                                .saturating_add(DENUO_NAME_MARKET_REQUEST_LIFETIME_SECONDS),
+                                .saturating_add(SHAKESCAPE_NAME_MARKET_REQUEST_LIFETIME_SECONDS),
                         },
                     );
-                    dispatch.sends.push(DenuoNameMarketSend {
+                    dispatch.sends.push(ShakescapeNameMarketSend {
                         peer,
                         request_id,
                         message: NameMarketMessage::GetOffers(hashes),
@@ -600,7 +606,7 @@ impl DenuoRelayHandle {
                     .filter_map(|hash| active_listing(&service.name_market, hash, now))
                     .collect::<Vec<_>>();
                 if !listings.is_empty() {
-                    dispatch.sends.push(DenuoNameMarketSend {
+                    dispatch.sends.push(ShakescapeNameMarketSend {
                         peer,
                         request_id,
                         message: NameMarketMessage::Offers(listings),
@@ -612,14 +618,14 @@ impl DenuoRelayHandle {
                     .name_market
                     .pending
                     .remove(&(peer, request_id))
-                    .ok_or(DenuoRelayHandleError::NameMarket(
+                    .ok_or(ShakescapeRelayHandleError::NameMarket(
                         "uncorrelated name-market offer batch",
                     ))?;
                 let returned = listings
                     .iter()
                     .map(|listing| {
                         listing.listing_hash().map_err(|_| {
-                            DenuoRelayHandleError::NameMarket("invalid listing signature")
+                            ShakescapeRelayHandleError::NameMarket("invalid listing signature")
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -627,7 +633,7 @@ impl DenuoRelayHandle {
                     .iter()
                     .any(|hash| expected.hashes.binary_search(hash).is_err())
                 {
-                    return Err(DenuoRelayHandleError::NameMarket(
+                    return Err(ShakescapeRelayHandleError::NameMarket(
                         "offer batch does not match its request",
                     ));
                 }
@@ -639,7 +645,7 @@ impl DenuoRelayHandle {
             }
             NameMarketMessage::GetOffer(hash) => {
                 if let Some(listing) = active_listing(&service.name_market, hash, now) {
-                    dispatch.sends.push(DenuoNameMarketSend {
+                    dispatch.sends.push(ShakescapeNameMarketSend {
                         peer,
                         request_id,
                         message: NameMarketMessage::Offer(listing),
@@ -651,14 +657,14 @@ impl DenuoRelayHandle {
                     .name_market
                     .pending
                     .remove(&(peer, request_id))
-                    .ok_or(DenuoRelayHandleError::NameMarket(
+                    .ok_or(ShakescapeRelayHandleError::NameMarket(
                         "uncorrelated singular name-market offer",
                     ))?;
-                let hash = listing
-                    .listing_hash()
-                    .map_err(|_| DenuoRelayHandleError::NameMarket("invalid listing signature"))?;
+                let hash = listing.listing_hash().map_err(|_| {
+                    ShakescapeRelayHandleError::NameMarket("invalid listing signature")
+                })?;
                 if expected.hashes.as_slice() != [hash] {
-                    return Err(DenuoRelayHandleError::NameMarket(
+                    return Err(ShakescapeRelayHandleError::NameMarket(
                         "singular offer does not match its request",
                     ));
                 }
@@ -695,16 +701,17 @@ impl DenuoRelayHandle {
         instance_nonce: [u8; 32],
         after_revision: u64,
         limit: usize,
-    ) -> Result<DenuoNameMarketEventPage, DenuoRelayHandleError> {
-        if instance_nonce == [0; 32] || limit == 0 || limit > MAX_DENUO_NAME_MARKET_EVENT_PAGE {
-            return Err(DenuoRelayHandleError::NameMarket(
+    ) -> Result<ShakescapeNameMarketEventPage, ShakescapeRelayHandleError> {
+        if instance_nonce == [0; 32] || limit == 0 || limit > MAX_SHAKESCAPE_NAME_MARKET_EVENT_PAGE
+        {
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "invalid name-market event page limit",
             ));
         }
         let service = self
             .inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?;
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
         let oldest_revision = service
             .name_market
             .events
@@ -713,7 +720,7 @@ impl DenuoRelayHandle {
                 event.revision
             });
         if after_revision > service.name_market.revision {
-            return Err(DenuoRelayHandleError::NameMarket(
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "name-market event cursor is outside the retained window",
             ));
         }
@@ -725,7 +732,7 @@ impl DenuoRelayHandle {
             .take(limit)
             .cloned()
             .collect();
-        Ok(DenuoNameMarketEventPage {
+        Ok(ShakescapeNameMarketEventPage {
             instance_nonce,
             cursor_reset: false,
             oldest_revision,
@@ -743,21 +750,24 @@ impl DenuoRelayHandle {
         expected_revision: Option<u64>,
         offset: usize,
         limit: usize,
-    ) -> Result<DenuoNameMarketSnapshotPage, DenuoRelayHandleError> {
-        if instance_nonce == [0; 32] || limit == 0 || limit > MAX_DENUO_NAME_MARKET_SNAPSHOT_PAGE {
-            return Err(DenuoRelayHandleError::NameMarket(
+    ) -> Result<ShakescapeNameMarketSnapshotPage, ShakescapeRelayHandleError> {
+        if instance_nonce == [0; 32]
+            || limit == 0
+            || limit > MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE
+        {
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "invalid name-market snapshot page limit",
             ));
         }
         let service = self
             .inner
             .lock()
-            .map_err(|_| DenuoRelayHandleError::LockPoisoned)?;
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
         let revision = service.name_market.revision;
         if expected_revision.is_some_and(|expected| expected != revision)
             || offset > service.name_market.records.len()
         {
-            return Err(DenuoRelayHandleError::NameMarket(
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "name-market snapshot changed during traversal",
             ));
         }
@@ -767,21 +777,24 @@ impl DenuoRelayHandle {
             .values()
             .skip(offset)
             .take(limit)
-            .map(|record| -> Result<_, DenuoRelayHandleError> {
+            .map(|record| -> Result<_, ShakescapeRelayHandleError> {
                 let (kind, content_hash) = match &record.state {
                     NameMarketRecordState::Active { .. } => {
-                        (DenuoNameMarketEventKind::Offer, record.listing_hash)
+                        (ShakescapeNameMarketEventKind::Offer, record.listing_hash)
                     }
                     NameMarketRecordState::Cancelled { cancellation } => {
                         let cancellation_hash = cancellation.cancellation_hash().map_err(|_| {
-                            DenuoRelayHandleError::NameMarket(
+                            ShakescapeRelayHandleError::NameMarket(
                                 "retained name-market cancellation identity is invalid",
                             )
                         })?;
-                        (DenuoNameMarketEventKind::Cancellation, cancellation_hash)
+                        (
+                            ShakescapeNameMarketEventKind::Cancellation,
+                            cancellation_hash,
+                        )
                     }
                 };
-                Ok(DenuoNameMarketSnapshotRecord {
+                Ok(ShakescapeNameMarketSnapshotRecord {
                     kind,
                     content_hash,
                     envelope_bytes: record.envelope_bytes.clone(),
@@ -791,11 +804,11 @@ impl DenuoRelayHandle {
         let consumed =
             offset
                 .checked_add(records.len())
-                .ok_or(DenuoRelayHandleError::NameMarket(
+                .ok_or(ShakescapeRelayHandleError::NameMarket(
                     "name-market snapshot cursor overflowed",
                 ))?;
         let next_offset = (consumed < service.name_market.records.len()).then_some(consumed);
-        Ok(DenuoNameMarketSnapshotPage {
+        Ok(ShakescapeNameMarketSnapshotPage {
             instance_nonce,
             snapshot_revision: revision,
             next_offset,
@@ -808,32 +821,32 @@ fn validate_handoff_expectation(
     envelope_bytes: &[u8],
     request_id: u64,
     message: &NameMarketMessage,
-    expectation: DenuoPublicationAcceptanceExpectation,
+    expectation: ShakescapePublicationAcceptanceExpectation,
     now: u64,
-) -> Result<(), DenuoRelayHandleError> {
+) -> Result<(), ShakescapeRelayHandleError> {
     let (network, content_id, message_kind) = match message {
         NameMarketMessage::Offer(listing) => (
             listing.network(),
             listing
                 .listing_hash()
-                .map_err(|_| DenuoRelayHandleError::NameMarket("invalid listing identity"))?,
-            DenuoPublicationMessageKind::Offer,
+                .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing identity"))?,
+            ShakescapePublicationMessageKind::Offer,
         ),
         NameMarketMessage::Cancel(cancellation) => (
             cancellation.network,
-            cancellation
-                .cancellation_hash()
-                .map_err(|_| DenuoRelayHandleError::NameMarket("invalid cancellation identity"))?,
-            DenuoPublicationMessageKind::Cancellation,
+            cancellation.cancellation_hash().map_err(|_| {
+                ShakescapeRelayHandleError::NameMarket("invalid cancellation identity")
+            })?,
+            ShakescapePublicationMessageKind::Cancellation,
         ),
         _ => {
-            return Err(DenuoRelayHandleError::NameMarket(
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "local publication accepts only singular offers and cancellations",
             ));
         }
     };
     let mut envelope_id = Sha256::new();
-    envelope_id.update(DENUO_OUTBOX_ENVELOPE_ID_DOMAIN);
+    envelope_id.update(SHAKESCAPE_OUTBOX_ENVELOPE_ID_DOMAIN);
     envelope_id.update(envelope_bytes);
     let envelope_id: [u8; 32] = envelope_id.finalize().into();
     let envelope_digest: [u8; 32] = Sha256::digest(envelope_bytes).into();
@@ -846,42 +859,42 @@ fn validate_handoff_expectation(
         || expectation.envelope_digest != envelope_digest
         || expectation.prepared_at_unix > now
     {
-        return Err(DenuoRelayHandleError::NameMarket(
-            "Denuo handoff does not match its canonical envelope",
+        return Err(ShakescapeRelayHandleError::NameMarket(
+            "Shakescape handoff does not match its canonical envelope",
         ));
     }
     Ok(())
 }
 
 fn validate_market_hello(
-    state: &DenuoNameMarketState,
+    state: &ShakescapeNameMarketState,
     hello: NameMarketHello,
-) -> Result<(), DenuoRelayHandleError> {
+) -> Result<(), ShakescapeRelayHandleError> {
     if hello.hns_magic != state.network_magic
         || hello.hns_genesis.as_bytes() != &state.network_genesis
         || hello.maximum_payload == 0
         || usize::try_from(hello.maximum_payload)
             .ok()
-            .is_none_or(|maximum| maximum > MAX_DENUO_MARKET_PAYLOAD)
+            .is_none_or(|maximum| maximum > MAX_SHAKESCAPE_MARKET_PAYLOAD)
     {
-        return Err(DenuoRelayHandleError::NameMarket(
+        return Err(ShakescapeRelayHandleError::NameMarket(
             "name-market hello has the wrong network or bounds",
         ));
     }
     Ok(())
 }
 
-fn local_market_hello(state: &DenuoNameMarketState) -> NameMarketHello {
+fn local_market_hello(state: &ShakescapeNameMarketState) -> NameMarketHello {
     NameMarketHello {
         hns_magic: state.network_magic,
         hns_genesis: state.network_genesis.into(),
-        maximum_payload: u32::try_from(MAX_DENUO_MARKET_PAYLOAD)
-            .expect("canonical Denuo market bound fits u32"),
+        maximum_payload: u32::try_from(MAX_SHAKESCAPE_MARKET_PAYLOAD)
+            .expect("canonical Shakescape market bound fits u32"),
         feature_flags: 0,
     }
 }
 
-fn active_inventory(state: &DenuoNameMarketState, now: u64) -> Vec<[u8; 32]> {
+fn active_inventory(state: &ShakescapeNameMarketState, now: u64) -> Vec<[u8; 32]> {
     state
         .records
         .values()
@@ -896,12 +909,12 @@ fn active_inventory(state: &DenuoNameMarketState, now: u64) -> Vec<[u8; 32]> {
         .collect()
 }
 
-fn active_listing_known(state: &DenuoNameMarketState, hash: [u8; 32], now: u64) -> bool {
+fn active_listing_known(state: &ShakescapeNameMarketState, hash: [u8; 32], now: u64) -> bool {
     active_listing(state, hash, now).is_some()
 }
 
 fn active_listing(
-    state: &DenuoNameMarketState,
+    state: &ShakescapeNameMarketState,
     hash: [u8; 32],
     now: u64,
 ) -> Option<FixedPriceListing> {
@@ -920,53 +933,53 @@ fn active_listing(
 }
 
 fn admit_listing(
-    service: &mut DenuoRelayService,
+    service: &mut ShakescapeRelayService,
     peer: PeerIdentity,
     listing: FixedPriceListing,
     request_id: u64,
     now: u64,
-) -> Result<DenuoNameMarketAdmission, DenuoRelayHandleError> {
+) -> Result<ShakescapeNameMarketAdmission, ShakescapeRelayHandleError> {
     listing
         .verify()
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid listing signature"))?;
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing signature"))?;
     if listing.network().magic != service.name_market.network_magic
         || listing.network().genesis.as_bytes() != &service.name_market.network_genesis
         || listing.created_at > now
         || listing.expires_at <= now
     {
-        return Err(DenuoRelayHandleError::NameMarket(
+        return Err(ShakescapeRelayHandleError::NameMarket(
             "listing has the wrong network or active window",
         ));
     }
     let listing_hash = listing
         .listing_hash()
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid listing identity"))?;
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing identity"))?;
     let identity = listing_identity(&listing)?;
     if let Some(existing) = service.name_market.records.get(&identity) {
         if existing.listing_hash == listing_hash
             && matches!(existing.state, NameMarketRecordState::Active { .. })
         {
-            return Ok(DenuoNameMarketAdmission {
+            return Ok(ShakescapeNameMarketAdmission {
                 revision: service.name_market.revision,
-                kind: DenuoNameMarketEventKind::Offer,
+                kind: ShakescapeNameMarketEventKind::Offer,
                 content_hash: listing_hash,
                 inserted: false,
                 rebroadcast: None,
             });
         }
         if listing.sequence <= existing.sequence {
-            return Err(DenuoRelayHandleError::NameMarket(
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "listing sequence does not advance seller/name state",
             ));
         }
-    } else if service.name_market.records.len() >= MAX_DENUO_NAME_MARKET_RECORDS {
-        return Err(DenuoRelayHandleError::NameMarket(
+    } else if service.name_market.records.len() >= MAX_SHAKESCAPE_NAME_MARKET_RECORDS {
+        return Err(ShakescapeRelayHandleError::NameMarket(
             "name-market record capacity reached",
         ));
     }
     let payload = listing
         .encode()
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid listing encoding"))?;
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing encoding"))?;
     admit_relay_object(
         &mut service.relay,
         peer,
@@ -978,8 +991,8 @@ fn admit_listing(
         now,
     )?;
     let envelope_bytes = NameMarketMessage::Offer(listing.clone())
-        .encode_envelope(DenuoRegistryVersion::V2, request_id)
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid listing envelope"))?;
+        .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing envelope"))?;
     if let Some(previous) = service.name_market.records.get(&identity) {
         service
             .name_market
@@ -1004,13 +1017,13 @@ fn admit_listing(
     append_event(
         &mut service.name_market,
         now,
-        DenuoNameMarketEventKind::Offer,
+        ShakescapeNameMarketEventKind::Offer,
         listing_hash,
         envelope_bytes,
     )?;
-    Ok(DenuoNameMarketAdmission {
+    Ok(ShakescapeNameMarketAdmission {
         revision: service.name_market.revision,
-        kind: DenuoNameMarketEventKind::Offer,
+        kind: ShakescapeNameMarketEventKind::Offer,
         content_hash: listing_hash,
         inserted: true,
         rebroadcast: Some(NameMarketMessage::OfferInventory(vec![listing_hash])),
@@ -1018,75 +1031,70 @@ fn admit_listing(
 }
 
 fn admit_cancellation(
-    service: &mut DenuoRelayService,
+    service: &mut ShakescapeRelayService,
     peer: PeerIdentity,
     cancellation: ListingCancellation,
     request_id: u64,
     now: u64,
-) -> Result<DenuoNameMarketAdmission, DenuoRelayHandleError> {
+) -> Result<ShakescapeNameMarketAdmission, ShakescapeRelayHandleError> {
     cancellation
         .verify()
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid cancellation signature"))?;
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid cancellation signature"))?;
     if cancellation.network.magic != service.name_market.network_magic
         || cancellation.network.genesis.as_bytes() != &service.name_market.network_genesis
         || cancellation.created_at > now
         || cancellation.expires_at <= now
     {
-        return Err(DenuoRelayHandleError::NameMarket(
+        return Err(ShakescapeRelayHandleError::NameMarket(
             "cancellation has the wrong network or active window",
         ));
     }
     let cancellation_hash = cancellation
         .cancellation_hash()
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid cancellation identity"))?;
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid cancellation identity"))?;
     let identity = *service
         .name_market
         .listing_index
         .get(&cancellation.listing_hash)
-        .ok_or(DenuoRelayHandleError::NameMarket(
+        .ok_or(ShakescapeRelayHandleError::NameMarket(
             "cancellation target listing is unavailable",
         ))?;
-    let existing =
-        service
-            .name_market
-            .records
-            .get(&identity)
-            .ok_or(DenuoRelayHandleError::NameMarket(
-                "cancellation target state is unavailable",
-            ))?;
+    let existing = service.name_market.records.get(&identity).ok_or(
+        ShakescapeRelayHandleError::NameMarket("cancellation target state is unavailable"),
+    )?;
     let listing = match &existing.state {
         NameMarketRecordState::Active { listing, .. } => listing.clone(),
         NameMarketRecordState::Cancelled {
             cancellation: durable,
         } => {
-            let durable_hash = durable
-                .cancellation_hash()
-                .map_err(|_| DenuoRelayHandleError::NameMarket("invalid retained cancellation"))?;
+            let durable_hash = durable.cancellation_hash().map_err(|_| {
+                ShakescapeRelayHandleError::NameMarket("invalid retained cancellation")
+            })?;
             if durable_hash == cancellation_hash {
-                return Ok(DenuoNameMarketAdmission {
+                return Ok(ShakescapeNameMarketAdmission {
                     revision: service.name_market.revision,
-                    kind: DenuoNameMarketEventKind::Cancellation,
+                    kind: ShakescapeNameMarketEventKind::Cancellation,
                     content_hash: cancellation_hash,
                     inserted: false,
                     rebroadcast: None,
                 });
             }
-            return Err(DenuoRelayHandleError::NameMarket(
+            return Err(ShakescapeRelayHandleError::NameMarket(
                 "cancellation does not advance seller/name state",
             ));
         }
     };
     cancellation
         .verify_for_listing(&listing, cancellation.network, now)
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid listing cancellation"))?;
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing cancellation"))?;
     if cancellation.sequence <= existing.sequence {
-        return Err(DenuoRelayHandleError::NameMarket(
+        return Err(ShakescapeRelayHandleError::NameMarket(
             "cancellation sequence does not advance seller/name state",
         ));
     }
     let payload = cancellation
         .encode()
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid cancellation encoding"))?;
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid cancellation encoding"))?;
     admit_relay_object(
         &mut service.relay,
         peer,
@@ -1098,8 +1106,8 @@ fn admit_cancellation(
         now,
     )?;
     let envelope_bytes = NameMarketMessage::Cancel(cancellation.clone())
-        .encode_envelope(DenuoRegistryVersion::V2, request_id)
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid cancellation envelope"))?;
+        .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid cancellation envelope"))?;
     service.name_market.records.insert(
         identity,
         NameMarketRecord {
@@ -1114,13 +1122,13 @@ fn admit_cancellation(
     append_event(
         &mut service.name_market,
         now,
-        DenuoNameMarketEventKind::Cancellation,
+        ShakescapeNameMarketEventKind::Cancellation,
         cancellation_hash,
         envelope_bytes,
     )?;
-    Ok(DenuoNameMarketAdmission {
+    Ok(ShakescapeNameMarketAdmission {
         revision: service.name_market.revision,
-        kind: DenuoNameMarketEventKind::Cancellation,
+        kind: ShakescapeNameMarketEventKind::Cancellation,
         content_hash: cancellation_hash,
         inserted: true,
         rebroadcast: Some(NameMarketMessage::Cancel(cancellation)),
@@ -1137,7 +1145,7 @@ fn admit_relay_object(
     expires_at: u64,
     payload: Vec<u8>,
     now: u64,
-) -> Result<(), DenuoRelayHandleError> {
+) -> Result<(), ShakescapeRelayHandleError> {
     let object = RelayObject::new(
         RelayKind::NameMarket,
         signer,
@@ -1152,16 +1160,16 @@ fn admit_relay_object(
             Ok(())
         }
         AnnouncementAdmission::AlreadyStored => Ok(()),
-        AnnouncementAdmission::AlreadyPending => Err(DenuoRelayHandleError::NameMarket(
+        AnnouncementAdmission::AlreadyPending => Err(ShakescapeRelayHandleError::NameMarket(
             "relay object fetch is already pending from another delivery",
         )),
     }
 }
 
-fn listing_identity(listing: &FixedPriceListing) -> Result<[u8; 32], DenuoRelayHandleError> {
+fn listing_identity(listing: &FixedPriceListing) -> Result<[u8; 32], ShakescapeRelayHandleError> {
     let name_hash = listing
         .name_hash()
-        .map_err(|_| DenuoRelayHandleError::NameMarket("invalid listing name"))?;
+        .map_err(|_| ShakescapeRelayHandleError::NameMarket("invalid listing name"))?;
     let mut identity = Vec::with_capacity(
         NAME_MARKET_IDENTITY_DOMAIN.len() + listing.seller_public_key().len() + 32,
     );
@@ -1172,27 +1180,28 @@ fn listing_identity(listing: &FixedPriceListing) -> Result<[u8; 32], DenuoRelayH
 }
 
 fn append_event(
-    state: &mut DenuoNameMarketState,
+    state: &mut ShakescapeNameMarketState,
     received_at_unix: u64,
-    kind: DenuoNameMarketEventKind,
+    kind: ShakescapeNameMarketEventKind,
     content_hash: [u8; 32],
     envelope_bytes: Vec<u8>,
-) -> Result<(), DenuoRelayHandleError> {
-    if envelope_bytes.is_empty() || envelope_bytes.len() > MAX_DENUO_MARKET_PAYLOAD {
-        return Err(DenuoRelayHandleError::NameMarket(
+) -> Result<(), ShakescapeRelayHandleError> {
+    if envelope_bytes.is_empty() || envelope_bytes.len() > MAX_SHAKESCAPE_MARKET_PAYLOAD {
+        return Err(ShakescapeRelayHandleError::NameMarket(
             "name-market event envelope exceeds bounds",
         ));
     }
-    state.revision = state
-        .revision
-        .checked_add(1)
-        .ok_or(DenuoRelayHandleError::NameMarket(
-            "name-market revision exhausted",
-        ))?;
-    if state.events.len() == MAX_DENUO_NAME_MARKET_EVENTS {
+    state.revision =
+        state
+            .revision
+            .checked_add(1)
+            .ok_or(ShakescapeRelayHandleError::NameMarket(
+                "name-market revision exhausted",
+            ))?;
+    if state.events.len() == MAX_SHAKESCAPE_NAME_MARKET_EVENTS {
         state.events.pop_front();
     }
-    state.events.push_back(DenuoNameMarketEvent {
+    state.events.push_back(ShakescapeNameMarketEvent {
         revision: state.revision,
         received_at_unix,
         kind,

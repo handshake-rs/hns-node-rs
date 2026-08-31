@@ -5,7 +5,7 @@ squashing its source history.
 
 ## Source identity
 
-- Source repository: `https://github.com/denuoweb/MeshMine.git`
+- Source repository: `https://github.com/shakescapeweb/MeshMine.git`
 - Source branch at extraction: `codex/external-rust-node-and-experimental-p2p`
 - Source commit: `67a11290d410dc88113c4c3516ce9d22e8640a49`
 - Extracted prefix: `hsrd`
@@ -49,7 +49,7 @@ this standalone repository as documented.
 
 The extraction hashes above are immutable provenance. Later standalone commits
 qualified the workspace, promoted retained mainnet historical replay, and
-added live Denuo registry and role-safe HIP-76 negotiation. At standalone commit
+added live Shakescape registry and role-safe HIP-76 negotiation. At standalone commit
 `42c76a622f2600a833835b4ca737d3350f73af52`, every
 `RpcConsensusReadiness` field is true and the strict mainnet canary can issue
 its private permit only for a synchronized, durably authoritative tip.
@@ -61,7 +61,7 @@ independent production endorsement.
 MeshMine's original external-node pin
 `504d3fed035feb8a637ca09c4e0816b6e1144622` already included the promoted
 historical-replay and invalid-corpus readiness but predated the later
-standalone Denuo/HIP-76 commits. Its current pin,
+standalone Shakescape/HIP-76 commits. Its current pin,
 `8bbcd61d96293ca5d895fe60845f180a94e5c38e`, is the actual integration
 boundary and still must not be described as consuming unpinned standalone HEAD
 features. Consumers must describe features against the revision they actually

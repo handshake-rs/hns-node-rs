@@ -12,11 +12,12 @@ use std::{
 
 use hns_consensus::Network;
 use hns_hnsr_protocol::{HNS_NODE_V1, HNS_WEB_V1};
-use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
+use hns_marketplace_protocol::{NameMarketMessage, ShakescapeRegistryVersion};
 use hns_p2p_experimental::{
     ExperimentalWireProfile, HnsrPolicy, ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION,
-    DENUO_EXTENSION_SERVICE, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_REGISTRY_PROTOCOL_VERSION,
-    DENUO_V2_REGISTRY_VERSION, ODOH_PACKET, ODOH_SERVICE, REGISTRY_NEGOTIATION_PROTOCOL_ID,
+    ODOH_PACKET, ODOH_SERVICE, REGISTRY_NEGOTIATION_PROTOCOL_ID, SHAKESCAPE_EXTENSION_SERVICE,
+    SHAKESCAPE_V1_REGISTRY_FINGERPRINT, SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION,
+    SHAKESCAPE_V1_REGISTRY_VERSION,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -27,7 +28,6 @@ use tokio::{
 use crate::{
     brontide::{inbound_handshake, outbound_handshake, BrontideIdentity, BrontideSession},
     constants::{DEFAULT_USER_AGENT, PROTOCOL_VERSION, SERVICE_NETWORK},
-    denuo::{extension_packet, DenuoRuntimeMetrics, DenuoSummary},
     experimental::{
         ExperimentalExchange, ExperimentalExchangeError, ExperimentalExchangeResponse,
         ExperimentalExchangeRuntime,
@@ -51,6 +51,7 @@ use crate::{
         spawn_brontide_peer_runtime, spawn_peer_runtime, OutboundPriority, PeerEvent, PeerHandle,
         PeerId, PeerRuntimeConfig, PeerRuntimeParameters, PeerSnapshot,
     },
+    shakescape::{extension_packet, ShakescapeRuntimeMetrics, ShakescapeSummary},
     wire::{NetAddress, NetworkMagic, Packet, VersionPacket},
     P2pError,
 };
@@ -141,7 +142,7 @@ impl LivePeerConfig {
             ban_score: 100,
             ban_time: Duration::from_secs(24 * 60 * 60),
             protocol_version: PROTOCOL_VERSION,
-            services: SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value(),
+            services: SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             no_relay: false,
             runtime: PeerRuntimeConfig::default(),
@@ -303,7 +304,7 @@ pub struct LivePeerManager {
     local_services: Arc<AtomicU64>,
     retired_bytes_sent: Arc<AtomicU64>,
     retired_bytes_received: Arc<AtomicU64>,
-    denuo_metrics: DenuoRuntimeMetrics,
+    shakescape_metrics: ShakescapeRuntimeMetrics,
     hip76_requester_policy: Arc<Mutex<Hip76RequesterPolicyRuntime>>,
     odoh: Arc<Mutex<OdohRequesterRuntime>>,
     experimental: Arc<Mutex<ExperimentalExchangeRuntime>>,
@@ -473,7 +474,7 @@ impl LivePeerManager {
                 local_services: Arc::new(AtomicU64::new(initial_services)),
                 retired_bytes_sent: Arc::new(AtomicU64::new(0)),
                 retired_bytes_received: Arc::new(AtomicU64::new(0)),
-                denuo_metrics: DenuoRuntimeMetrics::default(),
+                shakescape_metrics: ShakescapeRuntimeMetrics::default(),
                 hip76_requester_policy: Arc::new(Mutex::new(hip76_requester_policy)),
                 odoh: Arc::new(Mutex::new(odoh)),
                 experimental: Arc::new(Mutex::new(ExperimentalExchangeRuntime::default())),
@@ -704,7 +705,7 @@ impl LivePeerManager {
         snapshots
     }
 
-    /// Return exact live Denuo state and its negotiated registry for the
+    /// Return exact live Shakescape state and its negotiated registry for the
     /// authenticated static key selected by a platform adapter.
     pub async fn authenticated_experimental_peer(
         &self,
@@ -724,8 +725,8 @@ impl LivePeerManager {
             .and_then(|snapshot| snapshot.authenticated_experimental_evidence())
     }
 
-    pub async fn denuo_summary(&self) -> DenuoSummary {
-        self.snapshots_with_denuo_summary().await.1
+    pub async fn shakescape_summary(&self) -> ShakescapeSummary {
+        self.snapshots_with_shakescape_summary().await.1
     }
 
     /// Aggregate qname-free HIP-76 state across the currently live peer map.
@@ -847,14 +848,16 @@ impl LivePeerManager {
         })
     }
 
-    pub async fn snapshots_with_denuo_summary(&self) -> (Vec<PeerSnapshot>, DenuoSummary) {
+    pub async fn snapshots_with_shakescape_summary(
+        &self,
+    ) -> (Vec<PeerSnapshot>, ShakescapeSummary) {
         let snapshots = self.snapshots().await;
         let diagnostics = snapshots
             .iter()
-            .map(|snapshot| snapshot.denuo.clone())
+            .map(|snapshot| snapshot.shakescape.clone())
             .collect::<Vec<_>>();
         let summary = self
-            .denuo_metrics
+            .shakescape_metrics
             .summary(self.config.services, &diagnostics);
         (snapshots, summary)
     }
@@ -909,7 +912,7 @@ impl LivePeerManager {
     /// Send one canonical name-market message only to a peer with exact V2
     /// registry and protocol admission. The critical writer confirms that the
     /// frame reached the socket boundary before this call succeeds.
-    pub async fn send_denuo_name_market(
+    pub async fn send_shakescape_name_market(
         &self,
         peer: PeerId,
         request_id: u64,
@@ -923,16 +926,16 @@ impl LivePeerManager {
             .cloned()
             .ok_or(P2pError::PeerUnavailable(peer))?;
         let payload = message
-            .encode_envelope(DenuoRegistryVersion::V2, request_id)
+            .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
             .map_err(|error| {
                 P2pError::Protocol(format!(
-                    "canonical Denuo name-market encoding failed: {error}"
+                    "canonical Shakescape name-market encoding failed: {error}"
                 ))
             })?;
         let snapshot = handle.snapshot().await;
         if !exact_name_market_admission(&snapshot, self.config.network, payload.len()) {
             return Err(P2pError::Protocol(
-                "peer lacks exact Denuo V2 name-market admission".to_owned(),
+                "peer lacks exact Shakescape V1 name-market admission".to_owned(),
             ));
         }
         handle
@@ -946,7 +949,7 @@ impl LivePeerManager {
     /// Broadcast one canonical name-market message to every exactly admitted
     /// V2 peer. Failures are isolated per connection and returned to the
     /// caller rather than weakening admission for another peer.
-    pub async fn broadcast_denuo_name_market(
+    pub async fn broadcast_shakescape_name_market(
         &self,
         request_id: u64,
         message: &NameMarketMessage,
@@ -961,7 +964,10 @@ impl LivePeerManager {
         let mut report = BroadcastReport::default();
         for peer in candidates {
             report.attempted = report.attempted.saturating_add(1);
-            match self.send_denuo_name_market(peer, request_id, message).await {
+            match self
+                .send_shakescape_name_market(peer, request_id, message)
+                .await
+            {
                 Ok(()) => report.queued = report.queued.saturating_add(1),
                 Err(error) => report.failed.push((peer, error.to_string())),
             }
@@ -1502,15 +1508,15 @@ impl LivePeerManager {
             .await
             .into_iter()
             .filter_map(|snapshot| {
-                let wire_profile = snapshot.denuo_wire_profile?;
-                let negotiated = snapshot.denuo_negotiated_registry?;
+                let wire_profile = snapshot.shakescape_wire_profile?;
+                let negotiated = snapshot.shakescape_negotiated_registry?;
                 (snapshot.state == PeerState::Ready
                     && snapshot.transport == crate::PeerTransportKind::Brontide
                     && snapshot.authenticated_remote_static.is_some()
-                    && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
+                    && snapshot.services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0
                     && snapshot.services & hns_p2p_experimental::ODOH_SERVICE.value() != 0
-                    && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
-                    && wire_profile == hns_p2p_experimental::ExperimentalWireProfile::DenuoV2)
+                    && snapshot.shakescape.phase == crate::ShakescapePeerPhase::Negotiated
+                    && wire_profile == hns_p2p_experimental::ExperimentalWireProfile::ShakescapeV1)
                     .then_some(OdohProxyAdmission {
                         provenance: OdohPeerProvenance {
                             peer: snapshot.id,
@@ -1885,7 +1891,7 @@ impl LivePeerManager {
             config: self.config.runtime.clone(),
             critical_write_timeout: self.config.critical_broadcast_timeout,
             events: self.events.clone(),
-            denuo_metrics: self.denuo_metrics.clone(),
+            shakescape_metrics: self.shakescape_metrics.clone(),
             hip76_config,
             odoh: Arc::clone(&self.odoh),
             experimental: Arc::clone(&self.experimental),
@@ -1967,14 +1973,14 @@ fn hnsr_coordinator_config(config: &LivePeerConfig) -> HnsrCoordinatorConfig {
 }
 
 fn hnsr_admission_from_snapshot(snapshot: PeerSnapshot) -> Option<HnsrPeerAdmission> {
-    let wire_profile = snapshot.denuo_wire_profile?;
-    let negotiated = snapshot.denuo_negotiated_registry?;
+    let wire_profile = snapshot.shakescape_wire_profile?;
+    let negotiated = snapshot.shakescape_negotiated_registry?;
     (snapshot.state == PeerState::Ready
         && snapshot.transport == crate::PeerTransportKind::Brontide
         && snapshot.authenticated_remote_static.is_some()
-        && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
-        && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
-        && wire_profile == ExperimentalWireProfile::DenuoV2)
+        && snapshot.services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0
+        && snapshot.shakescape.phase == crate::ShakescapePeerPhase::Negotiated
+        && wire_profile == ExperimentalWireProfile::ShakescapeV1)
         .then_some(HnsrPeerAdmission {
             peer: snapshot.id,
             address: snapshot.address,
@@ -1992,10 +1998,10 @@ fn exact_experimental_admission(
     network: Network,
     packet_type: crate::PacketType,
 ) -> bool {
-    let Some(wire_profile) = snapshot.denuo_wire_profile else {
+    let Some(wire_profile) = snapshot.shakescape_wire_profile else {
         return false;
     };
-    let Some(negotiated) = snapshot.denuo_negotiated_registry.as_ref() else {
+    let Some(negotiated) = snapshot.shakescape_negotiated_registry.as_ref() else {
         return false;
     };
     let binding = OdohNetworkBinding::for_network(network);
@@ -2010,16 +2016,16 @@ fn exact_experimental_admission(
         _ => false,
     };
     service_available
-        && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
+        && snapshot.services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0
         && snapshot.transport == crate::PeerTransportKind::Brontide
         && snapshot.authenticated_remote_static.is_some()
-        && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
-        && wire_profile == ExperimentalWireProfile::DenuoV2
-        && negotiated.fingerprint == DENUO_V2_REGISTRY_FINGERPRINT
-        && negotiated.registry_version == DENUO_V2_REGISTRY_VERSION
+        && snapshot.shakescape.phase == crate::ShakescapePeerPhase::Negotiated
+        && wire_profile == ExperimentalWireProfile::ShakescapeV1
+        && negotiated.fingerprint == SHAKESCAPE_V1_REGISTRY_FINGERPRINT
+        && negotiated.registry_version == SHAKESCAPE_V1_REGISTRY_VERSION
         && negotiated.protocols.contains(&(
             REGISTRY_NEGOTIATION_PROTOCOL_ID,
-            DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+            SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION,
         ))
         && negotiated.network == binding.network
         && negotiated.genesis_hash == binding.genesis_hash
@@ -2032,7 +2038,7 @@ fn exact_name_market_admission(
     network: Network,
     payload_len: usize,
 ) -> bool {
-    let Some(negotiated) = snapshot.denuo_negotiated_registry.as_ref() else {
+    let Some(negotiated) = snapshot.shakescape_negotiated_registry.as_ref() else {
         return false;
     };
     let authenticated_transport = match network {
@@ -2044,14 +2050,14 @@ fn exact_name_market_admission(
     };
     snapshot.state == PeerState::Ready
         && authenticated_transport
-        && snapshot.services & DENUO_EXTENSION_SERVICE.value() != 0
-        && snapshot.denuo.phase == crate::DenuoPeerPhase::Negotiated
-        && snapshot.denuo_wire_profile == Some(ExperimentalWireProfile::DenuoV2)
-        && negotiated.fingerprint == DENUO_V2_REGISTRY_FINGERPRINT
-        && negotiated.registry_version == DENUO_V2_REGISTRY_VERSION
+        && snapshot.services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0
+        && snapshot.shakescape.phase == crate::ShakescapePeerPhase::Negotiated
+        && snapshot.shakescape_wire_profile == Some(ExperimentalWireProfile::ShakescapeV1)
+        && negotiated.fingerprint == SHAKESCAPE_V1_REGISTRY_FINGERPRINT
+        && negotiated.registry_version == SHAKESCAPE_V1_REGISTRY_VERSION
         && negotiated.protocols.contains(&(
             REGISTRY_NEGOTIATION_PROTOCOL_ID,
-            DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+            SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION,
         ))
         && negotiated
             .protocols
@@ -2088,15 +2094,15 @@ fn unix_time() -> u64 {
 mod tests {
     use super::*;
     use crate::{
-        denuo::DenuoPeerPhase,
         handshake::PeerState,
         runtime::{Hip76RequestOutcome, PeerTransportKind},
+        shakescape::ShakescapePeerPhase,
         wire::Packet,
         DnsRelayRequesterPolicy, DnsRelayStatus, Hip76ConnectionPhase,
     };
     use hns_p2p_experimental::{
-        DENUO_EXTENSION_MAX_NESTED_PAYLOAD, DENUO_EXTENSION_MAX_PACKET_PAYLOAD, DNS_RELAY_SERVICE,
-        REGISTRY_NEGOTIATION_MAX_PAYLOAD,
+        DNS_RELAY_SERVICE, REGISTRY_NEGOTIATION_MAX_PAYLOAD,
+        SHAKESCAPE_EXTENSION_MAX_NESTED_PAYLOAD, SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD,
     };
 
     const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2259,10 +2265,10 @@ mod tests {
         assert_eq!(server_manager.snapshots().await[0].state, PeerState::Ready);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let client_phase = client_manager.snapshots().await[0].denuo.phase;
-                let server_phase = server_manager.snapshots().await[0].denuo.phase;
-                if client_phase == DenuoPeerPhase::Negotiated
-                    && server_phase == DenuoPeerPhase::Negotiated
+                let client_phase = client_manager.snapshots().await[0].shakescape.phase;
+                let server_phase = server_manager.snapshots().await[0].shakescape.phase;
+                if client_phase == ShakescapePeerPhase::Negotiated
+                    && server_phase == ShakescapePeerPhase::Negotiated
                 {
                     break;
                 }
@@ -2270,43 +2276,54 @@ mod tests {
             }
         })
         .await
-        .expect("Denuo negotiation");
-        let (client_snapshots, client_denuo) = client_manager.snapshots_with_denuo_summary().await;
-        let (_, server_denuo) = server_manager.snapshots_with_denuo_summary().await;
+        .expect("Shakescape negotiation");
+        let (client_snapshots, client_shakescape) =
+            client_manager.snapshots_with_shakescape_summary().await;
+        let (_, server_shakescape) = server_manager.snapshots_with_shakescape_summary().await;
         assert_eq!(client_snapshots.len(), 1);
         let negotiated = client_snapshots[0]
-            .denuo
+            .shakescape
             .negotiated
             .as_ref()
             .expect("negotiated parameters");
-        assert_eq!(negotiated.protocols.len(), 1);
+        assert_eq!(negotiated.protocols.len(), 2);
         assert_eq!(negotiated.protocols[0].protocol_id, 0);
         assert_eq!(negotiated.protocols[0].protocol_version, 1);
+        assert_eq!(
+            negotiated.protocols[1].protocol_id,
+            ATOMIC_MARKET_PROTOCOL_ID
+        );
+        assert_eq!(
+            negotiated.protocols[1].protocol_version,
+            ATOMIC_MARKET_PROTOCOL_VERSION
+        );
         assert_eq!(negotiated.maximum_live_requests, 64);
         assert_eq!(negotiated.feature_flags, 0);
         assert_eq!(
             negotiated.maximum_send_size,
-            DENUO_EXTENSION_MAX_PACKET_PAYLOAD as u32
+            SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD as u32
         );
-        assert!(client_denuo.advertised());
-        assert_eq!(client_denuo.live.negotiated, 1);
-        assert_eq!(client_denuo.process.hello_admitted, 1);
-        assert_eq!(client_denuo.process.hello_ack_received, 1);
-        assert_eq!(client_denuo.process.agreements_computed, 1);
-        assert_eq!(server_denuo.live.negotiated, 1);
-        assert_eq!(server_denuo.process.hello_received, 1);
-        assert_eq!(server_denuo.process.hello_ack_admitted, 1);
-        assert_eq!(server_denuo.process.agreements_computed, 1);
+        assert!(client_shakescape.advertised());
+        assert_eq!(client_shakescape.live.negotiated, 1);
+        assert_eq!(client_shakescape.process.hello_admitted, 1);
+        assert_eq!(client_shakescape.process.hello_ack_received, 1);
+        assert_eq!(client_shakescape.process.agreements_computed, 1);
+        assert_eq!(server_shakescape.live.negotiated, 1);
+        assert_eq!(server_shakescape.process.hello_received, 1);
+        assert_eq!(server_shakescape.process.hello_ack_admitted, 1);
+        assert_eq!(server_shakescape.process.agreements_computed, 1);
         assert_eq!(
-            client_denuo.identity.maximum_packet_payload,
-            DENUO_EXTENSION_MAX_PACKET_PAYLOAD as u32
-        );
-        assert_eq!(
-            client_denuo.identity.maximum_nested_payload,
-            DENUO_EXTENSION_MAX_NESTED_PAYLOAD as u32
+            client_shakescape.identity.maximum_packet_payload,
+            SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD as u32
         );
         assert_eq!(
-            client_denuo.identity.maximum_registry_negotiation_payload,
+            client_shakescape.identity.maximum_nested_payload,
+            SHAKESCAPE_EXTENSION_MAX_NESTED_PAYLOAD as u32
+        );
+        assert_eq!(
+            client_shakescape
+                .identity
+                .maximum_registry_negotiation_payload,
             REGISTRY_NEGOTIATION_MAX_PAYLOAD as u32
         );
 
@@ -2380,12 +2397,12 @@ mod tests {
             traffic_after_disconnect.bytes_received >= traffic_before_disconnect.bytes_received
         );
         assert_eq!(client_manager.peer_count().await, 0);
-        let retired_denuo = client_manager.denuo_summary().await;
-        assert_eq!(retired_denuo.live.negotiated, 0);
-        assert_eq!(retired_denuo.process.agreements_computed, 1);
-        assert_eq!(retired_denuo.process.admitted(), 1);
-        assert_eq!(retired_denuo.process.received(), 1);
-        assert_eq!(retired_denuo.process.disabled, 0);
+        let retired_shakescape = client_manager.shakescape_summary().await;
+        assert_eq!(retired_shakescape.live.negotiated, 0);
+        assert_eq!(retired_shakescape.process.agreements_computed, 1);
+        assert_eq!(retired_shakescape.process.admitted(), 1);
+        assert_eq!(retired_shakescape.process.received(), 1);
+        assert_eq!(retired_shakescape.process.disabled, 0);
         client_manager.disconnect_all().await;
         server_manager.disconnect_all().await;
     }

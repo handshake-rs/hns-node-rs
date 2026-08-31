@@ -35,7 +35,7 @@ explicit outbound peers / optional listener
                     |
      VERSION / VERACK / SENDHEADERS / SENDCMPCT
                     |
-      optional Denuo registry / HIP-76 session
+      optional Shakescape registry / HIP-76 session
                     |
                     v
           headers-first synchronization
@@ -88,7 +88,7 @@ Remaining bounded opaque forms are retained only where safe rejection or ignore
 behavior is intentional.
 
 After ordinary VERSION/VERACK readiness, peers that mutually advertise the
-Denuo extension negotiate the exact canonical registry fingerprint through
+Shakescape extension negotiate the exact canonical registry fingerprint through
 packet `0xf4`. A matching agreement may activate the separate typed HIP-76
 `0xf0`/`0xf1` session. Requesting defaults to `Auto` with operator opt-out;
 provider advertisement defaults off and requires both explicit opt-in and a
@@ -102,7 +102,7 @@ explicitly restores `Auto`.
 
 HIP-77 packet `0xf2` is also intercepted before generic packet delivery. Its
 requester policy defaults on and selects only a ready Brontide peer advertising
-both service bits with exact Denuo V1 registry, network, genesis, and resource
+both service bits with exact Shakescape V1 registry, network, genesis, and resource
 evidence, whose authenticated key differs from the signed target locator. The
 process-wide requester bounds live work, correlates the exact response peer/key
 and request generation, expires deadlines, and clears work on disconnect or
@@ -116,7 +116,7 @@ target, and output-provider roles are off.
 HIP-78 packet `0xf3` enters the process-wide HNSR coordinator before generic
 delivery. Requester and opaque-relay policy default on, while endpoint,
 rendezvous, and plaintext roles remain unavailable. Every route is bound to an
-exact Brontide connection and canonical Denuo V1 evidence; relay actions are
+exact Brontide connection and canonical Shakescape V1 evidence; relay actions are
 retained until the destination writer reports the actual socket write. The
 relay service bit is advertised only with an explicit valid relay address and
 durable local Brontide key. Negative and positive startup flags respectively
@@ -152,7 +152,7 @@ Each live peer has:
 - bounded critical, control, and normal queues;
 - byte counters and ping latency;
 - a local misbehavior score;
-- Denuo registry phase/limits and qname-free HIP-76 role/session counters;
+- Shakescape registry phase/limits and qname-free HIP-76 role/session counters;
 - handshake, idle, ping, and pong timeouts.
 
 The in-progress frame read is retained when ping, idle, or shutdown maintenance
@@ -507,7 +507,7 @@ address-book availability, loaded/pruned counts, generation, dirty state,
 successful/failed flushes, decode failures, the last flush time, and its last
 storage error. Current API-v15 retains the API-v10 valid non-active and durably
 failed block counts and active-tip resulting authenticated root/height. It also
-exposes the canonical Denuo registry and qname-free HIP-76 phase, role, and
+exposes the canonical Shakescape registry and qname-free HIP-76 phase, role, and
 write-stage counters. The native endpoint includes an opaque runtime instance
 so external evidence can distinguish observations across restarts.
 

@@ -1,7 +1,7 @@
-//! Runtime coordination and bounded diagnostics for Denuo Experimental V2.
+//! Runtime coordination and bounded diagnostics for Shakescape Experimental V1.
 //!
 //! The coordinator is deliberately isolated from the ordinary Handshake peer
-//! state machine. An experimental negotiation failure disables Denuo for that
+//! state machine. An experimental negotiation failure disables Shakescape for that
 //! peer; it never becomes a peer error, score increase, ban, or disconnect.
 
 use std::{
@@ -15,17 +15,18 @@ use std::{
 use hns_consensus::Network as ConsensusNetwork;
 use hns_dns_relay_protocol::MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE;
 use hns_marketplace_protocol::{
-    DenuoRegistryVersion, NameMarketHello, NameMarketMessage, MAX_DENUO_MARKET_PAYLOAD,
+    NameMarketHello, NameMarketMessage, ShakescapeRegistryVersion, MAX_SHAKESCAPE_MARKET_PAYLOAD,
 };
 use hns_p2p_experimental::{
-    DenuoExtensionEnvelope, EnvelopeError, ExperimentalWireProfile, KnownMessage,
-    NegotiatedRegistry, NegotiationError, Network, ProtocolDisposition, ProtocolRange,
-    RegistryEnvelopeError, RegistryHello, ATOMIC_MARKET_PROTOCOL_ID,
-    ATOMIC_MARKET_PROTOCOL_VERSION, DENUO_EXTENSION_MAX_NESTED_PAYLOAD,
-    DENUO_EXTENSION_MAX_PACKET_PAYLOAD, DENUO_EXTENSION_PACKET, DENUO_EXTENSION_SERVICE,
-    DENUO_V2_EXPERIMENTAL_STATUS_LABEL, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_REGISTRY_ID,
-    DENUO_V2_REGISTRY_NAME, DENUO_V2_REGISTRY_PROTOCOL_VERSION, DENUO_V2_REGISTRY_VERSION,
-    DENUO_V2_WIRE_PROFILE, REGISTRY_NEGOTIATION_MAX_PAYLOAD,
+    EnvelopeError, ExperimentalWireProfile, KnownMessage, NegotiatedRegistry, NegotiationError,
+    Network, ProtocolDisposition, ProtocolRange, RegistryEnvelopeError, RegistryHello,
+    ShakescapeExtensionEnvelope, ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION,
+    EXPERIMENTAL_STATUS_LABEL, REGISTRY_NEGOTIATION_MAX_PAYLOAD,
+    SHAKESCAPE_EXTENSION_MAX_NESTED_PAYLOAD, SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD,
+    SHAKESCAPE_EXTENSION_PACKET, SHAKESCAPE_EXTENSION_SERVICE, SHAKESCAPE_V1_REGISTRY_FINGERPRINT,
+    SHAKESCAPE_V1_REGISTRY_ID, SHAKESCAPE_V1_REGISTRY_NAME,
+    SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION, SHAKESCAPE_V1_REGISTRY_VERSION,
+    SHAKESCAPE_V1_WIRE_PROFILE,
 };
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
@@ -35,13 +36,13 @@ use crate::{
     wire::{Packet, PacketType},
 };
 
-pub const DENUO_DEFAULT_MAXIMUM_LIVE_REQUESTS: u16 = 64;
+pub const SHAKESCAPE_DEFAULT_MAXIMUM_LIVE_REQUESTS: u16 = 64;
 
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
 )]
 #[serde(rename_all = "kebab-case")]
-pub enum DenuoPeerPhase {
+pub enum ShakescapePeerPhase {
     #[default]
     AwaitingVersion,
     NotAdvertised,
@@ -52,7 +53,7 @@ pub enum DenuoPeerPhase {
     Disabled,
 }
 
-impl DenuoPeerPhase {
+impl ShakescapePeerPhase {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AwaitingVersion => "awaiting-version",
@@ -68,7 +69,7 @@ impl DenuoPeerPhase {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum DenuoDisableReason {
+pub enum ShakescapeDisableReason {
     LocalServiceDisabled,
     PeerMissingService,
     PacketTooLarge,
@@ -89,7 +90,7 @@ pub enum DenuoDisableReason {
     LocalSendUnavailable,
 }
 
-impl DenuoDisableReason {
+impl ShakescapeDisableReason {
     pub const ALL: [Self; 18] = [
         Self::LocalServiceDisabled,
         Self::PeerMissingService,
@@ -159,31 +160,33 @@ impl DenuoDisableReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoNegotiatedProtocol {
+pub struct ShakescapeNegotiatedProtocol {
     pub protocol_id: u16,
     pub protocol_version: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoNegotiatedParameters {
+pub struct ShakescapeNegotiatedParameters {
     pub registry_version: u16,
-    pub protocols: Vec<DenuoNegotiatedProtocol>,
+    pub protocols: Vec<ShakescapeNegotiatedProtocol>,
     pub maximum_send_size: u32,
     pub maximum_live_requests: u16,
     pub feature_flags: u64,
 }
 
-impl From<&NegotiatedRegistry> for DenuoNegotiatedParameters {
+impl From<&NegotiatedRegistry> for ShakescapeNegotiatedParameters {
     fn from(negotiated: &NegotiatedRegistry) -> Self {
         Self {
             registry_version: negotiated.registry_version,
             protocols: negotiated
                 .protocols
                 .iter()
-                .map(|(protocol_id, protocol_version)| DenuoNegotiatedProtocol {
-                    protocol_id: *protocol_id,
-                    protocol_version: *protocol_version,
-                })
+                .map(
+                    |(protocol_id, protocol_version)| ShakescapeNegotiatedProtocol {
+                        protocol_id: *protocol_id,
+                        protocol_version: *protocol_version,
+                    },
+                )
                 .collect(),
             maximum_send_size: negotiated.maximum_send_size,
             maximum_live_requests: negotiated.maximum_live_requests,
@@ -193,15 +196,15 @@ impl From<&NegotiatedRegistry> for DenuoNegotiatedParameters {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoPeerDiagnostics {
-    pub phase: DenuoPeerPhase,
-    pub disable_reason: Option<DenuoDisableReason>,
+pub struct ShakescapePeerDiagnostics {
+    pub phase: ShakescapePeerPhase,
+    pub disable_reason: Option<ShakescapeDisableReason>,
     pub request_id: Option<u64>,
-    pub negotiated: Option<DenuoNegotiatedParameters>,
+    pub negotiated: Option<ShakescapeNegotiatedParameters>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoRegistryIdentity {
+pub struct ShakescapeRegistryIdentity {
     pub name: String,
     pub registry_id: String,
     pub fingerprint: String,
@@ -216,27 +219,27 @@ pub struct DenuoRegistryIdentity {
     pub maximum_registry_negotiation_payload: u32,
 }
 
-impl Default for DenuoRegistryIdentity {
+impl Default for ShakescapeRegistryIdentity {
     fn default() -> Self {
         Self {
-            name: DENUO_V2_REGISTRY_NAME.to_owned(),
-            registry_id: DENUO_V2_REGISTRY_ID.to_string(),
-            fingerprint: DENUO_V2_REGISTRY_FINGERPRINT.to_string(),
-            registry_version: DENUO_V2_REGISTRY_VERSION,
-            registry_protocol_version: DENUO_V2_REGISTRY_PROTOCOL_VERSION,
-            wire_profile: DENUO_V2_WIRE_PROFILE.to_owned(),
-            status: DENUO_V2_EXPERIMENTAL_STATUS_LABEL.to_owned(),
-            service_bit: DENUO_EXTENSION_SERVICE.value(),
-            packet_type: DENUO_EXTENSION_PACKET.value(),
-            maximum_packet_payload: DENUO_EXTENSION_MAX_PACKET_PAYLOAD as u32,
-            maximum_nested_payload: DENUO_EXTENSION_MAX_NESTED_PAYLOAD as u32,
+            name: SHAKESCAPE_V1_REGISTRY_NAME.to_owned(),
+            registry_id: SHAKESCAPE_V1_REGISTRY_ID.to_string(),
+            fingerprint: SHAKESCAPE_V1_REGISTRY_FINGERPRINT.to_string(),
+            registry_version: SHAKESCAPE_V1_REGISTRY_VERSION,
+            registry_protocol_version: SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION,
+            wire_profile: SHAKESCAPE_V1_WIRE_PROFILE.to_owned(),
+            status: EXPERIMENTAL_STATUS_LABEL.to_owned(),
+            service_bit: SHAKESCAPE_EXTENSION_SERVICE.value(),
+            packet_type: SHAKESCAPE_EXTENSION_PACKET.value(),
+            maximum_packet_payload: SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD as u32,
+            maximum_nested_payload: SHAKESCAPE_EXTENSION_MAX_NESTED_PAYLOAD as u32,
             maximum_registry_negotiation_payload: REGISTRY_NEGOTIATION_MAX_PAYLOAD as u32,
         }
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoLiveCounts {
+pub struct ShakescapeLiveCounts {
     pub awaiting_version: u64,
     pub not_advertised: u64,
     pub local_disabled: u64,
@@ -247,7 +250,7 @@ pub struct DenuoLiveCounts {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoProcessTotals {
+pub struct ShakescapeProcessTotals {
     pub hello_admitted: u64,
     pub hello_received: u64,
     pub hello_ack_admitted: u64,
@@ -257,7 +260,7 @@ pub struct DenuoProcessTotals {
     pub disabled: u64,
 }
 
-impl DenuoProcessTotals {
+impl ShakescapeProcessTotals {
     pub const fn admitted(&self) -> u64 {
         self.hello_admitted.saturating_add(self.hello_ack_admitted)
     }
@@ -272,45 +275,45 @@ impl DenuoProcessTotals {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoReasonCount {
-    pub reason: DenuoDisableReason,
+pub struct ShakescapeReasonCount {
+    pub reason: ShakescapeDisableReason,
     pub count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoSummary {
-    pub identity: DenuoRegistryIdentity,
+pub struct ShakescapeSummary {
+    pub identity: ShakescapeRegistryIdentity,
     pub local_service_mask: u64,
     pub advertised: bool,
-    pub live: DenuoLiveCounts,
-    pub process: DenuoProcessTotals,
-    pub rejection_reasons: Vec<DenuoReasonCount>,
+    pub live: ShakescapeLiveCounts,
+    pub process: ShakescapeProcessTotals,
+    pub rejection_reasons: Vec<ShakescapeReasonCount>,
 }
 
-impl Default for DenuoSummary {
+impl Default for ShakescapeSummary {
     fn default() -> Self {
         Self {
-            identity: DenuoRegistryIdentity::default(),
+            identity: ShakescapeRegistryIdentity::default(),
             local_service_mask: 0,
             advertised: false,
-            live: DenuoLiveCounts::default(),
-            process: DenuoProcessTotals::default(),
-            rejection_reasons: DenuoDisableReason::ALL
+            live: ShakescapeLiveCounts::default(),
+            process: ShakescapeProcessTotals::default(),
+            rejection_reasons: ShakescapeDisableReason::ALL
                 .into_iter()
-                .map(|reason| DenuoReasonCount { reason, count: 0 })
+                .map(|reason| ShakescapeReasonCount { reason, count: 0 })
                 .collect(),
         }
     }
 }
 
-impl DenuoSummary {
+impl ShakescapeSummary {
     pub const fn advertised(&self) -> bool {
         self.advertised
     }
 }
 
 #[derive(Debug, Default)]
-struct DenuoRuntimeMetricsInner {
+struct ShakescapeRuntimeMetricsInner {
     hello_admitted: AtomicU64,
     hello_received: AtomicU64,
     hello_ack_admitted: AtomicU64,
@@ -318,15 +321,15 @@ struct DenuoRuntimeMetricsInner {
     agreements_computed: AtomicU64,
     rejected: AtomicU64,
     disabled: AtomicU64,
-    rejection_reasons: [AtomicU64; DenuoDisableReason::ALL.len()],
+    rejection_reasons: [AtomicU64; ShakescapeDisableReason::ALL.len()],
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct DenuoRuntimeMetrics {
-    inner: Arc<DenuoRuntimeMetricsInner>,
+pub(crate) struct ShakescapeRuntimeMetrics {
+    inner: Arc<ShakescapeRuntimeMetricsInner>,
 }
 
-impl DenuoRuntimeMetrics {
+impl ShakescapeRuntimeMetrics {
     fn record_hello_admitted(&self) {
         saturating_increment(&self.inner.hello_admitted);
     }
@@ -347,12 +350,12 @@ impl DenuoRuntimeMetrics {
         saturating_increment(&self.inner.agreements_computed);
     }
 
-    fn record_disabled(&self, reason: DenuoDisableReason) {
+    fn record_disabled(&self, reason: ShakescapeDisableReason) {
         saturating_increment(&self.inner.disabled);
         self.record_rejected(reason);
     }
 
-    fn record_rejected(&self, reason: DenuoDisableReason) {
+    fn record_rejected(&self, reason: ShakescapeDisableReason) {
         saturating_increment(&self.inner.rejected);
         saturating_increment(&self.inner.rejection_reasons[reason.index()]);
     }
@@ -360,28 +363,28 @@ impl DenuoRuntimeMetrics {
     pub(crate) fn summary(
         &self,
         local_service_mask: u64,
-        peers: &[DenuoPeerDiagnostics],
-    ) -> DenuoSummary {
-        let mut live = DenuoLiveCounts::default();
+        peers: &[ShakescapePeerDiagnostics],
+    ) -> ShakescapeSummary {
+        let mut live = ShakescapeLiveCounts::default();
         for peer in peers {
             let target = match peer.phase {
-                DenuoPeerPhase::AwaitingVersion => &mut live.awaiting_version,
-                DenuoPeerPhase::NotAdvertised => &mut live.not_advertised,
-                DenuoPeerPhase::LocalDisabled => &mut live.local_disabled,
-                DenuoPeerPhase::Eligible => &mut live.eligible,
-                DenuoPeerPhase::HelloAdmitted => &mut live.pending,
-                DenuoPeerPhase::Negotiated => &mut live.negotiated,
-                DenuoPeerPhase::Disabled => &mut live.disabled,
+                ShakescapePeerPhase::AwaitingVersion => &mut live.awaiting_version,
+                ShakescapePeerPhase::NotAdvertised => &mut live.not_advertised,
+                ShakescapePeerPhase::LocalDisabled => &mut live.local_disabled,
+                ShakescapePeerPhase::Eligible => &mut live.eligible,
+                ShakescapePeerPhase::HelloAdmitted => &mut live.pending,
+                ShakescapePeerPhase::Negotiated => &mut live.negotiated,
+                ShakescapePeerPhase::Disabled => &mut live.disabled,
             };
             *target = target.saturating_add(1);
         }
 
-        DenuoSummary {
-            identity: DenuoRegistryIdentity::default(),
+        ShakescapeSummary {
+            identity: ShakescapeRegistryIdentity::default(),
             local_service_mask,
-            advertised: local_service_mask & DENUO_EXTENSION_SERVICE.value() != 0,
+            advertised: local_service_mask & SHAKESCAPE_EXTENSION_SERVICE.value() != 0,
             live,
-            process: DenuoProcessTotals {
+            process: ShakescapeProcessTotals {
                 hello_admitted: self.inner.hello_admitted.load(Ordering::Acquire),
                 hello_received: self.inner.hello_received.load(Ordering::Acquire),
                 hello_ack_admitted: self.inner.hello_ack_admitted.load(Ordering::Acquire),
@@ -390,9 +393,9 @@ impl DenuoRuntimeMetrics {
                 rejected: self.inner.rejected.load(Ordering::Acquire),
                 disabled: self.inner.disabled.load(Ordering::Acquire),
             },
-            rejection_reasons: DenuoDisableReason::ALL
+            rejection_reasons: ShakescapeDisableReason::ALL
                 .into_iter()
-                .map(|reason| DenuoReasonCount {
+                .map(|reason| ShakescapeReasonCount {
                     reason,
                     count: self.inner.rejection_reasons[reason.index()].load(Ordering::Acquire),
                 })
@@ -408,28 +411,28 @@ fn saturating_increment(counter: &AtomicU64) {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DenuoOutboundMessage {
+pub(crate) enum ShakescapeOutboundMessage {
     Hello,
     HelloAck,
     NameMarket,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DenuoAction {
+pub(crate) struct ShakescapeAction {
     pub response_payload: Option<Vec<u8>>,
-    pub outbound_message: Option<DenuoOutboundMessage>,
-    pub name_market: Option<DenuoNameMarketInbound>,
+    pub outbound_message: Option<ShakescapeOutboundMessage>,
+    pub name_market: Option<ShakescapeNameMarketInbound>,
 }
 
 /// One canonical name-market message admitted under the exact V2 registry.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DenuoNameMarketInbound {
+pub(crate) struct ShakescapeNameMarketInbound {
     pub request_id: u64,
     pub message: NameMarketMessage,
 }
 
 #[derive(Debug)]
-pub(crate) struct DenuoCoordinator {
+pub(crate) struct ShakescapeCoordinator {
     direction: PeerDirection,
     local_enabled: bool,
     local_hello: RegistryHello,
@@ -440,18 +443,18 @@ pub(crate) struct DenuoCoordinator {
     remote_advertises: Option<bool>,
     pending_deadline: Option<Instant>,
     negotiated: Option<NegotiatedRegistry>,
-    diagnostics: DenuoPeerDiagnostics,
-    metrics: DenuoRuntimeMetrics,
+    diagnostics: ShakescapePeerDiagnostics,
+    metrics: ShakescapeRuntimeMetrics,
 }
 
-impl DenuoCoordinator {
+impl ShakescapeCoordinator {
     pub(crate) fn new(
         direction: PeerDirection,
         network: ConsensusNetwork,
         local_services: u64,
         proposed_request_id: u64,
         negotiation_timeout: Duration,
-        metrics: DenuoRuntimeMetrics,
+        metrics: ShakescapeRuntimeMetrics,
     ) -> Result<Self, NegotiationError> {
         let experimental_network = match network {
             ConsensusNetwork::Mainnet => Network::Mainnet,
@@ -459,7 +462,7 @@ impl DenuoCoordinator {
             ConsensusNetwork::Regtest => Network::Regtest,
             ConsensusNetwork::Simnet => Network::Simnet,
         };
-        let local_hello = RegistryHello::denuo_v2(
+        let local_hello = RegistryHello::shakescape_v1(
             experimental_network,
             network.params().genesis_hash.into_inner(),
             vec![ProtocolRange {
@@ -468,30 +471,30 @@ impl DenuoCoordinator {
                 maximum_version: ATOMIC_MARKET_PROTOCOL_VERSION,
             }],
             u32::try_from(
-                DENUO_EXTENSION_MAX_PACKET_PAYLOAD.max(MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE),
+                SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD.max(MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE),
             )
-            .expect("canonical Denuo packet ceilings fit u32"),
-            DENUO_DEFAULT_MAXIMUM_LIVE_REQUESTS,
+            .expect("canonical Shakescape packet ceilings fit u32"),
+            SHAKESCAPE_DEFAULT_MAXIMUM_LIVE_REQUESTS,
             0,
         )?;
         let name_market_hello = NameMarketHello {
             hns_magic: network.params().packet_magic,
             hns_genesis: network.params().genesis_hash.into_inner().into(),
-            maximum_payload: u32::try_from(MAX_DENUO_MARKET_PAYLOAD)
-                .expect("canonical Denuo marketplace payload ceiling fits u32"),
+            maximum_payload: u32::try_from(MAX_SHAKESCAPE_MARKET_PAYLOAD)
+                .expect("canonical Shakescape marketplace payload ceiling fits u32"),
             feature_flags: 0,
         };
-        let diagnostics = DenuoPeerDiagnostics {
-            phase: if local_services & DENUO_EXTENSION_SERVICE.value() != 0 {
-                DenuoPeerPhase::AwaitingVersion
+        let diagnostics = ShakescapePeerDiagnostics {
+            phase: if local_services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0 {
+                ShakescapePeerPhase::AwaitingVersion
             } else {
-                DenuoPeerPhase::LocalDisabled
+                ShakescapePeerPhase::LocalDisabled
             },
-            ..DenuoPeerDiagnostics::default()
+            ..ShakescapePeerDiagnostics::default()
         };
         Ok(Self {
             direction,
-            local_enabled: local_services & DENUO_EXTENSION_SERVICE.value() != 0,
+            local_enabled: local_services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0,
             local_hello,
             name_market_hello,
             proposed_request_id: proposed_request_id.max(1),
@@ -505,7 +508,7 @@ impl DenuoCoordinator {
         })
     }
 
-    pub(crate) fn diagnostics(&self) -> DenuoPeerDiagnostics {
+    pub(crate) fn diagnostics(&self) -> ShakescapePeerDiagnostics {
         self.diagnostics.clone()
     }
 
@@ -514,40 +517,40 @@ impl DenuoCoordinator {
     ) -> Option<(ExperimentalWireProfile, &NegotiatedRegistry)> {
         self.negotiated
             .as_ref()
-            .map(|negotiated| (ExperimentalWireProfile::DenuoV2, negotiated))
+            .map(|negotiated| (ExperimentalWireProfile::ShakescapeV1, negotiated))
     }
 
     pub(crate) fn observe_remote_services(&mut self, services: u64) {
-        let advertised = services & DENUO_EXTENSION_SERVICE.value() != 0;
+        let advertised = services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0;
         self.remote_advertises = Some(advertised);
-        if self.diagnostics.phase == DenuoPeerPhase::AwaitingVersion && self.local_enabled {
+        if self.diagnostics.phase == ShakescapePeerPhase::AwaitingVersion && self.local_enabled {
             self.diagnostics.phase = if advertised {
-                DenuoPeerPhase::Eligible
+                ShakescapePeerPhase::Eligible
             } else {
-                DenuoPeerPhase::NotAdvertised
+                ShakescapePeerPhase::NotAdvertised
             };
         }
     }
 
-    pub(crate) fn on_ready(&mut self, _now: Instant) -> DenuoAction {
+    pub(crate) fn on_ready(&mut self, _now: Instant) -> ShakescapeAction {
         self.ready = true;
         if self.direction != PeerDirection::Outbound
-            || self.diagnostics.phase != DenuoPeerPhase::Eligible
+            || self.diagnostics.phase != ShakescapePeerPhase::Eligible
         {
-            return DenuoAction::default();
+            return ShakescapeAction::default();
         }
 
         let request_id = self.proposed_request_id;
         let response_payload = match encode_hello(request_id, &self.local_hello, false) {
             Ok(payload) => payload,
             Err(()) => {
-                self.disable(DenuoDisableReason::LocalEncodingFailure);
-                return DenuoAction::default();
+                self.disable(ShakescapeDisableReason::LocalEncodingFailure);
+                return ShakescapeAction::default();
             }
         };
-        DenuoAction {
+        ShakescapeAction {
             response_payload: Some(response_payload),
-            outbound_message: Some(DenuoOutboundMessage::Hello),
+            outbound_message: Some(ShakescapeOutboundMessage::Hello),
             name_market: None,
         }
     }
@@ -557,62 +560,62 @@ impl DenuoCoordinator {
     }
 
     pub(crate) fn expire(&mut self, now: Instant) -> bool {
-        if self.diagnostics.phase == DenuoPeerPhase::HelloAdmitted
+        if self.diagnostics.phase == ShakescapePeerPhase::HelloAdmitted
             && self
                 .pending_deadline
                 .is_some_and(|deadline| now >= deadline)
         {
-            self.disable(DenuoDisableReason::NegotiationTimeout);
+            self.disable(ShakescapeDisableReason::NegotiationTimeout);
             return true;
         }
         false
     }
 
-    pub(crate) fn receive_extension(&mut self, payload: &[u8]) -> DenuoAction {
-        if payload.len() > DENUO_EXTENSION_MAX_PACKET_PAYLOAD {
-            if self.diagnostics.phase == DenuoPeerPhase::Disabled {
+    pub(crate) fn receive_extension(&mut self, payload: &[u8]) -> ShakescapeAction {
+        if payload.len() > SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD {
+            if self.diagnostics.phase == ShakescapePeerPhase::Disabled {
                 self.metrics
-                    .record_rejected(DenuoDisableReason::PacketTooLarge);
+                    .record_rejected(ShakescapeDisableReason::PacketTooLarge);
             } else {
-                self.disable(DenuoDisableReason::PacketTooLarge);
+                self.disable(ShakescapeDisableReason::PacketTooLarge);
             }
-            return DenuoAction::default();
+            return ShakescapeAction::default();
         }
-        if self.diagnostics.phase == DenuoPeerPhase::Disabled {
-            return DenuoAction::default();
+        if self.diagnostics.phase == ShakescapePeerPhase::Disabled {
+            return ShakescapeAction::default();
         }
         if !self.local_enabled {
             self.metrics
-                .record_rejected(DenuoDisableReason::LocalServiceDisabled);
-            return DenuoAction::default();
+                .record_rejected(ShakescapeDisableReason::LocalServiceDisabled);
+            return ShakescapeAction::default();
         }
         match self.remote_advertises {
             Some(true) => {}
             Some(false) => {
-                self.disable(DenuoDisableReason::PeerMissingService);
-                return DenuoAction::default();
+                self.disable(ShakescapeDisableReason::PeerMissingService);
+                return ShakescapeAction::default();
             }
             None => {
-                self.disable(DenuoDisableReason::UnexpectedMessage);
-                return DenuoAction::default();
+                self.disable(ShakescapeDisableReason::UnexpectedMessage);
+                return ShakescapeAction::default();
             }
         }
         if !self.ready {
-            self.disable(DenuoDisableReason::UnexpectedMessage);
-            return DenuoAction::default();
+            self.disable(ShakescapeDisableReason::UnexpectedMessage);
+            return ShakescapeAction::default();
         }
-        let envelope = match DenuoExtensionEnvelope::decode_canonical(payload) {
+        let envelope = match ShakescapeExtensionEnvelope::decode_canonical(payload) {
             Ok(envelope) => envelope,
             Err(error) => {
                 self.disable(map_envelope_error(&error));
-                return DenuoAction::default();
+                return ShakescapeAction::default();
             }
         };
         let disposition = match envelope.classify() {
             Ok(disposition) => disposition,
             Err(error) => {
                 self.disable(map_envelope_error(&error));
-                return DenuoAction::default();
+                return ShakescapeAction::default();
             }
         };
         match disposition {
@@ -621,91 +624,93 @@ impl DenuoCoordinator {
                 self.receive_hello_ack(payload)
             }
             ProtocolDisposition::Known(KnownMessage::RegistryReject) => {
-                self.disable(DenuoDisableReason::UnexpectedMessage);
-                DenuoAction::default()
+                self.disable(ShakescapeDisableReason::UnexpectedMessage);
+                ShakescapeAction::default()
             }
             ProtocolDisposition::Known(message) if is_name_market_message(message) => {
                 self.receive_name_market(payload)
             }
             ProtocolDisposition::Known(_) => {
-                self.reject_subprotocol(DenuoDisableReason::UnsupportedProtocol);
-                DenuoAction::default()
+                self.reject_subprotocol(ShakescapeDisableReason::UnsupportedProtocol);
+                ShakescapeAction::default()
             }
             ProtocolDisposition::UnknownProtocol { .. } => {
                 // Subprotocol support is isolated from registry negotiation.
                 // Once the canonical registry is installed, a bounded packet
                 // for an unknown protocol is ignored without destroying that
                 // successful peer-level agreement.
-                self.reject_subprotocol(DenuoDisableReason::UnsupportedProtocol);
-                DenuoAction::default()
+                self.reject_subprotocol(ShakescapeDisableReason::UnsupportedProtocol);
+                ShakescapeAction::default()
             }
         }
     }
 
-    fn receive_name_market(&mut self, payload: &[u8]) -> DenuoAction {
+    fn receive_name_market(&mut self, payload: &[u8]) -> ShakescapeAction {
         let Some(negotiated) = self.negotiated.as_ref() else {
-            self.disable(DenuoDisableReason::UnexpectedMessage);
-            return DenuoAction::default();
+            self.disable(ShakescapeDisableReason::UnexpectedMessage);
+            return ShakescapeAction::default();
         };
-        if self.diagnostics.phase != DenuoPeerPhase::Negotiated
-            || negotiated.registry_version != DENUO_V2_REGISTRY_VERSION
-            || negotiated.fingerprint != DENUO_V2_REGISTRY_FINGERPRINT
+        if self.diagnostics.phase != ShakescapePeerPhase::Negotiated
+            || negotiated.registry_version != SHAKESCAPE_V1_REGISTRY_VERSION
+            || negotiated.fingerprint != SHAKESCAPE_V1_REGISTRY_FINGERPRINT
             || !negotiated
                 .protocols
                 .contains(&(ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION))
             || payload.len() > usize::try_from(self.local_hello.maximum_receive_size).unwrap_or(0)
         {
-            self.reject_subprotocol(DenuoDisableReason::UnsupportedProtocol);
-            return DenuoAction::default();
+            self.reject_subprotocol(ShakescapeDisableReason::UnsupportedProtocol);
+            return ShakescapeAction::default();
         }
         let (registry, request_id, message) = match NameMarketMessage::decode_envelope(payload) {
             Ok(decoded) => decoded,
             Err(_) => {
-                self.reject_subprotocol(DenuoDisableReason::MalformedEnvelope);
-                return DenuoAction::default();
+                self.reject_subprotocol(ShakescapeDisableReason::MalformedEnvelope);
+                return ShakescapeAction::default();
             }
         };
-        if registry != DenuoRegistryVersion::V2 {
-            self.reject_subprotocol(DenuoDisableReason::IncompatibleVersion);
-            return DenuoAction::default();
+        if registry != ShakescapeRegistryVersion::V1 {
+            self.reject_subprotocol(ShakescapeDisableReason::IncompatibleVersion);
+            return ShakescapeAction::default();
         }
-        DenuoAction {
-            name_market: Some(DenuoNameMarketInbound {
+        ShakescapeAction {
+            name_market: Some(ShakescapeNameMarketInbound {
                 request_id,
                 message,
             }),
-            ..DenuoAction::default()
+            ..ShakescapeAction::default()
         }
     }
 
-    fn receive_hello(&mut self, payload: &[u8]) -> DenuoAction {
+    fn receive_hello(&mut self, payload: &[u8]) -> ShakescapeAction {
         if self.direction != PeerDirection::Inbound {
-            self.disable(if self.diagnostics.phase == DenuoPeerPhase::Negotiated {
-                DenuoDisableReason::DuplicateOrReplay
-            } else {
-                DenuoDisableReason::UnexpectedMessage
-            });
-            return DenuoAction::default();
-        }
-        if self.diagnostics.phase != DenuoPeerPhase::Eligible {
             self.disable(
-                if self.diagnostics.request_id.is_some()
-                    || self.diagnostics.phase == DenuoPeerPhase::Negotiated
-                {
-                    DenuoDisableReason::DuplicateOrReplay
+                if self.diagnostics.phase == ShakescapePeerPhase::Negotiated {
+                    ShakescapeDisableReason::DuplicateOrReplay
                 } else {
-                    DenuoDisableReason::UnexpectedMessage
+                    ShakescapeDisableReason::UnexpectedMessage
                 },
             );
-            return DenuoAction::default();
+            return ShakescapeAction::default();
+        }
+        if self.diagnostics.phase != ShakescapePeerPhase::Eligible {
+            self.disable(
+                if self.diagnostics.request_id.is_some()
+                    || self.diagnostics.phase == ShakescapePeerPhase::Negotiated
+                {
+                    ShakescapeDisableReason::DuplicateOrReplay
+                } else {
+                    ShakescapeDisableReason::UnexpectedMessage
+                },
+            );
+            return ShakescapeAction::default();
         }
 
         let (request_id, remote_hello) =
-            match DenuoExtensionEnvelope::decode_registry_hello_v2(payload) {
+            match ShakescapeExtensionEnvelope::decode_registry_hello(payload) {
                 Ok(message) => message,
                 Err(error) => {
                     self.disable(map_registry_error(&error));
-                    return DenuoAction::default();
+                    return ShakescapeAction::default();
                 }
             };
         self.metrics.record_hello_received();
@@ -717,125 +722,125 @@ impl DenuoCoordinator {
         let response_payload = match encode_hello(request_id, &self.local_hello, true) {
             Ok(payload) => payload,
             Err(()) => {
-                self.disable(DenuoDisableReason::LocalEncodingFailure);
-                return DenuoAction::default();
+                self.disable(ShakescapeDisableReason::LocalEncodingFailure);
+                return ShakescapeAction::default();
             }
         };
         match NegotiatedRegistry::negotiate(&self.local_hello, &remote_hello) {
             Ok(negotiated) => self.install(negotiated),
             Err(error) => self.disable(map_negotiation_error(&error)),
         }
-        DenuoAction {
+        ShakescapeAction {
             response_payload: Some(response_payload),
-            outbound_message: Some(DenuoOutboundMessage::HelloAck),
+            outbound_message: Some(ShakescapeOutboundMessage::HelloAck),
             name_market: None,
         }
     }
 
-    fn receive_hello_ack(&mut self, payload: &[u8]) -> DenuoAction {
+    fn receive_hello_ack(&mut self, payload: &[u8]) -> ShakescapeAction {
         if self.direction != PeerDirection::Outbound {
-            self.disable(DenuoDisableReason::UnexpectedMessage);
-            return DenuoAction::default();
+            self.disable(ShakescapeDisableReason::UnexpectedMessage);
+            return ShakescapeAction::default();
         }
-        if self.diagnostics.phase != DenuoPeerPhase::HelloAdmitted {
+        if self.diagnostics.phase != ShakescapePeerPhase::HelloAdmitted {
             self.disable(
                 if self.diagnostics.request_id.is_some()
-                    || self.diagnostics.phase == DenuoPeerPhase::Negotiated
+                    || self.diagnostics.phase == ShakescapePeerPhase::Negotiated
                 {
-                    DenuoDisableReason::DuplicateOrReplay
+                    ShakescapeDisableReason::DuplicateOrReplay
                 } else {
-                    DenuoDisableReason::UnexpectedMessage
+                    ShakescapeDisableReason::UnexpectedMessage
                 },
             );
-            return DenuoAction::default();
+            return ShakescapeAction::default();
         }
 
         let (request_id, remote_hello) =
-            match DenuoExtensionEnvelope::decode_registry_hello_ack_v2(payload) {
+            match ShakescapeExtensionEnvelope::decode_registry_hello_ack(payload) {
                 Ok(message) => message,
                 Err(error) => {
                     self.disable(map_registry_error(&error));
-                    return DenuoAction::default();
+                    return ShakescapeAction::default();
                 }
             };
         self.metrics.record_hello_ack_received();
         if self.diagnostics.request_id != Some(request_id) {
-            self.disable(DenuoDisableReason::CorrelationMismatch);
-            return DenuoAction::default();
+            self.disable(ShakescapeDisableReason::CorrelationMismatch);
+            return ShakescapeAction::default();
         }
         match NegotiatedRegistry::negotiate(&self.local_hello, &remote_hello) {
             Ok(negotiated) => {
                 self.install(negotiated);
                 let request_id = self.proposed_request_id.checked_add(1).unwrap_or(1);
                 match NameMarketMessage::Hello(self.name_market_hello)
-                    .encode_envelope(DenuoRegistryVersion::V2, request_id)
+                    .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
                 {
-                    Ok(payload) => DenuoAction {
+                    Ok(payload) => ShakescapeAction {
                         response_payload: Some(payload),
-                        outbound_message: Some(DenuoOutboundMessage::NameMarket),
+                        outbound_message: Some(ShakescapeOutboundMessage::NameMarket),
                         name_market: None,
                     },
                     Err(_) => {
-                        self.disable(DenuoDisableReason::LocalEncodingFailure);
-                        DenuoAction::default()
+                        self.disable(ShakescapeDisableReason::LocalEncodingFailure);
+                        ShakescapeAction::default()
                     }
                 }
             }
             Err(error) => {
                 self.disable(map_negotiation_error(&error));
-                DenuoAction::default()
+                ShakescapeAction::default()
             }
         }
     }
 
     fn install(&mut self, negotiated: NegotiatedRegistry) {
         self.pending_deadline = None;
-        self.diagnostics.phase = DenuoPeerPhase::Negotiated;
+        self.diagnostics.phase = ShakescapePeerPhase::Negotiated;
         self.diagnostics.disable_reason = None;
-        self.diagnostics.negotiated = Some(DenuoNegotiatedParameters::from(&negotiated));
+        self.diagnostics.negotiated = Some(ShakescapeNegotiatedParameters::from(&negotiated));
         self.negotiated = Some(negotiated);
         self.metrics.record_agreement_computed();
     }
 
-    fn disable(&mut self, reason: DenuoDisableReason) {
-        if self.diagnostics.phase == DenuoPeerPhase::Disabled {
+    fn disable(&mut self, reason: ShakescapeDisableReason) {
+        if self.diagnostics.phase == ShakescapePeerPhase::Disabled {
             return;
         }
         self.pending_deadline = None;
         self.negotiated = None;
-        self.diagnostics.phase = DenuoPeerPhase::Disabled;
+        self.diagnostics.phase = ShakescapePeerPhase::Disabled;
         self.diagnostics.disable_reason = Some(reason);
         self.diagnostics.negotiated = None;
         self.metrics.record_disabled(reason);
     }
 
-    fn reject_subprotocol(&mut self, reason: DenuoDisableReason) {
-        if self.diagnostics.phase == DenuoPeerPhase::Negotiated {
+    fn reject_subprotocol(&mut self, reason: ShakescapeDisableReason) {
+        if self.diagnostics.phase == ShakescapePeerPhase::Negotiated {
             self.metrics.record_rejected(reason);
         } else {
             self.disable(reason);
         }
     }
 
-    pub(crate) fn outbound_admitted(&mut self, message: DenuoOutboundMessage, now: Instant) {
+    pub(crate) fn outbound_admitted(&mut self, message: ShakescapeOutboundMessage, now: Instant) {
         match message {
-            DenuoOutboundMessage::Hello => {
-                self.diagnostics.phase = DenuoPeerPhase::HelloAdmitted;
+            ShakescapeOutboundMessage::Hello => {
+                self.diagnostics.phase = ShakescapePeerPhase::HelloAdmitted;
                 self.diagnostics.request_id = Some(self.proposed_request_id);
                 self.pending_deadline = Some(now + self.negotiation_timeout);
                 self.metrics.record_hello_admitted();
             }
-            DenuoOutboundMessage::HelloAck => self.metrics.record_hello_ack_admitted(),
-            DenuoOutboundMessage::NameMarket => {}
+            ShakescapeOutboundMessage::HelloAck => self.metrics.record_hello_ack_admitted(),
+            ShakescapeOutboundMessage::NameMarket => {}
         }
     }
 
     pub(crate) fn outbound_rejected(&mut self) {
-        if self.diagnostics.phase == DenuoPeerPhase::Disabled {
+        if self.diagnostics.phase == ShakescapePeerPhase::Disabled {
             self.metrics
-                .record_rejected(DenuoDisableReason::LocalSendUnavailable);
+                .record_rejected(ShakescapeDisableReason::LocalSendUnavailable);
         } else {
-            self.disable(DenuoDisableReason::LocalSendUnavailable);
+            self.disable(ShakescapeDisableReason::LocalSendUnavailable);
         }
     }
 }
@@ -856,60 +861,64 @@ fn is_name_market_message(message: KnownMessage) -> bool {
 
 fn encode_hello(request_id: u64, hello: &RegistryHello, ack: bool) -> Result<Vec<u8>, ()> {
     let envelope = if ack {
-        DenuoExtensionEnvelope::registry_hello_ack_v2(request_id, hello)
+        ShakescapeExtensionEnvelope::registry_hello_ack(request_id, hello)
     } else {
-        DenuoExtensionEnvelope::registry_hello_v2(request_id, hello)
+        ShakescapeExtensionEnvelope::registry_hello(request_id, hello)
     }
     .map_err(|_| ())?;
     envelope.encode_canonical().map_err(|_| ())
 }
 
-fn map_registry_error(error: &RegistryEnvelopeError) -> DenuoDisableReason {
+fn map_registry_error(error: &RegistryEnvelopeError) -> ShakescapeDisableReason {
     match error {
         RegistryEnvelopeError::Envelope(error) => map_envelope_error(error),
         RegistryEnvelopeError::Negotiation(error) => map_negotiation_error(error),
-        RegistryEnvelopeError::WrongRegistryVersion(_) => DenuoDisableReason::IncompatibleVersion,
-        RegistryEnvelopeError::RegistryIdentityMismatch { .. } => {
-            DenuoDisableReason::WrongFingerprint
+        RegistryEnvelopeError::WrongRegistryVersion(_) => {
+            ShakescapeDisableReason::IncompatibleVersion
         }
-        RegistryEnvelopeError::WrongProtocol { .. } => DenuoDisableReason::UnsupportedProtocol,
-        RegistryEnvelopeError::UnsupportedFlags(_) => DenuoDisableReason::UnsupportedProtocol,
-        RegistryEnvelopeError::UnexpectedMessage { .. } => DenuoDisableReason::UnexpectedMessage,
+        RegistryEnvelopeError::RegistryIdentityMismatch { .. } => {
+            ShakescapeDisableReason::WrongFingerprint
+        }
+        RegistryEnvelopeError::WrongProtocol { .. } => ShakescapeDisableReason::UnsupportedProtocol,
+        RegistryEnvelopeError::UnsupportedFlags(_) => ShakescapeDisableReason::UnsupportedProtocol,
+        RegistryEnvelopeError::UnexpectedMessage { .. } => {
+            ShakescapeDisableReason::UnexpectedMessage
+        }
     }
 }
 
-fn map_envelope_error(error: &EnvelopeError) -> DenuoDisableReason {
+fn map_envelope_error(error: &EnvelopeError) -> ShakescapeDisableReason {
     match error {
-        EnvelopeError::PacketTooLarge { .. } => DenuoDisableReason::PacketTooLarge,
-        EnvelopeError::PayloadTooLarge { .. } => DenuoDisableReason::PayloadTooLarge,
-        EnvelopeError::UnknownMessage { .. } => DenuoDisableReason::UnexpectedMessage,
+        EnvelopeError::PacketTooLarge { .. } => ShakescapeDisableReason::PacketTooLarge,
+        EnvelopeError::PayloadTooLarge { .. } => ShakescapeDisableReason::PayloadTooLarge,
+        EnvelopeError::UnknownMessage { .. } => ShakescapeDisableReason::UnexpectedMessage,
         EnvelopeError::ProtocolUnavailable { .. } | EnvelopeError::UnsupportedFlags { .. } => {
-            DenuoDisableReason::UnsupportedProtocol
+            ShakescapeDisableReason::UnsupportedProtocol
         }
         EnvelopeError::ZeroRequestId { .. }
         | EnvelopeError::Decode(_)
         | EnvelopeError::WrongMagic(_)
-        | EnvelopeError::LengthMismatch { .. } => DenuoDisableReason::MalformedEnvelope,
+        | EnvelopeError::LengthMismatch { .. } => ShakescapeDisableReason::MalformedEnvelope,
     }
 }
 
-fn map_negotiation_error(error: &NegotiationError) -> DenuoDisableReason {
+fn map_negotiation_error(error: &NegotiationError) -> ShakescapeDisableReason {
     match error {
-        NegotiationError::WrongFingerprint { .. } => DenuoDisableReason::WrongFingerprint,
+        NegotiationError::WrongFingerprint { .. } => ShakescapeDisableReason::WrongFingerprint,
         NegotiationError::WrongNetwork { .. } | NegotiationError::UnknownNetwork(_) => {
-            DenuoDisableReason::WrongNetwork
+            ShakescapeDisableReason::WrongNetwork
         }
         NegotiationError::WrongGenesis | NegotiationError::ZeroGenesis => {
-            DenuoDisableReason::WrongGenesis
+            ShakescapeDisableReason::WrongGenesis
         }
         NegotiationError::UnknownFormatVersion(_) | NegotiationError::NoCommonRegistry => {
-            DenuoDisableReason::IncompatibleVersion
+            ShakescapeDisableReason::IncompatibleVersion
         }
-        NegotiationError::ZeroResourceLimit => DenuoDisableReason::InvalidResourceLimit,
+        NegotiationError::ZeroResourceLimit => ShakescapeDisableReason::InvalidResourceLimit,
         NegotiationError::MissingRegistryProtocol
         | NegotiationError::UnsupportedRegistryProtocolRange(_)
         | NegotiationError::RegistryProtocolNotNegotiated => {
-            DenuoDisableReason::UnsupportedProtocol
+            ShakescapeDisableReason::UnsupportedProtocol
         }
         NegotiationError::Decode(_)
         | NegotiationError::WrongMagic(_)
@@ -918,14 +927,14 @@ fn map_negotiation_error(error: &NegotiationError) -> DenuoDisableReason {
         | NegotiationError::DuplicateOrZeroRegistryVersion
         | NegotiationError::DuplicateProtocol
         | NegotiationError::ManagedRegistryProtocol
-        | NegotiationError::InvalidProtocolRange(_) => DenuoDisableReason::MalformedHello,
+        | NegotiationError::InvalidProtocolRange(_) => ShakescapeDisableReason::MalformedHello,
     }
 }
 
 pub(crate) const fn is_extension_packet_type(packet_type: PacketType) -> bool {
     matches!(
         packet_type,
-        PacketType::Unknown(value) if value == DENUO_EXTENSION_PACKET.value()
+        PacketType::Unknown(value) if value == SHAKESCAPE_EXTENSION_PACKET.value()
     )
 }
 
@@ -935,7 +944,7 @@ pub(crate) fn is_registry_hello_packet(packet: &Packet) -> bool {
             packet_type,
             payload,
         } if is_extension_packet_type(*packet_type) => {
-            DenuoExtensionEnvelope::decode_registry_hello_v2(payload).is_ok()
+            ShakescapeExtensionEnvelope::decode_registry_hello(payload).is_ok()
         }
         _ => false,
     }
@@ -943,7 +952,7 @@ pub(crate) fn is_registry_hello_packet(packet: &Packet) -> bool {
 
 pub(crate) fn extension_packet(payload: Vec<u8>) -> Packet {
     Packet::Unknown {
-        packet_type: PacketType::Unknown(DENUO_EXTENSION_PACKET.value()),
+        packet_type: PacketType::Unknown(SHAKESCAPE_EXTENSION_PACKET.value()),
         payload,
     }
 }
@@ -951,16 +960,16 @@ pub(crate) fn extension_packet(payload: Vec<u8>) -> Packet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_p2p_experimental::DENUO_ENVELOPE_OVERHEAD;
+    use hns_p2p_experimental::SHAKESCAPE_ENVELOPE_OVERHEAD;
 
-    const SERVICES: u64 = crate::SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+    const SERVICES: u64 = crate::SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
 
     fn coordinator(
         direction: PeerDirection,
         network: ConsensusNetwork,
-        metrics: DenuoRuntimeMetrics,
-    ) -> DenuoCoordinator {
-        let mut coordinator = DenuoCoordinator::new(
+        metrics: ShakescapeRuntimeMetrics,
+    ) -> ShakescapeCoordinator {
+        let mut coordinator = ShakescapeCoordinator::new(
             direction,
             network,
             SERVICES,
@@ -973,7 +982,7 @@ mod tests {
         coordinator
     }
 
-    fn admit(coordinator: &mut DenuoCoordinator, action: DenuoAction) -> Vec<u8> {
+    fn admit(coordinator: &mut ShakescapeCoordinator, action: ShakescapeAction) -> Vec<u8> {
         let message = action.outbound_message.expect("outbound message kind");
         let payload = action.response_payload.expect("outbound payload");
         coordinator.outbound_admitted(message, Instant::now());
@@ -982,12 +991,12 @@ mod tests {
 
     #[test]
     fn public_reason_order_and_labels_are_stable() {
-        let summary = DenuoSummary::default();
+        let summary = ShakescapeSummary::default();
         assert_eq!(
             summary.rejection_reasons.len(),
-            DenuoDisableReason::ALL.len()
+            ShakescapeDisableReason::ALL.len()
         );
-        for (index, reason) in DenuoDisableReason::ALL.into_iter().enumerate() {
+        for (index, reason) in ShakescapeDisableReason::ALL.into_iter().enumerate() {
             assert_eq!(reason.index(), index);
             assert_eq!(
                 serde_json::to_string(&reason).expect("serialize reason"),
@@ -1003,14 +1012,14 @@ mod tests {
             map_registry_error(&RegistryEnvelopeError::RegistryIdentityMismatch {
                 registry_version: 1,
             }),
-            DenuoDisableReason::WrongFingerprint
+            ShakescapeDisableReason::WrongFingerprint
         );
         assert_eq!(
             map_envelope_error(&EnvelopeError::ProtocolUnavailable {
                 registry_version: 1,
                 protocol_id: 1,
             }),
-            DenuoDisableReason::UnsupportedProtocol
+            ShakescapeDisableReason::UnsupportedProtocol
         );
         assert_eq!(
             map_envelope_error(&EnvelopeError::UnsupportedFlags {
@@ -1018,18 +1027,18 @@ mod tests {
                 protocol_version: 1,
                 flags: 1,
             }),
-            DenuoDisableReason::UnsupportedProtocol
+            ShakescapeDisableReason::UnsupportedProtocol
         );
         assert_eq!(
             map_negotiation_error(&NegotiationError::ZeroGenesis),
-            DenuoDisableReason::WrongGenesis
+            ShakescapeDisableReason::WrongGenesis
         );
     }
 
     #[test]
     fn advertisement_phase_is_unknown_until_version_is_observed() {
-        let metrics = DenuoRuntimeMetrics::default();
-        let mut enabled = DenuoCoordinator::new(
+        let metrics = ShakescapeRuntimeMetrics::default();
+        let mut enabled = ShakescapeCoordinator::new(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
             SERVICES,
@@ -1038,11 +1047,17 @@ mod tests {
             metrics.clone(),
         )
         .expect("enabled coordinator");
-        assert_eq!(enabled.diagnostics.phase, DenuoPeerPhase::AwaitingVersion);
+        assert_eq!(
+            enabled.diagnostics.phase,
+            ShakescapePeerPhase::AwaitingVersion
+        );
         enabled.observe_remote_services(crate::SERVICE_NETWORK);
-        assert_eq!(enabled.diagnostics.phase, DenuoPeerPhase::NotAdvertised);
+        assert_eq!(
+            enabled.diagnostics.phase,
+            ShakescapePeerPhase::NotAdvertised
+        );
 
-        let disabled = DenuoCoordinator::new(
+        let disabled = ShakescapeCoordinator::new(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
             crate::SERVICE_NETWORK,
@@ -1051,13 +1066,16 @@ mod tests {
             metrics,
         )
         .expect("locally disabled coordinator");
-        assert_eq!(disabled.diagnostics.phase, DenuoPeerPhase::LocalDisabled);
+        assert_eq!(
+            disabled.diagnostics.phase,
+            ShakescapePeerPhase::LocalDisabled
+        );
     }
 
     #[test]
-    fn stock_peer_becomes_ready_without_admitting_a_denuo_hello() {
-        let metrics = DenuoRuntimeMetrics::default();
-        let mut coordinator = DenuoCoordinator::new(
+    fn stock_peer_becomes_ready_without_admitting_a_shakescape_hello() {
+        let metrics = ShakescapeRuntimeMetrics::default();
+        let mut coordinator = ShakescapeCoordinator::new(
             PeerDirection::Outbound,
             ConsensusNetwork::Regtest,
             SERVICES,
@@ -1070,8 +1088,11 @@ mod tests {
 
         let action = coordinator.on_ready(Instant::now());
 
-        assert_eq!(coordinator.diagnostics.phase, DenuoPeerPhase::NotAdvertised);
-        assert_eq!(action, DenuoAction::default());
+        assert_eq!(
+            coordinator.diagnostics.phase,
+            ShakescapePeerPhase::NotAdvertised
+        );
+        assert_eq!(action, ShakescapeAction::default());
         let diagnostics = [coordinator.diagnostics()];
         let summary = metrics.summary(SERVICES, &diagnostics);
         assert_eq!(summary.live.not_advertised, 1);
@@ -1081,8 +1102,8 @@ mod tests {
 
     #[test]
     fn coordinators_negotiate_canonical_registry() {
-        let outbound_metrics = DenuoRuntimeMetrics::default();
-        let inbound_metrics = DenuoRuntimeMetrics::default();
+        let outbound_metrics = ShakescapeRuntimeMetrics::default();
+        let inbound_metrics = ShakescapeRuntimeMetrics::default();
         let now = Instant::now();
         let mut outbound = coordinator(
             PeerDirection::Outbound,
@@ -1102,8 +1123,8 @@ mod tests {
         let ack = admit(&mut inbound, inbound_action);
         outbound.receive_extension(&ack);
 
-        assert_eq!(outbound.diagnostics.phase, DenuoPeerPhase::Negotiated);
-        assert_eq!(inbound.diagnostics.phase, DenuoPeerPhase::Negotiated);
+        assert_eq!(outbound.diagnostics.phase, ShakescapePeerPhase::Negotiated);
+        assert_eq!(inbound.diagnostics.phase, ShakescapePeerPhase::Negotiated);
         assert_eq!(
             outbound
                 .diagnostics
@@ -1111,29 +1132,29 @@ mod tests {
                 .as_ref()
                 .expect("parameters")
                 .maximum_send_size,
-            DENUO_EXTENSION_MAX_PACKET_PAYLOAD as u32
+            SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD as u32
         );
         assert_eq!(
             outbound_metrics.summary(SERVICES, &[]).process,
-            DenuoProcessTotals {
+            ShakescapeProcessTotals {
                 hello_admitted: 1,
                 hello_ack_received: 1,
                 agreements_computed: 1,
-                ..DenuoProcessTotals::default()
+                ..ShakescapeProcessTotals::default()
             }
         );
         assert_eq!(
             inbound_metrics.summary(SERVICES, &[]).process,
-            DenuoProcessTotals {
+            ShakescapeProcessTotals {
                 hello_received: 1,
                 hello_ack_admitted: 1,
                 agreements_computed: 1,
-                ..DenuoProcessTotals::default()
+                ..ShakescapeProcessTotals::default()
             }
         );
 
-        let unknown_subprotocol = DenuoExtensionEnvelope {
-            registry_version: DENUO_V2_REGISTRY_VERSION,
+        let unknown_subprotocol = ShakescapeExtensionEnvelope {
+            registry_version: SHAKESCAPE_V1_REGISTRY_VERSION,
             protocol_id: 0x7fff,
             protocol_version: 1,
             message_type: 1,
@@ -1144,7 +1165,7 @@ mod tests {
         .encode_canonical()
         .expect("bounded unknown protocol");
         outbound.receive_extension(&unknown_subprotocol);
-        assert_eq!(outbound.diagnostics.phase, DenuoPeerPhase::Negotiated);
+        assert_eq!(outbound.diagnostics.phase, ShakescapePeerPhase::Negotiated);
         assert_eq!(outbound_metrics.summary(SERVICES, &[]).process.rejected, 1);
     }
 
@@ -1154,12 +1175,12 @@ mod tests {
         let mut outbound = coordinator(
             PeerDirection::Outbound,
             ConsensusNetwork::Testnet,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         let mut inbound = coordinator(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         inbound.on_ready(now);
         let outbound_action = outbound.on_ready(now);
@@ -1167,10 +1188,10 @@ mod tests {
         let action = inbound.receive_extension(&hello);
 
         assert!(action.response_payload.is_some());
-        assert_eq!(inbound.diagnostics.phase, DenuoPeerPhase::Disabled);
+        assert_eq!(inbound.diagnostics.phase, ShakescapePeerPhase::Disabled);
         assert_eq!(
             inbound.diagnostics.disable_reason,
-            Some(DenuoDisableReason::WrongNetwork)
+            Some(ShakescapeDisableReason::WrongNetwork)
         );
     }
 
@@ -1181,30 +1202,30 @@ mod tests {
         let mut fingerprint_sender = coordinator(
             PeerDirection::Outbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         let mut fingerprint_hello = fingerprint_sender
             .on_ready(now)
             .response_payload
             .expect("fingerprint hello");
-        fingerprint_hello[DENUO_ENVELOPE_OVERHEAD + 6] ^= 0x01;
+        fingerprint_hello[SHAKESCAPE_ENVELOPE_OVERHEAD + 6] ^= 0x01;
         let mut fingerprint_receiver = coordinator(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         fingerprint_receiver.on_ready(now);
         let action = fingerprint_receiver.receive_extension(&fingerprint_hello);
         assert_eq!(action.response_payload, None);
         assert_eq!(
             fingerprint_receiver.diagnostics.disable_reason,
-            Some(DenuoDisableReason::WrongFingerprint)
+            Some(ShakescapeDisableReason::WrongFingerprint)
         );
 
         let genesis_sender = coordinator(
             PeerDirection::Outbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         let mut wrong_genesis = genesis_sender.local_hello.clone();
         wrong_genesis.genesis_hash[0] ^= 0x01;
@@ -1212,18 +1233,18 @@ mod tests {
         let mut genesis_receiver = coordinator(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         genesis_receiver.on_ready(now);
         let action = genesis_receiver.receive_extension(&genesis_hello);
         assert!(action.response_payload.is_some());
         assert_eq!(
             genesis_receiver.diagnostics.disable_reason,
-            Some(DenuoDisableReason::WrongGenesis)
+            Some(ShakescapeDisableReason::WrongGenesis)
         );
 
-        let malformed_hello = DenuoExtensionEnvelope {
-            registry_version: DENUO_V2_REGISTRY_VERSION,
+        let malformed_hello = ShakescapeExtensionEnvelope {
+            registry_version: SHAKESCAPE_V1_REGISTRY_VERSION,
             protocol_id: 0,
             protocol_version: 1,
             message_type: 1,
@@ -1236,7 +1257,7 @@ mod tests {
         let mut malformed_receiver = coordinator(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         malformed_receiver.on_ready(now);
         assert_eq!(
@@ -1247,61 +1268,62 @@ mod tests {
         );
         assert_eq!(
             malformed_receiver.diagnostics.disable_reason,
-            Some(DenuoDisableReason::MalformedHello)
+            Some(ShakescapeDisableReason::MalformedHello)
         );
 
         let mut replay_sender = coordinator(
             PeerDirection::Outbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         let replay_action = replay_sender.on_ready(now);
         let hello = admit(&mut replay_sender, replay_action);
         let mut replay_receiver = coordinator(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         replay_receiver.on_ready(now);
         let ack_action = replay_receiver.receive_extension(&hello);
         let _ack = admit(&mut replay_receiver, ack_action);
         assert_eq!(
             replay_receiver.diagnostics.phase,
-            DenuoPeerPhase::Negotiated
+            ShakescapePeerPhase::Negotiated
         );
         replay_receiver.receive_extension(&hello);
         assert_eq!(
             replay_receiver.diagnostics.disable_reason,
-            Some(DenuoDisableReason::DuplicateOrReplay)
+            Some(ShakescapeDisableReason::DuplicateOrReplay)
         );
     }
 
     #[test]
     fn full_packet_bound_and_timeout_are_scoped_diagnostics() {
         let now = Instant::now();
-        let inbound_metrics = DenuoRuntimeMetrics::default();
+        let inbound_metrics = ShakescapeRuntimeMetrics::default();
         let mut inbound = coordinator(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
             inbound_metrics.clone(),
         );
         inbound.on_ready(now);
-        let oversized = vec![0; DENUO_EXTENSION_MAX_PACKET_PAYLOAD + 1];
+        let oversized = vec![0; SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD + 1];
         assert_eq!(inbound.receive_extension(&oversized).response_payload, None);
         assert_eq!(inbound.receive_extension(&oversized).response_payload, None);
         assert_eq!(
             inbound.diagnostics.disable_reason,
-            Some(DenuoDisableReason::PacketTooLarge)
+            Some(ShakescapeDisableReason::PacketTooLarge)
         );
         let oversized_summary = inbound_metrics.summary(SERVICES, &[inbound.diagnostics()]);
         assert_eq!(oversized_summary.process.disabled, 1);
         assert_eq!(oversized_summary.process.rejected, 2);
         assert_eq!(
-            oversized_summary.rejection_reasons[DenuoDisableReason::PacketTooLarge.index()].count,
+            oversized_summary.rejection_reasons[ShakescapeDisableReason::PacketTooLarge.index()]
+                .count,
             2
         );
 
-        let metrics = DenuoRuntimeMetrics::default();
+        let metrics = ShakescapeRuntimeMetrics::default();
         let mut outbound = coordinator(
             PeerDirection::Outbound,
             ConsensusNetwork::Regtest,
@@ -1313,7 +1335,7 @@ mod tests {
         let mut responder = coordinator(
             PeerDirection::Inbound,
             ConsensusNetwork::Regtest,
-            DenuoRuntimeMetrics::default(),
+            ShakescapeRuntimeMetrics::default(),
         );
         responder.on_ready(now);
         let response = responder.receive_extension(&hello);
@@ -1323,7 +1345,7 @@ mod tests {
         outbound.receive_extension(&late_ack);
         assert_eq!(
             outbound.diagnostics.disable_reason,
-            Some(DenuoDisableReason::NegotiationTimeout)
+            Some(ShakescapeDisableReason::NegotiationTimeout)
         );
         assert_eq!(metrics.summary(SERVICES, &[]).process.hello_ack_received, 0);
         assert_eq!(metrics.summary(SERVICES, &[]).process.disabled, 1);

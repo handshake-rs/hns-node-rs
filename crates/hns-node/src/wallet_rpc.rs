@@ -5,7 +5,7 @@
 
 use axum::{http::StatusCode, Json};
 use hns_marketplace_protocol::{
-    DenuoPublicationAcceptanceExpectation, DenuoPublicationMessageKind,
+    ShakescapePublicationAcceptanceExpectation, ShakescapePublicationMessageKind,
 };
 use hns_primitives::{
     hex_encode, Address, Coin, Covenant, NameHash, NameLifecycleState, NameState, Outpoint, Output,
@@ -45,7 +45,7 @@ const MAX_WALLET_RPC_PAGE_ITEMS: usize = 256;
 const MAX_WALLET_RPC_MEMPOOL_SCAN: usize = 1_024;
 const MAX_WALLET_RPC_OUTPOINTS: usize = 256;
 const MAX_WALLET_RPC_RESULT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_WALLET_RPC_DENUO_PUBLICATION_BYTES: usize = 16 * 1024;
+const MAX_WALLET_RPC_SHAKESCAPE_PUBLICATION_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,17 +144,17 @@ enum WalletRpcCall {
         expected_chain_epoch: u64,
         expected_mempool: WireExpectedMempool,
     },
-    DenuoNameMarketPublish {
+    ShakescapeNameMarketPublish {
         envelope_hex: String,
-        handoff: WireDenuoPublicationHandoff,
+        handoff: WireShakescapePublicationHandoff,
     },
-    DenuoNameMarketEvents {
+    ShakescapeNameMarketEvents {
         #[serde(default)]
         expected_instance_nonce: Option<String>,
         after_revision: u64,
         limit: usize,
     },
-    DenuoNameMarketSnapshot {
+    ShakescapeNameMarketSnapshot {
         #[serde(default)]
         expected_revision: Option<u64>,
         offset: usize,
@@ -188,7 +188,7 @@ enum WalletRpcCall {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WireDenuoPublicationHandoff {
+struct WireShakescapePublicationHandoff {
     network_magic: u32,
     network_genesis: String,
     attempt_id: String,
@@ -201,27 +201,27 @@ struct WireDenuoPublicationHandoff {
     request_id: u64,
 }
 
-fn decode_denuo_handoff(
-    wire: WireDenuoPublicationHandoff,
-) -> Result<DenuoPublicationAcceptanceExpectation, DispatchError> {
+fn decode_shakescape_handoff(
+    wire: WireShakescapePublicationHandoff,
+) -> Result<ShakescapePublicationAcceptanceExpectation, DispatchError> {
     let message_kind = match wire.message_kind.as_str() {
-        "offer" => DenuoPublicationMessageKind::Offer,
-        "cancellation" => DenuoPublicationMessageKind::Cancellation,
+        "offer" => ShakescapePublicationMessageKind::Offer,
+        "cancellation" => ShakescapePublicationMessageKind::Cancellation,
         _ => {
             return Err(DispatchError::Invalid(
-                "Denuo publication handoff kind is invalid",
+                "Shakescape publication handoff kind is invalid",
             ));
         }
     };
-    Ok(DenuoPublicationAcceptanceExpectation {
+    Ok(ShakescapePublicationAcceptanceExpectation {
         network_magic: wire.network_magic,
-        network_genesis: decode_hex_32(&wire.network_genesis, "Denuo network genesis")?,
-        attempt_id: decode_hex_32(&wire.attempt_id, "Denuo handoff attempt ID")?,
+        network_genesis: decode_hex_32(&wire.network_genesis, "Shakescape network genesis")?,
+        attempt_id: decode_hex_32(&wire.attempt_id, "Shakescape handoff attempt ID")?,
         record_sequence: wire.record_sequence,
         prepared_at_unix: wire.prepared_at_unix,
-        envelope_id: decode_hex_32(&wire.envelope_id, "Denuo envelope ID")?,
-        envelope_digest: decode_hex_32(&wire.envelope_digest, "Denuo envelope digest")?,
-        content_id: decode_hex_32(&wire.content_id, "Denuo content ID")?,
+        envelope_id: decode_hex_32(&wire.envelope_id, "Shakescape envelope ID")?,
+        envelope_digest: decode_hex_32(&wire.envelope_digest, "Shakescape envelope digest")?,
+        content_id: decode_hex_32(&wire.content_id, "Shakescape content ID")?,
         message_kind,
         request_id: wire.request_id,
     })
@@ -532,22 +532,22 @@ async fn dispatch_call(
                     Value::from(MAX_WALLET_INCOMING_TRANSFER_RETAINED_BLOCK_DECODES),
                 ),
                 (
-                    "denuo_name_market_registry",
-                    Value::from("denuo-v2"),
+                    "shakescape_name_market_registry",
+                    Value::from("shakescape-v1"),
                 ),
                 (
-                    "denuo_name_market_transport",
+                    "shakescape_name_market_transport",
                     Value::from("typed_local_publish_and_monotonic_event_cursor"),
                 ),
                 (
-                    "denuo_name_market_event_authority",
+                    "shakescape_name_market_event_authority",
                     Value::from(
                         "untrusted_discovery_input_requires_wallet_signature_current_lock_and_chain_revalidation",
                     ),
                 ),
                 (
-                    "maximum_denuo_name_market_event_page",
-                    Value::from(super::MAX_DENUO_NAME_MARKET_EVENT_PAGE),
+                    "maximum_shakescape_name_market_event_page",
+                    Value::from(super::MAX_SHAKESCAPE_NAME_MARKET_EVENT_PAGE),
                 ),
             ] {
                 object.insert(key.to_owned(), value);
@@ -771,19 +771,19 @@ async fn dispatch_call(
                     .await?,
             ))?
         }
-        WalletRpcCall::DenuoNameMarketPublish {
+        WalletRpcCall::ShakescapeNameMarketPublish {
             envelope_hex,
             handoff,
         } => {
             let envelope = decode_hex_bounded(
                 &envelope_hex,
-                MAX_WALLET_RPC_DENUO_PUBLICATION_BYTES,
-                "Denuo name-market publication",
+                MAX_WALLET_RPC_SHAKESCAPE_PUBLICATION_BYTES,
+                "Shakescape name-market publication",
             )?;
-            let handoff = decode_denuo_handoff(handoff)?;
+            let handoff = decode_shakescape_handoff(handoff)?;
             let now = super::current_unix_time().map_err(|_| DispatchError::Internal)?;
             let (admission, propagation, receipt) = backend
-                .publish_denuo_name_market(&envelope, handoff, now)
+                .publish_shakescape_name_market(&envelope, handoff, now)
                 .await?;
             serde_json::json!({
                 "revision": admission.revision,
@@ -799,23 +799,25 @@ async fn dispatch_call(
                 }
             })
         }
-        WalletRpcCall::DenuoNameMarketEvents {
+        WalletRpcCall::ShakescapeNameMarketEvents {
             expected_instance_nonce,
             after_revision,
             limit,
         } => {
-            if limit == 0 || limit > super::MAX_DENUO_NAME_MARKET_EVENT_PAGE {
+            if limit == 0 || limit > super::MAX_SHAKESCAPE_NAME_MARKET_EVENT_PAGE {
                 return Err(DispatchError::Invalid(
-                    "Denuo name-market event limit must be within 1..=256",
+                    "Shakescape name-market event limit must be within 1..=256",
                 ));
             }
             let expected_instance_nonce = expected_instance_nonce
-                .map(|nonce| decode_hex_32(&nonce, "Denuo instance nonce"))
+                .map(|nonce| decode_hex_32(&nonce, "Shakescape instance nonce"))
                 .transpose()?;
             if expected_instance_nonce == Some([0; 32]) {
-                return Err(DispatchError::Invalid("Denuo instance nonce is invalid"));
+                return Err(DispatchError::Invalid(
+                    "Shakescape instance nonce is invalid",
+                ));
             }
-            let page = backend.get_denuo_name_market_events(
+            let page = backend.get_shakescape_name_market_events(
                 expected_instance_nonce,
                 after_revision,
                 limit,
@@ -834,17 +836,18 @@ async fn dispatch_call(
                 })).collect::<Vec<_>>()
             })
         }
-        WalletRpcCall::DenuoNameMarketSnapshot {
+        WalletRpcCall::ShakescapeNameMarketSnapshot {
             expected_revision,
             offset,
             limit,
         } => {
-            if limit == 0 || limit > super::MAX_DENUO_NAME_MARKET_SNAPSHOT_PAGE {
+            if limit == 0 || limit > super::MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE {
                 return Err(DispatchError::Invalid(
-                    "Denuo name-market snapshot limit must be within 1..=256",
+                    "Shakescape name-market snapshot limit must be within 1..=256",
                 ));
             }
-            let page = backend.get_denuo_name_market_snapshot(expected_revision, offset, limit)?;
+            let page =
+                backend.get_shakescape_name_market_snapshot(expected_revision, offset, limit)?;
             serde_json::json!({
                 "instance_nonce": hex_encode(&page.instance_nonce),
                 "snapshot_revision": page.snapshot_revision,
@@ -1093,11 +1096,11 @@ fn map_backend_error(
             "the indexed owner transaction does not contain its selected output",
             false,
         ),
-        WalletBackendError::DenuoNameMarket(_) => wallet_rpc_failure(
+        WalletBackendError::ShakescapeNameMarket(_) => wallet_rpc_failure(
             request_id,
             StatusCode::CONFLICT,
-            "denuo_name_market_rejected",
-            "the local Denuo V2 relay rejected the publication or event cursor",
+            "shakescape_name_market_rejected",
+            "the local Shakescape V1 relay rejected the publication or event cursor",
             true,
         ),
         WalletBackendError::Corrupt(_) => wallet_rpc_failure(

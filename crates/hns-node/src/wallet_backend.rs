@@ -13,7 +13,7 @@ use hns_consensus::{
     transfer_maturity_height, validate_block_commitments, validate_transaction_sanity, Network,
     HSD_CONSENSUS_PROFILE,
 };
-use hns_marketplace_protocol::DenuoPublicationAcceptanceExpectation;
+use hns_marketplace_protocol::ShakescapePublicationAcceptanceExpectation;
 use hns_mempool::{
     minimum_policy_fee, sigop_adjusted_virtual_size, Admission, MempoolInfo, MempoolSnapshot,
     HSD_MINIMUM_RELAY_FEE_RATE,
@@ -47,9 +47,10 @@ use thiserror::Error;
 use super::{
     best_block_tip_from_snapshot, chain_epoch_from_snapshot, load_block, load_header_record,
     load_undo_pruning_checkpoint, median_time_past_with_lookup, read_canonical_hash,
-    CanonicalEpoch, CanonicalStateWriter, CanonicalWriterError, DenuoNameMarketAdmission,
-    DenuoNameMarketEventPage, DenuoNameMarketSnapshotPage, DenuoRelayHandle,
+    CanonicalEpoch, CanonicalStateWriter, CanonicalWriterError,
     LivePeerManager as ReexportedLivePeerManager, NodeReadHandle, NodeRuntime,
+    ShakescapeNameMarketAdmission, ShakescapeNameMarketEventPage, ShakescapeNameMarketSnapshotPage,
+    ShakescapeRelayHandle,
 };
 
 /// Maximum mempool entries sampled by one fee estimate.
@@ -1049,9 +1050,9 @@ pub enum WalletBackendError {
     /// Requested name has no active state in the current chain snapshot.
     #[error("current name state is absent")]
     NameStateMissing,
-    /// Local Denuo relay or typed name-market admission failed.
-    #[error("Denuo name-market operation failed: {0}")]
-    DenuoNameMarket(String),
+    /// Local Shakescape relay or typed name-market admission failed.
+    #[error("Shakescape name-market operation failed: {0}")]
+    ShakescapeNameMarket(String),
     /// Current name evidence requires an initialized active chain.
     #[error("wallet name evidence requires an initialized active chain")]
     ChainUninitialized,
@@ -1070,7 +1071,7 @@ pub struct WalletBackend {
     read: NodeReadHandle,
     writer: CanonicalStateWriter,
     peers: LivePeerManager,
-    denuo_relay: DenuoRelayHandle,
+    shakescape_relay: ShakescapeRelayHandle,
 }
 
 impl std::fmt::Debug for WalletBackend {
@@ -1091,27 +1092,27 @@ impl NodeRuntime {
             read: self.read(),
             writer: self.writer(),
             peers,
-            denuo_relay: self.denuo_relay(),
+            shakescape_relay: self.shakescape_relay(),
         }
     }
 }
 
 impl WalletBackend {
-    /// Commit one exact canonical local Denuo publication before propagating
+    /// Commit one exact canonical local Shakescape publication before propagating
     /// its typed message to every exactly admitted V2 peer.
-    pub async fn publish_denuo_name_market(
+    pub async fn publish_shakescape_name_market(
         &self,
         envelope_bytes: &[u8],
-        expectation: DenuoPublicationAcceptanceExpectation,
+        expectation: ShakescapePublicationAcceptanceExpectation,
         now: u64,
-    ) -> Result<(DenuoNameMarketAdmission, BroadcastReport, Vec<u8>), WalletBackendError> {
+    ) -> Result<(ShakescapeNameMarketAdmission, BroadcastReport, Vec<u8>), WalletBackendError> {
         let (admission, receipt) = self
-            .denuo_relay
+            .shakescape_relay
             .submit_name_market_handoff(envelope_bytes, expectation, now)
-            .map_err(|error| WalletBackendError::DenuoNameMarket(error.to_string()))?;
+            .map_err(|error| WalletBackendError::ShakescapeNameMarket(error.to_string()))?;
         let report = if let Some(message) = admission.rebroadcast.as_ref() {
             self.peers
-                .broadcast_denuo_name_market(admission.revision.max(1), message)
+                .broadcast_shakescape_name_market(admission.revision.max(1), message)
                 .await
         } else {
             BroadcastReport::default()
@@ -1119,15 +1120,15 @@ impl WalletBackend {
         Ok((admission, report, receipt))
     }
 
-    /// Read one bounded process-local Denuo event page. Event bytes remain
+    /// Read one bounded process-local Shakescape event page. Event bytes remain
     /// untrusted marketplace input; the wallet must verify and reconcile them
     /// against its current chain authority before use.
-    pub fn get_denuo_name_market_events(
+    pub fn get_shakescape_name_market_events(
         &self,
         expected_instance_nonce: Option<[u8; 32]>,
         after_revision: u64,
         limit: usize,
-    ) -> Result<DenuoNameMarketEventPage, WalletBackendError> {
+    ) -> Result<ShakescapeNameMarketEventPage, WalletBackendError> {
         let instance_nonce = *self
             .read
             .published_mempool()
@@ -1138,29 +1139,29 @@ impl WalletBackend {
             expected_instance_nonce.is_some_and(|expected| expected != instance_nonce);
         let effective_after_revision = if cursor_reset { 0 } else { after_revision };
         let mut page = self
-            .denuo_relay
+            .shakescape_relay
             .name_market_events(instance_nonce, effective_after_revision, limit)
-            .map_err(|error| WalletBackendError::DenuoNameMarket(error.to_string()))?;
+            .map_err(|error| WalletBackendError::ShakescapeNameMarket(error.to_string()))?;
         page.cursor_reset = cursor_reset;
         Ok(page)
     }
 
     /// Read one coherent bounded page over the latest seller/name relay state.
-    pub fn get_denuo_name_market_snapshot(
+    pub fn get_shakescape_name_market_snapshot(
         &self,
         expected_revision: Option<u64>,
         offset: usize,
         limit: usize,
-    ) -> Result<DenuoNameMarketSnapshotPage, WalletBackendError> {
+    ) -> Result<ShakescapeNameMarketSnapshotPage, WalletBackendError> {
         let instance_nonce = *self
             .read
             .published_mempool()
             .map_err(node_error)?
             .snapshot()
             .instance_nonce();
-        self.denuo_relay
+        self.shakescape_relay
             .name_market_snapshot(instance_nonce, expected_revision, offset, limit)
-            .map_err(|error| WalletBackendError::DenuoNameMarket(error.to_string()))
+            .map_err(|error| WalletBackendError::ShakescapeNameMarket(error.to_string()))
     }
 
     /// Read the active chain tip.

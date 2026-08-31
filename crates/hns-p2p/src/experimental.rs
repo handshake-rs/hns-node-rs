@@ -46,7 +46,7 @@ pub enum ExperimentalExchangeError {
     ResponseTooLarge,
     #[error("experimental peer disconnected")]
     Disconnected,
-    #[error("authenticated Denuo V1 admission evidence is unavailable")]
+    #[error("authenticated Shakescape V1 admission evidence is unavailable")]
     AdmissionRejected,
     #[error("experimental request socket write failed")]
     WriteFailed,
@@ -78,7 +78,7 @@ impl ExperimentalExchangeRuntime {
         let PacketType::Unknown(packet_type) = exchange.packet_type else {
             return Err(ExperimentalExchangeError::InvalidPacketType);
         };
-        if crate::denuo::is_extension_packet_type(exchange.packet_type)
+        if crate::shakescape::is_extension_packet_type(exchange.packet_type)
             || crate::is_hip76_packet_type(exchange.packet_type)
             || crate::is_odoh_packet_type(exchange.packet_type)
             || crate::is_hnsr_packet_type(exchange.packet_type)

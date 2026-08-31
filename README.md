@@ -151,7 +151,7 @@ Run `./target/release/hsrd --help` for all options.
 ## Local two-node smoke test
 
 After building the release binary, run two temporary regtest nodes and verify
-their P2P and Denuo negotiation:
+their P2P and Shakescape negotiation:
 
 ```bash
 ./scripts/qualify-two-node-regtest.sh
@@ -196,7 +196,7 @@ older-candidate accumulator mismatch has a separate
 - [Wallet indexes and typed backend](docs/HNS_NODE_WALLET_INDEX.md)
 - [Authenticated wallet RPC v1](docs/WALLET_RPC_V1.md)
 - [Mainnet pruned wallet-index node](docs/mainnet-pruned-wallet-node.md)
-- [Bounded Denuo marketplace relay](docs/DENUO_MARKET_RELAY.md)
+- [Bounded Shakescape marketplace relay](docs/SHAKESCAPE_MARKET_RELAY.md)
 - [Docker and GHCR](docs/docker.md)
 - [Legacy interval-accumulator recovery](docs/interval-accumulator-recovery.md)
 - [Native mainnet mining canary](docs/mainnet-canary.md)

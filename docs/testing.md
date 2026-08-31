@@ -39,7 +39,7 @@ for both lockfiles, formatting, every fuzz target, strict all-feature Clippy,
 all-feature and no-default-feature tests, and the optimized all-target release
 build. It runs the fixed native mining-path performance gate, then starts two
 independent regtest `hsrd` processes and requires ordinary P2P readiness,
-matching canonical Denuo registry negotiation, the exact registry fingerprint,
+matching canonical Shakescape registry negotiation, the exact registry fingerprint,
 and bidirectional traffic. The normal test matrix also covers live HIP-76
 requester/provider admission, requester opt-out, provider opt-in/backend
 readiness, revocation, timeouts, queue/socket completion, and qname-free

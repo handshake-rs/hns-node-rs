@@ -8,7 +8,7 @@ the returned DNS data, or enables a public output service by default.
 ## Consent and advertisement
 
 - The requester policy defaults to `Auto`. A node may request through a peer
-  that advertises the HIP-76 DNS output service after the Denuo registry
+  that advertises the HIP-76 DNS output service after the Shakescape registry
   agreement becomes active. `--no-hip76-requester` records a process-wide
   opt-out, `--hip76-requester` explicitly restores `Auto`, and using neither
   flag preserves the durable selection.

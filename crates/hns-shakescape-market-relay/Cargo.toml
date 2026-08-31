@@ -1,5 +1,5 @@
 [package]
-name = "hns-denuo-market-relay"
+name = "hns-shakescape-market-relay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

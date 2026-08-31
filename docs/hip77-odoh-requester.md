@@ -14,11 +14,11 @@ advertise the ODoH provider service bit on their behalf.
 ## Admission and routing
 
 A request can use a peer only after ordinary VERSION/VERACK readiness and an
-exact Denuo V1 registry negotiation. Admission retains the upstream
-`ExperimentalWireProfile::DenuoV1` and `NegotiatedRegistry` values rather than
+exact Shakescape V1 registry negotiation. Admission retains the upstream
+`ExperimentalWireProfile::ShakescapeV1` and `NegotiatedRegistry` values rather than
 reconstructing authority from diagnostics. The fingerprint, registry and
 negotiation protocol versions, network, genesis hash, send bound, and live-work
-bound must all match the local connection. Both the Denuo extension and ODoH
+bound must all match the local connection. Both the Shakescape extension and ODoH
 service bits must be present. Every ODoH path requires the exact
 remote static key authenticated by that connection's Brontide handshake; the
 default plaintext regtest/simnet transport therefore remains awaiting an

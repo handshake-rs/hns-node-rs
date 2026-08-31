@@ -36,9 +36,9 @@ use hns_mempool::{Admission, AirdropAdmission, ClaimAdmission};
 use hns_p2p::{
     generate_private_key, normalize_peer_ip, peer_address_group, BrontideIdentity, CompactBlock,
     CompactBlockError, CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse,
-    DenuoPeerProvenance, DnsRelayRequesterPolicy, Inventory, InventoryKind, LivePeerConfig,
-    LivePeerManager, LocatorPacket, OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent,
-    PeerId, PeerSnapshot, PeerTransport, SERVICE_NETWORK,
+    DnsRelayRequesterPolicy, Inventory, InventoryKind, LivePeerConfig, LivePeerManager,
+    LocatorPacket, OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent, PeerId,
+    PeerSnapshot, PeerTransport, ShakescapePeerProvenance, SERVICE_NETWORK,
 };
 use hns_primitives::{
     blake2b_256, Block, BlockHash, CovenantKind, Header, Height, Reader, Txid, Writer,
@@ -87,7 +87,7 @@ use crate::peer_bans::{
     load_peer_bans, persist_peer_bans, PeerBanBook, PeerBanLoad, HSD_BAN_SCORE,
     HSD_BAN_TIME_SECONDS, MAX_PEER_BANS,
 };
-use crate::{DenuoRelayHandle, DenuoRelayHandleError};
+use crate::{ShakescapeRelayHandle, ShakescapeRelayHandleError};
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
 const MAX_SERVED_HEADERS: usize = hns_p2p::MAX_HEADERS;
@@ -2611,7 +2611,7 @@ impl NodeService {
         )?;
         let node = runtime.read();
         let writer = runtime.writer();
-        let denuo_relay = runtime.denuo_relay();
+        let shakescape_relay = runtime.shakescape_relay();
         let rpc_read_context = node.rpc_read_context()?;
         writer
             .execute(None, "ensure native-sync genesis header", |node| {
@@ -2849,7 +2849,7 @@ impl NodeService {
             .as_ref()
             .map_or(0, |checkpoint| checkpoint.sequence);
         let initial_experimental_registry =
-            rpc_experimental_registry_info(&peers.denuo_summary().await);
+            rpc_experimental_registry_info(&peers.shakescape_summary().await);
         let initial_odoh = rpc_odoh_info(&peers.odoh_status(address_timestamp).await);
         let initial_hnsr = rpc_hnsr_info(&peers.hnsr_status().await);
         let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics {
@@ -3597,7 +3597,7 @@ impl NodeService {
                             &node,
                             &writer,
                             &peers,
-                            &denuo_relay,
+                            &shakescape_relay,
                             &validation,
                             &mut scheduler,
                             &mut reconnects,
@@ -5895,18 +5895,21 @@ async fn handle_mining_engine_diagnostics(
     Json(diagnostic_method(&state, "getminingengineinfo").await)
 }
 
-fn denuo_peer_identity(network: Network, provenance: DenuoPeerProvenance) -> Result<[u8; 32]> {
+fn shakescape_peer_identity(
+    network: Network,
+    provenance: ShakescapePeerProvenance,
+) -> Result<[u8; 32]> {
     if let Some(key) = provenance.authenticated_remote_static {
         let mut material = Vec::with_capacity(64);
-        material.extend_from_slice(b"hns-node/denuo-authenticated-peer/v1");
+        material.extend_from_slice(b"hns-node/shakescape-authenticated-peer/v1");
         material.extend_from_slice(key.as_bytes());
         return Ok(blake2b_256(&material));
     }
     if !matches!(network, Network::Regtest | Network::Simnet) {
-        anyhow::bail!("public-network Denuo message lacks authenticated Brontide provenance");
+        anyhow::bail!("public-network Shakescape message lacks authenticated Brontide provenance");
     }
     let mut material = Vec::with_capacity(96);
-    material.extend_from_slice(b"hns-node/denuo-controlled-peer/v1");
+    material.extend_from_slice(b"hns-node/shakescape-controlled-peer/v1");
     material.extend_from_slice(&provenance.peer.0.to_le_bytes());
     match provenance.address.ip() {
         IpAddr::V4(address) => material.extend_from_slice(&address.octets()),
@@ -5922,7 +5925,7 @@ async fn handle_peer_event(
     node: &NodeReadHandle,
     writer: &CanonicalStateWriter,
     peers: &LivePeerManager,
-    denuo_relay: &DenuoRelayHandle,
+    shakescape_relay: &ShakescapeRelayHandle,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
@@ -6023,13 +6026,13 @@ async fn handle_peer_event(
             // Circuit IDs and opaque application events remain on the typed
             // manager event surface and are deliberately absent from logs.
         }
-        PeerEvent::DenuoNameMarket {
+        PeerEvent::ShakescapeNameMarket {
             provenance,
             request_id,
             message,
         } => {
-            let peer_identity = denuo_peer_identity(node.network(), provenance)?;
-            match denuo_relay.receive_name_market(
+            let peer_identity = shakescape_peer_identity(node.network(), provenance)?;
+            match shakescape_relay.receive_name_market(
                 peer_identity,
                 provenance.peer,
                 request_id,
@@ -6039,13 +6042,13 @@ async fn handle_peer_event(
                 Ok(dispatch) => {
                     for send in dispatch.sends {
                         if let Err(error) = peers
-                            .send_denuo_name_market(send.peer, send.request_id, &send.message)
+                            .send_shakescape_name_market(send.peer, send.request_id, &send.message)
                             .await
                         {
                             tracing::debug!(
                                 peer = ?send.peer,
                                 %error,
-                                "Denuo name-market response was not delivered"
+                                "Shakescape name-market response was not delivered"
                             );
                         }
                     }
@@ -6056,23 +6059,26 @@ async fn handle_peer_event(
                     {
                         if let Some(message) = admission.rebroadcast {
                             let report = peers
-                                .broadcast_denuo_name_market(admission.revision.max(1), &message)
+                                .broadcast_shakescape_name_market(
+                                    admission.revision.max(1),
+                                    &message,
+                                )
                                 .await;
                             tracing::debug!(
                                 attempted = report.attempted,
                                 delivered = report.queued,
                                 failed = report.failed.len(),
-                                "propagated committed Denuo name-market publication"
+                                "propagated committed Shakescape name-market publication"
                             );
                         }
                     }
                 }
-                Err(DenuoRelayHandleError::NameMarket(reason)) => {
-                    let _ = denuo_relay.penalize_malformed(peer_identity, unix_time());
+                Err(ShakescapeRelayHandleError::NameMarket(reason)) => {
+                    let _ = shakescape_relay.penalize_malformed(peer_identity, unix_time());
                     tracing::debug!(
                         peer = ?provenance.peer,
                         %reason,
-                        "rejected malformed Denuo name-market message"
+                        "rejected malformed Shakescape name-market message"
                     );
                 }
                 Err(error) => return Err(anyhow::anyhow!(error)),
@@ -8923,7 +8929,7 @@ async fn refresh_diagnostics(
     checkpoint_sequence: u64,
 ) {
     let traffic = peers.traffic_totals().await;
-    let (snapshots, experimental_registry) = peers.snapshots_with_denuo_summary().await;
+    let (snapshots, experimental_registry) = peers.snapshots_with_shakescape_summary().await;
     let odoh = rpc_odoh_info(&peers.odoh_status(unix_time()).await);
     let hnsr = rpc_hnsr_info(&peers.hnsr_status().await);
     let mut state = diagnostics.write().await;
@@ -13710,7 +13716,9 @@ mod tests {
             enabled: true,
             observation_only: true,
             runtime_instance: "test-runtime".to_owned(),
-            experimental_registry: rpc_experimental_registry_info(&hns_p2p::DenuoSummary::default()),
+            experimental_registry: rpc_experimental_registry_info(
+                &hns_p2p::ShakescapeSummary::default(),
+            ),
             ..NativeSyncDiagnostics::default()
         }));
         let diagnostic_rpc = initialize_cached_diagnostic_rpc(&node, &diagnostics)

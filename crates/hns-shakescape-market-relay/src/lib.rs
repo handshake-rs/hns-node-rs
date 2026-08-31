@@ -1,4 +1,4 @@
-//! Bounded, content-addressed Denuo marketplace relay core.
+//! Bounded, content-addressed Shakescape marketplace relay core.
 //!
 //! This crate deliberately owns no signing keys, matching policy, price
 //! authority, wallet state, or funds. Canonical marketplace message decoders
@@ -47,7 +47,7 @@ impl RelayKind {
     }
 }
 
-/// Separately configurable Denuo marketplace relay roles.
+/// Separately configurable Shakescape marketplace relay roles.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RelayRoles {
     bits: u8,
@@ -153,7 +153,7 @@ impl RelayObject {
         payload: &[u8],
     ) -> ObjectHash {
         let mut writer = Writer::with_capacity(32 + payload.len());
-        writer.write_bytes(b"hns-denuo-market-relay-v1");
+        writer.write_bytes(b"hns-shakescape-market-relay-v1");
         writer.write_u8(kind as u8);
         writer.write_bytes(&signer);
         writer.write_u64(sequence);
@@ -344,58 +344,58 @@ pub struct RelayStatus {
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum RelayError {
     /// Resource limits are internally invalid.
-    #[error("invalid Denuo relay limits")]
+    #[error("invalid Shakescape relay limits")]
     InvalidLimits,
     /// The independently negotiated role is disabled.
-    #[error("Denuo relay role is disabled")]
+    #[error("Shakescape relay role is disabled")]
     RoleDisabled,
     /// Peer is progressively banned.
-    #[error("Denuo relay peer is banned")]
+    #[error("Shakescape relay peer is banned")]
     PeerBanned,
     /// Per-peer fixed-window announcement rate exceeded.
-    #[error("Denuo relay peer rate limit exceeded")]
+    #[error("Shakescape relay peer rate limit exceeded")]
     PeerRateLimited,
     /// Bounded peer abuse-accounting capacity is exhausted.
-    #[error("Denuo relay peer accounting capacity exhausted")]
+    #[error("Shakescape relay peer accounting capacity exhausted")]
     PeerCapacity,
     /// Per-signer fixed-window object rate exceeded.
-    #[error("Denuo relay signer rate limit exceeded")]
+    #[error("Shakescape relay signer rate limit exceeded")]
     SignerRateLimited,
     /// Per-signer policy disallows the role.
-    #[error("Denuo relay signer policy disallows role")]
+    #[error("Shakescape relay signer policy disallows role")]
     SignerRoleDenied,
     /// Per-signer active-object cap exceeded.
-    #[error("Denuo relay signer active-object limit exceeded")]
+    #[error("Shakescape relay signer active-object limit exceeded")]
     SignerObjectLimit,
     /// Bounded signer accounting capacity is exhausted.
-    #[error("Denuo relay signer accounting capacity exhausted")]
+    #[error("Shakescape relay signer accounting capacity exhausted")]
     SignerCapacity,
     /// Bounded explicit signer-policy capacity is exhausted.
-    #[error("Denuo relay signer policy capacity exhausted")]
+    #[error("Shakescape relay signer policy capacity exhausted")]
     SignerPolicyCapacity,
     /// Payload exceeds its configured or announced bound.
-    #[error("Denuo relay payload exceeds bound")]
+    #[error("Shakescape relay payload exceeds bound")]
     PayloadTooLarge,
     /// Creation/expiry bounds are invalid or stale.
-    #[error("Denuo relay object is stale or has invalid expiry")]
+    #[error("Shakescape relay object is stale or has invalid expiry")]
     InvalidExpiry,
     /// Signer sequence is not newer than the retained in-memory high-water.
-    #[error("Denuo relay signer sequence is stale")]
+    #[error("Shakescape relay signer sequence is stale")]
     StaleSequence,
     /// Pending hash-first request capacity is exhausted.
-    #[error("Denuo relay pending fetch capacity exhausted")]
+    #[error("Shakescape relay pending fetch capacity exhausted")]
     PendingCapacity,
     /// Payload arrived without a current matching hash-first request.
-    #[error("Denuo relay payload was not requested")]
+    #[error("Shakescape relay payload was not requested")]
     NotRequested,
     /// Payload metadata differs from the pending announcement.
-    #[error("Denuo relay payload metadata mismatch")]
+    #[error("Shakescape relay payload metadata mismatch")]
     AnnouncementMismatch,
     /// Claimed content hash differs from the canonical object hash.
-    #[error("Denuo relay content hash mismatch")]
+    #[error("Shakescape relay content hash mismatch")]
     HashMismatch,
     /// Total byte capacity cannot retain even after bounded eviction.
-    #[error("Denuo relay byte capacity exhausted")]
+    #[error("Shakescape relay byte capacity exhausted")]
     Capacity,
 }
 

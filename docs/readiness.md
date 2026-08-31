@@ -218,7 +218,7 @@ measurement, or the full qualification gate. Its immutable tombstone registry
 has a finite 65,536-entry lifetime cap, and later matching outputs are
 deliberately untracked; untrusted registration therefore remains unavailable
 and production availability remains blocked.
-Live marketplace wire advertisement separately awaits active Denuo V2
+Live marketplace wire advertisement separately awaits active Shakescape V1
 transport/admission, the typed adapter gate, and joined qualification. Exact
 crates.io `hns-rs` `=0.3.0` artifacts are pinned from the published, non-yanked,
 provenance-verified 19-package cohort; that removes source ambiguity but is not
@@ -248,7 +248,7 @@ Implemented:
 
 - exact bounded HNS frames and sync-relevant packets with HSD oracle fixtures;
 - inbound/outbound plaintext sessions and VERSION/VERACK negotiation;
-- post-VERSION canonical Denuo Experimental V1 registry negotiation with exact
+- post-VERSION canonical Shakescape Experimental V1 registry negotiation with exact
   fingerprint agreement, plus a live role-safe HIP-76 requester/provider
   session whose requester can opt out and whose provider remains explicit
   opt-in with a ready backend;

@@ -89,7 +89,7 @@ into a process-wide RPC snapshot.
   active tip's post-state authenticated root and the height it results from are
   exposed explicitly for an external HSD comparison; this differs from the
   pre-state root committed inside the active tip's own header.
-- API-v12 node status adds the canonical Denuo Experimental V1 registry
+- API-v12 node status adds the canonical Shakescape Experimental V1 registry
   identity, wire profile, packet/registry payload limits, and bounded live
   negotiation counts and rejection reasons. Each diagnostics refresh builds
   one `experimental_registry` object from the same per-peer capture for native

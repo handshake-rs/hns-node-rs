@@ -1,6 +1,6 @@
-# Bounded Denuo marketplace relay
+# Bounded Shakescape marketplace relay
 
-`hns-denuo-market-relay` is an isolated, noncustodial cache and abuse-policy
+`hns-shakescape-market-relay` is an isolated, noncustodial cache and abuse-policy
 core for five independently enabled roles:
 
 1. Handshake name-market listings/cancellations;
@@ -11,7 +11,7 @@ core for five independently enabled roles:
 
 The default `NodeConfig` role mask is empty. An embedded native adapter must
 explicitly enable roles and obtains the shared service through
-`NodeRuntime::denuo_relay`.
+`NodeRuntime::shakescape_relay`.
 
 ## Admission model
 
@@ -76,7 +76,7 @@ state rather than deriving safety from this cache.
 
 Canonical marketplace parsing and signature/semantic verification belong in
 the pinned `hns-rs` protocol crate. An adapter must perform that verification
-before passing exact canonical bytes to `DenuoRelayHandle::put`. The node core:
+before passing exact canonical bytes to `ShakescapeRelayHandle::put`. The node core:
 
 - does not sign messages or transactions;
 - does not choose matches;
@@ -86,13 +86,13 @@ before passing exact canonical bytes to `DenuoRelayHandle::put`. The node core:
 
 The workspace now pins exact crates.io `hns-rs` `=0.3.0` artifacts from source
 `d0cde9ded6f8f93f96f16daafc094849c6d484bf`. The published, non-yanked,
-provenance-verified 19-package cohort contains the canonical Denuo V2 registry,
+provenance-verified 19-package cohort contains the canonical Shakescape V1 registry,
 generated fingerprint, typed marketplace envelopes, and the new HRM-backed
 authority contracts.
-The active node transport and peer admission deliberately negotiate Denuo V1
+The active node transport and peer admission deliberately negotiate Shakescape V1
 and expose no marketplace subprotocol. No typed marketplace adapter or live
 advertisement is installed. Live marketplace wire advertisement must therefore
-remain disabled until transport admission adopts the exact Denuo V2 registry
+remain disabled until transport admission adopts the exact Shakescape V1 registry
 and fingerprint and the joined adapter is qualified. No sibling-path
 dependency or unassigned production message ID is used as a workaround. Enabling a local role
 creates only the bounded service for an installed native adapter; it does not
@@ -100,7 +100,7 @@ make this revision advertise a marketplace protocol.
 
 The node now has descriptor-bound, restart-durable confirmed Shakedex-v2 and
 HNS-HTLC-v1 funding/spend/preimage tracking plus bounded mempool reconciliation.
-That local tracking profile is derivative source implementation, not Denuo or
+That local tracking profile is derivative source implementation, not Shakescape or
 swap protocol authority: its frozen vectors cannot replace the published
 canonical `hns-swap` artifact and a qualified node adapter.
 It still does not construct or sign transactions, own swap workflow state,

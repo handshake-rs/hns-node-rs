@@ -14,10 +14,10 @@ use hns_hnsr_protocol::{
 };
 use hns_p2p_experimental::{
     ExperimentalWireProfile, HnsrPolicy, NegotiatedRegistry, Network as ExperimentalNetwork,
-    DENUO_EXTENSION_SERVICE, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_REGISTRY_PROTOCOL_VERSION,
-    DENUO_V2_REGISTRY_VERSION, HNSR_PROFILE_REGISTRY_FINGERPRINT,
-    HNSR_PROFILE_REGISTRY_PROTOCOL_VERSION, HNSR_PROFILE_REGISTRY_VERSION,
-    HNSR_PROFILE_WIRE_PROFILE, REGISTRY_NEGOTIATION_PROTOCOL_ID,
+    HNSR_PROFILE_REGISTRY_FINGERPRINT, HNSR_PROFILE_REGISTRY_PROTOCOL_VERSION,
+    HNSR_PROFILE_REGISTRY_VERSION, HNSR_PROFILE_WIRE_PROFILE, REGISTRY_NEGOTIATION_PROTOCOL_ID,
+    SHAKESCAPE_EXTENSION_SERVICE, SHAKESCAPE_V1_REGISTRY_FINGERPRINT,
+    SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION, SHAKESCAPE_V1_REGISTRY_VERSION,
 };
 use hns_primitives::blake2b_256;
 
@@ -803,14 +803,14 @@ impl HnsrCoordinator {
         {
             return Err(HnsrCoordinatorError::UnauthenticatedPeer);
         }
-        if peer.remote_services & DENUO_EXTENSION_SERVICE.value() == 0
+        if peer.remote_services & SHAKESCAPE_EXTENSION_SERVICE.value() == 0
             || (require_relay_service && peer.remote_services & HNSR_RELAY_SERVICE == 0)
-            || peer.wire_profile != ExperimentalWireProfile::DenuoV2
-            || peer.negotiated.fingerprint != DENUO_V2_REGISTRY_FINGERPRINT
-            || peer.negotiated.registry_version != DENUO_V2_REGISTRY_VERSION
+            || peer.wire_profile != ExperimentalWireProfile::ShakescapeV1
+            || peer.negotiated.fingerprint != SHAKESCAPE_V1_REGISTRY_FINGERPRINT
+            || peer.negotiated.registry_version != SHAKESCAPE_V1_REGISTRY_VERSION
             || !peer.negotiated.protocols.contains(&(
                 REGISTRY_NEGOTIATION_PROTOCOL_ID,
-                DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+                SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION,
             ))
             || peer.negotiated.network != self.config.binding.network
             || peer.negotiated.genesis_hash != self.config.binding.genesis_hash
@@ -1088,7 +1088,7 @@ pub enum HnsrCoordinatorError {
     Runtime(#[from] HnsrRuntimeError),
     #[error("HNSR requires an authenticated Brontide peer")]
     UnauthenticatedPeer,
-    #[error("HNSR requires exact canonical Denuo V1 negotiation")]
+    #[error("HNSR requires exact canonical Shakescape V1 negotiation")]
     RegistryNotNegotiated,
     #[error("unsupported HNSR profile {0}; expected HNS_NODE_V1 or HNS_WEB_V1")]
     UnsupportedProfile(u16),

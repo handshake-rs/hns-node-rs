@@ -99,8 +99,8 @@ for node in nodes:
         len(peers) != 1
         or peers[0].get("state") != "ready"
         or peers[0].get("transport") != "plaintext"
-        or peers[0].get("denuo", {}).get("phase") != "negotiated"
-        or peers[0].get("denuo", {}).get("negotiated") is None
+        or peers[0].get("shakescape", {}).get("phase") != "negotiated"
+        or peers[0].get("shakescape", {}).get("negotiated") is None
         or registry.get("fingerprint") != expected
         or registry.get("registry_id") != expected
         or registry.get("negotiated_peers") != 1
@@ -139,7 +139,7 @@ for name, path in zip(("node_a", "node_b"), sys.argv[1:]):
         "peer_count": len(node["peers"]),
         "peer_state": peer["state"],
         "transport": peer["transport"],
-        "denuo_phase": peer["denuo"]["phase"],
+        "shakescape_phase": peer["shakescape"]["phase"],
         "registry_fingerprint": registry["fingerprint"],
         "registry_negotiated_peers": registry["negotiated_peers"],
         "bytes_sent": node["bytes_sent"],

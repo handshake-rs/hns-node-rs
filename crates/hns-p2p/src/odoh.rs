@@ -21,10 +21,10 @@ use hns_odoh_protocol::{
     MAX_ODOH_CONFIG_SIZE, MAX_ODOH_PACKET_SIZE, MAX_ODOH_QUERY_SIZE, MAX_OUTER_PADDING_SIZE,
 };
 use hns_p2p_experimental::{
-    ExperimentalWireProfile, NegotiatedRegistry, Network as ExperimentalNetwork,
-    DENUO_EXTENSION_SERVICE, DENUO_V2_REGISTRY_FINGERPRINT, DENUO_V2_REGISTRY_PROTOCOL_VERSION,
-    DENUO_V2_REGISTRY_VERSION, DENUO_V2_WIRE_PROFILE, ODOH_PACKET, ODOH_SERVICE,
-    REGISTRY_NEGOTIATION_PROTOCOL_ID,
+    ExperimentalWireProfile, NegotiatedRegistry, Network as ExperimentalNetwork, ODOH_PACKET,
+    ODOH_SERVICE, REGISTRY_NEGOTIATION_PROTOCOL_ID, SHAKESCAPE_EXTENSION_SERVICE,
+    SHAKESCAPE_V1_REGISTRY_FINGERPRINT, SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION,
+    SHAKESCAPE_V1_REGISTRY_VERSION, SHAKESCAPE_V1_WIRE_PROFILE,
 };
 use hns_primitives::blake2b_256_many;
 use serde::{Deserialize, Serialize};
@@ -1046,8 +1046,8 @@ impl OdohRequesterRuntime {
             requester_default_enabled: true,
             service_bit: ODOH_SERVICE.value(),
             packet_type: ODOH_PACKET.value(),
-            registry_fingerprint: DENUO_V2_REGISTRY_FINGERPRINT.to_string(),
-            registry_wire_profile: DENUO_V2_WIRE_PROFILE.to_owned(),
+            registry_fingerprint: SHAKESCAPE_V1_REGISTRY_FINGERPRINT.to_string(),
+            registry_wire_profile: SHAKESCAPE_V1_WIRE_PROFILE.to_owned(),
             eligible_authenticated_proxies: eligible_authenticated_proxies as u64,
             faulted_proxies: self.faulted_proxies.len() as u64,
             target_slots: self.cache.slots.len() as u16,
@@ -1461,13 +1461,13 @@ impl OdohRequesterRuntime {
         if proxy.remote_services & ODOH_SERVICE.value() == 0 {
             return Err(OdohFailureReason::RemoteServiceNotAdvertised);
         }
-        if proxy.remote_services & DENUO_EXTENSION_SERVICE.value() == 0
-            || proxy.wire_profile != ExperimentalWireProfile::DenuoV2
-            || proxy.negotiated.fingerprint != DENUO_V2_REGISTRY_FINGERPRINT
-            || proxy.negotiated.registry_version != DENUO_V2_REGISTRY_VERSION
+        if proxy.remote_services & SHAKESCAPE_EXTENSION_SERVICE.value() == 0
+            || proxy.wire_profile != ExperimentalWireProfile::ShakescapeV1
+            || proxy.negotiated.fingerprint != SHAKESCAPE_V1_REGISTRY_FINGERPRINT
+            || proxy.negotiated.registry_version != SHAKESCAPE_V1_REGISTRY_VERSION
             || !proxy.negotiated.protocols.contains(&(
                 REGISTRY_NEGOTIATION_PROTOCOL_ID,
-                DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+                SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION,
             ))
             || proxy.negotiated.network != self.binding.network
             || proxy.negotiated.genesis_hash != self.binding.genesis_hash
@@ -1612,7 +1612,7 @@ impl<'input> CacheDecoder<'input> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_p2p_experimental::DENUO_V2_REGISTRY_FINGERPRINT;
+    use hns_p2p_experimental::SHAKESCAPE_V1_REGISTRY_FINGERPRINT;
 
     const TEST_MAGIC: u32 = 0xae38_95cf;
     const TEST_GENESIS: [u8; 32] = [0x42; 32];
@@ -1627,11 +1627,11 @@ mod tests {
 
     fn negotiated() -> NegotiatedRegistry {
         NegotiatedRegistry {
-            fingerprint: DENUO_V2_REGISTRY_FINGERPRINT,
-            registry_version: DENUO_V2_REGISTRY_VERSION,
+            fingerprint: SHAKESCAPE_V1_REGISTRY_FINGERPRINT,
+            registry_version: SHAKESCAPE_V1_REGISTRY_VERSION,
             protocols: vec![(
                 REGISTRY_NEGOTIATION_PROTOCOL_ID,
-                DENUO_V2_REGISTRY_PROTOCOL_VERSION,
+                SHAKESCAPE_V1_REGISTRY_PROTOCOL_VERSION,
             )],
             maximum_send_size: MAX_ODOH_PACKET_SIZE as u32,
             maximum_live_requests: 8,
@@ -1650,8 +1650,8 @@ mod tests {
                 transport: PeerTransportKind::Brontide,
                 authenticated_remote_static: Some(target_key),
             },
-            remote_services: DENUO_EXTENSION_SERVICE.value() | ODOH_SERVICE.value(),
-            wire_profile: ExperimentalWireProfile::DenuoV2,
+            remote_services: SHAKESCAPE_EXTENSION_SERVICE.value() | ODOH_SERVICE.value(),
+            wire_profile: ExperimentalWireProfile::ShakescapeV1,
             negotiated: negotiated(),
         }
     }
@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn production_followup_odoh_requires_exact_denuo_v2_admission_evidence() {
+    fn production_followup_odoh_requires_exact_shakescape_v1_admission_evidence() {
         let target_key = AuthenticatedPeerKey::new(locator().target_peer_key);
         let runtime = OdohRequesterRuntime::new(
             binding(),
@@ -1764,7 +1764,6 @@ mod tests {
             ExperimentalWireProfile::Official(1),
             ExperimentalWireProfile::LegacyDraftRegtest,
             ExperimentalWireProfile::Auto,
-            ExperimentalWireProfile::DenuoV1,
         ] {
             let mut rejected = canonical.clone();
             rejected.wire_profile = profile;
@@ -1780,15 +1779,15 @@ mod tests {
             runtime.ensure_proxy(&missing_odoh),
             Err(OdohFailureReason::RemoteServiceNotAdvertised)
         );
-        let mut missing_denuo = canonical.clone();
-        missing_denuo.remote_services &= !DENUO_EXTENSION_SERVICE.value();
+        let mut missing_shakescape = canonical.clone();
+        missing_shakescape.remote_services &= !SHAKESCAPE_EXTENSION_SERVICE.value();
         assert_eq!(
-            runtime.ensure_proxy(&missing_denuo),
+            runtime.ensure_proxy(&missing_shakescape),
             Err(OdohFailureReason::RegistryNotNegotiated)
         );
 
         let mut wrong_registry = canonical.clone();
-        wrong_registry.negotiated.fingerprint = hns_p2p_experimental::DENUO_V1_REGISTRY_FINGERPRINT;
+        wrong_registry.negotiated.registry_version = 2;
         assert_eq!(
             runtime.ensure_proxy(&wrong_registry),
             Err(OdohFailureReason::RegistryNotNegotiated)

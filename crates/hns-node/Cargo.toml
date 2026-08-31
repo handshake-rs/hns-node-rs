@@ -30,7 +30,7 @@ hns-store = { path = "../hns-store", default-features = false }
 hns-swap.workspace = true
 hns-sync = { path = "../hns-sync" }
 hns-wallet-index = { path = "../hns-wallet-index" }
-hns-denuo-market-relay = { path = "../hns-denuo-market-relay" }
+hns-shakescape-market-relay = { path = "../hns-shakescape-market-relay" }
 hns-urkel = { path = "../hns-urkel" }
 hex = "0.4"
 k256.workspace = true

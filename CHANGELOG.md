@@ -46,8 +46,8 @@ qualification or authorize deployment.
   opt-out, `--hip76-requester` explicitly restores `Auto`, and an absent flag
   preserves the saved choice while every live and future peer inherits it.
 - Enable the HIP-77 ODoH requester policy by default. Requests use only ready,
-  exact-Denuo-V1-negotiated, Brontide-authenticated peers advertising both the
-  Denuo and ODoH services with matching network and genesis evidence,
+  exact-Shakescape-V1-negotiated, Brontide-authenticated peers advertising both the
+  Shakescape and ODoH services with matching network and genesis evidence,
   reject proxy/target identity collisions, and carry bounded correlation and
   deadlines through socket-write acknowledgement. Target-signed public
   configuration records use a checksummed, network-bound, anti-rollback cache
@@ -59,7 +59,7 @@ qualification or authorize deployment.
   opt-out, and an absent flag preserves the durable choice.
 - Enable HIP-78 HNSR requester and opaque-relay policy by default with
   independent `--no-hnsr-requester` and `--no-hnsr-relay` opt-outs. Exact
-  Brontide/Denuo/network/genesis admission, explicit `HNS_NODE_V1` or
+  Brontide/Shakescape/network/genesis admission, explicit `HNS_NODE_V1` or
   `HNS_WEB_V1` circuit profiles, actual socket-write acknowledgements,
   connection-bound cleanup, and atomic
   checksummed state/floor persistence fail closed. Relay service advertisement

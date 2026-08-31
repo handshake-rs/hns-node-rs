@@ -122,7 +122,7 @@
   on regtest/simnet, with handshake, service, self-connect, timeout, ping/pong,
   priority-queue controls, and cancellation-safe partial frame reads across
   timer maintenance.
-- Canonical Denuo Experimental V1 registry negotiation after the ordinary
+- Canonical Shakescape Experimental V1 registry negotiation after the ordinary
   Handshake handshake, plus bounded role-safe HIP-76 live sessions with
   requester opt-out and provider/backend explicit opt-in.
 - Bounded peer manager, scoring, disconnect, snapshots, and reconnect backoff.
@@ -223,7 +223,7 @@
 - Explicit authority modes, capability-gated authoritative paths, readiness
   blockers, parity status, and read-only diagnostics.
 - Independent root and fuzz-workspace CI, locked dependency policy, a release
-  build, and a two-node regtest standard-P2P/Denuo negotiation qualifier.
+  build, and a two-node regtest standard-P2P/Shakescape negotiation qualifier.
 
 These foundations now satisfy the source consensus-readiness matrix. Production
 eligibility still depends on the explicit synchronized canary, deployment

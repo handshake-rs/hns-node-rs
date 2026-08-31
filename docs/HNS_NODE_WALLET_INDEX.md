@@ -683,10 +683,10 @@ this typed pull API. Durable encrypted workflow state, rebroadcast journals,
 matching decisions, transaction construction/signing, and secret preimages
 remain wallet responsibilities.
 
-The separate Denuo cache remains wire-disabled. The workspace now pins exact
-crates.io `hns-rs` `=0.3.0` artifacts containing generated Denuo V2 registry
+The separate Shakescape cache remains wire-disabled. The workspace now pins exact
+crates.io `hns-rs` `=0.3.0` artifacts containing generated Shakescape V1 registry
 assignments and typed envelopes. The 19-package cohort is published,
 non-yanked, and provenance-verified, so source availability is no longer the
-blocker. Live marketplace advertisement still requires active Denuo V2
+blocker. Live marketplace advertisement still requires active Shakescape V1
 transport/admission, a typed node adapter, and joined qualification; no sibling
 path or unassigned message ID is permitted.
