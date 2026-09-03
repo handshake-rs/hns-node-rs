@@ -118,6 +118,10 @@ With a persistent data directory, the `--no-hip76-requester`,
 persist across restart. Their matching positive flags explicitly reverse a
 saved opt-out; omitting both forms preserves the durable choice. These
 requester controls do not opt into HIP-76 or ODoH DNS-output provider roles.
+An explicitly configured HNSR relay can carry bounded opaque Node, Web, Chat,
+and Shakescape swap circuits. Swap-profile support is transport only: `hsrd`
+does not see wallet keys or plaintext circuit messages and does not validate,
+fund, or settle a marketplace offer.
 
 In another terminal, inspect node and synchronization status:
 
