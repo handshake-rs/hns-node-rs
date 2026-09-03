@@ -89,10 +89,13 @@ higher resolver boundary parses, correlates, and DNSSEC-validates them.
 
 HIP-78 requester and opaque circuit relay are wired through live authenticated
 peers and default on with independent durable opt-outs and explicit re-enable.
-The runtime admits only HNS
-Node v1 over exact Brontide and canonical Shakescape V1 evidence, acknowledges real
-destination writes, revokes connection-owned state on lifecycle failure, and
-persists only checksummed policy/counter/generation/time state. Relay service
+The runtime admits Node v1, Web v1, or the canonical Shakescape swap requester
+profile over exact Brontide and canonical Shakescape V1 evidence, acknowledges
+real destination writes, revokes connection-owned state on lifecycle failure,
+and persists only checksummed policy/counter/generation/time state. An enabled
+opaque relay advertises Node, Web, Chat, and Shakescape swap profiles without
+interpreting their payloads or acquiring endpoint, wallet, or settlement
+authority. Relay service
 advertisement remains unavailable until an explicit valid advertise address
 and durable Brontide identity are configured. Endpoint, rendezvous, and
 plaintext provider roles are unavailable.
