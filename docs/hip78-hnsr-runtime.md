@@ -26,12 +26,22 @@ Every circuit path is bound to the exact Brontide-authenticated connection,
 canonical Shakescape V1 registry fingerprint/version/protocol tuple, matching
 network and genesis, nonzero negotiated limits, and one explicit canonical
 profile. Native nodes default to `HNS_NODE_V1`; embedded browser adapters set
-`HNS_WEB_V1`. The selected profile is bound into requester admission, relay
-support, status, and durable configuration identity.
+`HNS_WEB_V1`, and an embedded Shakescape wallet transport can explicitly select
+the canonical swap profile `0x0004`. The selected requester profile is bound
+into admission, status, and durable configuration identity. An explicitly
+enabled ordinary relay advertises Node, Web, Chat, and Shakescape swap profile
+support independently of its own requester selection because it forwards
+opaque bytes and assumes neither endpoint role.
 Requester selection additionally requires the remote HNSR relay service bit.
 Incoming requesters and endpoints need Shakescape admission but do not impersonate
 a provider by advertising that bit. Connection IDs, not socket addresses, own
 reservations and circuits.
+
+Swap-profile support is transport only. The node does not decode marketplace
+offers or settlement messages inside an HNSR circuit, hold wallet keys, choose
+a counterparty, or treat forwarded bytes as chain evidence. Typed validation,
+funding, recovery, and settlement remain entirely with the authenticated
+endpoints.
 
 Packet `0xf3` is bounded before allocation and decoded strictly by the pinned
 `hns-hnsr-protocol` crate. Context ownership selects exactly one requester or
