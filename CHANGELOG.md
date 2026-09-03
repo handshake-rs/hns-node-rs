@@ -59,14 +59,18 @@ qualification or authorize deployment.
   opt-out, and an absent flag preserves the durable choice.
 - Enable HIP-78 HNSR requester and opaque-relay policy by default with
   independent `--no-hnsr-requester` and `--no-hnsr-relay` opt-outs. Exact
-  Brontide/Shakescape/network/genesis admission, explicit `HNS_NODE_V1` or
-  `HNS_WEB_V1` circuit profiles, actual socket-write acknowledgements,
+  Brontide/Shakescape/network/genesis admission, explicit Node, Web, or
+  Shakescape swap requester profiles, actual socket-write acknowledgements,
   connection-bound cleanup, and atomic
   checksummed state/floor persistence fail closed. Relay service advertisement
   additionally requires `--hnsr-relay-address`; endpoint, rendezvous, and
   plaintext roles remain unavailable. Symmetric `--hnsr-requester` and
   `--hnsr-relay` flags explicitly reverse saved opt-outs; absent flags preserve
   the durable selections without lowering the node's live capability ceiling.
+  An enabled relay advertises Node, Web, Chat, and Shakescape swap support. The
+  swap profile (`0x0004`) carries bounded opaque circuit bytes only; it
+  grants no offer-parsing, wallet-key, counterparty-selection, marketplace, or
+  settlement authority to the relay.
 - Publish key-bearing HSD fixed seeds, canonical negotiated-peer evidence, and
   a bounded raw authenticated extension exchange from `hns-p2p` for browser
   and mobile adapters. Brontide now uses portable RustCrypto
