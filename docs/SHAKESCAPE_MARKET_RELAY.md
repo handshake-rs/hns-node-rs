@@ -84,19 +84,21 @@ before passing exact canonical bytes to `ShakescapeRelayHandle::put`. The node c
 - does not hold keys, seeds, liquidity, or funds;
 - does not automatically accept or execute swaps.
 
-The workspace now pins exact crates.io `hns-rs` `=0.3.0` artifacts from source
-`d0cde9ded6f8f93f96f16daafc094849c6d484bf`. The published, non-yanked,
-provenance-verified 19-package cohort contains the canonical Shakescape V1 registry,
-generated fingerprint, typed marketplace envelopes, and the new HRM-backed
-authority contracts.
-The active node transport and peer admission deliberately negotiate Shakescape V1
-and expose no marketplace subprotocol. No typed marketplace adapter or live
-advertisement is installed. Live marketplace wire advertisement must therefore
-remain disabled until transport admission adopts the exact Shakescape V1 registry
-and fingerprint and the joined adapter is qualified. No sibling-path
-dependency or unassigned production message ID is used as a workaround. Enabling a local role
-creates only the bounded service for an installed native adapter; it does not
-make this revision advertise a marketplace protocol.
+The active node transport and peer admission negotiate the exact Shakescape V1
+registry and fingerprint. The current source selects the clean-break
+`hns-p2p-experimental` and marketplace protocol line while retaining the
+published base protocol artifacts recorded by the lockfile. No typed
+marketplace adapter or marketplace packet advertisement is installed. Enabling
+a local cache role creates only the bounded service for an installed native
+adapter; it does not make this revision advertise a marketplace protocol.
+
+The independently enabled HIP-78 opaque relay now advertises the canonical
+Shakescape swap circuit profile (`0x0004`) alongside Node, Web, and Chat. That
+profile permits two authenticated endpoints to carry bounded encrypted swap
+bytes through an ordinary relay. The relay does not decode the payload, invoke
+this marketplace cache, validate an offer, or acquire endpoint or settlement
+authority. A typed marketplace subprotocol remains disabled until its exact
+adapter and product boundary are separately joined and qualified.
 
 The node now has descriptor-bound, restart-durable confirmed Shakedex-v2 and
 HNS-HTLC-v1 funding/spend/preimage tracking plus bounded mempool reconciliation.
