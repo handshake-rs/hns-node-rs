@@ -50,7 +50,7 @@ pub use hns_hnsr_protocol::{
     HnsrRuntimeStatus, QueuedHnsrRoute, RelayLimits, RelayTicket, HNSR_PACKET_TYPE,
     HNSR_RELAY_SERVICE, HNS_NODE_V1, HNS_WEB_V1,
 };
-pub use hns_p2p_experimental::HnsrPolicy;
+pub use hns_p2p_experimental::{HnsrPolicy, SHAKESCAPE_EXTENSION_SERVICE};
 pub use hnsr::{
     decode_hnsr_packet, hnsr_packet, hnsr_peer_id, is_hnsr_packet_type, is_supported_hnsr_profile,
     peer_id_from_hnsr, validate_hnsr_relay_address, HnsrCoordinator, HnsrCoordinatorConfig,

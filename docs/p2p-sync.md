@@ -25,6 +25,15 @@ block requests only inside its retained horizon and sends `notfound` outside
 it; `--storage-mode archive` retains complete block bodies for full historical
 serving. Storage retention and inbound reachability are independent choices.
 
+`--p2p-advertise PUBLIC_IP:PORT` publishes a separately verified public
+raw-TCP forwarding socket for that listener. On public networks it is rejected
+unless it is routable, and it is rejected without `--p2p-listen`. The node
+sends the stock-compatible keyless `NETWORK | SHAKESCAPE` address to at most
+two ready outbound peers and refreshes it every 30 minutes so unmodified HSD
+peers can carry the listener through normal `ADDR` gossip. On that listener,
+the public-network runtime auto-detects ordinary Handshake framing by the exact
+network magic and otherwise follows its authenticated Brontide responder path.
+
 ## Runtime flow
 
 ```text

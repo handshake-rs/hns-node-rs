@@ -1651,6 +1651,7 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
         if !persistent_data_dir
             || !config.native_sync.enabled
             || config.native_sync.listen.is_none()
+            || config.native_sync.advertise.is_none()
             || config.native_sync.hnsr_relay_address.is_none()
             || !config.native_sync.hnsr_opaque_relay
             || config.native_sync.hnsr_opaque_relay_override != Some(true)
@@ -1659,7 +1660,7 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
                 .contains(ShakescapeRelayKind::NameMarket)
         {
             anyhow::bail!(
-                "Shakescape mobile rendezvous requires an absolute persistent data directory, native sync with an inbound P2P listener, a valid public HNSR relay address, an explicitly enabled opaque relay, and the typed name-market relay"
+                "Shakescape mobile rendezvous requires an absolute persistent data directory, native sync with an inbound P2P listener and public ADDR advertisement, a valid public HNSR relay address, an explicitly enabled opaque relay, and the typed name-market relay"
             );
         }
     }

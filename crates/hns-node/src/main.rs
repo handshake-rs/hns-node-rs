@@ -114,7 +114,9 @@ struct Cli {
 
     /// Run the implemented mobile board gateway profile: an inbound
     /// Handshake/Shakescape board peer plus an opaque HNSR swap-circuit relay.
-    /// This requires --data-dir, --p2p-listen, and --hnsr-relay-address.
+    /// This requires --data-dir, --p2p-listen, and --hnsr-relay-address. The
+    /// relay address is also advertised through stock-HSD ADDR gossip unless
+    /// --p2p-advertise explicitly selects another raw-TCP ingress socket.
     #[arg(
         long = "shakescape-mobile-rendezvous",
         conflicts_with_all = ["no_native_sync", "no_hnsr_relay"]
@@ -190,6 +192,12 @@ struct Cli {
     /// Bind an inbound Handshake P2P listener (Brontide on public networks).
     #[arg(long)]
     p2p_listen: Option<SocketAddr>,
+
+    /// Public socket advertised through ordinary HSD ADDR gossip. This must
+    /// reach the configured P2P listener, directly or through a raw-TCP
+    /// forwarder. The record is keyless for stock-HSD compatibility.
+    #[arg(long)]
+    p2p_advertise: Option<SocketAddr>,
 
     /// Connect to a peer. Public networks require KEYHEX@IP:PORT; may be repeated.
     #[arg(long = "connect")]
@@ -414,6 +422,11 @@ impl Cli {
                     && !self.native_sync_observe_only,
                 active_state_connect_batch: self.active_state_connect_batch,
                 listen: self.p2p_listen,
+                advertise: self.p2p_advertise.or_else(|| {
+                    self.shakescape_mobile_rendezvous
+                        .then_some(self.hnsr_relay_address)
+                        .flatten()
+                }),
                 connect,
                 connect_keys,
                 discovery: p2p_discovery,
@@ -939,6 +952,10 @@ mod tests {
         assert!(!config
             .shakescape_relay_roles
             .contains(hns_node::ShakescapeRelayKind::Rendezvous));
+        assert_eq!(
+            config.native_sync.advertise,
+            Some("8.8.8.8:12038".parse().expect("advertised listener"))
+        );
         assert_eq!(config.native_sync.hnsr_opaque_relay_override, Some(true));
         validate_node_config(&config).expect("complete public rendezvous config validates");
     }

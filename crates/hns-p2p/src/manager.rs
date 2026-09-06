@@ -78,6 +78,11 @@ pub struct LivePeerConfig {
     pub ban_time: Duration,
     pub protocol_version: u32,
     pub services: u64,
+    /// Permit exactly negotiated ShakeScape name-market messages on an
+    /// inbound plaintext Handshake session. Public-network managers keep
+    /// Brontide as their configured transport; this opt-in exists only for
+    /// stock-HSD-compatible keyless ADDR listeners.
+    pub allow_public_plaintext_shakescape: bool,
     pub user_agent: String,
     pub no_relay: bool,
     pub runtime: PeerRuntimeConfig,
@@ -143,6 +148,7 @@ impl LivePeerConfig {
             ban_time: Duration::from_secs(24 * 60 * 60),
             protocol_version: PROTOCOL_VERSION,
             services: SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value(),
+            allow_public_plaintext_shakescape: false,
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             no_relay: false,
             runtime: PeerRuntimeConfig::default(),
@@ -649,6 +655,66 @@ impl LivePeerManager {
             .await
     }
 
+    /// Accept either the manager's configured Brontide transport or an
+    /// ordinary keyless Handshake framing stream on one listener. Plaintext is
+    /// selected only when the first four bytes are the exact network magic;
+    /// every other prefix follows the normal Brontide responder path.
+    pub async fn accept_compatible_stream(
+        &self,
+        mut stream: TcpStream,
+        address: SocketAddr,
+    ) -> Result<PeerId, P2pError> {
+        if matches!(self.config.transport, PeerTransport::Plaintext) {
+            return self.accept_stream(stream, address).await;
+        }
+        self.ensure_capacity(PeerDirection::Inbound, address)
+            .await?;
+        stream.set_nodelay(true)?;
+        let mut prefix = [0_u8; 4];
+        tokio::time::timeout(self.config.runtime.handshake_timeout, async {
+            loop {
+                let received = stream.peek(&mut prefix).await?;
+                if received == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "peer closed before transport classification",
+                    ));
+                }
+                if received == prefix.len() {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            P2pError::Timeout(format!(
+                "inbound transport classification for {address} timed out"
+            ))
+        })??;
+        if compatible_stream_is_plaintext(self.config.network, prefix) {
+            return self
+                .register_stream(stream, address, PeerDirection::Inbound, None)
+                .await;
+        }
+        let identity = match &self.config.transport {
+            PeerTransport::Brontide(identity) => identity,
+            PeerTransport::Plaintext => unreachable!("plaintext returned before classification"),
+        };
+        let session = tokio::time::timeout(
+            self.config.runtime.handshake_timeout,
+            inbound_handshake(&mut stream, identity),
+        )
+        .await
+        .map_err(|_| {
+            P2pError::Timeout(format!(
+                "inbound Brontide handshake with {address} timed out"
+            ))
+        })??;
+        self.register_stream(stream, address, PeerDirection::Inbound, Some(session))
+            .await
+    }
+
     pub async fn serve_listener<F>(
         &self,
         listener: TcpListener,
@@ -664,6 +730,31 @@ impl LivePeerManager {
                 accepted = listener.accept() => {
                     let (stream, address) = accepted?;
                     if let Err(error) = self.accept_stream(stream, address).await {
+                        let _ = self.events.send(PeerEvent::InboundRejected {
+                            address,
+                            reason: error.to_string(),
+                        }).await;
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn serve_compatible_listener<F>(
+        &self,
+        listener: TcpListener,
+        shutdown: F,
+    ) -> Result<(), P2pError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => return Ok(()),
+                accepted = listener.accept() => {
+                    let (stream, address) = accepted?;
+                    if let Err(error) = self.accept_compatible_stream(stream, address).await {
                         let _ = self.events.send(PeerEvent::InboundRejected {
                             address,
                             reason: error.to_string(),
@@ -933,7 +1024,12 @@ impl LivePeerManager {
                 ))
             })?;
         let snapshot = handle.snapshot().await;
-        if !exact_name_market_admission(&snapshot, self.config.network, payload.len()) {
+        if !exact_name_market_admission(
+            &snapshot,
+            self.config.network,
+            self.config.allow_public_plaintext_shakescape,
+            payload.len(),
+        ) {
             return Err(P2pError::Protocol(
                 "peer lacks exact Shakescape V1 name-market admission".to_owned(),
             ));
@@ -958,7 +1054,14 @@ impl LivePeerManager {
             .snapshots()
             .await
             .into_iter()
-            .filter(|snapshot| exact_name_market_admission(snapshot, self.config.network, 1))
+            .filter(|snapshot| {
+                exact_name_market_admission(
+                    snapshot,
+                    self.config.network,
+                    self.config.allow_public_plaintext_shakescape,
+                    1,
+                )
+            })
             .map(|snapshot| snapshot.id)
             .collect::<Vec<_>>();
         let mut report = BroadcastReport::default();
@@ -2036,18 +2139,14 @@ fn exact_experimental_admission(
 fn exact_name_market_admission(
     snapshot: &PeerSnapshot,
     network: Network,
+    allow_public_plaintext: bool,
     payload_len: usize,
 ) -> bool {
     let Some(negotiated) = snapshot.shakescape_negotiated_registry.as_ref() else {
         return false;
     };
-    let authenticated_transport = match network {
-        Network::Mainnet | Network::Testnet => {
-            snapshot.transport == crate::PeerTransportKind::Brontide
-                && snapshot.authenticated_remote_static.is_some()
-        }
-        Network::Regtest | Network::Simnet => true,
-    };
+    let authenticated_transport =
+        name_market_transport_admitted(snapshot, network, allow_public_plaintext);
     snapshot.state == PeerState::Ready
         && authenticated_transport
         && snapshot.services & SHAKESCAPE_EXTENSION_SERVICE.value() != 0
@@ -2066,6 +2165,27 @@ fn exact_name_market_admission(
         && negotiated.genesis_hash == OdohNetworkBinding::for_network(network).genesis_hash
         && usize::try_from(negotiated.maximum_send_size).is_ok_and(|maximum| payload_len <= maximum)
         && negotiated.maximum_live_requests != 0
+}
+
+fn name_market_transport_admitted(
+    snapshot: &PeerSnapshot,
+    network: Network,
+    allow_public_plaintext: bool,
+) -> bool {
+    match network {
+        Network::Mainnet | Network::Testnet => {
+            (snapshot.transport == crate::PeerTransportKind::Brontide
+                && snapshot.authenticated_remote_static.is_some())
+                || (allow_public_plaintext
+                    && snapshot.transport == crate::PeerTransportKind::Plaintext
+                    && snapshot.authenticated_remote_static.is_none())
+        }
+        Network::Regtest | Network::Simnet => true,
+    }
+}
+
+fn compatible_stream_is_plaintext(network: Network, prefix: [u8; 4]) -> bool {
+    prefix == NetworkMagic::from(network).as_u32().to_le_bytes()
 }
 
 fn atomic_saturating_add(counter: &AtomicU64, value: u64) {
@@ -2097,7 +2217,7 @@ mod tests {
         handshake::PeerState,
         runtime::{Hip76RequestOutcome, PeerTransportKind},
         shakescape::ShakescapePeerPhase,
-        wire::Packet,
+        wire::{AsyncFrameReader, AsyncFrameWriter, Packet},
         DnsRelayRequesterPolicy, DnsRelayStatus, Hip76ConnectionPhase,
     };
     use hns_p2p_experimental::{
@@ -2835,6 +2955,120 @@ mod tests {
                 "unexpected {network:?} plaintext validation error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn compatible_listener_classifies_only_exact_network_magic_as_plaintext() {
+        for network in [
+            Network::Mainnet,
+            Network::Testnet,
+            Network::Regtest,
+            Network::Simnet,
+        ] {
+            let magic = NetworkMagic::from(network).as_u32().to_le_bytes();
+            assert!(compatible_stream_is_plaintext(network, magic));
+            let mut other = magic;
+            other[0] ^= 1;
+            assert!(!compatible_stream_is_plaintext(network, other));
+        }
+    }
+
+    #[test]
+    fn public_keyless_name_market_transport_requires_explicit_opt_in() {
+        let snapshot = PeerSnapshot::new(
+            PeerId(1),
+            "1.1.1.1:12038".parse().expect("peer address"),
+            PeerDirection::Inbound,
+        );
+        assert!(!name_market_transport_admitted(
+            &snapshot,
+            Network::Mainnet,
+            false
+        ));
+        assert!(name_market_transport_admitted(
+            &snapshot,
+            Network::Mainnet,
+            true
+        ));
+        assert!(name_market_transport_admitted(
+            &snapshot,
+            Network::Regtest,
+            false
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_compatible_listener_completes_keyless_handshake() {
+        let mut server_config = LivePeerConfig::for_network(Network::Mainnet);
+        server_config.allow_public_plaintext_shakescape = true;
+        server_config.runtime.ping_interval = Duration::from_secs(60);
+        let (server_manager, mut server_events) =
+            LivePeerManager::new(server_config).expect("server");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = {
+            let manager = server_manager.clone();
+            tokio::spawn(async move {
+                let (stream, peer_address) = listener.accept().await.expect("accept");
+                manager
+                    .accept_compatible_stream(stream, peer_address)
+                    .await
+                    .expect("compatible public plaintext registration")
+            })
+        };
+
+        let stream = TcpStream::connect(address).await.expect("connect");
+        let (read, write) = stream.into_split();
+        let magic = NetworkMagic::Mainnet;
+        let mut reader = AsyncFrameReader::new(read, magic);
+        let mut writer = AsyncFrameWriter::new(write, magic);
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+        writer
+            .write_packet(&Packet::Version(VersionPacket {
+                version: PROTOCOL_VERSION,
+                services,
+                time: unix_time(),
+                remote: NetAddress::from_socket_addr(address, unix_time(), services),
+                nonce: [0x55; 8],
+                agent: "/stock-keyless-test:0.1.0/".to_owned(),
+                height: 1,
+                no_relay: false,
+            }))
+            .await
+            .expect("send plaintext version");
+        let server_peer = server.await.expect("server task");
+
+        let mut received_version = false;
+        let mut received_verack = false;
+        tokio::time::timeout(LIVE_EVENT_TIMEOUT, async {
+            while !received_version || !received_verack {
+                match reader.read_packet().await.expect("server handshake packet") {
+                    Packet::Version(_) => {
+                        received_version = true;
+                        writer
+                            .write_packet(&Packet::Verack)
+                            .await
+                            .expect("send plaintext verack");
+                    }
+                    Packet::Verack => received_verack = true,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("plaintext handshake frames");
+        assert_eq!(
+            await_ready(&mut server_events, server_peer).await.services,
+            services
+        );
+        let snapshot = server_manager
+            .snapshots()
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.id == server_peer)
+            .expect("plaintext peer snapshot");
+        assert_eq!(snapshot.transport, PeerTransportKind::Plaintext);
+        assert!(snapshot.authenticated_remote_static.is_none());
     }
 
     #[tokio::test]

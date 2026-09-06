@@ -38,7 +38,8 @@ use hns_p2p::{
     CompactBlockError, CompactBlockReconstruction, CompactBlockRequest, CompactBlockResponse,
     DnsRelayRequesterPolicy, Inventory, InventoryKind, LivePeerConfig, LivePeerManager,
     LocatorPacket, OutboundPriority, P2pError, Packet, PeerDirection, PeerEvent, PeerId,
-    PeerSnapshot, PeerTransport, ShakescapePeerProvenance, SERVICE_NETWORK,
+    PeerSnapshot, PeerState, PeerTransport, ShakescapePeerProvenance, SERVICE_NETWORK,
+    SHAKESCAPE_EXTENSION_SERVICE,
 };
 use hns_primitives::{
     blake2b_256, Block, BlockHash, CovenantKind, Header, Height, Reader, Txid, Writer,
@@ -147,6 +148,8 @@ impl fmt::Display for PeerHeaderBatchLimit {
 
 impl Error for PeerHeaderBatchLimit {}
 const ADDRESS_BOOK_FLUSH_INTERVAL: Duration = Duration::from_secs(120);
+const LOCAL_ADDRESS_ADVERTISEMENT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS: usize = 2;
 const HSD_ADDRESS_HORIZON_SECONDS: u64 = 30 * 24 * 60 * 60;
 const HSD_ADDRESS_MIN_FAIL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const HSD_ADDRESS_MAX_FAILURES: u32 = 10;
@@ -177,6 +180,54 @@ const NATIVE_RUNTIME_EXTENSION_ABORT_GRACE: Duration = Duration::from_secs(1);
 const NATIVE_BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const NATIVE_MAX_INFLIGHT_PER_PEER: usize = 32;
 const BRONTIDE_IDENTITY_FILE: &str = "p2p-identity-v1.key";
+
+#[derive(Debug)]
+struct LocalAddressAdvertiser {
+    address: SocketAddr,
+    sent_to: HashSet<PeerId>,
+    refresh_at: Instant,
+}
+
+impl LocalAddressAdvertiser {
+    fn new(address: SocketAddr, now: Instant) -> Self {
+        Self {
+            address,
+            sent_to: HashSet::with_capacity(MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS),
+            refresh_at: now + LOCAL_ADDRESS_ADVERTISEMENT_INTERVAL,
+        }
+    }
+
+    fn begin_refresh_if_due(&mut self, now: Instant) -> bool {
+        if now < self.refresh_at {
+            return false;
+        }
+        self.sent_to.clear();
+        self.refresh_at = now + LOCAL_ADDRESS_ADVERTISEMENT_INTERVAL;
+        true
+    }
+
+    fn eligible(&self, snapshot: &PeerSnapshot) -> bool {
+        snapshot.direction == PeerDirection::Outbound
+            && snapshot.state == PeerState::Ready
+            && snapshot
+                .protocol_version
+                .is_some_and(supports_addr_protocol)
+            && self.sent_to.len() < MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS
+            && !self.sent_to.contains(&snapshot.id)
+    }
+
+    fn packet(&self, timestamp: u64) -> Packet {
+        Packet::Addr(vec![hns_p2p::NetAddress::from_socket_addr(
+            self.address,
+            timestamp,
+            SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value(),
+        )])
+    }
+
+    fn note_sent(&mut self, peer: PeerId) {
+        self.sent_to.insert(peer);
+    }
+}
 
 #[derive(Clone, Debug)]
 struct OwnedOrphan {
@@ -726,6 +777,10 @@ pub struct NativeSyncConfig {
     pub connect_active_state: bool,
     pub active_state_connect_batch: usize,
     pub listen: Option<SocketAddr>,
+    /// Externally reachable raw-TCP socket announced through ordinary ADDR
+    /// packets. It may differ from `listen` when a port forwarder terminates
+    /// the public socket without terminating Brontide.
+    pub advertise: Option<SocketAddr>,
     pub connect: Vec<SocketAddr>,
     /// Authenticated remote static keys for configured public-network peers.
     pub connect_keys: BTreeMap<SocketAddr, [u8; 33]>,
@@ -777,6 +832,7 @@ impl Default for NativeSyncConfig {
             connect_active_state: false,
             active_state_connect_batch: 288,
             listen: None,
+            advertise: None,
             connect: Vec::new(),
             connect_keys: BTreeMap::new(),
             discovery: false,
@@ -817,6 +873,14 @@ impl NativeSyncConfig {
         if let Some(address) = self.hnsr_relay_address {
             hns_p2p::validate_hnsr_relay_address(network, address).map_err(|error| {
                 anyhow::anyhow!("invalid HNSR relay address {address}: {error}")
+            })?;
+        }
+        if let Some(address) = self.advertise {
+            if self.listen.is_none() {
+                anyhow::bail!("advertising HNS P2P address {address} requires an inbound listener");
+            }
+            hns_p2p::validate_hnsr_relay_address(network, address).map_err(|error| {
+                anyhow::anyhow!("invalid advertised HNS P2P address {address}: {error}")
             })?;
         }
         if !matches!(
@@ -992,6 +1056,10 @@ pub struct NativeSyncDiagnostics {
     pub ban_list_last_error: Option<String>,
     pub dns_seed_addresses: u64,
     pub dns_seed_failures: u64,
+    /// Public listener injected into ordinary HSD ADDR gossip.
+    pub advertised_listener: Option<SocketAddr>,
+    pub local_address_advertisements: u64,
+    pub last_local_address_advertisement: Option<u64>,
     pub discovery_connection_failures: u64,
     pub received_addresses: u64,
     pub accepted_addresses: u64,
@@ -2666,6 +2734,7 @@ impl NodeService {
         }
         peer_config.maximum_inbound = native_sync_config.maximum_inbound;
         peer_config.maximum_outbound = native_sync_config.maximum_outbound;
+        peer_config.allow_public_plaintext_shakescape = native_sync_config.advertise.is_some();
         peer_config.ban_score = HSD_BAN_SCORE;
         peer_config.ban_time = Duration::from_secs(HSD_BAN_TIME_SECONDS);
         peer_config.hip76_requester_policy_override =
@@ -2707,6 +2776,9 @@ impl NodeService {
                 .get(ColumnFamily::Peers, HNSR_DURABLE_FLOOR_KEY)
                 .context("failed to read durable HNSR generation floor")?;
         }
+        let mut local_address_advertiser = native_sync_config
+            .advertise
+            .map(|address| LocalAddressAdvertiser::new(address, Instant::now()));
         let (peers, mut peer_events) = LivePeerManager::new(peer_config)
             .map_err(|error| anyhow::anyhow!("failed to initialize live peers: {error}"))?;
         if ban_list_persistent {
@@ -2883,6 +2955,7 @@ impl NodeService {
             ban_list_dirty: ban_list.is_dirty(),
             dns_seed_addresses,
             dns_seed_failures,
+            advertised_listener: native_sync_config.advertise,
             started_at: unix_time(),
             experimental_registry: initial_experimental_registry,
             hip76: rpc_hip76_info(&[]),
@@ -2977,12 +3050,16 @@ impl NodeService {
                 .with_context(|| format!("failed to bind HNS P2P listener on {address}"))?;
             let peers = peers.clone();
             let mut shutdown = shutdown_rx.clone();
+            let keyless_compatible = native_sync_config.advertise.is_some();
             Some(tokio::spawn(async move {
-                peers
-                    .serve_listener(listener, async move {
-                        let _ = shutdown.changed().await;
-                    })
-                    .await
+                let stop = async move {
+                    let _ = shutdown.changed().await;
+                };
+                if keyless_compatible {
+                    peers.serve_compatible_listener(listener, stop).await
+                } else {
+                    peers.serve_listener(listener, stop).await
+                }
             }))
         } else {
             None
@@ -3380,6 +3457,15 @@ impl NodeService {
                     if let Err(error) = peers.expire_hnsr(unix_time()).await {
                         record_warning(format!("failed to expire HNSR runtime work: {error}"));
                     }
+                    if let Some(advertiser) = local_address_advertiser.as_mut() {
+                        refresh_local_address_advertisement(
+                            advertiser,
+                            &peers,
+                            &diagnostics,
+                            Instant::now(),
+                        )
+                        .await;
+                    }
 
                     let compact_now = Instant::now();
                     let expired_peers = pending_compact_blocks
@@ -3607,6 +3693,7 @@ impl NodeService {
                             &mut scheduler,
                             &mut reconnects,
                             &mut address_book,
+                            &mut local_address_advertiser,
                             &ban_list,
                             &mut served_getaddr,
                             &mut compact_peers,
@@ -5910,18 +5997,72 @@ fn shakescape_peer_identity(
         material.extend_from_slice(key.as_bytes());
         return Ok(blake2b_256(&material));
     }
-    if !matches!(network, Network::Regtest | Network::Simnet) {
-        anyhow::bail!("public-network Shakescape message lacks authenticated Brontide provenance");
-    }
     let mut material = Vec::with_capacity(96);
-    material.extend_from_slice(b"hns-node/shakescape-controlled-peer/v1");
-    material.extend_from_slice(&provenance.peer.0.to_le_bytes());
-    match provenance.address.ip() {
+    material.extend_from_slice(b"hns-node/shakescape-keyless-peer/v1");
+    material.extend_from_slice(&network.params().packet_magic.to_le_bytes());
+    match normalize_peer_ip(provenance.address.ip()) {
         IpAddr::V4(address) => material.extend_from_slice(&address.octets()),
         IpAddr::V6(address) => material.extend_from_slice(&address.octets()),
     }
-    material.extend_from_slice(&provenance.address.port().to_le_bytes());
     Ok(blake2b_256(&material))
+}
+
+async fn send_local_address_advertisement(
+    advertiser: &mut LocalAddressAdvertiser,
+    snapshot: &PeerSnapshot,
+    peers: &LivePeerManager,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+) -> Result<bool> {
+    if !advertiser.eligible(snapshot) {
+        return Ok(false);
+    }
+    let timestamp = unix_time();
+    peers
+        .try_send(
+            snapshot.id,
+            Arc::new(advertiser.packet(timestamp)),
+            OutboundPriority::Control,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to advertise local HNS P2P address to {:?}: {error}",
+                snapshot.id
+            )
+        })?;
+    advertiser.note_sent(snapshot.id);
+    update_diagnostics(diagnostics, |state| {
+        state.local_address_advertisements = state.local_address_advertisements.saturating_add(1);
+        state.last_local_address_advertisement = Some(timestamp);
+    })
+    .await;
+    tracing::debug!(
+        peer = ?snapshot.id,
+        address = %advertiser.address,
+        "advertised local ShakeScape listener through HSD ADDR"
+    );
+    Ok(true)
+}
+
+async fn refresh_local_address_advertisement(
+    advertiser: &mut LocalAddressAdvertiser,
+    peers: &LivePeerManager,
+    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
+    now: Instant,
+) {
+    if !advertiser.begin_refresh_if_due(now) {
+        return;
+    }
+    for snapshot in peers.snapshots().await {
+        if advertiser.sent_to.len() >= MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS {
+            break;
+        }
+        if let Err(error) =
+            send_local_address_advertisement(advertiser, &snapshot, peers, diagnostics).await
+        {
+            record_warning(format!("{error:#}"));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5935,6 +6076,7 @@ async fn handle_peer_event(
     scheduler: &mut SyncScheduler,
     reconnects: &mut HashMap<SocketAddr, ReconnectState>,
     addresses: &mut BoundedAddressBook,
+    local_address_advertiser: &mut Option<LocalAddressAdvertiser>,
     bans: &PeerBanBook,
     served_getaddr: &mut HashSet<PeerId>,
     compact_peers: &mut HashSet<PeerId>,
@@ -5986,7 +6128,9 @@ async fn handle_peer_event(
                 .map_err(|error| anyhow::anyhow!("failed to negotiate compact blocks: {error}"))?;
             if discovery
                 && supports_addr_protocol(version.version)
-                && snapshot.is_some_and(|snapshot| snapshot.direction == PeerDirection::Outbound)
+                && snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.direction == PeerDirection::Outbound)
             {
                 peers
                     .try_send(peer, Arc::new(Packet::GetAddr), OutboundPriority::Control)
@@ -5994,6 +6138,12 @@ async fn handle_peer_event(
                     .map_err(|error| {
                         anyhow::anyhow!("failed to request peer addresses: {error}")
                     })?;
+            }
+            if let (Some(advertiser), Some(snapshot)) =
+                (local_address_advertiser.as_mut(), snapshot.as_ref())
+            {
+                let _ = send_local_address_advertisement(advertiser, snapshot, peers, diagnostics)
+                    .await?;
             }
         }
         PeerEvent::Disconnected {
@@ -11401,6 +11551,67 @@ mod tests {
         assert!(headers_only_active_state
             .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
+    }
+
+    #[test]
+    fn public_listener_advertisement_requires_listener_and_routable_address() {
+        let no_listener = NativeSyncConfig {
+            enabled: true,
+            advertise: Some("8.8.8.8:12038".parse().expect("public address")),
+            discovery: true,
+            ..NativeSyncConfig::default()
+        };
+        assert!(no_listener
+            .validate(AuthorityMode::Native, Network::Mainnet)
+            .is_err());
+
+        let private = NativeSyncConfig {
+            listen: Some("0.0.0.0:12038".parse().expect("listener")),
+            advertise: Some("192.168.8.177:12038".parse().expect("private address")),
+            ..no_listener.clone()
+        };
+        assert!(private
+            .validate(AuthorityMode::Native, Network::Mainnet)
+            .is_err());
+
+        let public = NativeSyncConfig {
+            advertise: Some("8.8.8.8:12038".parse().expect("public address")),
+            ..private
+        };
+        public
+            .validate(AuthorityMode::Native, Network::Mainnet)
+            .expect("public forwarded listener is valid");
+    }
+
+    #[test]
+    fn local_advertisement_is_stock_hsd_compatible_bounded_and_refreshable() {
+        let now = Instant::now();
+        let socket: SocketAddr = "8.8.8.8:12038".parse().expect("public address");
+        let mut advertiser = LocalAddressAdvertiser::new(socket, now);
+        let packet = advertiser.packet(123_456_789);
+        let Packet::Addr(addresses) = packet else {
+            panic!("advertiser must emit ADDR");
+        };
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].socket_addr(), Some(socket));
+        assert_eq!(addresses[0].time, 123_456_789);
+        assert_eq!(addresses[0].key, [0; 33]);
+        assert_eq!(
+            addresses[0].services,
+            SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value()
+        );
+
+        advertiser.note_sent(PeerId(1));
+        advertiser.note_sent(PeerId(2));
+        assert_eq!(
+            advertiser.sent_to.len(),
+            MAX_LOCAL_ADDRESS_ADVERTISEMENT_PEERS
+        );
+        assert!(!advertiser.begin_refresh_if_due(
+            now + LOCAL_ADDRESS_ADVERTISEMENT_INTERVAL - Duration::from_nanos(1)
+        ));
+        assert!(advertiser.begin_refresh_if_due(now + LOCAL_ADDRESS_ADVERTISEMENT_INTERVAL));
+        assert!(advertiser.sent_to.is_empty());
     }
 
     #[test]

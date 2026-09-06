@@ -126,10 +126,14 @@ fund, or settle a marketplace offer.
 For a durable public peer that mobile wallets can use as their shared
 ShakeScape board gateway, use `--shakescape-mobile-rendezvous` together with an
 absolute `--data-dir`, an inbound `--p2p-listen`, and the externally reachable
-`--hnsr-relay-address`. The composite mode enables the implemented typed
-name-market relay and opaque swap-circuit relay and rejects incomplete or
-private mainnet configurations. It does not claim the unimplemented HNSR
-endpoint-directory role; see [the exact service boundary](docs/SHAKESCAPE_MARKET_RELAY.md#mobile-rendezvous-gateway-profile).
+`--hnsr-relay-address`. That public raw-TCP socket is also injected into stock
+HSD `ADDR` gossip with `NETWORK | SHAKESCAPE`, a fresh timestamp, and the
+required zero key; `--p2p-advertise` can select a different public forwarding
+socket. The listener accepts both stock keyless Handshake framing and Brontide
+on that socket. The composite mode enables the implemented typed name-market
+relay and opaque swap-circuit relay and rejects incomplete or private mainnet
+configurations. It does not claim the unimplemented HNSR endpoint-directory
+role; see [the exact service boundary](docs/SHAKESCAPE_MARKET_RELAY.md#mobile-rendezvous-gateway-profile).
 
 In another terminal, inspect node and synchronization status:
 

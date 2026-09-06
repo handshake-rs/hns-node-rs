@@ -104,10 +104,23 @@ shared, always-on mobile board peer. It composes only implemented services:
   circuit profile.
 
 The mode requires an absolute persistent `--data-dir`, `--p2p-listen`, and a
-network-valid public `--hnsr-relay-address`. It explicitly re-enables the
-durable HNSR relay policy if an earlier run saved an opt-out. A private,
-unspecified, zero-port, or otherwise unroutable mainnet/testnet relay address
+network-valid public `--hnsr-relay-address`. By default that public socket is
+also the `--p2p-advertise` socket. It explicitly re-enables the durable HNSR
+relay policy if an earlier run saved an opt-out. A private, unspecified,
+zero-port, or otherwise unroutable mainnet/testnet advertised or relay address
 is rejected by `--check-config` before storage or networking starts.
+
+On each advertisement epoch the node sends one ordinary `ADDR` record to at
+most two ready outbound peers. The record contains the current timestamp,
+`NETWORK | SHAKESCAPE`, the verified public IP and port, and a zero key. It
+refreshes every 30 minutes. Stock HSD rejects keyed `ADDR` entries, so the
+public listener accepts standard keyless Handshake framing as well as
+Brontide. It remains legitimate because the endpoint really speaks
+the Handshake protocol and includes the required `NETWORK` service. Exact
+ShakeScape registry/network/genesis negotiation and signed board-message
+validation gate board use above that transport. A TLS/HTTP reverse proxy is
+not compatible; a forwarding service must preserve the raw TCP byte stream end
+to end.
 
 This profile is rendezvous in the product sense that separately connected
 phones share one continuously reachable board and relay. It does not claim an
@@ -123,6 +136,7 @@ hsrd \
   --network mainnet \
   --data-dir /absolute/path/on/persistent-volume/hsrd \
   --p2p-listen 0.0.0.0:12038 \
+  --p2p-advertise "$PUBLIC_IP:12038" \
   --hnsr-relay-address "$PUBLIC_IP:12038" \
   --shakescape-mobile-rendezvous \
   --check-config
