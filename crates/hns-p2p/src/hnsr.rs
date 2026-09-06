@@ -906,6 +906,31 @@ fn build_relay_service(
     Ok(Some(relay))
 }
 
+/// Validate one operator-advertised HNSR relay socket against the exact
+/// network address policy used when the live relay service is constructed.
+///
+/// This is intentionally available to embedding configuration validators so
+/// `--check-config` can reject an unusable public relay address before any
+/// listener, store, or peer runtime is opened.
+pub fn validate_hnsr_relay_address(
+    network: hns_consensus::Network,
+    advertised_address: SocketAddr,
+) -> Result<(), HnsrCoordinatorError> {
+    let mut config = HnsrCoordinatorConfig::for_network(network);
+    config.relay_backend = Some(HnsrRelayBackend {
+        advertised_address,
+        // `1` is a valid secp256k1 scalar. This key is validation-only and is
+        // never retained, advertised, or used by a live relay.
+        private_key: {
+            let mut key = [0_u8; 32];
+            key[31] = 1;
+            key
+        },
+    });
+    let _ = build_relay_service(&config)?;
+    Ok(())
+}
+
 fn fresh_session() -> [u8; 16] {
     loop {
         let session = rand::random::<[u8; 16]>();

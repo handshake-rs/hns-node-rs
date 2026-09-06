@@ -53,10 +53,10 @@ pub use hns_hnsr_protocol::{
 pub use hns_p2p_experimental::HnsrPolicy;
 pub use hnsr::{
     decode_hnsr_packet, hnsr_packet, hnsr_peer_id, is_hnsr_packet_type, is_supported_hnsr_profile,
-    peer_id_from_hnsr, HnsrCoordinator, HnsrCoordinatorConfig, HnsrCoordinatorError,
-    HnsrCoordinatorStatus, HnsrDurableFloor, HnsrIncoming, HnsrNetworkBinding, HnsrPeerAdmission,
-    HnsrPolicyUpdate, HnsrProcessTotals, HnsrRelayBackend, HnsrStateSnapshot,
-    HNS_SHAKESCAPE_SWAP_V1,
+    peer_id_from_hnsr, validate_hnsr_relay_address, HnsrCoordinator, HnsrCoordinatorConfig,
+    HnsrCoordinatorError, HnsrCoordinatorStatus, HnsrDurableFloor, HnsrIncoming,
+    HnsrNetworkBinding, HnsrPeerAdmission, HnsrPolicyUpdate, HnsrProcessTotals, HnsrRelayBackend,
+    HnsrStateSnapshot, HNS_SHAKESCAPE_SWAP_V1,
 };
 pub use manager::{
     normalize_peer_ip, BroadcastReport, Hip76RequesterPolicyUpdate, LivePeerConfig,

@@ -85,12 +85,52 @@ before passing exact canonical bytes to `ShakescapeRelayHandle::put`. The node c
 - does not automatically accept or execute swaps.
 
 The active node transport and peer admission negotiate the exact Shakescape V1
-registry and fingerprint. The current source selects the clean-break
-`hns-p2p-experimental` and marketplace protocol line while retaining the
-published base protocol artifacts recorded by the lockfile. No typed
-marketplace adapter or marketplace packet advertisement is installed. Enabling
-a local cache role creates only the bounded service for an installed native
-adapter; it does not make this revision advertise a marketplace protocol.
+registry and fingerprint. The native name-market adapter is installed: it
+decodes the canonical protocol, verifies listings and cancellations, serves
+bounded inventory/get exchanges, and propagates only committed publications.
+The other four generic cache roles still have no native peer-wire adapter;
+enabling one of those role bits alone does not advertise or relay that
+application protocol.
+
+## Mobile rendezvous gateway profile
+
+`--shakescape-mobile-rendezvous` is the fail-closed deployment profile for a
+shared, always-on mobile board peer. It composes only implemented services:
+
+- the typed name-market board relay;
+- an inbound Handshake/Brontide listener advertising the ordinary `NETWORK`
+  service together with the Shakescape extension service;
+- the bounded opaque HNSR relay, including the canonical Shakescape swap
+  circuit profile.
+
+The mode requires an absolute persistent `--data-dir`, `--p2p-listen`, and a
+network-valid public `--hnsr-relay-address`. It explicitly re-enables the
+durable HNSR relay policy if an earlier run saved an opt-out. A private,
+unspecified, zero-port, or otherwise unroutable mainnet/testnet relay address
+is rejected by `--check-config` before storage or networking starts.
+
+This profile is rendezvous in the product sense that separately connected
+phones share one continuously reachable board and relay. It does not claim an
+HNSR endpoint-directory role, does not publish wallet endpoint records, and
+does not make the unused generic `Rendezvous` cache role functional. Until a
+wallet endpoint/ticket exchange is installed, opaque circuit capability is
+available at the node boundary but is not itself peer discovery.
+
+Example:
+
+```bash
+hsrd \
+  --network mainnet \
+  --data-dir /absolute/path/on/persistent-volume/hsrd \
+  --p2p-listen 0.0.0.0:12038 \
+  --hnsr-relay-address "$PUBLIC_IP:12038" \
+  --shakescape-mobile-rendezvous \
+  --check-config
+```
+
+Set `PUBLIC_IP` to the actual public IPv4 address routed to the listener (or
+pass a bracketed public IPv6 socket directly). The advertised address is never
+inferred from the bind wildcard.
 
 The independently enabled HIP-78 opaque relay now advertises the canonical
 Shakescape swap circuit profile (`0x0004`) alongside Node, Web, and Chat. That

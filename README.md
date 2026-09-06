@@ -123,6 +123,14 @@ and Shakescape swap circuits. Swap-profile support is transport only: `hsrd`
 does not see wallet keys or plaintext circuit messages and does not validate,
 fund, or settle a marketplace offer.
 
+For a durable public peer that mobile wallets can use as their shared
+ShakeScape board gateway, use `--shakescape-mobile-rendezvous` together with an
+absolute `--data-dir`, an inbound `--p2p-listen`, and the externally reachable
+`--hnsr-relay-address`. The composite mode enables the implemented typed
+name-market relay and opaque swap-circuit relay and rejects incomplete or
+private mainnet configurations. It does not claim the unimplemented HNSR
+endpoint-directory role; see [the exact service boundary](docs/SHAKESCAPE_MARKET_RELAY.md#mobile-rendezvous-gateway-profile).
+
 In another terminal, inspect node and synchronization status:
 
 ```bash

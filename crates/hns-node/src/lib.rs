@@ -1543,6 +1543,10 @@ pub struct NodeConfig {
     pub wallet_index: bool,
     /// Explicit Shakescape marketplace relay roles. Empty is requester-only.
     pub shakescape_relay_roles: ShakescapeRelayRoles,
+    /// Fail-closed composite service for mobile board synchronization and
+    /// opaque wallet-to-wallet swap circuits. This is not an HNSR endpoint
+    /// directory and does not acquire wallet or settlement authority.
+    pub shakescape_mobile_rendezvous: bool,
     /// Optional HNSA-bound endpoint signer required for authenticated local
     /// wallet publication acceptance. The secret is redacted and zeroized.
     pub shakescape_name_market_acceptance_signer: Option<ShakescapeRelayAcceptanceSigner>,
@@ -1570,6 +1574,7 @@ impl Default for NodeConfig {
             spender_index: false,
             wallet_index: false,
             shakescape_relay_roles: ShakescapeRelayRoles::NONE,
+            shakescape_mobile_rendezvous: false,
             shakescape_name_market_acceptance_signer: None,
             name_tree_compaction: NameTreeCompactionConfig::default(),
             undo_retention: UndoRetentionConfig::default(),
@@ -1635,6 +1640,29 @@ fn decode_transaction_index_mode(raw: &[u8]) -> Result<bool> {
 
 pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
     config.rpc_limits.validate()?;
+
+    if config.shakescape_mobile_rendezvous {
+        let persistent_data_dir = config.data_dir.as_ref().is_some_and(|path| {
+            path.is_absolute()
+                && !path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+        });
+        if !persistent_data_dir
+            || !config.native_sync.enabled
+            || config.native_sync.listen.is_none()
+            || config.native_sync.hnsr_relay_address.is_none()
+            || !config.native_sync.hnsr_opaque_relay
+            || config.native_sync.hnsr_opaque_relay_override != Some(true)
+            || !config
+                .shakescape_relay_roles
+                .contains(ShakescapeRelayKind::NameMarket)
+        {
+            anyhow::bail!(
+                "Shakescape mobile rendezvous requires an absolute persistent data directory, native sync with an inbound P2P listener, a valid public HNSR relay address, an explicitly enabled opaque relay, and the typed name-market relay"
+            );
+        }
+    }
 
     if let Some(signer) = &config.shakescape_name_market_acceptance_signer {
         let network = signer.policy().network();

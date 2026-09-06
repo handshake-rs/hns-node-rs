@@ -6,10 +6,12 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 AssertPathIsMountPoint=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9
 AssertPathIsReadWrite=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9
+AssertPathExists=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/shakescape-rendezvous-%i.env
 
 [Service]
 Type=simple
 WorkingDirectory=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-wallet-v1
+EnvironmentFile=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/shakescape-rendezvous-%i.env
 ExecStartPre=/usr/bin/sha256sum --check --strict --status /media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i.sha256
 ExecStart=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i \
   --network mainnet \
@@ -25,9 +27,10 @@ ExecStart=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i \
   --wallet-index \
   --storage-mode pruned \
   --native-sync \
+  --p2p-listen 0.0.0.0:12038 \
   --p2p-discovery \
   --maximum-known-addresses 4096 \
-  --maximum-inbound 0 \
+  --maximum-inbound 64 \
   --maximum-outbound 8 \
   --active-state-connect-batch 32 \
   --validation-workers 2 \
@@ -38,7 +41,8 @@ ExecStart=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i \
   --no-hip76-requester \
   --no-odoh-requester \
   --no-hnsr-requester \
-  --no-hnsr-relay \
+  --hnsr-relay-address ${HSRD_HNSR_RELAY_ADDRESS} \
+  --shakescape-mobile-rendezvous \
   --log-filter info
 Restart=on-failure
 RestartSec=10
@@ -64,4 +68,5 @@ ReadWritePaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-prun
 ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i
 ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i.sha256
 ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/mainnet-pruned-wallet-v1.authorization
+ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/shakescape-rendezvous-%i.env
 InaccessiblePaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/Backups

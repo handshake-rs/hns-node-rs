@@ -112,6 +112,15 @@ struct Cli {
     #[arg(long = "shakescape-name-market-relay")]
     shakescape_name_market_relay: bool,
 
+    /// Run the implemented mobile board gateway profile: an inbound
+    /// Handshake/Shakescape board peer plus an opaque HNSR swap-circuit relay.
+    /// This requires --data-dir, --p2p-listen, and --hnsr-relay-address.
+    #[arg(
+        long = "shakescape-mobile-rendezvous",
+        conflicts_with_all = ["no_native_sync", "no_hnsr_relay"]
+    )]
+    shakescape_mobile_rendezvous: bool,
+
     /// Mode-0600 JSON policy binding local publication receipts to one exact
     /// HRM-authorized HNSA endpoint.
     #[arg(long = "shakescape-name-market-acceptance-policy-file")]
@@ -381,12 +390,13 @@ impl Cli {
             spender_index: self.spender_index,
             wallet_index: self.wallet_index,
             shakescape_relay_roles: ShakescapeRelayRoles::new(
-                self.shakescape_name_market_relay,
+                self.shakescape_name_market_relay || self.shakescape_mobile_rendezvous,
                 self.shakescape_cross_chain_relay,
                 self.shakescape_price_relay,
                 self.shakescape_rendezvous_relay,
                 self.shakescape_swap_status_relay,
             ),
+            shakescape_mobile_rendezvous: self.shakescape_mobile_rendezvous,
             shakescape_name_market_acceptance_signer,
             name_tree_compaction: NameTreeCompactionConfig {
                 compact_on_startup: self.compact_name_tree_on_startup,
@@ -434,7 +444,8 @@ impl Cli {
                 } else {
                     None
                 },
-                hnsr_opaque_relay_override: if self.hnsr_relay {
+                hnsr_opaque_relay_override: if self.hnsr_relay || self.shakescape_mobile_rendezvous
+                {
                     Some(true)
                 } else if self.no_hnsr_relay {
                     Some(false)
@@ -776,6 +787,7 @@ async fn main() -> anyhow::Result<()> {
             spender_index = config.spender_index,
             wallet_index = config.wallet_index,
             shakescape_relay_roles = config.shakescape_relay_roles.bits(),
+            shakescape_mobile_rendezvous = config.shakescape_mobile_rendezvous,
             rpc_max_request_bytes = config.rpc_limits.maximum_request_bytes,
             rpc_max_concurrent_requests = config.rpc_limits.maximum_concurrent_requests,
             rpc_execution_timeout_ms = config.rpc_limits.execution_timeout.as_millis(),
@@ -902,6 +914,62 @@ mod tests {
         assert_eq!(reenabled.native_sync.odoh_requester_override, Some(true));
         assert_eq!(reenabled.native_sync.hnsr_requester_override, Some(true));
         assert_eq!(reenabled.native_sync.hnsr_opaque_relay_override, Some(true));
+    }
+
+    #[test]
+    fn mobile_rendezvous_composes_only_the_implemented_public_services() {
+        let config = Cli::try_parse_from([
+            "hsrd",
+            "--data-dir",
+            "/var/lib/hsrd/mainnet-mobile-rendezvous",
+            "--p2p-listen",
+            "0.0.0.0:12038",
+            "--hnsr-relay-address",
+            "8.8.8.8:12038",
+            "--shakescape-mobile-rendezvous",
+        ])
+        .expect("mobile rendezvous CLI")
+        .into_config()
+        .expect("mobile rendezvous config");
+
+        assert!(config.shakescape_mobile_rendezvous);
+        assert!(config
+            .shakescape_relay_roles
+            .contains(hns_node::ShakescapeRelayKind::NameMarket));
+        assert!(!config
+            .shakescape_relay_roles
+            .contains(hns_node::ShakescapeRelayKind::Rendezvous));
+        assert_eq!(config.native_sync.hnsr_opaque_relay_override, Some(true));
+        validate_node_config(&config).expect("complete public rendezvous config validates");
+    }
+
+    #[test]
+    fn mobile_rendezvous_refuses_partial_or_private_mainnet_configuration() {
+        let missing = Cli::try_parse_from(["hsrd", "--shakescape-mobile-rendezvous"])
+            .expect("partial CLI")
+            .into_config()
+            .expect("partial config");
+        assert!(validate_node_config(&missing).is_err());
+
+        let private = Cli::try_parse_from([
+            "hsrd",
+            "--data-dir",
+            "/var/lib/hsrd/mainnet-mobile-rendezvous",
+            "--p2p-listen",
+            "0.0.0.0:12038",
+            "--hnsr-relay-address",
+            "192.168.8.106:12038",
+            "--shakescape-mobile-rendezvous",
+        ])
+        .expect("private relay CLI")
+        .into_config()
+        .expect("private relay config");
+        assert!(validate_node_config(&private).is_err());
+
+        assert!(
+            Cli::try_parse_from(["hsrd", "--shakescape-mobile-rendezvous", "--no-hnsr-relay"])
+                .is_err()
+        );
     }
 
     #[test]

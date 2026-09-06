@@ -814,6 +814,11 @@ impl NativeSyncConfig {
         if !self.enabled {
             return Ok(());
         }
+        if let Some(address) = self.hnsr_relay_address {
+            hns_p2p::validate_hnsr_relay_address(network, address).map_err(|error| {
+                anyhow::anyhow!("invalid HNSR relay address {address}: {error}")
+            })?;
+        }
         if !matches!(
             authority_mode,
             AuthorityMode::Disabled | AuthorityMode::Native
