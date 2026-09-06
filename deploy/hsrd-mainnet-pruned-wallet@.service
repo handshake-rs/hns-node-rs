@@ -10,12 +10,12 @@ AssertPathExists=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/sh
 
 [Service]
 Type=simple
-WorkingDirectory=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-wallet-v1
+WorkingDirectory=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-wallet-v4
 EnvironmentFile=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/shakescape-rendezvous-%i.env
 ExecStartPre=/usr/bin/sha256sum --check --strict --status /media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i.sha256
 ExecStart=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i \
   --network mainnet \
-  --data-dir /media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-wallet-v1 \
+  --data-dir /media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-wallet-v4 \
   --rpc-bind 127.0.0.1:12037 \
   --rpc-authorization-header-file /media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/mainnet-pruned-wallet-v1.authorization \
   --rpc-max-request-bytes 65536 \
@@ -65,7 +65,7 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-wallet-v1
+ReadWritePaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-wallet-v4
 ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i
 ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i.sha256
 ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/mainnet-pruned-wallet-v1.authorization
