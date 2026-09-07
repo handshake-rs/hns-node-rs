@@ -22,7 +22,7 @@ use hns_store::{
 };
 #[cfg(unix)]
 use hns_store::{
-    prefetch_name_page_records_at, read_name_page_directory_at, NamePageDirectory,
+    prefetch_name_page_records_at, read_name_page_hot_directory_at, NamePageDirectory,
     PositionedNamePageReader,
 };
 #[cfg(not(unix))]
@@ -335,8 +335,8 @@ impl NamePageReadAheadPool {
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let file = files.file_mut(page.0)?;
-                        let directory = read_name_page_directory_at(file, page.1)?;
                         let slots = requested.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
+                        let directory = read_name_page_hot_directory_at(file, page.1, &slots)?;
                         let prefetched =
                             prefetch_name_page_records_at(file, page.1, &directory, &slots)?;
                         let mut reader = PositionedNamePageReader::with_prefetched(

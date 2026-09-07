@@ -681,7 +681,19 @@ impl<'a> PositionedNamePageReader<'a> {
     }
 
     pub fn record(&mut self, slot: u16) -> Result<NamePageRecord, NamePageError> {
-        let Some((subpage, local_slot)) = self.directory.subpage_location(slot)? else {
+        let location = match self.directory.subpage_location(slot) {
+            Ok(location) => location,
+            // Read-ahead may prepare an older page before traversal of a newer
+            // page discovers another address in it. Expand the sparse routing
+            // prefix only for that late slot; append-postordered same-page
+            // descendants were already covered by the original maximum.
+            Err(NamePageError::DirectoryInvariant) => {
+                read_name_page_hot_directory_at(self.file, self.page, &[slot])?
+                    .subpage_location(slot)?
+            }
+            Err(error) => return Err(error),
+        };
+        let Some((subpage, local_slot)) = location else {
             if let Some(span) = &self.legacy_span {
                 let location = self.directory.record(slot)?;
                 if let Some(start) = location.payload_offset.checked_sub(span.start) {
@@ -1275,6 +1287,70 @@ fn decode_name_subpage_index(encoded: &[u8]) -> Result<(u16, u8), NamePageError>
     Ok((record_count, subpage_count))
 }
 
+/// Validate the structural prefix used only to route hot positioned reads.
+/// The selected record subpage remains the authentication boundary; see
+/// [`read_name_page_hot_directory_at`].
+#[cfg(unix)]
+fn decode_name_subpage_index_prefix(
+    encoded: &[u8],
+    maximum_slot: u16,
+) -> Result<(u16, u8), NamePageError> {
+    let required = NAME_SUBPAGE_INDEX_HEADER_BYTES
+        .checked_add(
+            usize::from(maximum_slot)
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(NAME_SUBPAGE_INDEX_ENTRY_BYTES))
+                .ok_or(NamePageError::OffsetOverflow)?,
+        )
+        .ok_or(NamePageError::OffsetOverflow)?;
+    if encoded.len() < required || encoded.get(..8) != Some(NAME_SUBPAGE_INDEX_MAGIC) {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+    let mut cursor = 8usize;
+    let version = read_u16(encoded, &mut cursor)?;
+    if version != NAME_SUBPAGE_VERSION {
+        return Err(NamePageError::UnsupportedVersion(version));
+    }
+    let record_count = read_u16(encoded, &mut cursor)?;
+    let subpage_count = read_u8(encoded, &mut cursor)?;
+    if read_array::<3>(encoded, &mut cursor)? != [0; 3]
+        || record_count == 0
+        || maximum_slot >= record_count
+        || subpage_count == 0
+        || usize::from(subpage_count) > NAME_SUBPAGE_DATA_COUNT
+    {
+        return Err(NamePageError::DirectoryInvariant);
+    }
+
+    // Every complete prefix begins with subpage 1 and its local slots are
+    // dense. Later subpages must likewise advance exactly one at a time. This
+    // catches malformed routing before I/O while avoiding a hash/read of the
+    // unused remainder of the 4 KiB index.
+    let mut previous_subpage = 0u8;
+    let mut expected_local = 0u8;
+    for slot in 0..=maximum_slot {
+        let (subpage, local_slot) = decode_name_subpage_index_location_unchecked(encoded, slot)?;
+        if subpage == previous_subpage {
+            if subpage == 0 || local_slot != expected_local {
+                return Err(NamePageError::DirectoryInvariant);
+            }
+        } else {
+            if subpage != previous_subpage.saturating_add(1) || local_slot != 0 {
+                return Err(NamePageError::DirectoryInvariant);
+            }
+            previous_subpage = subpage;
+            expected_local = 0;
+        }
+        if subpage > subpage_count {
+            return Err(NamePageError::DirectoryInvariant);
+        }
+        expected_local = expected_local
+            .checked_add(1)
+            .ok_or(NamePageError::DirectoryInvariant)?;
+    }
+    Ok((record_count, subpage_count))
+}
+
 fn decode_name_subpage_index_location(
     encoded: &[u8],
     record_count: u16,
@@ -1846,6 +1922,70 @@ pub fn read_name_page_directory_at(
             record_count: header.record_count,
             directory_end: header.directory_end,
             payload_end: header.payload_end,
+        },
+    })
+}
+
+/// Read only the authenticated-subpage index prefix needed to resolve the
+/// requested logical slots.
+///
+/// Version-2 record subpages authenticate their complete local directory and
+/// payload independently. The page index is therefore only a routing hint on
+/// this hot path: after it selects a subpage/local-slot pair, the caller still
+/// authenticates that complete 4 KiB subpage and content-hash checks the
+/// selected record against the root supplied by its authenticated parent.
+/// Corrupt routing bytes can make a durable tree unavailable, but cannot make
+/// a different record satisfy that expected root.
+///
+/// Reading through the greatest requested slot also covers every earlier
+/// same-page child in the append-postordered layout. Legacy pages retain the
+/// fully validated directory path.
+#[cfg(unix)]
+pub fn read_name_page_hot_directory_at(
+    file: &File,
+    page: u32,
+    slots: &[u16],
+) -> Result<NamePageDirectory, NamePageError> {
+    let maximum_slot = slots
+        .iter()
+        .copied()
+        .max()
+        .ok_or(NamePageError::DirectoryInvariant)?;
+    let prefix_bytes = NAME_SUBPAGE_INDEX_HEADER_BYTES
+        .checked_add(
+            usize::from(maximum_slot)
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(NAME_SUBPAGE_INDEX_ENTRY_BYTES))
+                .ok_or(NamePageError::OffsetOverflow)?,
+        )
+        .ok_or(NamePageError::OffsetOverflow)?;
+    if prefix_bytes > NAME_SUBPAGE_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES {
+        return Err(NamePageError::SlotOutOfRange {
+            slot: maximum_slot,
+            records: u16::try_from(
+                (NAME_SUBPAGE_BYTES
+                    - NAME_SUBPAGE_CHECKSUM_BYTES
+                    - NAME_SUBPAGE_INDEX_HEADER_BYTES)
+                    / NAME_SUBPAGE_INDEX_ENTRY_BYTES,
+            )
+            .unwrap_or(u16::MAX),
+        });
+    }
+    let page_offset = u64::from(page)
+        .checked_mul(NAME_PAGE_BYTES as u64)
+        .ok_or(NamePageError::OffsetOverflow)?;
+    let mut encoded = vec![0u8; prefix_bytes];
+    file.read_exact_at(&mut encoded, page_offset)
+        .map_err(name_page_io)?;
+    if encoded.get(..8) != Some(NAME_SUBPAGE_INDEX_MAGIC) {
+        return read_name_page_directory_at(file, page);
+    }
+    let (record_count, subpage_count) = decode_name_subpage_index_prefix(&encoded, maximum_slot)?;
+    Ok(NamePageDirectory {
+        layout: NamePageDirectoryLayout::Subpages {
+            encoded_index: encoded,
+            record_count,
+            subpage_count,
         },
     })
 }
@@ -2461,6 +2601,22 @@ mod tests {
             assert_eq!(reader.cached_subpages(), 1);
             assert_eq!(reader.record(64).expect("next subpage record"), records[64]);
             assert_eq!(reader.cached_subpages(), 2);
+
+            let hot = read_name_page_hot_directory_at(&file, 0, &[32, 63])
+                .expect("sparse hot subpage index");
+            assert_eq!(hot.record_count(), 96);
+            assert_eq!(
+                hot.resident_bytes(),
+                NAME_SUBPAGE_INDEX_HEADER_BYTES + 64 * NAME_SUBPAGE_INDEX_ENTRY_BYTES
+            );
+            assert!(hot.resident_bytes() < positioned.resident_bytes());
+            let prefetched = prefetch_name_page_records_at(&file, 0, &hot, &[32, 63])
+                .expect("prefetch through sparse hot index");
+            assert_eq!(prefetched.subpages.len(), 1);
+            let mut reader = PositionedNamePageReader::with_prefetched(&file, 0, &hot, prefetched)
+                .expect("positioned reader with sparse hot index");
+            assert_eq!(reader.record(32).expect("hot first record"), records[32]);
+            assert_eq!(reader.record(63).expect("hot second record"), records[63]);
             fs::remove_file(path).expect("remove subpage fixture");
         }
     }
