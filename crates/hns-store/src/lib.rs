@@ -126,7 +126,7 @@ pub const AIRDROP_FIELD_BITS: usize = 217_557;
 pub const AIRDROP_FIELD_BYTES: usize = AIRDROP_FIELD_BITS.div_ceil(8);
 
 #[cfg(feature = "rocksdb-backend")]
-const ROCKS_POINT_CACHE_BYTES: usize = 192 * 1024 * 1024;
+const ROCKS_POINT_CACHE_BYTES: usize = 512 * 1024 * 1024;
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_BULK_CACHE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(feature = "rocksdb-backend")]
@@ -4347,7 +4347,7 @@ enum RocksCommitFault {
 
 #[cfg(feature = "rocksdb-backend")]
 fn rocks_column_family_options(family: ColumnFamily, cache: &rocksdb::Cache) -> rocksdb::Options {
-    use rocksdb::{BlockBasedOptions, Options};
+    use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Options};
 
     let mut table = BlockBasedOptions::default();
     table.set_block_cache(cache);
@@ -4355,6 +4355,16 @@ fn rocks_column_family_options(family: ColumnFamily, cache: &rocksdb::Cache) -> 
     table.set_optimize_filters_for_memory(true);
     table.set_cache_index_and_filter_blocks(true);
     table.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    if matches!(family, ColumnFamily::TxIndex | ColumnFamily::Utxo) {
+        // These point-lookup-heavy families grow to hundreds of SSTs during
+        // mainnet IBD. Partitioned filters avoid loading and checksumming one
+        // monolithic bloom filter per file, while pinning the small top level
+        // keeps partition routing resident. Existing SSTs remain readable and
+        // are converted naturally by flushes and compactions.
+        table.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+        table.set_partition_filters(true);
+        table.set_pin_top_level_index_and_filter(true);
+    }
     if matches!(family, ColumnFamily::Blocks | ColumnFamily::Undo) {
         table.set_block_size(ROCKS_BULK_BLOCK_BYTES);
     }
@@ -7853,6 +7863,18 @@ mod tests {
                     "Options.max_bytes_for_level_base: {ROCKS_UTXO_LEVEL_BASE_BYTES}"
                 )),
                 "{family} did not apply the larger level base"
+            );
+            assert!(
+                options.contains("partition_filters: 1"),
+                "{family} did not apply partitioned bloom filters"
+            );
+            assert!(
+                options.contains("index_type: 2"),
+                "{family} did not apply the two-level index"
+            );
+            assert!(
+                options.contains("pin_top_level_index_and_filter: 1"),
+                "{family} did not pin the partition-routing metadata"
             );
         }
         let _ = std::fs::remove_dir_all(&path);
