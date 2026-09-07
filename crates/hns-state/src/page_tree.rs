@@ -1918,7 +1918,8 @@ struct NamePagePathRecordCache {
     capacity_bytes: usize,
     accounted_bytes: usize,
     records: HashMap<TreeRoot, CachedNamePagePathRecord>,
-    clock: VecDeque<TreeRoot>,
+    internal_clock: VecDeque<TreeRoot>,
+    leaf_clock: VecDeque<TreeRoot>,
     leaf_records: usize,
 }
 
@@ -1928,30 +1929,39 @@ impl NamePagePathRecordCache {
             capacity_bytes,
             accounted_bytes: 0,
             records: HashMap::new(),
-            clock: VecDeque::new(),
+            internal_clock: VecDeque::new(),
+            leaf_clock: VecDeque::new(),
             leaf_records: 0,
         }
     }
 
-    /// Evict one second-chance clock entry. Leaf-first eviction prevents
+    /// Evict one same-class second-chance clock entry. Separate leaf and
+    /// internal clocks make each eviction amortized constant time; a shared
+    /// queue would rescan every protected internal node for every leaf victim.
+    /// Leaf-first selection by the caller prevents
     /// large name-state values with little cross-interval reuse from
     /// displacing the compact internal routing nodes shared by almost every
     /// subsequent Patricia traversal.
-    fn evict_one(&mut self, leaves_only: bool) -> bool {
-        if self.clock.is_empty() || (leaves_only && self.leaf_records == 0) {
+    fn evict_one(&mut self, leaf: bool) -> bool {
+        let clock = if leaf {
+            &mut self.leaf_clock
+        } else {
+            &mut self.internal_clock
+        };
+        if clock.is_empty() {
             return false;
         }
         loop {
-            let candidate = self.clock.pop_front().expect("nonempty cache clock");
+            let candidate = clock.pop_front().expect("nonempty cache clock");
             let Some(record) = self.records.get_mut(&candidate) else {
                 continue;
             };
-            if leaves_only && !record.leaf {
-                self.clock.push_back(candidate);
+            if record.leaf != leaf {
+                debug_assert_eq!(record.leaf, leaf, "path cache class clock drift");
                 continue;
             }
             if std::mem::replace(&mut record.referenced, false) {
-                self.clock.push_back(candidate);
+                clock.push_back(candidate);
                 continue;
             }
             let evicted = self
@@ -2023,7 +2033,11 @@ impl NamePagePathRecordCache {
             }
         }
 
-        self.clock.push_back(root);
+        if leaf {
+            self.leaf_clock.push_back(root);
+        } else {
+            self.internal_clock.push_back(root);
+        }
         self.records.insert(
             root,
             CachedNamePagePathRecord {
@@ -6491,6 +6505,8 @@ mod tests {
 
         assert!(cache.accounted_bytes <= capacity);
         assert!(cache.leaf_records < leaf_count);
+        assert_eq!(cache.leaf_clock.len(), cache.leaf_records);
+        assert_eq!(cache.internal_clock.len(), internal.len());
         for (root, address) in internal {
             assert!(cache.get(root, address).expect("read internal").is_some());
         }
