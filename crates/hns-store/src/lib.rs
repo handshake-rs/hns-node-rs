@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod authenticated_namespace;
-mod direct;
 mod name_page;
+mod rocks;
 mod segment;
 
-pub use direct::{DirectBatch, DirectSnapshot, DirectStore};
+pub use rocks::{RocksBatch, RocksSnapshot, RocksStore};
 
 pub use authenticated_namespace::{
     AuthenticatedNamespaceError, AuthenticatedNamespaceLease, AuthenticatedNamespaceState,
@@ -61,7 +61,7 @@ pub const PRE_INTERVAL_SCHEMA_VERSION: u32 = 16;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-direct-v1";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-rocks-fresh-v1";
 pub const MIXED_INDEX_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v15";
 /// Persistent compatibility flag for databases that can still contain v19
 /// wallet rows in the old mixed `tx_index` column family.
@@ -166,7 +166,7 @@ pub struct PrefixScanPage {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum StoreBackend {
-    Direct,
+    RocksDb,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -1570,15 +1570,15 @@ pub fn mark_clean_shutdown<S: Store>(store: &S) -> Result<(), StoreError> {
 
 pub fn open_store(config: &StoreConfig) -> Result<StoreHandle, StoreError> {
     match config.backend {
-        StoreBackend::Direct => DirectStore::open_with_durability(&config.path, config.durability)
-            .map(StoreHandle::Direct),
+        StoreBackend::RocksDb => RocksStore::open_with_durability(&config.path, config.durability)
+            .map(StoreHandle::Rocks),
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum StoreHandle {
     Memory(MemoryStore),
-    Direct(DirectStore),
+    Rocks(RocksStore),
     Archived {
         inner: Box<StoreHandle>,
         archive: Arc<SegmentArchive>,
@@ -1732,7 +1732,7 @@ impl StoreHandle {
     pub const fn is_restart_durable(&self) -> bool {
         match self {
             Self::Memory(_) => false,
-            Self::Direct(_) => true,
+            Self::Rocks(_) => true,
             Self::Archived { inner, .. } => inner.is_restart_durable(),
         }
     }
@@ -1742,7 +1742,7 @@ impl StoreHandle {
     pub fn reopen_required(&self) -> bool {
         match self {
             Self::Memory(_) => false,
-            Self::Direct(store) => store.reopen_required(),
+            Self::Rocks(store) => store.reopen_required(),
             Self::Archived { inner, archive, .. } => {
                 archive.reopen_required() || inner.reopen_required()
             }
@@ -1764,7 +1764,7 @@ impl StoreHandle {
     pub const fn durability_policy(&self) -> DurabilityPolicy {
         match self {
             Self::Memory(_) => DurabilityPolicy::Sync,
-            Self::Direct(store) => store.durability,
+            Self::Rocks(store) => store.durability,
             Self::Archived { inner, .. } => inner.durability_policy(),
         }
     }
@@ -1772,7 +1772,7 @@ impl StoreHandle {
     /// Commit one already-metered atomic mutation while carrying the same
     /// cumulative budget through any payload-archive transformation.
     ///
-    /// Memory and non-archived direct handles are transparent and leave the
+    /// Memory and non-archived RocksDB handles are transparent and leave the
     /// budget untouched. An archived handle performs and charges a read-only
     /// preflight before moving payload values, appending frames, replacing
     /// locators, or extending the backend batch with its two manifests.
@@ -1792,7 +1792,7 @@ impl StoreHandle {
         self.ensure_operational()?;
         match self {
             Self::Memory(store) => commit_memory_store_handle(store, batch),
-            Self::Direct(store) => commit_direct_store_handle(store, batch),
+            Self::Rocks(store) => commit_rocks_store_handle(store, batch),
             Self::Archived { inner, archive, .. } => {
                 commit_archived_store_handle(inner, archive, batch, budget)
             }
@@ -1823,7 +1823,7 @@ impl StoreHandle {
             ));
         }
         let database_directory = match &self {
-            Self::Direct(store) => store.path.clone(),
+            Self::Rocks(store) => store.path.clone(),
             Self::Memory(_) => directory.clone(),
             Self::Archived { .. } => unreachable!("archive attachment was rejected above"),
         };
@@ -3136,9 +3136,9 @@ impl Store for StoreHandle {
             Self::Memory(store) => store
                 .snapshot()
                 .map(|snapshot| StoreHandleSnapshot::Memory(snapshot, PhantomData)),
-            Self::Direct(store) => store
+            Self::Rocks(store) => store
                 .snapshot()
-                .map(|snapshot| StoreHandleSnapshot::Direct(snapshot, PhantomData)),
+                .map(|snapshot| StoreHandleSnapshot::Rocks(snapshot, PhantomData)),
             Self::Archived { inner, archive, .. } => {
                 // Linearize snapshot creation with segment publication. The
                 // guard is released immediately; the backend snapshot itself
@@ -3157,7 +3157,7 @@ impl Store for StoreHandle {
     fn batch(&self) -> Self::Batch {
         match self {
             Self::Memory(store) => StoreHandleBatch::Memory(store.batch()),
-            Self::Direct(store) => StoreHandleBatch::Direct(store.batch()),
+            Self::Rocks(store) => StoreHandleBatch::Rocks(store.batch()),
             Self::Archived { inner, .. } => inner.batch(),
         }
     }
@@ -3173,16 +3173,16 @@ fn commit_memory_store_handle(
 ) -> Result<(), StoreError> {
     match batch {
         StoreHandleBatch::Memory(batch) => store.commit(batch),
-        StoreHandleBatch::Direct(_) => Err(StoreError::BackendMismatch),
+        StoreHandleBatch::Rocks(_) => Err(StoreError::BackendMismatch),
     }
 }
 
-fn commit_direct_store_handle(
-    store: &DirectStore,
+fn commit_rocks_store_handle(
+    store: &RocksStore,
     batch: StoreHandleBatch,
 ) -> Result<(), StoreError> {
     match batch {
-        StoreHandleBatch::Direct(batch) => store.commit(batch),
+        StoreHandleBatch::Rocks(batch) => store.commit(batch),
         StoreHandleBatch::Memory(_) => Err(StoreError::BackendMismatch),
     }
 }
@@ -3286,7 +3286,7 @@ fn commit_archived_store_handle(
 
 pub enum StoreHandleSnapshot<'a> {
     Memory(MemorySnapshot, PhantomData<&'a ()>),
-    Direct(DirectSnapshot, PhantomData<&'a ()>),
+    Rocks(RocksSnapshot<'a>, PhantomData<&'a ()>),
     Archived(Box<StoreHandleSnapshot<'a>>, Arc<SegmentArchive>),
 }
 
@@ -3294,7 +3294,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         match self {
             Self::Memory(snapshot, _) => snapshot.get(family, key),
-            Self::Direct(snapshot, _) => snapshot.get(family, key),
+            Self::Rocks(snapshot, _) => snapshot.get(family, key),
             Self::Archived(snapshot, archive) => {
                 let Some(raw) = snapshot.get(family, key)? else {
                     return Ok(None);
@@ -3311,7 +3311,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
         match self {
             Self::Memory(snapshot, _) => snapshot.get_many(family, keys),
-            Self::Direct(snapshot, _) => snapshot.get_many(family, keys),
+            Self::Rocks(snapshot, _) => snapshot.get_many(family, keys),
             Self::Archived(snapshot, archive) => {
                 let values = snapshot.get_many(family, keys)?;
                 if segmented_kind(family).is_none() {
@@ -3336,7 +3336,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
     ) -> Result<Vec<ScanEntry>, StoreError> {
         match self {
             Self::Memory(snapshot, _) => snapshot.scan_prefix(family, prefix),
-            Self::Direct(snapshot, _) => snapshot.scan_prefix(family, prefix),
+            Self::Rocks(snapshot, _) => snapshot.scan_prefix(family, prefix),
             Self::Archived(snapshot, archive) => {
                 let entries = snapshot.scan_prefix(family, prefix)?;
                 if segmented_kind(family).is_none() {
@@ -3364,7 +3364,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
             Self::Memory(snapshot, _) => {
                 snapshot.scan_prefix_page(family, prefix, start_after, budget)
             }
-            Self::Direct(snapshot, _) => {
+            Self::Rocks(snapshot, _) => {
                 snapshot.scan_prefix_page(family, prefix, start_after, budget)
             }
             Self::Archived(snapshot, _) if segmented_kind(family).is_none() => {
@@ -3394,7 +3394,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
     ) -> Result<(), StoreError> {
         match self {
             Self::Memory(snapshot, _) => snapshot.visit_prefix(family, prefix, visitor),
-            Self::Direct(snapshot, _) => snapshot.visit_prefix(family, prefix, visitor),
+            Self::Rocks(snapshot, _) => snapshot.visit_prefix(family, prefix, visitor),
             Self::Archived(snapshot, _) if segmented_kind(family).is_none() => {
                 snapshot.visit_prefix(family, prefix, visitor)
             }
@@ -3411,7 +3411,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
 #[derive(Clone, Debug)]
 pub enum StoreHandleBatch {
     Memory(MemoryBatch),
-    Direct(DirectBatch),
+    Rocks(RocksBatch),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3544,7 +3544,7 @@ impl StoreHandleBatch {
                     visit_archive_payload(key.family, &key.key, value, visitor)?;
                 }
             }
-            Self::Direct(batch) => {
+            Self::Rocks(batch) => {
                 for (key, value) in &batch.operations {
                     let Some(value) = value else {
                         continue;
@@ -3570,7 +3570,7 @@ impl StoreHandleBatch {
                     collect_archive_payload(key.family, &key.key, value, &mut payloads)?;
                 }
             }
-            Self::Direct(batch) => {
+            Self::Rocks(batch) => {
                 for (key, value) in &mut batch.operations {
                     let Some(value) = value else {
                         continue;
@@ -3602,7 +3602,7 @@ impl StoreHandleBatch {
                     replace_archive_payload(key.family, value, &mut locators)?;
                 }
             }
-            Self::Direct(batch) => {
+            Self::Rocks(batch) => {
                 for (key, value) in &mut batch.operations {
                     let Some(value) = value else {
                         continue;
@@ -3690,14 +3690,14 @@ impl WriteBatch for StoreHandleBatch {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.put(family, key, value),
-            Self::Direct(batch) => batch.put(family, key, value),
+            Self::Rocks(batch) => batch.put(family, key, value),
         }
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.delete(family, key),
-            Self::Direct(batch) => batch.delete(family, key),
+            Self::Rocks(batch) => batch.delete(family, key),
         }
     }
 }
@@ -3706,21 +3706,21 @@ impl CheckpointWriteBatch for StoreHandleBatch {
     fn begin_checkpoint(&mut self) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.begin_checkpoint(),
-            Self::Direct(batch) => batch.begin_checkpoint(),
+            Self::Rocks(batch) => batch.begin_checkpoint(),
         }
     }
 
     fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.commit_checkpoint(),
-            Self::Direct(batch) => batch.commit_checkpoint(),
+            Self::Rocks(batch) => batch.commit_checkpoint(),
         }
     }
 
     fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.rollback_checkpoint(),
-            Self::Direct(batch) => batch.rollback_checkpoint(),
+            Self::Rocks(batch) => batch.rollback_checkpoint(),
         }
     }
 }
@@ -4052,8 +4052,8 @@ fn compact_memory_history(history: &mut Vec<MemoryVersion>, oldest_snapshot: Opt
 
 type BatchOperation = Option<Vec<u8>>;
 // A batch is last-write-wins and contains at most one operation per physical
-// key before publication. The direct backend consumes this map into one B+tree
-// write transaction, while the memory backend installs every unique key at one
+// key before publication. The RocksDB backend consumes this map into one WAL
+// transaction, while the memory backend installs every unique key at one
 // common generation. Hashing avoids a second comparison-tree update in the hot
 // staging path without changing externally observable ordering.
 type BatchOperations = HashMap<StoreKey, BatchOperation>;

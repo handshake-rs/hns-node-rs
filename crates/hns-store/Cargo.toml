@@ -10,6 +10,6 @@ repository.workspace = true
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 hns-primitives = { path = "../hns-primitives" }
 hns-urkel = { path = "../hns-urkel" }
-redb = "=4.2.0"
+rocksdb = "=0.24.0"
 serde.workspace = true
 thiserror.workspace = true

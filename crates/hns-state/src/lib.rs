@@ -11789,7 +11789,7 @@ mod tests {
             );
             let store = open_store(&StoreConfig {
                 path,
-                backend: StoreBackend::Direct,
+                backend: StoreBackend::RocksDb,
                 durability: DurabilityPolicy::Sync,
             })
             .expect("open child store");
@@ -11817,7 +11817,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let config = StoreConfig {
             path: path.clone(),
-            backend: StoreBackend::Direct,
+            backend: StoreBackend::RocksDb,
             durability: DurabilityPolicy::Sync,
         };
         let retained = MemoryUrkel::from_entries((0..64).map(|index| {

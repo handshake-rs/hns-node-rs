@@ -122,7 +122,7 @@ fn run() -> Result<()> {
 
     let store = open_store(&StoreConfig {
         path: chain_dir,
-        backend: StoreBackend::Direct,
+        backend: StoreBackend::RocksDb,
         durability: DurabilityPolicy::Sync,
     })
     .context("failed to open stopped hsrd store (is the node still running?)")?

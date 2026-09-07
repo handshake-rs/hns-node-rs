@@ -31,14 +31,14 @@ const AUTO_DATA_ROOT_ATTEMPTS: u32 = 128;
 enum Scenario {
     #[default]
     Smoke,
-    PersistentDirectSync,
+    PersistentRocksSync,
 }
 
 impl Scenario {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Smoke => "smoke",
-            Self::PersistentDirectSync => "persistent-direct-sync",
+            Self::PersistentRocksSync => "persistent-rocks-sync",
         }
     }
 }
@@ -90,9 +90,9 @@ impl ScenarioPlan {
                 measured_blocks: MEASURED_BLOCKS,
                 requested_cache_occupancy: None,
             },
-            Scenario::PersistentDirectSync => Self {
+            Scenario::PersistentRocksSync => Self {
                 scenario,
-                expected_backend: "direct",
+                expected_backend: "rocksdb",
                 expected_durability: "sync",
                 warmup_blocks: 0,
                 setup_blocks: PERSISTENT_SETUP_BLOCKS,
@@ -423,10 +423,10 @@ fn execute_workload(
     plan: ScenarioPlan,
 ) -> Result<GateOutcome, Box<dyn Error>> {
     if plan.scenario == Scenario::Smoke && arguments.data_root.is_some() {
-        return Err("--data-root is only valid with --scenario persistent-direct-sync".into());
+        return Err("--data-root is only valid with --scenario persistent-rocks-sync".into());
     }
 
-    let mut persistent_root = if plan.scenario == Scenario::PersistentDirectSync {
+    let mut persistent_root = if plan.scenario == Scenario::PersistentRocksSync {
         Some(match &arguments.data_root {
             Some(path) => PerformanceDataRoot::create_caller_selected(path)?,
             None => PerformanceDataRoot::create_automatic()?,
@@ -455,7 +455,7 @@ fn execute_workload(
     };
     let state = NodeState::from_config(&config)?;
     let observed_backend = store_backend(&state.store);
-    let observed_durability = if observed_backend == "direct" {
+    let observed_durability = if observed_backend == "rocksdb" {
         state.store.durability_policy().as_str()
     } else {
         "not-applicable"
@@ -665,7 +665,7 @@ fn observed_tip_height(node: &NodeService) -> Result<usize, Box<dyn Error>> {
 fn store_backend(store: &StoreHandle) -> &'static str {
     match store {
         StoreHandle::Memory(_) => "memory",
-        StoreHandle::Direct(_) => "direct",
+        StoreHandle::Rocks(_) => "rocksdb",
         StoreHandle::Archived { inner, .. } => store_backend(inner),
     }
 }
@@ -1005,10 +1005,10 @@ mod tests {
             candidate_micros: vec![passing_sample; plan.measured_blocks],
             connect_micros: vec![passing_sample; plan.measured_blocks],
         };
-        let persistent = scenario == Scenario::PersistentDirectSync;
+        let persistent = scenario == Scenario::PersistentRocksSync;
         GateOutcome {
             plan,
-            observed_backend: Some(if persistent { "direct" } else { "memory" }),
+            observed_backend: Some(if persistent { "rocksdb" } else { "memory" }),
             observed_durability: Some(if persistent { "sync" } else { "not-applicable" }),
             data_root: persistent.then(|| "/fresh/performance/root".to_owned()),
             data_root_policy: if persistent {
@@ -1046,14 +1046,14 @@ mod tests {
         let persistent = Arguments::try_parse_from([
             "hsrd-performance-gate",
             "--scenario",
-            "persistent-direct-sync",
+            "persistent-rocks-sync",
             "--data-root",
             "/new/performance/root",
             "--json-output",
             "/new/performance/report.json",
         ])
         .expect("persistent arguments");
-        assert_eq!(persistent.scenario, Scenario::PersistentDirectSync);
+        assert_eq!(persistent.scenario, Scenario::PersistentRocksSync);
         assert_eq!(
             persistent.data_root,
             Some(PathBuf::from("/new/performance/root"))
@@ -1075,12 +1075,12 @@ mod tests {
 
     #[test]
     fn persistent_report_contains_exact_backend_scale_version_and_distributions() {
-        let outcome = passing_outcome(Scenario::PersistentDirectSync);
+        let outcome = passing_outcome(Scenario::PersistentRocksSync);
         assert!(outcome.passed());
         let report = json_report(&outcome);
         assert_eq!(report["schema_version"], 2);
-        assert_eq!(report["scenario"], "persistent-direct-sync");
-        assert_eq!(report["backend"], "direct");
+        assert_eq!(report["scenario"], "persistent-rocks-sync");
+        assert_eq!(report["backend"], "rocksdb");
         assert_eq!(report["durability"], "sync");
         assert_eq!(report["package_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn persistent_report_fails_closed_on_cache_or_unavailable_evidence() {
-        let mut mismatched = passing_outcome(Scenario::PersistentDirectSync);
+        let mut mismatched = passing_outcome(Scenario::PersistentRocksSync);
         mismatched.observed_cache_occupancy = Some(PERSISTENT_CACHE_OCCUPANCY - 1);
         assert!(!mismatched.passed());
         let mismatch_report = json_report(&mismatched);
@@ -1122,7 +1122,7 @@ mod tests {
         assert_eq!(mismatch_report["evidence"]["cache_evidence_matches"], false);
 
         let unavailable = GateOutcome::unavailable(
-            ScenarioPlan::for_scenario(Scenario::PersistentDirectSync),
+            ScenarioPlan::for_scenario(Scenario::PersistentRocksSync),
             "backend unavailable".to_owned(),
         );
         assert!(!unavailable.passed());
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[test]
     fn bounded_hsd_version_oracle_covers_persistent_setup_and_measurement() {
-        let plan = ScenarioPlan::for_scenario(Scenario::PersistentDirectSync);
+        let plan = ScenarioPlan::for_scenario(Scenario::PersistentRocksSync);
         let maximum_entries = plan.history_entry_limit().expect("history limit");
         assert_eq!(
             maximum_entries,

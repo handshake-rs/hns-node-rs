@@ -12644,7 +12644,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_address_book_survives_direct_reopen() {
+    fn durable_address_book_survives_rocks_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-address-book-reopen-{}-{}",
             std::process::id(),
@@ -12653,7 +12653,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let config = hns_store::StoreConfig {
             path: path.clone(),
-            backend: hns_store::StoreBackend::Direct,
+            backend: hns_store::StoreBackend::RocksDb,
             durability: hns_store::DurabilityPolicy::Sync,
         };
         let address: SocketAddr = "9.9.9.9:12038".parse().expect("peer");
@@ -13679,7 +13679,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_canonical_body_survives_direct_reopen() {
+    fn out_of_order_canonical_body_survives_rocks_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-native-out-of-order-{}-{}",
             std::process::id(),

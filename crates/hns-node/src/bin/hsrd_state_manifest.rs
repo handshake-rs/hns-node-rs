@@ -165,7 +165,7 @@ fn run() -> Result<()> {
     let data_dir = require_audit_copy(&arguments.data_dir)?;
     let store = open_store(&StoreConfig {
         path: data_dir.clone(),
-        backend: StoreBackend::Direct,
+        backend: StoreBackend::RocksDb,
         durability: DurabilityPolicy::Sync,
     })
     .context("failed to open copied hsrd store")?;

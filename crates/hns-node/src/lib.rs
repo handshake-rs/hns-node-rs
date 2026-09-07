@@ -9401,14 +9401,14 @@ impl NodeState {
         let store = match &config.data_dir {
             Some(data_dir) => open_store(&StoreConfig {
                 path: data_dir.join("chain"),
-                backend: StoreBackend::Direct,
+                backend: StoreBackend::RocksDb,
                 durability: config.storage_durability,
             })
             .map_err(|error| anyhow::anyhow!("failed to open node store: {error}"))?,
             None => StoreHandle::memory(),
         };
         validate_existing_store_identity(&store, config.network)?;
-        // direct-v1 is an intentionally fresh-only layout. An older identity
+        // rocks-fresh-v1 is an intentionally fresh-only layout. An older identity
         // was rejected above; there is no startup migration or historical
         // database scan on the new node path.
         bind_store_identity(&store, config.network)?;
@@ -9435,7 +9435,7 @@ impl NodeState {
         } else {
             (None, None)
         };
-        // The direct-v1 store persists the authenticated name-tree mutations
+        // The fresh RocksDB store persists the authenticated name-tree mutations
         // in the same atomic block transaction. Fresh nodes never bootstrap,
         // migrate, or consult the former external name-page generations.
         let name_pages = None;
@@ -20460,7 +20460,7 @@ mod tests {
         {
             let store = open_store(&StoreConfig {
                 path: path.join("chain"),
-                backend: StoreBackend::Direct,
+                backend: StoreBackend::RocksDb,
                 durability: DurabilityPolicy::Sync,
             })
             .expect("open fault store");
@@ -20475,7 +20475,7 @@ mod tests {
         assert!(error.to_string().contains("body"), "{error}");
         let store = open_store(&StoreConfig {
             path: path.join("chain"),
-            backend: StoreBackend::Direct,
+            backend: StoreBackend::RocksDb,
             durability: DurabilityPolicy::Sync,
         })
         .expect("reopen failed-start store");
@@ -20485,7 +20485,7 @@ mod tests {
     }
 
     #[test]
-    fn content_addressed_name_proofs_survive_direct_reopen() {
+    fn content_addressed_name_proofs_survive_rocks_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-name-proof-reopen-{}-{}",
             std::process::id(),
@@ -20494,7 +20494,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let config = StoreConfig {
             path: path.clone(),
-            backend: StoreBackend::Direct,
+            backend: StoreBackend::RocksDb,
             durability: DurabilityPolicy::Sync,
         };
         let name = b"persistedrocksproof";
@@ -20545,7 +20545,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_name_tree_compaction_survives_unclean_direct_reopen() {
+    fn startup_name_tree_compaction_survives_unclean_rocks_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-name-compaction-reopen-{}-{}",
             std::process::id(),
@@ -20554,7 +20554,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let store_config = StoreConfig {
             path: path.clone(),
-            backend: StoreBackend::Direct,
+            backend: StoreBackend::RocksDb,
             durability: DurabilityPolicy::Sync,
         };
         let node_config = NodeConfig {
@@ -20625,7 +20625,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_retention_survives_unclean_direct_reopen() {
+    fn undo_retention_survives_unclean_rocks_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-undo-retention-reopen-{}-{}",
             std::process::id(),
@@ -20634,7 +20634,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let store_config = StoreConfig {
             path: path.clone(),
-            backend: StoreBackend::Direct,
+            backend: StoreBackend::RocksDb,
             durability: DurabilityPolicy::Sync,
         };
         let policy = UndoRetentionPolicy {

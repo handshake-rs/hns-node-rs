@@ -109,7 +109,7 @@ fn main() -> Result<()> {
         .unwrap_or(started);
     let store = open_store(&StoreConfig {
         path: arguments.data_dir.join("chain"),
-        backend: StoreBackend::Direct,
+        backend: StoreBackend::RocksDb,
         durability: DurabilityPolicy::Sync,
     })
     .context("failed to open hsrd chain store")?

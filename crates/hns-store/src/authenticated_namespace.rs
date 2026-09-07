@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use crate::{
     apply_memory_changes, memory_value_at, segment_store_error, BatchOperations, ColumnFamily,
-    DirectStore, DurabilityPolicy, MemoryStore, MemoryStoreState, ReadSnapshot, SegmentArchive,
+    DurabilityPolicy, MemoryStore, MemoryStoreState, ReadSnapshot, RocksStore, SegmentArchive,
     Store, StoreError, StoreHandle, StoreKey,
 };
 
@@ -357,7 +357,7 @@ impl StoreHandle {
     fn authenticated_namespace_owners(&self) -> &SharedNamespaceOwners {
         match self {
             Self::Memory(store) => &store.authenticated_namespaces,
-            Self::Direct(store) => &store.authenticated_namespaces,
+            Self::Rocks(store) => &store.authenticated_namespaces,
             Self::Archived { inner, .. } => inner.authenticated_namespace_owners(),
         }
     }
@@ -367,7 +367,7 @@ impl StoreHandle {
     ) -> &SharedNamespaceArchiveRegistration {
         match self {
             Self::Memory(store) => &store.authenticated_namespace_archive,
-            Self::Direct(store) => &store.authenticated_namespace_archive,
+            Self::Rocks(store) => &store.authenticated_namespace_archive,
             Self::Archived { inner, .. } => inner.authenticated_namespace_archive_registration(),
         }
     }
@@ -403,7 +403,7 @@ impl StoreHandle {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.reserve_physical_namespace_epoch(namespace)
             }
-            Self::Direct(_) => {
+            Self::Rocks(_) => {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.reserve_physical_namespace_epoch(namespace)
             }
@@ -421,7 +421,7 @@ impl StoreHandle {
     ) -> Result<NonZeroU64, AuthenticatedNamespaceError> {
         match self {
             Self::Memory(store) => reserve_memory_namespace_epoch(store, namespace),
-            Self::Direct(store) => reserve_direct_namespace_epoch(store, namespace),
+            Self::Rocks(store) => reserve_rocks_namespace_epoch(store, namespace),
             Self::Archived { .. } => Err(AuthenticatedNamespaceError::ArchiveRegistrationMismatch),
         }
     }
@@ -436,7 +436,7 @@ impl StoreHandle {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.load_physical_namespace_image(namespace)
             }
-            Self::Direct(_) => {
+            Self::Rocks(_) => {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.load_physical_namespace_image(namespace)
             }
@@ -454,7 +454,7 @@ impl StoreHandle {
     ) -> Result<NamespaceImage, AuthenticatedNamespaceError> {
         match self {
             Self::Memory(store) => load_memory_namespace_image(store, namespace),
-            Self::Direct(store) => load_direct_namespace_image(store, namespace),
+            Self::Rocks(store) => load_rocks_namespace_image(store, namespace),
             Self::Archived { .. } => Err(AuthenticatedNamespaceError::ArchiveRegistrationMismatch),
         }
     }
@@ -479,7 +479,7 @@ impl StoreHandle {
                     proposed,
                 )
             }
-            Self::Direct(_) => {
+            Self::Rocks(_) => {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.compare_exchange_physical_namespace_image(
                     namespace,
@@ -520,7 +520,7 @@ impl StoreHandle {
                 proposed_revision,
                 proposed,
             ),
-            Self::Direct(store) => compare_exchange_direct_namespace(
+            Self::Rocks(store) => compare_exchange_rocks_namespace(
                 store,
                 namespace,
                 fencing_token,
@@ -1036,8 +1036,8 @@ fn prepare_replacement(
     ))
 }
 
-fn direct_namespace_image_locked(
-    store: &DirectStore,
+fn rocks_namespace_image_locked(
+    store: &RocksStore,
     namespace: OperationNamespaceId,
 ) -> Result<NamespaceImage, AuthenticatedNamespaceError> {
     let snapshot = store.snapshot_unlocked()?;
@@ -1077,13 +1077,13 @@ fn direct_namespace_image_locked(
     NamespaceImage::decode(namespace, control, state)
 }
 
-fn reserve_direct_namespace_epoch(
-    store: &DirectStore,
+fn reserve_rocks_namespace_epoch(
+    store: &RocksStore,
     namespace: OperationNamespaceId,
 ) -> Result<NonZeroU64, AuthenticatedNamespaceError> {
     let _publication = store.lock_publication()?;
     store.ensure_operational()?;
-    let image = direct_namespace_image_locked(store, namespace)?;
+    let image = rocks_namespace_image_locked(store, namespace)?;
     let token = next_epoch(image.control)?;
     let next_control = match image.control {
         Some(control) => NamespaceControl {
@@ -1101,17 +1101,17 @@ fn reserve_direct_namespace_epoch(
     Ok(token)
 }
 
-fn load_direct_namespace_image(
-    store: &DirectStore,
+fn load_rocks_namespace_image(
+    store: &RocksStore,
     namespace: OperationNamespaceId,
 ) -> Result<NamespaceImage, AuthenticatedNamespaceError> {
     let _publication = store.lock_publication()?;
     store.ensure_operational()?;
-    direct_namespace_image_locked(store, namespace)
+    rocks_namespace_image_locked(store, namespace)
 }
 
-fn compare_exchange_direct_namespace(
-    store: &DirectStore,
+fn compare_exchange_rocks_namespace(
+    store: &RocksStore,
     namespace: OperationNamespaceId,
     fencing_token: NonZeroU64,
     expectation: StateExpectation<'_>,
@@ -1120,7 +1120,7 @@ fn compare_exchange_direct_namespace(
 ) -> Result<AuthenticatedNamespaceWrite, AuthenticatedNamespaceError> {
     let _publication = store.lock_publication()?;
     store.ensure_operational()?;
-    let image = direct_namespace_image_locked(store, namespace)?;
+    let image = rocks_namespace_image_locked(store, namespace)?;
     let control = image.control.ok_or(AuthenticatedNamespaceError::Corrupt(
         "held namespace is missing its control record",
     ))?;
@@ -1174,13 +1174,13 @@ mod tests {
         OperationNamespaceId::new([byte; 32]).expect("nonzero namespace")
     }
 
-    fn direct_test_directory(label: &str) -> std::path::PathBuf {
+    fn rocks_test_directory(label: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "hsrd-direct-namespace-{label}-{}-{nonce}",
+            "hsrd-rocks-namespace-{label}-{}-{nonce}",
             std::process::id()
         ))
     }
@@ -1274,11 +1274,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_namespace_state_and_fencing_epoch_survive_process_reopen() {
-        let path = direct_test_directory("reopen");
+    fn rocks_namespace_state_and_fencing_epoch_survive_process_reopen() {
+        let path = rocks_test_directory("reopen");
         let key = namespace(31);
         {
-            let store = StoreHandle::Direct(DirectStore::open(&path).expect("open direct store"));
+            let store = StoreHandle::Rocks(RocksStore::open(&path).expect("open RocksDB store"));
             crate::initialize_schema(&store).expect("initialize schema");
             let lease = store
                 .acquire_authenticated_namespace(key)
@@ -1293,7 +1293,7 @@ mod tests {
         }
 
         {
-            let store = StoreHandle::Direct(DirectStore::open(&path).expect("reopen direct store"));
+            let store = StoreHandle::Rocks(RocksStore::open(&path).expect("reopen RocksDB store"));
             let lease = store
                 .acquire_authenticated_namespace(key)
                 .expect("reacquire namespace");
@@ -1306,7 +1306,7 @@ mod tests {
                 }
             );
         }
-        std::fs::remove_dir_all(path).expect("remove direct namespace fixture");
+        std::fs::remove_dir_all(path).expect("remove RocksDB namespace fixture");
     }
 
     #[test]
