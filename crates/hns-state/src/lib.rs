@@ -371,8 +371,8 @@ pub struct NameTreeIntervalMigrationSummary {
 }
 
 /// Exact, read-only resource projection for a schema-16 interval migration.
-/// The Rocks temporary estimate covers the complete staged publication plus
-/// one equivalent WAL/flush copy; the caller must add its filesystem reserve.
+/// The database temporary estimate covers the complete staged publication plus
+/// one equivalent copy-on-write publication; the caller adds its reserve.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NameTreeIntervalMigrationPlan {
     pub active_heights: u64,
@@ -404,7 +404,7 @@ pub struct NameTreeIntervalMigrationLimits {
     /// Maximum backup plus rewritten-undo publication bytes.
     pub max_publication_bytes: u64,
     /// Maximum key/value and conservative operation bytes staged in one
-    /// RocksDB batch. One record is never split across batches.
+    /// database transaction. One record is never split across batches.
     pub max_pending_batch_bytes: u64,
     pub max_pending_names: u64,
     /// Conservative in-memory estimate for distinct accumulator names.
@@ -7807,7 +7807,6 @@ mod tests {
     use hns_primitives::{
         hash_name, Address, CovenantKind, Header, Input, Output, Txid, Uint256, Witness,
     };
-    #[cfg(feature = "rocksdb-backend")]
     use hns_store::{open_store, DurabilityPolicy, StoreBackend, StoreConfig};
     use hns_store::{MemoryBatch, MemorySnapshot, MemoryStore, StagingOverlay, Store};
 
@@ -8889,14 +8888,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     struct ExitAfterCommitStore<S: Store> {
         inner: S,
         exit_after: usize,
         commits: Cell<usize>,
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     impl<S: Store> ExitAfterCommitStore<S> {
         fn new(inner: S, exit_after: usize) -> Self {
             Self {
@@ -8907,7 +8904,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     impl<S: Store> Store for ExitAfterCommitStore<S> {
         type Snapshot<'a>
             = S::Snapshot<'a>
@@ -11781,7 +11777,6 @@ mod tests {
         assert!(store.take_committed_batch_sizes().is_empty());
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     #[test]
     fn streaming_compaction_process_exit_is_restart_safe() {
         const CHILD_ENV: &str = "HSRD_COMPACTION_EXIT_CHILD";
@@ -11794,7 +11789,7 @@ mod tests {
             );
             let store = open_store(&StoreConfig {
                 path,
-                backend: StoreBackend::RocksDb,
+                backend: StoreBackend::Direct,
                 durability: DurabilityPolicy::Sync,
             })
             .expect("open child store");
@@ -11822,7 +11817,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let config = StoreConfig {
             path: path.clone(),
-            backend: StoreBackend::RocksDb,
+            backend: StoreBackend::Direct,
             durability: DurabilityPolicy::Sync,
         };
         let retained = MemoryUrkel::from_entries((0..64).map(|index| {

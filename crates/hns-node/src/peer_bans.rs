@@ -574,9 +574,8 @@ mod tests {
         }));
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     #[test]
-    fn durable_peer_ban_survives_rocksdb_reopen() {
+    fn durable_peer_ban_survives_direct_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-peer-ban-reopen-{}-{}",
             std::process::id(),
@@ -585,7 +584,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let config = hns_store::StoreConfig {
             path: path.clone(),
-            backend: hns_store::StoreBackend::RocksDb,
+            backend: hns_store::StoreBackend::Direct,
             durability: hns_store::DurabilityPolicy::Sync,
         };
         let now = 1_800_000_000;

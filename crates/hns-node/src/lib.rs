@@ -141,13 +141,11 @@ use hns_state::{
     connect_block_to_batch_with_services_and_prepared_utxos, decode_coin, decode_name_state,
     disconnect_block_to_batch, encode_outpoint_key, load_persisted_name_tree_records,
     load_stored_name_tree_commit_root, load_stored_name_tree_root,
-    maximum_name_page_validation_records, migrate_name_tree_interval_accumulator_bounded,
-    name_page_root_key, name_tree_snapshot_pin_key, pack_name_page_records_consuming,
-    pack_reachable_name_page_records_consuming_with_limit,
-    plan_name_tree_interval_accumulator_migration_bounded, prefetch_replay_utxos,
-    prepare_block_utxos_with_transaction_ids,
-    reconcile_legacy_name_tree_interval_accumulator_bounded, retained_name_tree_roots_bounded,
-    stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits_and_progress,
+    maximum_name_page_validation_records, name_page_root_key, name_tree_snapshot_pin_key,
+    pack_name_page_records_consuming, pack_reachable_name_page_records_consuming_with_limit,
+    prefetch_replay_utxos, prepare_block_utxos_with_transaction_ids,
+    retained_name_tree_roots_bounded, stage_remove_name_tree_snapshot_pin,
+    stream_name_page_tree_delta_with_limits_and_progress,
     stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
     validate_persisted_name_tree_root, validate_persisted_name_trees,
     verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
@@ -155,27 +153,26 @@ use hns_state::{
     ConnectBlock, DisconnectBlock, NamePagePathCache, NamePagePathCacheUpdate,
     NamePagePhysicalStreamPhase, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot,
     NamePageState, NamePageStreamLimits, NamePageTreeReader, NamePageValidationLimits,
-    NameTreeAccumulatorSession, NameTreeCompactionSummary, NameTreeIntervalMigrationLimits,
-    NameTreeMaterializationLimits, NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits,
-    PageTreeError, RetainedNameTreeRootLimits, StateError, StateServices, StoredStateEngine,
-    TreeRoot, NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT, NAME_PAGE_ROOT_PREFIX,
-    NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    NameTreeAccumulatorSession, NameTreeCompactionSummary, NameTreeMaterializationLimits,
+    NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits,
+    StateError, StateServices, StoredStateEngine, TreeRoot,
+    NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
+    NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 #[cfg(test)]
 use hns_state::{
     load_name_tree_snapshot_pins, pack_name_page_records, verify_stored_name_tree_root,
 };
 use hns_store::{
-    decode_u64, encode_u64, filesystem_available_bytes, filesystem_tree_usage_bounded,
-    mark_unclean_start, open_store, truncate_name_pages_to_committed_tail, was_clean_shutdown,
-    AtomicWriteEffectBudget, CheckpointWriteBatch, ColumnFamily, DurabilityPolicy,
-    FilesystemTreeUsageLimits, MetaKey, NamePageAppender, NamePageError, PrefixScanBudget,
-    ReadSnapshot, ScanEntry, SegmentArchiveScrubLimits, SegmentCompactionExecutionLimits,
-    SegmentCompactionLimits, StagingOverlay, Store, StoreBackend, StoreConfig, StoreError,
-    StoreHandle, StoreHandleBatch, StoreHandleSnapshot, WriteBatch, SCHEMA_VERSION,
-    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED,
-    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS,
-    STORAGE_PROFILE,
+    decode_u64, encode_u64, filesystem_available_bytes, mark_unclean_start, open_store,
+    truncate_name_pages_to_committed_tail, was_clean_shutdown, AtomicWriteEffectBudget,
+    CheckpointWriteBatch, ColumnFamily, DurabilityPolicy, MetaKey, NamePageAppender, NamePageError,
+    PrefixScanBudget, ReadSnapshot, ScanEntry, SegmentArchiveScrubLimits,
+    SegmentCompactionExecutionLimits, SegmentCompactionLimits, StagingOverlay, Store, StoreBackend,
+    StoreConfig, StoreError, StoreHandle, StoreHandleBatch, StoreHandleSnapshot, WriteBatch,
+    SCHEMA_VERSION, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES,
+    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS,
+    SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, STORAGE_PROFILE,
 };
 use hns_wallet_index::{
     decode_index_profile, encode_index_profile, index_profile_is_current, index_profile_version,
@@ -5105,7 +5102,7 @@ struct RpcStoreEntries {
 }
 
 /// Cloneable, immutable access to the durable RPC read model. Creating this
-/// handle while the native-sync coordinator is locked is O(1); all RocksDB
+/// handle while the native-sync coordinator is locked is O(1); all database
 /// snapshot acquisition, decoding, and bounded block reads happen after that
 /// lock has been released.
 #[derive(Clone, Debug)]
@@ -6020,22 +6017,6 @@ struct ReorgStagedEffectMeter {
 
 #[cfg(test)]
 thread_local! {
-    /// Deterministic fault injection for the production archived-store
-    /// boundary. The limit is clamped only after a reorg has physically
-    /// appended at least one name page, so the archive's next accounted charge
-    /// must reject and exercise safe page-tail rollback.
-    static TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    static TEST_REORG_APPENDED_NAME_PAGE_BYTES: std::cell::Cell<u64> = const {
-        std::cell::Cell::new(0)
-    };
-    static TEST_REORG_MAX_GENERATED_UNDO_BYTES: std::cell::Cell<u64> = const {
-        std::cell::Cell::new(0)
-    };
-    static TEST_REORG_NAME_STATE_WRITES: std::cell::Cell<u64> = const {
-        std::cell::Cell::new(0)
-    };
     static TEST_NAME_PAGE_COMPACTION_COMMIT_ERROR: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
@@ -6256,20 +6237,6 @@ impl<B: WriteBatch> WriteBatch for ReorgMeteredBatch<B> {
         let (charge, consumed) = self.replacement_charge(family, key, value.len())?;
         self.inner.put(family, key, value)?;
         self.record_replacement_charge(family, key, charge, consumed);
-        #[cfg(test)]
-        if family == ColumnFamily::Undo {
-            TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(|observed| {
-                observed.set(
-                    observed
-                        .get()
-                        .max(u64::try_from(value.len()).unwrap_or(u64::MAX)),
-                );
-            });
-        }
-        #[cfg(test)]
-        if family == ColumnFamily::NameState {
-            TEST_REORG_NAME_STATE_WRITES.with(|writes| writes.set(writes.get().saturating_add(1)));
-        }
         Ok(())
     }
 
@@ -6420,17 +6387,7 @@ impl<B: WriteBatch> NamePagePublicationBatch for ReorgMeteredBatch<B> {
     }
 
     fn record_name_page_append(&self, page_count: usize) {
-        #[cfg(not(test))]
         let _ = page_count;
-
-        #[cfg(test)]
-        TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(|observed| {
-            observed.set(
-                u64::try_from(page_count)
-                    .unwrap_or(u64::MAX)
-                    .saturating_mul(hns_store::NAME_PAGE_BYTES as u64),
-            );
-        });
     }
 }
 
@@ -6903,6 +6860,7 @@ fn ensure_name_page_output_capacity(
     Ok(())
 }
 
+#[cfg(test)]
 fn preflight_migration_data_ceiling(current_bytes: u64, temporary_bytes: u64) -> Result<u64> {
     let aggregate_bytes = current_bytes.saturating_add(temporary_bytes);
     if aggregate_bytes > MAX_NAME_PAGE_GENERATION_BYTES {
@@ -9443,113 +9401,16 @@ impl NodeState {
         let store = match &config.data_dir {
             Some(data_dir) => open_store(&StoreConfig {
                 path: data_dir.join("chain"),
-                backend: StoreBackend::RocksDb,
+                backend: StoreBackend::Direct,
                 durability: config.storage_durability,
             })
             .map_err(|error| anyhow::anyhow!("failed to open node store: {error}"))?,
             None => StoreHandle::memory(),
         };
         validate_existing_store_identity(&store, config.network)?;
-        let migration_limits = NameTreeIntervalMigrationLimits::default();
-        let migration_plan = plan_name_tree_interval_accumulator_migration_bounded(
-            &store,
-            config.network.params().names.tree_interval,
-            migration_limits,
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("failed to preflight node state storage migration: {error}")
-        })?;
-        if let Some(plan) = migration_plan.as_ref() {
-            for (context, bytes) in [
-                ("height-index input", plan.height_index_bytes),
-                ("undo input", plan.undo_input_bytes),
-                ("legacy backup output", plan.backup_output_bytes),
-                ("undo rewrite output", plan.rewrite_output_bytes),
-                ("atomic publication", plan.publication_bytes),
-                ("temporary migration storage", plan.required_temporary_bytes),
-            ] {
-                if bytes > MAX_NAME_PAGE_GENERATION_BYTES {
-                    anyhow::bail!(
-                        "{context} requires {bytes} bytes, exceeding the 150,000,000,000-byte production data ceiling; run qualified offline maintenance"
-                    );
-                }
-            }
-            if let Some(data_dir) = &config.data_dir {
-                let chain_directory = data_dir.join("chain");
-                let usage = filesystem_tree_usage_bounded(
-                    data_dir,
-                    FilesystemTreeUsageLimits {
-                        max_apparent_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
-                        max_allocated_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
-                        deadline: migration_limits.deadline,
-                        ..FilesystemTreeUsageLimits::default()
-                    },
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to measure bounded migration data-root usage {}: {error}",
-                        data_dir.display()
-                    )
-                })?;
-                let current_bytes = usage.apparent_bytes.max(usage.allocated_bytes);
-                preflight_migration_data_ceiling(
-                    current_bytes,
-                    plan.required_temporary_bytes,
-                )
-                .with_context(|| {
-                    format!(
-                        "schema migration current data root ({current_bytes} bytes) plus temporary output ({} bytes) exceeds the exact production ceiling; run qualified offline maintenance",
-                        plan.required_temporary_bytes
-                    )
-                })?;
-                let available = filesystem_available_bytes(&chain_directory).map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to inspect migration filesystem {}: {error}",
-                        chain_directory.display()
-                    )
-                })?;
-                let required = plan
-                    .required_temporary_bytes
-                    .checked_add(MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("migration temporary storage requirement overflow")
-                    })?;
-                if available < required {
-                    anyhow::bail!(
-                        "schema migration requires {} temporary bytes plus {} reserve, but {} bytes are available; run qualified offline maintenance",
-                        plan.required_temporary_bytes,
-                        MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
-                        available
-                    );
-                }
-            }
-        }
-        if let Some(migration) = migrate_name_tree_interval_accumulator_bounded(
-            &store,
-            config.network.params().names.tree_interval,
-            migration_limits,
-        )
-        .map_err(|error| anyhow::anyhow!("failed to migrate node state storage: {error}"))?
-        {
-            tracing::info!(
-                active_heights = migration.active_heights,
-                undos_rewritten = migration.undos_rewritten,
-                legacy_undos_backed_up = migration.legacy_undos_backed_up,
-                pending_names = migration.pending_names,
-                tip_height = migration.tip_height,
-                height_index_bytes = migration.height_index_bytes,
-                undo_input_bytes = migration.undo_input_bytes,
-                backup_output_bytes = migration.backup_output_bytes,
-                rewrite_output_bytes = migration.rewrite_output_bytes,
-                publication_bytes = migration.publication_bytes,
-                required_temporary_bytes = migration.required_temporary_bytes,
-                peak_pending_names = migration.peak_pending_names,
-                peak_pending_name_bytes = migration.peak_pending_name_bytes,
-                peak_batch_bytes = migration.peak_batch_bytes,
-                batch_commits = migration.batch_commits,
-                "migrated name-tree state to consensus-interval accumulation"
-            );
-        }
+        // direct-v1 is an intentionally fresh-only layout. An older identity
+        // was rejected above; there is no startup migration or historical
+        // database scan on the new node path.
         bind_store_identity(&store, config.network)?;
         let store = match &config.data_dir {
             Some(data_dir) => store
@@ -9565,36 +9426,6 @@ impl NodeState {
         // clean marker and incorrectly authorize the next fast path.
         mark_unclean_start(&store)
             .map_err(|error| anyhow::anyhow!("failed to mark running store unclean: {error}"))?;
-
-        // Versions before the exact changed-name undo contract could persist
-        // ordinary BID/REDEEM touches in undo without counting them in the
-        // pending interval accumulator. Repair only that strictly validated
-        // subset case before any state writer or startup checkpoint fast path
-        // is admitted.
-        let active_tip_height = {
-            let snapshot = store.snapshot()?;
-            best_block_tip_from_snapshot(&snapshot)?.map_or(0, |tip| tip.height)
-        };
-        if let Some(reconciliation) = reconcile_legacy_name_tree_interval_accumulator_bounded(
-            &store,
-            config.network.params().names.tree_interval,
-            active_tip_height,
-            NameTreeMaterializationLimits::default(),
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("failed to reconcile legacy name-tree interval accumulator: {error}")
-        })? {
-            tracing::warn!(
-                first_height = reconciliation.first_height,
-                last_height = reconciliation.last_height,
-                previous_names = reconciliation.previous_names,
-                reconciled_names = reconciliation.reconciled_names,
-                previous_references = reconciliation.previous_references,
-                reconciled_references = reconciliation.reconciled_references,
-                "reconciled legacy name-tree accumulator from canonical undo"
-            );
-        }
-
         let (checkpoint, checkpoint_warning) = if previous_shutdown_clean {
             let snapshot = store.snapshot()?;
             match load_startup_audit_checkpoint(&snapshot) {
@@ -9604,14 +9435,10 @@ impl NodeState {
         } else {
             (None, None)
         };
-        let name_pages = match &config.data_dir {
-            Some(data_dir) => Some(NamePageStorage::open_or_bootstrap(
-                data_dir.join("name-pages"),
-                &store,
-                config.network,
-            )?),
-            None => None,
-        };
+        // The direct-v1 store persists the authenticated name-tree mutations
+        // in the same atomic block transaction. Fresh nodes never bootstrap,
+        // migrate, or consult the former external name-page generations.
+        let name_pages = None;
         let (mut state, audit) = Self::from_store_for_network_with_startup_audit(
             store,
             config.network,
@@ -12855,14 +12682,6 @@ impl NodeState {
         let name_page_prepare_micros =
             u64::try_from(name_page_prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let (batch, mut meter, _) = batch.into_parts();
-        #[cfg(test)]
-        {
-            let reject = TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT.with(|enabled| enabled.get())
-                && TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(|bytes| bytes.get() > 0);
-            if reject {
-                meter.limit = meter.consumed;
-            }
-        }
         drop(raw_base);
         let store_publication_started = Instant::now();
         let publication_result = self.commit_index_publication(publication, move |state| {
@@ -13005,7 +12824,7 @@ impl NodeState {
         self.ensure_storage_operational()?;
         if self.name_pages.is_some() {
             anyhow::bail!(
-                "legacy RocksDB name-node compaction is disabled after append-only page storage is active"
+                "legacy database name-node compaction is disabled after append-only page storage is active"
             );
         }
         self.compact_name_tree_nodes_with_interval(None)?
@@ -14814,7 +14633,6 @@ pub fn init_logging(filter: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::sync::Barrier;
 
     use hns_chain::{read_canonical_hash, BlockIndex, HeaderImport};
@@ -14826,7 +14644,6 @@ mod tests {
         Output, Transaction, Txid, Witness,
     };
     use hns_rpc::{JsonRpcRequest, RpcService};
-    #[cfg(feature = "rocksdb-backend")]
     use hns_state::StateEngine;
     use hns_state::{
         name_tree_snapshot_pin_key, write_coin_to_batch, write_name_state_to_batch,
@@ -14836,47 +14653,6 @@ mod tests {
     use hns_urkel::MemoryUrkel;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[cfg(feature = "rocksdb-backend")]
-    struct ReorgArchivePreflightRejectGuard;
-
-    #[cfg(feature = "rocksdb-backend")]
-    impl ReorgArchivePreflightRejectGuard {
-        fn enable() -> Self {
-            TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(|bytes| bytes.set(0));
-            TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(|bytes| bytes.set(0));
-            TEST_REORG_NAME_STATE_WRITES.with(|writes| writes.set(0));
-            TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT.with(|enabled| {
-                assert!(
-                    !enabled.replace(true),
-                    "reorg archive fault already enabled"
-                );
-            });
-            Self
-        }
-
-        fn appended_name_page_bytes(&self) -> u64 {
-            TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(std::cell::Cell::get)
-        }
-
-        fn maximum_generated_undo_bytes(&self) -> u64 {
-            TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(std::cell::Cell::get)
-        }
-
-        fn generated_name_state_writes(&self) -> u64 {
-            TEST_REORG_NAME_STATE_WRITES.with(std::cell::Cell::get)
-        }
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    impl Drop for ReorgArchivePreflightRejectGuard {
-        fn drop(&mut self) {
-            TEST_REORG_REJECT_AT_ARCHIVE_PREFLIGHT.with(|enabled| enabled.set(false));
-            TEST_REORG_APPENDED_NAME_PAGE_BYTES.with(|bytes| bytes.set(0));
-            TEST_REORG_MAX_GENERATED_UNDO_BYTES.with(|bytes| bytes.set(0));
-            TEST_REORG_NAME_STATE_WRITES.with(|writes| writes.set(0));
-        }
-    }
 
     fn complete_store_image(store: &StoreHandle) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
         let snapshot = store.snapshot().expect("complete store snapshot");
@@ -15055,23 +14831,6 @@ mod tests {
             store: store.clone(),
             directory,
         }
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    fn flat_directory_file_image(directory: &std::path::Path) -> Vec<(String, Vec<u8>)> {
-        let mut image = std::fs::read_dir(directory)
-            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
-            .map(|entry| {
-                let entry = entry.expect("read directory entry");
-                let file_type = entry.file_type().expect("read directory entry type");
-                assert!(file_type.is_file(), "unexpected non-file segment entry");
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let bytes = std::fs::read(entry.path()).expect("read segment entry");
-                (name, bytes)
-            })
-            .collect::<Vec<_>>();
-        image.sort_by(|left, right| left.0.cmp(&right.0));
-        image
     }
 
     #[test]
@@ -16704,12 +16463,6 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove rollback fence fixture");
     }
 
-    struct CountingNamePageSnapshot<'a, S> {
-        inner: &'a S,
-        locator_gets: Cell<usize>,
-        locator_scans: Cell<usize>,
-    }
-
     #[test]
     fn concurrent_safety_fences_preserve_one_first_cause_record() {
         const WORKERS: usize = 8;
@@ -17141,109 +16894,6 @@ mod tests {
             .expect("fence remains");
         assert_eq!(evidence_after.digest, evidence.digest);
         assert_eq!(evidence_after.encoded, evidence.encoded);
-    }
-
-    #[test]
-    fn name_page_compaction_fence_clears_only_after_bounded_physical_audit() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-name-page-fence-clear-{}-{nonce}",
-            std::process::id()
-        ));
-        let store = StoreHandle::memory();
-        let state = NodeState::from_store_for_network(store.clone(), Network::Regtest)
-            .expect("initialize page-fence store");
-        drop(
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-                .expect("bootstrap authoritative pages"),
-        );
-        state
-            .chain
-            .record_external_safety_fence(ProductionSafetyFence {
-                version: PRODUCTION_SAFETY_FENCE_VERSION,
-                kind: ProductionSafetyFenceKind::NamePageCompaction,
-                context: "name-page root locator records".to_owned(),
-                limit: MAX_NAME_PAGE_ROOT_LOCATORS,
-                actual: MAX_NAME_PAGE_ROOT_LOCATORS + 1,
-                root: None,
-                candidate: None,
-                detail: "offline compaction recovery required".to_owned(),
-            })
-            .expect("persist page fence");
-        let evidence = inspect_production_safety_fence(&store)
-            .expect("inspect page fence")
-            .expect("page fence");
-
-        let cleared = clear_production_safety_fence_validated(
-            &store,
-            Network::Regtest,
-            ProductionSafetyFenceClearRequest {
-                expected_digest: evidence.digest,
-                acknowledgement:
-                    ProductionSafetyFenceClearAcknowledgement::OfflineRecoveryCompletedAndVerified,
-                name_page_directory: Some(directory.clone()),
-            },
-        )
-        .expect("bounded physical audit clears recovered page fence");
-        assert_eq!(cleared.digest, evidence.digest);
-        assert!(inspect_production_safety_fence(&store)
-            .expect("reinspect cleared page fence")
-            .is_none());
-        std::fs::remove_dir_all(directory).expect("remove page-fence directory");
-    }
-
-    impl<'a, S> CountingNamePageSnapshot<'a, S> {
-        fn new(inner: &'a S) -> Self {
-            Self {
-                inner,
-                locator_gets: Cell::new(0),
-                locator_scans: Cell::new(0),
-            }
-        }
-    }
-
-    impl<S: ReadSnapshot> ReadSnapshot for CountingNamePageSnapshot<'_, S> {
-        fn get(
-            &self,
-            family: ColumnFamily,
-            key: &[u8],
-        ) -> std::result::Result<Option<Vec<u8>>, hns_store::StoreError> {
-            if family == ColumnFamily::Snapshots && key.starts_with(NAME_PAGE_ROOT_PREFIX) {
-                self.locator_gets.set(self.locator_gets.get() + 1);
-            }
-            self.inner.get(family, key)
-        }
-
-        fn get_many(
-            &self,
-            family: ColumnFamily,
-            keys: &[&[u8]],
-        ) -> std::result::Result<Vec<Option<Vec<u8>>>, hns_store::StoreError> {
-            self.inner.get_many(family, keys)
-        }
-
-        fn scan_prefix(
-            &self,
-            family: ColumnFamily,
-            prefix: &[u8],
-        ) -> std::result::Result<Vec<hns_store::ScanEntry>, hns_store::StoreError> {
-            if family == ColumnFamily::Snapshots && prefix == NAME_PAGE_ROOT_PREFIX {
-                self.locator_scans.set(self.locator_scans.get() + 1);
-            }
-            self.inner.scan_prefix(family, prefix)
-        }
-
-        fn prefetch_name_tree_paths(
-            &self,
-            root: [u8; 32],
-            keys: &[[u8; 32]],
-        ) -> std::result::Result<Option<Vec<hns_store::NameTreePathRecord>>, hns_store::StoreError>
-        {
-            self.inner.prefetch_name_tree_paths(root, keys)
-        }
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -19045,76 +18695,6 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_page_reader_does_not_scan_historical_root_locators() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-node-name-page-point-roots-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-        let store = StoreHandle::memory();
-        drop(
-            NodeState::from_store_for_network(store.clone(), Network::Regtest)
-                .expect("initialize page store"),
-        );
-        let pages = NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-            .expect("open pages");
-        let locator = NamePageRootLocator::new(
-            pages.state.manifest.generation,
-            hns_store::NamePageAddress::new(0, 0, 0).expect("test locator"),
-        );
-        let mut historical_roots = Vec::new();
-        let mut batch = store.batch();
-        for index in 1u32..=1_024 {
-            let mut raw_root = [0u8; 32];
-            raw_root[..4].copy_from_slice(&index.to_le_bytes());
-            let root = TreeRoot::new(raw_root);
-            historical_roots.push(root);
-            batch
-                .put(
-                    ColumnFamily::Snapshots,
-                    &name_page_root_key(root),
-                    &NamePageRootRecord {
-                        root,
-                        locator,
-                        height: index,
-                    }
-                    .encode(),
-                )
-                .expect("stage historical locator");
-        }
-        store.commit(batch).expect("publish historical locators");
-
-        let snapshot = store.snapshot().expect("counted snapshot");
-        {
-            let counted = CountingNamePageSnapshot::new(&snapshot);
-            let (_reader, legacy_fallback) = pages
-                .reader_for_roots(&counted, std::iter::empty(), false)
-                .expect("ordinary connect reader");
-            assert!(!legacy_fallback);
-            assert_eq!(counted.locator_scans.get(), 0);
-            assert_eq!(counted.locator_gets.get(), 0);
-
-            let (_reader, legacy_fallback) = pages
-                .reader_for_roots(&counted, [historical_roots[731]], false)
-                .expect("rollback root reader");
-            assert!(!legacy_fallback);
-            assert_eq!(counted.locator_scans.get(), 0);
-            assert_eq!(
-                counted.locator_gets.get(),
-                1,
-                "one requested rollback root must cost one point lookup"
-            );
-        }
-        drop(snapshot);
-        drop(pages);
-        std::fs::remove_dir_all(directory).expect("remove page directory");
-    }
-
-    #[test]
     fn startup_page_segment_limit_is_checked_before_range_collection() {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -19321,133 +18901,6 @@ mod tests {
     }
 
     #[test]
-    fn name_page_bootstrap_and_reopen_use_earliest_reused_pin_height() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-node-name-page-reused-pin-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-
-        let store = StoreHandle::memory();
-        let tree = MemoryUrkel::from_entries([
-            (NameHash::new([0x21; 32]), b"reused-left".to_vec()),
-            (NameHash::new([0xa1; 32]), b"reused-right".to_vec()),
-        ])
-        .expect("reused pin tree");
-        let root = tree.root();
-        let tip_height = 3_205;
-        let tip_hash = BlockHash::new([0x72; 32]);
-        let tip = BlockIndexRecord {
-            hash: tip_hash,
-            height: tip_height,
-            prev_hash: BlockHash::ZERO,
-            chainwork: Uint256::ONE,
-            status: BlockStatus {
-                active_chain: true,
-                ..BlockStatus::default()
-            },
-            tx_count: 0,
-            validated_at: None,
-        };
-        let mut batch = store.batch();
-        for (node_root, raw) in tree.node_records().expect("reused pin records") {
-            batch
-                .put(ColumnFamily::NameTreeNodes, node_root.as_bytes(), &raw)
-                .expect("stage reused pin record");
-        }
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeRoot.as_bytes(),
-                root.as_bytes(),
-            )
-            .expect("stage working root");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeCommitRoot.as_bytes(),
-                root.as_bytes(),
-            )
-            .expect("stage committed root");
-        write_block_index_to_batch(&mut batch, &tip).expect("stage reused pin tip");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::BestBlockHash.as_bytes(),
-                tip_hash.as_bytes(),
-            )
-            .expect("bind reused pin tip");
-        for (height, tag) in [(2_952, 0x73), (3_204, 0x74)] {
-            batch
-                .put(
-                    ColumnFamily::Snapshots,
-                    &name_tree_snapshot_pin_key(height),
-                    &NameTreeSnapshotPin {
-                        height,
-                        block_hash: BlockHash::new([tag; 32]),
-                        root,
-                    }
-                    .encode(),
-                )
-                .expect("stage reused snapshot pin");
-        }
-        store.commit(batch).expect("publish reused pin fixture");
-
-        let pages = NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Mainnet)
-            .expect("bootstrap reused pin pages");
-        let snapshot = store.snapshot().expect("bootstrapped reused pin snapshot");
-        let record = load_name_page_root_record(&snapshot, root)
-            .expect("read bootstrap locator")
-            .expect("bootstrap locator");
-        assert_eq!(record.height, 2_952);
-        let locator = record.locator;
-        drop(snapshot);
-        drop(pages);
-
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Snapshots,
-                &name_page_root_key(root),
-                &NamePageRootRecord {
-                    root,
-                    locator,
-                    height: tip_height,
-                }
-                .encode(),
-            )
-            .expect("stage legacy inconsistent locator height");
-        store
-            .commit(batch)
-            .expect("publish legacy inconsistent locator height");
-
-        let pages = NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Mainnet)
-            .expect("repair reused pin locator height on reopen");
-        let snapshot = store.snapshot().expect("repaired reused pin snapshot");
-        let record = load_name_page_root_record(&snapshot, root)
-            .expect("read repaired locator")
-            .expect("repaired locator");
-        assert_eq!(record.height, 2_952);
-        let (reader, legacy_missing) = pages
-            .reader_for_roots(&snapshot, std::iter::empty(), false)
-            .expect("open repaired reused pin reader");
-        assert!(!legacy_missing);
-        assert!(
-            !seed_startup_pin_page_roots(&snapshot, Network::Mainnet, &reader)
-                .expect("seed reused pin roots after repair")
-        );
-
-        drop(reader);
-        drop(snapshot);
-        drop(pages);
-        std::fs::remove_dir_all(directory).expect("remove reused pin pages");
-    }
-
-    #[test]
     fn exhaustive_page_audit_seeds_more_than_4096_historical_pin_roots() {
         const PIN_COUNT: u32 = 4_097;
 
@@ -19576,843 +19029,6 @@ mod tests {
         drop(reader);
         drop(snapshot);
         std::fs::remove_file(path).expect("remove pin pages");
-    }
-
-    #[test]
-    fn page_compaction_materializes_pre_page_retained_roots_and_fails_closed_if_missing() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-node-name-page-upgrade-roots-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-        let store = StoreHandle::memory();
-        drop(
-            NodeState::from_store_for_network(store.clone(), Network::Regtest)
-                .expect("initialize upgrade store"),
-        );
-        let historical = MemoryUrkel::from_entries([
-            (NameHash::new([0x11; 32]), b"historical-left".to_vec()),
-            (NameHash::new([0x91; 32]), b"historical-right".to_vec()),
-        ])
-        .expect("historical tree");
-        let current = MemoryUrkel::from_entries([
-            (NameHash::new([0x11; 32]), b"current-left".to_vec()),
-            (NameHash::new([0x91; 32]), b"historical-right".to_vec()),
-        ])
-        .expect("current tree");
-        let historical_root = historical.root();
-        let current_root = current.root();
-        let undo_hash = BlockHash::new([0x61; 32]);
-        let undo = BlockUndo {
-            block_hash: undo_hash,
-            height: 1,
-            previous_tree_root: historical_root,
-            resulting_tree_root: current_root,
-            previous_committed_tree_root: historical_root,
-            resulting_committed_tree_root: current_root,
-            spent_coins: Vec::new(),
-            created_coins: Vec::new(),
-            airdrop_positions: Vec::new(),
-            previous_name_states: Vec::new(),
-            name_tree_interval_boundary: false,
-            previous_name_tree_accumulator_last_height: None,
-            previous_name_tree_accumulator: None,
-        };
-        let mut batch = store.batch();
-        for tree in [&historical, &current] {
-            for (root, raw) in tree.node_records().expect("tree records") {
-                batch
-                    .put(ColumnFamily::NameTreeNodes, root.as_bytes(), &raw)
-                    .expect("stage legacy tree record");
-            }
-        }
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeRoot.as_bytes(),
-                current_root.as_bytes(),
-            )
-            .expect("stage working root");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeCommitRoot.as_bytes(),
-                current_root.as_bytes(),
-            )
-            .expect("stage committed root");
-        batch
-            .put(
-                ColumnFamily::Undo,
-                undo_hash.as_bytes(),
-                &undo.encode().expect("encode retained undo"),
-            )
-            .expect("stage retained undo");
-        store.commit(batch).expect("publish pre-page state");
-
-        let mut pages =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-                .expect("bootstrap pages");
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Snapshots,
-                &name_page_root_key(current_root),
-                &NamePageRootRecord {
-                    root: current_root,
-                    locator: pages.state.root_locator().expect("current root locator"),
-                    height: 1,
-                }
-                .encode(),
-            )
-            .expect("stage current page locator");
-        store.commit(batch).expect("publish current page locator");
-        let snapshot = store.snapshot().expect("bootstrap snapshot");
-        assert!(load_name_page_root_record(&snapshot, current_root)
-            .expect("current locator")
-            .is_some());
-        assert!(
-            load_name_page_root_record(&snapshot, historical_root)
-                .expect("historical locator")
-                .is_none(),
-            "pre-page historical undo roots begin without page locators"
-        );
-        drop(snapshot);
-
-        let report = pages
-            .compact_generation(&store)
-            .expect("materialize retained upgrade root");
-        assert_eq!(report.generation, 2);
-        let snapshot = store.snapshot().expect("compacted snapshot");
-        for root in [current_root, historical_root] {
-            let record = load_name_page_root_record(&snapshot, root)
-                .expect("retained locator")
-                .expect("published retained locator");
-            assert_eq!(record.locator.generation, report.generation);
-        }
-        let (reader, legacy_fallback) = pages
-            .reader_for_roots(&snapshot, [current_root, historical_root], false)
-            .expect("compacted retained readers");
-        assert!(!legacy_fallback);
-        let page_snapshot = NamePageSnapshot::new(&snapshot, &reader);
-        validate_persisted_name_trees(&page_snapshot, [current_root, historical_root])
-            .expect("validate materialized retained roots");
-        drop(reader);
-        drop(snapshot);
-
-        let missing_root = TreeRoot::new([0xee; 32]);
-        let missing_hash = BlockHash::new([0x62; 32]);
-        let missing_undo = BlockUndo {
-            block_hash: missing_hash,
-            height: 2,
-            previous_tree_root: missing_root,
-            resulting_tree_root: current_root,
-            previous_committed_tree_root: missing_root,
-            resulting_committed_tree_root: current_root,
-            spent_coins: Vec::new(),
-            created_coins: Vec::new(),
-            airdrop_positions: Vec::new(),
-            previous_name_states: Vec::new(),
-            name_tree_interval_boundary: false,
-            previous_name_tree_accumulator_last_height: None,
-            previous_name_tree_accumulator: None,
-        };
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Undo,
-                missing_hash.as_bytes(),
-                &missing_undo.encode().expect("encode missing undo"),
-            )
-            .expect("stage missing retained undo");
-        store.commit(batch).expect("publish missing retained root");
-        let generation_before = pages.state.manifest.generation;
-        assert!(pages.compact_generation(&store).is_err());
-        assert_eq!(pages.state.manifest.generation, generation_before);
-        assert!(!pages.reopen_required);
-
-        drop(pages);
-        std::fs::remove_dir_all(directory).expect("remove upgrade page directory");
-    }
-
-    #[test]
-    fn ambiguous_name_page_commit_fence_preserves_old_or_new_recovery_bytes() {
-        fn append_synced_page(pages: &mut NamePageStorage, tag: u8) -> hns_store::SegmentManifest {
-            pages
-                .appender
-                .as_mut()
-                .expect("page appender")
-                .append(&[hns_store::NamePageRecord {
-                    key: [tag; 32],
-                    children: Vec::new(),
-                    canonical: vec![tag],
-                }])
-                .expect("append page");
-            pages
-                .appender
-                .as_mut()
-                .expect("page appender")
-                .sync_data()
-                .expect("sync page")
-        }
-
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let rejected_directory = std::env::temp_dir().join(format!(
-            "hsrd-name-page-rejected-fence-{}-{nonce}",
-            std::process::id()
-        ));
-        let applied_directory = std::env::temp_dir().join(format!(
-            "hsrd-name-page-applied-fence-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&rejected_directory);
-        let _ = std::fs::remove_dir_all(&applied_directory);
-
-        // Simulate Store::commit rejecting before its write. The synced tail
-        // remains untouched while the process is fenced; reopening the old
-        // durable manifest is the only operation allowed to truncate it.
-        let rejected_store = StoreHandle::memory();
-        let _rejected_state =
-            NodeState::from_store_for_network(rejected_store.clone(), Network::Regtest)
-                .expect("initialize rejected store");
-        let mut rejected_pages = NamePageStorage::open_or_bootstrap(
-            rejected_directory.clone(),
-            &rejected_store,
-            Network::Regtest,
-        )
-        .expect("rejected pages");
-        let rejected_committed = rejected_pages.state.manifest.durable_bytes;
-        let _ = append_synced_page(&mut rejected_pages, 0x41);
-        let rejected_tail = std::fs::metadata(&rejected_pages.file_path)
-            .expect("rejected tail metadata")
-            .len();
-        assert!(rejected_tail > rejected_committed);
-        rejected_pages.fence_after_commit_attempt();
-        assert!(rejected_pages.reopen_required);
-        assert!(rejected_pages.appender.is_none());
-        assert_eq!(
-            std::fs::metadata(&rejected_pages.file_path)
-                .expect("fenced rejected metadata")
-                .len(),
-            rejected_tail
-        );
-        assert!(rejected_pages
-            .reader_for_roots(
-                &rejected_store.snapshot().expect("rejected snapshot"),
-                std::iter::empty(),
-                false,
-            )
-            .is_err());
-        drop(rejected_pages);
-        let rejected_reopened = NamePageStorage::open_or_bootstrap(
-            rejected_directory.clone(),
-            &rejected_store,
-            Network::Regtest,
-        )
-        .expect("reopen rejected pages");
-        assert_eq!(
-            std::fs::metadata(&rejected_reopened.file_path)
-                .expect("reopened rejected metadata")
-                .len(),
-            rejected_committed
-        );
-
-        // Simulate Store::commit applying its batch and then returning Err.
-        // Reopening must follow the new durable manifest and preserve every
-        // page byte referenced by that applied batch.
-        let applied_store = StoreHandle::memory();
-        let _applied_state =
-            NodeState::from_store_for_network(applied_store.clone(), Network::Regtest)
-                .expect("initialize applied store");
-        let mut applied_pages = NamePageStorage::open_or_bootstrap(
-            applied_directory.clone(),
-            &applied_store,
-            Network::Regtest,
-        )
-        .expect("applied pages");
-        let applied_manifest = append_synced_page(&mut applied_pages, 0x42);
-        let applied_tail = std::fs::metadata(&applied_pages.file_path)
-            .expect("applied tail metadata")
-            .len();
-        let mut applied_state = applied_pages.state.clone();
-        applied_state.manifest = applied_manifest;
-        let mut batch = applied_store.batch();
-        batch
-            .put(
-                ColumnFamily::Snapshots,
-                NAME_PAGE_STATE_KEY,
-                &applied_state.encode().expect("encode applied page state"),
-            )
-            .expect("stage applied page state");
-        applied_store
-            .commit(batch)
-            .expect("simulate applied commit batch");
-        applied_pages.fence_after_commit_attempt();
-        assert_eq!(
-            std::fs::metadata(&applied_pages.file_path)
-                .expect("fenced applied metadata")
-                .len(),
-            applied_tail
-        );
-        drop(applied_pages);
-        let applied_reopened = NamePageStorage::open_or_bootstrap(
-            applied_directory.clone(),
-            &applied_store,
-            Network::Regtest,
-        )
-        .expect("reopen applied pages");
-        assert_eq!(applied_reopened.state.manifest, applied_manifest);
-        assert_eq!(
-            std::fs::metadata(&applied_reopened.file_path)
-                .expect("reopened applied metadata")
-                .len(),
-            applied_tail
-        );
-
-        drop(rejected_reopened);
-        drop(applied_reopened);
-        std::fs::remove_dir_all(rejected_directory).expect("remove rejected fence fixture");
-        std::fs::remove_dir_all(applied_directory).expect("remove applied fence fixture");
-    }
-
-    #[test]
-    fn ambiguous_name_page_fence_revokes_node_authority_and_mutation() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-name-page-authority-fence-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-        let store = StoreHandle::memory();
-        let mut state =
-            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        state.name_pages = Some(
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-                .expect("pages"),
-        );
-        let mut node = NodeService::try_with_state(
-            NodeConfig {
-                network: Network::Regtest,
-                ..NodeConfig::default()
-            },
-            state,
-        )
-        .expect("node");
-        let publication_hash = BlockHash::new([0x55; 32]);
-        let mut publication_key = Vec::with_capacity(hns_mining::PUBLICATION_KEY_PREFIX.len() + 32);
-        publication_key.extend_from_slice(hns_mining::PUBLICATION_KEY_PREFIX);
-        publication_key.extend_from_slice(publication_hash.as_bytes());
-        let mut publication_batch = store.batch();
-        publication_batch
-            .put(
-                ColumnFamily::Snapshots,
-                &publication_key,
-                b"fenced-publication-intent",
-            )
-            .expect("stage publication intent");
-        store
-            .commit(publication_batch)
-            .expect("commit publication intent");
-        node.state
-            .name_pages
-            .as_mut()
-            .expect("page storage")
-            .fence_after_commit_attempt();
-        node.fail_closed_after_ambiguous_commit();
-
-        assert!(node.state.storage_reopen_required());
-        assert!(node.observed_mining_snapshot().is_err());
-        assert!(node.subscribe_mining_events().is_err());
-        assert!(node.mining_snapshot().is_none());
-        assert_eq!(node.mining_events.committed_generation(), 1);
-        let mempool_before = node.state.mempool.info();
-        for error in [
-            node.mining_engine_accept_peer_transaction(coinbase_transaction())
-                .expect_err("fenced peer transaction"),
-            node.mining_engine_accept_peer_claim(hns_primitives::Claim::default())
-                .expect_err("fenced peer claim"),
-            node.mining_engine_accept_peer_airdrop(hns_primitives::AirdropProof {
-                index: 0,
-                proof: Vec::new(),
-                subindex: 0,
-                subproof: Vec::new(),
-                key: Vec::new(),
-                version: 0,
-                address: Vec::new(),
-                fee: 0,
-                signature: Vec::new(),
-            })
-            .expect_err("fenced peer airdrop"),
-        ] {
-            assert!(error.to_string().contains("restart and reopen"), "{error}");
-        }
-        assert_eq!(node.state.mempool.info(), mempool_before);
-        let publication_error = node
-            .mining_engine_complete_publication(publication_hash)
-            .expect_err("fenced publication-intent deletion");
-        assert!(
-            publication_error.to_string().contains("restart and reopen"),
-            "{publication_error}"
-        );
-        assert_eq!(
-            store
-                .snapshot()
-                .expect("publication snapshot")
-                .get(ColumnFamily::Snapshots, &publication_key)
-                .expect("publication lookup")
-                .as_deref(),
-            Some(b"fenced-publication-intent".as_slice())
-        );
-        let error = node
-            .connect_block(NodeBlockImport::fixture(
-                block_with_commitments(vec![coinbase_transaction()]),
-                0,
-                1,
-            ))
-            .expect_err("fenced mutation");
-        assert!(error.to_string().contains("restart and reopen"), "{error}");
-
-        drop(node);
-        std::fs::remove_dir_all(directory).expect("remove authority fence fixture");
-    }
-
-    #[test]
-    fn page_backed_node_commits_interval_root_without_lsm_name_nodes_and_restarts() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-node-name-pages-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-
-        let store = StoreHandle::memory();
-        let mut state =
-            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        state.name_pages = Some(
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-                .expect("pages"),
-        );
-        state.state_engine = StoredStateEngine::with_services(
-            store.clone(),
-            Network::Regtest,
-            NameFlags::NONE,
-            true,
-            Arc::new(AllowAllInputVerifier),
-            Arc::new(RejectSpecialCoinbaseIssuance),
-        )
-        .expect("fixture verifier");
-        let mut node =
-            NodeService::try_with_state(active_state_native_config(), state).expect("node");
-        let records = connect_fixture_chain(&mut node, 200, None);
-        let spend_txid = node
-            .state
-            .blocks
-            .load_block(&records[198].hash)
-            .expect("load spend source")
-            .expect("spend source")
-            .transactions[0]
-            .txid();
-
-        let mut opening = block_with_commitments(vec![
-            coinbase_transaction_with_tag(201, 50),
-            open_transaction(
-                b"page-backed-name",
-                Outpoint {
-                    txid: spend_txid,
-                    index: 0,
-                },
-            ),
-        ]);
-        opening.header.prev_block = records[200].hash;
-        opening.header.nonce = 221;
-        let opening = node
-            .connect_block(NodeBlockImport::fixture(opening, 201, 202))
-            .expect("connect pending OPEN");
-
-        let mut previous = opening.hash;
-        let mut boundary_block = None;
-        for height in 202..=205 {
-            let snapshot = store.snapshot().expect("pre-boundary snapshot");
-            let root = load_stored_name_tree_commit_root(&snapshot).expect("header root");
-            drop(snapshot);
-            let mut block = block_with_commitments(vec![coinbase_transaction_with_tag(height, 50)]);
-            block.header.prev_block = previous;
-            block.header.tree_root = *root.as_bytes();
-            block.header.nonce = height.saturating_add(20);
-            if height == 205 {
-                boundary_block = Some(block.clone());
-            }
-            previous = node
-                .connect_block(NodeBlockImport::fixture(
-                    block,
-                    height,
-                    u64::from(height) + 1,
-                ))
-                .unwrap_or_else(|error| panic!("connect page boundary {height}: {error}"))
-                .hash;
-        }
-
-        let snapshot = store.snapshot().expect("page-backed snapshot");
-        assert!(snapshot
-            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
-            .expect("LSM name nodes")
-            .is_empty());
-        let page_state = NamePageState::decode(
-            &snapshot
-                .get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)
-                .expect("page state read")
-                .expect("page state"),
-        )
-        .expect("decode page state");
-        assert_ne!(page_state.root, TreeRoot::ZERO);
-        assert!(page_state.manifest.durable_bytes > 0);
-        assert_eq!(page_state.committed_height, Some(205));
-        let (reader, _) = node
-            .state
-            .name_pages
-            .as_ref()
-            .expect("page storage")
-            .reader_for_roots(&snapshot, std::iter::empty(), false)
-            .expect("page reader");
-        let duplicate = reader
-            .load(page_state.root)
-            .expect("load current root")
-            .expect("current root record");
-        drop(snapshot);
-        drop(reader);
-
-        let pages = node.state.name_pages.as_mut().expect("page storage");
-        pages
-            .appender
-            .as_mut()
-            .expect("page appender")
-            .append(&[hns_store::NamePageRecord {
-                key: *page_state.root.as_bytes(),
-                children: Vec::new(),
-                canonical: duplicate.clone(),
-            }])
-            .expect("append simulated uncommitted page");
-        pages
-            .appender
-            .as_mut()
-            .expect("page appender")
-            .sync_data()
-            .expect("sync simulated tail");
-        assert!(
-            std::fs::metadata(&pages.file_path)
-                .expect("page metadata")
-                .len()
-                > page_state.manifest.durable_bytes
-        );
-        pages
-            .rollback_uncommitted_tail()
-            .expect("truncate uncommitted page");
-        assert_eq!(
-            std::fs::metadata(&pages.file_path)
-                .expect("recovered page metadata")
-                .len(),
-            page_state.manifest.durable_bytes
-        );
-
-        node.disconnect_block(NodeBlockDisconnect {
-            block_hash: previous,
-            height: 205,
-        })
-        .expect("disconnect page boundary");
-        let snapshot = store.snapshot().expect("disconnected page snapshot");
-        let disconnected_page_state = NamePageState::decode(
-            &snapshot
-                .get(ColumnFamily::Snapshots, NAME_PAGE_STATE_KEY)
-                .expect("disconnected page state read")
-                .expect("disconnected page state"),
-        )
-        .expect("decode disconnected page state");
-        assert_eq!(disconnected_page_state.root, TreeRoot::ZERO);
-        assert!(snapshot
-            .scan_prefix(ColumnFamily::NameTreeNodes, b"")
-            .expect("disconnected LSM name nodes")
-            .is_empty());
-        drop(snapshot);
-
-        node.connect_block(NodeBlockImport::fixture(
-            boundary_block.expect("boundary block"),
-            205,
-            206,
-        ))
-        .expect("reconnect page boundary");
-
-        let raw = store.snapshot().expect("pre-seal snapshot");
-        let root = load_stored_name_tree_commit_root(&raw).expect("pre-seal root");
-        let (reader, _) = node
-            .state
-            .name_pages
-            .as_ref()
-            .expect("page storage")
-            .reader_for_roots(&raw, std::iter::empty(), false)
-            .expect("pre-seal reader");
-        let mut batch = store.batch();
-        let skipped_seal_height = NAME_PAGE_SEGMENT_BLOCKS
-            .checked_mul(2)
-            .and_then(|height| height.checked_add(17))
-            .expect("skipped seal height");
-        let prepared = node
-            .state
-            .name_pages
-            .as_mut()
-            .expect("page storage")
-            .prepare_root(
-                &raw,
-                &mut batch,
-                reader
-                    .into_known_addresses()
-                    .expect("physical seal addresses"),
-                BTreeMap::new(),
-                &[],
-                NamePageRootTarget {
-                    root,
-                    height: Some(skipped_seal_height),
-                },
-            )
-            .expect("prepare physical seal");
-        drop(raw);
-        store.commit(batch).expect("publish physical seal");
-        node.state
-            .name_pages
-            .as_mut()
-            .expect("page storage")
-            .commit_prepared(prepared.clone());
-        assert_eq!(prepared.manifest.active_segment, 1);
-        assert_eq!(prepared.manifest.durable_bytes, 0);
-        assert_eq!(
-            prepared.last_sealed_height,
-            Some(NAME_PAGE_SEGMENT_BLOCKS * 2)
-        );
-        assert_eq!(
-            prepared
-                .root_address
-                .expect("sealed root address")
-                .segment(),
-            0
-        );
-        let unpublished_path = name_page_file_path(&directory, prepared.manifest.generation, 2);
-        let mut unpublished =
-            NamePageAppender::create_new(&unpublished_path, prepared.manifest.generation, 2)
-                .expect("create unpublished successor");
-        unpublished
-            .append(&[hns_store::NamePageRecord {
-                key: *prepared.root.as_bytes(),
-                children: Vec::new(),
-                canonical: duplicate,
-            }])
-            .expect("append unpublished successor page");
-        unpublished
-            .sync_data()
-            .expect("sync unpublished successor page");
-        drop(unpublished);
-        drop(node);
-
-        let pages = NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-            .expect("reopen pages");
-        assert!(!unpublished_path.exists());
-        let snapshot = store.snapshot().expect("sealed snapshot");
-        let (reader, _) = pages
-            .reader_for_roots(&snapshot, std::iter::empty(), false)
-            .expect("sealed multi-segment reader");
-        assert!(reader
-            .load(prepared.root)
-            .expect("load sealed root")
-            .is_some());
-        drop(reader);
-        drop(snapshot);
-        let (_reopened, audit) = NodeState::from_store_for_network_with_startup_audit(
-            store,
-            Network::Regtest,
-            None,
-            None,
-            Some(pages),
-        )
-        .expect("restart page-backed node");
-        assert_eq!(audit, StartupAuditKind::Exhaustive);
-        std::fs::remove_dir_all(directory).expect("remove page fixture");
-    }
-
-    #[test]
-    fn page_batch_publishes_every_intermediate_snapshot_pin_locator() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-node-name-page-pins-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-
-        let store = StoreHandle::memory();
-        let state =
-            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        drop(state);
-        let mut pages =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-                .expect("pages");
-        let first = MemoryUrkel::from_entries([
-            (NameHash::new([0x11; 32]), b"alpha".to_vec()),
-            (NameHash::new([0x91; 32]), b"beta".to_vec()),
-        ])
-        .expect("first tree");
-        let second = MemoryUrkel::from_entries([
-            (NameHash::new([0x11; 32]), b"alpha-updated".to_vec()),
-            (NameHash::new([0x91; 32]), b"beta".to_vec()),
-            (NameHash::new([0xe1; 32]), b"gamma".to_vec()),
-        ])
-        .expect("second tree");
-        let first_root = first.root();
-        let second_root = second.root();
-        let mut records = first.node_records().expect("first records");
-        records.extend(second.node_records().expect("second records"));
-        let staged_nodes = records
-            .into_iter()
-            .map(|(root, raw)| (root.as_bytes().to_vec(), Some(raw)))
-            .collect::<BTreeMap<_, _>>();
-        let pins = [
-            NameTreeSnapshotPin {
-                height: 5,
-                block_hash: BlockHash::new([0x51; 32]),
-                root: first_root,
-            },
-            NameTreeSnapshotPin {
-                height: 10,
-                block_hash: BlockHash::new([0x52; 32]),
-                root: second_root,
-            },
-        ];
-
-        let raw = store.snapshot().expect("base snapshot");
-        let (reader, _) = pages
-            .reader_for_roots(&raw, std::iter::empty(), false)
-            .expect("base reader");
-        let mut batch = store.batch();
-        let prepared = pages
-            .prepare_root(
-                &raw,
-                &mut batch,
-                reader.into_known_addresses().expect("base addresses"),
-                staged_nodes,
-                &pins,
-                NamePageRootTarget {
-                    root: second_root,
-                    height: Some(12),
-                },
-            )
-            .expect("prepare multi-boundary page batch");
-        drop(raw);
-        store.commit(batch).expect("publish page batch");
-        pages.commit_prepared(prepared);
-
-        let snapshot = store.snapshot().expect("published snapshot");
-        for (root, expected_height) in [(first_root, 5), (second_root, 10)] {
-            let record = load_name_page_root_record(&snapshot, root)
-                .expect("load locator")
-                .expect("published locator");
-            assert_eq!(record.height, expected_height);
-            let (reader, _) = pages
-                .reader_for_roots(&snapshot, [root], false)
-                .expect("published reader");
-            assert!(reader.load(root).expect("load pinned root").is_some());
-        }
-        drop(snapshot);
-
-        let stale_root = TreeRoot::new([0x77; 32]);
-        let first_locator = store
-            .snapshot()
-            .expect("locator snapshot")
-            .get(ColumnFamily::Snapshots, &name_page_root_key(first_root))
-            .expect("first locator read")
-            .map(|raw| NamePageRootRecord::decode(&raw).expect("first locator decode"))
-            .expect("first locator");
-        let mut batch = store.batch();
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeRoot.as_bytes(),
-                first_root.as_bytes(),
-            )
-            .expect("bind working root");
-        batch
-            .put(
-                ColumnFamily::Meta,
-                MetaKey::NameTreeCommitRoot.as_bytes(),
-                second_root.as_bytes(),
-            )
-            .expect("bind committed root");
-        batch
-            .put(
-                ColumnFamily::Snapshots,
-                &name_page_root_key(stale_root),
-                &NamePageRootRecord {
-                    root: stale_root,
-                    locator: first_locator.locator,
-                    height: 1,
-                }
-                .encode(),
-            )
-            .expect("stage stale locator");
-        store.commit(batch).expect("publish retained root bindings");
-
-        let report = pages
-            .compact_generation(&store)
-            .expect("compact page generation");
-        assert_eq!(report.previous_generation, 1);
-        assert_eq!(report.generation, 2);
-        assert_eq!(report.retained_roots, 2);
-        assert!(report.records_written > 0);
-        {
-            let snapshot = store.snapshot().expect("compacted snapshot");
-            assert!(load_name_page_root_record(&snapshot, stale_root)
-                .expect("stale locator read")
-                .is_none());
-            let (reader, _) = pages
-                .reader_for_roots(&snapshot, [first_root, second_root], false)
-                .expect("compacted reader");
-            let page_snapshot = NamePageSnapshot::new(&snapshot, &reader);
-            assert!(
-                validate_persisted_name_trees(&page_snapshot, [first_root, second_root])
-                    .expect("validate compacted retained roots")
-                    >= 2
-            );
-        }
-
-        let orphan_path = name_page_file_path(&directory, 3, 0);
-        let superseded_path = name_page_file_path(&directory, 1, 0);
-        drop(
-            NamePageAppender::create_new(&orphan_path, 3, 0)
-                .expect("create orphan future generation"),
-        );
-        drop(
-            NamePageAppender::create_new(&superseded_path, 1, 0)
-                .expect("restore superseded generation"),
-        );
-        drop(pages);
-        let reopened =
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-                .expect("recover pages");
-        assert!(!orphan_path.exists());
-        assert!(!superseded_path.exists());
-        assert_eq!(reopened.state.manifest.generation, 2);
-        drop(reopened);
-        std::fs::remove_dir_all(directory).expect("remove page fixture");
     }
 
     #[test]
@@ -21807,7 +20423,6 @@ mod tests {
         std::fs::remove_dir_all(path).expect("remove marker fixture");
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     #[test]
     fn clean_restart_uses_checkpoint_and_failed_startup_stays_unclean() {
         let path = std::env::temp_dir().join(format!(
@@ -21845,7 +20460,7 @@ mod tests {
         {
             let store = open_store(&StoreConfig {
                 path: path.join("chain"),
-                backend: StoreBackend::RocksDb,
+                backend: StoreBackend::Direct,
                 durability: DurabilityPolicy::Sync,
             })
             .expect("open fault store");
@@ -21860,7 +20475,7 @@ mod tests {
         assert!(error.to_string().contains("body"), "{error}");
         let store = open_store(&StoreConfig {
             path: path.join("chain"),
-            backend: StoreBackend::RocksDb,
+            backend: StoreBackend::Direct,
             durability: DurabilityPolicy::Sync,
         })
         .expect("reopen failed-start store");
@@ -21869,9 +20484,8 @@ mod tests {
         std::fs::remove_dir_all(path).expect("remove startup-audit store");
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     #[test]
-    fn content_addressed_name_proofs_survive_rocksdb_reopen() {
+    fn content_addressed_name_proofs_survive_direct_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-name-proof-reopen-{}-{}",
             std::process::id(),
@@ -21880,7 +20494,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let config = StoreConfig {
             path: path.clone(),
-            backend: StoreBackend::RocksDb,
+            backend: StoreBackend::Direct,
             durability: DurabilityPolicy::Sync,
         };
         let name = b"persistedrocksproof";
@@ -21930,9 +20544,8 @@ mod tests {
         std::fs::remove_dir_all(&path).expect("remove test store");
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     #[test]
-    fn startup_name_tree_compaction_survives_unclean_rocksdb_reopen() {
+    fn startup_name_tree_compaction_survives_unclean_direct_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-name-compaction-reopen-{}-{}",
             std::process::id(),
@@ -21941,7 +20554,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let store_config = StoreConfig {
             path: path.clone(),
-            backend: StoreBackend::RocksDb,
+            backend: StoreBackend::Direct,
             durability: DurabilityPolicy::Sync,
         };
         let node_config = NodeConfig {
@@ -22011,9 +20624,8 @@ mod tests {
         std::fs::remove_dir_all(&path).expect("remove test store");
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     #[test]
-    fn undo_retention_survives_unclean_rocksdb_reopen() {
+    fn undo_retention_survives_unclean_direct_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-undo-retention-reopen-{}-{}",
             std::process::id(),
@@ -22022,7 +20634,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let store_config = StoreConfig {
             path: path.clone(),
-            backend: StoreBackend::RocksDb,
+            backend: StoreBackend::Direct,
             durability: DurabilityPolicy::Sync,
         };
         let policy = UndoRetentionPolicy {
@@ -24467,325 +23079,6 @@ mod tests {
 
         drop(node);
         std::fs::remove_dir_all(directory).expect("remove staged-effect fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn archive_budget_rejection_after_name_page_append_rolls_back_entire_reorg() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        // Name-page publication preserves a 10 GB filesystem reserve, so keep
-        // the real RocksDB/archive fixture beside the configured build target
-        // instead of assuming `/tmp` has production-scale free space.
-        let test_root = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("target"));
-        let directory = test_root.join(format!(
-            "hsrd-reorg-archive-page-budget-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create archived reorg fixture");
-
-        let mut node = NodeService::try_new(NodeConfig {
-            network: Network::Regtest,
-            data_dir: Some(directory.clone()),
-            transaction_index: true,
-            storage_durability: DurabilityPolicy::Sync,
-            native_sync: NativeSyncConfig {
-                enabled: true,
-                listen: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
-                ..NativeSyncConfig::default()
-            },
-            mining_engine: MiningEngineConfig {
-                enabled: true,
-                transaction_relay: true,
-                ..MiningEngineConfig::default()
-            },
-            ..NodeConfig::default()
-        })
-        .expect("open archived RocksDB node");
-        let store = node.state.store.clone();
-        node.state.state_engine = StoredStateEngine::with_services(
-            store.clone(),
-            Network::Regtest,
-            NameFlags::NONE,
-            true,
-            Arc::new(AllowAllInputVerifier),
-            Arc::new(RejectSpecialCoinbaseIssuance),
-        )
-        .expect("fixture state services");
-
-        let genesis = block_with_commitments(vec![coinbase_transaction_with_tag(0, 50)]);
-        let genesis = node
-            .connect_block(NodeBlockImport::fixture(genesis, 0, 1))
-            .expect("connect archived genesis");
-        let names = (0u32..10_000)
-            .map(|index| format!("archive-reorg-page-{index}"))
-            .filter(|name| {
-                let hash = NameHash::new(sha3_256(name.as_bytes()));
-                hns_consensus::rollout_height(&hash, Network::Regtest.params().names) == 0
-                    && !hns_consensus::is_reserved(&hash, 1, Network::Regtest.params().names)
-            })
-            .take(2)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names.len(),
-            2,
-            "find two immediately rolled-out unreserved names"
-        );
-        let name_funding = Outpoint {
-            txid: Txid::new([0xd4; 32]),
-            index: 0,
-        };
-        install_script_coin(&node, name_funding.clone(), 10_000, 0);
-        let mut opening = block_with_commitments(vec![
-            coinbase_transaction_with_tag(1, 50),
-            open_transaction(names[0].as_bytes(), name_funding),
-        ]);
-        opening.header.prev_block = genesis.hash;
-        opening.header.nonce = 101;
-        let opening = node
-            .connect_block(NodeBlockImport::fixture(opening, 1, 2))
-            .expect("connect pending OPEN");
-
-        let mut previous = opening.hash;
-        let mut height_three = None;
-        let mut old_tip = None;
-        for height in 2..=4 {
-            let snapshot = store.snapshot().expect("pre-boundary root snapshot");
-            let root = load_stored_name_tree_commit_root(&snapshot).expect("pre-boundary root");
-            drop(snapshot);
-            let mut block = block_with_commitments(vec![coinbase_transaction_with_tag(height, 50)]);
-            block.header.prev_block = previous;
-            block.header.tree_root = *root.as_bytes();
-            block.header.nonce = height.saturating_add(100);
-            let record = node
-                .connect_block(NodeBlockImport::fixture(
-                    block,
-                    height,
-                    u64::from(height) + 1,
-                ))
-                .unwrap_or_else(|error| panic!("connect active height {height}: {error}"));
-            previous = record.hash;
-            if height == 3 {
-                height_three = Some(record.clone());
-            }
-            if height == 4 {
-                old_tip = Some(record);
-            }
-        }
-        let height_three = height_three.expect("height-three ancestor");
-        let old_tip = old_tip.expect("old height-four tip");
-
-        // The second replacement block spends an output created by the first.
-        // This forces the production StagingOverlay read-your-writes path while
-        // the 2,048-output parent generates a nontrivial real undo and tx index.
-        let replacement_funding = Outpoint {
-            txid: Txid::new([0xe4; 32]),
-            index: 0,
-        };
-        install_script_coin(&node, replacement_funding.clone(), 1_000_000, 0);
-        let mempool_funding = Outpoint {
-            txid: Txid::new([0xf4; 32]),
-            index: 0,
-        };
-        install_script_coin(&node, mempool_funding.clone(), 10_000, 0);
-        let mempool_transaction = script_spend(mempool_funding, 9_000);
-        let mempool_txid = mempool_transaction.txid();
-        assert!(matches!(
-            node.mining_engine_accept_peer_transaction(mempool_transaction)
-                .expect("seed unrelated mempool transaction"),
-            hns_mempool::Admission::Accepted(txid) if txid == mempool_txid
-        ));
-        let replacement_name_funding = Outpoint {
-            txid: Txid::new([0xa4; 32]),
-            index: 0,
-        };
-        install_script_coin(&node, replacement_name_funding.clone(), 10_000, 0);
-        let replacement_name_transaction =
-            open_transaction(names[1].as_bytes(), replacement_name_funding);
-        let mut parent = script_spend(replacement_funding, 900_000);
-        parent.outputs = (0..2_048)
-            .map(|index| Output {
-                value: 100,
-                address: Address::new(0, vec![(index % 251) as u8; 20])
-                    .expect("replacement output address"),
-                covenant: Covenant {
-                    kind: CovenantKind::None,
-                    items: Vec::new(),
-                },
-            })
-            .collect();
-        let parent_txid = parent.txid();
-        let current_root = {
-            let snapshot = store.snapshot().expect("replacement root snapshot");
-            let root = load_stored_name_tree_commit_root(&snapshot).expect("replacement root");
-            drop(snapshot);
-            root
-        };
-        let mut replacement = block_with_commitments(vec![
-            coinbase_transaction_with_tag(0x400, 50),
-            parent,
-            replacement_name_transaction,
-        ]);
-        replacement.header.prev_block = height_three.hash;
-        replacement.header.tree_root = *current_root.as_bytes();
-        replacement.header.nonce = 0x404;
-        let replacement_hash = replacement.hash();
-
-        let child_transaction = script_spend(
-            Outpoint {
-                txid: parent_txid,
-                index: 0,
-            },
-            90,
-        );
-        let child_txid = child_transaction.txid();
-        let mut child = block_with_commitments(vec![
-            coinbase_transaction_with_tag(0x500, 50),
-            child_transaction,
-        ]);
-        child.header.prev_block = replacement_hash;
-        child.header.tree_root = *current_root.as_bytes();
-        child.header.nonce = 0x505;
-        let child_hash = child.hash();
-
-        let durable_before = complete_store_image(&store);
-        let block_tip_before = node.state.best_block_tip().expect("block tip before");
-        let header_tip_before = node.state.chain.best_tip().expect("header tip before");
-        let mining_before = node
-            .observed_mining_snapshot()
-            .expect("mining state before")
-            .map(|snapshot| (snapshot.generation, snapshot.tip.hash));
-        let mining_generation_before = node.mining_events.committed_generation();
-        let mempool_before = node.state.mempool.info();
-        let (page_path, page_state_before, page_generation_before, page_bytes_before) = {
-            let pages = node.state.name_pages.as_ref().expect("page storage");
-            (
-                pages.file_path.clone(),
-                pages.state.clone(),
-                (pages.committed_generation_bytes, pages.generation_bytes),
-                std::fs::read(&pages.file_path).expect("page bytes before"),
-            )
-        };
-        let payload_directory = directory.join("payload-segments");
-        let payload_bytes_before = flat_directory_file_image(&payload_directory);
-
-        let fault = ReorgArchivePreflightRejectGuard::enable();
-        let error = node
-            .apply_reorg(NodeReorg {
-                disconnect: vec![NodeBlockDisconnect {
-                    block_hash: old_tip.hash,
-                    height: old_tip.height,
-                }],
-                connect: vec![
-                    NodeBlockImport::fixture(replacement, 4, 6),
-                    NodeBlockImport::fixture(child, 5, 7),
-                ],
-            })
-            .expect_err("archive budget must reject after page append");
-        assert!(
-            format!("{error:#}").contains(ReorgStagedEffectMeter::CONTEXT),
-            "{error:#}"
-        );
-        assert!(
-            fault.appended_name_page_bytes() >= hns_store::NAME_PAGE_BYTES as u64,
-            "the fault must be armed only after a real fixed-size page append"
-        );
-        assert!(
-            fault.maximum_generated_undo_bytes() >= 64 * 1024,
-            "the replacement must generate and stage a substantial encoded undo"
-        );
-        assert!(
-            fault.generated_name_state_writes() > 0,
-            "a replacement OPEN must generate a real NameState batch write"
-        );
-        assert!(
-            !node.state.storage_reopen_required(),
-            "read-only archive budget rejection is unambiguous"
-        );
-
-        assert_eq!(complete_store_image(&store), durable_before);
-        assert_eq!(
-            flat_directory_file_image(&payload_directory),
-            payload_bytes_before,
-            "archive preflight rejection must happen before segment append"
-        );
-        assert_eq!(
-            node.state.best_block_tip().expect("block tip after"),
-            block_tip_before
-        );
-        assert_eq!(
-            node.state.chain.best_tip().expect("header tip after"),
-            header_tip_before
-        );
-        assert!(
-            node.state
-                .blocks
-                .load_block_record(&old_tip.hash)
-                .expect("old index after")
-                .expect("old index")
-                .status
-                .active_chain
-        );
-        for hash in [replacement_hash, child_hash] {
-            assert!(node
-                .state
-                .blocks
-                .load_block_record(&hash)
-                .expect("replacement index after")
-                .is_none());
-        }
-        assert!(node
-            .state
-            .blocks
-            .load_tx_index(&parent_txid)
-            .expect("parent tx index after")
-            .is_none());
-        assert!(node
-            .state
-            .blocks
-            .load_tx_index(&child_txid)
-            .expect("child tx index after")
-            .is_none());
-        assert_eq!(
-            node.observed_mining_snapshot()
-                .expect("mining state after")
-                .map(|snapshot| (snapshot.generation, snapshot.tip.hash)),
-            mining_before
-        );
-        assert_eq!(
-            node.mining_events.committed_generation(),
-            mining_generation_before
-        );
-        assert_eq!(node.state.mempool.info(), mempool_before);
-        assert_eq!(
-            node.mining_engine_mempool_transaction(&mempool_txid)
-                .as_ref()
-                .map(Transaction::txid),
-            Some(mempool_txid),
-            "unrelated live mempool content must survive the rejected reorg"
-        );
-        let pages = node.state.name_pages.as_ref().expect("page storage after");
-        assert_eq!(pages.file_path, page_path);
-        assert_eq!(pages.state, page_state_before);
-        assert_eq!(
-            (pages.committed_generation_bytes, pages.generation_bytes),
-            page_generation_before
-        );
-        assert_eq!(
-            std::fs::read(&pages.file_path).expect("page bytes after"),
-            page_bytes_before,
-            "late rejection must truncate the uncommitted page tail"
-        );
-
-        drop(fault);
-        drop(node);
-        drop(store);
-        std::fs::remove_dir_all(directory).expect("remove archived reorg fixture");
     }
 
     #[tokio::test]

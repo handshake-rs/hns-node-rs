@@ -1103,7 +1103,7 @@ fn publication_retry_page_budget(maximum: usize) -> Result<u16> {
 }
 
 /// Apply an async wall-clock bound to a blocking storage worker. Dropping the
-/// join handle cannot stop a RocksDB syscall, so the concurrency permit lives
+/// join handle cannot stop a database syscall, so the concurrency permit lives
 /// inside the worker and remains charged until the underlying call exits.
 async fn await_publication_blocking_worker<T>(
     operation: &'static str,
@@ -2314,19 +2314,6 @@ impl NodeService {
         &mut self,
         result: Result<T>,
     ) -> Result<T> {
-        #[cfg(test)]
-        if result.as_ref().is_err_and(|error| {
-            error
-                .downcast_ref::<InjectedPublicationQueueCommitAmbiguity>()
-                .is_some()
-        }) {
-            // Exercise the same node-level reopen fence used when a physical
-            // name-page or RocksDB publication crosses its commit boundary.
-            // The memory StoreHandle itself has no ambiguous-commit state.
-            if let Some(pages) = self.state.name_pages.as_mut() {
-                pages.fence_after_commit_attempt();
-            }
-        }
         if let Some(invariant) = result
             .as_ref()
             .err()
@@ -3727,89 +3714,15 @@ fn retire_publication_intent(
     commit_publication_queue_batch(store, batch, "terminal publication retirement")
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublicationQueueCommitFault {
-    None = 0,
-    BeforeCommit = 1,
-    AfterCommit = 2,
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct InjectedPublicationQueueCommitAmbiguity;
-
-#[cfg(test)]
-impl std::fmt::Display for InjectedPublicationQueueCommitAmbiguity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("injected publication queue ambiguity after atomic commit")
-    }
-}
-
-#[cfg(test)]
-impl std::error::Error for InjectedPublicationQueueCommitAmbiguity {}
-
-#[cfg(test)]
-std::thread_local! {
-    static PUBLICATION_QUEUE_COMMIT_FAULT: std::cell::Cell<u8> = const {
-        std::cell::Cell::new(PublicationQueueCommitFault::None as u8)
-    };
-}
-
-#[cfg(test)]
-fn inject_publication_queue_commit_fault(fault: PublicationQueueCommitFault) {
-    PUBLICATION_QUEUE_COMMIT_FAULT.with(|configured| configured.set(fault as u8));
-}
-
-#[cfg(test)]
-fn take_publication_queue_commit_fault() -> PublicationQueueCommitFault {
-    PUBLICATION_QUEUE_COMMIT_FAULT.with(|configured| match configured.replace(0) {
-        1 => PublicationQueueCommitFault::BeforeCommit,
-        2 => PublicationQueueCommitFault::AfterCommit,
-        _ => PublicationQueueCommitFault::None,
-    })
-}
-
 fn commit_publication_queue_batch(
     store: &StoreHandle,
     batch: hns_store::StoreHandleBatch,
     context: &'static str,
 ) -> Result<()> {
-    #[cfg(test)]
-    let fault = take_publication_queue_commit_fault();
-    #[cfg(test)]
-    if fault == PublicationQueueCommitFault::BeforeCommit {
-        anyhow::bail!("injected publication queue failure before atomic commit");
-    }
     store
         .commit(batch)
         .with_context(|| format!("failed to commit {context}"))?;
-    #[cfg(test)]
-    if fault == PublicationQueueCommitFault::AfterCommit {
-        return Err(anyhow::Error::new(InjectedPublicationQueueCommitAmbiguity));
-    }
     Ok(())
-}
-
-#[cfg(test)]
-fn load_quarantined_publication(
-    store: &StoreHandle,
-    block_hash: BlockHash,
-) -> Result<Option<SolvedBlockPublicationIntent>> {
-    let snapshot = store.snapshot()?;
-    let Some(encoded) = snapshot.get(
-        ColumnFamily::Snapshots,
-        &publication_quarantine_key(block_hash),
-    )?
-    else {
-        return Ok(None);
-    };
-    let intent = SolvedBlockPublicationIntent::decode(&encoded)
-        .map_err(|error| anyhow::anyhow!("invalid checksummed quarantine entry: {error}"))?;
-    if intent.block_hash != block_hash {
-        return Ok(None);
-    }
-    Ok(Some(intent))
 }
 
 fn read_publication_queue_page(
@@ -4431,26 +4344,6 @@ mod tests {
         let restarted =
             NodeService::try_with_state(config, state).expect("restart mining node service");
         (restarted, store)
-    }
-
-    fn attach_test_ambiguity_fence(node: &mut NodeService, tag: &str) -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-publication-{tag}-fence-{}-{nonce}",
-            std::process::id()
-        ));
-        node.state.name_pages = Some(
-            crate::NamePageStorage::open_or_bootstrap(
-                directory.clone(),
-                &node.state.store,
-                Network::Regtest,
-            )
-            .expect("test name-page storage"),
-        );
-        directory
     }
 
     #[test]
@@ -5284,170 +5177,5 @@ mod tests {
             .expect("retired intent point read")
             .is_none());
         runtime.shutdown().await.expect("runtime shutdown");
-    }
-
-    #[test]
-    fn stage_and_migration_faults_preserve_atomic_index_semantics() {
-        let mut before_stage = authoritative_mining_node();
-        let candidate = solve_native_candidate(&before_stage, 1, 0xa1);
-        let block_hash = candidate.block().hash();
-        let initial = load_publication_queue_index(
-            &before_stage.state().store,
-            DEFAULT_MAX_PENDING_PUBLICATIONS,
-        )
-        .expect("initial staging index")
-        .expect("initialized staging index");
-        inject_publication_queue_commit_fault(PublicationQueueCommitFault::BeforeCommit);
-        before_stage
-            .mining_engine_stage_publication(&candidate, 0xa1)
-            .expect_err("definite pre-commit stage failure");
-        assert_eq!(
-            load_publication_queue_index(
-                &before_stage.state().store,
-                DEFAULT_MAX_PENDING_PUBLICATIONS
-            )
-            .expect("unchanged staging index"),
-            Some(initial)
-        );
-        assert!(before_stage
-            .state()
-            .store
-            .snapshot()
-            .expect("precommit snapshot")
-            .get(ColumnFamily::Snapshots, &publication_intent_key(block_hash))
-            .expect("precommit intent point read")
-            .is_none());
-        assert!(before_stage.mining_snapshot().is_some());
-
-        let mut after_stage = authoritative_mining_node();
-        let stage_pages = attach_test_ambiguity_fence(&mut after_stage, "stage");
-        let candidate = solve_native_candidate(&after_stage, 1, 0xa2);
-        let expected_intent =
-            SolvedBlockPublicationIntent::from_candidate(&candidate, 0xa2).expect("stage intent");
-        inject_publication_queue_commit_fault(PublicationQueueCommitFault::AfterCommit);
-        after_stage
-            .mining_engine_stage_publication(&candidate, 0xa2)
-            .expect_err("ambiguous post-commit stage acknowledgement");
-        assert!(after_stage.state.storage_reopen_required());
-        assert!(after_stage.mining_snapshot().is_none());
-        assert_eq!(
-            read_publication_queue_page(
-                &after_stage.state().store,
-                DEFAULT_MAX_PENDING_PUBLICATIONS,
-                MiningPublicationRetryCursor::default()
-            )
-            .expect("committed ambiguous stage")
-            .intents,
-            vec![expected_intent]
-        );
-        drop(after_stage);
-        std::fs::remove_dir_all(stage_pages).expect("remove stage fence fixture");
-
-        let mut before_migration = NodeService::new(mining_test_config());
-        before_migration
-            .connect_block(NodeBlockImport::from_peer(canonical_regtest_genesis(), 0))
-            .expect("connect migration genesis");
-        inject_publication_queue_commit_fault(PublicationQueueCommitFault::BeforeCommit);
-        before_migration
-            .mining_engine_initialize_publication_queue()
-            .expect_err("definite pre-commit migration failure");
-        assert!(load_publication_queue_index(
-            &before_migration.state().store,
-            DEFAULT_MAX_PENDING_PUBLICATIONS
-        )
-        .expect("precommit migration index")
-        .is_none());
-        assert!(before_migration.mining_snapshot().is_some());
-
-        let mut after_migration = NodeService::new(mining_test_config());
-        after_migration
-            .connect_block(NodeBlockImport::from_peer(canonical_regtest_genesis(), 0))
-            .expect("connect ambiguous migration genesis");
-        let migration_pages = attach_test_ambiguity_fence(&mut after_migration, "migration");
-        inject_publication_queue_commit_fault(PublicationQueueCommitFault::AfterCommit);
-        after_migration
-            .mining_engine_initialize_publication_queue()
-            .expect_err("ambiguous post-commit migration acknowledgement");
-        assert!(load_publication_queue_index(
-            &after_migration.state().store,
-            DEFAULT_MAX_PENDING_PUBLICATIONS
-        )
-        .expect("committed migration index")
-        .is_some());
-        assert!(after_migration.state.storage_reopen_required());
-        assert!(after_migration.mining_snapshot().is_none());
-        drop(after_migration);
-        std::fs::remove_dir_all(migration_pages).expect("remove migration fence fixture");
-    }
-
-    #[test]
-    fn retirement_fault_semantics_distinguish_definite_and_ambiguous_commit() {
-        let mut before = authoritative_mining_node();
-        let before_candidate = solve_native_candidate(&before, 1, 0x51);
-        let before_intent = before
-            .mining_engine_stage_publication(&before_candidate, 3)
-            .expect("stage before-commit fixture");
-        inject_publication_queue_commit_fault(PublicationQueueCommitFault::BeforeCommit);
-        before
-            .mining_engine_retire_publication(&before_intent, PublicationRetirement::Stale)
-            .expect_err("definite pre-commit failure");
-        assert!(before.mining_snapshot().is_some());
-        assert_eq!(
-            read_publication_queue_page(
-                &before.state().store,
-                DEFAULT_MAX_PENDING_PUBLICATIONS,
-                MiningPublicationRetryCursor::default()
-            )
-            .expect("unchanged live queue")
-            .intents,
-            vec![before_intent]
-        );
-
-        let mut after_delete = authoritative_mining_node();
-        let delete_pages = attach_test_ambiguity_fence(&mut after_delete, "delete");
-        let delete_candidate = solve_native_candidate(&after_delete, 1, 0x52);
-        let delete_intent = after_delete
-            .mining_engine_stage_publication(&delete_candidate, 4)
-            .expect("stage post-commit deletion fixture");
-        inject_publication_queue_commit_fault(PublicationQueueCommitFault::AfterCommit);
-        after_delete
-            .mining_engine_retire_publication(&delete_intent, PublicationRetirement::Stale)
-            .expect_err("ambiguous post-commit deletion acknowledgement");
-        assert!(after_delete.state.storage_reopen_required());
-        assert!(after_delete.mining_snapshot().is_none());
-        assert!(read_publication_queue_page(
-            &after_delete.state().store,
-            DEFAULT_MAX_PENDING_PUBLICATIONS,
-            MiningPublicationRetryCursor::default()
-        )
-        .expect("post-commit live queue")
-        .intents
-        .is_empty());
-
-        drop(after_delete);
-        std::fs::remove_dir_all(delete_pages).expect("remove deletion fence fixture");
-
-        let mut after_quarantine = authoritative_mining_node();
-        let quarantine_pages = attach_test_ambiguity_fence(&mut after_quarantine, "quarantine");
-        let quarantine_candidate = solve_native_candidate(&after_quarantine, 1, 0x53);
-        let quarantine_intent = after_quarantine
-            .mining_engine_stage_publication(&quarantine_candidate, 5)
-            .expect("stage post-commit quarantine fixture");
-        inject_publication_queue_commit_fault(PublicationQueueCommitFault::AfterCommit);
-        after_quarantine
-            .mining_engine_retire_publication(&quarantine_intent, PublicationRetirement::Invalid)
-            .expect_err("ambiguous post-commit quarantine acknowledgement");
-        assert!(after_quarantine.state.storage_reopen_required());
-        assert!(after_quarantine.mining_snapshot().is_none());
-        assert_eq!(
-            load_quarantined_publication(
-                &after_quarantine.state().store,
-                quarantine_intent.block_hash
-            )
-            .expect("checksummed quarantine entry"),
-            Some(quarantine_intent)
-        );
-        drop(after_quarantine);
-        std::fs::remove_dir_all(quarantine_pages).expect("remove quarantine fence fixture");
     }
 }

@@ -35,7 +35,7 @@ const EXCLUDED_HSD_UTXO_FIELDS: [&str; 1] = ["origin_transaction_version"];
     about = "Export a constant-space semantic state manifest from an offline hsrd database copy"
 )]
 struct Arguments {
-    /// Copied hsrd RocksDB chain directory. The live node database is refused.
+    /// Copied hsrd direct-store chain directory. The live node database is refused.
     #[arg(long)]
     data_dir: PathBuf,
 }
@@ -165,7 +165,7 @@ fn run() -> Result<()> {
     let data_dir = require_audit_copy(&arguments.data_dir)?;
     let store = open_store(&StoreConfig {
         path: data_dir.clone(),
-        backend: StoreBackend::RocksDb,
+        backend: StoreBackend::Direct,
         durability: DurabilityPolicy::Sync,
     })
     .context("failed to open copied hsrd store")?;

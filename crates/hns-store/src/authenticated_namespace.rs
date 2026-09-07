@@ -6,7 +6,7 @@
 //! the atomic publication that installs the replacement. This module provides
 //! that native-store boundary. It deliberately reserves its storage keys from
 //! [`crate::WriteBatch`], requires synchronous durability, and retains
-//! ambiguous RocksDB publication failures behind the store-wide reopen fence.
+//! ambiguous database publication failures behind the store-wide reopen fence.
 //! Acquisition also requires the current storage schema to be initialized.
 //! Once a segment archive is attached, namespace access must use that wrapper;
 //! surviving raw aliases are fenced from this API.
@@ -26,19 +26,17 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use hns_primitives::blake2b_256_many;
 use thiserror::Error;
 
-#[cfg(feature = "rocksdb-backend")]
-use crate::RocksStore;
 use crate::{
     apply_memory_changes, memory_value_at, segment_store_error, BatchOperations, ColumnFamily,
-    DurabilityPolicy, MemoryStore, MemoryStoreState, ReadSnapshot, SegmentArchive, Store,
-    StoreError, StoreHandle, StoreKey,
+    DirectStore, DurabilityPolicy, MemoryStore, MemoryStoreState, ReadSnapshot, SegmentArchive,
+    Store, StoreError, StoreHandle, StoreKey,
 };
 
 /// Maximum canonical bytes retained for one complete authority/replay image.
 ///
 /// HNSR's bounded requester/rendezvous aggregates can approach fourteen MiB;
-/// this ceiling leaves framing room. RocksDB values are first read as pinned
-/// slices and checked against the ceiling before copying into Rust-owned state.
+/// this ceiling leaves framing room. Values are checked against the ceiling
+/// before copying into Rust-owned state.
 pub const AUTHENTICATED_NAMESPACE_MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 
 const CONTROL_KEY_PREFIX: &[u8] = b"authenticated-namespace-control/v1/";
@@ -359,8 +357,7 @@ impl StoreHandle {
     fn authenticated_namespace_owners(&self) -> &SharedNamespaceOwners {
         match self {
             Self::Memory(store) => &store.authenticated_namespaces,
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => &store.authenticated_namespaces,
+            Self::Direct(store) => &store.authenticated_namespaces,
             Self::Archived { inner, .. } => inner.authenticated_namespace_owners(),
         }
     }
@@ -370,8 +367,7 @@ impl StoreHandle {
     ) -> &SharedNamespaceArchiveRegistration {
         match self {
             Self::Memory(store) => &store.authenticated_namespace_archive,
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => &store.authenticated_namespace_archive,
+            Self::Direct(store) => &store.authenticated_namespace_archive,
             Self::Archived { inner, .. } => inner.authenticated_namespace_archive_registration(),
         }
     }
@@ -407,8 +403,7 @@ impl StoreHandle {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.reserve_physical_namespace_epoch(namespace)
             }
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(_) => {
+            Self::Direct(_) => {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.reserve_physical_namespace_epoch(namespace)
             }
@@ -426,8 +421,7 @@ impl StoreHandle {
     ) -> Result<NonZeroU64, AuthenticatedNamespaceError> {
         match self {
             Self::Memory(store) => reserve_memory_namespace_epoch(store, namespace),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => reserve_rocks_namespace_epoch(store, namespace),
+            Self::Direct(store) => reserve_direct_namespace_epoch(store, namespace),
             Self::Archived { .. } => Err(AuthenticatedNamespaceError::ArchiveRegistrationMismatch),
         }
     }
@@ -442,8 +436,7 @@ impl StoreHandle {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.load_physical_namespace_image(namespace)
             }
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(_) => {
+            Self::Direct(_) => {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.load_physical_namespace_image(namespace)
             }
@@ -461,8 +454,7 @@ impl StoreHandle {
     ) -> Result<NamespaceImage, AuthenticatedNamespaceError> {
         match self {
             Self::Memory(store) => load_memory_namespace_image(store, namespace),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => load_rocks_namespace_image(store, namespace),
+            Self::Direct(store) => load_direct_namespace_image(store, namespace),
             Self::Archived { .. } => Err(AuthenticatedNamespaceError::ArchiveRegistrationMismatch),
         }
     }
@@ -487,8 +479,7 @@ impl StoreHandle {
                     proposed,
                 )
             }
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(_) => {
+            Self::Direct(_) => {
                 let _registration = self.lock_namespace_archive_registration(None)?;
                 self.compare_exchange_physical_namespace_image(
                     namespace,
@@ -529,8 +520,7 @@ impl StoreHandle {
                 proposed_revision,
                 proposed,
             ),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => compare_exchange_rocks_namespace(
+            Self::Direct(store) => compare_exchange_direct_namespace(
                 store,
                 namespace,
                 fencing_token,
@@ -1046,33 +1036,24 @@ fn prepare_replacement(
     ))
 }
 
-#[cfg(feature = "rocksdb-backend")]
-fn rocks_namespace_image_locked(
-    store: &RocksStore,
+fn direct_namespace_image_locked(
+    store: &DirectStore,
     namespace: OperationNamespaceId,
 ) -> Result<NamespaceImage, AuthenticatedNamespaceError> {
-    let control_cf = RocksStore::cf(&store.db, ColumnFamily::Meta)?;
-    let state_cf = RocksStore::cf(&store.db, ColumnFamily::Snapshots)?;
-    let schema = store
-        .db
-        .get_pinned_cf(control_cf, crate::MetaKey::SchemaVersion.as_bytes())
-        .map_err(|error| StoreError::Backend(error.to_string()))?;
-    let profile = store
-        .db
-        .get_pinned_cf(control_cf, crate::MetaKey::StorageProfile.as_bytes())
-        .map_err(|error| StoreError::Backend(error.to_string()))?;
-    let name_tree_root = store
-        .db
-        .get_pinned_cf(control_cf, crate::MetaKey::NameTreeRoot.as_bytes())
-        .map_err(|error| StoreError::Backend(error.to_string()))?;
-    let name_tree_commit_root = store
-        .db
-        .get_pinned_cf(control_cf, crate::MetaKey::NameTreeCommitRoot.as_bytes())
-        .map_err(|error| StoreError::Backend(error.to_string()))?;
-    let airdrop_field = store
-        .db
-        .get_pinned_cf(control_cf, crate::MetaKey::AirdropField.as_bytes())
-        .map_err(|error| StoreError::Backend(error.to_string()))?;
+    let snapshot = store.snapshot_unlocked()?;
+    let schema = snapshot.get(ColumnFamily::Meta, crate::MetaKey::SchemaVersion.as_bytes())?;
+    let profile = snapshot.get(
+        ColumnFamily::Meta,
+        crate::MetaKey::StorageProfile.as_bytes(),
+    )?;
+    let name_tree_root =
+        snapshot.get(ColumnFamily::Meta, crate::MetaKey::NameTreeRoot.as_bytes())?;
+    let name_tree_commit_root = snapshot.get(
+        ColumnFamily::Meta,
+        crate::MetaKey::NameTreeCommitRoot.as_bytes(),
+    )?;
+    let airdrop_field =
+        snapshot.get(ColumnFamily::Meta, crate::MetaKey::AirdropField.as_bytes())?;
     validate_initialized_schema_records(
         schema.as_deref(),
         profile.as_deref(),
@@ -1080,10 +1061,7 @@ fn rocks_namespace_image_locked(
         name_tree_commit_root.as_deref(),
         airdrop_field.as_deref(),
     )?;
-    let control = store
-        .db
-        .get_pinned_cf(control_cf, control_key(namespace))
-        .map_err(|error| StoreError::Backend(error.to_string()))?;
+    let control = snapshot.get(ColumnFamily::Meta, &control_key(namespace))?;
     if control
         .as_ref()
         .is_some_and(|encoded| encoded.len() != CONTROL_BYTES)
@@ -1092,28 +1070,20 @@ fn rocks_namespace_image_locked(
             "control record has the wrong size",
         ));
     }
-    let state = store
-        .db
-        .get_pinned_cf(state_cf, state_key(namespace))
-        .map_err(|error| StoreError::Backend(error.to_string()))?;
+    let state = snapshot.get(ColumnFamily::Snapshots, &state_key(namespace))?;
     if let Some(encoded) = state.as_ref() {
         validate_proposed_state(encoded)?;
     }
-    NamespaceImage::decode(
-        namespace,
-        control.map(|encoded| encoded.as_ref().to_vec()),
-        state.map(|encoded| encoded.as_ref().to_vec()),
-    )
+    NamespaceImage::decode(namespace, control, state)
 }
 
-#[cfg(feature = "rocksdb-backend")]
-fn reserve_rocks_namespace_epoch(
-    store: &RocksStore,
+fn reserve_direct_namespace_epoch(
+    store: &DirectStore,
     namespace: OperationNamespaceId,
 ) -> Result<NonZeroU64, AuthenticatedNamespaceError> {
     let _publication = store.lock_publication()?;
     store.ensure_operational()?;
-    let image = rocks_namespace_image_locked(store, namespace)?;
+    let image = direct_namespace_image_locked(store, namespace)?;
     let token = next_epoch(image.control)?;
     let next_control = match image.control {
         Some(control) => NamespaceControl {
@@ -1131,19 +1101,17 @@ fn reserve_rocks_namespace_epoch(
     Ok(token)
 }
 
-#[cfg(feature = "rocksdb-backend")]
-fn load_rocks_namespace_image(
-    store: &RocksStore,
+fn load_direct_namespace_image(
+    store: &DirectStore,
     namespace: OperationNamespaceId,
 ) -> Result<NamespaceImage, AuthenticatedNamespaceError> {
     let _publication = store.lock_publication()?;
     store.ensure_operational()?;
-    rocks_namespace_image_locked(store, namespace)
+    direct_namespace_image_locked(store, namespace)
 }
 
-#[cfg(feature = "rocksdb-backend")]
-fn compare_exchange_rocks_namespace(
-    store: &RocksStore,
+fn compare_exchange_direct_namespace(
+    store: &DirectStore,
     namespace: OperationNamespaceId,
     fencing_token: NonZeroU64,
     expectation: StateExpectation<'_>,
@@ -1152,7 +1120,7 @@ fn compare_exchange_rocks_namespace(
 ) -> Result<AuthenticatedNamespaceWrite, AuthenticatedNamespaceError> {
     let _publication = store.lock_publication()?;
     store.ensure_operational()?;
-    let image = rocks_namespace_image_locked(store, namespace)?;
+    let image = direct_namespace_image_locked(store, namespace)?;
     let control = image.control.ok_or(AuthenticatedNamespaceError::Corrupt(
         "held namespace is missing its control record",
     ))?;
@@ -1186,20 +1154,6 @@ mod tests {
     use super::*;
     use crate::{ReadSnapshot, Store, WriteBatch};
 
-    #[cfg(feature = "rocksdb-backend")]
-    fn temporary_directory(label: &str) -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "hsrd-authenticated-namespace-{label}-{}-{nonce}",
-            std::process::id()
-        ));
-        assert!(!path.exists(), "temporary fixture unexpectedly exists");
-        path
-    }
-
     fn directory_image(
         directory: &std::path::Path,
     ) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
@@ -1218,6 +1172,17 @@ mod tests {
 
     fn namespace(byte: u8) -> OperationNamespaceId {
         OperationNamespaceId::new([byte; 32]).expect("nonzero namespace")
+    }
+
+    fn direct_test_directory(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "hsrd-direct-namespace-{label}-{}-{nonce}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -1306,6 +1271,42 @@ mod tests {
                 minimum_revision: 1,
             }
         );
+    }
+
+    #[test]
+    fn direct_namespace_state_and_fencing_epoch_survive_process_reopen() {
+        let path = direct_test_directory("reopen");
+        let key = namespace(31);
+        {
+            let store = StoreHandle::Direct(DirectStore::open(&path).expect("open direct store"));
+            crate::initialize_schema(&store).expect("initialize schema");
+            let lease = store
+                .acquire_authenticated_namespace(key)
+                .expect("acquire namespace");
+            assert_eq!(lease.fencing_token().get(), 1);
+            assert_eq!(
+                lease
+                    .compare_exchange_complete_state(StateExpectation::Absent, 7, b"durable")
+                    .expect("create durable state"),
+                AuthenticatedNamespaceWrite::Committed
+            );
+        }
+
+        {
+            let store = StoreHandle::Direct(DirectStore::open(&path).expect("reopen direct store"));
+            let lease = store
+                .acquire_authenticated_namespace(key)
+                .expect("reacquire namespace");
+            assert_eq!(lease.fencing_token().get(), 2);
+            assert_eq!(
+                lease.load_complete_state().expect("load durable state"),
+                AuthenticatedNamespaceState::Initialized {
+                    encoded: b"durable".to_vec(),
+                    minimum_revision: 7,
+                }
+            );
+        }
+        std::fs::remove_dir_all(path).expect("remove direct namespace fixture");
     }
 
     #[test]
@@ -1781,315 +1782,5 @@ mod tests {
         drop(reattached);
         drop(raw);
         std::fs::remove_dir_all(directory).expect("remove archive fence fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_namespace_persists_state_and_fencing_epoch_across_true_reopen() {
-        let path = temporary_directory("reopen");
-        let key = namespace(13);
-        let rocks = RocksStore::open(&path).expect("open RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-        crate::initialize_schema(&store).expect("initialize schema");
-        let lease = store
-            .acquire_authenticated_namespace(key)
-            .expect("acquire namespace");
-        assert_eq!(lease.fencing_token().get(), 1);
-        assert_eq!(
-            lease
-                .compare_exchange_complete_state(StateExpectation::Absent, 0, b"durable-zero")
-                .expect("create durable state"),
-            AuthenticatedNamespaceWrite::Committed
-        );
-        drop(lease);
-        drop(store);
-        drop(rocks);
-
-        let rocks = RocksStore::open(&path).expect("truly reopen RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-        let lease = store
-            .acquire_authenticated_namespace(key)
-            .expect("reacquire namespace");
-        assert_eq!(lease.fencing_token().get(), 2);
-        assert_eq!(
-            lease.load_complete_state().expect("load reopened state"),
-            AuthenticatedNamespaceState::Initialized {
-                encoded: b"durable-zero".to_vec(),
-                minimum_revision: 0,
-            }
-        );
-        drop(lease);
-        drop(store);
-        drop(rocks);
-        std::fs::remove_dir_all(path).expect("remove RocksDB reopen fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_archive_manifests_persistently_require_archived_namespace_handle() {
-        let root = temporary_directory("archive-reopen");
-        let chain = root.join("chain");
-        let segments = root.join("segments");
-        let key = namespace(23);
-        let rocks = RocksStore::open(&chain).expect("open RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-        crate::initialize_schema(&store).expect("initialize schema");
-        let archived = store
-            .with_segment_archive(segments.clone())
-            .expect("attach archive");
-        let lease = archived
-            .acquire_authenticated_namespace(key)
-            .expect("acquire archived namespace");
-        assert_eq!(lease.fencing_token().get(), 1);
-        drop(lease);
-        drop(archived);
-        drop(rocks);
-
-        let rocks = RocksStore::open(&chain).expect("truly reopen RocksDB");
-        let raw = StoreHandle::Rocks(rocks.clone());
-        assert!(matches!(
-            raw.acquire_authenticated_namespace(key),
-            Err(AuthenticatedNamespaceError::ArchiveHandleRequired)
-        ));
-        let archived = raw
-            .with_segment_archive(segments)
-            .expect("recover archive wrapper");
-        let lease = archived
-            .acquire_authenticated_namespace(key)
-            .expect("acquire after archive recovery");
-        assert_eq!(lease.fencing_token().get(), 2);
-        drop(lease);
-        drop(archived);
-        drop(rocks);
-        std::fs::remove_dir_all(root).expect("remove archive-reopen fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn archived_rocks_namespace_ambiguous_write_fences_and_recovers() {
-        let root = temporary_directory("archived-ambiguous");
-        let chain = root.join("chain");
-        let segments = root.join("segments");
-        let key = namespace(26);
-        let rocks = RocksStore::open(&chain).expect("open RocksDB");
-        let raw = StoreHandle::Rocks(rocks.clone());
-        crate::initialize_schema(&raw).expect("initialize schema");
-        let archived = raw
-            .with_segment_archive(segments.clone())
-            .expect("attach archive");
-        let lease = archived
-            .acquire_authenticated_namespace(key)
-            .expect("acquire archived namespace");
-        rocks.inject_next_commit_fault(crate::RocksCommitFault::AfterWrite);
-        assert!(lease
-            .compare_exchange_complete_state(StateExpectation::Absent, 0, b"archived-new")
-            .is_err());
-        assert!(archived.reopen_required());
-        assert!(rocks.reopen_required());
-        assert!(lease.load_complete_state().is_err());
-        drop(lease);
-        drop(archived);
-        drop(rocks);
-
-        let rocks = RocksStore::open(&chain).expect("truly reopen RocksDB");
-        let archived = StoreHandle::Rocks(rocks.clone())
-            .with_segment_archive(segments)
-            .expect("recover archive");
-        let lease = archived
-            .acquire_authenticated_namespace(key)
-            .expect("acquire recovered namespace");
-        assert_eq!(lease.fencing_token().get(), 2);
-        assert_eq!(
-            lease.load_complete_state().expect("resolve durable state"),
-            AuthenticatedNamespaceState::Initialized {
-                encoded: b"archived-new".to_vec(),
-                minimum_revision: 0,
-            }
-        );
-        drop(lease);
-        drop(archived);
-        drop(rocks);
-        std::fs::remove_dir_all(root).expect("remove archived ambiguity fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_namespace_rejects_wal_and_authoritatively_rechecks_reserved_keys() {
-        let wal_path = temporary_directory("wal");
-        let key = namespace(14);
-        let rocks = RocksStore::open_with_durability(&wal_path, DurabilityPolicy::Wal)
-            .expect("open WAL RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-        assert!(matches!(
-            store.acquire_authenticated_namespace(key),
-            Err(AuthenticatedNamespaceError::NonDurableStore)
-        ));
-        assert_eq!(
-            rocks
-                .snapshot()
-                .expect("WAL snapshot")
-                .get(ColumnFamily::Meta, &control_key(key))
-                .expect("WAL control read"),
-            None
-        );
-        drop(store);
-        drop(rocks);
-        std::fs::remove_dir_all(wal_path).expect("remove WAL fixture");
-
-        let path = temporary_directory("reserved");
-        let rocks = RocksStore::open(&path).expect("open RocksDB");
-        let mut operations = BatchOperations::new();
-        operations.insert(
-            StoreKey::new(ColumnFamily::Snapshots, &state_key(key)),
-            Some(b"bypass".to_vec()),
-        );
-        let batch = crate::RocksBatch {
-            operations,
-            checkpoint: None,
-        };
-        assert!(rocks.commit(batch).is_err());
-        assert_eq!(
-            rocks
-                .snapshot()
-                .expect("reserved snapshot")
-                .get(ColumnFamily::Snapshots, &state_key(key))
-                .expect("reserved state read"),
-            None
-        );
-        drop(rocks);
-        std::fs::remove_dir_all(path).expect("remove reserved-key fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_namespace_known_rejection_keeps_lease_retryable() {
-        let path = temporary_directory("before-write");
-        let key = namespace(15);
-        let rocks = RocksStore::open(&path).expect("open RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-
-        crate::initialize_schema(&store).expect("initialize fault fixture schema");
-
-        rocks.inject_next_commit_fault(crate::RocksCommitFault::BeforeWrite);
-        assert!(store.acquire_authenticated_namespace(key).is_err());
-        assert!(!store.reopen_required());
-        let lease = store
-            .acquire_authenticated_namespace(key)
-            .expect("retry known-rejected acquisition");
-        assert_eq!(lease.fencing_token().get(), 1);
-
-        rocks.inject_next_commit_fault(crate::RocksCommitFault::BeforeWrite);
-        assert!(lease
-            .compare_exchange_complete_state(StateExpectation::Absent, 0, b"retryable")
-            .is_err());
-        assert!(!store.reopen_required());
-        assert_eq!(
-            lease.load_complete_state().expect("load rejected state"),
-            AuthenticatedNamespaceState::NeverInitialized
-        );
-        assert_eq!(
-            lease
-                .compare_exchange_complete_state(StateExpectation::Absent, 0, b"retryable")
-                .expect("retry known-rejected publication"),
-            AuthenticatedNamespaceWrite::Committed
-        );
-        drop(lease);
-        drop(store);
-        drop(rocks);
-        std::fs::remove_dir_all(path).expect("remove known-rejection fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_namespace_ambiguous_publication_fences_every_clone_until_reopen() {
-        let path = temporary_directory("ambiguous-publication");
-        let key = namespace(16);
-        let rocks = RocksStore::open(&path).expect("open RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-        let clone = store.clone();
-        crate::initialize_schema(&store).expect("initialize fault fixture schema");
-        let lease = store
-            .acquire_authenticated_namespace(key)
-            .expect("acquire namespace");
-        rocks.inject_next_commit_fault(crate::RocksCommitFault::AfterWrite);
-        assert!(lease
-            .compare_exchange_complete_state(StateExpectation::Absent, 0, b"committed-new")
-            .is_err());
-        assert!(store.reopen_required());
-        assert!(clone.reopen_required());
-        assert!(lease.load_complete_state().is_err());
-        assert!(clone
-            .acquire_authenticated_namespace(namespace(17))
-            .is_err());
-        drop(lease);
-        drop(clone);
-        drop(store);
-        drop(rocks);
-
-        let rocks = RocksStore::open(&path).expect("truly reopen RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-        let lease = store
-            .acquire_authenticated_namespace(key)
-            .expect("acquire after ambiguous publication");
-        assert_eq!(lease.fencing_token().get(), 2);
-        assert_eq!(
-            lease
-                .load_complete_state()
-                .expect("resolve durable outcome"),
-            AuthenticatedNamespaceState::Initialized {
-                encoded: b"committed-new".to_vec(),
-                minimum_revision: 0,
-            }
-        );
-        assert_eq!(
-            lease
-                .compare_exchange_complete_state(StateExpectation::Absent, 0, b"committed-new",)
-                .expect("idempotently resolve committed proposal"),
-            AuthenticatedNamespaceWrite::AlreadyCommitted
-        );
-        drop(lease);
-        drop(store);
-        drop(rocks);
-        std::fs::remove_dir_all(path).expect("remove ambiguous-publication fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_namespace_ambiguous_acquisition_exposes_no_lease_and_burns_epoch() {
-        let path = temporary_directory("ambiguous-acquisition");
-        let key = namespace(18);
-        let rocks = RocksStore::open(&path).expect("open RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-        crate::initialize_schema(&store).expect("initialize fault fixture schema");
-        rocks.inject_next_commit_fault(crate::RocksCommitFault::AfterWrite);
-        assert!(store.acquire_authenticated_namespace(key).is_err());
-        assert!(store.reopen_required());
-        assert!(
-            !rocks
-                .authenticated_namespaces
-                .lock()
-                .expect("owner registry")
-                .contains_key(&key),
-            "ambiguous acquisition must not expose or retain a live lease"
-        );
-        drop(store);
-        drop(rocks);
-
-        let rocks = RocksStore::open(&path).expect("truly reopen RocksDB");
-        let store = StoreHandle::Rocks(rocks.clone());
-        let lease = store
-            .acquire_authenticated_namespace(key)
-            .expect("acquire after ambiguous reservation");
-        assert_eq!(lease.fencing_token().get(), 2);
-        assert_eq!(
-            lease
-                .load_complete_state()
-                .expect("load uninitialized state"),
-            AuthenticatedNamespaceState::NeverInitialized
-        );
-        drop(lease);
-        drop(store);
-        drop(rocks);
-        std::fs::remove_dir_all(path).expect("remove ambiguous-acquisition fixture");
     }
 }

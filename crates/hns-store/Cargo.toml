@@ -6,14 +6,10 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
-[features]
-default = ["rocksdb-backend"]
-rocksdb-backend = ["dep:rocksdb"]
-
 [dependencies]
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 hns-primitives = { path = "../hns-primitives" }
 hns-urkel = { path = "../hns-urkel" }
-rocksdb = { version = "0.24", optional = true }
+redb = "=4.2.0"
 serde.workspace = true
 thiserror.workspace = true

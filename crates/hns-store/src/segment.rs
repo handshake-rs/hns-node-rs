@@ -178,7 +178,7 @@ pub struct SegmentScan {
     pub torn_tail: bool,
 }
 
-/// The RocksDB state batch stores this authoritative durable tail beside root
+/// The database transaction stores this authoritative durable tail beside root
 /// locators. Segment bytes are synced first. Bytes beyond `durable_bytes` are
 /// therefore unreachable crash residue and may be truncated during recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,6 +239,89 @@ pub struct SegmentFileInspection {
     pub valid_bytes: u64,
     pub file_bytes: u64,
     pub torn_tail: bool,
+}
+
+/// Bounded, checksumming reader for one immutable segment file.
+///
+/// Unlike [`scan_segment_prefix`], this reader never materializes the complete
+/// file. It owns at most one protocol-limited frame and its decoded payload at
+/// a time, so a multi-gigabyte historical block corpus can feed fresh-state
+/// reconstruction with `O(maximum frame bytes)` working memory. The caller
+/// supplies the generation and segment identity from the filename or a trusted
+/// manifest; they are carried into each returned locator and are not inferred
+/// from unauthenticated file contents.
+#[derive(Debug)]
+pub struct SegmentFileReader {
+    file: File,
+    file_bytes: u64,
+    offset: u64,
+    generation: u64,
+    segment: u32,
+    expected_kind: SegmentKind,
+}
+
+impl SegmentFileReader {
+    pub fn open(
+        path: impl AsRef<Path>,
+        generation: u64,
+        segment: u32,
+        expected_kind: SegmentKind,
+    ) -> Result<Self, SegmentError> {
+        let mut file = File::open(path).map_err(segment_io)?;
+        let file_bytes = file.metadata().map_err(segment_io)?.len();
+        file.seek(SeekFrom::Start(0)).map_err(segment_io)?;
+        Ok(Self {
+            file,
+            file_bytes,
+            offset: 0,
+            generation,
+            segment,
+            expected_kind,
+        })
+    }
+
+    pub const fn file_bytes(&self) -> u64 {
+        self.file_bytes
+    }
+
+    pub const fn consumed_bytes(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn next_record(&mut self) -> Result<Option<(SegmentLocator, SegmentRecord)>, SegmentError> {
+        if self.offset == self.file_bytes {
+            return Ok(None);
+        }
+        let remaining = self
+            .file_bytes
+            .checked_sub(self.offset)
+            .ok_or(SegmentError::LocatorOverflow)?;
+        let encoded =
+            read_next_frame(&mut self.file, remaining)?.ok_or_else(|| SegmentError::Truncated {
+                required: 12,
+                available: usize::try_from(remaining).unwrap_or(usize::MAX),
+            })?;
+        let (record, frame_length) = decode_segment_record(&encoded)?;
+        if record.kind != self.expected_kind {
+            return Err(SegmentError::ValueLocatorKind {
+                expected: self.expected_kind,
+                actual: record.kind,
+            });
+        }
+        let frame_length =
+            u32::try_from(frame_length).map_err(|_| SegmentError::LengthOverflow(frame_length))?;
+        let locator = SegmentLocator {
+            generation: self.generation,
+            segment: self.segment,
+            offset: self.offset,
+            frame_length,
+        };
+        self.offset = self
+            .offset
+            .checked_add(u64::from(frame_length))
+            .ok_or(SegmentError::LocatorOverflow)?;
+        Ok(Some((locator, record)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -389,7 +472,7 @@ impl SegmentAppender {
     }
 
     /// Open only when the file ends at the tail committed in the authoritative
-    /// RocksDB manifest. Recovery must explicitly remove any orphan or torn
+    /// database manifest. Recovery must explicitly remove any orphan or torn
     /// suffix first.
     pub fn open_at_committed_tail(
         path: impl AsRef<Path>,
@@ -441,7 +524,7 @@ impl SegmentAppender {
         Ok(locator)
     }
 
-    /// Sync appended frames before publishing this tail in a RocksDB state
+    /// Sync appended frames before publishing this tail in a database state
     /// transaction. The returned manifest is not authoritative until that
     /// transaction commits.
     pub fn sync_data(&mut self) -> Result<SegmentManifest, SegmentError> {
@@ -508,8 +591,6 @@ pub struct SegmentArchive {
     commit_outcome_uncertain: AtomicBool,
     writer: Mutex<SegmentArchiveWriter>,
     readers: Mutex<SegmentReaderCache>,
-    #[cfg(all(test, feature = "rocksdb-backend"))]
-    poison_readers_on_install: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -575,8 +656,6 @@ impl SegmentArchive {
             commit_outcome_uncertain: AtomicBool::new(false),
             writer: Mutex::new(SegmentArchiveWriter { block, undo }),
             readers: Mutex::new(SegmentReaderCache::default()),
-            #[cfg(all(test, feature = "rocksdb-backend"))]
-            poison_readers_on_install: AtomicBool::new(false),
         })
     }
 
@@ -594,8 +673,6 @@ impl SegmentArchive {
             commit_outcome_uncertain: AtomicBool::new(false),
             writer: Mutex::new(SegmentArchiveWriter { block, undo }),
             readers: Mutex::new(SegmentReaderCache::default()),
-            #[cfg(all(test, feature = "rocksdb-backend"))]
-            poison_readers_on_install: AtomicBool::new(false),
         })
     }
 
@@ -638,12 +715,6 @@ impl SegmentArchive {
     /// and only then remove the non-authoritative generation.
     pub(crate) fn mark_commit_outcome_uncertain(&self) {
         self.commit_outcome_uncertain.store(true, Ordering::Release);
-    }
-
-    #[cfg(all(test, feature = "rocksdb-backend"))]
-    pub(crate) fn inject_next_install_reader_poison(&self) {
-        self.poison_readers_on_install
-            .store(true, Ordering::Release);
     }
 
     pub(crate) fn prepare_locked(
@@ -887,21 +958,6 @@ impl SegmentArchive {
         };
         *writer = rewrite.writer;
         let installed = (|| {
-            #[cfg(all(test, feature = "rocksdb-backend"))]
-            if self.poison_readers_on_install.swap(false, Ordering::AcqRel) {
-                std::thread::scope(|scope| {
-                    let readers = &self.readers;
-                    let poisoned = scope
-                        .spawn(move || {
-                            let _reader_guard =
-                                readers.lock().expect("reader cache lock before injection");
-                            panic!("inject post-commit reader-cache poison");
-                        })
-                        .join()
-                        .is_err();
-                    assert!(poisoned, "reader-cache poison injection did not panic");
-                });
-            }
             self.readers
                 .lock()
                 .map_err(|_| SegmentError::Poisoned)?
@@ -1018,7 +1074,7 @@ fn recover_archive_channel(
     kind: SegmentKind,
     manifest: SegmentManifest,
 ) -> Result<ArchiveChannel, SegmentError> {
-    // The RocksDB manifest is the atomic publication point for generation
+    // The database manifest is the atomic publication point for generation
     // rewrites. Any other generation is either pre-commit crash residue or a
     // post-commit predecessor and is safe to remove during exclusive reopen.
     remove_other_archive_generations(directory, kind, manifest.generation)?;
@@ -1710,7 +1766,7 @@ fn inspect_segment_file_with_scrub_budget(
 
 /// Validate the authoritative prefix, then discard any complete-or-torn
 /// uncommitted suffix. The caller supplies `committed_bytes` only from a
-/// checksum-verified manifest loaded from the atomic RocksDB state batch.
+/// checksum-verified manifest loaded from the atomic database transaction.
 pub fn truncate_segment_to_committed_tail(
     path: impl AsRef<Path>,
     committed_bytes: u64,
@@ -1983,6 +2039,52 @@ mod tests {
             .expect("prepare payload");
         writer.commit_prepared(&prepared);
         prepared.locators[0]
+    }
+
+    #[test]
+    fn file_reader_streams_authenticated_frames_with_bounded_state() {
+        let path = test_file();
+        let first = record(&[0x11; 37]);
+        let mut second = record(&[0x22; 91]);
+        second.key = [0x24; 32];
+        let first_encoded = encode_segment_record(&first).expect("first frame");
+        let second_encoded = encode_segment_record(&second).expect("second frame");
+        let mut encoded = first_encoded.clone();
+        encoded.extend_from_slice(&second_encoded);
+        fs::write(&path, &encoded).expect("write fixture");
+
+        let mut reader = SegmentFileReader::open(&path, 9, 4, SegmentKind::Block).expect("reader");
+        assert_eq!(reader.file_bytes(), encoded.len() as u64);
+        let (first_locator, first_read) = reader.next_record().expect("read first").expect("first");
+        assert_eq!(first_read, first);
+        assert_eq!(first_locator.generation, 9);
+        assert_eq!(first_locator.segment, 4);
+        assert_eq!(first_locator.offset, 0);
+        assert_eq!(first_locator.frame_length as usize, first_encoded.len());
+        assert_eq!(reader.consumed_bytes(), first_encoded.len() as u64);
+
+        let (second_locator, second_read) =
+            reader.next_record().expect("read second").expect("second");
+        assert_eq!(second_read, second);
+        assert_eq!(second_locator.offset, first_encoded.len() as u64);
+        assert_eq!(reader.consumed_bytes(), encoded.len() as u64);
+        assert!(reader.next_record().expect("end").is_none());
+
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn file_reader_rejects_torn_tail() {
+        let path = test_file();
+        let mut encoded = encode_segment_record(&record(&[0x33; 64])).expect("frame");
+        encoded.pop();
+        fs::write(&path, encoded).expect("write fixture");
+        let mut reader = SegmentFileReader::open(&path, 1, 0, SegmentKind::Block).expect("reader");
+        assert!(matches!(
+            reader.next_record(),
+            Err(SegmentError::Truncated { .. })
+        ));
+        fs::remove_file(path).expect("remove fixture");
     }
 
     #[test]

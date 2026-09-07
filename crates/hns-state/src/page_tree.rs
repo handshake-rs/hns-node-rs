@@ -70,7 +70,7 @@ const NAME_PAGE_ROOT_RECORD_BYTES: usize = NAME_PAGE_ROOT_RECORD_BODY_BYTES + 32
 pub const NAME_PAGE_ROOT_PREFIX: &[u8] = b"name-page-root/v1/";
 // A bootstrap task advances by one record per round. Keep two complete rounds
 // inside the decoded-page cache so a parent page is not evicted while its
-// children are visited. A much wider frontier improves RocksDB MultiGet batch
+// children are visited. A much wider frontier improves database multi-get batch
 // size, but page-backed generation compaction then rereads the same immutable
 // pages after every cache rotation.
 const NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES: usize = DEFAULT_PAGE_CACHE_PAGES / 2;
@@ -2862,7 +2862,7 @@ impl NamePageTreeReader {
     ///
     /// Root locators are normally published atomically with page appends. This
     /// bounded-memory path exists for offline recovery when the page bytes
-    /// survived but their small RocksDB locator did not. A returned locator is
+    /// survived but their small database locator did not. A returned locator is
     /// content-hash checked and its child addresses must point backward.
     pub fn locate_record(
         &self,

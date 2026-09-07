@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod authenticated_namespace;
+mod direct;
 mod name_page;
 mod segment;
+
+pub use direct::{DirectBatch, DirectSnapshot, DirectStore};
 
 pub use authenticated_namespace::{
     AuthenticatedNamespaceError, AuthenticatedNamespaceLease, AuthenticatedNamespaceState,
@@ -26,8 +29,8 @@ pub use segment::{
     decode_segment_record, decode_segment_record_ref, encode_segment_record, inspect_segment_file,
     plan_segment_page_reads, scan_segment_prefix, truncate_segment_to_committed_tail,
     SegmentAppender, SegmentArchive, SegmentArchiveScrub, SegmentArchiveScrubLimits,
-    SegmentChannelScrub, SegmentError, SegmentFileInspection, SegmentKind, SegmentLocator,
-    SegmentManifest, SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan,
+    SegmentChannelScrub, SegmentError, SegmentFileInspection, SegmentFileReader, SegmentKind,
+    SegmentLocator, SegmentManifest, SegmentPageRead, SegmentRecord, SegmentRecordRef, SegmentScan,
     SegmentValueLocator, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES,
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS,
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS, SEGMENT_MAX_HINTS, SEGMENT_PAGE_BYTES,
@@ -46,17 +49,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(all(test, feature = "rocksdb-backend"))]
-use std::sync::atomic::AtomicU8;
-#[cfg(feature = "rocksdb-backend")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "rocksdb-backend")]
-use std::sync::Mutex;
-
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 20;
-/// Last schema whose RocksDB backend colocated the global transaction index,
+pub const SCHEMA_VERSION: u32 = 21;
+/// Last legacy schema that colocated the global transaction index,
 /// immutable wallet history, and mutable wallet state in `tx_index`.
 pub const MIXED_INDEX_SCHEMA_VERSION: u32 = 19;
 pub const LEGACY_SCHEMA_VERSION: u32 = 18;
@@ -65,15 +61,11 @@ pub const PRE_INTERVAL_SCHEMA_VERSION: u32 = 16;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v16";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-direct-v1";
 pub const MIXED_INDEX_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v15";
 /// Persistent compatibility flag for databases that can still contain v19
 /// wallet rows in the old mixed `tx_index` column family.
 pub const MIXED_INDEX_FALLBACK_REQUIRED_KEY: &[u8] = b"mixed-index-fallback-required/v1";
-#[cfg(feature = "rocksdb-backend")]
-const WALLET_INDEX_PREFIX: &[u8] = b"wallet-index/v1/";
-#[cfg(feature = "rocksdb-backend")]
-const WALLET_HISTORY_PREFIX: &[u8] = b"wallet-index/v1/history/";
 pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v14";
 pub const INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
 pub const PRE_INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
@@ -100,7 +92,7 @@ pub const SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_PUBLICATION_BYTES: u64 = 256 * 1
 pub const SEGMENT_COMPACTION_DEFAULT_FILESYSTEM_RESERVE_BYTES: u64 = 10_000_000_000;
 pub const SEGMENT_COMPACTION_DEFAULT_MAX_ELAPSED: Duration = Duration::from_secs(4 * 60 * 60);
 const SEGMENT_COMPACTION_BATCH_OPERATION_OVERHEAD_BYTES: u64 = 64;
-const SEGMENT_COMPACTION_ROCKS_TEMPORARY_MULTIPLIER: u64 = 2;
+const SEGMENT_COMPACTION_DATABASE_TEMPORARY_MULTIPLIER: u64 = 2;
 const SNAPSHOT_EMPTY_PROBE_BYTES: usize = 4 * 1024;
 // A raw archived value is moved into an `ArchivePayload` before its framed
 // encoding is built. Charge the complete key/value representation once even
@@ -136,55 +128,6 @@ const ARCHIVE_MANIFEST_ENCODED_BYTES: usize = 8 + 4 + 8 + 4 + 8 + 32;
 /// followed by 1,358 faucet positions.
 pub const AIRDROP_FIELD_BITS: usize = 217_557;
 pub const AIRDROP_FIELD_BYTES: usize = AIRDROP_FIELD_BITS.div_ceil(8);
-
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_POINT_CACHE_BYTES: usize = 512 * 1024 * 1024;
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_BULK_CACHE_BYTES: usize = 32 * 1024 * 1024;
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_BLOOM_BITS_PER_KEY: f64 = 10.0;
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_BACKGROUND_JOBS: i32 = 4;
-/// Bound aggregate memtable memory across all column families while leaving
-/// enough room for write-heavy state and index families to merge immutable
-/// memtables before flushing. The node's active-state staging budget is
-/// separately bounded, so this keeps peak IBD memory predictable.
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_DB_WRITE_BUFFER_BYTES: usize = 768 * 1024 * 1024;
-/// Bound aggregate WAL retention across all column families. Without an
-/// explicit limit RocksDB derives the allowance from every column family's
-/// write buffers; a mainnet replay retained more than 4 GiB of WAL files. The
-/// ceiling must also be large enough not to force sub-memtable flushes across
-/// every dirty column family during bulk active-chain replay.
-#[cfg(feature = "rocksdb-backend")]
-pub const ROCKS_MAX_TOTAL_WAL_BYTES: u64 = 1024 * 1024 * 1024;
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_BULK_BLOCK_BYTES: usize = 32 * 1024;
-/// The transaction/wallet indexes and consensus UTXO set receive dense IBD
-/// writes. Mutable families also receive repeated puts and deletes in the same
-/// key ranges. Merging two larger memtables removes more of that churn before
-/// it reaches the LSM tree, while three buffers still leave one writable
-/// memtable during a paired flush.
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_UTXO_WRITE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_UTXO_MAX_WRITE_BUFFERS: i32 = 3;
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_UTXO_MIN_WRITE_BUFFERS_TO_MERGE: i32 = 2;
-/// Match the target SST size to a paired UTXO memtable flush. This reduces
-/// file count and overlap bookkeeping without creating multi-gigabyte files.
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_UTXO_TARGET_FILE_BYTES: u64 = 256 * 1024 * 1024;
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_UTXO_LEVEL_BASE_BYTES: u64 = 1024 * 1024 * 1024;
-/// The linked RocksDB archive has no coroutine support, so one native
-/// BatchedMultiGet cannot overlap reads across SST levels. Large immutable
-/// snapshot reads use a fixed number of scoped callers instead; smaller reads
-/// stay serial to avoid thread startup and result-join overhead.
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_BATCHED_MULTI_GET_PARALLELISM: usize = 4;
-#[cfg(feature = "rocksdb-backend")]
-const ROCKS_BATCHED_MULTI_GET_PARALLEL_THRESHOLD: usize = 1_024;
 
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
 pub type PrefixVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
@@ -223,16 +166,16 @@ pub struct PrefixScanPage {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum StoreBackend {
-    RocksDb,
+    Direct,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DurabilityPolicy {
-    /// Keep the RocksDB WAL enabled and fsync the write before returning.
+    /// Publish the transaction and fsync it before returning.
     #[default]
     Sync,
-    /// Keep the WAL enabled but allow the operating system to schedule fsync.
+    /// Publish atomically but allow the operating system to schedule fsync.
     Wal,
 }
 
@@ -1498,7 +1441,7 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
             }
             drop(snapshot);
             if mixed_index_upgrade {
-                // v20 changes only RocksDB placement. Reads retain an exact
+                // v20 changed only legacy database placement. Reads retain an exact
                 // fallback to v19's mixed family, while every touched wallet
                 // row is atomically moved to its new family. Updating these
                 // markers after all durable bindings validate makes the
@@ -1627,27 +1570,15 @@ pub fn mark_clean_shutdown<S: Store>(store: &S) -> Result<(), StoreError> {
 
 pub fn open_store(config: &StoreConfig) -> Result<StoreHandle, StoreError> {
     match config.backend {
-        StoreBackend::RocksDb => {
-            #[cfg(feature = "rocksdb-backend")]
-            {
-                RocksStore::open_with_durability(&config.path, config.durability)
-                    .map(StoreHandle::Rocks)
-            }
-
-            #[cfg(not(feature = "rocksdb-backend"))]
-            {
-                let _ = &config.path;
-                Err(StoreError::FeatureDisabled("rocksdb-backend"))
-            }
-        }
+        StoreBackend::Direct => DirectStore::open_with_durability(&config.path, config.durability)
+            .map(StoreHandle::Direct),
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum StoreHandle {
     Memory(MemoryStore),
-    #[cfg(feature = "rocksdb-backend")]
-    Rocks(RocksStore),
+    Direct(DirectStore),
     Archived {
         inner: Box<StoreHandle>,
         archive: Arc<SegmentArchive>,
@@ -1680,7 +1611,7 @@ pub struct SegmentCompactionLimits {
     /// generation.
     pub max_live_frame_bytes: u64,
     /// Maximum combined key/locator bytes in the final atomic publication
-    /// batch. RocksDB-internal WriteBatch overhead is additional and small.
+    /// batch. Backend-internal transaction overhead is additional and small.
     pub max_atomic_locator_bytes: u64,
     /// Record and key/value byte bounds for each immutable-snapshot iterator
     /// page used while preparing the rewrite.
@@ -1720,7 +1651,7 @@ impl SegmentCompactionLimits {
 
 /// Physical, publication, reserve, and absolute time envelope for one segment
 /// generation rewrite. The reserve is applied once when the payload archive
-/// and RocksDB share a filesystem, or independently to each filesystem when
+/// and database share a filesystem, or independently to each filesystem when
 /// they reside on different mounts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentCompactionExecutionLimits {
@@ -1751,13 +1682,13 @@ pub struct SegmentArchiveCompactionPlan {
     pub physical_frame_bytes: u64,
     pub reclaimable_frame_bytes: u64,
     pub estimated_atomic_locator_bytes: u64,
-    /// Conservative serialized RocksDB WriteBatch size including fixed
+    /// Conservative serialized database transaction size including fixed
     /// per-operation framing and the two manifest replacements.
     pub estimated_atomic_publication_bytes: u64,
-    /// Conservative filesystem allowance for WAL plus an equivalent
-    /// publication-sized RocksDB staging/flush copy.
-    pub estimated_rocks_temporary_bytes: u64,
-    /// New segment generation plus RocksDB temporary publication allowance.
+    /// Conservative filesystem allowance for the copy-on-write database
+    /// publication.
+    pub estimated_database_temporary_bytes: u64,
+    /// New segment generation plus database temporary publication allowance.
     /// The caller-configured persistent reserve is additional.
     pub required_temporary_bytes: u64,
     pub scan_page_records: usize,
@@ -1801,8 +1732,7 @@ impl StoreHandle {
     pub const fn is_restart_durable(&self) -> bool {
         match self {
             Self::Memory(_) => false,
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(_) => true,
+            Self::Direct(_) => true,
             Self::Archived { inner, .. } => inner.is_restart_durable(),
         }
     }
@@ -1812,8 +1742,7 @@ impl StoreHandle {
     pub fn reopen_required(&self) -> bool {
         match self {
             Self::Memory(_) => false,
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => store.reopen_required(),
+            Self::Direct(store) => store.reopen_required(),
             Self::Archived { inner, archive, .. } => {
                 archive.reopen_required() || inner.reopen_required()
             }
@@ -1835,8 +1764,7 @@ impl StoreHandle {
     pub const fn durability_policy(&self) -> DurabilityPolicy {
         match self {
             Self::Memory(_) => DurabilityPolicy::Sync,
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => store.durability,
+            Self::Direct(store) => store.durability,
             Self::Archived { inner, .. } => inner.durability_policy(),
         }
     }
@@ -1844,7 +1772,7 @@ impl StoreHandle {
     /// Commit one already-metered atomic mutation while carrying the same
     /// cumulative budget through any payload-archive transformation.
     ///
-    /// Memory and non-archived RocksDB handles are transparent and leave the
+    /// Memory and non-archived direct handles are transparent and leave the
     /// budget untouched. An archived handle performs and charges a read-only
     /// preflight before moving payload values, appending frames, replacing
     /// locators, or extending the backend batch with its two manifests.
@@ -1864,8 +1792,7 @@ impl StoreHandle {
         self.ensure_operational()?;
         match self {
             Self::Memory(store) => commit_memory_store_handle(store, batch),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => commit_rocks_store_handle(store, batch),
+            Self::Direct(store) => commit_direct_store_handle(store, batch),
             Self::Archived { inner, archive, .. } => {
                 commit_archived_store_handle(inner, archive, batch, budget)
             }
@@ -1896,8 +1823,7 @@ impl StoreHandle {
             ));
         }
         let database_directory = match &self {
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => store.path.clone(),
+            Self::Direct(store) => store.path.clone(),
             Self::Memory(_) => directory.clone(),
             Self::Archived { .. } => unreachable!("archive attachment was rejected above"),
         };
@@ -2076,11 +2002,11 @@ impl StoreHandle {
             database_directory,
             SegmentCompactionCapacityRequest {
                 payload_output_bytes: plan.live_frame_bytes,
-                rocks_temporary_bytes: plan.estimated_rocks_temporary_bytes,
+                database_temporary_bytes: plan.estimated_database_temporary_bytes,
                 reserve: execution.minimum_filesystem_reserve_bytes,
                 shared_context: "segment compaction preflight shared filesystem",
                 payload_context: "segment compaction preflight payload filesystem",
-                rocks_context: "segment compaction preflight RocksDB filesystem",
+                database_context: "segment compaction preflight database filesystem",
             },
         )?;
         ensure_segment_compaction_deadline(execution.deadline, "segment compaction planning")?;
@@ -2149,7 +2075,7 @@ impl StoreHandle {
         })?;
         let publication = segment_compaction_publication_estimate(live_records)?;
         let required_temporary_bytes = live_frame_bytes
-            .checked_add(publication.rocks_temporary_bytes)
+            .checked_add(publication.database_temporary_bytes)
             .ok_or_else(|| {
                 StoreError::Schema("segment compaction total temporary size overflow".to_owned())
             })?;
@@ -2160,7 +2086,7 @@ impl StoreHandle {
             reclaimable_frame_bytes: physical_frame_bytes.saturating_sub(live_frame_bytes),
             estimated_atomic_locator_bytes: publication.atomic_locator_bytes,
             estimated_atomic_publication_bytes: publication.atomic_publication_bytes,
-            estimated_rocks_temporary_bytes: publication.rocks_temporary_bytes,
+            estimated_database_temporary_bytes: publication.database_temporary_bytes,
             required_temporary_bytes,
             scan_page_records: limits.scan_page_records,
             scan_page_bytes: limits.scan_page_bytes,
@@ -2228,11 +2154,12 @@ impl StoreHandle {
             database_directory,
             SegmentCompactionCapacityRequest {
                 payload_output_bytes: plan.live_frame_bytes,
-                rocks_temporary_bytes: plan.estimated_rocks_temporary_bytes,
+                database_temporary_bytes: plan.estimated_database_temporary_bytes,
                 reserve: execution.minimum_filesystem_reserve_bytes,
                 shared_context: "segment compaction before output creation on shared filesystem",
                 payload_context: "segment compaction before output creation on payload filesystem",
-                rocks_context: "segment compaction before output creation on RocksDB filesystem",
+                database_context:
+                    "segment compaction before output creation on database filesystem",
             },
         )?;
         ensure_segment_compaction_deadline(execution.deadline, "segment compaction execution")?;
@@ -2481,11 +2408,11 @@ impl StoreHandle {
                 database_directory,
                 SegmentCompactionCapacityRequest {
                     payload_output_bytes: 0,
-                    rocks_temporary_bytes: plan.estimated_rocks_temporary_bytes,
+                    database_temporary_bytes: plan.estimated_database_temporary_bytes,
                     reserve: execution.minimum_filesystem_reserve_bytes,
                     shared_context: "segment compaction precommit shared filesystem",
                     payload_context: "segment compaction precommit payload filesystem",
-                    rocks_context: "segment compaction precommit RocksDB filesystem",
+                    database_context: "segment compaction precommit database filesystem",
                 },
             )?;
             ensure_segment_compaction_deadline(execution.deadline, "segment compaction precommit")
@@ -2498,7 +2425,7 @@ impl StoreHandle {
         }
         if let Err(error) = inner.commit(batch) {
             // Once write_opt has been invoked, an error does not prove that
-            // RocksDB rejected the atomic batch. Preserve both generations and
+            // The database rejected the atomic batch. Preserve both generations and
             // fence this process; reopen will select the old or new manifests
             // and remove only the generation they do not reference.
             archive.mark_commit_outcome_uncertain();
@@ -2566,7 +2493,7 @@ impl StoreHandle {
     /// Rewrite legacy inline block and undo values through the archive wrapper
     /// in bounded, idempotent transactions. The caller must hold exclusive
     /// ownership of the database (the maintenance CLI enforces this with the
-    /// RocksDB lock and a clean-shutdown marker).
+    /// database lock and a clean-shutdown marker).
     pub fn migrate_inline_segment_payloads(
         &self,
         batch_records: usize,
@@ -2678,39 +2605,13 @@ impl StoreHandle {
         }
         Ok(report)
     }
-
-    pub fn create_rocks_checkpoint(&self, directory: &Path) -> Result<(), StoreError> {
-        self.ensure_operational()?;
-        #[cfg(feature = "rocksdb-backend")]
-        {
-            match self {
-                Self::Rocks(store) => store.create_checkpoint(directory),
-                Self::Archived { inner, archive, .. } => {
-                    let writer = archive.writer().map_err(segment_store_error)?;
-                    let result = inner.create_rocks_checkpoint(directory);
-                    drop(writer);
-                    result
-                }
-                Self::Memory(_) => Err(StoreError::Backend(
-                    "RocksDB checkpoint requested for memory store".to_owned(),
-                )),
-            }
-        }
-        #[cfg(not(feature = "rocksdb-backend"))]
-        {
-            let _ = directory;
-            Err(StoreError::Backend(
-                "RocksDB checkpoint support is not compiled in".to_owned(),
-            ))
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SegmentCompactionPublicationEstimate {
     atomic_locator_bytes: u64,
     atomic_publication_bytes: u64,
-    rocks_temporary_bytes: u64,
+    database_temporary_bytes: u64,
 }
 
 fn segment_compaction_publication_estimate(
@@ -2772,15 +2673,15 @@ fn segment_compaction_publication_estimate(
         .ok_or_else(|| {
             StoreError::Schema("segment compaction atomic publication size overflow".to_owned())
         })?;
-    let rocks_temporary_bytes = atomic_publication_bytes
-        .checked_mul(SEGMENT_COMPACTION_ROCKS_TEMPORARY_MULTIPLIER)
+    let database_temporary_bytes = atomic_publication_bytes
+        .checked_mul(SEGMENT_COMPACTION_DATABASE_TEMPORARY_MULTIPLIER)
         .ok_or_else(|| {
-            StoreError::Schema("segment compaction RocksDB temporary size overflow".to_owned())
+            StoreError::Schema("segment compaction database temporary size overflow".to_owned())
         })?;
     Ok(SegmentCompactionPublicationEstimate {
         atomic_locator_bytes,
         atomic_publication_bytes,
-        rocks_temporary_bytes,
+        database_temporary_bytes,
     })
 }
 
@@ -2863,11 +2764,11 @@ fn ensure_segment_compaction_capacity(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SegmentCompactionCapacityRequest {
     payload_output_bytes: u64,
-    rocks_temporary_bytes: u64,
+    database_temporary_bytes: u64,
     reserve: u64,
     shared_context: &'static str,
     payload_context: &'static str,
-    rocks_context: &'static str,
+    database_context: &'static str,
 }
 
 fn ensure_segment_compaction_filesystem_capacity(
@@ -2896,7 +2797,7 @@ fn ensure_segment_compaction_capacity_values(
     if shared_filesystem {
         let temporary_bytes = request
             .payload_output_bytes
-            .saturating_add(request.rocks_temporary_bytes);
+            .saturating_add(request.database_temporary_bytes);
         return ensure_segment_compaction_capacity(
             archive_available,
             temporary_bytes,
@@ -2912,9 +2813,9 @@ fn ensure_segment_compaction_capacity_values(
     )?;
     ensure_segment_compaction_capacity(
         database_available,
-        request.rocks_temporary_bytes,
+        request.database_temporary_bytes,
         request.reserve,
-        request.rocks_context,
+        request.database_context,
     )
 }
 
@@ -3235,8 +3136,9 @@ impl Store for StoreHandle {
             Self::Memory(store) => store
                 .snapshot()
                 .map(|snapshot| StoreHandleSnapshot::Memory(snapshot, PhantomData)),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => store.snapshot().map(StoreHandleSnapshot::Rocks),
+            Self::Direct(store) => store
+                .snapshot()
+                .map(|snapshot| StoreHandleSnapshot::Direct(snapshot, PhantomData)),
             Self::Archived { inner, archive, .. } => {
                 // Linearize snapshot creation with segment publication. The
                 // guard is released immediately; the backend snapshot itself
@@ -3255,8 +3157,7 @@ impl Store for StoreHandle {
     fn batch(&self) -> Self::Batch {
         match self {
             Self::Memory(store) => StoreHandleBatch::Memory(store.batch()),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(store) => StoreHandleBatch::Rocks(store.batch()),
+            Self::Direct(store) => StoreHandleBatch::Direct(store.batch()),
             Self::Archived { inner, .. } => inner.batch(),
         }
     }
@@ -3270,18 +3171,19 @@ fn commit_memory_store_handle(
     store: &MemoryStore,
     batch: StoreHandleBatch,
 ) -> Result<(), StoreError> {
-    #[cfg(feature = "rocksdb-backend")]
-    {
-        match batch {
-            StoreHandleBatch::Memory(batch) => store.commit(batch),
-            StoreHandleBatch::Rocks(_) => Err(StoreError::BackendMismatch),
-        }
+    match batch {
+        StoreHandleBatch::Memory(batch) => store.commit(batch),
+        StoreHandleBatch::Direct(_) => Err(StoreError::BackendMismatch),
     }
+}
 
-    #[cfg(not(feature = "rocksdb-backend"))]
-    {
-        let StoreHandleBatch::Memory(batch) = batch;
-        store.commit(batch)
+fn commit_direct_store_handle(
+    store: &DirectStore,
+    batch: StoreHandleBatch,
+) -> Result<(), StoreError> {
+    match batch {
+        StoreHandleBatch::Direct(batch) => store.commit(batch),
+        StoreHandleBatch::Memory(_) => Err(StoreError::BackendMismatch),
     }
 }
 
@@ -3382,21 +3284,9 @@ fn commit_archived_store_handle(
     Ok(())
 }
 
-#[cfg(feature = "rocksdb-backend")]
-fn commit_rocks_store_handle(
-    store: &RocksStore,
-    batch: StoreHandleBatch,
-) -> Result<(), StoreError> {
-    match batch {
-        StoreHandleBatch::Rocks(batch) => store.commit(batch),
-        StoreHandleBatch::Memory(_) => Err(StoreError::BackendMismatch),
-    }
-}
-
 pub enum StoreHandleSnapshot<'a> {
     Memory(MemorySnapshot, PhantomData<&'a ()>),
-    #[cfg(feature = "rocksdb-backend")]
-    Rocks(RocksSnapshot<'a>),
+    Direct(DirectSnapshot, PhantomData<&'a ()>),
     Archived(Box<StoreHandleSnapshot<'a>>, Arc<SegmentArchive>),
 }
 
@@ -3404,8 +3294,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         match self {
             Self::Memory(snapshot, _) => snapshot.get(family, key),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(snapshot) => snapshot.get(family, key),
+            Self::Direct(snapshot, _) => snapshot.get(family, key),
             Self::Archived(snapshot, archive) => {
                 let Some(raw) = snapshot.get(family, key)? else {
                     return Ok(None);
@@ -3422,8 +3311,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
         match self {
             Self::Memory(snapshot, _) => snapshot.get_many(family, keys),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(snapshot) => snapshot.get_many(family, keys),
+            Self::Direct(snapshot, _) => snapshot.get_many(family, keys),
             Self::Archived(snapshot, archive) => {
                 let values = snapshot.get_many(family, keys)?;
                 if segmented_kind(family).is_none() {
@@ -3448,8 +3336,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
     ) -> Result<Vec<ScanEntry>, StoreError> {
         match self {
             Self::Memory(snapshot, _) => snapshot.scan_prefix(family, prefix),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(snapshot) => snapshot.scan_prefix(family, prefix),
+            Self::Direct(snapshot, _) => snapshot.scan_prefix(family, prefix),
             Self::Archived(snapshot, archive) => {
                 let entries = snapshot.scan_prefix(family, prefix)?;
                 if segmented_kind(family).is_none() {
@@ -3477,8 +3364,9 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
             Self::Memory(snapshot, _) => {
                 snapshot.scan_prefix_page(family, prefix, start_after, budget)
             }
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(snapshot) => snapshot.scan_prefix_page(family, prefix, start_after, budget),
+            Self::Direct(snapshot, _) => {
+                snapshot.scan_prefix_page(family, prefix, start_after, budget)
+            }
             Self::Archived(snapshot, _) if segmented_kind(family).is_none() => {
                 snapshot.scan_prefix_page(family, prefix, start_after, budget)
             }
@@ -3506,8 +3394,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
     ) -> Result<(), StoreError> {
         match self {
             Self::Memory(snapshot, _) => snapshot.visit_prefix(family, prefix, visitor),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(snapshot) => snapshot.visit_prefix(family, prefix, visitor),
+            Self::Direct(snapshot, _) => snapshot.visit_prefix(family, prefix, visitor),
             Self::Archived(snapshot, _) if segmented_kind(family).is_none() => {
                 snapshot.visit_prefix(family, prefix, visitor)
             }
@@ -3524,8 +3411,7 @@ impl ReadSnapshot for StoreHandleSnapshot<'_> {
 #[derive(Clone, Debug)]
 pub enum StoreHandleBatch {
     Memory(MemoryBatch),
-    #[cfg(feature = "rocksdb-backend")]
-    Rocks(RocksBatch),
+    Direct(DirectBatch),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3658,8 +3544,7 @@ impl StoreHandleBatch {
                     visit_archive_payload(key.family, &key.key, value, visitor)?;
                 }
             }
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(batch) => {
+            Self::Direct(batch) => {
                 for (key, value) in &batch.operations {
                     let Some(value) = value else {
                         continue;
@@ -3685,8 +3570,7 @@ impl StoreHandleBatch {
                     collect_archive_payload(key.family, &key.key, value, &mut payloads)?;
                 }
             }
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(batch) => {
+            Self::Direct(batch) => {
                 for (key, value) in &mut batch.operations {
                     let Some(value) = value else {
                         continue;
@@ -3718,8 +3602,7 @@ impl StoreHandleBatch {
                     replace_archive_payload(key.family, value, &mut locators)?;
                 }
             }
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(batch) => {
+            Self::Direct(batch) => {
                 for (key, value) in &mut batch.operations {
                     let Some(value) = value else {
                         continue;
@@ -3807,16 +3690,14 @@ impl WriteBatch for StoreHandleBatch {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.put(family, key, value),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(batch) => batch.put(family, key, value),
+            Self::Direct(batch) => batch.put(family, key, value),
         }
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.delete(family, key),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(batch) => batch.delete(family, key),
+            Self::Direct(batch) => batch.delete(family, key),
         }
     }
 }
@@ -3825,24 +3706,21 @@ impl CheckpointWriteBatch for StoreHandleBatch {
     fn begin_checkpoint(&mut self) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.begin_checkpoint(),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(batch) => batch.begin_checkpoint(),
+            Self::Direct(batch) => batch.begin_checkpoint(),
         }
     }
 
     fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.commit_checkpoint(),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(batch) => batch.commit_checkpoint(),
+            Self::Direct(batch) => batch.commit_checkpoint(),
         }
     }
 
     fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
         match self {
             Self::Memory(batch) => batch.rollback_checkpoint(),
-            #[cfg(feature = "rocksdb-backend")]
-            Self::Rocks(batch) => batch.rollback_checkpoint(),
+            Self::Direct(batch) => batch.rollback_checkpoint(),
         }
     }
 }
@@ -4174,10 +4052,10 @@ fn compact_memory_history(history: &mut Vec<MemoryVersion>, oldest_snapshot: Opt
 
 type BatchOperation = Option<Vec<u8>>;
 // A batch is last-write-wins and contains at most one operation per physical
-// key before publication. RocksDB does not require key order for an atomic
-// WriteBatch, and the memory backend installs every unique key at one common
-// generation. Hashing therefore removes a second comparison-tree update from
-// the hot staging path without changing any externally observable ordering.
+// key before publication. The direct backend consumes this map into one B+tree
+// write transaction, while the memory backend installs every unique key at one
+// common generation. Hashing avoids a second comparison-tree update in the hot
+// staging path without changing externally observable ordering.
 type BatchOperations = HashMap<StoreKey, BatchOperation>;
 type BatchCheckpointEntry = (StoreKey, Option<BatchOperation>);
 type BatchCheckpoint = Vec<BatchCheckpointEntry>;
@@ -4257,10 +4135,15 @@ fn replace_batch_operation(
     key: StoreKey,
     value: BatchOperation,
 ) {
-    let previous = operations.insert(key.clone(), value);
-    if let Some(journal) = checkpoint {
-        journal.push((key, previous));
+    if checkpoint.is_none() {
+        operations.insert(key, value);
+        return;
     }
+    let previous = operations.insert(key.clone(), value);
+    checkpoint
+        .as_mut()
+        .expect("checkpoint presence checked above")
+        .push((key, previous));
 }
 
 fn begin_batch_checkpoint(checkpoint: &mut Option<BatchCheckpoint>) -> Result<(), StoreError> {
@@ -4304,617 +4187,6 @@ fn rollback_batch_checkpoint(
     Ok(())
 }
 
-#[cfg(feature = "rocksdb-backend")]
-#[derive(Clone)]
-pub struct RocksStore {
-    db: Arc<rocksdb::DB>,
-    path: PathBuf,
-    durability: DurabilityPolicy,
-    legacy_wallet_fallback: bool,
-    // Keep both shared caches alive for exactly as long as the DB. Separating
-    // large, mostly one-pass block/undo pages prevents them from evicting hot
-    // UTXO, name-state, and Urkel point-lookup pages.
-    point_cache: rocksdb::Cache,
-    bulk_cache: rocksdb::Cache,
-    reopen_required: Arc<AtomicBool>,
-    /// Linearizes snapshot creation and atomic publication without holding a
-    /// lock for the snapshot's subsequent reads.
-    publication_lock: Arc<Mutex<()>>,
-    authenticated_namespaces: authenticated_namespace::SharedNamespaceOwners,
-    authenticated_namespace_archive: authenticated_namespace::SharedNamespaceArchiveRegistration,
-    #[cfg(test)]
-    commit_fault: Arc<AtomicU8>,
-}
-
-#[cfg(feature = "rocksdb-backend")]
-impl fmt::Debug for RocksStore {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RocksStore")
-            .field("durability", &self.durability)
-            .field("legacy_wallet_fallback", &self.legacy_wallet_fallback)
-            .field("point_cache_usage", &self.point_cache.get_usage())
-            .field("bulk_cache_usage", &self.bulk_cache.get_usage())
-            .field("reopen_required", &self.reopen_required())
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "rocksdb-backend")]
-impl RocksStore {
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
-        Self::open_with_durability(path, DurabilityPolicy::Sync)
-    }
-
-    pub fn open_with_durability(
-        path: impl AsRef<std::path::Path>,
-        durability: DurabilityPolicy,
-    ) -> Result<Self, StoreError> {
-        use rocksdb::{Cache, ColumnFamilyDescriptor, Options};
-
-        let path = path.as_ref().to_path_buf();
-        let mut db_options = Options::default();
-        db_options.create_if_missing(true);
-        db_options.create_missing_column_families(true);
-        db_options.set_max_background_jobs(ROCKS_BACKGROUND_JOBS);
-        db_options.set_db_write_buffer_size(ROCKS_DB_WRITE_BUFFER_BYTES);
-        db_options.set_max_total_wal_size(ROCKS_MAX_TOTAL_WAL_BYTES);
-
-        let point_cache = Cache::new_lru_cache(ROCKS_POINT_CACHE_BYTES);
-        let bulk_cache = Cache::new_lru_cache(ROCKS_BULK_CACHE_BYTES);
-
-        let descriptors = ColumnFamily::ALL.into_iter().map(|family| {
-            let cache = if matches!(family, ColumnFamily::Blocks | ColumnFamily::Undo) {
-                &bulk_cache
-            } else {
-                &point_cache
-            };
-            ColumnFamilyDescriptor::new(family.name(), rocks_column_family_options(family, cache))
-        });
-
-        let db = rocksdb::DB::open_cf_descriptors(&db_options, &path, descriptors)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
-        let meta = Self::cf(&db, ColumnFamily::Meta)?;
-        let legacy_wallet_fallback = db
-            .get_cf(meta, MIXED_INDEX_FALLBACK_REQUIRED_KEY)
-            .map_err(|error| StoreError::Backend(error.to_string()))?
-            .is_some()
-            || db
-                .get_cf(meta, MetaKey::SchemaVersion.as_bytes())
-                .map_err(|error| StoreError::Backend(error.to_string()))?
-                .as_deref()
-                == Some(encode_u32(MIXED_INDEX_SCHEMA_VERSION).as_slice());
-
-        Ok(Self {
-            db: Arc::new(db),
-            path,
-            durability,
-            legacy_wallet_fallback,
-            point_cache,
-            bulk_cache,
-            reopen_required: Arc::new(AtomicBool::new(false)),
-            publication_lock: Arc::new(Mutex::new(())),
-            authenticated_namespaces: Arc::new(Mutex::new(BTreeMap::new())),
-            authenticated_namespace_archive: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            commit_fault: Arc::new(AtomicU8::new(RocksCommitFault::None as u8)),
-        })
-    }
-
-    pub fn create_checkpoint(&self, path: impl AsRef<Path>) -> Result<(), StoreError> {
-        let _publication = self.lock_publication()?;
-        self.ensure_operational()?;
-        let checkpoint = rocksdb::checkpoint::Checkpoint::new(&self.db)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
-        checkpoint
-            .create_checkpoint(path)
-            .map_err(|error| StoreError::Backend(error.to_string()))
-    }
-
-    pub fn reopen_required(&self) -> bool {
-        if self.publication_lock.is_poisoned() {
-            self.mark_commit_outcome_uncertain();
-        }
-        self.reopen_required.load(Ordering::Acquire)
-    }
-
-    fn ensure_operational(&self) -> Result<(), StoreError> {
-        if self.reopen_required() {
-            return Err(StoreError::Backend(
-                "RocksDB publication outcome is uncertain; reopen required".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn lock_publication(&self) -> Result<std::sync::MutexGuard<'_, ()>, StoreError> {
-        match self.publication_lock.lock() {
-            Ok(publication) => Ok(publication),
-            Err(_) => {
-                // The panicking thread may have crossed write_opt before
-                // unwinding. Every clone must report the same fail-stop state.
-                self.mark_commit_outcome_uncertain();
-                Err(StoreError::Backend(
-                    "RocksDB publication lock is poisoned; reopen required".to_owned(),
-                ))
-            }
-        }
-    }
-
-    fn mark_commit_outcome_uncertain(&self) {
-        self.reopen_required.store(true, Ordering::Release);
-    }
-
-    fn cf(db: &rocksdb::DB, family: ColumnFamily) -> Result<&rocksdb::ColumnFamily, StoreError> {
-        db.cf_handle(family.name())
-            .ok_or_else(|| StoreError::MissingColumnFamily(family.name()))
-    }
-
-    #[cfg(test)]
-    fn inject_next_commit_fault(&self, fault: RocksCommitFault) {
-        self.commit_fault.store(fault as u8, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    fn take_commit_fault(&self) -> RocksCommitFault {
-        match self.commit_fault.swap(0, Ordering::AcqRel) {
-            1 => RocksCommitFault::BeforeWrite,
-            2 => RocksCommitFault::AfterWrite,
-            _ => RocksCommitFault::None,
-        }
-    }
-
-    /// Publish already validated operations while the caller retains the
-    /// backend's publication lock. Namespace CAS uses this private path so its
-    /// live reads, fence comparison, and write form one critical section.
-    fn commit_operations_locked(&self, operations: BatchOperations) -> Result<(), StoreError> {
-        let mut write_batch = rocksdb::WriteBatch::default();
-        for (key, value) in operations {
-            let cf = Self::cf(&self.db, key.family)?;
-            let legacy_cf = (self.legacy_wallet_fallback
-                && RocksSnapshot::legacy_wallet_family(key.family, &key.key).is_some())
-            .then(|| Self::cf(&self.db, ColumnFamily::TxIndex))
-            .transpose()?;
-            match value {
-                Some(value) => {
-                    write_batch.put_cf(cf, &key.key, value);
-                    if let Some(legacy_cf) = legacy_cf {
-                        write_batch.delete_cf(legacy_cf, key.key);
-                    }
-                }
-                None => {
-                    write_batch.delete_cf(cf, &key.key);
-                    if let Some(legacy_cf) = legacy_cf {
-                        write_batch.delete_cf(legacy_cf, key.key);
-                    }
-                }
-            }
-        }
-
-        let mut options = rocksdb::WriteOptions::default();
-        options.disable_wal(false);
-        options.set_sync(matches!(self.durability, DurabilityPolicy::Sync));
-
-        #[cfg(test)]
-        let fault = self.take_commit_fault();
-        #[cfg(test)]
-        if fault == RocksCommitFault::BeforeWrite {
-            return Err(StoreError::Io(
-                "injected RocksDB failure before atomic write".to_owned(),
-            ));
-        }
-
-        if let Err(error) = self.db.write_opt(write_batch, &options) {
-            // RocksDB's error acknowledgement does not prove that an atomic
-            // WAL/memtable publication is absent. Fence every clone before
-            // releasing the publication lock; reopen establishes the actual
-            // durable sequence.
-            self.mark_commit_outcome_uncertain();
-            return Err(StoreError::Backend(format!(
-                "RocksDB atomic write outcome is uncertain; reopen required: {error}"
-            )));
-        }
-
-        #[cfg(test)]
-        if fault == RocksCommitFault::AfterWrite {
-            self.mark_commit_outcome_uncertain();
-            return Err(StoreError::Io(
-                "injected RocksDB failure after atomic write; reopen required".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(test, feature = "rocksdb-backend"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-enum RocksCommitFault {
-    None = 0,
-    BeforeWrite = 1,
-    AfterWrite = 2,
-}
-
-#[cfg(feature = "rocksdb-backend")]
-fn rocks_column_family_options(family: ColumnFamily, cache: &rocksdb::Cache) -> rocksdb::Options {
-    use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Options};
-
-    let mut table = BlockBasedOptions::default();
-    table.set_block_cache(cache);
-    table.set_bloom_filter(ROCKS_BLOOM_BITS_PER_KEY, false);
-    table.set_optimize_filters_for_memory(true);
-    table.set_cache_index_and_filter_blocks(true);
-    table.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    if matches!(
-        family,
-        ColumnFamily::TxIndex
-            | ColumnFamily::WalletHistory
-            | ColumnFamily::WalletState
-            | ColumnFamily::Utxo
-    ) {
-        // These point-lookup-heavy families grow to hundreds of SSTs during
-        // mainnet IBD. Partitioned filters avoid loading and checksumming one
-        // monolithic bloom filter per file, while pinning the small top level
-        // keeps partition routing resident. Existing SSTs remain readable and
-        // are converted naturally by flushes and compactions.
-        table.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
-        table.set_partition_filters(true);
-        table.set_pin_top_level_index_and_filter(true);
-    }
-    if matches!(family, ColumnFamily::Blocks | ColumnFamily::Undo) {
-        table.set_block_size(ROCKS_BULK_BLOCK_BYTES);
-    }
-
-    let mut options = Options::default();
-    options.set_block_based_table_factory(&table);
-    if matches!(
-        family,
-        ColumnFamily::TxIndex
-            | ColumnFamily::WalletHistory
-            | ColumnFamily::WalletState
-            | ColumnFamily::Utxo
-    ) {
-        options.set_write_buffer_size(ROCKS_UTXO_WRITE_BUFFER_BYTES);
-        options.set_max_write_buffer_number(ROCKS_UTXO_MAX_WRITE_BUFFERS);
-        options.set_min_write_buffer_number_to_merge(ROCKS_UTXO_MIN_WRITE_BUFFERS_TO_MERGE);
-        options.set_target_file_size_base(ROCKS_UTXO_TARGET_FILE_BYTES);
-        options.set_max_bytes_for_level_base(ROCKS_UTXO_LEVEL_BASE_BYTES);
-        options.set_level_compaction_dynamic_level_bytes(true);
-    }
-    options
-}
-
-#[cfg(feature = "rocksdb-backend")]
-impl Store for RocksStore {
-    type Snapshot<'a> = RocksSnapshot<'a>;
-    type Batch = RocksBatch;
-
-    fn snapshot(&self) -> Result<Self::Snapshot<'_>, StoreError> {
-        let _publication = self.lock_publication()?;
-        self.ensure_operational()?;
-        let db = self.db.as_ref();
-        Ok(RocksSnapshot {
-            db,
-            snapshot: db.snapshot(),
-            legacy_wallet_fallback: self.legacy_wallet_fallback,
-        })
-    }
-
-    fn batch(&self) -> Self::Batch {
-        RocksBatch::default()
-    }
-
-    fn commit(&self, batch: Self::Batch) -> Result<(), StoreError> {
-        self.ensure_operational()?;
-        if batch.operations.is_empty() {
-            return Ok(());
-        }
-        for key in batch.operations.keys() {
-            authenticated_namespace::ensure_ordinary_key(key.family, &key.key)?;
-        }
-
-        let _publication = self.lock_publication()?;
-        self.ensure_operational()?;
-        self.commit_operations_locked(batch.operations)
-    }
-}
-
-#[cfg(feature = "rocksdb-backend")]
-pub struct RocksSnapshot<'a> {
-    db: &'a rocksdb::DB,
-    snapshot: rocksdb::Snapshot<'a>,
-    legacy_wallet_fallback: bool,
-}
-
-#[cfg(feature = "rocksdb-backend")]
-impl RocksSnapshot<'_> {
-    fn legacy_wallet_family(family: ColumnFamily, key_or_prefix: &[u8]) -> Option<ColumnFamily> {
-        let matches_family = match family {
-            ColumnFamily::WalletHistory => key_or_prefix.starts_with(WALLET_HISTORY_PREFIX),
-            ColumnFamily::WalletState => {
-                key_or_prefix.starts_with(WALLET_INDEX_PREFIX)
-                    && !key_or_prefix.starts_with(WALLET_HISTORY_PREFIX)
-            }
-            _ => false,
-        };
-        matches_family.then_some(ColumnFamily::TxIndex)
-    }
-
-    fn enabled_legacy_wallet_family(
-        &self,
-        family: ColumnFamily,
-        key_or_prefix: &[u8],
-    ) -> Option<ColumnFamily> {
-        self.legacy_wallet_fallback
-            .then(|| Self::legacy_wallet_family(family, key_or_prefix))
-            .flatten()
-    }
-
-    fn batched_get_many(
-        &self,
-        cf: &rocksdb::ColumnFamily,
-        keys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
-        let mut options = rocksdb::ReadOptions::default();
-        options.set_snapshot(&self.snapshot);
-        self.db
-            // RocksDB's batched path groups point lookups by block-based SST
-            // internals. Callers do not promise sorted keys, and the API
-            // preserves input order when sorting internally.
-            .batched_multi_get_cf_opt(cf, keys.iter(), false, &options)
-            .into_iter()
-            .map(|value| {
-                value
-                    .map(|value| value.map(|value| value.as_ref().to_vec()))
-                    .map_err(|error| StoreError::Backend(error.to_string()))
-            })
-            .collect()
-    }
-
-    fn get_many_from_family(
-        &self,
-        family: ColumnFamily,
-        keys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
-        let cf = RocksStore::cf(self.db, family)?;
-        if keys.len() < ROCKS_BATCHED_MULTI_GET_PARALLEL_THRESHOLD {
-            return self.batched_get_many(cf, keys);
-        }
-
-        let chunk_size = keys.len().div_ceil(ROCKS_BATCHED_MULTI_GET_PARALLELISM);
-        std::thread::scope(|scope| {
-            let workers = keys
-                .chunks(chunk_size)
-                .map(|chunk| scope.spawn(move || self.batched_get_many(cf, chunk)))
-                .collect::<Vec<_>>();
-            let mut values = Vec::with_capacity(keys.len());
-            for worker in workers {
-                let chunk = worker.join().map_err(|_| {
-                    StoreError::Backend("RocksDB batched multi-get worker panicked".to_owned())
-                })??;
-                values.extend(chunk);
-            }
-            Ok(values)
-        })
-    }
-
-    fn scan_prefix_from_family(
-        &self,
-        family: ColumnFamily,
-        prefix: &[u8],
-    ) -> Result<Vec<ScanEntry>, StoreError> {
-        use rocksdb::{Direction, IteratorMode};
-
-        let cf = RocksStore::cf(self.db, family)?;
-        let mut entries = Vec::new();
-        for item in self
-            .snapshot
-            .iterator_cf(cf, IteratorMode::From(prefix, Direction::Forward))
-        {
-            let (key, value) = item.map_err(|error| StoreError::Backend(error.to_string()))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            entries.push((key.to_vec(), value.to_vec()));
-        }
-        Ok(entries)
-    }
-
-    fn scan_prefix_page_from_family(
-        &self,
-        family: ColumnFamily,
-        prefix: &[u8],
-        start_after: Option<&[u8]>,
-        budget: PrefixScanBudget,
-    ) -> Result<PrefixScanPage, StoreError> {
-        use rocksdb::{Direction, IteratorMode};
-
-        let cf = RocksStore::cf(self.db, family)?;
-        let start = start_after.unwrap_or(prefix);
-        let mut page = PrefixScanPage::default();
-        for item in self
-            .snapshot
-            .iterator_cf(cf, IteratorMode::From(start, Direction::Forward))
-        {
-            let (key, value) = item.map_err(|error| StoreError::Backend(error.to_string()))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            if start_after.is_some_and(|cursor| key.as_ref() <= cursor) {
-                continue;
-            }
-            if !push_bounded_scan_entry(&mut page, &key, &value, budget)? {
-                break;
-            }
-        }
-        Ok(page)
-    }
-}
-
-#[cfg(feature = "rocksdb-backend")]
-impl ReadSnapshot for RocksSnapshot<'_> {
-    fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let cf = RocksStore::cf(self.db, family)?;
-        let value = self
-            .snapshot
-            .get_cf(cf, key)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
-        if value.is_some() {
-            return Ok(value);
-        }
-        let Some(legacy) = self.enabled_legacy_wallet_family(family, key) else {
-            return Ok(None);
-        };
-        let legacy_cf = RocksStore::cf(self.db, legacy)?;
-        self.snapshot
-            .get_cf(legacy_cf, key)
-            .map_err(|error| StoreError::Backend(error.to_string()))
-    }
-
-    fn get_many(
-        &self,
-        family: ColumnFamily,
-        keys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
-        let mut values = self.get_many_from_family(family, keys)?;
-        let legacy = keys
-            .first()
-            .and_then(|key| self.enabled_legacy_wallet_family(family, key));
-        let Some(legacy) = legacy else {
-            return Ok(values);
-        };
-        if !keys
-            .iter()
-            .all(|key| Self::legacy_wallet_family(family, key) == Some(legacy))
-        {
-            return Err(StoreError::Schema(
-                "wallet batched read mixes keys from different physical families".to_owned(),
-            ));
-        }
-        let missing = values
-            .iter()
-            .enumerate()
-            .filter_map(|(index, value)| value.is_none().then_some((index, keys[index])))
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            return Ok(values);
-        }
-        let legacy_keys = missing.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-        let legacy_values = self.get_many_from_family(legacy, &legacy_keys)?;
-        for ((index, _), value) in missing.into_iter().zip(legacy_values) {
-            values[index] = value;
-        }
-        Ok(values)
-    }
-
-    fn scan_prefix(
-        &self,
-        family: ColumnFamily,
-        prefix: &[u8],
-    ) -> Result<Vec<ScanEntry>, StoreError> {
-        let current = self.scan_prefix_from_family(family, prefix)?;
-        let Some(legacy) = self.enabled_legacy_wallet_family(family, prefix) else {
-            return Ok(current);
-        };
-        let mut merged = self
-            .scan_prefix_from_family(legacy, prefix)?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        merged.extend(current);
-        Ok(merged.into_iter().collect())
-    }
-
-    fn scan_prefix_page(
-        &self,
-        family: ColumnFamily,
-        prefix: &[u8],
-        start_after: Option<&[u8]>,
-        budget: PrefixScanBudget,
-    ) -> Result<PrefixScanPage, StoreError> {
-        let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
-        let current = self.scan_prefix_page_from_family(family, prefix, start_after, budget)?;
-        let Some(legacy) = self.enabled_legacy_wallet_family(family, prefix) else {
-            return Ok(current);
-        };
-        let legacy = self.scan_prefix_page_from_family(legacy, prefix, start_after, budget)?;
-        let underlying_has_more = current.continuation.is_some() || legacy.continuation.is_some();
-        let mut merged = legacy.entries.into_iter().collect::<BTreeMap<_, _>>();
-        merged.extend(current.entries);
-        let mut page = PrefixScanPage::default();
-        for (key, value) in merged {
-            if !push_bounded_scan_entry(&mut page, &key, &value, budget)? {
-                break;
-            }
-        }
-        if page.continuation.is_none() && underlying_has_more {
-            page.continuation = page.entries.last().map(|(key, _)| key.clone());
-        }
-        Ok(page)
-    }
-
-    fn visit_prefix(
-        &self,
-        family: ColumnFamily,
-        prefix: &[u8],
-        visitor: &mut PrefixVisitor<'_>,
-    ) -> Result<(), StoreError> {
-        for (key, value) in self.scan_prefix(family, prefix)? {
-            visitor(&key, &value)?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "rocksdb-backend")]
-#[derive(Clone, Debug, Default)]
-pub struct RocksBatch {
-    // Both the staging overlay and the durable backend are last-write-wins.
-    // Retaining only the final operation avoids allocating and submitting every
-    // intermediate mutation produced by a multi-block activation.
-    operations: BatchOperations,
-    checkpoint: Option<BatchCheckpoint>,
-}
-
-#[cfg(feature = "rocksdb-backend")]
-impl WriteBatch for RocksBatch {
-    fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        authenticated_namespace::ensure_ordinary_key(family, key)?;
-        replace_batch_operation(
-            &mut self.operations,
-            &mut self.checkpoint,
-            StoreKey::new(family, key),
-            Some(value.to_vec()),
-        );
-        Ok(())
-    }
-
-    fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
-        authenticated_namespace::ensure_ordinary_key(family, key)?;
-        replace_batch_operation(
-            &mut self.operations,
-            &mut self.checkpoint,
-            StoreKey::new(family, key),
-            None,
-        );
-        Ok(())
-    }
-}
-
-#[cfg(feature = "rocksdb-backend")]
-impl CheckpointWriteBatch for RocksBatch {
-    fn begin_checkpoint(&mut self) -> Result<(), StoreError> {
-        begin_batch_checkpoint(&mut self.checkpoint)
-    }
-
-    fn commit_checkpoint(&mut self) -> Result<(), StoreError> {
-        commit_batch_checkpoint(&mut self.checkpoint)
-    }
-
-    fn rollback_checkpoint(&mut self) -> Result<(), StoreError> {
-        rollback_batch_checkpoint(&mut self.operations, &mut self.checkpoint)
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("store feature `{0}` is disabled")]
@@ -4923,8 +4195,6 @@ pub enum StoreError {
     BackendMismatch,
     #[error("store backend failed: {0}")]
     Backend(String),
-    #[error("missing column family `{0}`")]
-    MissingColumnFamily(&'static str),
     #[error("store I/O failed: {0}")]
     Io(String),
     #[error("{context} exceeded its resource limit: limit {limit}, actual {actual}")]
@@ -5097,32 +4367,6 @@ mod tests {
         std::fs::remove_dir_all(directory).expect("remove memory archive fixture");
     }
 
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn restart_durability_accepts_rocks_and_delegates_through_rocks_archive() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "hsrd-rocks-restart-durability-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-
-        let rocks = RocksStore::open(root.join("chain")).expect("open rocksdb");
-        let raw = StoreHandle::Rocks(rocks.clone());
-        assert!(raw.is_restart_durable());
-        let archived = raw
-            .with_segment_archive(root.join("payloads"))
-            .expect("attach rocks archive");
-        assert!(archived.is_restart_durable());
-
-        drop(archived);
-        drop(rocks);
-        std::fs::remove_dir_all(root).expect("remove rocks archive fixture");
-    }
-
     #[test]
     fn memory_batch_retains_only_the_final_operation_per_key() {
         let mut batch = MemoryBatch::default();
@@ -5196,32 +4440,6 @@ mod tests {
                 .get(ColumnFamily::Meta, b"transient")
                 .expect("transient committed value"),
             None
-        );
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_batch_retains_only_the_final_operation_per_family_and_key() {
-        let mut batch = RocksBatch::default();
-        batch
-            .put(ColumnFamily::Blocks, &[0x11; 32], b"archived-body")
-            .expect("body put");
-        batch
-            .delete(ColumnFamily::Blocks, &[0x11; 32])
-            .expect("body delete");
-        batch
-            .put(ColumnFamily::Blocks, &[0x11; 32], b"replacement-body")
-            .expect("replacement body");
-        batch
-            .put(ColumnFamily::Undo, &[0x11; 32], b"undo")
-            .expect("undo put");
-
-        assert_eq!(batch.operations.len(), 2);
-        assert_eq!(
-            batch
-                .operations
-                .get(&StoreKey::new(ColumnFamily::Blocks, &[0x11; 32])),
-            Some(&Some(b"replacement-body".to_vec()))
         );
     }
 
@@ -6685,18 +5903,18 @@ mod tests {
     fn segment_compaction_capacity_accepts_exact_bounds_and_rejects_one_under() {
         const SHARED: &str = "test shared filesystem";
         const PAYLOAD: &str = "test payload filesystem";
-        const ROCKS: &str = "test RocksDB filesystem";
+        const DATABASE: &str = "test database filesystem";
         assert_eq!(
             SegmentCompactionExecutionLimits::default().minimum_filesystem_reserve_bytes,
             10_000_000_000
         );
         let request = SegmentCompactionCapacityRequest {
             payload_output_bytes: 40,
-            rocks_temporary_bytes: 30,
+            database_temporary_bytes: 30,
             reserve: 30,
             shared_context: SHARED,
             payload_context: PAYLOAD,
-            rocks_context: ROCKS,
+            database_context: DATABASE,
         };
 
         ensure_segment_compaction_capacity_values(true, 100, 100, request)
@@ -6725,7 +5943,7 @@ mod tests {
         assert!(matches!(
             ensure_segment_compaction_capacity_values(false, 70, 59, request),
             Err(StoreError::InsufficientSpace {
-                context: ROCKS,
+                context: DATABASE,
                 available: 59,
                 required: 60,
                 reserve: 30,
@@ -7502,1132 +6720,5 @@ mod tests {
         }
         drop(archived);
         std::fs::remove_dir_all(directory).expect("remove dense-prefix fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_store_persists_across_reopen() {
-        let path =
-            std::env::temp_dir().join(format!("hsrd-rocks-store-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-
-        {
-            let store = RocksStore::open(&path).expect("open rocksdb");
-            initialize_schema(&store).expect("schema");
-            let mut batch = store.batch();
-            batch
-                .put(ColumnFamily::Headers, b"hash", b"header")
-                .expect("put");
-            store.commit(batch).expect("commit");
-        }
-
-        {
-            let store = RocksStore::open(&path).expect("reopen rocksdb");
-            let snapshot = store.snapshot().expect("snapshot");
-            assert_eq!(
-                snapshot.get(ColumnFamily::Headers, b"hash").expect("get"),
-                Some(b"header".to_vec())
-            );
-            assert_eq!(
-                snapshot
-                    .get_many(ColumnFamily::Headers, &[b"missing", b"hash"])
-                    .expect("multi-get"),
-                vec![None, Some(b"header".to_vec())]
-            );
-            assert_eq!(
-                snapshot
-                    .scan_prefix(ColumnFamily::Headers, b"ha")
-                    .expect("scan"),
-                vec![(b"hash".to_vec(), b"header".to_vec())]
-            );
-            let mut visited = Vec::new();
-            snapshot
-                .visit_prefix(ColumnFamily::Headers, b"ha", &mut |key, value| {
-                    visited.push((key.to_vec(), value.to_vec()));
-                    Ok(())
-                })
-                .expect("visit");
-            assert_eq!(visited, vec![(b"hash".to_vec(), b"header".to_vec())]);
-            initialize_schema(&store).expect("schema still valid");
-        }
-
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_parallel_batched_multi_get_preserves_input_order_and_missing_values() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "hsrd-rocks-parallel-multi-get-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        let store = RocksStore::open(&path).expect("open rocksdb");
-        initialize_schema(&store).expect("schema");
-        let count = ROCKS_BATCHED_MULTI_GET_PARALLEL_THRESHOLD + 17;
-        let mut batch = store.batch();
-        for index in 0..count {
-            let index = u64::try_from(index).expect("test index");
-            batch
-                .put(
-                    ColumnFamily::Utxo,
-                    &index.to_be_bytes(),
-                    &index.wrapping_mul(3).to_le_bytes(),
-                )
-                .expect("put test point");
-        }
-        store.commit(batch).expect("commit test points");
-
-        let mut keys = (0..count)
-            .rev()
-            .map(|index| {
-                u64::try_from(index)
-                    .expect("query index")
-                    .to_be_bytes()
-                    .to_vec()
-            })
-            .collect::<Vec<_>>();
-        keys.insert(count / 2, vec![0xff; 8]);
-        let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
-        let values = store
-            .snapshot()
-            .expect("snapshot")
-            .get_many(ColumnFamily::Utxo, &key_refs)
-            .expect("parallel multi-get");
-        assert_eq!(values.len(), keys.len());
-        for (key, value) in keys.iter().zip(values) {
-            if key == &[0xff; 8] {
-                assert_eq!(value, None);
-                continue;
-            }
-            let index = u64::from_be_bytes(key.as_slice().try_into().expect("query key"));
-            assert_eq!(value, Some(index.wrapping_mul(3).to_le_bytes().to_vec()));
-        }
-
-        drop(store);
-        std::fs::remove_dir_all(path).expect("remove RocksDB fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_archive_writes_locator_sized_lsm_values() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "hsrd-rocks-archive-test-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let rocks = RocksStore::open(root.join("chain")).expect("open rocksdb");
-        let raw = StoreHandle::Rocks(rocks.clone());
-        let archived = raw
-            .with_segment_archive(root.join("payloads"))
-            .expect("attach archive");
-        let key = [0x61; 32];
-        let payload = vec![0xa5; 1024 * 1024];
-        let mut batch = archived.batch();
-        batch
-            .put(ColumnFamily::Blocks, &key, &payload)
-            .expect("stage payload");
-        archived.commit(batch).expect("commit payload");
-
-        let stored = rocks
-            .snapshot()
-            .expect("raw rocks snapshot")
-            .get(ColumnFamily::Blocks, &key)
-            .expect("raw rocks value")
-            .expect("raw rocks value");
-        assert!(stored.len() < 128);
-        assert!(SegmentValueLocator::decode(&stored)
-            .expect("decode locator")
-            .is_some());
-        assert_eq!(
-            archived
-                .snapshot()
-                .expect("archive snapshot")
-                .get(ColumnFamily::Blocks, &key)
-                .expect("resolved payload"),
-            Some(payload)
-        );
-        drop(archived);
-        drop(rocks);
-        std::fs::remove_dir_all(root).expect("remove rocks archive fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn archived_rocks_effect_budget_is_exact_and_rejects_before_any_publication() {
-        const INITIAL_CONSUMED: u64 = 4_096;
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "hsrd-rocks-archive-budget-test-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let chain_path = root.join("chain");
-        let archive_path = root.join("payloads");
-        let rocks = RocksStore::open(&chain_path).expect("open RocksDB");
-        let archived = StoreHandle::Rocks(rocks.clone())
-            .with_segment_archive(archive_path.clone())
-            .expect("attach archive");
-        let block_key = [0x91; 32];
-        let undo_key = [0x92; 32];
-        let block_payload = vec![0xa1; 4_097];
-        let undo_payload = vec![0xb2; 8_193];
-
-        let segment_lengths = || {
-            std::fs::read_dir(&archive_path)
-                .expect("read archive directory")
-                .map(|entry| {
-                    let entry = entry.expect("archive entry");
-                    let metadata = entry.metadata().expect("archive entry metadata");
-                    (entry.file_name(), metadata.len())
-                })
-                .collect::<BTreeMap<_, _>>()
-        };
-        let before_segment_lengths = segment_lengths();
-        let raw_before = rocks.snapshot().expect("raw preflight snapshot");
-        let before_block_manifest = raw_before
-            .get(ColumnFamily::Snapshots, BLOCK_SEGMENT_MANIFEST_KEY)
-            .expect("block manifest read")
-            .expect("block manifest");
-        let before_undo_manifest = raw_before
-            .get(ColumnFamily::Snapshots, UNDO_SEGMENT_MANIFEST_KEY)
-            .expect("undo manifest read")
-            .expect("undo manifest");
-        assert_eq!(
-            raw_before
-                .get(ColumnFamily::Blocks, &block_key)
-                .expect("absent block"),
-            None
-        );
-        assert_eq!(
-            raw_before
-                .get(ColumnFamily::Undo, &undo_key)
-                .expect("absent undo"),
-            None
-        );
-        drop(raw_before);
-
-        let make_batch = || {
-            let mut batch = archived.batch();
-            batch
-                .put(ColumnFamily::Blocks, &block_key, &block_payload)
-                .expect("stage block payload");
-            batch
-                .put(ColumnFamily::Undo, &undo_key, &undo_payload)
-                .expect("stage undo payload");
-            batch
-                .put(ColumnFamily::Meta, b"archive-budget", b"published")
-                .expect("stage metadata");
-            batch
-        };
-        let rejected_batch = make_batch();
-        let effects = rejected_batch
-            .archive_commit_effects(Some(TEST_ATOMIC_WRITE_FRAMING_BYTES))
-            .expect("preflight effects");
-        assert_eq!(effects.payloads, 2);
-
-        let empty_frame = encode_segment_record(&SegmentRecord {
-            kind: SegmentKind::Block,
-            key: [0; 32],
-            hints: Vec::new(),
-            payload: Vec::new(),
-        })
-        .expect("encode empty frame");
-        assert_eq!(
-            u64::try_from(empty_frame.len()).expect("frame overhead"),
-            ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES
-        );
-        let manifest_bytes = SegmentManifest::decode(&before_block_manifest)
-            .expect("decode block manifest")
-            .encode()
-            .len();
-        assert_eq!(
-            SegmentManifest::decode(&before_undo_manifest)
-                .expect("decode undo manifest")
-                .encode()
-                .len(),
-            manifest_bytes
-        );
-        assert_eq!(manifest_bytes, ARCHIVE_MANIFEST_ENCODED_BYTES);
-
-        let expected_operation_charge = |key_bytes: u64, value_bytes: u64, copies: u64| {
-            key_bytes
-                .saturating_add(value_bytes)
-                .saturating_add(TEST_ATOMIC_WRITE_FRAMING_BYTES)
-                .saturating_mul(copies)
-        };
-        let expected_extracted = expected_operation_charge(
-            u64::try_from(block_key.len()).expect("block key length"),
-            u64::try_from(block_payload.len()).expect("block payload length"),
-            ARCHIVE_EXTRACTED_PAYLOAD_COPIES,
-        )
-        .saturating_add(expected_operation_charge(
-            u64::try_from(undo_key.len()).expect("undo key length"),
-            u64::try_from(undo_payload.len()).expect("undo payload length"),
-            ARCHIVE_EXTRACTED_PAYLOAD_COPIES,
-        ));
-        let expected_frames = expected_operation_charge(
-            0,
-            u64::try_from(block_payload.len())
-                .expect("block length")
-                .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES),
-            ARCHIVE_FRAME_COPIES,
-        )
-        .saturating_add(expected_operation_charge(
-            0,
-            u64::try_from(undo_payload.len())
-                .expect("undo length")
-                .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES),
-            ARCHIVE_FRAME_COPIES,
-        ));
-        let expected_locators = expected_operation_charge(
-            u64::try_from(block_key.len()).expect("block key length"),
-            u64::try_from(SegmentValueLocator::encoded_len()).expect("locator length"),
-            ARCHIVE_LOCATOR_PUBLICATION_COPIES,
-        )
-        .saturating_add(expected_operation_charge(
-            u64::try_from(undo_key.len()).expect("undo key length"),
-            u64::try_from(SegmentValueLocator::encoded_len()).expect("locator length"),
-            ARCHIVE_LOCATOR_PUBLICATION_COPIES,
-        ));
-        let expected_manifests = expected_operation_charge(
-            u64::try_from(BLOCK_SEGMENT_MANIFEST_KEY.len()).expect("block manifest key length"),
-            u64::try_from(manifest_bytes).expect("manifest length"),
-            ARCHIVE_MANIFEST_PUBLICATION_COPIES,
-        )
-        .saturating_add(expected_operation_charge(
-            u64::try_from(UNDO_SEGMENT_MANIFEST_KEY.len()).expect("undo manifest key length"),
-            u64::try_from(manifest_bytes).expect("manifest length"),
-            ARCHIVE_MANIFEST_PUBLICATION_COPIES,
-        ));
-        assert_eq!(effects.extracted_payload_bytes, expected_extracted);
-        assert_eq!(effects.framed_segment_bytes, expected_frames);
-        assert_eq!(effects.locator_publication_bytes, expected_locators);
-        assert_eq!(effects.manifest_publication_bytes, expected_manifests);
-        let exact_additional = expected_extracted
-            .saturating_add(expected_frames)
-            .saturating_add(expected_locators)
-            .saturating_add(expected_manifests);
-        assert_eq!(effects.total(), exact_additional);
-        let exact_cumulative = INITIAL_CONSUMED.saturating_add(exact_additional);
-
-        let mut one_short = TestAtomicWriteEffectBudget {
-            consumed: INITIAL_CONSUMED,
-            limit: exact_cumulative - 1,
-        };
-        let error = archived
-            .commit_with_effect_budget(rejected_batch, &mut one_short)
-            .expect_err("one-byte-short budget must reject");
-        assert!(matches!(
-            error,
-            StoreError::LimitExceeded {
-                context: TEST_ATOMIC_WRITE_CONTEXT,
-                limit,
-                actual,
-            } if limit == exact_cumulative - 1 && actual == exact_cumulative
-        ));
-        assert_eq!(one_short.consumed, INITIAL_CONSUMED);
-        assert_eq!(segment_lengths(), before_segment_lengths);
-        let raw_rejected = rocks.snapshot().expect("raw rejected snapshot");
-        assert_eq!(
-            raw_rejected
-                .get(ColumnFamily::Blocks, &block_key)
-                .expect("rejected block"),
-            None
-        );
-        assert_eq!(
-            raw_rejected
-                .get(ColumnFamily::Undo, &undo_key)
-                .expect("rejected undo"),
-            None
-        );
-        assert_eq!(
-            raw_rejected
-                .get(ColumnFamily::Meta, b"archive-budget")
-                .expect("rejected metadata"),
-            None
-        );
-        assert_eq!(
-            raw_rejected
-                .get(ColumnFamily::Snapshots, BLOCK_SEGMENT_MANIFEST_KEY)
-                .expect("rejected block manifest"),
-            Some(before_block_manifest.clone())
-        );
-        assert_eq!(
-            raw_rejected
-                .get(ColumnFamily::Snapshots, UNDO_SEGMENT_MANIFEST_KEY)
-                .expect("rejected undo manifest"),
-            Some(before_undo_manifest.clone())
-        );
-        drop(raw_rejected);
-
-        let mut exact = TestAtomicWriteEffectBudget {
-            consumed: INITIAL_CONSUMED,
-            limit: exact_cumulative,
-        };
-        archived
-            .commit_with_effect_budget(make_batch(), &mut exact)
-            .expect("exact cumulative archive budget");
-        assert_eq!(exact.consumed, exact_cumulative);
-
-        let raw_committed = rocks.snapshot().expect("raw committed snapshot");
-        let raw_block = raw_committed
-            .get(ColumnFamily::Blocks, &block_key)
-            .expect("raw block")
-            .expect("block locator");
-        let raw_undo = raw_committed
-            .get(ColumnFamily::Undo, &undo_key)
-            .expect("raw undo")
-            .expect("undo locator");
-        let block_locator = SegmentValueLocator::decode(&raw_block)
-            .expect("decode block locator")
-            .expect("block locator");
-        let undo_locator = SegmentValueLocator::decode(&raw_undo)
-            .expect("decode undo locator")
-            .expect("undo locator");
-        assert_eq!(
-            u64::from(block_locator.locator.frame_length),
-            u64::try_from(block_payload.len())
-                .expect("block payload length")
-                .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES)
-        );
-        assert_eq!(
-            u64::from(undo_locator.locator.frame_length),
-            u64::try_from(undo_payload.len())
-                .expect("undo payload length")
-                .saturating_add(ARCHIVE_EMPTY_HINT_FRAME_OVERHEAD_BYTES)
-        );
-        let block_path = archive_path.join(format!(
-            "block-g{:016x}-s{:08x}.seg",
-            block_locator.locator.generation, block_locator.locator.segment
-        ));
-        let undo_path = archive_path.join(format!(
-            "undo-g{:016x}-s{:08x}.seg",
-            undo_locator.locator.generation, undo_locator.locator.segment
-        ));
-        assert_eq!(
-            std::fs::metadata(block_path)
-                .expect("committed block segment metadata")
-                .len(),
-            block_locator
-                .locator
-                .offset
-                .saturating_add(u64::from(block_locator.locator.frame_length))
-        );
-        assert_eq!(
-            std::fs::metadata(undo_path)
-                .expect("committed undo segment metadata")
-                .len(),
-            undo_locator
-                .locator
-                .offset
-                .saturating_add(u64::from(undo_locator.locator.frame_length))
-        );
-        assert_eq!(
-            raw_committed
-                .get(ColumnFamily::Meta, b"archive-budget")
-                .expect("committed metadata"),
-            Some(b"published".to_vec())
-        );
-        drop(raw_committed);
-        assert_eq!(
-            archived
-                .snapshot()
-                .expect("resolved committed snapshot")
-                .get(ColumnFamily::Blocks, &block_key)
-                .expect("resolved block"),
-            Some(block_payload)
-        );
-        assert_eq!(
-            archived
-                .snapshot()
-                .expect("resolved committed snapshot")
-                .get(ColumnFamily::Undo, &undo_key)
-                .expect("resolved undo"),
-            Some(undo_payload)
-        );
-
-        drop(archived);
-        drop(rocks);
-        std::fs::remove_dir_all(root).expect("remove RocksDB archive budget fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_commit_fault_fences_shared_clones_until_true_reopen() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "hsrd-rocks-publication-fence-test-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        let rocks = RocksStore::open(&path).expect("open rocksdb");
-        let clone = rocks.clone();
-
-        let mut rejected = rocks.batch();
-        rejected
-            .put(ColumnFamily::Meta, b"before-write", b"rejected")
-            .expect("stage before-write fault");
-        rocks.inject_next_commit_fault(RocksCommitFault::BeforeWrite);
-        assert!(rocks.commit(rejected).is_err());
-        assert!(!rocks.reopen_required());
-        assert!(!clone.reopen_required());
-
-        let mut accepted = clone.batch();
-        accepted
-            .put(ColumnFamily::Meta, b"after-before", b"accepted")
-            .expect("stage safe retry");
-        clone
-            .commit(accepted)
-            .expect("commit after known rejection");
-
-        let mut ambiguous = rocks.batch();
-        ambiguous
-            .put(ColumnFamily::Meta, b"after-write", b"committed")
-            .expect("stage after-write fault");
-        rocks.inject_next_commit_fault(RocksCommitFault::AfterWrite);
-        assert!(rocks.commit(ambiguous).is_err());
-        assert!(rocks.reopen_required());
-        assert!(clone.reopen_required());
-        assert!(rocks.snapshot().is_err());
-        assert!(clone
-            .create_checkpoint(path.with_extension("blocked-checkpoint"))
-            .is_err());
-        let mut bypass = clone.batch();
-        bypass
-            .put(ColumnFamily::Meta, b"fenced-bypass", b"rejected")
-            .expect("stage fenced bypass");
-        assert!(clone.commit(bypass).is_err());
-        drop(clone);
-        drop(rocks);
-
-        let reopened = RocksStore::open(&path).expect("truly reopen RocksDB");
-        assert!(!reopened.reopen_required());
-        let snapshot = reopened.snapshot().expect("reopened snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, b"before-write")
-                .expect("rejected value"),
-            None
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, b"after-before")
-                .expect("accepted value"),
-            Some(b"accepted".to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, b"after-write")
-                .expect("ambiguous applied value"),
-            Some(b"committed".to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, b"fenced-bypass")
-                .expect("fenced bypass value"),
-            None
-        );
-        drop(snapshot);
-        let poison = reopened.clone();
-        assert!(std::thread::spawn(move || {
-            let _publication = poison.publication_lock.lock().expect("publication lock");
-            panic!("inject RocksDB publication-lock poison");
-        })
-        .join()
-        .is_err());
-        assert!(reopened.reopen_required());
-        assert!(reopened.snapshot().is_err());
-        drop(reopened);
-        std::fs::remove_dir_all(path).expect("remove RocksDB fence fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_segment_publication_faults_recover_the_complete_old_or_new_batch() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "hsrd-rocks-segment-fault-test-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let chain_path = root.join("chain");
-        let rocks = RocksStore::open(&chain_path).expect("open rocksdb");
-        let raw = StoreHandle::Rocks(rocks.clone());
-        let archive_path = root.join("payloads");
-        let archived = raw
-            .clone()
-            .with_segment_archive(archive_path.clone())
-            .expect("attach archive");
-        let retained = [0x81; 32];
-        let rejected = [0x82; 32];
-        let accepted = [0x83; 32];
-        let mut batch = archived.batch();
-        batch
-            .put(ColumnFamily::Blocks, &retained, b"retained")
-            .expect("stage retained");
-        archived.commit(batch).expect("commit retained");
-
-        let mut batch = archived.batch();
-        batch
-            .put(ColumnFamily::Blocks, &rejected, b"must remain absent")
-            .expect("stage rejected");
-        rocks.inject_next_commit_fault(RocksCommitFault::BeforeWrite);
-        assert!(archived.commit(batch).is_err());
-        assert!(archived.reopen_required());
-        assert!(!rocks.reopen_required());
-        assert!(archived.snapshot().is_err());
-        assert!(archived.segment_archive_inventory().is_err());
-        let mut metadata = archived.batch();
-        metadata
-            .put(ColumnFamily::Meta, b"must-not-bypass", b"rejected")
-            .expect("stage fenced metadata");
-        assert!(archived.commit(metadata).is_err());
-        drop(archived);
-
-        let archived = raw
-            .clone()
-            .with_segment_archive(archive_path.clone())
-            .expect("recover old publication");
-        let snapshot = archived.snapshot().expect("old snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Blocks, &retained)
-                .expect("retained block"),
-            Some(b"retained".to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Blocks, &rejected)
-                .expect("rejected block"),
-            None
-        );
-        drop(snapshot);
-
-        let mut batch = archived.batch();
-        batch
-            .put(ColumnFamily::Blocks, &accepted, b"committed before error")
-            .expect("stage accepted");
-        rocks.inject_next_commit_fault(RocksCommitFault::AfterWrite);
-        assert!(archived.commit(batch).is_err());
-        assert!(archived.reopen_required());
-        assert!(rocks.reopen_required());
-        assert!(raw.reopen_required());
-        assert!(archived.snapshot().is_err());
-        let mut metadata = archived.batch();
-        metadata
-            .put(ColumnFamily::Meta, b"post-write-bypass", b"rejected")
-            .expect("stage post-write metadata");
-        assert!(archived.commit(metadata).is_err());
-        drop(archived);
-        drop(raw);
-        drop(rocks);
-
-        let rocks = RocksStore::open(&chain_path).expect("truly reopen RocksDB");
-        let recovered = StoreHandle::Rocks(rocks.clone())
-            .with_segment_archive(archive_path)
-            .expect("recover committed publication");
-        let snapshot = recovered.snapshot().expect("new snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Blocks, &retained)
-                .expect("retained block"),
-            Some(b"retained".to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Blocks, &accepted)
-                .expect("accepted block"),
-            Some(b"committed before error".to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Blocks, &rejected)
-                .expect("rejected block"),
-            None
-        );
-        drop(snapshot);
-        drop(recovered);
-        drop(rocks);
-        std::fs::remove_dir_all(root).expect("remove segment fault fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn compaction_post_write_error_reopens_the_new_generation_without_data_loss() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "hsrd-rocks-compaction-fault-test-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let chain_path = root.join("chain");
-        let rocks = RocksStore::open(&chain_path).expect("open rocksdb");
-        let raw = StoreHandle::Rocks(rocks.clone());
-        let archive_path = root.join("payloads");
-        let archived = raw
-            .clone()
-            .with_segment_archive(archive_path.clone())
-            .expect("attach archive");
-        let live = [0x91; 32];
-        let dead = [0x92; 32];
-        let mut batch = archived.batch();
-        batch
-            .put(ColumnFamily::Blocks, &live, b"live after compaction")
-            .expect("stage live");
-        batch
-            .put(ColumnFamily::Blocks, &dead, b"dead before compaction")
-            .expect("stage dead");
-        archived.commit(batch).expect("commit fixtures");
-        let mut batch = archived.batch();
-        batch
-            .delete(ColumnFamily::Blocks, &dead)
-            .expect("retire dead locator");
-        archived.commit(batch).expect("commit retirement");
-
-        rocks.inject_next_commit_fault(RocksCommitFault::AfterWrite);
-        let error = archived
-            .compact_segment_archive()
-            .expect_err("post-write acknowledgement fault");
-        assert!(error.to_string().contains("outcome is uncertain"));
-        assert!(archived.reopen_required());
-        assert!(raw.reopen_required());
-        assert!(rocks.reopen_required());
-        assert!(archived.snapshot().is_err());
-        assert!(archived.scrub_segment_archive().is_err());
-        let mut metadata = archived.batch();
-        metadata
-            .put(ColumnFamily::Meta, b"compaction-bypass", b"rejected")
-            .expect("stage fenced compaction metadata");
-        assert!(archived.commit(metadata).is_err());
-        drop(archived);
-        drop(raw);
-        drop(rocks);
-
-        let rocks = RocksStore::open(&chain_path).expect("truly reopen RocksDB");
-        let recovered = StoreHandle::Rocks(rocks.clone())
-            .with_segment_archive(archive_path.clone())
-            .expect("recover new generation");
-        let snapshot = recovered.snapshot().expect("recovered snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Blocks, &live)
-                .expect("live block"),
-            Some(b"live after compaction".to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Blocks, &dead)
-                .expect("dead block"),
-            None
-        );
-        drop(snapshot);
-        assert_eq!(
-            recovered
-                .scrub_segment_archive()
-                .expect("scrub recovered generation")
-                .blocks
-                .records,
-            1
-        );
-        for entry in std::fs::read_dir(&archive_path).expect("read archive") {
-            let name = entry
-                .expect("archive entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned();
-            assert!(name.contains("-g0000000000000002-"), "{name}");
-        }
-        drop(recovered);
-        drop(rocks);
-        std::fs::remove_dir_all(root).expect("remove compaction fault fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn compaction_post_commit_install_poison_fences_and_recovers_new_generation() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "hsrd-rocks-compaction-install-fault-test-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let chain_path = root.join("chain");
-        let rocks = RocksStore::open(&chain_path).expect("open rocksdb");
-        let raw = StoreHandle::Rocks(rocks.clone());
-        let archive_path = root.join("payloads");
-        let archived = raw
-            .clone()
-            .with_segment_archive(archive_path.clone())
-            .expect("attach archive");
-        let live = [0xa1; 32];
-        let mut batch = archived.batch();
-        batch
-            .put(
-                ColumnFamily::Blocks,
-                &live,
-                b"committed replacement generation",
-            )
-            .expect("stage live block");
-        archived.commit(batch).expect("commit live block");
-        let snapshot_before = archived.snapshot().expect("snapshot before compaction");
-
-        let StoreHandle::Archived { archive, .. } = &archived else {
-            panic!("expected archived store");
-        };
-        archive.inject_next_install_reader_poison();
-        let error = archived
-            .compact_segment_archive()
-            .expect_err("post-commit installation poison");
-        let message = error.to_string();
-        assert!(
-            message
-                .contains("database publication committed but archive installation is incomplete"),
-            "{message}"
-        );
-        assert!(message.contains("reopen required"), "{message}");
-        assert!(archived.reopen_required());
-        assert!(!raw.reopen_required());
-        assert!(!rocks.reopen_required());
-        assert!(archived.snapshot().is_err());
-        assert!(snapshot_before.get(ColumnFamily::Blocks, &live).is_err());
-        let mut fenced = archived.batch();
-        fenced
-            .put(ColumnFamily::Meta, b"install-fault-bypass", b"rejected")
-            .expect("stage fenced metadata");
-        assert!(archived.commit(fenced).is_err());
-
-        let names = std::fs::read_dir(&archive_path)
-            .expect("read preserved generations")
-            .map(|entry| {
-                entry
-                    .expect("archive entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect::<Vec<_>>();
-        for expected in [
-            "block-g0000000000000001-",
-            "undo-g0000000000000001-",
-            "block-g0000000000000002-",
-            "undo-g0000000000000002-",
-        ] {
-            assert!(
-                names.iter().any(|name| name.contains(expected)),
-                "missing {expected} in {names:?}"
-            );
-        }
-        drop(snapshot_before);
-        drop(archived);
-        drop(raw);
-        drop(rocks);
-
-        let rocks = RocksStore::open(&chain_path).expect("truly reopen RocksDB");
-        let recovered = StoreHandle::Rocks(rocks.clone())
-            .with_segment_archive(archive_path.clone())
-            .expect("recover committed generation");
-        assert!(!recovered.reopen_required());
-        let snapshot = recovered.snapshot().expect("recovered snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Blocks, &live)
-                .expect("resolved replacement locator"),
-            Some(b"committed replacement generation".to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::Meta, b"install-fault-bypass")
-                .expect("fenced metadata"),
-            None
-        );
-        drop(snapshot);
-        assert_eq!(
-            recovered
-                .scrub_segment_archive()
-                .expect("scrub recovered generation")
-                .blocks
-                .records,
-            1
-        );
-        for entry in std::fs::read_dir(&archive_path).expect("read recovered archive") {
-            let name = entry
-                .expect("archive entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned();
-            assert!(name.contains("-g0000000000000002-"), "{name}");
-        }
-        drop(recovered);
-        drop(rocks);
-        std::fs::remove_dir_all(root).expect("remove compaction install-fault fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_store_exposes_selected_wal_durability_policy() {
-        let path =
-            std::env::temp_dir().join(format!("hsrd-rocks-durability-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        let store =
-            RocksStore::open_with_durability(&path, DurabilityPolicy::Wal).expect("open rocksdb");
-        assert_eq!(store.durability, DurabilityPolicy::Wal);
-        drop(store);
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_store_configures_bounded_cache_domains() {
-        let path = std::env::temp_dir().join(format!(
-            "hsrd-rocks-cache-domain-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        let store = RocksStore::open(&path).expect("open rocksdb");
-
-        let point_cf = RocksStore::cf(&store.db, ColumnFamily::NameTreeNodes).expect("point cf");
-        let bulk_cf = RocksStore::cf(&store.db, ColumnFamily::Blocks).expect("bulk cf");
-        assert_eq!(
-            store
-                .db
-                .property_int_value_cf(point_cf, rocksdb::properties::BLOCK_CACHE_CAPACITY)
-                .expect("point cache capacity"),
-            Some(ROCKS_POINT_CACHE_BYTES as u64)
-        );
-        assert_eq!(
-            store
-                .db
-                .property_int_value_cf(bulk_cf, rocksdb::properties::BLOCK_CACHE_CAPACITY)
-                .expect("bulk cache capacity"),
-            Some(ROCKS_BULK_CACHE_BYTES as u64)
-        );
-        assert!(format!("{store:?}").contains("point_cache_usage"));
-
-        drop(store);
-        let log = std::fs::read_to_string(path.join("LOG")).expect("rocksdb option log");
-        assert!(
-            log.contains(&format!(
-                "Options.db_write_buffer_size: {ROCKS_DB_WRITE_BUFFER_BYTES}"
-            )),
-            "RocksDB did not apply the aggregate memtable cap"
-        );
-        assert!(
-            log.contains(&format!(
-                "Options.max_total_wal_size: {ROCKS_MAX_TOTAL_WAL_BYTES}"
-            )),
-            "RocksDB did not apply the aggregate WAL cap"
-        );
-
-        for family in ["tx_index", "wallet_history", "wallet_state", "utxo"] {
-            let options = log
-                .split(&format!("Options for column family [{family}]:"))
-                .nth(1)
-                .and_then(|tail| tail.split("Options for column family [").next())
-                .unwrap_or_else(|| panic!("{family} RocksDB options"));
-            assert!(
-                options.contains(&format!(
-                    "Options.write_buffer_size: {ROCKS_UTXO_WRITE_BUFFER_BYTES}"
-                )),
-                "{family} did not apply the larger write buffer"
-            );
-            assert!(
-                options.contains(&format!(
-                    "Options.max_write_buffer_number: {ROCKS_UTXO_MAX_WRITE_BUFFERS}"
-                )),
-                "{family} did not apply the write-buffer count"
-            );
-            assert!(
-                options.contains(&format!(
-                    "Options.min_write_buffer_number_to_merge: {ROCKS_UTXO_MIN_WRITE_BUFFERS_TO_MERGE}"
-                )),
-                "{family} did not apply paired memtable flushing"
-            );
-            assert!(
-                options.contains(&format!(
-                    "Options.target_file_size_base: {ROCKS_UTXO_TARGET_FILE_BYTES}"
-                )),
-                "{family} did not apply the larger target file size"
-            );
-            assert!(
-                options.contains(&format!(
-                    "Options.max_bytes_for_level_base: {ROCKS_UTXO_LEVEL_BASE_BYTES}"
-                )),
-                "{family} did not apply the larger level base"
-            );
-            assert!(
-                options.contains("partition_filters: 1"),
-                "{family} did not apply partitioned bloom filters"
-            );
-            assert!(
-                options.contains("index_type: 2"),
-                "{family} did not apply the two-level index"
-            );
-            assert!(
-                options.contains("pin_top_level_index_and_filter: 1"),
-                "{family} did not pin the partition-routing metadata"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_wallet_families_fallback_and_migrate_legacy_rows_atomically() {
-        let path = std::env::temp_dir().join(format!(
-            "hsrd-rocks-wallet-family-migration-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        let store = RocksStore::open(&path).expect("open rocksdb");
-        let prefix = b"wallet-index/v1/history/script/";
-        let legacy_key = [prefix.as_slice(), b"a"].concat();
-        let current_key = [prefix.as_slice(), b"b"].concat();
-        let mut seed = store.batch();
-        seed.put(
-            ColumnFamily::Meta,
-            MetaKey::SchemaVersion.as_bytes(),
-            &encode_u32(MIXED_INDEX_SCHEMA_VERSION),
-        )
-        .expect("seed mixed schema marker");
-        seed.put(ColumnFamily::TxIndex, &legacy_key, b"legacy")
-            .expect("seed legacy row");
-        seed.put(ColumnFamily::WalletHistory, &current_key, b"current")
-            .expect("seed current row");
-        store.commit(seed).expect("commit seed rows");
-        drop(store);
-        let store = RocksStore::open(&path).expect("reopen mixed-layout rocksdb");
-
-        let snapshot = store.snapshot().expect("mixed snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::WalletHistory, &legacy_key)
-                .expect("legacy fallback"),
-            Some(b"legacy".to_vec())
-        );
-        let page = snapshot
-            .scan_prefix_page(
-                ColumnFamily::WalletHistory,
-                prefix,
-                None,
-                PrefixScanBudget {
-                    max_entries: 1,
-                    max_bytes: 1024,
-                },
-            )
-            .expect("merged first page");
-        assert_eq!(page.entries, vec![(legacy_key.clone(), b"legacy".to_vec())]);
-        let continuation = page.continuation.expect("bounded continuation");
-        let page = snapshot
-            .scan_prefix_page(
-                ColumnFamily::WalletHistory,
-                prefix,
-                Some(&continuation),
-                PrefixScanBudget {
-                    max_entries: 1,
-                    max_bytes: 1024,
-                },
-            )
-            .expect("merged second page");
-        assert_eq!(page.entries, vec![(current_key, b"current".to_vec())]);
-        drop(snapshot);
-
-        let mut migrate = store.batch();
-        migrate
-            .put(ColumnFamily::WalletHistory, &legacy_key, b"migrated")
-            .expect("migrate row");
-        store.commit(migrate).expect("commit migrated row");
-        let snapshot = store.snapshot().expect("migrated snapshot");
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::WalletHistory, &legacy_key)
-                .expect("new family row"),
-            Some(b"migrated".to_vec())
-        );
-        assert_eq!(
-            snapshot
-                .get(ColumnFamily::TxIndex, &legacy_key)
-                .expect("legacy row deleted"),
-            None
-        );
-        drop(snapshot);
-
-        let mut delete = store.batch();
-        delete
-            .delete(ColumnFamily::WalletHistory, &legacy_key)
-            .expect("delete migrated row");
-        store.commit(delete).expect("commit delete");
-        assert_eq!(
-            store
-                .snapshot()
-                .expect("deleted snapshot")
-                .get(ColumnFamily::WalletHistory, &legacy_key)
-                .expect("deleted row"),
-            None
-        );
-        drop(store);
-        let _ = std::fs::remove_dir_all(&path);
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn rocks_snapshot_is_sequence_consistent() {
-        let path =
-            std::env::temp_dir().join(format!("hsrd-rocks-snapshot-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        let store = RocksStore::open(&path).expect("open rocksdb");
-
-        let mut initial = store.batch();
-        initial
-            .put(ColumnFamily::Meta, b"key", b"old")
-            .expect("put initial");
-        store.commit(initial).expect("commit initial");
-
-        let snapshot = store.snapshot().expect("snapshot");
-        let mut replacement = store.batch();
-        replacement
-            .put(ColumnFamily::Meta, b"key", b"new")
-            .expect("put replacement");
-        store.commit(replacement).expect("commit replacement");
-
-        assert_eq!(
-            snapshot.get(ColumnFamily::Meta, b"key").expect("get"),
-            Some(b"old".to_vec())
-        );
-        assert_eq!(
-            store
-                .snapshot()
-                .expect("new snapshot")
-                .get(ColumnFamily::Meta, b"key")
-                .expect("get"),
-            Some(b"new".to_vec())
-        );
-
-        drop(snapshot);
-        drop(store);
-        let _ = std::fs::remove_dir_all(&path);
     }
 }

@@ -140,7 +140,7 @@ pub struct RpcConsensusReadiness {
     pub validated_reorg_planning: bool,
     /// Complete multi-block reorganizations commit in one write batch.
     pub atomic_reorganizations: bool,
-    /// RocksDB writes retain WAL protection and expose an explicit sync policy.
+    /// Durable database writes expose an explicit synchronization policy.
     pub wal_durability: bool,
     pub historical_replay: bool,
     pub invalid_corpus: bool,

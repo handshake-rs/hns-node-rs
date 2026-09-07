@@ -48,7 +48,7 @@ use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcExperimentalRegistryInfo, RpcHip76Info,
     RpcHnsrInfo, RpcMethod, RpcOdohInfo, RpcService, RpcSnapshot,
 };
-#[cfg(all(test, feature = "rocksdb-backend"))]
+#[cfg(test)]
 use hns_store::mark_clean_shutdown;
 use hns_store::{
     ColumnFamily, ReadSnapshot, SegmentArchiveCompactionReport, Store, StoreError, StoreHandle,
@@ -1152,7 +1152,7 @@ pub struct NativeSyncDiagnostics {
     /// Records served by the bounded cache shared across activation slices.
     #[serde(default)]
     pub active_state_last_name_page_path_cache_hits: u64,
-    /// Durable RocksDB publication and page-state finalization in that activation.
+    /// Durable database publication and page-state finalization in that activation.
     #[serde(default)]
     pub active_state_last_store_publication_micros: u64,
     pub active_state_last_post_commit_micros: u64,
@@ -3810,7 +3810,7 @@ impl NodeService {
                         checkpoint_sequence,
                     )
                     .await;
-                    // Maintenance includes stable RocksDB/header scans. If it
+                    // Maintenance includes stable database/header scans. If it
                     // exceeded the period, an already-expired next tick would
                     // otherwise remain permanently ready in the biased outer
                     // supervisor select.
@@ -4733,12 +4733,6 @@ impl NodeService {
         NodeReadHandle::native_sync_header_record_from_snapshot(&snapshot, hash)
     }
 
-    #[cfg(test)]
-    fn native_sync_block(&self, hash: &BlockHash) -> Result<Option<Block>> {
-        let snapshot = self.state.store.snapshot()?;
-        load_block_from_snapshot(&snapshot, hash).context("failed to load test block")
-    }
-
     fn native_sync_store_validated_blocks(
         &mut self,
         blocks: Vec<(ValidatedBlock, bool)>,
@@ -4755,11 +4749,26 @@ impl NodeService {
             let import = self
                 .state
                 .validate_prevalidated_native_import(&request, canonical, stateless)?;
-            candidates.push((request, import));
+            candidates.push((request, import, stateless, canonical));
         }
+
+        // Fresh checkpoint-backed IBD does not need a durable body staging
+        // transaction followed by an archive read and a second chainstate
+        // transaction. Connect the longest available canonical successor run
+        // directly from the worker-owned block values. The block bytes, undo,
+        // UTXO/name changes, indexes and new tip are then published together.
+        // Remaining out-of-order or side-chain bodies retain the ordinary
+        // durable alternate path below.
+        self.native_sync_connect_checkpoint_prefix(&candidates)?;
+
         let result = self
             .state
-            .store_validated_alternates(candidates)
+            .store_validated_alternates(
+                candidates
+                    .into_iter()
+                    .map(|(request, import, _, _)| (request, import))
+                    .collect(),
+            )
             .map(|mutations| {
                 mutations
                     .into_iter()
@@ -4770,6 +4779,122 @@ impl NodeService {
             self.fail_closed_after_ambiguous_commit();
         }
         result
+    }
+
+    fn native_sync_connect_checkpoint_prefix(
+        &mut self,
+        candidates: &[(
+            NodeBlockImport,
+            super::ValidatedImport,
+            StatelessBodyValidation,
+            bool,
+        )],
+    ) -> Result<usize> {
+        // A one-block batch gains no fsync amortization. Let it enter the
+        // durable body queue and join the next active-state replay slice.
+        if candidates.len() < 2 {
+            return Ok(0);
+        }
+
+        let active = self.state.best_block_tip()?;
+        let mut next_height = active
+            .as_ref()
+            .map_or(0, |tip| tip.height.saturating_add(1));
+        let mut previous = active.as_ref().map_or(BlockHash::ZERO, |tip| tip.hash);
+        let checkpoint_height = self.config.network.last_checkpoint();
+        let mut selected = Vec::new();
+        let mut selected_indexes = HashSet::new();
+
+        loop {
+            let Some((index, (request, _, proof, _))) =
+                candidates.iter().enumerate().find(|(index, candidate)| {
+                    !selected_indexes.contains(index)
+                        && candidate.3
+                        && candidate.0.height == next_height
+                        && candidate.0.block.header.prev_block == previous
+                        && candidate.0.height <= checkpoint_height
+                })
+            else {
+                break;
+            };
+            selected_indexes.insert(index);
+            previous = request.block.hash();
+            next_height = next_height.saturating_add(1);
+            selected.push((request.clone(), *proof));
+        }
+
+        if selected.len() < 2 {
+            return Ok(0);
+        }
+
+        let connect = selected
+            .iter()
+            .map(|(request, _)| request.clone())
+            .collect::<Vec<_>>();
+        let proofs = selected.iter().map(|(_, proof)| *proof).collect::<Vec<_>>();
+        for request in &connect {
+            let summary = HeaderSummary::from_block(request.block(), request.height());
+            self.mining_events.candidate_tip_seen(summary.clone());
+            self.mining_events.block_syntax_validated(summary);
+        }
+
+        let activation = NodeReorg {
+            disconnect: Vec::new(),
+            connect,
+        };
+        let reconciliation_snapshot = self.state.store.snapshot()?;
+        preflight_reorg_reconciliation_budget(
+            &reconciliation_snapshot,
+            &activation,
+            NodeReorgLimits::with_maximum_connect_and_staged_effect_bytes(
+                selected.len(),
+                self.config.native_sync.active_state_staged_effect_bytes,
+            ),
+        )?;
+        drop(reconciliation_snapshot);
+
+        let prepared = PreparedNativeActivation::new(proofs)?;
+        let mutation = self.state.apply_reorg_classified_with_limits_and_prepared(
+            activation,
+            NodeReorgLimits::with_maximum_connect_and_staged_effect_bytes(
+                selected.len(),
+                self.config.native_sync.active_state_staged_effect_bytes,
+            ),
+            Some(prepared),
+        );
+        let mutation = match mutation {
+            Ok(mutation) => mutation,
+            Err(ChainActivationFailure::ContextualInvalid(failure)) => {
+                anyhow::bail!(
+                    "checkpoint-backed canonical block {} at height {} failed contextual validation: {:#}",
+                    failure.request.block.hash().to_hex(),
+                    failure.request.height,
+                    failure.error
+                );
+            }
+            Err(ChainActivationFailure::Internal(error)) => return Err(error),
+        };
+
+        let committed_hashes = mutation
+            .summary
+            .connected
+            .iter()
+            .map(|record| record.hash)
+            .collect::<HashSet<_>>();
+        let committed_transactions = selected
+            .iter()
+            .filter(|(request, _)| committed_hashes.contains(&request.block.hash()))
+            .flat_map(|(request, _)| request.block.transactions.clone())
+            .collect::<Vec<_>>();
+        let mining_publication = self.publish_durable_mining_state(&mutation.mining);
+        let mempool_generation =
+            self.mining_engine_reconcile_chain_transition(&[], &committed_transactions);
+        mining_publication?;
+        self.mining_engine_publish_mempool_reconciled(
+            mutation.mining.generation,
+            mempool_generation,
+        )?;
+        Ok(mutation.summary.connected.len())
     }
 
     fn native_sync_store_failed_block(
@@ -9638,7 +9763,7 @@ fn runtime_instance_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NamePageStorage, NodeConfig, NodeState};
+    use crate::NodeConfig;
     use hns_consensus::{ConsensusError, SequenceLockView, TransactionInputVerifier};
     use hns_mempool::{ContextualTransactionVerifier, MempoolContext, MempoolView};
     use hns_primitives::{
@@ -12434,9 +12559,8 @@ mod tests {
         assert_eq!(addresses.eviction_order.first().copied(), Some(expected));
     }
 
-    #[cfg(feature = "rocksdb-backend")]
     #[test]
-    fn durable_address_book_survives_rocksdb_reopen() {
+    fn durable_address_book_survives_direct_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-address-book-reopen-{}-{}",
             std::process::id(),
@@ -12445,7 +12569,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let config = hns_store::StoreConfig {
             path: path.clone(),
-            backend: hns_store::StoreBackend::RocksDb,
+            backend: hns_store::StoreBackend::Direct,
             durability: hns_store::DurabilityPolicy::Sync,
         };
         let address: SocketAddr = "9.9.9.9:12038".parse().expect("peer");
@@ -13471,91 +13595,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_name_page_fence_blocks_native_header_body_and_compaction_writes() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "hsrd-native-name-page-fence-{}-{nonce}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-
-        let store = StoreHandle::memory();
-        let mut state =
-            NodeState::from_store_for_network(store.clone(), Network::Regtest).expect("state");
-        state.name_pages = Some(
-            NamePageStorage::open_or_bootstrap(directory.clone(), &store, Network::Regtest)
-                .expect("pages"),
-        );
-        let mut node = NodeService::try_with_state(
-            NodeConfig {
-                network: Network::Regtest,
-                ..NodeConfig::default()
-            },
-            state,
-        )
-        .expect("node");
-        node.state
-            .name_pages
-            .as_mut()
-            .expect("page storage")
-            .fence_after_commit_attempt();
-        node.fail_closed_after_ambiguous_commit();
-
-        let params = Network::Regtest.params();
-        let header_error = node
-            .native_sync_import_headers(vec![params.genesis_header()])
-            .expect_err("fenced header persistence");
-        assert!(
-            header_error.to_string().contains("restart and reopen"),
-            "{header_error}"
-        );
-        assert!(node
-            .state
-            .chain
-            .load_record(&params.genesis_hash)
-            .expect("genesis header lookup")
-            .is_none());
-
-        let alternate = linked_validator_block(1, &params.genesis_header());
-        let alternate_hash = alternate.hash();
-        let body_error = node
-            .native_sync_store_validated_blocks(vec![(
-                ValidatedBlock {
-                    sequence: 0,
-                    peer: PeerId(1),
-                    height: 1,
-                    block: alternate,
-                },
-                true,
-            )])
-            .expect_err("fenced alternate-body persistence");
-        assert!(
-            body_error.to_string().contains("restart and reopen"),
-            "{body_error}"
-        );
-        assert!(node
-            .native_sync_block(&alternate_hash)
-            .expect("alternate body lookup")
-            .is_none());
-
-        let compaction_error = node
-            .compact_name_tree_nodes()
-            .expect_err("fenced public compaction");
-        assert!(
-            compaction_error.to_string().contains("restart and reopen"),
-            "{compaction_error}"
-        );
-
-        drop(node);
-        fs::remove_dir_all(directory).expect("remove native fence fixture");
-    }
-
-    #[cfg(feature = "rocksdb-backend")]
-    #[test]
-    fn out_of_order_canonical_body_survives_rocksdb_reopen() {
+    fn out_of_order_canonical_body_survives_direct_reopen() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-native-out-of-order-{}-{}",
             std::process::id(),

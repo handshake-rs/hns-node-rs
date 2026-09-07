@@ -427,7 +427,7 @@ impl NamePageAppender {
 
     /// Write one complete immutable page. State mutation prepares records in
     /// memory first, so consensus failure cannot leave a partially published
-    /// page or locator in the RocksDB batch.
+    /// page or locator in the database transaction.
     pub fn append(
         &mut self,
         records: &[NamePageRecord],

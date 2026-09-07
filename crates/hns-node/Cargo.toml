@@ -7,8 +7,7 @@ publish.workspace = true
 repository.workspace = true
 
 [features]
-default = ["rocksdb-backend"]
-rocksdb-backend = ["hns-state/rocksdb-backend", "hns-store/rocksdb-backend"]
+default = []
 experimental-authority = []
 
 [dependencies]
@@ -63,10 +62,6 @@ path = "src/bin/hsrd_state_manifest.rs"
 [[bin]]
 name = "hsrd-rollback-manifest"
 path = "src/bin/hsrd_rollback_manifest.rs"
-
-[[bin]]
-name = "hsrd-storage-maintenance"
-path = "src/bin/hsrd_storage_maintenance.rs"
 
 [[bin]]
 name = "hsrd-name-tree-diagnose"
