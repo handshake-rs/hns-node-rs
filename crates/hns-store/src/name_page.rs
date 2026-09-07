@@ -203,26 +203,121 @@ pub enum NamePagePush {
     Full(NamePageRecord),
 }
 
-#[derive(Clone, Debug)]
-pub struct NamePageBuilder {
-    segment: u32,
-    page: u32,
-    records: Vec<NamePageRecord>,
-    keys: BTreeSet<[u8; 32]>,
-    subpage_record_counts: Vec<usize>,
-    subpage_record_bytes: Vec<usize>,
+/// Result of adding record dimensions to an allocation-free page layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamePageLayoutPush {
+    Added(NamePageAddress),
+    Full,
 }
 
-impl NamePageBuilder {
+/// Exact page-layout planner which retains no keys, children, or payloads.
+///
+/// A caller that already guarantees globally unique records can use this to
+/// assign the same addresses as [`NamePageBuilder`] without temporarily
+/// transferring every canonical payload into a second collection.
+#[derive(Clone, Debug)]
+pub struct NamePageLayoutBuilder {
+    segment: u32,
+    page: u32,
+    records: usize,
+    subpages: usize,
+    current_subpage_records: usize,
+    current_subpage_record_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct NamePageBuilder {
+    layout: NamePageLayoutBuilder,
+    records: Vec<NamePageRecord>,
+    keys: BTreeSet<[u8; 32]>,
+}
+
+impl NamePageLayoutBuilder {
     pub fn new(segment: u32, page: u32) -> Result<Self, NamePageError> {
         NamePageAddress::new(segment, page, 0)?;
         Ok(Self {
             segment,
             page,
+            records: 0,
+            subpages: 0,
+            current_subpage_records: 0,
+            current_subpage_record_bytes: 0,
+        })
+    }
+
+    /// Add one record's dimensions using exactly the physical builder's
+    /// subpage and index capacity rules.
+    pub fn push(
+        &mut self,
+        children: usize,
+        canonical_bytes: usize,
+    ) -> Result<NamePageLayoutPush, NamePageError> {
+        validate_name_page_record_dimensions(self.records, children, canonical_bytes)?;
+        let added_bytes = name_page_record_dimension_bytes(children, canonical_bytes)?;
+        let index_required = NAME_SUBPAGE_INDEX_HEADER_BYTES
+            .checked_add(
+                self.records
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(NAME_SUBPAGE_INDEX_ENTRY_BYTES))
+                    .ok_or(NamePageError::OffsetOverflow)?,
+            )
+            .and_then(|bytes| bytes.checked_add(NAME_SUBPAGE_CHECKSUM_BYTES))
+            .ok_or(NamePageError::OffsetOverflow)?;
+        if index_required > NAME_SUBPAGE_BYTES {
+            return Ok(NamePageLayoutPush::Full);
+        }
+        let next_count = self
+            .current_subpage_records
+            .checked_add(1)
+            .ok_or(NamePageError::OffsetOverflow)?;
+        let next_bytes = self
+            .current_subpage_record_bytes
+            .checked_add(added_bytes)
+            .ok_or(NamePageError::OffsetOverflow)?;
+        let mut required = name_subpage_required_bytes(next_count, next_bytes)?;
+        if self.current_subpage_records >= NAME_SUBPAGE_LOCAL_RECORD_MAX
+            || required > NAME_SUBPAGE_BYTES
+        {
+            if self.subpages == NAME_SUBPAGE_DATA_COUNT {
+                return Ok(NamePageLayoutPush::Full);
+            }
+            required = name_subpage_required_bytes(1, added_bytes)?;
+            if required > NAME_SUBPAGE_BYTES {
+                return Err(NamePageError::RecordTooLarge {
+                    index: self.records,
+                    actual: added_bytes,
+                    maximum: NAME_SUBPAGE_BYTES
+                        - NAME_SUBPAGE_RECORD_HEADER_BYTES
+                        - NAME_SUBPAGE_CHECKSUM_BYTES,
+                });
+            }
+            self.subpages += 1;
+            self.current_subpage_records = 0;
+            self.current_subpage_record_bytes = 0;
+        } else if self.subpages == 0 {
+            self.subpages = 1;
+        }
+        let slot =
+            u16::try_from(self.records).map_err(|_| NamePageError::TooManyRecords(self.records))?;
+        let address = NamePageAddress::new(self.segment, self.page, slot)?;
+        self.records += 1;
+        self.current_subpage_records += 1;
+        self.current_subpage_record_bytes =
+            required - NAME_SUBPAGE_RECORD_HEADER_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES;
+        Ok(NamePageLayoutPush::Added(address))
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.records == 0
+    }
+}
+
+impl NamePageBuilder {
+    pub fn new(segment: u32, page: u32) -> Result<Self, NamePageError> {
+        Ok(Self {
+            layout: NamePageLayoutBuilder::new(segment, page)?,
             records: Vec::new(),
             keys: BTreeSet::new(),
-            subpage_record_counts: Vec::new(),
-            subpage_record_bytes: Vec::new(),
         })
     }
 
@@ -233,65 +328,17 @@ impl NamePageBuilder {
         if self.keys.contains(&record.key) {
             return Err(NamePageError::DuplicateKey);
         }
-        let added_bytes = name_page_record_bytes(&record)?;
-        let index_required = NAME_SUBPAGE_INDEX_HEADER_BYTES
-            .checked_add(
-                self.records
-                    .len()
-                    .checked_add(1)
-                    .and_then(|count| count.checked_mul(NAME_SUBPAGE_INDEX_ENTRY_BYTES))
-                    .ok_or(NamePageError::OffsetOverflow)?,
-            )
-            .and_then(|bytes| bytes.checked_add(NAME_SUBPAGE_CHECKSUM_BYTES))
-            .ok_or(NamePageError::OffsetOverflow)?;
-        if index_required > NAME_SUBPAGE_BYTES {
-            return Ok(NamePagePush::Full(record));
-        }
-        let mut subpage = self.subpage_record_counts.len().saturating_sub(1);
-        let current_count = self
-            .subpage_record_counts
-            .get(subpage)
-            .copied()
-            .unwrap_or(0);
-        let current_bytes = self.subpage_record_bytes.get(subpage).copied().unwrap_or(0);
-        let mut required = name_subpage_required_bytes(
-            current_count
-                .checked_add(1)
-                .ok_or(NamePageError::OffsetOverflow)?,
-            current_bytes
-                .checked_add(added_bytes)
-                .ok_or(NamePageError::OffsetOverflow)?,
-        )?;
-        if current_count >= NAME_SUBPAGE_LOCAL_RECORD_MAX || required > NAME_SUBPAGE_BYTES {
-            if self.subpage_record_counts.len() == NAME_SUBPAGE_DATA_COUNT {
-                return Ok(NamePagePush::Full(record));
+        match self
+            .layout
+            .push(record.children.len(), record.canonical.len())?
+        {
+            NamePageLayoutPush::Added(address) => {
+                self.keys.insert(record.key);
+                self.records.push(record);
+                Ok(NamePagePush::Added(address))
             }
-            subpage = self.subpage_record_counts.len();
-            required = name_subpage_required_bytes(1, added_bytes)?;
-            if required > NAME_SUBPAGE_BYTES {
-                return Err(NamePageError::RecordTooLarge {
-                    index: self.records.len(),
-                    actual: added_bytes,
-                    maximum: NAME_SUBPAGE_BYTES
-                        - NAME_SUBPAGE_RECORD_HEADER_BYTES
-                        - NAME_SUBPAGE_CHECKSUM_BYTES,
-                });
-            }
-            self.subpage_record_counts.push(0);
-            self.subpage_record_bytes.push(0);
-        } else if self.subpage_record_counts.is_empty() {
-            self.subpage_record_counts.push(0);
-            self.subpage_record_bytes.push(0);
+            NamePageLayoutPush::Full => Ok(NamePagePush::Full(record)),
         }
-        let slot = u16::try_from(self.records.len())
-            .map_err(|_| NamePageError::TooManyRecords(self.records.len()))?;
-        let address = NamePageAddress::new(self.segment, self.page, slot)?;
-        self.keys.insert(record.key);
-        self.records.push(record);
-        self.subpage_record_counts[subpage] += 1;
-        self.subpage_record_bytes[subpage] =
-            required - NAME_SUBPAGE_RECORD_HEADER_BYTES - NAME_SUBPAGE_CHECKSUM_BYTES;
-        Ok(NamePagePush::Added(address))
     }
 
     pub fn finish(self) -> Result<Vec<u8>, NamePageError> {
@@ -1135,16 +1182,24 @@ fn encode_name_record_subpage(
 }
 
 fn validate_name_page_record(index: usize, record: &NamePageRecord) -> Result<(), NamePageError> {
-    if !record.children.is_empty() && record.children.len() != 2 {
-        return Err(NamePageError::ChildCount(record.children.len()));
+    validate_name_page_record_dimensions(index, record.children.len(), record.canonical.len())
+}
+
+fn validate_name_page_record_dimensions(
+    index: usize,
+    children: usize,
+    canonical_bytes: usize,
+) -> Result<(), NamePageError> {
+    if children != 0 && children != 2 {
+        return Err(NamePageError::ChildCount(children));
     }
-    if record.canonical.is_empty() {
+    if canonical_bytes == 0 {
         return Err(NamePageError::EmptyRecord(index));
     }
-    if record.canonical.len() > usize::from(u16::MAX) {
+    if canonical_bytes > usize::from(u16::MAX) {
         return Err(NamePageError::RecordTooLarge {
             index,
-            actual: record.canonical.len(),
+            actual: canonical_bytes,
             maximum: usize::from(u16::MAX),
         });
     }
@@ -1152,10 +1207,17 @@ fn validate_name_page_record(index: usize, record: &NamePageRecord) -> Result<()
 }
 
 fn name_page_record_bytes(record: &NamePageRecord) -> Result<usize, NamePageError> {
+    name_page_record_dimension_bytes(record.children.len(), record.canonical.len())
+}
+
+fn name_page_record_dimension_bytes(
+    children: usize,
+    canonical_bytes: usize,
+) -> Result<usize, NamePageError> {
     NAME_PAGE_INDEX_BYTES
         .checked_add(NAME_PAGE_RECORD_FIXED_BYTES)
-        .and_then(|bytes| bytes.checked_add(record.children.len() * NAME_PAGE_CHILD_BYTES))
-        .and_then(|bytes| bytes.checked_add(record.canonical.len()))
+        .and_then(|bytes| bytes.checked_add(children * NAME_PAGE_CHILD_BYTES))
+        .and_then(|bytes| bytes.checked_add(canonical_bytes))
         .ok_or(NamePageError::OffsetOverflow)
 }
 
@@ -2298,6 +2360,52 @@ mod tests {
             decode_name_page(&encoded).expect("decode").record_count(),
             480
         );
+    }
+
+    #[test]
+    fn lightweight_layout_matches_physical_builder_across_page_boundaries() {
+        let segment = 12;
+        let mut page = 34;
+        let mut layout = NamePageLayoutBuilder::new(segment, page).expect("layout");
+        let mut builder = NamePageBuilder::new(segment, page).expect("builder");
+        for index in 0u16..2_000 {
+            let mut key = [0u8; 32];
+            key[..2].copy_from_slice(&index.to_le_bytes());
+            let children = if index.is_multiple_of(3) {
+                Vec::new()
+            } else {
+                vec![address(1, index), address(2, index)]
+            };
+            let canonical =
+                vec![(index & 0xff) as u8; 16 + usize::from(index % 7).saturating_mul(211)];
+            loop {
+                let planned = layout
+                    .push(children.len(), canonical.len())
+                    .expect("plan record");
+                let physical = builder
+                    .push(NamePageRecord {
+                        key,
+                        children: children.clone(),
+                        canonical: canonical.clone(),
+                    })
+                    .expect("build record");
+                match (planned, physical) {
+                    (NamePageLayoutPush::Added(planned), NamePagePush::Added(physical)) => {
+                        assert_eq!(planned, physical);
+                        break;
+                    }
+                    (NamePageLayoutPush::Full, NamePagePush::Full(returned)) => {
+                        assert_eq!(returned.key, key);
+                        page += 1;
+                        layout = NamePageLayoutBuilder::new(segment, page).expect("next layout");
+                        builder = NamePageBuilder::new(segment, page).expect("next builder");
+                    }
+                    (planned, physical) => {
+                        panic!("layout/build divergence: {planned:?} versus {physical:?}")
+                    }
+                }
+            }
+        }
     }
 
     #[test]

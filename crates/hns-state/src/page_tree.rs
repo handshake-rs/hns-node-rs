@@ -16,9 +16,9 @@ use std::{sync::mpsc, thread::JoinHandle};
 use hns_primitives::{blake2b_256, NameHash, Reader, Writer};
 use hns_store::{
     decode_name_page, filesystem_available_bytes, ColumnFamily, NamePageAddress, NamePageAppender,
-    NamePageBuilder, NamePageError, NamePagePush, NamePageRecord, NameTreePathRecord,
-    PrefixScanBudget, PrefixScanPage, ReadSnapshot, ScanEntry, SegmentManifest, StoreError,
-    NAME_PAGE_BYTES,
+    NamePageBuilder, NamePageError, NamePageLayoutBuilder, NamePageLayoutPush, NamePagePush,
+    NamePageRecord, NameTreePathRecord, PrefixScanBudget, PrefixScanPage, ReadSnapshot, ScanEntry,
+    SegmentManifest, StoreError, NAME_PAGE_BYTES,
 };
 #[cfg(unix)]
 use hns_store::{
@@ -721,11 +721,13 @@ pub struct PackedNamePages {
     generation: u64,
     segment: u32,
     first_page: u32,
-    records: BTreeMap<TreeRoot, Vec<u8>>,
-    order: Vec<TreeRoot>,
+    /// Canonical records in child-before-parent emission order.
+    records: Vec<(TreeRoot, Vec<u8>)>,
     page_count: usize,
     addresses: HashMap<TreeRoot, NamePageAddress>,
-    children: HashMap<TreeRoot, [NamePageAddress; 2]>,
+    /// Child locators aligned one-for-one with `records`. This avoids a second
+    /// hash table containing a duplicate root for every internal node.
+    children: Vec<Option<[NamePageAddress; 2]>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1688,16 +1690,12 @@ impl PackedNamePages {
             self.first_page,
             self.page_count,
             &self.addresses,
-            &self.children,
-            self.order.iter().copied(),
+            self.records
+                .iter()
+                .zip(self.children.iter().copied())
+                .map(|((root, canonical), children)| (*root, canonical.clone(), children)),
             appender,
             reserve_bytes,
-            |root| {
-                self.records
-                    .get(&root)
-                    .cloned()
-                    .ok_or(PageTreeError::MissingPackedRecord(root))
-            },
         )
     }
 
@@ -1711,8 +1709,7 @@ impl PackedNamePages {
             generation,
             segment,
             first_page,
-            mut records,
-            order,
+            records,
             page_count,
             addresses,
             children,
@@ -1723,35 +1720,29 @@ impl PackedNamePages {
             first_page,
             page_count,
             &addresses,
-            &children,
-            order,
+            records
+                .into_iter()
+                .zip(children)
+                .map(|((root, canonical), children)| (root, canonical, children)),
             appender,
             reserve_bytes,
-            |root| {
-                records
-                    .remove(&root)
-                    .ok_or(PageTreeError::MissingPackedRecord(root))
-            },
         )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_packed_name_page_records<I, F>(
+fn append_packed_name_page_records<I>(
     generation: u64,
     segment: u32,
     first_page: u32,
     expected_pages: usize,
     addresses: &HashMap<TreeRoot, NamePageAddress>,
-    child_addresses: &HashMap<TreeRoot, [NamePageAddress; 2]>,
     order: I,
     appender: &mut NamePageAppender,
     reserve_bytes: u64,
-    mut canonical_for: F,
 ) -> Result<SegmentManifest, PageTreeError>
 where
-    I: IntoIterator<Item = TreeRoot>,
-    F: FnMut(TreeRoot) -> Result<Vec<u8>, PageTreeError>,
+    I: IntoIterator<Item = (TreeRoot, Vec<u8>, Option<[NamePageAddress; 2]>)>,
 {
     if appender.generation() != generation
         || appender.segment() != segment
@@ -1779,8 +1770,7 @@ where
         Ok(())
     };
 
-    for root in order {
-        let canonical = canonical_for(root)?;
+    for (root, canonical, planned_children) in order {
         let decoded = UrkelNodeRecord::decode_ref(&canonical)?;
         let actual = decoded.root();
         if actual != root {
@@ -1789,14 +1779,12 @@ where
                 actual,
             });
         }
-        let children = match decoded {
-            UrkelNodeRecordRef::Leaf { .. } => Vec::new(),
-            UrkelNodeRecordRef::Internal { left, .. } => child_addresses
-                .get(&root)
-                .copied()
-                .ok_or(PageTreeError::MissingChildAddress(left))?
-                .into_iter()
-                .collect::<Vec<_>>(),
+        let children = match (decoded, planned_children) {
+            (UrkelNodeRecordRef::Leaf { .. }, None) => Vec::new(),
+            (UrkelNodeRecordRef::Internal { .. }, Some(children)) => {
+                children.into_iter().collect::<Vec<_>>()
+            }
+            _ => return Err(PageTreeError::ChildLocatorMismatch(root)),
         };
         let mut record = NamePageRecord {
             key: *root.as_bytes(),
@@ -4213,156 +4201,162 @@ pub fn pack_name_page_records_consuming(
     generation: u64,
     segment: u32,
     first_page: u32,
-    mut records: BTreeMap<TreeRoot, Vec<u8>>,
+    records: BTreeMap<TreeRoot, Vec<u8>>,
     known_addresses: &HashMap<TreeRoot, NamePageAddress>,
 ) -> Result<PackedNamePages, PageTreeError> {
-    // The input remains ordered so independent runs choose the same DFS roots
-    // and therefore assign identical page addresses. Build a separate lookup
-    // table once: using the ordered map for every child probe and every
-    // emitted record makes a large replay delta O(N log N) after consensus
-    // work is already complete.
-    let record_lookup = records
+    // Preserve the BTreeMap's stable root order in one dense allocation, then
+    // address records by index. The visit-state byte vector replaces two
+    // root-sized hash sets, and the final topological vector becomes the
+    // packed payload itself rather than a second list of roots.
+    let mut records = records.into_iter().collect::<Vec<_>>();
+    let record_indices = records
         .iter()
-        .map(|(root, raw)| (*root, raw.as_slice()))
+        .enumerate()
+        .map(|(index, (root, _))| (*root, index))
         .collect::<HashMap<_, _>>();
     let mut order = Vec::with_capacity(records.len());
-    let mut visiting = HashSet::new();
-    let mut visited = HashSet::new();
-    for root in records.keys().copied() {
-        visit_new_record(
-            root,
-            &record_lookup,
+    let mut visit_states = vec![0_u8; records.len()];
+    for index in 0..records.len() {
+        visit_new_record_indexed(
+            index,
+            &records,
+            &record_indices,
             known_addresses,
-            &mut visiting,
-            &mut visited,
+            &mut visit_states,
             &mut order,
         )?;
     }
-    drop(record_lookup);
+    drop(record_indices);
+    drop(visit_states);
+    if order.len() != records.len() {
+        return Err(PageTreeError::StateCodec(
+            "name-page traversal did not schedule every record".to_owned(),
+        ));
+    }
+    // Apply the topological permutation in place. Two dense index vectors are
+    // substantially smaller than allocating another Vec of root/payload
+    // pairs, and swapping Vec owners preserves every canonical allocation.
+    let mut original_at_position = (0..records.len()).collect::<Vec<_>>();
+    let mut position_of_original = original_at_position.clone();
+    for (target, desired_original) in order.into_iter().enumerate() {
+        let source = position_of_original[desired_original];
+        if source == target {
+            continue;
+        }
+        records.swap(target, source);
+        original_at_position.swap(target, source);
+        position_of_original[original_at_position[target]] = target;
+        position_of_original[original_at_position[source]] = source;
+    }
+    drop(original_at_position);
+    drop(position_of_original);
 
     let mut addresses = HashMap::with_capacity(records.len());
-    let mut children_by_root = HashMap::with_capacity(records.len() / 2);
-    let mut retained_records = BTreeMap::new();
+    let mut children = Vec::with_capacity(records.len());
     let mut page_count = 0usize;
     let mut page_number = first_page;
-    let mut builder = NamePageBuilder::new(segment, page_number)?;
-    let retain_builder = |builder: NamePageBuilder,
-                          retained: &mut BTreeMap<TreeRoot, Vec<u8>>|
-     -> Result<(), PageTreeError> {
-        for record in builder.into_records() {
-            let root = TreeRoot::new(record.key);
-            if retained.insert(root, record.canonical).is_some() {
-                return Err(PageTreeError::RecordCycle(root));
-            }
-        }
-        Ok(())
-    };
-    for root in order.iter().copied() {
-        let canonical = records
-            .remove(&root)
-            .ok_or(PageTreeError::MissingPackedRecord(root))?;
-        let decoded = UrkelNodeRecord::decode_ref(&canonical)?;
-        if decoded.root() != root {
+    let mut layout = NamePageLayoutBuilder::new(segment, page_number)?;
+    for (root, canonical) in &records {
+        let decoded = UrkelNodeRecord::decode_ref(canonical)?;
+        if decoded.root() != *root {
             return Err(PageTreeError::RecordKeyMismatch {
-                expected: root,
+                expected: *root,
                 actual: decoded.root(),
             });
         }
-        let children = match decoded {
-            UrkelNodeRecordRef::Leaf { .. } => Vec::new(),
-            UrkelNodeRecordRef::Internal { left, right, .. } => {
-                let children = [
-                    resolve_child_address(left, &addresses, known_addresses)?,
-                    resolve_child_address(right, &addresses, known_addresses)?,
-                ];
-                children_by_root.insert(root, children);
-                children.into_iter().collect()
-            }
-        };
-        let mut record = NamePageRecord {
-            key: *root.as_bytes(),
-            children,
-            canonical,
+        let child_addresses = match decoded {
+            UrkelNodeRecordRef::Leaf { .. } => None,
+            UrkelNodeRecordRef::Internal { left, right, .. } => Some([
+                resolve_child_address(left, &addresses, known_addresses)?,
+                resolve_child_address(right, &addresses, known_addresses)?,
+            ]),
         };
         loop {
-            match builder.push(record)? {
-                NamePagePush::Added(address) => {
-                    addresses.insert(root, address);
+            match layout.push(child_addresses.map_or(0, |_| 2), canonical.len())? {
+                NamePageLayoutPush::Added(address) => {
+                    addresses.insert(*root, address);
+                    children.push(child_addresses);
                     break;
                 }
-                NamePagePush::Full(returned) => {
-                    retain_builder(builder, &mut retained_records)?;
+                NamePageLayoutPush::Full => {
                     page_count = page_count
                         .checked_add(1)
                         .ok_or(PageTreeError::OffsetOverflow)?;
                     page_number = page_number
                         .checked_add(1)
                         .ok_or(PageTreeError::OffsetOverflow)?;
-                    builder = NamePageBuilder::new(segment, page_number)?;
-                    record = returned;
+                    layout = NamePageLayoutBuilder::new(segment, page_number)?;
                 }
             }
         }
     }
-    if !builder.is_empty() {
-        retain_builder(builder, &mut retained_records)?;
+    if !layout.is_empty() {
         page_count = page_count
             .checked_add(1)
             .ok_or(PageTreeError::OffsetOverflow)?;
     }
-    if !records.is_empty() || retained_records.len() != order.len() {
+    if children.len() != records.len() {
         return Err(PageTreeError::StateCodec(
-            "consuming name-page pack did not transfer every canonical record".to_owned(),
+            "consuming name-page pack did not plan every canonical record".to_owned(),
         ));
     }
     Ok(PackedNamePages {
         generation,
         segment,
         first_page,
-        records: retained_records,
-        order,
+        records,
         page_count,
         addresses,
-        children: children_by_root,
+        children,
     })
 }
 
-fn visit_new_record(
-    root: TreeRoot,
-    records: &HashMap<TreeRoot, &[u8]>,
+fn visit_new_record_indexed(
+    index: usize,
+    records: &[(TreeRoot, Vec<u8>)],
+    record_indices: &HashMap<TreeRoot, usize>,
     known_addresses: &HashMap<TreeRoot, NamePageAddress>,
-    visiting: &mut HashSet<TreeRoot>,
-    visited: &mut HashSet<TreeRoot>,
-    order: &mut Vec<TreeRoot>,
+    visit_states: &mut [u8],
+    order: &mut Vec<usize>,
 ) -> Result<(), PageTreeError> {
-    if visited.contains(&root) {
-        return Ok(());
+    let (root, raw) = records
+        .get(index)
+        .ok_or_else(|| PageTreeError::StateCodec("packed record index out of range".to_owned()))?;
+    match visit_states.get(index).copied() {
+        Some(2) => return Ok(()),
+        Some(1) => return Err(PageTreeError::RecordCycle(*root)),
+        Some(0) => visit_states[index] = 1,
+        _ => {
+            return Err(PageTreeError::StateCodec(
+                "invalid packed record visit state".to_owned(),
+            ))
+        }
     }
-    if !visiting.insert(root) {
-        return Err(PageTreeError::RecordCycle(root));
-    }
-    let raw = records
-        .get(&root)
-        .ok_or(PageTreeError::MissingPackedRecord(root))?;
     let record = UrkelNodeRecord::decode_ref(raw)?;
-    if record.root() != root {
+    if record.root() != *root {
         return Err(PageTreeError::RecordKeyMismatch {
-            expected: root,
+            expected: *root,
             actual: record.root(),
         });
     }
     if let UrkelNodeRecordRef::Internal { left, right, .. } = record {
         for child in [left, right] {
-            if records.contains_key(&child) {
-                visit_new_record(child, records, known_addresses, visiting, visited, order)?;
+            if let Some(child_index) = record_indices.get(&child).copied() {
+                visit_new_record_indexed(
+                    child_index,
+                    records,
+                    record_indices,
+                    known_addresses,
+                    visit_states,
+                    order,
+                )?;
             } else if !known_addresses.contains_key(&child) {
                 return Err(PageTreeError::MissingChildAddress(child));
             }
         }
     }
-    visiting.remove(&root);
-    visited.insert(root);
-    order.push(root);
+    visit_states[index] = 2;
+    order.push(index);
     Ok(())
 }
 
@@ -5214,6 +5208,62 @@ mod tests {
         for path in [input, output] {
             std::fs::remove_file(path).expect("remove page fixture");
         }
+    }
+
+    #[test]
+    fn consuming_pack_preserves_canonical_allocations_and_emits_valid_pages() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-consuming-pack-{}-{nonce}.pages",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let entries = (0u16..256)
+            .map(|index| {
+                let mut key = [0u8; 32];
+                key[..2].copy_from_slice(&index.to_be_bytes());
+                (NameHash::new(key), vec![(index & 0xff) as u8; 96])
+            })
+            .collect::<Vec<_>>();
+        let tree = MemoryUrkel::from_entries(entries).expect("tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("records");
+        let canonical_allocations = records
+            .iter()
+            .map(|(record_root, canonical)| (*record_root, canonical.as_ptr()))
+            .collect::<HashMap<_, _>>();
+        let packed = pack_name_page_records_consuming(23, 0, 0, records, &HashMap::new())
+            .expect("consuming pack");
+        assert!(packed.page_count() > 1);
+        for (record_root, canonical) in &packed.records {
+            assert_eq!(
+                canonical_allocations.get(record_root).copied(),
+                Some(canonical.as_ptr()),
+                "canonical payload allocation was copied during planning"
+            );
+        }
+        let root_locator = packed.root_locator(root).expect("root locator");
+        let record_count = packed.record_count();
+        let mut appender = NamePageAppender::create_new(&path, 23, 0).expect("create output pages");
+        packed
+            .append_consuming_with_reserve(&mut appender, 0)
+            .expect("append consuming pack");
+        drop(appender);
+        let reader = NamePageTreeReader::open(&path, root, root_locator).expect("open pages");
+        assert_eq!(
+            validate_record_tree(root, |record_root| {
+                reader
+                    .load(record_root)
+                    .map_err(|error| UrkelError::Storage(error.to_string()))
+            })
+            .expect("validate consuming pack"),
+            record_count
+        );
+        drop(reader);
+        std::fs::remove_file(path).expect("remove page fixture");
     }
 
     #[test]

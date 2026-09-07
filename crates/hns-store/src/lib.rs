@@ -13,8 +13,9 @@ pub use name_page::{
     decode_name_page, encode_name_page, encode_name_subpage_page, inspect_name_page_file,
     plan_name_page_reads, read_name_page_directory, read_name_page_record,
     truncate_name_pages_to_committed_tail, NamePageAddress, NamePageAppender, NamePageBuilder,
-    NamePageDirectory, NamePageError, NamePageFileInspection, NamePagePush, NamePageRecord,
-    NamePageRecordLocation, NamePageRecordRef, NamePageRef, NAME_PAGE_BYTES, NAME_SUBPAGE_BYTES,
+    NamePageDirectory, NamePageError, NamePageFileInspection, NamePageLayoutBuilder,
+    NamePageLayoutPush, NamePagePush, NamePageRecord, NamePageRecordLocation, NamePageRecordRef,
+    NamePageRef, NAME_PAGE_BYTES, NAME_SUBPAGE_BYTES,
 };
 #[cfg(unix)]
 pub use name_page::{

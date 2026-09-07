@@ -316,10 +316,11 @@ const REORG_PUBLICATION_OPERATION_COPIES: u64 = 2;
 // Streaming publication retains only one encoded fixed-size output page beyond
 // the already charged canonical records, independent of the total page count.
 const REORG_NAME_PAGE_OUTPUT_COPIES: u64 = 1;
-// The consuming packer builds bounded lookup/order/visited/address metadata.
-// Precharge a deliberately ABI-independent 1 KiB per-record envelope before
-// those allocations; canonical node bytes were already charged while staging.
-const REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD: u64 = 1024;
+/// Conservative peak metadata allowance for name-page planning. Canonical
+/// bytes are already charged by staged operations; the planner now keeps one
+/// dense record vector and alternates between traversal/permutation and compact
+/// layout metadata rather than retaining duplicate record and child hash maps.
+const REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD: u64 = 512;
 const MAX_REORG_RECONCILIATION_TRANSACTIONS: u64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
@@ -15836,15 +15837,21 @@ mod tests {
 
     #[test]
     fn reorg_meter_rejects_one_byte_over_before_name_page_pack_allocations() {
-        let modeled_per_record_metadata = std::mem::size_of::<(TreeRoot, Vec<u8>)>()
-            .saturating_add(std::mem::size_of::<(TreeRoot, &[u8])>())
-            .saturating_add(3usize.saturating_mul(std::mem::size_of::<TreeRoot>()))
+        let input_map_metadata = std::mem::size_of::<(TreeRoot, Vec<u8>)>();
+        let ordered_record_metadata = std::mem::size_of::<(TreeRoot, Vec<u8>)>();
+        let traversal_metadata = ordered_record_metadata
+            .saturating_add(std::mem::size_of::<(TreeRoot, usize)>())
+            .saturating_add(std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<u8>());
+        let layout_metadata = ordered_record_metadata
             .saturating_add(std::mem::size_of::<(TreeRoot, hns_store::NamePageAddress)>())
-            .saturating_add(std::mem::size_of::<hns_store::NamePageRecord>());
+            .saturating_add(std::mem::size_of::<Option<[hns_store::NamePageAddress; 2]>>());
+        let modeled_per_record_metadata =
+            input_map_metadata.saturating_add(traversal_metadata.max(layout_metadata));
         assert!(
             modeled_per_record_metadata.saturating_mul(2)
                 <= REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD as usize,
-            "the 1 KiB packing allowance must cover modeled structs plus 2x container headroom"
+            "packing allowance must cover the peak planning phase plus 2x container headroom"
         );
         let records = BTreeMap::from([(TreeRoot::new([0xb1; 32]), vec![0xb2; 8 * 1024])]);
         let charge = ReorgStagedEffectMeter::name_page_packing_charge(&records);
