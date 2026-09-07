@@ -700,7 +700,7 @@ pub fn incoming_transfers<S: ReadSnapshot>(
     let prefix = active_prefix(recipient);
     let start_after = cursor.map(|cursor| active_cursor_key(recipient, cursor));
     let page = snapshot.scan_prefix_page(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &prefix,
         start_after.as_deref(),
         PrefixScanBudget {
@@ -783,7 +783,7 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
 ) -> Result<(), IndexError> {
     let block_hash = block.hash();
     if snapshot
-        .get(ColumnFamily::TxIndex, &undo_key(block_hash))?
+        .get(ColumnFamily::WalletState, &undo_key(block_hash))?
         .is_some()
     {
         return Err(IndexError::Corrupt(
@@ -837,11 +837,12 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
             let entry = entry_from_coin(&coin, &transfer, &delta.evidence);
             entry.validate_evidence(&delta.evidence)?;
             let key = entry.key()?;
-            let value = snapshot
-                .get(ColumnFamily::TxIndex, &key)?
-                .ok_or(IndexError::Corrupt(
-                    "active incoming TRANSFER row is missing",
-                ))?;
+            let value =
+                snapshot
+                    .get(ColumnFamily::WalletState, &key)?
+                    .ok_or(IndexError::Corrupt(
+                        "active incoming TRANSFER row is missing",
+                    ))?;
             if IncomingTransferEntry::decode(&key, &value)? != entry {
                 return Err(IndexError::Corrupt(
                     "active incoming TRANSFER row disagrees with spent coin",
@@ -853,7 +854,7 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
                 ));
             }
             spent_effects.push((key.clone(), value));
-            batch.delete(ColumnFamily::TxIndex, &key)?;
+            batch.delete(ColumnFamily::WalletState, &key)?;
         }
     }
 
@@ -869,7 +870,7 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
         let mut outputs = BTreeSet::new();
         for (entry, key, value) in &plan.entries {
             entry.validate_evidence(&plan.evidence)?;
-            if snapshot.get(ColumnFamily::TxIndex, key)?.is_some() {
+            if snapshot.get(ColumnFamily::WalletState, key)?.is_some() {
                 return Err(IndexError::Corrupt(
                     "new incoming TRANSFER active row already exists",
                 ));
@@ -882,17 +883,17 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
             created_effects.push((key.clone(), value.clone()));
         }
         batch.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &evidence_key(*txid),
             &plan.evidence.encode()?,
         )?;
         batch.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &evidence_state_key(*txid),
             &EvidenceState::active(outputs)?.encode(*txid)?,
         )?;
         for (_, key, value) in &plan.entries {
-            batch.put(ColumnFamily::TxIndex, key, value)?;
+            batch.put(ColumnFamily::WalletState, key, value)?;
         }
     }
 
@@ -900,7 +901,7 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
         delta.state.retired_by = delta.state.active_outputs.is_empty().then_some(block_hash);
         delta.state.validate_evidence(&delta.evidence)?;
         batch.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &evidence_state_key(txid),
             &delta.state.encode(txid)?,
         )?;
@@ -926,7 +927,7 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
         )?,
     };
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &undo_key(block_hash),
         &undo.encode()?,
     )?;
@@ -967,7 +968,7 @@ pub(super) fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
             Err(error) => Some(Err(error)),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let raw_undo = snapshot.get(ColumnFamily::TxIndex, &undo_key(block_hash))?;
+    let raw_undo = snapshot.get(ColumnFamily::WalletState, &undo_key(block_hash))?;
     let transfer_undo = TransferUndoMarker::decode(
         block_hash,
         raw_undo
@@ -1037,15 +1038,15 @@ pub(super) fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
             ));
         }
         for (_, key, value) in &plan.entries {
-            if snapshot.get(ColumnFamily::TxIndex, key)?.as_deref() != Some(value) {
+            if snapshot.get(ColumnFamily::WalletState, key)?.as_deref() != Some(value) {
                 return Err(IndexError::Corrupt(
                     "created incoming TRANSFER active row disagrees with undo",
                 ));
             }
-            batch.delete(ColumnFamily::TxIndex, key)?;
+            batch.delete(ColumnFamily::WalletState, key)?;
         }
-        batch.delete(ColumnFamily::TxIndex, &evidence_state_key(txid))?;
-        batch.delete(ColumnFamily::TxIndex, &evidence_key(txid))?;
+        batch.delete(ColumnFamily::WalletState, &evidence_state_key(txid))?;
+        batch.delete(ColumnFamily::WalletState, &evidence_key(txid))?;
     }
 
     let mut restore = BTreeMap::<
@@ -1099,7 +1100,7 @@ pub(super) fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
             ));
         }
         for (entry, key, value) in items {
-            if snapshot.get(ColumnFamily::TxIndex, &key)?.is_some()
+            if snapshot.get(ColumnFamily::WalletState, &key)?.is_some()
                 || !state.active_outputs.insert(entry.coin.outpoint.index)
             {
                 return Err(IndexError::Corrupt(
@@ -1107,12 +1108,12 @@ pub(super) fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
                 ));
             }
             spent_effects.push((key.clone(), value.clone()));
-            batch.put(ColumnFamily::TxIndex, &key, &value)?;
+            batch.put(ColumnFamily::WalletState, &key, &value)?;
         }
         state.retired_by = None;
         state.validate_evidence(&evidence)?;
         batch.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &evidence_state_key(txid),
             &state.encode(txid)?,
         )?;
@@ -1128,7 +1129,7 @@ pub(super) fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
             "incoming TRANSFER spent-effect commitment disagrees with consensus undo",
         ));
     }
-    batch.delete(ColumnFamily::TxIndex, &undo_key(block_hash))?;
+    batch.delete(ColumnFamily::WalletState, &undo_key(block_hash))?;
     Ok(())
 }
 
@@ -1143,7 +1144,7 @@ pub fn stage_prune_undo<B: WriteBatch, S: ReadSnapshot>(
 ) -> Result<(), IndexError> {
     let block_hash = consensus_undo.block_hash;
     let key = undo_key(block_hash);
-    let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
+    let Some(raw) = snapshot.get(ColumnFamily::WalletState, &key)? else {
         if require_marker {
             return Err(IndexError::Corrupt(
                 "incoming TRANSFER undo marker is missing for a wallet-indexed block",
@@ -1192,7 +1193,7 @@ pub fn stage_prune_undo<B: WriteBatch, S: ReadSnapshot>(
         entry.validate_evidence(evidence)?;
         let key = entry.key()?;
         let value = entry.encode()?;
-        if snapshot.get(ColumnFamily::TxIndex, &key)?.is_some() {
+        if snapshot.get(ColumnFamily::WalletState, &key)?.is_some() {
             return Err(IndexError::Corrupt(
                 "spent incoming TRANSFER remains active at undo pruning",
             ));
@@ -1234,8 +1235,8 @@ pub fn stage_prune_undo<B: WriteBatch, S: ReadSnapshot>(
         }
         if state.active_outputs.is_empty() {
             if state.retired_by == Some(block_hash) {
-                batch.delete(ColumnFamily::TxIndex, &evidence_state_key(txid))?;
-                batch.delete(ColumnFamily::TxIndex, &evidence_key(txid))?;
+                batch.delete(ColumnFamily::WalletState, &evidence_state_key(txid))?;
+                batch.delete(ColumnFamily::WalletState, &evidence_key(txid))?;
             } else if state.retired_by.is_none() {
                 return Err(IndexError::Corrupt(
                     "empty incoming TRANSFER evidence lacks a retirement block",
@@ -1247,7 +1248,7 @@ pub fn stage_prune_undo<B: WriteBatch, S: ReadSnapshot>(
             ));
         }
     }
-    batch.delete(ColumnFamily::TxIndex, &key)?;
+    batch.delete(ColumnFamily::WalletState, &key)?;
     Ok(())
 }
 
@@ -1374,7 +1375,7 @@ fn load_evidence<S: ReadSnapshot>(
     txid: Txid,
 ) -> Result<Option<TransferEvidence>, IndexError> {
     snapshot
-        .get(ColumnFamily::TxIndex, &evidence_key(txid))?
+        .get(ColumnFamily::WalletState, &evidence_key(txid))?
         .as_deref()
         .map(|raw| TransferEvidence::decode(txid, raw))
         .transpose()
@@ -1385,7 +1386,7 @@ fn load_evidence_state<S: ReadSnapshot>(
     txid: Txid,
 ) -> Result<Option<EvidenceState>, IndexError> {
     snapshot
-        .get(ColumnFamily::TxIndex, &evidence_state_key(txid))?
+        .get(ColumnFamily::WalletState, &evidence_state_key(txid))?
         .as_deref()
         .map(|raw| EvidenceState::decode(txid, raw))
         .transpose()
@@ -1636,7 +1637,7 @@ mod tests {
         let snapshot = store.snapshot().expect("snapshot");
         snapshot
             .scan_prefix_page(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 b"wallet-index/v1/name-transfer/",
                 None,
                 PrefixScanBudget {
@@ -1655,7 +1656,7 @@ mod tests {
         let snapshot = store.snapshot().expect("snapshot");
         snapshot
             .scan_prefix_page(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &prefix,
                 None,
                 PrefixScanBudget {
@@ -1772,9 +1773,10 @@ mod tests {
 
     impl ReadSnapshot for CountingSnapshot {
         fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-            if family == ColumnFamily::TxIndex && key.starts_with(EVIDENCE_PREFIX) {
+            if family == ColumnFamily::WalletState && key.starts_with(EVIDENCE_PREFIX) {
                 self.evidence_gets.set(self.evidence_gets.get() + 1);
-            } else if family == ColumnFamily::TxIndex && key.starts_with(EVIDENCE_STATE_PREFIX) {
+            } else if family == ColumnFamily::WalletState && key.starts_with(EVIDENCE_STATE_PREFIX)
+            {
                 self.evidence_state_gets
                     .set(self.evidence_state_gets.get() + 1);
             } else if family == ColumnFamily::Utxo {
@@ -1977,7 +1979,7 @@ mod tests {
         let snapshot = store.snapshot().expect("snapshot");
         let (key, mut raw) = snapshot
             .scan_prefix_page(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &active_prefix(recipient),
                 None,
                 PrefixScanBudget {
@@ -1994,7 +1996,7 @@ mod tests {
         raw[1] ^= 1;
         let mut corrupt = store.batch();
         corrupt
-            .put(ColumnFamily::TxIndex, &key, &raw)
+            .put(ColumnFamily::WalletState, &key, &raw)
             .expect("replace active row");
         store.commit(corrupt).expect("commit checksum corruption");
         let snapshot = store.snapshot().expect("snapshot");
@@ -2009,7 +2011,7 @@ mod tests {
         let snapshot = store.snapshot().expect("snapshot");
         let (key, raw) = snapshot
             .scan_prefix_page(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &active_prefix(recipient),
                 None,
                 PrefixScanBudget {
@@ -2028,7 +2030,7 @@ mod tests {
         let malformed = active_raw_unchecked(&entry);
         let mut corrupt = store.batch();
         corrupt
-            .put(ColumnFamily::TxIndex, &key, &malformed)
+            .put(ColumnFamily::WalletState, &key, &malformed)
             .expect("replace active row");
         store.commit(corrupt).expect("commit covenant corruption");
         let snapshot = store.snapshot().expect("snapshot");
@@ -2045,7 +2047,7 @@ mod tests {
         let (store, recipient, txid, _, _) = single_query_fixture();
         let mut corrupt = store.batch();
         corrupt
-            .delete(ColumnFamily::TxIndex, &evidence_key(txid))
+            .delete(ColumnFamily::WalletState, &evidence_key(txid))
             .expect("delete evidence");
         store.commit(corrupt).expect("commit missing evidence");
         let snapshot = store.snapshot().expect("snapshot");
@@ -2059,7 +2061,7 @@ mod tests {
         let (store, recipient, txid, _, _) = single_query_fixture();
         let mut corrupt = store.batch();
         corrupt
-            .delete(ColumnFamily::TxIndex, &evidence_state_key(txid))
+            .delete(ColumnFamily::WalletState, &evidence_state_key(txid))
             .expect("delete evidence state");
         store
             .commit(corrupt)
@@ -2083,7 +2085,7 @@ mod tests {
         let mut corrupt = store.batch();
         corrupt
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &evidence_key(txid),
                 &mismatched.encode().expect("encode mismatched evidence"),
             )
@@ -2106,7 +2108,7 @@ mod tests {
         let mut corrupt = store.batch();
         corrupt
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &evidence_state_key(txid),
                 &wrong_membership
                     .encode(txid)
@@ -2132,7 +2134,7 @@ mod tests {
         let mut corrupt = store.batch();
         corrupt
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &evidence_state_key(txid),
                 &retired.encode(txid).expect("encode retired evidence state"),
             )
@@ -2257,7 +2259,7 @@ mod tests {
 
         let snapshot = store.snapshot().expect("snapshot");
         assert!(snapshot
-            .get(ColumnFamily::TxIndex, &evidence_key(txid))
+            .get(ColumnFamily::WalletState, &evidence_key(txid))
             .expect("evidence")
             .is_some());
         assert_eq!(
@@ -2905,7 +2907,7 @@ mod tests {
             Some(spend.hash())
         );
         let exact_retired_state = snapshot
-            .get(ColumnFamily::TxIndex, &evidence_state_key(txid))
+            .get(ColumnFamily::WalletState, &evidence_state_key(txid))
             .expect("read retired state")
             .expect("retired state present");
         drop(snapshot);
@@ -2917,7 +2919,7 @@ mod tests {
         let mut corrupt_state = store.batch();
         corrupt_state
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &evidence_state_key(txid),
                 &stale_state,
             )
@@ -2942,7 +2944,7 @@ mod tests {
         let mut restore_state = store.batch();
         restore_state
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &evidence_state_key(txid),
                 &exact_retired_state,
             )
@@ -2953,7 +2955,7 @@ mod tests {
 
         let snapshot = store.snapshot().expect("snapshot");
         let real_spender_marker = snapshot
-            .get(ColumnFamily::TxIndex, &undo_key(spend.hash()))
+            .get(ColumnFamily::WalletState, &undo_key(spend.hash()))
             .expect("read spender marker")
             .expect("spender marker present");
         drop(snapshot);
@@ -2983,7 +2985,7 @@ mod tests {
         let mut corrupt = store.batch();
         corrupt
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &undo_key(spend.hash()),
                 &empty_spender_marker,
             )
@@ -3006,7 +3008,7 @@ mod tests {
         let mut restore_marker = store.batch();
         restore_marker
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &undo_key(spend.hash()),
                 &real_spender_marker,
             )
@@ -3227,7 +3229,7 @@ mod tests {
         corrupt[7] ^= 1;
         let mut seed = store.batch();
         write_coin_to_batch(&mut seed, &source_coin).expect("seed source coin");
-        seed.put(ColumnFamily::TxIndex, key, &corrupt)
+        seed.put(ColumnFamily::WalletState, key, &corrupt)
             .expect("corrupt active row");
         store.commit(seed).expect("commit corruption");
 

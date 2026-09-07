@@ -10474,19 +10474,27 @@ impl NodeState {
         });
         let removes_built_component =
             persisted.is_some_and(|available| !available.is_satisfied_by(profile));
-        let has_wallet_keys = !snapshot
-            .scan_prefix_page(
-                ColumnFamily::TxIndex,
-                b"wallet-index/v1/",
-                None,
-                PrefixScanBudget {
-                    max_entries: 1,
-                    max_bytes: 4 * 1024,
-                },
-            )
-            .context("failed to inspect wallet indexes")?
-            .entries
-            .is_empty();
+        let wallet_probe = PrefixScanBudget {
+            max_entries: 1,
+            max_bytes: 4 * 1024,
+        };
+        let mut has_wallet_keys = false;
+        for family in [
+            ColumnFamily::WalletHistory,
+            ColumnFamily::WalletState,
+            // v19 colocated wallet rows with the global transaction index.
+            ColumnFamily::TxIndex,
+        ] {
+            if !snapshot
+                .scan_prefix_page(family, b"wallet-index/v1/", None, wallet_probe)
+                .context("failed to inspect wallet indexes")?
+                .entries
+                .is_empty()
+            {
+                has_wallet_keys = true;
+                break;
+            }
+        }
         if persisted_version.is_some_and(|version| version < hns_wallet_index::PROFILE_VERSION)
             && persisted.is_some_and(|available| available.wallet)
             && (has_chain_history || has_wallet_keys)
@@ -15340,7 +15348,7 @@ mod tests {
 
         fn transfer_snapshot_image(snapshot: &impl ReadSnapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
             snapshot
-                .scan_prefix(ColumnFamily::TxIndex, b"wallet-index/v1/name-transfer/")
+                .scan_prefix(ColumnFamily::WalletState, b"wallet-index/v1/name-transfer/")
                 .expect("scan TRANSFER image")
         }
 

@@ -54,14 +54,25 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u32 = 19;
+pub const SCHEMA_VERSION: u32 = 20;
+/// Last schema whose RocksDB backend colocated the global transaction index,
+/// immutable wallet history, and mutable wallet state in `tx_index`.
+pub const MIXED_INDEX_SCHEMA_VERSION: u32 = 19;
 pub const LEGACY_SCHEMA_VERSION: u32 = 18;
 pub const INTERVAL_SCHEMA_VERSION: u32 = 17;
 pub const PRE_INTERVAL_SCHEMA_VERSION: u32 = 16;
 
 /// Durable database layout/profile identifier. A profile change is an explicit
 /// migration boundary even when the low-level column families remain readable.
-pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v15";
+pub const STORAGE_PROFILE: &[u8] = b"hsrd-mining-v16";
+pub const MIXED_INDEX_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v15";
+/// Persistent compatibility flag for databases that can still contain v19
+/// wallet rows in the old mixed `tx_index` column family.
+pub const MIXED_INDEX_FALLBACK_REQUIRED_KEY: &[u8] = b"mixed-index-fallback-required/v1";
+#[cfg(feature = "rocksdb-backend")]
+const WALLET_INDEX_PREFIX: &[u8] = b"wallet-index/v1/";
+#[cfg(feature = "rocksdb-backend")]
+const WALLET_HISTORY_PREFIX: &[u8] = b"wallet-index/v1/history/";
 pub const LEGACY_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v14";
 pub const INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v13";
 pub const PRE_INTERVAL_STORAGE_PROFILE: &[u8] = b"hsrd-mining-v12";
@@ -134,7 +145,7 @@ const ROCKS_BLOOM_BITS_PER_KEY: f64 = 10.0;
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_BACKGROUND_JOBS: i32 = 4;
 /// Bound aggregate memtable memory across all column families while leaving
-/// enough room for the two write-heavy UTXO families to merge immutable
+/// enough room for write-heavy state and index families to merge immutable
 /// memtables before flushing. The node's active-state staging budget is
 /// separately bounded, so this keeps peak IBD memory predictable.
 #[cfg(feature = "rocksdb-backend")]
@@ -148,10 +159,11 @@ const ROCKS_DB_WRITE_BUFFER_BYTES: usize = 768 * 1024 * 1024;
 pub const ROCKS_MAX_TOTAL_WAL_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_BULK_BLOCK_BYTES: usize = 32 * 1024;
-/// The global transaction and consensus UTXO indexes receive multiple puts
-/// and deletes for the same key ranges during IBD. Merging two larger
-/// memtables removes more of that churn before it reaches the LSM tree, while
-/// three buffers still leave one writable memtable during a paired flush.
+/// The transaction/wallet indexes and consensus UTXO set receive dense IBD
+/// writes. Mutable families also receive repeated puts and deletes in the same
+/// key ranges. Merging two larger memtables removes more of that churn before
+/// it reaches the LSM tree, while three buffers still leave one writable
+/// memtable during a paired flush.
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_UTXO_WRITE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
 #[cfg(feature = "rocksdb-backend")]
@@ -519,16 +531,22 @@ pub enum ColumnFamily {
     Orphans,
     MempoolPersist,
     Snapshots,
+    /// Immutable, script-prefixed confirmed wallet history.
+    WalletHistory,
+    /// Mutable wallet UTXOs, spenders, transfers, and tracked contracts.
+    WalletState,
 }
 
 impl ColumnFamily {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Meta,
         Self::Headers,
         Self::HeightIndex,
         Self::BlockIndex,
         Self::Blocks,
         Self::TxIndex,
+        Self::WalletHistory,
+        Self::WalletState,
         Self::Utxo,
         Self::NameState,
         Self::NameTreeNodes,
@@ -547,6 +565,8 @@ impl ColumnFamily {
             Self::BlockIndex => "block_index",
             Self::Blocks => "blocks",
             Self::TxIndex => "tx_index",
+            Self::WalletHistory => "wallet_history",
+            Self::WalletState => "wallet_state",
             Self::Utxo => "utxo",
             Self::NameState => "name_state",
             Self::NameTreeNodes => "name_tree_nodes",
@@ -1314,20 +1334,18 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
     match schema {
         Some(bytes) => {
             let version = decode_u32(&bytes)?;
-            if version != SCHEMA_VERSION {
-                return Err(StoreError::Schema(format!(
-                    "expected schema version {SCHEMA_VERSION}, got {version}; a clean reindex is required"
-                )));
-            }
             let profile = profile.ok_or_else(|| {
                 StoreError::Schema(
                     "schema marker exists without a storage-profile marker; refusing ambiguous database"
-                        .to_owned(),
+                    .to_owned(),
                 )
             })?;
-            if profile.as_slice() != STORAGE_PROFILE {
+            let current = version == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE;
+            let mixed_index_upgrade = version == MIXED_INDEX_SCHEMA_VERSION
+                && profile.as_slice() == MIXED_INDEX_STORAGE_PROFILE;
+            if !current && !mixed_index_upgrade {
                 return Err(StoreError::Schema(format!(
-                    "expected storage profile `{}`, got `{}`; a clean reindex is required",
+                    "expected schema/profile {SCHEMA_VERSION}/`{}`, got {version}/`{}`; a clean reindex is required",
                     String::from_utf8_lossy(STORAGE_PROFILE),
                     String::from_utf8_lossy(&profile),
                 )));
@@ -1368,7 +1386,29 @@ pub fn initialize_schema<S: Store>(store: &S) -> Result<(), StoreError> {
                     airdrop_field.len()
                 )));
             }
-            Ok(())
+            drop(snapshot);
+            if mixed_index_upgrade {
+                // v20 changes only RocksDB placement. Reads retain an exact
+                // fallback to v19's mixed family, while every touched wallet
+                // row is atomically moved to its new family. Updating these
+                // markers after all durable bindings validate makes the
+                // transition restart-safe without a stop-the-world rewrite.
+                let mut batch = store.batch();
+                batch.put(
+                    ColumnFamily::Meta,
+                    MetaKey::SchemaVersion.as_bytes(),
+                    &encode_u32(SCHEMA_VERSION),
+                )?;
+                batch.put(
+                    ColumnFamily::Meta,
+                    MetaKey::StorageProfile.as_bytes(),
+                    STORAGE_PROFILE,
+                )?;
+                batch.put(ColumnFamily::Meta, MIXED_INDEX_FALLBACK_REQUIRED_KEY, &[1])?;
+                store.commit(batch)
+            } else {
+                Ok(())
+            }
         }
         None => {
             if profile.is_some()
@@ -4155,6 +4195,7 @@ pub struct RocksStore {
     db: Arc<rocksdb::DB>,
     path: PathBuf,
     durability: DurabilityPolicy,
+    legacy_wallet_fallback: bool,
     // Keep both shared caches alive for exactly as long as the DB. Separating
     // large, mostly one-pass block/undo pages prevents them from evicting hot
     // UTXO, name-state, and Urkel point-lookup pages.
@@ -4176,6 +4217,7 @@ impl fmt::Debug for RocksStore {
         formatter
             .debug_struct("RocksStore")
             .field("durability", &self.durability)
+            .field("legacy_wallet_fallback", &self.legacy_wallet_fallback)
             .field("point_cache_usage", &self.point_cache.get_usage())
             .field("bulk_cache_usage", &self.bulk_cache.get_usage())
             .field("reopen_required", &self.reopen_required())
@@ -4217,11 +4259,22 @@ impl RocksStore {
 
         let db = rocksdb::DB::open_cf_descriptors(&db_options, &path, descriptors)
             .map_err(|error| StoreError::Backend(error.to_string()))?;
+        let meta = Self::cf(&db, ColumnFamily::Meta)?;
+        let legacy_wallet_fallback = db
+            .get_cf(meta, MIXED_INDEX_FALLBACK_REQUIRED_KEY)
+            .map_err(|error| StoreError::Backend(error.to_string()))?
+            .is_some()
+            || db
+                .get_cf(meta, MetaKey::SchemaVersion.as_bytes())
+                .map_err(|error| StoreError::Backend(error.to_string()))?
+                .as_deref()
+                == Some(encode_u32(MIXED_INDEX_SCHEMA_VERSION).as_slice());
 
         Ok(Self {
             db: Arc::new(db),
             path,
             durability,
+            legacy_wallet_fallback,
             point_cache,
             bulk_cache,
             reopen_required: Arc::new(AtomicBool::new(false)),
@@ -4303,9 +4356,23 @@ impl RocksStore {
         let mut write_batch = rocksdb::WriteBatch::default();
         for (key, value) in operations {
             let cf = Self::cf(&self.db, key.family)?;
+            let legacy_cf = (self.legacy_wallet_fallback
+                && RocksSnapshot::legacy_wallet_family(key.family, &key.key).is_some())
+            .then(|| Self::cf(&self.db, ColumnFamily::TxIndex))
+            .transpose()?;
             match value {
-                Some(value) => write_batch.put_cf(cf, key.key, value),
-                None => write_batch.delete_cf(cf, key.key),
+                Some(value) => {
+                    write_batch.put_cf(cf, &key.key, value);
+                    if let Some(legacy_cf) = legacy_cf {
+                        write_batch.delete_cf(legacy_cf, key.key);
+                    }
+                }
+                None => {
+                    write_batch.delete_cf(cf, &key.key);
+                    if let Some(legacy_cf) = legacy_cf {
+                        write_batch.delete_cf(legacy_cf, key.key);
+                    }
+                }
             }
         }
 
@@ -4363,7 +4430,13 @@ fn rocks_column_family_options(family: ColumnFamily, cache: &rocksdb::Cache) -> 
     table.set_optimize_filters_for_memory(true);
     table.set_cache_index_and_filter_blocks(true);
     table.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    if matches!(family, ColumnFamily::TxIndex | ColumnFamily::Utxo) {
+    if matches!(
+        family,
+        ColumnFamily::TxIndex
+            | ColumnFamily::WalletHistory
+            | ColumnFamily::WalletState
+            | ColumnFamily::Utxo
+    ) {
         // These point-lookup-heavy families grow to hundreds of SSTs during
         // mainnet IBD. Partitioned filters avoid loading and checksumming one
         // monolithic bloom filter per file, while pinning the small top level
@@ -4379,7 +4452,13 @@ fn rocks_column_family_options(family: ColumnFamily, cache: &rocksdb::Cache) -> 
 
     let mut options = Options::default();
     options.set_block_based_table_factory(&table);
-    if matches!(family, ColumnFamily::TxIndex | ColumnFamily::Utxo) {
+    if matches!(
+        family,
+        ColumnFamily::TxIndex
+            | ColumnFamily::WalletHistory
+            | ColumnFamily::WalletState
+            | ColumnFamily::Utxo
+    ) {
         options.set_write_buffer_size(ROCKS_UTXO_WRITE_BUFFER_BYTES);
         options.set_max_write_buffer_number(ROCKS_UTXO_MAX_WRITE_BUFFERS);
         options.set_min_write_buffer_number_to_merge(ROCKS_UTXO_MIN_WRITE_BUFFERS_TO_MERGE);
@@ -4402,6 +4481,7 @@ impl Store for RocksStore {
         Ok(RocksSnapshot {
             db,
             snapshot: db.snapshot(),
+            legacy_wallet_fallback: self.legacy_wallet_fallback,
         })
     }
 
@@ -4428,10 +4508,33 @@ impl Store for RocksStore {
 pub struct RocksSnapshot<'a> {
     db: &'a rocksdb::DB,
     snapshot: rocksdb::Snapshot<'a>,
+    legacy_wallet_fallback: bool,
 }
 
 #[cfg(feature = "rocksdb-backend")]
 impl RocksSnapshot<'_> {
+    fn legacy_wallet_family(family: ColumnFamily, key_or_prefix: &[u8]) -> Option<ColumnFamily> {
+        let matches_family = match family {
+            ColumnFamily::WalletHistory => key_or_prefix.starts_with(WALLET_HISTORY_PREFIX),
+            ColumnFamily::WalletState => {
+                key_or_prefix.starts_with(WALLET_INDEX_PREFIX)
+                    && !key_or_prefix.starts_with(WALLET_HISTORY_PREFIX)
+            }
+            _ => false,
+        };
+        matches_family.then_some(ColumnFamily::TxIndex)
+    }
+
+    fn enabled_legacy_wallet_family(
+        &self,
+        family: ColumnFamily,
+        key_or_prefix: &[u8],
+    ) -> Option<ColumnFamily> {
+        self.legacy_wallet_fallback
+            .then(|| Self::legacy_wallet_family(family, key_or_prefix))
+            .flatten()
+    }
+
     fn batched_get_many(
         &self,
         cf: &rocksdb::ColumnFamily,
@@ -4452,18 +4555,8 @@ impl RocksSnapshot<'_> {
             })
             .collect()
     }
-}
 
-#[cfg(feature = "rocksdb-backend")]
-impl ReadSnapshot for RocksSnapshot<'_> {
-    fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let cf = RocksStore::cf(self.db, family)?;
-        self.snapshot
-            .get_cf(cf, key)
-            .map_err(|error| StoreError::Backend(error.to_string()))
-    }
-
-    fn get_many(
+    fn get_many_from_family(
         &self,
         family: ColumnFamily,
         keys: &[&[u8]],
@@ -4490,7 +4583,7 @@ impl ReadSnapshot for RocksSnapshot<'_> {
         })
     }
 
-    fn scan_prefix(
+    fn scan_prefix_from_family(
         &self,
         family: ColumnFamily,
         prefix: &[u8],
@@ -4499,24 +4592,20 @@ impl ReadSnapshot for RocksSnapshot<'_> {
 
         let cf = RocksStore::cf(self.db, family)?;
         let mut entries = Vec::new();
-
         for item in self
             .snapshot
             .iterator_cf(cf, IteratorMode::From(prefix, Direction::Forward))
         {
             let (key, value) = item.map_err(|error| StoreError::Backend(error.to_string()))?;
-
             if !key.starts_with(prefix) {
                 break;
             }
-
             entries.push((key.to_vec(), value.to_vec()));
         }
-
         Ok(entries)
     }
 
-    fn scan_prefix_page(
+    fn scan_prefix_page_from_family(
         &self,
         family: ColumnFamily,
         prefix: &[u8],
@@ -4525,7 +4614,6 @@ impl ReadSnapshot for RocksSnapshot<'_> {
     ) -> Result<PrefixScanPage, StoreError> {
         use rocksdb::{Direction, IteratorMode};
 
-        let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
         let cf = RocksStore::cf(self.db, family)?;
         let start = start_after.unwrap_or(prefix);
         let mut page = PrefixScanPage::default();
@@ -4546,6 +4634,108 @@ impl ReadSnapshot for RocksSnapshot<'_> {
         }
         Ok(page)
     }
+}
+
+#[cfg(feature = "rocksdb-backend")]
+impl ReadSnapshot for RocksSnapshot<'_> {
+    fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        let cf = RocksStore::cf(self.db, family)?;
+        let value = self
+            .snapshot
+            .get_cf(cf, key)
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        if value.is_some() {
+            return Ok(value);
+        }
+        let Some(legacy) = self.enabled_legacy_wallet_family(family, key) else {
+            return Ok(None);
+        };
+        let legacy_cf = RocksStore::cf(self.db, legacy)?;
+        self.snapshot
+            .get_cf(legacy_cf, key)
+            .map_err(|error| StoreError::Backend(error.to_string()))
+    }
+
+    fn get_many(
+        &self,
+        family: ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        let mut values = self.get_many_from_family(family, keys)?;
+        let legacy = keys
+            .first()
+            .and_then(|key| self.enabled_legacy_wallet_family(family, key));
+        let Some(legacy) = legacy else {
+            return Ok(values);
+        };
+        if !keys
+            .iter()
+            .all(|key| Self::legacy_wallet_family(family, key) == Some(legacy))
+        {
+            return Err(StoreError::Schema(
+                "wallet batched read mixes keys from different physical families".to_owned(),
+            ));
+        }
+        let missing = values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.is_none().then_some((index, keys[index])))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(values);
+        }
+        let legacy_keys = missing.iter().map(|(_, key)| *key).collect::<Vec<_>>();
+        let legacy_values = self.get_many_from_family(legacy, &legacy_keys)?;
+        for ((index, _), value) in missing.into_iter().zip(legacy_values) {
+            values[index] = value;
+        }
+        Ok(values)
+    }
+
+    fn scan_prefix(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+    ) -> Result<Vec<ScanEntry>, StoreError> {
+        let current = self.scan_prefix_from_family(family, prefix)?;
+        let Some(legacy) = self.enabled_legacy_wallet_family(family, prefix) else {
+            return Ok(current);
+        };
+        let mut merged = self
+            .scan_prefix_from_family(legacy, prefix)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        merged.extend(current);
+        Ok(merged.into_iter().collect())
+    }
+
+    fn scan_prefix_page(
+        &self,
+        family: ColumnFamily,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        budget: PrefixScanBudget,
+    ) -> Result<PrefixScanPage, StoreError> {
+        let budget = validate_prefix_scan_request(prefix, start_after, budget)?;
+        let current = self.scan_prefix_page_from_family(family, prefix, start_after, budget)?;
+        let Some(legacy) = self.enabled_legacy_wallet_family(family, prefix) else {
+            return Ok(current);
+        };
+        let legacy = self.scan_prefix_page_from_family(legacy, prefix, start_after, budget)?;
+        let underlying_has_more = current.continuation.is_some() || legacy.continuation.is_some();
+        let mut merged = legacy.entries.into_iter().collect::<BTreeMap<_, _>>();
+        merged.extend(current.entries);
+        let mut page = PrefixScanPage::default();
+        for (key, value) in merged {
+            if !push_bounded_scan_entry(&mut page, &key, &value, budget)? {
+                break;
+            }
+        }
+        if page.continuation.is_none() && underlying_has_more {
+            page.continuation = page.entries.last().map(|(key, _)| key.clone());
+        }
+        Ok(page)
+    }
 
     fn visit_prefix(
         &self,
@@ -4553,17 +4743,7 @@ impl ReadSnapshot for RocksSnapshot<'_> {
         prefix: &[u8],
         visitor: &mut PrefixVisitor<'_>,
     ) -> Result<(), StoreError> {
-        use rocksdb::{Direction, IteratorMode};
-
-        let cf = RocksStore::cf(self.db, family)?;
-        for item in self
-            .snapshot
-            .iterator_cf(cf, IteratorMode::From(prefix, Direction::Forward))
-        {
-            let (key, value) = item.map_err(|error| StoreError::Backend(error.to_string()))?;
-            if !key.starts_with(prefix) {
-                break;
-            }
+        for (key, value) in self.scan_prefix(family, prefix)? {
             visitor(&key, &value)?;
         }
         Ok(())
@@ -5563,6 +5743,75 @@ mod tests {
                 .get(ColumnFamily::Meta, MetaKey::AirdropField.as_bytes())
                 .expect("airdrop field"),
             Some(vec![0; AIRDROP_FIELD_BYTES])
+        );
+    }
+
+    #[test]
+    fn initialize_schema_atomically_upgrades_the_mixed_index_layout() {
+        let store = MemoryStore::new();
+        let mut batch = store.batch();
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::SchemaVersion.as_bytes(),
+                &encode_u32(MIXED_INDEX_SCHEMA_VERSION),
+            )
+            .expect("legacy schema");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::StorageProfile.as_bytes(),
+                MIXED_INDEX_STORAGE_PROFILE,
+            )
+            .expect("legacy profile");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeRoot.as_bytes(),
+                &[1; 32],
+            )
+            .expect("working root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::NameTreeCommitRoot.as_bytes(),
+                &[2; 32],
+            )
+            .expect("commit root");
+        batch
+            .put(
+                ColumnFamily::Meta,
+                MetaKey::AirdropField.as_bytes(),
+                &[3; AIRDROP_FIELD_BYTES],
+            )
+            .expect("airdrop field");
+        store.commit(batch).expect("seed mixed-index schema");
+
+        initialize_schema(&store).expect("upgrade compatible placement schema");
+        let snapshot = store.snapshot().expect("upgraded snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, MetaKey::SchemaVersion.as_bytes())
+                .expect("schema"),
+            Some(encode_u32(SCHEMA_VERSION).to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())
+                .expect("profile"),
+            Some(STORAGE_PROFILE.to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, MetaKey::NameTreeRoot.as_bytes())
+                .expect("working root"),
+            Some(vec![1; 32])
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::Meta, MIXED_INDEX_FALLBACK_REQUIRED_KEY)
+                .expect("fallback marker"),
+            Some(vec![1])
         );
     }
 
@@ -7927,17 +8176,12 @@ mod tests {
             "RocksDB did not apply the aggregate WAL cap"
         );
 
-        let tx_index_options = log
-            .split("Options for column family [tx_index]:")
-            .nth(1)
-            .and_then(|tail| tail.split("Options for column family [utxo]:").next())
-            .expect("tx-index RocksDB options");
-        let utxo_options = log
-            .split("Options for column family [utxo]:")
-            .nth(1)
-            .and_then(|tail| tail.split("Options for column family [name_state]:").next())
-            .expect("UTXO RocksDB options");
-        for (family, options) in [("tx_index", tx_index_options), ("utxo", utxo_options)] {
+        for family in ["tx_index", "wallet_history", "wallet_state", "utxo"] {
+            let options = log
+                .split(&format!("Options for column family [{family}]:"))
+                .nth(1)
+                .and_then(|tail| tail.split("Options for column family [").next())
+                .unwrap_or_else(|| panic!("{family} RocksDB options"));
             assert!(
                 options.contains(&format!(
                     "Options.write_buffer_size: {ROCKS_UTXO_WRITE_BUFFER_BYTES}"
@@ -7981,6 +8225,104 @@ mod tests {
                 "{family} did not pin the partition-routing metadata"
             );
         }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_wallet_families_fallback_and_migrate_legacy_rows_atomically() {
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-rocks-wallet-family-migration-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let store = RocksStore::open(&path).expect("open rocksdb");
+        let prefix = b"wallet-index/v1/history/script/";
+        let legacy_key = [prefix.as_slice(), b"a"].concat();
+        let current_key = [prefix.as_slice(), b"b"].concat();
+        let mut seed = store.batch();
+        seed.put(
+            ColumnFamily::Meta,
+            MetaKey::SchemaVersion.as_bytes(),
+            &encode_u32(MIXED_INDEX_SCHEMA_VERSION),
+        )
+        .expect("seed mixed schema marker");
+        seed.put(ColumnFamily::TxIndex, &legacy_key, b"legacy")
+            .expect("seed legacy row");
+        seed.put(ColumnFamily::WalletHistory, &current_key, b"current")
+            .expect("seed current row");
+        store.commit(seed).expect("commit seed rows");
+        drop(store);
+        let store = RocksStore::open(&path).expect("reopen mixed-layout rocksdb");
+
+        let snapshot = store.snapshot().expect("mixed snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::WalletHistory, &legacy_key)
+                .expect("legacy fallback"),
+            Some(b"legacy".to_vec())
+        );
+        let page = snapshot
+            .scan_prefix_page(
+                ColumnFamily::WalletHistory,
+                prefix,
+                None,
+                PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: 1024,
+                },
+            )
+            .expect("merged first page");
+        assert_eq!(page.entries, vec![(legacy_key.clone(), b"legacy".to_vec())]);
+        let continuation = page.continuation.expect("bounded continuation");
+        let page = snapshot
+            .scan_prefix_page(
+                ColumnFamily::WalletHistory,
+                prefix,
+                Some(&continuation),
+                PrefixScanBudget {
+                    max_entries: 1,
+                    max_bytes: 1024,
+                },
+            )
+            .expect("merged second page");
+        assert_eq!(page.entries, vec![(current_key, b"current".to_vec())]);
+        drop(snapshot);
+
+        let mut migrate = store.batch();
+        migrate
+            .put(ColumnFamily::WalletHistory, &legacy_key, b"migrated")
+            .expect("migrate row");
+        store.commit(migrate).expect("commit migrated row");
+        let snapshot = store.snapshot().expect("migrated snapshot");
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::WalletHistory, &legacy_key)
+                .expect("new family row"),
+            Some(b"migrated".to_vec())
+        );
+        assert_eq!(
+            snapshot
+                .get(ColumnFamily::TxIndex, &legacy_key)
+                .expect("legacy row deleted"),
+            None
+        );
+        drop(snapshot);
+
+        let mut delete = store.batch();
+        delete
+            .delete(ColumnFamily::WalletHistory, &legacy_key)
+            .expect("delete migrated row");
+        store.commit(delete).expect("commit delete");
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("deleted snapshot")
+                .get(ColumnFamily::WalletHistory, &legacy_key)
+                .expect("deleted row"),
+            None
+        );
+        drop(store);
         let _ = std::fs::remove_dir_all(&path);
     }
 

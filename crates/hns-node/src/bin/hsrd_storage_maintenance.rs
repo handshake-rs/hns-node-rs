@@ -21,9 +21,9 @@ use hns_store::{
     SegmentArchiveScrub, SegmentArchiveScrubLimits, SegmentCompactionExecutionLimits,
     SegmentCompactionLimits, SegmentMigrationReport, Store, StoreBackend, StoreConfig,
     BLOCK_SEGMENT_MANIFEST_KEY, INTERVAL_SCHEMA_VERSION, INTERVAL_STORAGE_PROFILE,
-    LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION,
-    PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION,
-    SEGMENT_COMPACTION_DEFAULT_FILESYSTEM_RESERVE_BYTES,
+    LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE, MIXED_INDEX_SCHEMA_VERSION,
+    MIXED_INDEX_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE,
+    SCHEMA_VERSION, SEGMENT_COMPACTION_DEFAULT_FILESYSTEM_RESERVE_BYTES,
     SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_LOCATOR_BYTES,
     SEGMENT_COMPACTION_DEFAULT_MAX_ATOMIC_PUBLICATION_BYTES,
     SEGMENT_COMPACTION_DEFAULT_MAX_ELAPSED, SEGMENT_COMPACTION_DEFAULT_MAX_LIVE_FRAME_BYTES,
@@ -524,6 +524,8 @@ fn validate_store_identity(store: &hns_store::StoreHandle) -> Result<StoreIdenti
         .get(ColumnFamily::Meta, MetaKey::StorageProfile.as_bytes())?
         .context("storage profile marker is missing")?;
     let supported = (schema == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE)
+        || (schema == MIXED_INDEX_SCHEMA_VERSION
+            && profile.as_slice() == MIXED_INDEX_STORAGE_PROFILE)
         || (schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE)
         || (schema == INTERVAL_SCHEMA_VERSION && profile.as_slice() == INTERVAL_STORAGE_PROFILE)
         || (schema == PRE_INTERVAL_SCHEMA_VERSION

@@ -757,7 +757,7 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         return Err(IndexError::ContractRetired);
     }
     let key = registration_key(registration.id);
-    if let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? {
+    if let Some(raw) = snapshot.get(ColumnFamily::WalletState, &key)? {
         let stored: ContractRegistration = decode_record(b"contract-registration-v1", &key, &raw)?;
         if stored != *registration {
             return Err(IndexError::Corrupt(
@@ -765,12 +765,11 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
             ));
         }
         let binding_key = address_key(&registration.funding_address()?);
-        let binding =
-            snapshot
-                .get(ColumnFamily::TxIndex, &binding_key)?
-                .ok_or(IndexError::Corrupt(
-                    "tracked contract registration has no address binding",
-                ))?;
+        let binding = snapshot
+            .get(ColumnFamily::WalletState, &binding_key)?
+            .ok_or(IndexError::Corrupt(
+                "tracked contract registration has no address binding",
+            ))?;
         if decode_address_bindings(&binding_key, &binding)?
             .binary_search(&registration.id)
             .is_err()
@@ -794,7 +793,7 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     }
 
     if snapshot
-        .get(ColumnFamily::TxIndex, &observation_key(registration.id))?
+        .get(ColumnFamily::WalletState, &observation_key(registration.id))?
         .is_some()
     {
         return Err(IndexError::Corrupt(
@@ -812,7 +811,7 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     let address = registration.funding_address()?;
     let address_key = address_key(&address);
     let mut address_bindings = snapshot
-        .get(ColumnFamily::TxIndex, &address_key)?
+        .get(ColumnFamily::WalletState, &address_key)?
         .as_deref()
         .map(|raw| decode_address_bindings(&address_key, raw))
         .transpose()?
@@ -829,7 +828,7 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         Err(position) => address_bindings.insert(position, registration.id),
     }
     let count = snapshot
-        .get(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?
+        .get(ColumnFamily::WalletState, REGISTRATION_COUNT_KEY)?
         .as_deref()
         .map(decode_registration_count)
         .transpose()?
@@ -840,7 +839,7 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     let next = count.checked_add(1).ok_or(IndexError::ContractCapacity)?;
     let lifecycle_revision = next_lifecycle_revision(snapshot, batch)?;
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &key,
         &encode_record(b"contract-registration-v1", &key, registration)?,
     )?;
@@ -853,12 +852,12 @@ pub fn register_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         },
     )?;
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &address_key,
         &encode_address_bindings(&address_key, &address_bindings)?,
     )?;
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         REGISTRATION_COUNT_KEY,
         &encode_registration_count(next),
     )?;
@@ -898,7 +897,7 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     require_contract_profile(profile)?;
     registration.validate()?;
     let key = registration_key(registration.id);
-    let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
+    let Some(raw) = snapshot.get(ColumnFamily::WalletState, &key)? else {
         if let Some(retirement) = load_stored_completed_retirement(snapshot, registration.id)? {
             validate_stored_completed_retirement(snapshot, &retirement, None)?;
             if retirement.registration != *registration {
@@ -909,7 +908,7 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
             return Err(IndexError::ContractRetired);
         }
         if snapshot
-            .get(ColumnFamily::TxIndex, &observation_key(registration.id))?
+            .get(ColumnFamily::WalletState, &observation_key(registration.id))?
             .is_some()
         {
             return Err(IndexError::Corrupt(
@@ -918,7 +917,7 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         }
         let binding_key = address_key(&registration.funding_address()?);
         if snapshot
-            .get(ColumnFamily::TxIndex, &binding_key)?
+            .get(ColumnFamily::WalletState, &binding_key)?
             .as_deref()
             .map(|raw| decode_address_bindings(&binding_key, raw))
             .transpose()?
@@ -967,7 +966,7 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
 
     let binding_key = address_key(&registration.funding_address()?);
     let binding = snapshot
-        .get(ColumnFamily::TxIndex, &binding_key)?
+        .get(ColumnFamily::WalletState, &binding_key)?
         .ok_or(IndexError::Corrupt(
             "tracked contract registration has no address binding",
         ))?;
@@ -977,7 +976,7 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         .map_err(|_| IndexError::Corrupt("tracked contract address binding mismatch"))?;
     ids.remove(position);
     let count = snapshot
-        .get(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?
+        .get(ColumnFamily::WalletState, REGISTRATION_COUNT_KEY)?
         .as_deref()
         .map(decode_registration_count)
         .transpose()?
@@ -988,22 +987,22 @@ pub fn retire_never_confirmed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         "tracked contract count underflow during retirement",
     ))?;
 
-    batch.delete(ColumnFamily::TxIndex, &key)?;
-    batch.delete(ColumnFamily::TxIndex, &observation_key(registration.id))?;
+    batch.delete(ColumnFamily::WalletState, &key)?;
+    batch.delete(ColumnFamily::WalletState, &observation_key(registration.id))?;
     if ids.is_empty() {
-        batch.delete(ColumnFamily::TxIndex, &binding_key)?;
+        batch.delete(ColumnFamily::WalletState, &binding_key)?;
     } else {
         batch.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &binding_key,
             &encode_address_bindings(&binding_key, &ids)?,
         )?;
     }
     if next == 0 {
-        batch.delete(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?;
+        batch.delete(ColumnFamily::WalletState, REGISTRATION_COUNT_KEY)?;
     } else {
         batch.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             REGISTRATION_COUNT_KEY,
             &encode_registration_count(next),
         )?;
@@ -1068,7 +1067,7 @@ pub fn retire_completed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
 
     let key = registration_key(registration.id);
     let raw = snapshot
-        .get(ColumnFamily::TxIndex, &key)?
+        .get(ColumnFamily::WalletState, &key)?
         .ok_or(IndexError::UnknownContract)?;
     let stored_registration: ContractRegistration =
         decode_record(b"contract-registration-v1", &key, &raw)?;
@@ -1098,7 +1097,7 @@ pub fn retire_completed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     }
 
     let retirement_count = snapshot
-        .get(ColumnFamily::TxIndex, RETIREMENT_COUNT_KEY)?
+        .get(ColumnFamily::WalletState, RETIREMENT_COUNT_KEY)?
         .as_deref()
         .map(decode_retirement_count)
         .transpose()?
@@ -1112,7 +1111,7 @@ pub fn retire_completed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
 
     let binding_key = address_key(&registration.funding_address()?);
     let binding = snapshot
-        .get(ColumnFamily::TxIndex, &binding_key)?
+        .get(ColumnFamily::WalletState, &binding_key)?
         .ok_or(IndexError::Corrupt(
             "tracked contract registration has no address binding",
         ))?;
@@ -1122,7 +1121,7 @@ pub fn retire_completed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         .map_err(|_| IndexError::Corrupt("tracked contract address binding mismatch"))?;
     ids.remove(position);
     let active_count = snapshot
-        .get(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?
+        .get(ColumnFamily::WalletState, REGISTRATION_COUNT_KEY)?
         .as_deref()
         .map(decode_registration_count)
         .transpose()?
@@ -1147,7 +1146,7 @@ pub fn retire_completed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
     };
     let retirement_key = retirement_key(registration.id);
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &retirement_key,
         &encode_record(
             b"contract-completed-retirement-v1",
@@ -1156,29 +1155,29 @@ pub fn retire_completed_tracked_contract<S: ReadSnapshot, B: WriteBatch>(
         )?,
     )?;
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         RETIREMENT_COUNT_KEY,
         &encode_retirement_count(next_retirement_count),
     )?;
-    batch.delete(ColumnFamily::TxIndex, &key)?;
-    batch.delete(ColumnFamily::TxIndex, &observation_key(registration.id))?;
+    batch.delete(ColumnFamily::WalletState, &key)?;
+    batch.delete(ColumnFamily::WalletState, &observation_key(registration.id))?;
     for event_key in history.event_keys {
-        batch.delete(ColumnFamily::TxIndex, &event_key)?;
+        batch.delete(ColumnFamily::WalletState, &event_key)?;
     }
     if ids.is_empty() {
-        batch.delete(ColumnFamily::TxIndex, &binding_key)?;
+        batch.delete(ColumnFamily::WalletState, &binding_key)?;
     } else {
         batch.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &binding_key,
             &encode_address_bindings(&binding_key, &ids)?,
         )?;
     }
     if next_active_count == 0 {
-        batch.delete(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?;
+        batch.delete(ColumnFamily::WalletState, REGISTRATION_COUNT_KEY)?;
     } else {
         batch.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             REGISTRATION_COUNT_KEY,
             &encode_registration_count(next_active_count),
         )?;
@@ -1223,7 +1222,7 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
         return Ok(());
     }
     let expected = snapshot
-        .get(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)?
+        .get(ColumnFamily::WalletState, REGISTRATION_COUNT_KEY)?
         .as_deref()
         .map(decode_registration_count)
         .transpose()?
@@ -1245,12 +1244,11 @@ pub fn validate_tracked_contract_registry<S: ReadSnapshot>(
             ));
         }
         let binding_key = address_key(&registration.funding_address()?);
-        let binding =
-            snapshot
-                .get(ColumnFamily::TxIndex, &binding_key)?
-                .ok_or(IndexError::Corrupt(
-                    "tracked contract registration has no address binding",
-                ))?;
+        let binding = snapshot
+            .get(ColumnFamily::WalletState, &binding_key)?
+            .ok_or(IndexError::Corrupt(
+                "tracked contract registration has no address binding",
+            ))?;
         if decode_address_bindings(&binding_key, &binding)?
             .binary_search(&registration.id)
             .is_err()
@@ -1344,7 +1342,7 @@ pub fn validate_completed_tracked_contract_retirements<
     if !profile.wallet {
         return Ok(());
     }
-    let expected_raw = snapshot.get(ColumnFamily::TxIndex, RETIREMENT_COUNT_KEY)?;
+    let expected_raw = snapshot.get(ColumnFamily::WalletState, RETIREMENT_COUNT_KEY)?;
     let expected = expected_raw
         .as_deref()
         .map(decode_retirement_count)
@@ -1360,7 +1358,7 @@ pub fn validate_completed_tracked_contract_retirements<
     let mut total = 0_u32;
     loop {
         let page = snapshot.scan_prefix_page(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             RETIREMENT_PREFIX,
             cursor.as_deref(),
             PrefixScanBudget {
@@ -1446,7 +1444,7 @@ pub fn tracked_contract_fundings<S: ReadSnapshot>(
     let prefix = funding_prefix(id);
     validate_cursor(&prefix, cursor)?;
     let page = snapshot.scan_prefix_page(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &prefix,
         cursor.map(|cursor| cursor.key.as_slice()),
         PrefixScanBudget {
@@ -1491,7 +1489,7 @@ pub fn tracked_contract_events<S: ReadSnapshot>(
     let prefix = event_prefix(id);
     validate_cursor(&prefix, cursor)?;
     let page = snapshot.scan_prefix_page(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &prefix,
         cursor.map(|cursor| cursor.key.as_slice()),
         PrefixScanBudget {
@@ -1630,7 +1628,7 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
                 kind,
             };
             batch.delete(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &funding_key(registration.id, &input.previous_output),
             )?;
             put_event(batch, &event)?;
@@ -1705,7 +1703,7 @@ pub(crate) fn stage_disconnect<S: ReadSnapshot, B: WriteBatch>(
                 input_position_u32,
                 transaction.txid(),
             );
-            let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
+            let Some(raw) = snapshot.get(ColumnFamily::WalletState, &key)? else {
                 continue;
             };
             let stored: StoredTrackedContractEvent =
@@ -1742,7 +1740,7 @@ pub(crate) fn stage_disconnect<S: ReadSnapshot, B: WriteBatch>(
                 ));
             }
             put_funding(batch, prior_funding)?;
-            batch.delete(ColumnFamily::TxIndex, &key)?;
+            batch.delete(ColumnFamily::WalletState, &key)?;
         }
     }
 
@@ -1773,7 +1771,7 @@ pub(crate) fn stage_disconnect<S: ReadSnapshot, B: WriteBatch>(
                 output_position,
                 transaction.txid(),
             );
-            let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
+            let Some(raw) = snapshot.get(ColumnFamily::WalletState, &key)? else {
                 continue;
             };
             let stored: StoredTrackedContractEvent =
@@ -1797,10 +1795,10 @@ pub(crate) fn stage_disconnect<S: ReadSnapshot, B: WriteBatch>(
                 ));
             }
             batch.delete(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &funding_key(registration.id, &outpoint),
             )?;
-            batch.delete(ColumnFamily::TxIndex, &key)?;
+            batch.delete(ColumnFamily::WalletState, &key)?;
         }
     }
     Ok(())
@@ -1955,7 +1953,7 @@ fn validate_registry_prefix<S: ReadSnapshot>(
     let mut total = 0_u32;
     loop {
         let page = snapshot.scan_prefix_page(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             prefix,
             cursor.as_deref(),
             PrefixScanBudget {
@@ -2000,7 +1998,7 @@ fn load_registration<S: ReadSnapshot>(
 ) -> Result<Option<ContractRegistration>, IndexError> {
     let key = registration_key(id);
     snapshot
-        .get(ColumnFamily::TxIndex, &key)?
+        .get(ColumnFamily::WalletState, &key)?
         .as_deref()
         .map(|raw| {
             let registration: ContractRegistration =
@@ -2045,7 +2043,7 @@ fn analyze_completed_history<S: ReadSnapshot>(
 
     loop {
         let page = snapshot.scan_prefix_page(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &prefix,
             cursor.as_deref(),
             PrefixScanBudget {
@@ -2202,7 +2200,7 @@ fn load_stored_completed_retirement<S: ReadSnapshot>(
 ) -> Result<Option<StoredCompletedContractRetirement>, IndexError> {
     let key = retirement_key(id);
     snapshot
-        .get(ColumnFamily::TxIndex, &key)?
+        .get(ColumnFamily::WalletState, &key)?
         .as_deref()
         .map(|raw| {
             let retirement: StoredCompletedContractRetirement =
@@ -2325,7 +2323,7 @@ fn validate_stored_completed_retirement<S: ReadSnapshot>(
     }
     let binding_key = address_key(&retirement.registration.funding_address()?);
     if snapshot
-        .get(ColumnFamily::TxIndex, &binding_key)?
+        .get(ColumnFamily::WalletState, &binding_key)?
         .as_deref()
         .map(|raw| decode_address_bindings(&binding_key, raw))
         .transpose()?
@@ -2344,7 +2342,7 @@ fn observation_key(id: ContractId) -> Vec<u8> {
 
 fn load_lifecycle_sequence<S: ReadSnapshot>(snapshot: &S) -> Result<u64, IndexError> {
     snapshot
-        .get(ColumnFamily::TxIndex, LIFECYCLE_SEQUENCE_KEY)?
+        .get(ColumnFamily::WalletState, LIFECYCLE_SEQUENCE_KEY)?
         .as_deref()
         .map(decode_lifecycle_sequence)
         .transpose()
@@ -2361,7 +2359,7 @@ fn next_lifecycle_revision<S: ReadSnapshot, B: WriteBatch>(
             "tracked contract lifecycle sequence exhausted",
         ))?;
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         LIFECYCLE_SEQUENCE_KEY,
         &encode_lifecycle_sequence(next),
     )?;
@@ -2374,7 +2372,7 @@ fn load_observation<S: ReadSnapshot>(
 ) -> Result<Option<ContractObservationRecord>, IndexError> {
     let key = observation_key(id);
     snapshot
-        .get(ColumnFamily::TxIndex, &key)?
+        .get(ColumnFamily::WalletState, &key)?
         .as_deref()
         .map(|raw| {
             let record: ContractObservationRecord =
@@ -2398,7 +2396,7 @@ fn put_observation<B: WriteBatch>(
 ) -> Result<(), IndexError> {
     let key = observation_key(record.contract_id);
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &key,
         &encode_record(b"contract-observation-v1", &key, &record)?,
     )?;
@@ -2430,7 +2428,7 @@ fn mark_contract_confirmed<S: ReadSnapshot, B: WriteBatch>(
 
 fn prefix_has_entry<S: ReadSnapshot>(snapshot: &S, prefix: &[u8]) -> Result<bool, IndexError> {
     let page = snapshot.scan_prefix_page(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         prefix,
         None,
         PrefixScanBudget {
@@ -2451,7 +2449,7 @@ fn matching_contract_for_output<S: ReadSnapshot>(
     output: &Output,
 ) -> Result<Option<ContractRegistration>, IndexError> {
     let key = address_key(&output.address);
-    let Some(raw) = snapshot.get(ColumnFamily::TxIndex, &key)? else {
+    let Some(raw) = snapshot.get(ColumnFamily::WalletState, &key)? else {
         return Ok(None);
     };
     let mut matched = None;
@@ -2482,7 +2480,7 @@ fn put_funding<B: WriteBatch>(
 ) -> Result<(), IndexError> {
     let key = funding_key(funding.contract_id, &funding.coin.outpoint);
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &key,
         &encode_record(b"contract-funding-v1", &key, funding)?,
     )?;
@@ -2496,7 +2494,7 @@ fn load_funding<S: ReadSnapshot>(
 ) -> Result<Option<TrackedContractFunding>, IndexError> {
     let key = funding_key(id, outpoint);
     snapshot
-        .get(ColumnFamily::TxIndex, &key)?
+        .get(ColumnFamily::WalletState, &key)?
         .as_deref()
         .map(|raw| decode_funding(id, &key, raw))
         .transpose()
@@ -2520,7 +2518,7 @@ fn put_event<B: WriteBatch>(batch: &mut B, event: &TrackedContractEvent) -> Resu
     let key = event.key();
     let stored = StoredTrackedContractEvent::from(event);
     batch.put(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &key,
         &encode_record(b"contract-event-v1", &key, &stored)?,
     )?;
@@ -3331,19 +3329,19 @@ mod tests {
         let key = retirement_key(registration.id);
         let mut seed = store.batch();
         seed.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             LIFECYCLE_SEQUENCE_KEY,
             &encode_lifecycle_sequence(lifecycle_revision),
         )
         .expect("seed lifecycle");
         seed.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             RETIREMENT_COUNT_KEY,
             &encode_retirement_count(1),
         )
         .expect("seed retirement count");
         seed.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &key,
             &encode_record(b"contract-completed-retirement-v1", &key, &tombstone)
                 .expect("encode tombstone"),
@@ -3564,14 +3562,14 @@ mod tests {
         let key = registration_key(registration.id);
         let snapshot = store.snapshot().expect("registered snapshot");
         let mut raw = snapshot
-            .get(ColumnFamily::TxIndex, &key)
+            .get(ColumnFamily::WalletState, &key)
             .expect("registration read")
             .expect("registration value");
         drop(snapshot);
         raw[CHECKSUM_BYTES] ^= 1;
         let mut corruption = store.batch();
         corruption
-            .put(ColumnFamily::TxIndex, &key, &raw)
+            .put(ColumnFamily::WalletState, &key, &raw)
             .expect("stage corruption");
         store.commit(corruption).expect("commit corruption");
 
@@ -3647,7 +3645,7 @@ mod tests {
             decode_address_bindings(
                 &binding_key,
                 &snapshot
-                    .get(ColumnFamily::TxIndex, &binding_key)
+                    .get(ColumnFamily::WalletState, &binding_key)
                     .expect("binding read")
                     .expect("remaining binding"),
             )
@@ -3657,7 +3655,7 @@ mod tests {
         assert_eq!(
             decode_registration_count(
                 &snapshot
-                    .get(ColumnFamily::TxIndex, REGISTRATION_COUNT_KEY)
+                    .get(ColumnFamily::WalletState, REGISTRATION_COUNT_KEY)
                     .expect("count read")
                     .expect("remaining count"),
             )
@@ -3803,7 +3801,7 @@ mod tests {
         store.commit(register).expect("legacy registration commit");
         let mut erase_state = store.batch();
         erase_state
-            .delete(ColumnFamily::TxIndex, &observation_key(legacy.id))
+            .delete(ColumnFamily::WalletState, &observation_key(legacy.id))
             .expect("stage legacy state removal");
         store
             .commit(erase_state)
@@ -3868,7 +3866,7 @@ mod tests {
         let bindings = decode_address_bindings(
             &address_key(&address),
             &snapshot
-                .get(ColumnFamily::TxIndex, &address_key(&address))
+                .get(ColumnFamily::WalletState, &address_key(&address))
                 .expect("binding read")
                 .expect("binding"),
         )
@@ -3932,7 +3930,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut seed = store.batch();
         seed.put(
-            ColumnFamily::TxIndex,
+            ColumnFamily::WalletState,
             &key,
             &encode_address_bindings(&key, &candidates).expect("bounded candidate encoding"),
         )

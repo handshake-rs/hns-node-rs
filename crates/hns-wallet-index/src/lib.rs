@@ -1,7 +1,7 @@
 //! Optional, active-chain wallet indexes for `hns-node`.
 //!
-//! The indexes live in the existing transaction-index column family under
-//! versioned, non-32-byte prefixes. They are staged in the same atomic batch
+//! Immutable script history and mutable wallet state live in separate column
+//! families under versioned prefixes. They are staged in the same atomic batch
 //! as UTXO/name-state connection or disconnection and are never consensus
 //! inputs.
 
@@ -535,7 +535,7 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
             }
             if profile.spenders() {
                 batch.put(
-                    ColumnFamily::TxIndex,
+                    ColumnFamily::WalletState,
                     &spender_key(&input.previous_output),
                     &SpendingTransaction {
                         txid,
@@ -548,7 +548,7 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
             }
             if profile.utxos() {
                 batch.delete(
-                    ColumnFamily::TxIndex,
+                    ColumnFamily::WalletState,
                     &utxo_key(
                         ScriptId::from_address(&coin.address),
                         &input.previous_output,
@@ -560,7 +560,7 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
     if profile.histories() {
         for ((script, _), entry) in history {
             batch.put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletHistory,
                 &history_key(script, &entry),
                 &entry.encode(script),
             )?;
@@ -628,7 +628,7 @@ pub fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
                 );
             }
             if profile.utxos() {
-                batch.delete(ColumnFamily::TxIndex, &utxo_key(script, &outpoint))?;
+                batch.delete(ColumnFamily::WalletState, &utxo_key(script, &outpoint))?;
             }
         }
         for input in &transaction.inputs {
@@ -654,21 +654,24 @@ pub fn stage_disconnect<B: WriteBatch, S: ReadSnapshot>(
                 );
             }
             if profile.spenders() {
-                batch.delete(ColumnFamily::TxIndex, &spender_key(&input.previous_output))?;
+                batch.delete(
+                    ColumnFamily::WalletState,
+                    &spender_key(&input.previous_output),
+                )?;
             }
         }
     }
 
     if profile.histories() {
         for ((script, _), entry) in history {
-            batch.delete(ColumnFamily::TxIndex, &history_key(script, &entry))?;
+            batch.delete(ColumnFamily::WalletHistory, &history_key(script, &entry))?;
         }
     }
     if profile.utxos() {
         for coin in &undo.spent_coins {
             let script = ScriptId::from_address(&coin.address);
             batch.put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &utxo_key(script, &coin.outpoint),
                 &encode_utxo_value(script, coin),
             )?;
@@ -696,7 +699,7 @@ pub fn script_history<S: ReadSnapshot>(
     let prefix = history_prefix(script);
     let start_after = cursor.map(|cursor| history_cursor_key(script, cursor));
     let page = snapshot.scan_prefix_page(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletHistory,
         &prefix,
         start_after.as_deref(),
         PrefixScanBudget {
@@ -735,7 +738,7 @@ pub fn script_utxos<S: ReadSnapshot>(
     let prefix = utxo_prefix(script);
     let start_after = cursor.map(|cursor| utxo_key(script, &cursor.outpoint));
     let page = snapshot.scan_prefix_page(
-        ColumnFamily::TxIndex,
+        ColumnFamily::WalletState,
         &prefix,
         start_after.as_deref(),
         PrefixScanBudget {
@@ -772,7 +775,7 @@ pub fn spending_transaction<S: ReadSnapshot>(
         return Err(IndexError::Disabled("spender"));
     }
     snapshot
-        .get(ColumnFamily::TxIndex, &spender_key(outpoint))?
+        .get(ColumnFamily::WalletState, &spender_key(outpoint))?
         .as_deref()
         .map(|raw| SpendingTransaction::decode(outpoint, raw))
         .transpose()
@@ -872,7 +875,7 @@ fn stage_created_outputs<B: WriteBatch>(
                 covenant: output.covenant.clone(),
             };
             batch.put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &utxo_key(script, &outpoint),
                 &encode_utxo_value(script, &coin),
             )?;
@@ -1605,15 +1608,15 @@ mod tests {
         let source_spender_key = spender_key(&previous);
         let snapshot = store.snapshot().unwrap();
         let history_value = snapshot
-            .get(ColumnFamily::TxIndex, &source_history_key)
+            .get(ColumnFamily::WalletHistory, &source_history_key)
             .unwrap()
             .unwrap();
         let utxo_value = snapshot
-            .get(ColumnFamily::TxIndex, &source_utxo_key)
+            .get(ColumnFamily::WalletState, &source_utxo_key)
             .unwrap()
             .unwrap();
         let spender_value = snapshot
-            .get(ColumnFamily::TxIndex, &source_spender_key)
+            .get(ColumnFamily::WalletState, &source_spender_key)
             .unwrap()
             .unwrap();
         drop(snapshot);
@@ -1626,28 +1629,28 @@ mod tests {
         let mut relocate = store.batch();
         relocate
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletHistory,
                 &history_key(relocated_script, &history_entry),
                 &history_value,
             )
             .unwrap();
         relocate
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &utxo_key(relocated_script, &received_outpoint),
                 &utxo_value,
             )
             .unwrap();
         relocate
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &spender_key(&other_outpoint),
                 &spender_value,
             )
             .unwrap();
         relocate
             .put(
-                ColumnFamily::TxIndex,
+                ColumnFamily::WalletState,
                 &source_utxo_key,
                 &corrupted_utxo_value,
             )

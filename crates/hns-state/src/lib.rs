@@ -46,8 +46,9 @@ use hns_store::{
     decode_u32, encode_u32, ColumnFamily, MetaKey, PrefixScanBudget, PrefixScanPage, ReadSnapshot,
     Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES, INTERVAL_SCHEMA_VERSION,
     INTERVAL_STORAGE_PROFILE, LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE,
-    PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION,
-    STAGED_STATE_POINT_READ_CACHE_LIMIT, STORAGE_PROFILE,
+    MIXED_INDEX_SCHEMA_VERSION, MIXED_INDEX_STORAGE_PROFILE, PRE_INTERVAL_SCHEMA_VERSION,
+    PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION, STAGED_STATE_POINT_READ_CACHE_LIMIT,
+    STORAGE_PROFILE,
 };
 use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
@@ -4688,6 +4689,9 @@ pub fn plan_name_tree_interval_accumulator_migration_bounded<S: Store>(
     if schema == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE {
         return Ok(None);
     }
+    if schema == MIXED_INDEX_SCHEMA_VERSION && profile.as_slice() == MIXED_INDEX_STORAGE_PROFILE {
+        return Ok(None);
+    }
     if (schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE)
         || (schema == INTERVAL_SCHEMA_VERSION && profile.as_slice() == INTERVAL_STORAGE_PROFILE)
     {
@@ -4763,6 +4767,9 @@ pub fn migrate_name_tree_interval_accumulator_bounded<S: Store>(
             StateError::Codec("schema marker exists without a storage profile".to_owned())
         })?;
     if schema == SCHEMA_VERSION && profile.as_slice() == STORAGE_PROFILE {
+        return Ok(None);
+    }
+    if schema == MIXED_INDEX_SCHEMA_VERSION && profile.as_slice() == MIXED_INDEX_STORAGE_PROFILE {
         return Ok(None);
     }
     if (schema == LEGACY_SCHEMA_VERSION && profile.as_slice() == LEGACY_STORAGE_PROFILE)
