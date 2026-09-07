@@ -125,8 +125,8 @@ use hns_p2p::{
     PeerSnapshot, ShakescapeSummary,
 };
 use hns_primitives::{
-    blake2b_256, hex_encode, sha3_256, Block, BlockHash, Coin, CompactTarget, Height, NameHash,
-    NameState, Outpoint, Reader, Transaction, Txid, Uint256, Writer,
+    blake2b_256, hex_encode, sha3_256, Block, BlockHash, BlockTransactionIds, Coin, CompactTarget,
+    Height, NameHash, NameState, Outpoint, Reader, Transaction, Txid, Uint256, Writer,
 };
 use hns_rpc::{
     BasicRpcService, JsonRpcRequest, JsonRpcResponse, RpcAuthorityInfo, RpcBlockEntry,
@@ -136,8 +136,9 @@ use hns_rpc::{
     RpcService, RpcSnapshot, RpcTransactionEntry, RpcUndoRetentionInfo,
 };
 use hns_state::{
-    compact_name_tree_nodes_streaming, connect_block_to_batch_with_services,
-    connect_block_to_batch_with_services_and_accumulator, decode_coin, decode_name_state,
+    compact_name_tree_nodes_streaming,
+    connect_block_to_batch_with_services_accumulator_and_transaction_ids,
+    connect_block_to_batch_with_services_and_transaction_ids, decode_coin, decode_name_state,
     disconnect_block_to_batch, encode_outpoint_key, load_persisted_name_tree_records,
     load_stored_name_tree_commit_root, load_stored_name_tree_root,
     maximum_name_page_validation_records, migrate_name_tree_interval_accumulator_bounded,
@@ -178,7 +179,7 @@ use hns_store::{
 use hns_wallet_index::{
     decode_index_profile, encode_index_profile, index_profile_is_current, index_profile_version,
     register_tracked_contract, retire_completed_tracked_contract,
-    retire_never_confirmed_tracked_contract, stage_connect as stage_wallet_index_connect,
+    retire_never_confirmed_tracked_contract, stage_connect_with_transaction_ids,
     stage_disconnect as stage_wallet_index_disconnect, stage_prune_incoming_transfer_undo,
     validate_completed_tracked_contract_retirements, validate_tracked_contract_registry,
     INDEX_PROFILE_MODE_KEY,
@@ -11915,6 +11916,7 @@ impl NodeState {
         validate_active_extension(snapshot, request, validated.chainwork)?;
 
         let block_hash = request.block.hash();
+        let transaction_ids = BlockTransactionIds::new(&request.block);
         let historical_validation = validated.historical_validation;
         let mut status = validated.status;
 
@@ -11948,10 +11950,10 @@ impl NodeState {
         // the state connector is about to spend. A later validation failure
         // discards the shared batch, so no derivative write is published alone.
         let wallet_index_started = Instant::now();
-        stage_wallet_index_connect(
+        stage_connect_with_transaction_ids(
             snapshot,
             batch,
-            &request.block,
+            &transaction_ids,
             request.height,
             self.wallet_index_profile,
         )
@@ -11969,14 +11971,23 @@ impl NodeState {
         };
         let consensus_state_started = Instant::now();
         let state_summary = match accumulator {
-            Some(accumulator) => connect_block_to_batch_with_services_and_accumulator(
+            Some(accumulator) => {
+                connect_block_to_batch_with_services_accumulator_and_transaction_ids(
+                    snapshot,
+                    batch,
+                    connect,
+                    services,
+                    accumulator,
+                    &transaction_ids,
+                )
+            }
+            None => connect_block_to_batch_with_services_and_transaction_ids(
                 snapshot,
                 batch,
                 connect,
                 services,
-                accumulator,
+                &transaction_ids,
             ),
-            None => connect_block_to_batch_with_services(snapshot, batch, connect, services),
         }
         .map_err(StateConnectError)?;
         let consensus_state_micros =

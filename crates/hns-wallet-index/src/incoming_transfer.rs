@@ -780,7 +780,7 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
     batch: &mut B,
     block: &Block,
     height: Height,
-    plan: &BlockConnectPlan,
+    plan: &BlockConnectPlan<'_>,
 ) -> Result<(), IndexError> {
     let block_hash = plan.block_hash;
     if snapshot
@@ -793,7 +793,7 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
     }
 
     let (created_outpoints, created_plans) =
-        created_live_plans_with_ids(block, height, block_hash, &plan.transaction_ids)?;
+        created_live_plans_with_ids(block, height, block_hash, plan.transaction_ids)?;
     let mut existing = BTreeMap::<Txid, ExistingTransactionDelta>::new();
     let mut spent_outpoints = HashSet::<Outpoint>::new();
     let mut spent_effects = Vec::new();
@@ -944,7 +944,8 @@ fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
     block: &Block,
     height: Height,
 ) -> Result<(), IndexError> {
-    let plan = BlockConnectPlan::prepare(snapshot, block, height)?;
+    let transaction_ids = hns_primitives::BlockTransactionIds::new(block);
+    let plan = BlockConnectPlan::prepare(snapshot, &transaction_ids, height)?;
     stage_connect_prefetched(snapshot, batch, block, height, &plan)
 }
 

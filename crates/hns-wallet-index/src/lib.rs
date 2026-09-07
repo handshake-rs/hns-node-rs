@@ -15,7 +15,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use hns_primitives::{
-    blake2b_256, Address, Block, BlockHash, Coin, Height, Outpoint, Transaction, Txid, Writer,
+    blake2b_256, Address, Block, BlockHash, BlockTransactionIds, Coin, Height, Outpoint,
+    Transaction, Txid, Writer,
 };
 use hns_state::{decode_coin, encode_coin, encode_outpoint_key, BlockUndo};
 use hns_store::{
@@ -476,26 +477,23 @@ pub enum IndexError {
 /// created coins clone every spendable output. Preparing both once prevents
 /// the independent history, incoming-transfer, and swap indexes from
 /// repeating that work during initial synchronization.
-struct BlockConnectPlan {
+struct BlockConnectPlan<'a> {
     block_hash: BlockHash,
-    transaction_ids: Vec<Txid>,
+    transaction_ids: &'a [Txid],
     created_coins: HashMap<Outpoint, Coin>,
     external_input_coins: HashMap<Outpoint, Option<Coin>>,
 }
 
-impl BlockConnectPlan {
+impl<'a> BlockConnectPlan<'a> {
     fn prepare<S: ReadSnapshot>(
         snapshot: &S,
-        block: &Block,
+        analysis: &'a BlockTransactionIds<'_>,
         height: Height,
     ) -> Result<Self, IndexError> {
+        let block = analysis.block();
         let block_hash = block.hash();
-        let transaction_ids = block
-            .transactions
-            .iter()
-            .map(Transaction::txid)
-            .collect::<Vec<_>>();
-        let created_coins = block_created_coins_with_ids(block, height, &transaction_ids)?;
+        let transaction_ids = analysis.as_slice();
+        let created_coins = block_created_coins_with_ids(block, height, transaction_ids)?;
         let external_input_coins = prefetch_external_input_coins(snapshot, block, &created_coins)?;
         Ok(Self {
             block_hash,
@@ -517,10 +515,24 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
     height: Height,
     profile: WalletIndexProfile,
 ) -> Result<(), IndexError> {
+    let transaction_ids = BlockTransactionIds::new(block);
+    stage_connect_with_transaction_ids(snapshot, batch, &transaction_ids, height, profile)
+}
+
+/// Stage enabled indexes while reusing transaction IDs already derived for
+/// the same immutably borrowed block.
+pub fn stage_connect_with_transaction_ids<B: WriteBatch, S: ReadSnapshot>(
+    snapshot: &S,
+    batch: &mut B,
+    transaction_ids: &BlockTransactionIds<'_>,
+    height: Height,
+    profile: WalletIndexProfile,
+) -> Result<(), IndexError> {
     if !profile.enabled() {
         return Ok(());
     }
-    let plan = BlockConnectPlan::prepare(snapshot, block, height)?;
+    let block = transaction_ids.block();
+    let plan = BlockConnectPlan::prepare(snapshot, transaction_ids, height)?;
     let mut history = BTreeMap::<(ScriptId, Txid), ScriptHistoryEntry>::new();
 
     for (transaction_position, (transaction, txid)) in block

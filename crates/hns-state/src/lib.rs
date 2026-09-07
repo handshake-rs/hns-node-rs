@@ -39,8 +39,8 @@ use hns_consensus::{
 };
 use hns_primitives::{
     blake2b_256, Address, AirdropKey, AirdropProof, AirdropSignatureVerifier, Amount, Block,
-    BlockHash, Coin, Covenant, CovenantKind, DnssecVerifier, Height, NameHash, NameLifecycleState,
-    NameState, Outpoint, OwnershipProof, PrimitiveError, Reader, Transaction,
+    BlockHash, BlockTransactionIds, Coin, Covenant, CovenantKind, DnssecVerifier, Height, NameHash,
+    NameLifecycleState, NameState, Outpoint, OwnershipProof, PrimitiveError, Reader, Transaction,
     UnavailableAirdropSignatureVerifier, Writer, AIRDROP_TREE_LEAVES, MAX_ADDRESS_HASH_SIZE,
     MAX_BLOCK_WEIGHT, MAX_NAME_SIZE, MAX_RESOURCE_SIZE, MAX_SCRIPT_STACK, MAX_TX_SIZE,
     MIN_ADDRESS_HASH_SIZE,
@@ -2197,14 +2197,34 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     request: ConnectBlock<'_>,
     services: StateServices<'_>,
 ) -> Result<StateSummary, StateError> {
+    let transaction_ids = BlockTransactionIds::new(request.block);
+    connect_block_to_batch_with_services_and_transaction_ids(
+        snapshot,
+        batch,
+        request.clone(),
+        services,
+        &transaction_ids,
+    )
+}
+
+/// Stage one ordinary atomic block while sharing its already derived
+/// transaction identities with sibling indexes.
+pub fn connect_block_to_batch_with_services_and_transaction_ids<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    request: ConnectBlock<'_>,
+    services: StateServices<'_>,
+    transaction_ids: &BlockTransactionIds<'_>,
+) -> Result<StateSummary, StateError> {
     let mut accumulator = NameTreeAccumulatorSession::default();
     accumulator.begin_checkpoint()?;
-    let result = connect_block_to_batch_with_services_and_accumulator(
+    let result = connect_block_to_batch_with_services_accumulator_and_transaction_ids(
         snapshot,
         batch,
         request,
         services,
         &mut accumulator,
+        transaction_ids,
     );
     match result {
         Ok(summary) => {
@@ -2230,6 +2250,35 @@ pub fn connect_block_to_batch_with_services_and_accumulator<T: ReadSnapshot, B: 
     services: StateServices<'_>,
     accumulator_session: &mut NameTreeAccumulatorSession,
 ) -> Result<StateSummary, StateError> {
+    let transaction_ids = BlockTransactionIds::new(request.block);
+    connect_block_to_batch_with_services_accumulator_and_transaction_ids(
+        snapshot,
+        batch,
+        request.clone(),
+        services,
+        accumulator_session,
+        &transaction_ids,
+    )
+}
+
+/// Stage one block while reusing IDs derived from the exact immutable block
+/// borrow shared with other atomic derivative indexes.
+pub fn connect_block_to_batch_with_services_accumulator_and_transaction_ids<
+    T: ReadSnapshot,
+    B: WriteBatch,
+>(
+    snapshot: &T,
+    batch: &mut B,
+    request: ConnectBlock<'_>,
+    services: StateServices<'_>,
+    accumulator_session: &mut NameTreeAccumulatorSession,
+    transaction_ids: &BlockTransactionIds<'_>,
+) -> Result<StateSummary, StateError> {
+    if !std::ptr::eq(request.block, transaction_ids.block()) {
+        return Err(StateError::Codec(
+            "transaction IDs were prepared for a different block borrow".to_owned(),
+        ));
+    }
     let route = services.historical_validation;
     let checkpointed = route == HistoricalValidationPlan::hsd_checkpointed();
     if route != HistoricalValidationPlan::full() && !checkpointed {
@@ -2276,7 +2325,7 @@ pub fn connect_block_to_batch_with_services_and_accumulator<T: ReadSnapshot, B: 
         .transactions
         .first()
         .ok_or(StateError::MissingCoinbase)?;
-    let prefetched_utxos = prefetch_block_utxos(snapshot, request.block)?;
+    let prefetched_utxos = prefetch_block_utxos_with_transaction_ids(snapshot, transaction_ids)?;
     let chain_context =
         SnapshotChainContext::new(snapshot, request.height, services.historical_validation);
     let has_claim = coinbase
@@ -2331,7 +2380,13 @@ pub fn connect_block_to_batch_with_services_and_accumulator<T: ReadSnapshot, B: 
         &issuance.claims,
     )?;
 
-    for (transaction_index, transaction) in request.block.transactions.iter().enumerate() {
+    for (transaction_index, (transaction, txid)) in request
+        .block
+        .transactions
+        .iter()
+        .zip(transaction_ids.as_slice().iter().copied())
+        .enumerate()
+    {
         if transaction_index != 0 {
             let resolved = resolve_transaction_inputs(
                 &prefetched_utxos,
@@ -2419,7 +2474,6 @@ pub fn connect_block_to_batch_with_services_and_accumulator<T: ReadSnapshot, B: 
             )?;
         }
 
-        let txid = transaction.txid();
         for (output_index, output) in transaction.outputs.iter().enumerate() {
             // HSD's Coins.fromTX omits null-data and REVOKE outputs entirely.
             // Their value and covenant effects were still validated above,
@@ -2678,7 +2732,23 @@ fn extend_block_utxo_outpoints(
     outpoints: &mut Vec<Outpoint>,
     maximum: usize,
 ) -> Result<bool, StateError> {
-    for (transaction_index, transaction) in block.transactions.iter().enumerate() {
+    let transaction_ids = BlockTransactionIds::new(block);
+    extend_block_utxo_outpoints_with_transaction_ids(&transaction_ids, unique, outpoints, maximum)
+}
+
+fn extend_block_utxo_outpoints_with_transaction_ids(
+    transaction_ids: &BlockTransactionIds<'_>,
+    unique: &mut HashSet<Outpoint>,
+    outpoints: &mut Vec<Outpoint>,
+    maximum: usize,
+) -> Result<bool, StateError> {
+    for (transaction_index, (transaction, txid)) in transaction_ids
+        .block()
+        .transactions
+        .iter()
+        .zip(transaction_ids.as_slice().iter().copied())
+        .enumerate()
+    {
         if transaction_index != 0 {
             for input in &transaction.inputs {
                 if outpoints.len() == maximum {
@@ -2689,7 +2759,6 @@ fn extend_block_utxo_outpoints(
                 }
             }
         }
-        let txid = transaction.txid();
         for (output_index, output) in transaction.outputs.iter().enumerate() {
             if output.is_unspendable() {
                 continue;
@@ -2750,13 +2819,27 @@ where
     Ok(outpoints.len())
 }
 
+#[cfg(test)]
 fn prefetch_block_utxos<T: ReadSnapshot>(
     snapshot: &T,
     block: &Block,
 ) -> Result<HashMap<Outpoint, Option<Coin>>, StateError> {
+    let transaction_ids = BlockTransactionIds::new(block);
+    prefetch_block_utxos_with_transaction_ids(snapshot, &transaction_ids)
+}
+
+fn prefetch_block_utxos_with_transaction_ids<T: ReadSnapshot>(
+    snapshot: &T,
+    transaction_ids: &BlockTransactionIds<'_>,
+) -> Result<HashMap<Outpoint, Option<Coin>>, StateError> {
     let mut unique = HashSet::new();
     let mut outpoints = Vec::new();
-    let saturated = extend_block_utxo_outpoints(block, &mut unique, &mut outpoints, usize::MAX)?;
+    let saturated = extend_block_utxo_outpoints_with_transaction_ids(
+        transaction_ids,
+        &mut unique,
+        &mut outpoints,
+        usize::MAX,
+    )?;
     debug_assert!(!saturated);
     if outpoints.is_empty() {
         return Ok(HashMap::new());

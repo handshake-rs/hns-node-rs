@@ -1523,7 +1523,7 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
     block: &Block,
     height: Height,
     profile: WalletIndexProfile,
-    plan: &BlockConnectPlan,
+    plan: &BlockConnectPlan<'_>,
 ) -> Result<(), IndexError> {
     if !profile.wallet {
         return Ok(());
@@ -1672,7 +1672,8 @@ fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
     height: Height,
     profile: WalletIndexProfile,
 ) -> Result<(), IndexError> {
-    let plan = BlockConnectPlan::prepare(snapshot, block, height)?;
+    let transaction_ids = hns_primitives::BlockTransactionIds::new(block);
+    let plan = BlockConnectPlan::prepare(snapshot, &transaction_ids, height)?;
     stage_connect_prefetched(snapshot, batch, block, height, profile, &plan)
 }
 

@@ -787,6 +787,53 @@ impl Block {
     }
 }
 
+/// Transaction identities computed once for one immutably borrowed block.
+///
+/// The block borrow prevents callers from mutating or replacing the body
+/// while derived indexes and consensus state reuse these identities. Keeping
+/// the source block and IDs in one value also removes a separate count or
+/// identity-matching contract from downstream hot paths.
+#[derive(Debug)]
+pub struct BlockTransactionIds<'a> {
+    block: &'a Block,
+    ids: Vec<Txid>,
+}
+
+impl<'a> BlockTransactionIds<'a> {
+    #[must_use]
+    pub fn new(block: &'a Block) -> Self {
+        Self {
+            block,
+            ids: block.transactions.iter().map(Transaction::txid).collect(),
+        }
+    }
+
+    #[must_use]
+    pub const fn block(&self) -> &'a Block {
+        self.block
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[Txid] {
+        &self.ids
+    }
+
+    #[must_use]
+    pub fn get(&self, transaction_index: usize) -> Option<Txid> {
+        self.ids.get(transaction_index).copied()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Outpoint {
     pub txid: Txid,
