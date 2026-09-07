@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -90,6 +91,29 @@ pub struct NamePageStreamProgress {
     pub bytes_completed: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamePagePhysicalStreamPhase {
+    Discovering,
+    Rewriting,
+}
+
+/// Monotonic progress for a physical generation rewrite.
+///
+/// Discovery authenticates each reachable source record while visiting source
+/// pages newest-first. Rewriting then visits the discovered addresses in the
+/// opposite order so every child has a new-generation address before its
+/// parent is emitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NamePagePhysicalStreamProgress {
+    pub phase: NamePagePhysicalStreamPhase,
+    pub source_records_discovered: u64,
+    pub source_pages_discovered: u64,
+    pub source_pages_rewritten: u64,
+    pub records_written: u64,
+    pub pages_written: u64,
+    pub bytes_written: u64,
+}
+
 /// Absolute resource envelope for one direct name-tree generation stream.
 ///
 /// Every limit is checked before the corresponding in-memory insertion or
@@ -113,6 +137,19 @@ struct ParallelNamePageStreamOptions<'a> {
     limits: NamePageStreamLimits,
     progress_interval: Duration,
     address_index: Option<&'a mut HashMap<TreeRoot, NamePageAddress>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhysicalNamePageWork {
+    root: TreeRoot,
+    depth: u16,
+    slot: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PhysicalNamePageSpan {
+    first: usize,
+    end: usize,
 }
 
 /// Absolute resource envelope for discovering the physical address index of
@@ -2725,6 +2762,295 @@ impl NamePageTreeReader {
         Ok(Some(records))
     }
 
+    /// Rewrite one authenticated tree by physical source address rather than
+    /// repeatedly resolving hashes through the decoded-page cache.
+    ///
+    /// Page records are append-postordered: both child locators of an
+    /// internal record must be smaller than the parent locator. The discovery
+    /// pass therefore consumes pending work in descending page/slot order and
+    /// reads every reachable source page at most once. Reversing the resulting
+    /// compact address vector gives an emission order in which every child has
+    /// already received its destination address.
+    pub fn stream_physical_tree_indexed_with_limits_and_progress<P>(
+        &self,
+        root: TreeRoot,
+        appender: &mut NamePageAppender,
+        limits: NamePageStreamLimits,
+        progress_interval: Duration,
+        mut on_progress: P,
+    ) -> Result<(StreamedNamePages, HashMap<TreeRoot, NamePageAddress>), PageTreeError>
+    where
+        P: FnMut(NamePagePhysicalStreamProgress),
+    {
+        ensure_page_tree_deadline(limits.deadline, "name-page physical discovery")?;
+        let mut source_records_discovered = 0u64;
+        let mut source_pages_discovered = 0u64;
+        on_progress(NamePagePhysicalStreamProgress {
+            phase: NamePagePhysicalStreamPhase::Discovering,
+            source_records_discovered,
+            source_pages_discovered,
+            source_pages_rewritten: 0,
+            records_written: 0,
+            pages_written: 0,
+            bytes_written: 0,
+        });
+
+        if root == TreeRoot::ZERO {
+            let mut known = HashMap::new();
+            let emitter = StreamingPageEmitter::new_with_address_index(
+                appender,
+                limits,
+                progress_interval,
+                |progress| {
+                    on_progress(NamePagePhysicalStreamProgress {
+                        phase: NamePagePhysicalStreamPhase::Rewriting,
+                        source_records_discovered,
+                        source_pages_discovered,
+                        source_pages_rewritten: 0,
+                        records_written: progress.records_completed,
+                        pages_written: progress.pages_completed,
+                        bytes_written: progress.bytes_completed,
+                    });
+                },
+                Some(&mut known),
+            )?;
+            let (manifest, record_count, page_count) = emitter.finish()?;
+            return Ok((
+                StreamedNamePages {
+                    manifest,
+                    root_address: None,
+                    record_count,
+                    page_count,
+                    parallel_subtrees: 0,
+                },
+                known,
+            ));
+        }
+
+        let root_address = self
+            .addresses
+            .lock()
+            .map_err(|_| PageTreeError::Poisoned)?
+            .get(&root)
+            .copied()
+            .ok_or(PageTreeError::MissingPackedAddress(root))?;
+        let mut pending = BTreeMap::<(u32, u32), Vec<PhysicalNamePageWork>>::new();
+        let mut scheduled_records = 0u64;
+        insert_physical_name_page_work(
+            &mut pending,
+            root,
+            root_address,
+            0,
+            &mut scheduled_records,
+            limits.max_records,
+        )?;
+        let reachable_capacity = usize::try_from(limits.max_records)
+            .unwrap_or(usize::MAX)
+            .min(1_048_576);
+        let mut reachable = Vec::<NamePageAddress>::with_capacity(reachable_capacity);
+        let mut encoded = vec![0u8; NAME_PAGE_BYTES];
+        let now = Instant::now();
+        let mut next_progress = now.checked_add(progress_interval).unwrap_or(now);
+
+        while let Some(page_key) = pending.last_key_value().map(|(page, _)| *page) {
+            ensure_page_tree_deadline(limits.deadline, "name-page physical discovery")?;
+            self.read_physical_page(page_key, &mut encoded)?;
+            let page = decode_name_page(&encoded)?;
+            source_pages_discovered = add_page_tree_resource(
+                source_pages_discovered,
+                1,
+                limits.max_pages,
+                "name-page physical source pages",
+            )?;
+            let (_, mut page_work) = pending.pop_last().expect("pending page exists");
+            while let Some(work) = page_work.pop() {
+                ensure_page_tree_deadline(limits.deadline, "name-page physical discovery")?;
+                let address = NamePageAddress::new(page_key.0, page_key.1, work.slot)?;
+                let raw = page.record(address.slot())?;
+                let (discovered, decoded) = validate_name_page_record_parts(
+                    raw.key,
+                    raw.children,
+                    raw.canonical,
+                    work.root,
+                )?;
+                if reachable
+                    .last()
+                    .is_some_and(|previous| *previous <= address)
+                {
+                    return Err(PageTreeError::StateCodec(
+                        "physical name-page traversal lost descending address order".to_owned(),
+                    ));
+                }
+                reachable.push(address);
+                source_records_discovered = source_records_discovered.saturating_add(1);
+
+                match decoded {
+                    UrkelNodeRecordRef::Leaf { .. } => {}
+                    UrkelNodeRecordRef::Internal { prefix, .. } => {
+                        let child_depth =
+                            bootstrap_child_depth(usize::from(work.depth), prefix.bit_len())?;
+                        let child_depth = u16::try_from(child_depth).map_err(|_| {
+                            PageTreeError::Urkel(UrkelError::InvalidNode(
+                                "Urkel record depth overflowed".to_owned(),
+                            ))
+                        })?;
+                        for (child, child_address) in discovered.into_iter().flatten() {
+                            if child_address >= address {
+                                return Err(PageTreeError::ChildLocatorMismatch(work.root));
+                            }
+                            if (child_address.segment(), child_address.page()) == page_key {
+                                insert_physical_name_page_slot_work(
+                                    &mut page_work,
+                                    child,
+                                    child_address,
+                                    child_depth,
+                                    &mut scheduled_records,
+                                    limits.max_records,
+                                )?;
+                            } else {
+                                insert_physical_name_page_work(
+                                    &mut pending,
+                                    child,
+                                    child_address,
+                                    child_depth,
+                                    &mut scheduled_records,
+                                    limits.max_records,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if progress_interval != Duration::MAX
+                && (progress_interval.is_zero() || Instant::now() >= next_progress)
+            {
+                on_progress(NamePagePhysicalStreamProgress {
+                    phase: NamePagePhysicalStreamPhase::Discovering,
+                    source_records_discovered,
+                    source_pages_discovered,
+                    source_pages_rewritten: 0,
+                    records_written: 0,
+                    pages_written: 0,
+                    bytes_written: 0,
+                });
+                let now = Instant::now();
+                next_progress = now.checked_add(progress_interval).unwrap_or(now);
+            }
+        }
+        if source_records_discovered != scheduled_records {
+            return Err(PageTreeError::StateCodec(
+                "physical name-page discovery did not consume every scheduled record".to_owned(),
+            ));
+        }
+        on_progress(NamePagePhysicalStreamProgress {
+            phase: NamePagePhysicalStreamPhase::Discovering,
+            source_records_discovered,
+            source_pages_discovered,
+            source_pages_rewritten: 0,
+            records_written: 0,
+            pages_written: 0,
+            bytes_written: 0,
+        });
+
+        reachable.reverse();
+        let page_spans = physical_name_page_spans(&reachable)?;
+        let mut destination_addresses = Vec::<NamePageAddress>::with_capacity(reachable.len());
+        let mut known = HashMap::with_capacity(reachable.len());
+        let source_pages_rewritten = Cell::new(0u64);
+        let mut emitter = StreamingPageEmitter::new_with_address_index(
+            appender,
+            limits,
+            progress_interval,
+            |progress| {
+                on_progress(NamePagePhysicalStreamProgress {
+                    phase: NamePagePhysicalStreamPhase::Rewriting,
+                    source_records_discovered,
+                    source_pages_discovered,
+                    source_pages_rewritten: source_pages_rewritten.get(),
+                    records_written: progress.records_completed,
+                    pages_written: progress.pages_completed,
+                    bytes_written: progress.bytes_completed,
+                });
+            },
+            Some(&mut known),
+        )?;
+        let mut source_index = 0usize;
+        while source_index < reachable.len() {
+            ensure_page_tree_deadline(limits.deadline, "name-page physical rewrite")?;
+            let first_address = reachable[source_index];
+            let page_key = (first_address.segment(), first_address.page());
+            let span = page_spans.get(&page_key).copied().ok_or_else(|| {
+                PageTreeError::StateCodec("physical name-page span is missing".to_owned())
+            })?;
+            if span.first != source_index {
+                return Err(PageTreeError::StateCodec(
+                    "physical name-page spans are not contiguous".to_owned(),
+                ));
+            }
+            self.read_physical_page(page_key, &mut encoded)?;
+            source_pages_rewritten.set(add_page_tree_resource(
+                source_pages_rewritten.get(),
+                1,
+                limits.max_pages,
+                "name-page physical rewrite source pages",
+            )?);
+            let page = decode_name_page(&encoded)?;
+            for (record_index, address) in
+                reachable[span.first..span.end].iter().copied().enumerate()
+            {
+                let record_index = span.first.saturating_add(record_index);
+                let raw = page.record(address.slot())?;
+                let record_root = TreeRoot::new(raw.key);
+                let (discovered, _) = validate_name_page_record_parts(
+                    raw.key,
+                    raw.children,
+                    raw.canonical,
+                    record_root,
+                )?;
+                let mut children = Vec::with_capacity(2);
+                for (_, child_address) in discovered.into_iter().flatten() {
+                    if child_address >= address {
+                        return Err(PageTreeError::ChildLocatorMismatch(record_root));
+                    }
+                    let child_index =
+                        physical_name_page_source_index(&reachable, &page_spans, child_address)?;
+                    let destination = destination_addresses
+                        .get(child_index)
+                        .copied()
+                        .ok_or(PageTreeError::MissingEarlierRecord(child_address))?;
+                    children.push(destination);
+                }
+                if record_index != destination_addresses.len() {
+                    return Err(PageTreeError::StateCodec(
+                        "physical name-page destination index is not contiguous".to_owned(),
+                    ));
+                }
+                let destination = emitter.emit(record_root, raw.canonical.to_vec(), children)?;
+                destination_addresses.push(destination);
+            }
+            source_index = span.end;
+        }
+
+        let root_source_index =
+            physical_name_page_source_index(&reachable, &page_spans, root_address)?;
+        let rewritten_root_address = destination_addresses
+            .get(root_source_index)
+            .copied()
+            .ok_or(PageTreeError::MissingPackedAddress(root))?;
+        let (manifest, record_count, page_count) = emitter.finish()?;
+        Ok((
+            StreamedNamePages {
+                manifest,
+                root_address: Some(rewritten_root_address),
+                record_count,
+                page_count,
+                parallel_subtrees: 0,
+            },
+            known,
+        ))
+    }
+
     pub fn known_addresses(&self) -> Result<HashMap<TreeRoot, NamePageAddress>, PageTreeError> {
         self.addresses
             .lock()
@@ -3208,6 +3534,126 @@ impl NamePageTreeReader {
             .insert(cache_key, CachedNamePage { records });
         Ok(())
     }
+
+    fn read_physical_page(
+        &self,
+        page: (u32, u32),
+        encoded: &mut [u8],
+    ) -> Result<(), PageTreeError> {
+        if encoded.len() != NAME_PAGE_BYTES {
+            return Err(PageTreeError::StateCodec(
+                "physical name-page read buffer has the wrong size".to_owned(),
+            ));
+        }
+        let offset = u64::from(page.1)
+            .checked_mul(NAME_PAGE_BYTES as u64)
+            .ok_or(PageTreeError::OffsetOverflow)?;
+        let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
+        let file = files.file_mut(page.0)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(PageTreeError::io)?;
+        file.read_exact(encoded).map_err(PageTreeError::io)
+    }
+}
+
+fn insert_physical_name_page_work(
+    pending: &mut BTreeMap<(u32, u32), Vec<PhysicalNamePageWork>>,
+    root: TreeRoot,
+    address: NamePageAddress,
+    depth: u16,
+    scheduled_records: &mut u64,
+    maximum_records: u64,
+) -> Result<(), PageTreeError> {
+    insert_physical_name_page_slot_work(
+        pending
+            .entry((address.segment(), address.page()))
+            .or_default(),
+        root,
+        address,
+        depth,
+        scheduled_records,
+        maximum_records,
+    )
+}
+
+fn insert_physical_name_page_slot_work(
+    page: &mut Vec<PhysicalNamePageWork>,
+    root: TreeRoot,
+    address: NamePageAddress,
+    depth: u16,
+    scheduled_records: &mut u64,
+    maximum_records: u64,
+) -> Result<(), PageTreeError> {
+    if root == TreeRoot::ZERO {
+        return Err(PageTreeError::Urkel(UrkelError::InvalidNode(
+            "Urkel record tree contains an empty child".to_owned(),
+        )));
+    }
+    match page.binary_search_by_key(&address.slot(), |work| work.slot) {
+        Ok(index) if page[index].root != root => Err(PageTreeError::AddressConflict(root)),
+        Ok(_) => Err(PageTreeError::DuplicateRecord(root)),
+        Err(index) => {
+            *scheduled_records = add_page_tree_resource(
+                *scheduled_records,
+                1,
+                maximum_records,
+                "name-page physical scheduled records",
+            )?;
+            page.insert(
+                index,
+                PhysicalNamePageWork {
+                    root,
+                    depth,
+                    slot: address.slot(),
+                },
+            );
+            Ok(())
+        }
+    }
+}
+
+fn physical_name_page_spans(
+    addresses: &[NamePageAddress],
+) -> Result<HashMap<(u32, u32), PhysicalNamePageSpan>, PageTreeError> {
+    if addresses.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(PageTreeError::StateCodec(
+            "physical name-page addresses are not strictly increasing".to_owned(),
+        ));
+    }
+    let mut spans = HashMap::new();
+    let mut first = 0usize;
+    while first < addresses.len() {
+        let page = (addresses[first].segment(), addresses[first].page());
+        let mut end = first + 1;
+        while end < addresses.len() && (addresses[end].segment(), addresses[end].page()) == page {
+            end += 1;
+        }
+        if spans
+            .insert(page, PhysicalNamePageSpan { first, end })
+            .is_some()
+        {
+            return Err(PageTreeError::StateCodec(
+                "physical name-page addresses contain a split page span".to_owned(),
+            ));
+        }
+        first = end;
+    }
+    Ok(spans)
+}
+
+fn physical_name_page_source_index(
+    addresses: &[NamePageAddress],
+    spans: &HashMap<(u32, u32), PhysicalNamePageSpan>,
+    target: NamePageAddress,
+) -> Result<usize, PageTreeError> {
+    let span = spans
+        .get(&(target.segment(), target.page()))
+        .copied()
+        .ok_or(PageTreeError::MissingEarlierRecord(target))?;
+    addresses[span.first..span.end]
+        .binary_search(&target)
+        .map(|index| span.first + index)
+        .map_err(|_| PageTreeError::MissingEarlierRecord(target))
 }
 
 #[cfg(unix)]
@@ -3843,7 +4289,7 @@ impl PageTreeError {
 mod tests {
     use super::*;
     use hns_primitives::NameHash;
-    use hns_store::{MemoryStore, Store, WriteBatch};
+    use hns_store::{encode_name_page, MemoryStore, Store, WriteBatch};
     use hns_urkel::{
         prove_hsd_from_records, update_record_tree, validate_record_tree, MemoryUrkel,
     };
@@ -4371,6 +4817,241 @@ mod tests {
         drop(reader);
         drop(appender);
         std::fs::remove_file(path).expect("remove page fixture");
+    }
+
+    #[test]
+    fn physical_stream_rewrites_each_reachable_source_page_once() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let prefix = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-physical-stream-{}-{nonce}",
+            std::process::id()
+        ));
+        let input = prefix.with_extension("input.pages");
+        let output = prefix.with_extension("output.pages");
+        for path in [&input, &output] {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let entries = (0u16..512)
+            .map(|index| {
+                let mut key = [0u8; 32];
+                key[..2].copy_from_slice(&index.to_be_bytes());
+                key[30..].copy_from_slice(&index.reverse_bits().to_be_bytes());
+                (NameHash::new(key), vec![(index & 0xff) as u8; 128])
+            })
+            .collect::<Vec<_>>();
+        let tree = MemoryUrkel::from_entries(entries).expect("tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("records");
+        let packed =
+            pack_name_page_records(21, 0, 0, &records, &HashMap::new()).expect("pack records");
+        assert!(packed.page_count() > 1);
+        let mut input_appender =
+            NamePageAppender::create_new(&input, 21, 0).expect("create input pages");
+        packed
+            .append(&mut input_appender)
+            .expect("append input pages");
+        drop(input_appender);
+
+        let root_locator = packed.root_locator(root).expect("root locator");
+        let reader =
+            NamePageTreeReader::open(&input, root, root_locator).expect("open input pages");
+        let mut output_appender =
+            NamePageAppender::create_new(&output, 22, 0).expect("create output pages");
+        let mut progress = Vec::new();
+        let (streamed, known) = reader
+            .stream_physical_tree_indexed_with_limits_and_progress(
+                root,
+                &mut output_appender,
+                default_name_page_stream_limits(),
+                Duration::ZERO,
+                |event| progress.push(event),
+            )
+            .expect("physical rewrite");
+        assert_eq!(streamed.record_count, records.len() as u64);
+        assert_eq!(known.len(), records.len());
+        assert_eq!(known.get(&root).copied(), streamed.root_address);
+        let discovery = progress
+            .iter()
+            .rev()
+            .find(|event| event.phase == NamePagePhysicalStreamPhase::Discovering)
+            .copied()
+            .expect("discovery progress");
+        assert_eq!(discovery.source_records_discovered, records.len() as u64);
+        assert_eq!(
+            discovery.source_pages_discovered,
+            packed.page_count() as u64
+        );
+        assert_eq!(discovery.records_written, 0);
+        let final_progress = progress.last().copied().expect("rewrite progress");
+        assert_eq!(final_progress.phase, NamePagePhysicalStreamPhase::Rewriting);
+        assert_eq!(final_progress.records_written, streamed.record_count);
+        assert_eq!(final_progress.pages_written, streamed.page_count);
+        assert_eq!(
+            final_progress.source_pages_rewritten,
+            packed.page_count() as u64
+        );
+
+        drop(output_appender);
+        drop(reader);
+        let output_reader = NamePageTreeReader::open(
+            &output,
+            root,
+            NamePageRootLocator::new(
+                streamed.manifest.generation,
+                streamed.root_address.expect("rewritten root address"),
+            ),
+        )
+        .expect("open rewritten pages");
+        assert_eq!(
+            validate_record_tree(root, |record_root| {
+                output_reader
+                    .load(record_root)
+                    .map_err(|error| UrkelError::Storage(error.to_string()))
+            })
+            .expect("validate rewritten tree"),
+            records.len()
+        );
+
+        drop(output_reader);
+        for path in [input, output] {
+            std::fs::remove_file(path).expect("remove page fixture");
+        }
+    }
+
+    #[test]
+    fn physical_stream_rejects_forward_children_and_bounded_work_before_output() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let prefix = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-physical-invalid-{}-{nonce}",
+            std::process::id()
+        ));
+        let valid_input = prefix.with_extension("valid.pages");
+        let invalid_input = prefix.with_extension("invalid.pages");
+        let bounded_output = prefix.with_extension("bounded-output.pages");
+        let invalid_output = prefix.with_extension("invalid-output.pages");
+        for path in [
+            &valid_input,
+            &invalid_input,
+            &bounded_output,
+            &invalid_output,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let tree = MemoryUrkel::from_entries([
+            (NameHash::new([0x11; 32]), b"left".to_vec()),
+            (NameHash::new([0x91; 32]), b"right".to_vec()),
+        ])
+        .expect("tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("records");
+        assert_eq!(records.len(), 3);
+        let packed =
+            pack_name_page_records(31, 0, 0, &records, &HashMap::new()).expect("pack records");
+        let root_locator = packed.root_locator(root).expect("root locator");
+        let mut input_appender =
+            NamePageAppender::create_new(&valid_input, 31, 0).expect("create valid pages");
+        packed
+            .append(&mut input_appender)
+            .expect("append valid pages");
+        drop(input_appender);
+
+        let valid_reader =
+            NamePageTreeReader::open(&valid_input, root, root_locator).expect("open valid pages");
+        let mut bounded_appender =
+            NamePageAppender::create_new(&bounded_output, 32, 0).expect("bounded output");
+        let mut bounded_limits = default_name_page_stream_limits();
+        bounded_limits.max_records = 2;
+        bounded_limits.max_known_addresses = 2;
+        let error = valid_reader
+            .stream_physical_tree_indexed_with_limits_and_progress(
+                root,
+                &mut bounded_appender,
+                bounded_limits,
+                Duration::MAX,
+                |_| {},
+            )
+            .expect_err("three records exceed bounded physical work");
+        assert!(matches!(
+            error,
+            PageTreeError::ResourceLimit {
+                context: "name-page physical scheduled records",
+                limit: 2,
+                actual: 3,
+            }
+        ));
+        assert_eq!(
+            std::fs::metadata(&bounded_output)
+                .expect("bounded output metadata")
+                .len(),
+            0
+        );
+        drop(bounded_appender);
+        drop(valid_reader);
+
+        let decoded_root =
+            UrkelNodeRecord::decode(records.get(&root).expect("root record")).expect("decode root");
+        let UrkelNodeRecord::Internal { left, right, .. } = decoded_root else {
+            panic!("two-leaf tree must have an internal root");
+        };
+        let leaf_address = NamePageAddress::new(0, 0, 0).expect("leaf address");
+        let root_address = NamePageAddress::new(0, 0, 2).expect("root address");
+        let invalid_page = encode_name_page(&[
+            NamePageRecord {
+                key: *left.as_bytes(),
+                children: Vec::new(),
+                canonical: records.get(&left).expect("left record").clone(),
+            },
+            NamePageRecord {
+                key: *right.as_bytes(),
+                children: Vec::new(),
+                canonical: records.get(&right).expect("right record").clone(),
+            },
+            NamePageRecord {
+                key: *root.as_bytes(),
+                children: vec![leaf_address, root_address],
+                canonical: records.get(&root).expect("root record").clone(),
+            },
+        ])
+        .expect("encode invalid page");
+        std::fs::write(&invalid_input, invalid_page).expect("write invalid page");
+        let invalid_reader = NamePageTreeReader::open(
+            &invalid_input,
+            root,
+            NamePageRootLocator::new(31, root_address),
+        )
+        .expect("open invalid pages");
+        let mut invalid_appender =
+            NamePageAppender::create_new(&invalid_output, 32, 0).expect("invalid output");
+        let error = invalid_reader
+            .stream_physical_tree_indexed_with_limits_and_progress(
+                root,
+                &mut invalid_appender,
+                default_name_page_stream_limits(),
+                Duration::MAX,
+                |_| {},
+            )
+            .expect_err("forward child locator must fail");
+        assert!(matches!(error, PageTreeError::ChildLocatorMismatch(actual) if actual == root));
+        assert_eq!(
+            std::fs::metadata(&invalid_output)
+                .expect("invalid output metadata")
+                .len(),
+            0
+        );
+
+        drop(invalid_appender);
+        drop(invalid_reader);
+        for path in [valid_input, invalid_input, bounded_output, invalid_output] {
+            std::fs::remove_file(path).expect("remove page fixture");
+        }
     }
 
     #[test]

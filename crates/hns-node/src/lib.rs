@@ -144,17 +144,17 @@ use hns_state::{
     pack_name_page_records_consuming, plan_name_tree_interval_accumulator_migration_bounded,
     reconcile_legacy_name_tree_interval_accumulator_bounded, retained_name_tree_roots_bounded,
     stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits_and_progress,
-    stream_name_page_tree_indexed_with_limits_and_progress,
     stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
     validate_persisted_name_tree_root, validate_persisted_name_trees,
     verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
     visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
-    ConnectBlock, DisconnectBlock, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot,
-    NamePageState, NamePageStreamLimits, NamePageTreeReader, NamePageValidationLimits,
-    NameTreeCompactionSummary, NameTreeIntervalMigrationLimits, NameTreeMaterializationLimits,
-    NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits,
-    StateError, StateServices, StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX,
-    NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    ConnectBlock, DisconnectBlock, NamePagePhysicalStreamPhase, NamePageRootLocator,
+    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageStreamLimits, NamePageTreeReader,
+    NamePageValidationLimits, NameTreeCompactionSummary, NameTreeIntervalMigrationLimits,
+    NameTreeMaterializationLimits, NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits,
+    PageTreeError, RetainedNameTreeRootLimits, StateError, StateServices, StoredStateEngine,
+    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
+    NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 #[cfg(test)]
 use hns_state::{
@@ -7318,30 +7318,36 @@ impl NamePageStorage {
             let (base, mut known) = {
                 let (source_reader, _) =
                     self.reader_for_roots(&snapshot, std::iter::empty(), false)?;
-                let source_snapshot = NamePageSnapshot::new(&snapshot, &source_reader);
-                stream_name_page_tree_indexed_with_limits_and_progress(
-                    &source_snapshot,
-                    self.state.root,
-                    &mut appender,
-                    production_name_page_stream_limits(filesystem_limits.deadline),
-                    progress_interval,
-                    move |progress| {
-                        tracing::info!(
-                            phase = "streaming-base",
-                            previous_generation,
-                            generation,
-                            records_written = progress.records_completed,
-                            pages_written = progress.pages_completed,
-                            bytes_written = progress.bytes_completed,
-                            elapsed_seconds = start.elapsed().as_secs(),
-                            remaining_deadline_seconds =
-                                remaining_deadline_seconds(filesystem_limits.deadline),
-                            "compacting authenticated name pages"
-                        );
-                    },
-                )
-                .map_err(anyhow::Error::new)
-                .context("failed to stream compacted name-page base")?
+                source_reader
+                    .stream_physical_tree_indexed_with_limits_and_progress(
+                        self.state.root,
+                        &mut appender,
+                        production_name_page_stream_limits(filesystem_limits.deadline),
+                        progress_interval,
+                        move |progress| {
+                            let phase = match progress.phase {
+                                NamePagePhysicalStreamPhase::Discovering => "discovering-base",
+                                NamePagePhysicalStreamPhase::Rewriting => "streaming-base",
+                            };
+                            tracing::info!(
+                                phase,
+                                previous_generation,
+                                generation,
+                                source_records_discovered = progress.source_records_discovered,
+                                source_pages_discovered = progress.source_pages_discovered,
+                                source_pages_rewritten = progress.source_pages_rewritten,
+                                records_written = progress.records_written,
+                                pages_written = progress.pages_written,
+                                bytes_written = progress.bytes_written,
+                                elapsed_seconds = start.elapsed().as_secs(),
+                                remaining_deadline_seconds =
+                                    remaining_deadline_seconds(filesystem_limits.deadline),
+                                "compacting authenticated name pages"
+                            );
+                        },
+                    )
+                    .map_err(anyhow::Error::new)
+                    .context("failed to stream compacted name-page base")?
             };
             tracing::info!(
                 phase = "streaming-base",
