@@ -142,7 +142,7 @@ use hns_state::{
     load_stored_name_tree_commit_root, load_stored_name_tree_root,
     maximum_name_page_validation_records, migrate_name_tree_interval_accumulator_bounded,
     name_page_root_key, name_tree_snapshot_pin_key, pack_name_page_records_consuming,
-    plan_name_tree_interval_accumulator_migration_bounded,
+    plan_name_tree_interval_accumulator_migration_bounded, prefetch_replay_utxos,
     reconcile_legacy_name_tree_interval_accumulator_bounded, retained_name_tree_roots_bounded,
     stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits_and_progress,
     stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
@@ -189,7 +189,7 @@ use tokio::{
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 17;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 18;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -6661,6 +6661,8 @@ struct NodeReorgMutation {
 #[derive(Clone, Copy, Debug, Default)]
 struct NodeReorgTimings {
     block_staging_micros: u64,
+    utxo_prefetch_micros: u64,
+    utxos_prefetched: usize,
     name_page_prepare_micros: u64,
     store_publication_micros: u64,
 }
@@ -12385,6 +12387,16 @@ impl NodeState {
             });
         }
 
+        let utxo_prefetch_started = Instant::now();
+        let utxos_prefetched = prefetch_replay_utxos(
+            &staged,
+            request.connect.iter().map(|connect| &connect.block),
+        )
+        .map_err(anyhow::Error::new)
+        .context("failed to prefetch active-state replay UTXOs")
+        .map_err(ChainActivationFailure::Internal)?;
+        let utxo_prefetch_micros =
+            u64::try_from(utxo_prefetch_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let mut name_accumulator = NameTreeAccumulatorSession::default();
         for connect in request.connect {
             let hash = connect.block.hash();
@@ -12732,6 +12744,8 @@ impl NodeState {
             truncated_direct_connect_limit,
             timings: NodeReorgTimings {
                 block_staging_micros,
+                utxo_prefetch_micros,
+                utxos_prefetched,
                 name_page_prepare_micros,
                 store_publication_micros,
             },

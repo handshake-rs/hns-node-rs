@@ -46,7 +46,8 @@ use hns_store::{
     decode_u32, encode_u32, ColumnFamily, MetaKey, PrefixScanBudget, PrefixScanPage, ReadSnapshot,
     Store, StoreError, WriteBatch, AIRDROP_FIELD_BYTES, INTERVAL_SCHEMA_VERSION,
     INTERVAL_STORAGE_PROFILE, LEGACY_SCHEMA_VERSION, LEGACY_STORAGE_PROFILE,
-    PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION, STORAGE_PROFILE,
+    PRE_INTERVAL_SCHEMA_VERSION, PRE_INTERVAL_STORAGE_PROFILE, SCHEMA_VERSION,
+    STAGED_STATE_POINT_READ_CACHE_LIMIT, STORAGE_PROFILE,
 };
 use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
@@ -2667,15 +2668,18 @@ fn resolve_transaction_inputs(
     Ok(resolved)
 }
 
-fn prefetch_block_utxos<T: ReadSnapshot>(
-    snapshot: &T,
+fn extend_block_utxo_outpoints(
     block: &Block,
-) -> Result<HashMap<Outpoint, Option<Coin>>, StateError> {
-    let mut unique = HashSet::new();
-    let mut outpoints = Vec::new();
+    unique: &mut HashSet<Outpoint>,
+    outpoints: &mut Vec<Outpoint>,
+    maximum: usize,
+) -> Result<bool, StateError> {
     for (transaction_index, transaction) in block.transactions.iter().enumerate() {
         if transaction_index != 0 {
             for input in &transaction.inputs {
+                if outpoints.len() == maximum {
+                    return Ok(true);
+                }
                 if unique.insert(input.previous_output.clone()) {
                     outpoints.push(input.previous_output.clone());
                 }
@@ -2690,11 +2694,66 @@ fn prefetch_block_utxos<T: ReadSnapshot>(
                 StateError::Codec(format!("output index {output_index} exceeds u32"))
             })?;
             let outpoint = Outpoint { txid, index };
+            if outpoints.len() == maximum {
+                return Ok(true);
+            }
             if unique.insert(outpoint.clone()) {
                 outpoints.push(outpoint);
             }
         }
     }
+    Ok(false)
+}
+
+/// Warm the bounded point-read cache for the earliest UTXOs in an atomic
+/// multi-block replay. The staged snapshot still resolves every later write or
+/// deletion before this immutable-base cache, so outputs created and spent
+/// within the same replay retain exact read-your-writes behavior.
+pub fn prefetch_replay_utxos<'a, T, I>(snapshot: &T, blocks: I) -> Result<usize, StateError>
+where
+    T: ReadSnapshot,
+    I: IntoIterator<Item = &'a Block>,
+{
+    let mut unique = HashSet::new();
+    let mut outpoints = Vec::new();
+    for block in blocks {
+        if extend_block_utxo_outpoints(
+            block,
+            &mut unique,
+            &mut outpoints,
+            STAGED_STATE_POINT_READ_CACHE_LIMIT,
+        )? {
+            break;
+        }
+    }
+    if outpoints.is_empty() {
+        return Ok(0);
+    }
+
+    let keys = outpoints
+        .iter()
+        .map(encode_outpoint_key)
+        .collect::<Vec<_>>();
+    let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let values = snapshot.get_many(ColumnFamily::Utxo, &key_refs)?;
+    if values.len() != outpoints.len() {
+        return Err(StateError::Codec(format!(
+            "UTXO multi-get returned {} values for {} replay outpoints",
+            values.len(),
+            outpoints.len()
+        )));
+    }
+    Ok(outpoints.len())
+}
+
+fn prefetch_block_utxos<T: ReadSnapshot>(
+    snapshot: &T,
+    block: &Block,
+) -> Result<HashMap<Outpoint, Option<Coin>>, StateError> {
+    let mut unique = HashSet::new();
+    let mut outpoints = Vec::new();
+    let saturated = extend_block_utxo_outpoints(block, &mut unique, &mut outpoints, usize::MAX)?;
+    debug_assert!(!saturated);
     if outpoints.is_empty() {
         return Ok(HashMap::new());
     }
@@ -9981,6 +10040,21 @@ mod tests {
             index: 0,
         };
         let candidate = block(88, vec![coinbase(Vec::new()), spend]);
+        let second_spend = Transaction {
+            version: 1,
+            inputs: vec![Input {
+                previous_output: created.clone(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![output(19)],
+            locktime: 0,
+        };
+        let second_created = Outpoint {
+            txid: second_spend.txid(),
+            index: 0,
+        };
+        let second_candidate = block(89, vec![coinbase(Vec::new()), second_spend]);
         let guarded = NoNameStateScanSnapshot {
             inner: store.snapshot().expect("snapshot"),
             name_node_reads: Cell::new(0),
@@ -9990,11 +10064,20 @@ mod tests {
             utxo_batches: Cell::new(0),
             maximum_utxo_batch: Cell::new(0),
         };
-        let prefetched = prefetch_block_utxos(&guarded, &candidate).expect("prefetch");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&guarded);
+        assert_eq!(
+            prefetch_replay_utxos(&staged, [&candidate, &second_candidate])
+                .expect("warm replay UTXOs"),
+            4
+        );
+        let prefetched = prefetch_block_utxos(&staged, &candidate).expect("prefetch block");
+        let second_prefetched =
+            prefetch_block_utxos(&staged, &second_candidate).expect("prefetch second block");
 
         assert_eq!(guarded.utxo_reads.get(), 0);
         assert_eq!(guarded.utxo_batches.get(), 1);
-        assert_eq!(guarded.maximum_utxo_batch.get(), 3);
+        assert_eq!(guarded.maximum_utxo_batch.get(), 4);
         assert_eq!(
             prefetched[&first_outpoint].as_ref().map(|coin| coin.value),
             Some(11)
@@ -10004,6 +10087,8 @@ mod tests {
             Some(13)
         );
         assert_eq!(prefetched[&created], None);
+        assert_eq!(second_prefetched[&created], None);
+        assert_eq!(second_prefetched[&second_created], None);
     }
 
     #[test]

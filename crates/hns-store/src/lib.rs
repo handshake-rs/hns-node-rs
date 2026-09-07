@@ -756,7 +756,7 @@ const STAGED_NAME_NODE_READ_CACHE_LIMIT: usize = 131_072;
 /// Bound point values read from one immutable active-state base snapshot.
 /// Missing values are cached too. Overlay writes always take precedence, so
 /// caching cannot mask a later mutation in the same atomic transaction.
-const STAGED_STATE_POINT_READ_CACHE_LIMIT: usize = 65_536;
+pub const STAGED_STATE_POINT_READ_CACHE_LIMIT: usize = 65_536;
 
 const fn caches_staged_state_point_read(family: ColumnFamily) -> bool {
     matches!(
