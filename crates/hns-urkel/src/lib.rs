@@ -1117,7 +1117,6 @@ where
         .into_iter()
         .map(|(key, value)| RecordMutation { key, value })
         .collect::<Vec<_>>();
-    let mutation_refs = mutations.iter().collect::<Vec<_>>();
     let mut context = RecordMutationContext {
         load,
         loaded,
@@ -1129,7 +1128,7 @@ where
         root,
         0,
         NameHash::new([0; 32]),
-        &mutation_refs,
+        &mutations,
         &mut frontier,
     )?;
     frontier.sort_unstable_by_key(RecordMutationFrontier::representative);
@@ -1180,7 +1179,7 @@ fn collect_record_mutation_frontier<F>(
     root: TreeRoot,
     depth: usize,
     path_key: NameHash,
-    mutations: &[&RecordMutation],
+    mutations: &[RecordMutation],
     frontier: &mut Vec<RecordMutationFrontier>,
 ) -> Result<(), UrkelError>
 where
@@ -1239,26 +1238,40 @@ where
             right,
         } => {
             let branch_depth = checked_branch_depth(&prefix, depth)?;
-            let mut left_mutations = Vec::new();
-            let mut right_mutations = Vec::new();
-            for mutation in mutations {
-                if !prefix.matches_key(mutation.key.as_bytes(), depth) {
+            // The input comes from a BTreeMap and is ordered by the complete
+            // 256-bit key. Every key matching one compressed Patricia prefix
+            // is therefore one contiguous range. Retain that range as a
+            // borrowed slice instead of allocating and filling two reference
+            // vectors at every internal node.
+            let mut matching_start = None;
+            let mut matching_end = 0_usize;
+            let mut matching_range_ended = false;
+            for (index, mutation) in mutations.iter().enumerate() {
+                if prefix.matches_key(mutation.key.as_bytes(), depth) {
+                    if matching_range_ended {
+                        return Err(UrkelError::InvalidNode(
+                            "ordered mutations contain a discontiguous prefix range".to_owned(),
+                        ));
+                    }
+                    matching_start.get_or_insert(index);
+                    matching_end = index + 1;
+                } else {
+                    if matching_start.is_some() {
+                        matching_range_ended = true;
+                    }
                     if let Some(value) = mutation.value.as_ref() {
                         frontier.push(RecordMutationFrontier::Leaf {
                             key: mutation.key,
                             value: value.clone(),
                         });
                     }
-                    continue;
-                }
-                if key_bit(mutation.key.as_bytes(), branch_depth) == 0 {
-                    left_mutations.push(*mutation);
-                } else {
-                    right_mutations.push(*mutation);
                 }
             }
 
-            if left_mutations.is_empty() && right_mutations.is_empty() {
+            let matching = matching_start
+                .map(|start| &mutations[start..matching_end])
+                .unwrap_or_default();
+            if matching.is_empty() {
                 frontier.push(RecordMutationFrontier::Existing {
                     root,
                     original_depth: depth,
@@ -1266,6 +1279,9 @@ where
                 });
                 return Ok(());
             }
+            let split = matching
+                .partition_point(|mutation| key_bit(mutation.key.as_bytes(), branch_depth) == 0);
+            let (left_mutations, right_mutations) = matching.split_at(split);
 
             let left_path = internal_record_representative(path_key, depth, &prefix, 0);
             if left_mutations.is_empty() {
@@ -1280,7 +1296,7 @@ where
                     left,
                     branch_depth + 1,
                     left_path,
-                    &left_mutations,
+                    left_mutations,
                     frontier,
                 )?;
             }
@@ -1298,7 +1314,7 @@ where
                     right,
                     branch_depth + 1,
                     right_path,
-                    &right_mutations,
+                    right_mutations,
                     frontier,
                 )?;
             }
