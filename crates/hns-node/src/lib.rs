@@ -148,13 +148,13 @@ use hns_state::{
     validate_persisted_name_tree_root, validate_persisted_name_trees,
     verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
     visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
-    ConnectBlock, DisconnectBlock, NamePagePhysicalStreamPhase, NamePageRootLocator,
-    NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageStreamLimits, NamePageTreeReader,
-    NamePageValidationLimits, NameTreeCompactionSummary, NameTreeIntervalMigrationLimits,
-    NameTreeMaterializationLimits, NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits,
-    PageTreeError, RetainedNameTreeRootLimits, StateError, StateServices, StoredStateEngine,
-    TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY,
-    NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    ConnectBlock, DisconnectBlock, NamePagePathCache, NamePagePhysicalStreamPhase,
+    NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageStreamLimits,
+    NamePageTreeReader, NamePageValidationLimits, NameTreeCompactionSummary,
+    NameTreeIntervalMigrationLimits, NameTreeMaterializationLimits, NameTreeSnapshotPin,
+    NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits, StateError,
+    StateServices, StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
+    NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 #[cfg(test)]
 use hns_state::{
@@ -6674,6 +6674,7 @@ struct NamePageStorage {
     reopen_required: bool,
     committed_generation_bytes: u64,
     generation_bytes: u64,
+    path_cache: NamePagePathCache,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7110,6 +7111,7 @@ impl NamePageStorage {
                 reopen_required: false,
                 committed_generation_bytes: generation_bytes,
                 generation_bytes,
+                path_cache: NamePagePathCache::default(),
             });
         }
 
@@ -7207,6 +7209,7 @@ impl NamePageStorage {
             reopen_required: false,
             committed_generation_bytes: generation_bytes,
             generation_bytes,
+            path_cache: NamePagePathCache::default(),
         })
     }
 
@@ -7227,12 +7230,13 @@ impl NamePageStorage {
                     .expect("zero page address fits"),
             )
         });
-        let reader = NamePageTreeReader::open_generation(
+        let reader = NamePageTreeReader::open_generation_with_shared_path_cache(
             &self.directory,
             self.state.manifest.generation,
             self.state.manifest.active_segment,
             self.state.root,
             locator,
+            self.path_cache.clone(),
         )
         .map_err(|error| anyhow::anyhow!("failed to open name-page reader: {error}"))?;
         let mut legacy_missing = false;
@@ -7610,6 +7614,7 @@ impl NamePageStorage {
         self.appender.take();
         self.file_path = file_path;
         self.state = next;
+        self.path_cache = NamePagePathCache::default();
         self.appender = Some(appender);
         tracing::info!(
             phase = "cleaning-old-generation",

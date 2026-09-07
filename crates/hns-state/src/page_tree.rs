@@ -40,10 +40,10 @@ const NAME_PAGE_READ_AHEAD_CACHE_PAGES: usize = 128;
 const NAME_PAGE_READ_AHEAD_WORKERS: usize = 4;
 #[cfg(unix)]
 const NAME_PAGE_READ_AHEAD_FILES_PER_WORKER: usize = 2;
-// One reader is scoped to one atomic activation slice. Retain authenticated
-// path records across the blocks in that slice so their heavily overlapping
-// immutable prefixes do not return to disk. The conservative accounting below
-// includes duplicated decoded-prefix storage and hash-map/Arc overhead.
+// Retain authenticated path records across consecutive activation slices so
+// their heavily overlapping immutable prefixes do not return to disk. The
+// conservative accounting below includes duplicated decoded-prefix storage
+// and hash-map/Arc overhead.
 const NAME_PAGE_PATH_RECORD_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const NAME_PAGE_STATE_VERSION: u32 = 2;
 const LEGACY_NAME_PAGE_STATE_VERSION: u32 = 1;
@@ -1984,6 +1984,50 @@ impl NamePagePathRecordCache {
     }
 }
 
+/// Bounded cache shared by readers of one immutable name-page generation.
+///
+/// The owning node replaces this handle after generation compaction, so an
+/// address from an older physical layout can never authenticate a new one.
+#[derive(Clone, Debug)]
+pub struct NamePagePathCache {
+    records: Arc<Mutex<NamePagePathRecordCache>>,
+}
+
+impl Default for NamePagePathCache {
+    fn default() -> Self {
+        Self {
+            records: Arc::new(Mutex::new(NamePagePathRecordCache::new(
+                NAME_PAGE_PATH_RECORD_CACHE_BYTES,
+            ))),
+        }
+    }
+}
+
+impl NamePagePathCache {
+    fn get(
+        &self,
+        root: TreeRoot,
+        address: NamePageAddress,
+    ) -> Result<Option<Arc<LoadedNamePageRecord>>, PageTreeError> {
+        self.records
+            .lock()
+            .map_err(|_| PageTreeError::Poisoned)?
+            .get(root, address)
+    }
+
+    fn insert(
+        &self,
+        root: TreeRoot,
+        address: NamePageAddress,
+        loaded: Arc<LoadedNamePageRecord>,
+    ) -> Result<(), PageTreeError> {
+        self.records
+            .lock()
+            .map_err(|_| PageTreeError::Poisoned)?
+            .insert(root, address, loaded)
+    }
+}
+
 #[derive(Debug)]
 struct NamePagePathWork {
     root: TreeRoot,
@@ -2073,7 +2117,7 @@ pub struct NamePageTreeReader {
     root_segment: u32,
     addresses: Mutex<HashMap<TreeRoot, NamePageAddress>>,
     cache: Mutex<PageCache>,
-    path_records: Mutex<NamePagePathRecordCache>,
+    path_records: NamePagePathCache,
     path_page_reads: AtomicU64,
 }
 
@@ -2523,11 +2567,56 @@ impl NamePageTreeReader {
         )
     }
 
+    /// Open one generation while retaining authenticated path records shared
+    /// with earlier readers of that same generation.
+    pub fn open_generation_with_shared_path_cache(
+        directory: impl AsRef<Path>,
+        generation: u64,
+        active_segment: u32,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+        path_records: NamePagePathCache,
+    ) -> Result<Self, PageTreeError> {
+        if locator.generation != generation {
+            return Err(PageTreeError::WrongGeneration {
+                expected: generation,
+                actual: locator.generation,
+            });
+        }
+        Self::open_source_with_caches(
+            NamePageSegmentSource::Generation {
+                directory: directory.as_ref().to_path_buf(),
+                generation,
+                active_segment,
+            },
+            root,
+            locator,
+            DEFAULT_PAGE_CACHE_PAGES,
+            path_records,
+        )
+    }
+
     fn open_source_with_cache(
         segments: NamePageSegmentSource,
         root: TreeRoot,
         locator: NamePageRootLocator,
         cache_pages: usize,
+    ) -> Result<Self, PageTreeError> {
+        Self::open_source_with_caches(
+            segments,
+            root,
+            locator,
+            cache_pages,
+            NamePagePathCache::default(),
+        )
+    }
+
+    fn open_source_with_caches(
+        segments: NamePageSegmentSource,
+        root: TreeRoot,
+        locator: NamePageRootLocator,
+        cache_pages: usize,
+        path_records: NamePagePathCache,
     ) -> Result<Self, PageTreeError> {
         let address = locator.page_address();
         if !segments.contains(address.segment()) {
@@ -2549,9 +2638,7 @@ impl NamePageTreeReader {
             root_segment: address.segment(),
             addresses: Mutex::new(addresses),
             cache: Mutex::new(PageCache::new(cache_pages)),
-            path_records: Mutex::new(NamePagePathRecordCache::new(
-                NAME_PAGE_PATH_RECORD_CACHE_BYTES,
-            )),
+            path_records,
             path_page_reads: AtomicU64::new(0),
         })
     }
@@ -2882,8 +2969,6 @@ impl NamePageTreeReader {
                         let loaded =
                             Arc::new(validate_loaded_name_page_record(&record, work.root)?);
                         self.path_records
-                            .lock()
-                            .map_err(|_| PageTreeError::Poisoned)?
                             .insert(work.root, address, Arc::clone(&loaded))?;
                         loaded
                     }
@@ -2910,10 +2995,7 @@ impl NamePageTreeReader {
         root: TreeRoot,
         address: NamePageAddress,
     ) -> Result<Option<Arc<LoadedNamePageRecord>>, PageTreeError> {
-        self.path_records
-            .lock()
-            .map_err(|_| PageTreeError::Poisoned)?
-            .get(root, address)
+        self.path_records.get(root, address)
     }
 
     fn consume_name_page_path_record(
@@ -5727,8 +5809,16 @@ mod tests {
         let mut appender = NamePageAppender::create_new(&path, 3, 0).expect("create pages");
         packed.append(&mut appender).expect("append pages");
         let root_locator = packed.root_locator(root).expect("root locator");
-        let reader =
-            NamePageTreeReader::open_with_cache(&path, root, root_locator, 1).expect("reader");
+        let path_records = NamePagePathCache::default();
+        let source = NamePageSegmentSource::Explicit(Arc::new(BTreeMap::from([(0, path.clone())])));
+        let reader = NamePageTreeReader::open_source_with_caches(
+            source.clone(),
+            root,
+            root_locator,
+            1,
+            path_records.clone(),
+        )
+        .expect("reader");
         assert_eq!(
             reader.locate_record(root).expect("locate root"),
             Some(root_locator)
@@ -5777,6 +5867,25 @@ mod tests {
         assert_eq!(repeated, records);
         assert_eq!(reader.path_page_read_count(), after);
         drop(reader);
+
+        let reopened = NamePageTreeReader::open_source_with_caches(
+            source,
+            root,
+            root_locator,
+            1,
+            path_records,
+        )
+        .expect("reopen reader with shared path cache");
+        let reopened_prefetch = reopened
+            .prefetch_paths(
+                root,
+                &entries.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            )
+            .expect("reopened physical-order path prefetch")
+            .expect("page-backed root");
+        assert_eq!(reopened_prefetch, records);
+        assert_eq!(reopened.path_page_read_count(), 0);
+        drop(reopened);
 
         let reader =
             NamePageTreeReader::open_with_cache(&path, root, root_locator, 1).expect("reader");

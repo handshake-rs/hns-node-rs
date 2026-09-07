@@ -8,7 +8,7 @@ pub use page_tree::{
     pack_name_page_records_consuming, stream_name_page_tree, stream_name_page_tree_delta,
     stream_name_page_tree_delta_with_limits, stream_name_page_tree_delta_with_limits_and_progress,
     stream_name_page_tree_indexed_with_limits_and_progress, stream_name_page_tree_with_limits,
-    stream_name_page_tree_with_limits_and_progress, NamePagePhysicalStreamPhase,
+    stream_name_page_tree_with_limits_and_progress, NamePagePathCache, NamePagePhysicalStreamPhase,
     NamePagePhysicalStreamProgress, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot,
     NamePageState, NamePageStreamLimits, NamePageStreamProgress, NamePageTraversalLimits,
     NamePageTreeReader, NamePageValidation, NamePageValidationLimits, NamePageValidationProgress,
