@@ -164,6 +164,14 @@ const ROCKS_UTXO_MIN_WRITE_BUFFERS_TO_MERGE: i32 = 2;
 const ROCKS_UTXO_TARGET_FILE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_UTXO_LEVEL_BASE_BYTES: u64 = 1024 * 1024 * 1024;
+/// The linked RocksDB archive has no coroutine support, so one native
+/// BatchedMultiGet cannot overlap reads across SST levels. Large immutable
+/// snapshot reads use a fixed number of scoped callers instead; smaller reads
+/// stay serial to avoid thread startup and result-join overhead.
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_BATCHED_MULTI_GET_PARALLELISM: usize = 4;
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_BATCHED_MULTI_GET_PARALLEL_THRESHOLD: usize = 1_024;
 
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
 pub type PrefixVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
@@ -4423,6 +4431,30 @@ pub struct RocksSnapshot<'a> {
 }
 
 #[cfg(feature = "rocksdb-backend")]
+impl RocksSnapshot<'_> {
+    fn batched_get_many(
+        &self,
+        cf: &rocksdb::ColumnFamily,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_snapshot(&self.snapshot);
+        self.db
+            // RocksDB's batched path groups point lookups by block-based SST
+            // internals. Callers do not promise sorted keys, and the API
+            // preserves input order when sorting internally.
+            .batched_multi_get_cf_opt(cf, keys.iter(), false, &options)
+            .into_iter()
+            .map(|value| {
+                value
+                    .map(|value| value.map(|value| value.as_ref().to_vec()))
+                    .map_err(|error| StoreError::Backend(error.to_string()))
+            })
+            .collect()
+    }
+}
+
+#[cfg(feature = "rocksdb-backend")]
 impl ReadSnapshot for RocksSnapshot<'_> {
     fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         let cf = RocksStore::cf(self.db, family)?;
@@ -4437,22 +4469,25 @@ impl ReadSnapshot for RocksSnapshot<'_> {
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
         let cf = RocksStore::cf(self.db, family)?;
-        let mut options = rocksdb::ReadOptions::default();
-        options.set_snapshot(&self.snapshot);
-        self.db
-            // RocksDB's batched path groups point lookups by block-based SST
-            // internals. This is materially cheaper than the compatibility
-            // MultiGet C API for the tens of thousands of UTXOs resolved by
-            // one active-state replay slice. Callers do not promise sorted
-            // keys, and the API preserves input order when sorting internally.
-            .batched_multi_get_cf_opt(cf, keys.iter(), false, &options)
-            .into_iter()
-            .map(|value| {
-                value
-                    .map(|value| value.map(|value| value.as_ref().to_vec()))
-                    .map_err(|error| StoreError::Backend(error.to_string()))
-            })
-            .collect()
+        if keys.len() < ROCKS_BATCHED_MULTI_GET_PARALLEL_THRESHOLD {
+            return self.batched_get_many(cf, keys);
+        }
+
+        let chunk_size = keys.len().div_ceil(ROCKS_BATCHED_MULTI_GET_PARALLELISM);
+        std::thread::scope(|scope| {
+            let workers = keys
+                .chunks(chunk_size)
+                .map(|chunk| scope.spawn(move || self.batched_get_many(cf, chunk)))
+                .collect::<Vec<_>>();
+            let mut values = Vec::with_capacity(keys.len());
+            for worker in workers {
+                let chunk = worker.join().map_err(|_| {
+                    StoreError::Backend("RocksDB batched multi-get worker panicked".to_owned())
+                })??;
+                values.extend(chunk);
+            }
+            Ok(values)
+        })
     }
 
     fn scan_prefix(
@@ -7002,6 +7037,64 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[cfg(feature = "rocksdb-backend")]
+    #[test]
+    fn rocks_parallel_batched_multi_get_preserves_input_order_and_missing_values() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-rocks-parallel-multi-get-{}-{nonce}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let store = RocksStore::open(&path).expect("open rocksdb");
+        initialize_schema(&store).expect("schema");
+        let count = ROCKS_BATCHED_MULTI_GET_PARALLEL_THRESHOLD + 17;
+        let mut batch = store.batch();
+        for index in 0..count {
+            let index = u64::try_from(index).expect("test index");
+            batch
+                .put(
+                    ColumnFamily::Utxo,
+                    &index.to_be_bytes(),
+                    &index.wrapping_mul(3).to_le_bytes(),
+                )
+                .expect("put test point");
+        }
+        store.commit(batch).expect("commit test points");
+
+        let mut keys = (0..count)
+            .rev()
+            .map(|index| {
+                u64::try_from(index)
+                    .expect("query index")
+                    .to_be_bytes()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        keys.insert(count / 2, vec![0xff; 8]);
+        let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let values = store
+            .snapshot()
+            .expect("snapshot")
+            .get_many(ColumnFamily::Utxo, &key_refs)
+            .expect("parallel multi-get");
+        assert_eq!(values.len(), keys.len());
+        for (key, value) in keys.iter().zip(values) {
+            if key == &[0xff; 8] {
+                assert_eq!(value, None);
+                continue;
+            }
+            let index = u64::from_be_bytes(key.as_slice().try_into().expect("query key"));
+            assert_eq!(value, Some(index.wrapping_mul(3).to_le_bytes().to_vec()));
+        }
+
+        drop(store);
+        std::fs::remove_dir_all(path).expect("remove RocksDB fixture");
     }
 
     #[cfg(feature = "rocksdb-backend")]
