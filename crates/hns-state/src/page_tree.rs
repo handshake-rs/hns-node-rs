@@ -1896,6 +1896,7 @@ struct CachedNamePagePathRecord {
     loaded: Arc<LoadedNamePageRecord>,
     accounted_bytes: usize,
     referenced: bool,
+    leaf: bool,
 }
 
 #[derive(Debug)]
@@ -1903,8 +1904,8 @@ struct NamePagePathRecordCache {
     capacity_bytes: usize,
     accounted_bytes: usize,
     records: HashMap<TreeRoot, CachedNamePagePathRecord>,
-    clock: Vec<TreeRoot>,
-    clock_hand: usize,
+    clock: VecDeque<TreeRoot>,
+    leaf_records: usize,
 }
 
 impl NamePagePathRecordCache {
@@ -1913,8 +1914,41 @@ impl NamePagePathRecordCache {
             capacity_bytes,
             accounted_bytes: 0,
             records: HashMap::new(),
-            clock: Vec::new(),
-            clock_hand: 0,
+            clock: VecDeque::new(),
+            leaf_records: 0,
+        }
+    }
+
+    /// Evict one second-chance clock entry. Leaf-first eviction prevents
+    /// large name-state values with little cross-interval reuse from
+    /// displacing the compact internal routing nodes shared by almost every
+    /// subsequent Patricia traversal.
+    fn evict_one(&mut self, leaves_only: bool) -> bool {
+        if self.clock.is_empty() || (leaves_only && self.leaf_records == 0) {
+            return false;
+        }
+        loop {
+            let candidate = self.clock.pop_front().expect("nonempty cache clock");
+            let Some(record) = self.records.get_mut(&candidate) else {
+                continue;
+            };
+            if leaves_only && !record.leaf {
+                self.clock.push_back(candidate);
+                continue;
+            }
+            if std::mem::replace(&mut record.referenced, false) {
+                self.clock.push_back(candidate);
+                continue;
+            }
+            let evicted = self
+                .records
+                .remove(&candidate)
+                .expect("clock entry remains in path cache");
+            self.accounted_bytes = self.accounted_bytes.saturating_sub(evicted.accounted_bytes);
+            if evicted.leaf {
+                self.leaf_records = self.leaf_records.saturating_sub(1);
+            }
+            return true;
         }
     }
 
@@ -1960,36 +1994,22 @@ impl NamePagePathRecordCache {
         if accounted_bytes > self.capacity_bytes {
             return Ok(());
         }
+        let leaf = matches!(&loaded.node, ValidatedNamePageNode::Leaf);
         while self.accounted_bytes.saturating_add(accounted_bytes) > self.capacity_bytes {
-            let candidate = self.clock[self.clock_hand];
-            let referenced = self
-                .records
-                .get_mut(&candidate)
-                .map(|record| std::mem::replace(&mut record.referenced, false))
-                .unwrap_or(false);
-            if referenced {
-                self.clock_hand = (self.clock_hand + 1) % self.clock.len();
-                continue;
+            if leaf {
+                if !self.evict_one(true) {
+                    // Internal nodes own the remaining capacity. A leaf miss
+                    // is cheaper than evicting reusable routing topology.
+                    return Ok(());
+                }
+            } else if self.leaf_records > 0 {
+                self.evict_one(true);
+            } else if !self.evict_one(false) {
+                return Ok(());
             }
-            if let Some(evicted) = self.records.remove(&candidate) {
-                self.accounted_bytes = self.accounted_bytes.saturating_sub(evicted.accounted_bytes);
-            }
-            self.clock[self.clock_hand] = root;
-            self.clock_hand = (self.clock_hand + 1) % self.clock.len();
-            self.records.insert(
-                root,
-                CachedNamePagePathRecord {
-                    address,
-                    loaded,
-                    accounted_bytes,
-                    referenced: true,
-                },
-            );
-            self.accounted_bytes = self.accounted_bytes.saturating_add(accounted_bytes);
-            return Ok(());
         }
 
-        self.clock.push(root);
+        self.clock.push_back(root);
         self.records.insert(
             root,
             CachedNamePagePathRecord {
@@ -1997,9 +2017,13 @@ impl NamePagePathRecordCache {
                 loaded,
                 accounted_bytes,
                 referenced: true,
+                leaf,
             },
         );
         self.accounted_bytes = self.accounted_bytes.saturating_add(accounted_bytes);
+        if leaf {
+            self.leaf_records = self.leaf_records.saturating_add(1);
+        }
         Ok(())
     }
 }
@@ -6368,6 +6392,84 @@ mod tests {
         assert!(stats.cache_hits >= records.len() as u64);
 
         drop(reader);
+        std::fs::remove_file(path).expect("remove page fixture");
+    }
+
+    #[test]
+    fn path_cache_protects_internal_topology_from_large_leaf_churn() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-cache-priority-{}-{nonce}.pages",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let tree = MemoryUrkel::from_entries((0u8..64).map(|index| {
+            let mut key = [0u8; 32];
+            key[0] = index;
+            key[31] = index.reverse_bits();
+            (NameHash::new(key), vec![index; 3_500])
+        }))
+        .expect("tree");
+        let records = tree.node_records().expect("records");
+        let packed =
+            pack_name_page_records(42, 0, 0, &records, &HashMap::new()).expect("pack records");
+        let mut appender = NamePageAppender::create_new(&path, 42, 0).expect("create pages");
+        let (_, update) = packed
+            .append_consuming_with_reserve_and_cache_update(&mut appender, 0)
+            .expect("append pages");
+        drop(appender);
+
+        let internal_bytes = update
+            .records
+            .iter()
+            .filter(|(_, _, loaded)| matches!(&loaded.node, ValidatedNamePageNode::Internal { .. }))
+            .map(|(_, _, loaded)| {
+                loaded
+                    .canonical
+                    .len()
+                    .saturating_add(std::mem::size_of::<CachedNamePagePathRecord>())
+                    .saturating_add(std::mem::size_of::<TreeRoot>())
+            })
+            .sum::<usize>();
+        let leaf_bytes = update
+            .records
+            .iter()
+            .find(|(_, _, loaded)| matches!(&loaded.node, ValidatedNamePageNode::Leaf))
+            .map(|(_, _, loaded)| {
+                loaded
+                    .canonical
+                    .len()
+                    .saturating_add(std::mem::size_of::<CachedNamePagePathRecord>())
+                    .saturating_add(std::mem::size_of::<TreeRoot>())
+            })
+            .expect("leaf record");
+        let capacity = internal_bytes.saturating_add(leaf_bytes.saturating_mul(2));
+        let internal = update
+            .records
+            .iter()
+            .filter_map(|(root, address, loaded)| {
+                matches!(&loaded.node, ValidatedNamePageNode::Internal { .. })
+                    .then_some((*root, *address))
+            })
+            .collect::<Vec<_>>();
+        let leaf_count = update.records.len().saturating_sub(internal.len());
+        let mut cache = NamePagePathRecordCache::new(capacity);
+        for (root, address, loaded) in update.records {
+            cache
+                .insert(root, address, loaded)
+                .expect("insert path record");
+        }
+
+        assert!(cache.accounted_bytes <= capacity);
+        assert!(cache.leaf_records < leaf_count);
+        for (root, address) in internal {
+            assert!(cache.get(root, address).expect("read internal").is_some());
+        }
+
         std::fs::remove_file(path).expect("remove page fixture");
     }
 
