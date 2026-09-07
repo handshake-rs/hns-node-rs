@@ -136,12 +136,13 @@ use hns_rpc::{
     RpcService, RpcSnapshot, RpcTransactionEntry, RpcUndoRetentionInfo,
 };
 use hns_state::{
-    compact_name_tree_nodes_streaming, connect_block_to_batch_with_services, decode_coin,
-    decode_name_state, disconnect_block_to_batch, encode_outpoint_key,
-    load_persisted_name_tree_records, load_stored_name_tree_commit_root,
-    load_stored_name_tree_root, maximum_name_page_validation_records,
-    migrate_name_tree_interval_accumulator_bounded, name_page_root_key, name_tree_snapshot_pin_key,
-    pack_name_page_records_consuming, plan_name_tree_interval_accumulator_migration_bounded,
+    compact_name_tree_nodes_streaming, connect_block_to_batch_with_services,
+    connect_block_to_batch_with_services_and_accumulator, decode_coin, decode_name_state,
+    disconnect_block_to_batch, encode_outpoint_key, load_persisted_name_tree_records,
+    load_stored_name_tree_commit_root, load_stored_name_tree_root,
+    maximum_name_page_validation_records, migrate_name_tree_interval_accumulator_bounded,
+    name_page_root_key, name_tree_snapshot_pin_key, pack_name_page_records_consuming,
+    plan_name_tree_interval_accumulator_migration_bounded,
     reconcile_legacy_name_tree_interval_accumulator_bounded, retained_name_tree_roots_bounded,
     stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits_and_progress,
     stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
@@ -150,11 +151,11 @@ use hns_state::{
     visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
     ConnectBlock, DisconnectBlock, NamePagePathCache, NamePagePhysicalStreamPhase,
     NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageStreamLimits,
-    NamePageTreeReader, NamePageValidationLimits, NameTreeCompactionSummary,
-    NameTreeIntervalMigrationLimits, NameTreeMaterializationLimits, NameTreeSnapshotPin,
-    NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits, StateError,
-    StateServices, StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
-    NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    NamePageTreeReader, NamePageValidationLimits, NameTreeAccumulatorSession,
+    NameTreeCompactionSummary, NameTreeIntervalMigrationLimits, NameTreeMaterializationLimits,
+    NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits,
+    StateError, StateServices, StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX,
+    NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 #[cfg(test)]
 use hns_state::{
@@ -11791,6 +11792,25 @@ impl NodeState {
         validated: ValidatedImport,
         persist_raw_body: bool,
     ) -> Result<StagedConnect> {
+        self.stage_connect_with_accumulator(
+            snapshot,
+            batch,
+            request,
+            validated,
+            persist_raw_body,
+            None,
+        )
+    }
+
+    fn stage_connect_with_accumulator<T: ReadSnapshot, B: WriteBatch>(
+        &self,
+        snapshot: &T,
+        batch: &mut B,
+        request: &NodeBlockImport,
+        validated: ValidatedImport,
+        persist_raw_body: bool,
+        accumulator: Option<&mut NameTreeAccumulatorSession>,
+    ) -> Result<StagedConnect> {
         validate_active_extension(snapshot, request, validated.chainwork)?;
 
         let block_hash = request.block.hash();
@@ -11836,18 +11856,23 @@ impl NodeState {
         .map_err(anyhow::Error::new)
         .context("failed to stage wallet indexes")?;
 
-        let state_summary = connect_block_to_batch_with_services(
-            snapshot,
-            batch,
-            ConnectBlock {
-                block_hash,
-                height: request.height,
-                coinbase_maturity: self.network.params().coinbase_maturity,
-                block_reward: self.network.params().block_reward(request.height),
-                block: &request.block,
-            },
-            services,
-        )
+        let connect = ConnectBlock {
+            block_hash,
+            height: request.height,
+            coinbase_maturity: self.network.params().coinbase_maturity,
+            block_reward: self.network.params().block_reward(request.height),
+            block: &request.block,
+        };
+        let state_summary = match accumulator {
+            Some(accumulator) => connect_block_to_batch_with_services_and_accumulator(
+                snapshot,
+                batch,
+                connect,
+                services,
+                accumulator,
+            ),
+            None => connect_block_to_batch_with_services(snapshot, batch, connect, services),
+        }
         .map_err(StateConnectError)?;
         if state_summary.historical_validation != historical_validation {
             anyhow::bail!("state engine returned a different historical validation route");
@@ -12360,6 +12385,7 @@ impl NodeState {
             });
         }
 
+        let mut name_accumulator = NameTreeAccumulatorSession::default();
         for connect in request.connect {
             let hash = connect.block.hash();
             let stateless = prepared
@@ -12400,19 +12426,33 @@ impl NodeState {
                     }),
             }
             .map_err(ChainActivationFailure::Internal)?;
+            name_accumulator
+                .begin_checkpoint()
+                .map_err(anyhow::Error::new)
+                .context("failed to begin name-tree accumulator checkpoint")
+                .map_err(ChainActivationFailure::Internal)?;
             if direct_prefix_eligible {
-                batch
-                    .begin_checkpoint()
-                    .map_err(anyhow::Error::from)
-                    .context("failed to begin direct-extension block checkpoint")
-                    .map_err(ChainActivationFailure::Internal)?;
+                if let Err(error) = batch.begin_checkpoint() {
+                    name_accumulator
+                        .rollback_checkpoint()
+                        .map_err(anyhow::Error::new)
+                        .context(
+                            "failed to roll back name-tree accumulator after batch checkpoint failure",
+                        )
+                        .map_err(ChainActivationFailure::Internal)?;
+                    return Err(ChainActivationFailure::Internal(
+                        anyhow::Error::from(error)
+                            .context("failed to begin direct-extension block checkpoint"),
+                    ));
+                }
             }
-            let staged_connect = match self.stage_connect(
+            let staged_connect = match self.stage_connect_with_accumulator(
                 &staged,
                 &mut batch,
                 &connect,
                 validated,
                 persist_raw_body,
+                Some(&mut name_accumulator),
             ) {
                 Ok(record) => record,
                 Err(error)
@@ -12420,6 +12460,11 @@ impl NodeState {
                         .downcast_ref::<StateConnectError>()
                         .is_some_and(|error| error.0.is_consensus_invalid()) =>
                 {
+                    name_accumulator
+                        .rollback_checkpoint()
+                        .map_err(anyhow::Error::new)
+                        .context("failed to roll back name-tree accumulator after invalid block")
+                        .map_err(ChainActivationFailure::Internal)?;
                     return Err(ChainActivationFailure::ContextualInvalid(Box::new(
                         ContextualActivationFailure {
                             request: connect,
@@ -12439,6 +12484,11 @@ impl NodeState {
                         .map_err(anyhow::Error::from)
                         .context("failed to roll back oversized direct-extension block")
                         .map_err(ChainActivationFailure::Internal)?;
+                    name_accumulator
+                        .rollback_checkpoint()
+                        .map_err(anyhow::Error::new)
+                        .context("failed to roll back oversized name-tree accumulator block")
+                        .map_err(ChainActivationFailure::Internal)?;
                     let connected = summary.connected.len();
                     truncated_direct_connect_limit = Some(connected);
                     tracing::warn!(
@@ -12452,6 +12502,11 @@ impl NodeState {
                     break;
                 }
                 Err(error) => {
+                    name_accumulator
+                        .rollback_checkpoint()
+                        .map_err(anyhow::Error::new)
+                        .context("failed to roll back name-tree accumulator after connect error")
+                        .map_err(ChainActivationFailure::Internal)?;
                     return Err(ChainActivationFailure::Internal(error.context(format!(
                         "failed to connect stored block {} at height {}",
                         hash.to_hex(),
@@ -12460,12 +12515,25 @@ impl NodeState {
                 }
             };
             if direct_prefix_eligible {
-                batch
-                    .commit_checkpoint()
-                    .map_err(anyhow::Error::from)
-                    .context("failed to accept direct-extension block checkpoint")
-                    .map_err(ChainActivationFailure::Internal)?;
+                if let Err(error) = batch.commit_checkpoint() {
+                    name_accumulator
+                        .rollback_checkpoint()
+                        .map_err(anyhow::Error::new)
+                        .context(
+                            "failed to roll back name-tree accumulator after batch checkpoint commit failure",
+                        )
+                        .map_err(ChainActivationFailure::Internal)?;
+                    return Err(ChainActivationFailure::Internal(
+                        anyhow::Error::from(error)
+                            .context("failed to accept direct-extension block checkpoint"),
+                    ));
+                }
             }
+            name_accumulator
+                .commit_checkpoint()
+                .map_err(anyhow::Error::new)
+                .context("failed to accept name-tree accumulator checkpoint")
+                .map_err(ChainActivationFailure::Internal)?;
             let previous = previous_block_records.get(&hash).cloned().ok_or_else(|| {
                 ChainActivationFailure::Internal(anyhow::anyhow!(
                     "reorganization cache plan omitted block {}",
@@ -12480,6 +12548,12 @@ impl NodeState {
             index_updates.extend(staged_connect.pruned);
             staged_pin_heights.push(connect.height);
         }
+
+        name_accumulator
+            .publish(&mut batch)
+            .map_err(anyhow::Error::new)
+            .context("failed to publish final name-tree accumulator")
+            .map_err(ChainActivationFailure::Internal)?;
 
         if truncated_direct_connect_limit.is_none()
             && prepared.as_ref().is_some_and(|proofs| !proofs.is_empty())

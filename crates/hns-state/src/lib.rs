@@ -260,6 +260,33 @@ pub struct NameTreeAccumulator {
     pub names: BTreeMap<NameHash, u16>,
 }
 
+/// Transactional in-memory accumulator for a multi-block atomic activation.
+///
+/// Ordinary one-block callers still publish exactly one encoded accumulator.
+/// A replay slice can reuse this object across blocks and publish only its
+/// final value, avoiding repeated decode, full-map clone, and full-map encode
+/// work as the 36-block name interval grows.
+#[derive(Debug, Default)]
+pub struct NameTreeAccumulatorSession {
+    accumulator: Option<NameTreeAccumulator>,
+    initialized: bool,
+    checkpoint: Option<NameTreeAccumulatorCheckpoint>,
+}
+
+#[derive(Debug)]
+struct NameTreeAccumulatorCheckpoint {
+    previous_initialized: bool,
+    previous_was_none: bool,
+    previous_last_height: Option<Height>,
+    previous_counts: Vec<(NameHash, Option<u16>)>,
+    boundary_accumulator: Option<NameTreeAccumulator>,
+}
+
+struct NameTreeAccumulatorPrevious {
+    last_height: Option<Height>,
+    boundary_accumulator: Option<NameTreeAccumulator>,
+}
+
 /// Evidence for the one-key startup reconciliation of accumulators written by
 /// the legacy touched-name undo contract. No undo, NameState, authenticated
 /// tree, or chain-index record is rewritten by this compatibility bridge.
@@ -455,6 +482,190 @@ impl NameTreeAccumulator {
             last_height,
             names,
         })
+    }
+}
+
+impl NameTreeAccumulatorSession {
+    pub fn begin_checkpoint(&mut self) -> Result<(), StateError> {
+        if self.checkpoint.is_some() {
+            return Err(StateError::Codec(
+                "name-tree accumulator checkpoint is already active".to_owned(),
+            ));
+        }
+        if !self.initialized && self.accumulator.is_some() {
+            return Err(StateError::Codec(
+                "uninitialized name-tree accumulator session contains state".to_owned(),
+            ));
+        }
+        self.checkpoint = Some(NameTreeAccumulatorCheckpoint {
+            previous_initialized: self.initialized,
+            previous_was_none: self.accumulator.is_none(),
+            previous_last_height: self
+                .accumulator
+                .as_ref()
+                .map(|accumulator| accumulator.last_height),
+            previous_counts: Vec::new(),
+            boundary_accumulator: None,
+        });
+        Ok(())
+    }
+
+    pub fn commit_checkpoint(&mut self) -> Result<(), StateError> {
+        if self.checkpoint.take().is_none() {
+            return Err(StateError::Codec(
+                "name-tree accumulator checkpoint is not active".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn rollback_checkpoint(&mut self) -> Result<(), StateError> {
+        let checkpoint = self.checkpoint.take().ok_or_else(|| {
+            StateError::Codec("name-tree accumulator checkpoint is not active".to_owned())
+        })?;
+        if let Some(boundary_accumulator) = checkpoint.boundary_accumulator {
+            if self.accumulator.is_some() {
+                return Err(StateError::Codec(
+                    "name-tree accumulator rollback has two current states".to_owned(),
+                ));
+            }
+            self.accumulator = Some(boundary_accumulator);
+        }
+        if checkpoint.previous_was_none {
+            self.accumulator = None;
+        } else {
+            let accumulator = self.accumulator.as_mut().ok_or_else(|| {
+                StateError::Codec(
+                    "name-tree accumulator rollback lost its previous state".to_owned(),
+                )
+            })?;
+            accumulator.last_height = checkpoint.previous_last_height.ok_or_else(|| {
+                StateError::Codec(
+                    "name-tree accumulator rollback lost its previous height".to_owned(),
+                )
+            })?;
+            for (name_hash, previous) in checkpoint.previous_counts.into_iter().rev() {
+                match previous {
+                    Some(previous) => {
+                        accumulator.names.insert(name_hash, previous);
+                    }
+                    None => {
+                        accumulator.names.remove(&name_hash);
+                    }
+                }
+            }
+        }
+        self.initialized = checkpoint.previous_initialized;
+        Ok(())
+    }
+
+    pub fn publish<B: WriteBatch>(&self, batch: &mut B) -> Result<(), StateError> {
+        if self.checkpoint.is_some() {
+            return Err(StateError::Codec(
+                "cannot publish a name-tree accumulator with an active checkpoint".to_owned(),
+            ));
+        }
+        if !self.initialized {
+            return Err(StateError::Codec(
+                "cannot publish an uninitialized name-tree accumulator session".to_owned(),
+            ));
+        }
+        match &self.accumulator {
+            Some(accumulator) => batch.put(
+                ColumnFamily::Snapshots,
+                NAME_TREE_ACCUMULATOR_KEY,
+                &accumulator.encode()?,
+            )?,
+            None => batch.delete(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?,
+        }
+        Ok(())
+    }
+
+    fn prepare_block<T, I>(
+        &mut self,
+        snapshot: &T,
+        base_root: TreeRoot,
+        height: Height,
+        interval_boundary: bool,
+        changed_names: I,
+    ) -> Result<NameTreeAccumulatorPrevious, StateError>
+    where
+        T: ReadSnapshot,
+        I: IntoIterator<Item = NameHash>,
+    {
+        if self.checkpoint.is_none() {
+            return Err(StateError::Codec(
+                "name-tree accumulator block has no active checkpoint".to_owned(),
+            ));
+        }
+        if !self.initialized {
+            self.accumulator = load_name_tree_accumulator(snapshot)?;
+            self.initialized = true;
+        }
+        if self
+            .accumulator
+            .as_ref()
+            .is_some_and(|accumulator| accumulator.base_root != base_root)
+        {
+            return Err(StateError::Codec(
+                "name-tree accumulator base root does not match the committed root".to_owned(),
+            ));
+        }
+
+        let previous = NameTreeAccumulatorPrevious {
+            last_height: self
+                .accumulator
+                .as_ref()
+                .map(|accumulator| accumulator.last_height),
+            boundary_accumulator: interval_boundary
+                .then(|| self.accumulator.clone())
+                .flatten(),
+        };
+        let accumulator = self
+            .accumulator
+            .get_or_insert_with(|| NameTreeAccumulator::new(base_root, height));
+        accumulator.last_height = height;
+        let checkpoint = self
+            .checkpoint
+            .as_mut()
+            .expect("checkpoint presence checked above");
+        for name_hash in changed_names {
+            let previous = accumulator.names.get(&name_hash).copied();
+            checkpoint.previous_counts.push((name_hash, previous));
+            let count = accumulator.names.entry(name_hash).or_default();
+            *count = count.checked_add(1).ok_or_else(|| {
+                StateError::Codec("name-tree accumulator reference count overflowed".to_owned())
+            })?;
+        }
+        Ok(previous)
+    }
+
+    fn finish_block(&mut self, interval_boundary: bool) -> Result<(), StateError> {
+        let checkpoint = self.checkpoint.as_mut().ok_or_else(|| {
+            StateError::Codec("name-tree accumulator block has no active checkpoint".to_owned())
+        })?;
+        if interval_boundary {
+            let accumulator = self.accumulator.take().ok_or_else(|| {
+                StateError::Codec("name-tree interval boundary has no accumulator".to_owned())
+            })?;
+            if checkpoint
+                .boundary_accumulator
+                .replace(accumulator)
+                .is_some()
+            {
+                return Err(StateError::Codec(
+                    "name-tree accumulator checkpoint crossed two boundaries".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn names(&self) -> Result<impl Iterator<Item = NameHash> + '_, StateError> {
+        self.accumulator
+            .as_ref()
+            .map(|accumulator| accumulator.names.keys().copied())
+            .ok_or_else(|| StateError::Codec("name-tree accumulator is unavailable".to_owned()))
     }
 }
 
@@ -1981,6 +2192,39 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     request: ConnectBlock<'_>,
     services: StateServices<'_>,
 ) -> Result<StateSummary, StateError> {
+    let mut accumulator = NameTreeAccumulatorSession::default();
+    accumulator.begin_checkpoint()?;
+    let result = connect_block_to_batch_with_services_and_accumulator(
+        snapshot,
+        batch,
+        request,
+        services,
+        &mut accumulator,
+    );
+    match result {
+        Ok(summary) => {
+            accumulator.commit_checkpoint()?;
+            accumulator.publish(batch)?;
+            Ok(summary)
+        }
+        Err(error) => {
+            accumulator.rollback_checkpoint()?;
+            Err(error)
+        }
+    }
+}
+
+/// Stage one block while retaining the decoded interval accumulator in the
+/// caller's atomic multi-block transaction. The caller brackets every block
+/// with the session checkpoint methods and publishes the final accumulator
+/// exactly once before committing the shared write batch.
+pub fn connect_block_to_batch_with_services_and_accumulator<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    request: ConnectBlock<'_>,
+    services: StateServices<'_>,
+    accumulator_session: &mut NameTreeAccumulatorSession,
+) -> Result<StateSummary, StateError> {
     let route = services.historical_validation;
     let checkpointed = route == HistoricalValidationPlan::hsd_checkpointed();
     if route != HistoricalValidationPlan::full() && !checkpointed {
@@ -2250,52 +2494,33 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
     }
 
     let interval_boundary = request.height.is_multiple_of(tree_interval);
-    let previous_name_tree_accumulator = load_name_tree_accumulator(snapshot)?;
-    let mut accumulator = match &previous_name_tree_accumulator {
-        Some(accumulator) => {
-            if accumulator.base_root != inherited_committed_tree_root {
-                return Err(StateError::Codec(
-                    "name-tree accumulator base root does not match the committed root".to_owned(),
-                ));
-            }
-            let mut accumulator = accumulator.clone();
-            accumulator.last_height = request.height;
-            accumulator
-        }
-        None => NameTreeAccumulator::new(inherited_committed_tree_root, request.height),
-    };
-    for name_hash in name_overrides.keys() {
-        let count = accumulator.names.entry(*name_hash).or_default();
-        *count = count.checked_add(1).ok_or_else(|| {
-            StateError::Codec("name-tree accumulator reference count overflowed".to_owned())
-        })?;
-    }
+    let previous_name_tree_accumulator = accumulator_session.prepare_block(
+        snapshot,
+        inherited_committed_tree_root,
+        request.height,
+        interval_boundary,
+        name_overrides.keys().copied(),
+    )?;
 
     let resulting_tree_root = if interval_boundary {
         let mut interval_overrides = BTreeMap::<NameHash, Option<NameState>>::new();
-        for name_hash in accumulator.names.keys() {
-            let state = match name_state_changes.current.get(name_hash) {
+        for name_hash in accumulator_session.names()? {
+            let state = match name_state_changes.current.get(&name_hash) {
                 Some(state) => (!state.is_null()).then_some(state.clone()),
-                None => load_name_state(snapshot, name_hash)?.filter(|state| !state.is_null()),
+                None => load_name_state(snapshot, &name_hash)?.filter(|state| !state.is_null()),
             };
-            interval_overrides.insert(*name_hash, state);
+            interval_overrides.insert(name_hash, state);
         }
-        let root = stage_name_tree_with_overrides(
+        stage_name_tree_with_overrides(
             snapshot,
             batch,
             inherited_committed_tree_root,
             &interval_overrides,
-        )?;
-        batch.delete(ColumnFamily::Snapshots, NAME_TREE_ACCUMULATOR_KEY)?;
-        root
+        )?
     } else {
-        batch.put(
-            ColumnFamily::Snapshots,
-            NAME_TREE_ACCUMULATOR_KEY,
-            &accumulator.encode()?,
-        )?;
         inherited_committed_tree_root
     };
+    accumulator_session.finish_block(interval_boundary)?;
     let resulting_committed_tree_root = resulting_tree_root;
     batch.put(
         ColumnFamily::Meta,
@@ -2339,12 +2564,8 @@ pub fn connect_block_to_batch_with_services<T: ReadSnapshot, B: WriteBatch>(
         airdrop_positions: issuance.airdrop_positions.clone(),
         previous_name_states,
         name_tree_interval_boundary: interval_boundary,
-        previous_name_tree_accumulator_last_height: previous_name_tree_accumulator
-            .as_ref()
-            .map(|accumulator| accumulator.last_height),
-        previous_name_tree_accumulator: interval_boundary
-            .then_some(previous_name_tree_accumulator)
-            .flatten(),
+        previous_name_tree_accumulator_last_height: previous_name_tree_accumulator.last_height,
+        previous_name_tree_accumulator: previous_name_tree_accumulator.boundary_accumulator,
     };
     batch.put(
         ColumnFamily::Undo,
@@ -10655,6 +10876,59 @@ mod tests {
     }
 
     #[test]
+    fn accumulator_session_rolls_back_an_interval_boundary() {
+        let store = MemoryStore::new();
+        hns_store::initialize_schema(&store).expect("schema");
+        let snapshot = store.snapshot().expect("snapshot");
+        let alpha = hash_name("sessionalpha").expect("alpha hash");
+        let beta = hash_name("sessionbeta").expect("beta hash");
+        let gamma = hash_name("sessiongamma").expect("gamma hash");
+        let mut session = NameTreeAccumulatorSession::default();
+
+        session.begin_checkpoint().expect("first checkpoint");
+        let previous = session
+            .prepare_block(&snapshot, TreeRoot::ZERO, 117, false, [alpha, beta])
+            .expect("prepare first block");
+        assert_eq!(previous.last_height, None);
+        assert_eq!(previous.boundary_accumulator, None);
+        session.finish_block(false).expect("finish first block");
+        session
+            .commit_checkpoint()
+            .expect("commit first checkpoint");
+
+        session.begin_checkpoint().expect("boundary checkpoint");
+        let previous = session
+            .prepare_block(&snapshot, TreeRoot::ZERO, 120, true, [alpha, gamma])
+            .expect("prepare boundary block");
+        assert_eq!(previous.last_height, Some(117));
+        assert_eq!(
+            previous
+                .boundary_accumulator
+                .as_ref()
+                .and_then(|accumulator| accumulator.names.get(&alpha)),
+            Some(&1)
+        );
+        session.finish_block(true).expect("finish boundary block");
+        assert!(session.names().is_err());
+        session
+            .rollback_checkpoint()
+            .expect("roll back boundary checkpoint");
+
+        let mut batch = store.batch();
+        session.publish(&mut batch).expect("publish accumulator");
+        drop(snapshot);
+        store.commit(batch).expect("commit accumulator");
+        let snapshot = store.snapshot().expect("published snapshot");
+        let accumulator = load_name_tree_accumulator(&snapshot)
+            .expect("load accumulator")
+            .expect("stored accumulator");
+        assert_eq!(accumulator.base_root, TreeRoot::ZERO);
+        assert_eq!(accumulator.first_height, 117);
+        assert_eq!(accumulator.last_height, 117);
+        assert_eq!(accumulator.names, BTreeMap::from([(alpha, 1), (beta, 1)]));
+    }
+
+    #[test]
     fn multi_step_overlay_reads_incremental_nodes_and_retains_historical_roots() {
         let store = MemoryStore::new();
         hns_store::initialize_schema(&store).expect("schema");
@@ -10676,7 +10950,9 @@ mod tests {
         let overlay = StagingOverlay::new();
         let staged = overlay.snapshot(&base);
         let mut batch = overlay.batch(store.batch());
-        let first_summary = connect_block_to_batch_with_services(
+        let mut accumulator = NameTreeAccumulatorSession::default();
+        accumulator.begin_checkpoint().expect("first checkpoint");
+        let first_summary = connect_block_to_batch_with_services_and_accumulator(
             &staged,
             &mut batch,
             ConnectBlock {
@@ -10687,13 +10963,18 @@ mod tests {
                 block: &first,
             },
             services,
+            &mut accumulator,
         )
         .expect("stage first block");
+        accumulator
+            .commit_checkpoint()
+            .expect("commit first checkpoint");
 
         let mut second = block(120, vec![coinbase(vec![open_output(b"overlaybeta")])]);
         second.header.tree_root = *first_summary.resulting_tree_root.as_bytes();
         let second_hash = second.hash();
-        let second_summary = connect_block_to_batch_with_services(
+        accumulator.begin_checkpoint().expect("second checkpoint");
+        let second_summary = connect_block_to_batch_with_services_and_accumulator(
             &staged,
             &mut batch,
             ConnectBlock {
@@ -10704,8 +10985,15 @@ mod tests {
                 block: &second,
             },
             services,
+            &mut accumulator,
         )
         .expect("stage second block from overlay nodes");
+        accumulator
+            .commit_checkpoint()
+            .expect("commit second checkpoint");
+        accumulator
+            .publish(&mut batch)
+            .expect("publish accumulator");
         assert_ne!(
             second_summary.resulting_tree_root,
             first_summary.resulting_tree_root
