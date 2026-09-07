@@ -12510,9 +12510,9 @@ impl NodeState {
         let overlay = StagingOverlay::new();
         let staged = overlay.snapshot(&base);
         let staged_batch = if self.name_pages.is_some() {
-            overlay.batch_with_deferred_name_tree_nodes(store.batch())
+            overlay.batch_with_deferred_writes_and_name_tree_nodes(store.batch())
         } else {
-            overlay.batch(store.batch())
+            overlay.batch_with_deferred_writes(store.batch())
         };
         let mut batch = ReorgMeteredBatch::new(
             staged_batch,
@@ -12813,8 +12813,13 @@ impl NodeState {
             None => (None, hns_state::NamePagePathReadStats::default()),
         };
         let (batch, meter, operation_charges) = batch.into_parts();
+        let materialized = batch
+            .into_materialized_inner()
+            .map_err(anyhow::Error::new)
+            .context("failed to materialize deferred active-state writes")
+            .map_err(ChainActivationFailure::Internal)?;
         let mut batch = ReorgMeteredBatch::with_operation_charges(
-            batch.into_inner(),
+            materialized,
             meter,
             REORG_PUBLICATION_OPERATION_COPIES,
             operation_charges,

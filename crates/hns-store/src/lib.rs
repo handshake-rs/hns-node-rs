@@ -837,6 +837,7 @@ impl StagingOverlay {
             inner,
             changes: Rc::clone(&self.changes),
             defer_name_tree_nodes: false,
+            defer_all_writes: false,
             checkpoint: None,
         }
     }
@@ -850,6 +851,39 @@ impl StagingOverlay {
             inner,
             changes: Rc::clone(&self.changes),
             defer_name_tree_nodes: true,
+            defer_all_writes: false,
+            checkpoint: None,
+        }
+    }
+
+    /// Retain every final point mutation only in the read-your-writes overlay
+    /// while the atomic state transition is being constructed.
+    ///
+    /// Large replay slices otherwise keep the complete value set twice: once
+    /// in this overlay and once in the backend write batch. After all staged
+    /// reads finish, callers use [`StagedBatch::into_materialized_inner`] to
+    /// transfer final values into the backend batch one at a time.
+    pub fn batch_with_deferred_writes<B: WriteBatch>(&self, inner: B) -> StagedBatch<B> {
+        StagedBatch {
+            inner,
+            changes: Rc::clone(&self.changes),
+            defer_name_tree_nodes: false,
+            defer_all_writes: true,
+            checkpoint: None,
+        }
+    }
+
+    /// Fully defer ordinary writes and route immutable name nodes to the page
+    /// store instead of materializing them into the backend batch.
+    pub fn batch_with_deferred_writes_and_name_tree_nodes<B: WriteBatch>(
+        &self,
+        inner: B,
+    ) -> StagedBatch<B> {
+        StagedBatch {
+            inner,
+            changes: Rc::clone(&self.changes),
+            defer_name_tree_nodes: true,
+            defer_all_writes: true,
             checkpoint: None,
         }
     }
@@ -1177,18 +1211,74 @@ pub struct StagedBatch<B: WriteBatch> {
     inner: B,
     changes: SharedStagedChanges,
     defer_name_tree_nodes: bool,
+    defer_all_writes: bool,
     checkpoint: Option<StagedCheckpoint>,
 }
 
 impl<B: WriteBatch> StagedBatch<B> {
     pub fn into_inner(self) -> B {
+        assert!(
+            !self.defer_all_writes,
+            "fully deferred staged writes must be materialized before commit"
+        );
         self.inner
+    }
+
+    /// Drain a fully deferred overlay into its backend batch without retaining
+    /// a second complete key/value copy for the lifetime of state staging.
+    ///
+    /// Immutable name nodes must first be removed with
+    /// [`StagingOverlay::take_staged_family`], because their durable target is
+    /// the page store rather than this backend batch. Any transfer failure
+    /// leaves an uncommitted backend batch which the caller must discard.
+    pub fn into_materialized_inner(mut self) -> Result<B, StoreError> {
+        if !self.defer_all_writes {
+            return Err(StoreError::Backend(
+                "staged batch does not contain fully deferred writes".to_owned(),
+            ));
+        }
+        if self.checkpoint.is_some() {
+            return Err(StoreError::Backend(
+                "cannot materialize a staged batch with an active checkpoint".to_owned(),
+            ));
+        }
+        if Rc::strong_count(&self.changes) > 2 {
+            return Err(StoreError::Backend(
+                "cannot materialize deferred writes while staged readers or cloned overlays remain"
+                    .to_owned(),
+            ));
+        }
+        let changes = {
+            let mut changes = self.changes.borrow_mut();
+            if self.defer_name_tree_nodes
+                && changes
+                    .get(&ColumnFamily::NameTreeNodes)
+                    .is_some_and(|nodes| !nodes.is_empty())
+            {
+                return Err(StoreError::Backend(
+                    "cannot materialize deferred immutable name nodes into the backend batch"
+                        .to_owned(),
+                ));
+            }
+            std::mem::take(&mut *changes)
+        };
+        for (family, operations) in changes {
+            for (key, value) in operations {
+                match value {
+                    Some(value) => self.inner.put(family, &key, &value)?,
+                    None => self.inner.delete(family, &key)?,
+                }
+            }
+        }
+        Ok(self.inner)
     }
 }
 
 impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
     fn put(&mut self, family: ColumnFamily, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
-        if !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes) {
+        if !self.defer_all_writes
+            && !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes)
+        {
             self.inner.put(family, key, value)?;
         }
         let key = key.to_vec();
@@ -1205,7 +1295,9 @@ impl<B: WriteBatch> WriteBatch for StagedBatch<B> {
     }
 
     fn delete(&mut self, family: ColumnFamily, key: &[u8]) -> Result<(), StoreError> {
-        if !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes) {
+        if !self.defer_all_writes
+            && !(self.defer_name_tree_nodes && family == ColumnFamily::NameTreeNodes)
+        {
             self.inner.delete(family, key)?;
         }
         let key = key.to_vec();
@@ -5695,6 +5787,157 @@ mod tests {
         assert_eq!(
             snapshot.get(ColumnFamily::Meta, b"root").expect("root"),
             Some(b"bound".to_vec())
+        );
+    }
+
+    #[test]
+    fn fully_deferred_batch_materializes_only_final_operations() {
+        let store = MemoryStore::new();
+        let mut initial = store.batch();
+        initial
+            .put(ColumnFamily::Headers, b"removed", b"old")
+            .expect("initial removed value");
+        store.commit(initial).expect("commit initial state");
+
+        let base = store.snapshot().expect("deferred base");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&base);
+        let mut batch = overlay.batch_with_deferred_writes(store.batch());
+        batch
+            .put(ColumnFamily::Meta, b"shared", b"first")
+            .expect("first deferred value");
+        batch.begin_checkpoint().expect("begin deferred checkpoint");
+        batch
+            .put(ColumnFamily::Meta, b"shared", b"discarded")
+            .expect("checkpoint replacement");
+        batch
+            .put(ColumnFamily::Meta, b"transient", b"discarded")
+            .expect("checkpoint insertion");
+        batch
+            .rollback_checkpoint()
+            .expect("rollback deferred checkpoint");
+        batch
+            .put(ColumnFamily::Meta, b"shared", b"final")
+            .expect("final deferred value");
+        batch
+            .delete(ColumnFamily::Headers, b"removed")
+            .expect("deferred deletion");
+
+        assert!(
+            batch.inner.operations.is_empty(),
+            "fully deferred staging must not retain an eager backend copy"
+        );
+        assert_eq!(
+            staged
+                .get(ColumnFamily::Meta, b"shared")
+                .expect("staged final value"),
+            Some(b"final".to_vec())
+        );
+        assert_eq!(
+            staged
+                .get(ColumnFamily::Meta, b"transient")
+                .expect("rolled-back staged value"),
+            None
+        );
+        drop(staged);
+        drop(base);
+
+        let inner = batch
+            .into_materialized_inner()
+            .expect("materialize deferred operations");
+        assert_eq!(inner.operations.len(), 2);
+        assert!(overlay.changes.borrow().is_empty());
+        drop(overlay);
+        store.commit(inner).expect("commit materialized operations");
+        let committed = store.snapshot().expect("materialized snapshot");
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Meta, b"shared")
+                .expect("committed final value"),
+            Some(b"final".to_vec())
+        );
+        assert_eq!(
+            committed
+                .get(ColumnFamily::Headers, b"removed")
+                .expect("committed deletion"),
+            None
+        );
+    }
+
+    #[test]
+    fn fully_deferred_page_batch_routes_name_nodes_out_of_backend() {
+        let store = MemoryStore::new();
+        let base = store.snapshot().expect("page-deferred base");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&base);
+        let mut batch = overlay.batch_with_deferred_writes_and_name_tree_nodes(store.batch());
+        batch
+            .put(ColumnFamily::NameTreeNodes, b"node", b"canonical")
+            .expect("deferred name node");
+        batch
+            .put(ColumnFamily::Meta, b"root", b"bound")
+            .expect("deferred root");
+        assert!(batch.inner.operations.is_empty());
+        assert_eq!(
+            staged
+                .get(ColumnFamily::NameTreeNodes, b"node")
+                .expect("staged name node"),
+            Some(b"canonical".to_vec())
+        );
+        drop(staged);
+        drop(base);
+
+        assert_eq!(
+            overlay.take_staged_family(ColumnFamily::NameTreeNodes),
+            BTreeMap::from([(b"node".to_vec(), Some(b"canonical".to_vec()))])
+        );
+        let inner = batch
+            .into_materialized_inner()
+            .expect("materialize page-backed operations");
+        assert_eq!(inner.operations.len(), 1);
+        drop(overlay);
+        store.commit(inner).expect("commit page-backed operations");
+        let committed = store.snapshot().expect("page-backed snapshot");
+        assert_eq!(
+            committed
+                .get(ColumnFamily::NameTreeNodes, b"node")
+                .expect("uncommitted name node"),
+            None
+        );
+        assert_eq!(
+            committed.get(ColumnFamily::Meta, b"root").expect("root"),
+            Some(b"bound".to_vec())
+        );
+    }
+
+    #[test]
+    fn fully_deferred_materialization_rejects_live_staged_reader() {
+        let store = MemoryStore::new();
+        let base = store.snapshot().expect("reader-bound base");
+        let overlay = StagingOverlay::new();
+        let staged = overlay.snapshot(&base);
+        let mut batch = overlay.batch_with_deferred_writes(store.batch());
+        batch
+            .put(ColumnFamily::Meta, b"uncommitted", b"value")
+            .expect("deferred value");
+
+        let error = batch
+            .into_materialized_inner()
+            .expect_err("live staged reader must prevent ownership transfer");
+        assert!(format!("{error}").contains("staged readers"));
+        assert_eq!(
+            staged
+                .get(ColumnFamily::Meta, b"uncommitted")
+                .expect("reader retains staged value"),
+            Some(b"value".to_vec())
+        );
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("unchanged store")
+                .get(ColumnFamily::Meta, b"uncommitted")
+                .expect("uncommitted durable value"),
+            None
         );
     }
 
