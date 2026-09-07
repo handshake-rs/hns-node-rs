@@ -12,7 +12,7 @@
     reason = "the public index boundary uses explicit domain names"
 )]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use hns_primitives::{
     blake2b_256, Address, Block, BlockHash, Coin, Height, Outpoint, Transaction, Txid, Writer,
@@ -486,6 +486,7 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
     }
     let block_hash = block.hash();
     let created = block_created_coins(block, height)?;
+    let existing = prefetch_external_input_coins(snapshot, block, &created)?;
     let mut history = BTreeMap::<(ScriptId, Txid), ScriptHistoryEntry>::new();
 
     for (transaction_position, transaction) in block.transactions.iter().enumerate() {
@@ -512,7 +513,10 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
                 u32::try_from(input_position).map_err(|_| IndexError::PositionOverflow)?;
             let coin = match created.get(&input.previous_output) {
                 Some(coin) => coin.clone(),
-                None => load_coin(snapshot, &input.previous_output)?
+                None => existing
+                    .get(&input.previous_output)
+                    .cloned()
+                    .flatten()
                     .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?,
             };
             if profile.histories() {
@@ -563,9 +567,9 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
         }
     }
     if profile.wallet {
-        incoming_transfer::stage_connect(snapshot, batch, block, height)?;
+        incoming_transfer::stage_connect_prefetched(snapshot, batch, block, height, &existing)?;
     }
-    swap::stage_connect(snapshot, batch, block, height, profile)?;
+    swap::stage_connect_prefetched(snapshot, batch, block, height, profile, &existing)?;
     Ok(())
 }
 
@@ -930,16 +934,53 @@ fn block_created_coins(
     Ok(coins)
 }
 
-fn load_coin<S: ReadSnapshot>(
+fn prefetch_external_input_coins<S: ReadSnapshot>(
     snapshot: &S,
-    outpoint: &Outpoint,
-) -> Result<Option<Coin>, IndexError> {
-    snapshot
-        .get(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))?
-        .as_deref()
-        .map(decode_coin)
-        .transpose()
-        .map_err(IndexError::from)
+    block: &Block,
+    created: &HashMap<Outpoint, Coin>,
+) -> Result<HashMap<Outpoint, Option<Coin>>, IndexError> {
+    let mut unique = HashSet::new();
+    let mut outpoints = Vec::new();
+    for transaction in &block.transactions {
+        for input in &transaction.inputs {
+            if input.previous_output.is_null()
+                || created.contains_key(&input.previous_output)
+                || !unique.insert(input.previous_output.clone())
+            {
+                continue;
+            }
+            outpoints.push(input.previous_output.clone());
+        }
+    }
+    if outpoints.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let keys = outpoints
+        .iter()
+        .map(encode_outpoint_key)
+        .collect::<Vec<_>>();
+    let key_refs = keys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let values = snapshot.get_many(ColumnFamily::Utxo, &key_refs)?;
+    if values.len() != outpoints.len() {
+        return Err(IndexError::Corrupt(
+            "wallet index UTXO multi-get length mismatch",
+        ));
+    }
+
+    outpoints
+        .into_iter()
+        .zip(values)
+        .map(|(outpoint, raw)| {
+            let coin = raw.as_deref().map(decode_coin).transpose()?;
+            if coin.as_ref().is_some_and(|coin| coin.outpoint != outpoint) {
+                return Err(IndexError::Corrupt(
+                    "wallet index coin payload does not match UTXO key",
+                ));
+            }
+            Ok((outpoint, coin))
+        })
+        .collect()
 }
 
 fn history_prefix(script: ScriptId) -> Vec<u8> {
@@ -1041,9 +1082,45 @@ fn array_at<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
     use hns_primitives::{Covenant, CovenantKind, Input, Output, Witness};
     use hns_state::{write_coin_to_batch, TreeRoot};
-    use hns_store::{MemoryStore, Store};
+    use hns_store::{MemorySnapshot, MemoryStore, Store};
+
+    struct UtxoReadCountingSnapshot {
+        inner: MemorySnapshot,
+        point_gets: Cell<usize>,
+        multi_gets: Cell<usize>,
+    }
+
+    impl ReadSnapshot for UtxoReadCountingSnapshot {
+        fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+            if family == ColumnFamily::Utxo {
+                self.point_gets.set(self.point_gets.get() + 1);
+            }
+            self.inner.get(family, key)
+        }
+
+        fn get_many(
+            &self,
+            family: ColumnFamily,
+            keys: &[&[u8]],
+        ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
+            if family == ColumnFamily::Utxo {
+                self.multi_gets.set(self.multi_gets.get() + 1);
+            }
+            self.inner.get_many(family, keys)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+            self.inner.scan_prefix(family, prefix)
+        }
+    }
 
     fn address(byte: u8) -> Address {
         Address::new(0, vec![byte; 20]).unwrap()
@@ -1282,6 +1359,75 @@ mod tests {
                 .txid,
             transaction.txid()
         );
+    }
+
+    #[test]
+    fn connect_prefetches_external_input_coins_in_one_storage_read() {
+        let store = MemoryStore::new();
+        let previous = [
+            Outpoint {
+                txid: Txid::new([31; 32]),
+                index: 0,
+            },
+            Outpoint {
+                txid: Txid::new([32; 32]),
+                index: 1,
+            },
+        ];
+        let mut seed = store.batch();
+        for (offset, outpoint) in previous.iter().enumerate() {
+            write_coin_to_batch(
+                &mut seed,
+                &Coin {
+                    outpoint: outpoint.clone(),
+                    value: 20 + offset as u64,
+                    height: 2,
+                    coinbase: false,
+                    address: address(30 + offset as u8),
+                    covenant: Covenant {
+                        kind: CovenantKind::None,
+                        items: Vec::new(),
+                    },
+                },
+            )
+            .expect("seed input coin");
+        }
+        store.commit(seed).expect("commit input coins");
+
+        let block = block(vec![Transaction {
+            version: 0,
+            inputs: previous
+                .iter()
+                .cloned()
+                .map(|previous_output| Input {
+                    previous_output,
+                    sequence: u32::MAX,
+                    witness: Witness::default(),
+                })
+                .collect(),
+            outputs: vec![output(40, 39)],
+            locktime: 0,
+        }]);
+        let snapshot = UtxoReadCountingSnapshot {
+            inner: store.snapshot().expect("snapshot"),
+            point_gets: Cell::new(0),
+            multi_gets: Cell::new(0),
+        };
+        let mut batch = store.batch();
+        stage_connect(
+            &snapshot,
+            &mut batch,
+            &block,
+            9,
+            WalletIndexProfile {
+                wallet: true,
+                ..WalletIndexProfile::default()
+            },
+        )
+        .expect("stage wallet indexes");
+
+        assert_eq!(snapshot.multi_gets.get(), 1);
+        assert_eq!(snapshot.point_gets.get(), 0);
     }
 
     #[test]

@@ -774,11 +774,12 @@ pub fn incoming_transfers<S: ReadSnapshot>(
 }
 
 /// Stage the incoming-TRANSFER derivative index for one block connection.
-pub(super) fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
+pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
     snapshot: &S,
     batch: &mut B,
     block: &Block,
     height: Height,
+    existing_coins: &std::collections::HashMap<Outpoint, Option<Coin>>,
 ) -> Result<(), IndexError> {
     let block_hash = block.hash();
     if snapshot
@@ -801,7 +802,10 @@ pub(super) fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
             {
                 continue;
             }
-            let coin = load_coin(snapshot, &input.previous_output)?
+            let coin = existing_coins
+                .get(&input.previous_output)
+                .cloned()
+                .flatten()
                 .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?;
             let Some(transfer) = decode_transfer(&coin.covenant)? else {
                 continue;
@@ -927,6 +931,18 @@ pub(super) fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
         &undo.encode()?,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
+    snapshot: &S,
+    batch: &mut B,
+    block: &Block,
+    height: Height,
+) -> Result<(), IndexError> {
+    let created = crate::block_created_coins(block, height)?;
+    let existing = crate::prefetch_external_input_coins(snapshot, block, &created)?;
+    stage_connect_prefetched(snapshot, batch, block, height, &existing)
 }
 
 /// Stage exact incoming-TRANSFER reversal for an active-tip disconnect.
@@ -1340,6 +1356,7 @@ fn decode_transfer(covenant: &Covenant) -> Result<Option<TransferFields>, IndexE
     }))
 }
 
+#[cfg(test)]
 fn load_coin<S: ReadSnapshot>(
     snapshot: &S,
     outpoint: &Outpoint,

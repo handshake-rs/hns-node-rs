@@ -12,7 +12,7 @@ use hns_primitives::{
     Transaction, Txid, Writer,
 };
 use hns_secp256k1::Secp256k1Verifier;
-use hns_state::{decode_coin, encode_outpoint_key, BlockUndo};
+use hns_state::BlockUndo;
 use hns_store::{ColumnFamily, PrefixScanBudget, ReadSnapshot, WriteBatch};
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -1519,12 +1519,13 @@ pub fn tracked_contract_events<S: ReadSnapshot>(
     })
 }
 
-pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
+pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
     snapshot: &S,
     batch: &mut B,
     block: &Block,
     height: Height,
     profile: WalletIndexProfile,
+    existing_coins: &HashMap<Outpoint, Option<Coin>>,
 ) -> Result<(), IndexError> {
     if !profile.wallet {
         return Ok(());
@@ -1581,7 +1582,10 @@ pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
             }
             let coin = match created.get(&input.previous_output) {
                 Some(coin) => coin.clone(),
-                None => load_coin(snapshot, &input.previous_output)?
+                None => existing_coins
+                    .get(&input.previous_output)
+                    .cloned()
+                    .flatten()
                     .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?,
             };
             let Some(registration) = matching_contract_for_output(
@@ -1633,6 +1637,19 @@ pub(crate) fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
+    snapshot: &S,
+    batch: &mut B,
+    block: &Block,
+    height: Height,
+    profile: WalletIndexProfile,
+) -> Result<(), IndexError> {
+    let created = crate::block_created_coins(block, height)?;
+    let existing = crate::prefetch_external_input_coins(snapshot, block, &created)?;
+    stage_connect_prefetched(snapshot, batch, block, height, profile, &existing)
 }
 
 pub(crate) fn stage_disconnect<S: ReadSnapshot, B: WriteBatch>(
@@ -2541,18 +2558,6 @@ fn block_created_coins(
         }
     }
     Ok(coins)
-}
-
-fn load_coin<S: ReadSnapshot>(
-    snapshot: &S,
-    outpoint: &Outpoint,
-) -> Result<Option<Coin>, IndexError> {
-    snapshot
-        .get(ColumnFamily::Utxo, &encode_outpoint_key(outpoint))?
-        .as_deref()
-        .map(decode_coin)
-        .transpose()
-        .map_err(IndexError::from)
 }
 
 fn registration_key(id: ContractId) -> Vec<u8> {
