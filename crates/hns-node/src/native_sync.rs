@@ -1552,40 +1552,6 @@ fn active_state_contention_retry_interval(consecutive: usize) -> Duration {
     native_sync_contention_retry_interval(MIN_NATIVE_SYNC_POLL_INTERVAL, consecutive)
 }
 
-async fn native_sync_stable_read_with_retry<T, F>(
-    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
-    base_delay: Duration,
-    maximum_attempts: usize,
-    mut read: F,
-) -> Result<T>
-where
-    F: FnMut() -> Result<T>,
-{
-    debug_assert!(maximum_attempts != 0);
-    for attempt in 0..maximum_attempts {
-        match read() {
-            Ok(value) => return Ok(value),
-            Err(error) if canonical_writer_busy(&error) => {
-                update_diagnostics(diagnostics, |state| {
-                    state.canonical_read_contentions =
-                        state.canonical_read_contentions.saturating_add(1);
-                })
-                .await;
-                if attempt + 1 == maximum_attempts {
-                    return Err(error);
-                }
-                tokio::time::sleep(native_sync_contention_retry_interval(
-                    base_delay,
-                    attempt + 1,
-                ))
-                .await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("non-zero stable-read attempt bound always returns")
-}
-
 fn trace_recovered_canonical_contention(
     operation: &'static str,
     total: u64,
@@ -4385,11 +4351,12 @@ impl NodeService {
 
 impl NodeReadHandle {
     fn native_sync_best_header_tip(&self) -> Result<Option<ChainTip>> {
-        self.with_stable_read(|_store, headers| {
+        let (_, tip) = self.with_stable_chain_read(|_snapshot, headers| {
             headers
                 .best_tip()
                 .map_err(|error| anyhow::anyhow!("failed to read best native-sync header: {error}"))
-        })
+        })?;
+        Ok(tip)
     }
 
     fn native_sync_header_deployments(
@@ -4562,17 +4529,17 @@ impl NodeReadHandle {
     }
 
     fn native_sync_active_tip(&self) -> Result<Option<ChainTip>> {
-        self.with_stable_read(|store, _headers| {
-            let snapshot = store.snapshot()?;
-            best_block_tip_from_snapshot(&snapshot).context("failed to read active native-sync tip")
-        })
+        let (_, tip) = self.with_stable_chain_read(|snapshot, _headers| {
+            best_block_tip_from_snapshot(snapshot).context("failed to read active native-sync tip")
+        })?;
+        Ok(tip)
     }
 
     fn native_sync_has_block(&self, hash: &BlockHash) -> Result<bool> {
-        self.with_stable_read(|store, _headers| {
-            let snapshot = store.snapshot()?;
-            Self::native_sync_has_block_from_snapshot(&snapshot, hash)
-        })
+        let (_, has_block) = self.with_stable_chain_read(|snapshot, _headers| {
+            Self::native_sync_has_block_from_snapshot(snapshot, hash)
+        })?;
+        Ok(has_block)
     }
 
     fn native_sync_has_block_from_snapshot(
@@ -4616,10 +4583,10 @@ impl NodeReadHandle {
     }
 
     fn native_sync_header_record(&self, hash: &BlockHash) -> Result<Option<HeaderRecord>> {
-        self.with_stable_read(|store, _headers| {
-            let snapshot = store.snapshot()?;
-            Self::native_sync_header_record_from_snapshot(&snapshot, hash)
-        })
+        let (_, record) = self.with_stable_chain_read(|snapshot, _headers| {
+            Self::native_sync_header_record_from_snapshot(snapshot, hash)
+        })?;
+        Ok(record)
     }
 
     fn native_sync_header_record_from_snapshot(
@@ -4634,15 +4601,14 @@ impl NodeReadHandle {
         validated: &[ValidatedBlock],
     ) -> Result<Vec<(bool, bool)>> {
         let genesis = self.network().params().genesis_header();
-        self.with_stable_read(|store, headers| {
-            let snapshot = store.snapshot()?;
+        let (_, classifications) = self.with_stable_chain_read(|snapshot, headers| {
             validated
                 .iter()
                 .map(|validated| {
                     let hash = validated.block.hash();
                     let parent_available = validated.block.header == genesis
                         || Self::native_sync_has_block_from_snapshot(
-                            &snapshot,
+                            snapshot,
                             &validated.block.header.prev_block,
                         )?;
                     let canonical = headers
@@ -4652,7 +4618,8 @@ impl NodeReadHandle {
                     Ok((parent_available, canonical))
                 })
                 .collect()
-        })
+        })?;
+        Ok(classifications)
     }
 
     fn native_sync_canonical_body_is_in_horizon(
@@ -4663,7 +4630,7 @@ impl NodeReadHandle {
     ) -> Result<bool> {
         let horizon = Height::try_from(self.config().native_sync.orphan_blocks)
             .context("orphan block horizon exceeds the canonical height range")?;
-        self.with_stable_read(|store, headers| {
+        let (_, in_horizon) = self.with_stable_chain_read(|snapshot, headers| {
             if headers
                 .canonical_hash(height)
                 .context("failed to read canonical native-sync header")?
@@ -4671,9 +4638,8 @@ impl NodeReadHandle {
             {
                 return Ok(true);
             }
-            let snapshot = store.snapshot()?;
             let contiguous = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
-                &snapshot,
+                snapshot,
                 headers,
                 stored_tip_hint,
             )?;
@@ -4681,14 +4647,15 @@ impl NodeReadHandle {
                 .as_ref()
                 .map_or(0, |tip| tip.height.saturating_add(1));
             Ok(horizon != 0 && height >= start && height < start.saturating_add(horizon))
-        })
+        })?;
+        Ok(in_horizon)
     }
 
     fn native_sync_block(&self, hash: &BlockHash) -> Result<Option<Block>> {
-        self.with_stable_read(|store, _headers| {
-            let snapshot = store.snapshot()?;
-            load_block_from_snapshot(&snapshot, hash).context("failed to load native-sync block")
-        })
+        let (_, block) = self.with_stable_chain_read(|snapshot, _headers| {
+            load_block_from_snapshot(snapshot, hash).context("failed to load native-sync block")
+        })?;
+        Ok(block)
     }
 }
 
@@ -5286,10 +5253,10 @@ impl NodeReadHandle {
     }
 
     fn native_sync_contiguous_body_tip(&self, hint: Option<&ChainTip>) -> Result<Option<ChainTip>> {
-        self.with_stable_read(|store, headers| {
-            let snapshot = store.snapshot()?;
-            Self::native_sync_contiguous_body_tip_from_snapshot(&snapshot, headers, hint)
-        })
+        let (_, tip) = self.with_stable_chain_read(|snapshot, headers| {
+            Self::native_sync_contiguous_body_tip_from_snapshot(snapshot, headers, hint)
+        })?;
+        Ok(tip)
     }
 
     /// Advance an in-process scheduler tip without resolving its payload a
@@ -5303,12 +5270,10 @@ impl NodeReadHandle {
         &self,
         hint: Option<&ChainTip>,
     ) -> Result<Option<ChainTip>> {
-        self.with_stable_read(|store, headers| {
-            let snapshot = store.snapshot()?;
-            Self::native_sync_contiguous_body_tip_from_snapshot_impl(
-                &snapshot, headers, hint, false,
-            )
-        })
+        let (_, tip) = self.with_stable_chain_read(|snapshot, headers| {
+            Self::native_sync_contiguous_body_tip_from_snapshot_impl(snapshot, headers, hint, false)
+        })?;
+        Ok(tip)
     }
 
     fn native_sync_contiguous_body_tip_from_snapshot(
@@ -5396,10 +5361,9 @@ impl NodeReadHandle {
         if body_window == 0 {
             anyhow::bail!("orphan block horizon is zero");
         }
-        let (contiguous, candidates) = self.with_stable_read(|store, headers| {
-            let snapshot = store.snapshot()?;
+        let (_, (contiguous, candidates)) = self.with_stable_chain_read(|snapshot, headers| {
             let contiguous = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
-                &snapshot,
+                snapshot,
                 headers,
                 hint.as_ref(),
             )?;
@@ -5426,7 +5390,7 @@ impl NodeReadHandle {
                 else {
                     break;
                 };
-                if !Self::native_sync_has_block_from_snapshot(&snapshot, &hash)? {
+                if !Self::native_sync_has_block_from_snapshot(snapshot, &hash)? {
                     candidates.push((hash, height));
                 }
             }
@@ -5463,7 +5427,7 @@ impl NodeReadHandle {
             return Ok(Vec::new());
         }
         let config = self.config();
-        self.with_stable_read(|_store, headers| {
+        let (_, locator) = self.with_stable_chain_read(|_snapshot, headers| {
             let Some(tip) = headers
                 .best_tip()
                 .map_err(|error| anyhow::anyhow!("failed to read locator header tip: {error}"))?
@@ -5494,7 +5458,8 @@ impl NodeReadHandle {
             }
             locator.truncate(maximum);
             Ok(locator)
-        })
+        })?;
+        Ok(locator)
     }
 
     fn native_sync_headers_after_locator(
@@ -5504,8 +5469,7 @@ impl NodeReadHandle {
         maximum: usize,
     ) -> Result<Vec<Header>> {
         let maximum = maximum.min(MAX_SERVED_HEADERS);
-        self.with_stable_read(|store, headers| {
-            let snapshot = store.snapshot()?;
+        let (_, served) = self.with_stable_chain_read(|snapshot, headers| {
             let Some(best) = headers
                 .best_tip()
                 .map_err(|error| anyhow::anyhow!("failed to read served-header tip: {error}"))?
@@ -5515,8 +5479,7 @@ impl NodeReadHandle {
 
             let mut start_height = 0;
             'locator: for hash in locator {
-                if let Some(record) =
-                    Self::native_sync_header_record_from_snapshot(&snapshot, hash)?
+                if let Some(record) = Self::native_sync_header_record_from_snapshot(snapshot, hash)?
                 {
                     if headers
                         .canonical_hash(record.height)
@@ -5540,7 +5503,7 @@ impl NodeReadHandle {
                 else {
                     break;
                 };
-                let record = Self::native_sync_header_record_from_snapshot(&snapshot, &hash)?
+                let record = Self::native_sync_header_record_from_snapshot(snapshot, &hash)?
                     .ok_or_else(|| {
                         anyhow::anyhow!("canonical header {} is missing", hash.to_hex())
                     })?;
@@ -5550,7 +5513,8 @@ impl NodeReadHandle {
                 }
             }
             Ok(served)
-        })
+        })?;
+        Ok(served)
     }
 
     /// Build Core's parent-authority response with O(1) keyed reads from one
@@ -7294,19 +7258,18 @@ async fn serve_block_transactions(
     diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let block_hash = request.block_hash;
-    let (known, too_old, block) = node.with_stable_read(|store, _headers| {
-        let snapshot = store.snapshot()?;
-        let Some(record) = load_header_record(&snapshot, &block_hash)? else {
+    let (_, (known, too_old, block)) = node.with_stable_chain_read(|snapshot, _headers| {
+        let Some(record) = load_header_record(snapshot, &block_hash)? else {
             return Ok((false, false, None));
         };
-        let active_height = best_block_tip_from_snapshot(&snapshot)?.map_or(0, |tip| tip.height);
+        let active_height = best_block_tip_from_snapshot(snapshot)?.map_or(0, |tip| tip.height);
         if record.height.saturating_add(15) < active_height {
             return Ok((true, true, None));
         }
         Ok((
             true,
             false,
-            load_block_from_snapshot(&snapshot, &block_hash)?,
+            load_block_from_snapshot(snapshot, &block_hash)?,
         ))
     })?;
     if !known {
@@ -7356,17 +7319,8 @@ async fn accept_peer_block(
     diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let hash = block.hash();
-    let result = accept_peer_block_inner(
-        peer,
-        block,
-        node,
-        writer,
-        peers,
-        validation,
-        scheduler,
-        diagnostics,
-    )
-    .await;
+    let result =
+        accept_peer_block_inner(peer, block, node, writer, peers, validation, scheduler).await;
     let Err(error) = result else {
         return Ok(());
     };
@@ -7407,22 +7361,13 @@ async fn accept_peer_block_inner(
     peers: &LivePeerManager,
     validation: &ValidationSubmitter,
     scheduler: &mut SyncScheduler,
-    diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let hash = block.hash();
-    let retry_delay = node.config().native_sync.poll_interval;
-    let (mut record, has_body) =
-        native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
-            node.with_stable_read(|store, _headers| {
-                let snapshot = store.snapshot()?;
-                let record =
-                    NodeReadHandle::native_sync_header_record_from_snapshot(&snapshot, &hash)?;
-                let has_body =
-                    NodeReadHandle::native_sync_has_block_from_snapshot(&snapshot, &hash)?;
-                Ok((record, has_body))
-            })
-        })
-        .await?;
+    let (_, (mut record, has_body)) = node.with_stable_chain_read(|snapshot, _headers| {
+        let record = NodeReadHandle::native_sync_header_record_from_snapshot(snapshot, &hash)?;
+        let has_body = NodeReadHandle::native_sync_has_block_from_snapshot(snapshot, &hash)?;
+        Ok((record, has_body))
+    })?;
     if record.as_ref().is_some_and(|record| record.status.failed) {
         scheduler.reject_block(Some(peer), hash, false, StdInstant::now());
         penalize_peer(peers, peer, 100, "known invalid block branch").await?;
@@ -7438,11 +7383,8 @@ async fn accept_peer_block_inner(
             if block.header == config.network.params().genesis_header() {
                 true
             } else {
-                native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
-                    node.native_sync_header_record(&block.header.prev_block)
-                })
-                .await?
-                .is_some()
+                node.native_sync_header_record(&block.header.prev_block)?
+                    .is_some()
             }
         };
         if !parent_known {
@@ -7494,15 +7436,9 @@ async fn accept_peer_block_inner(
                 );
             }
         };
-        let best_header = native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
-            node.native_sync_best_header_tip()
-        })
-        .await?;
+        let best_header = node.native_sync_best_header_tip()?;
         scheduler.set_best_header(best_header);
-        native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
-            node.native_sync_queue_missing_canonical_bodies(scheduler)
-        })
-        .await?;
+        node.native_sync_queue_missing_canonical_bodies(scheduler)?;
     }
 
     let record = record.ok_or_else(|| anyhow::anyhow!("imported block header has no record"))?;
@@ -7515,10 +7451,8 @@ async fn accept_peer_block_inner(
             hash.to_hex()
         );
     }
-    let in_horizon = native_sync_stable_read_with_retry(diagnostics, retry_delay, 3, || {
-        node.native_sync_canonical_body_is_in_horizon(hash, record.height, scheduler.stored_tip())
-    })
-    .await?;
+    let in_horizon =
+        node.native_sync_canonical_body_is_in_horizon(hash, record.height, scheduler.stored_tip())?;
     if !in_horizon {
         // A persisted reservation from an older runtime or a future scheduler
         // call site must not become an alternate authorization path.
@@ -8154,15 +8088,9 @@ async fn handle_validated_blocks_inner(
         return Ok(());
     }
     // Retain the owned, statelessly validated bodies while a concurrent
-    // active-state slice publishes. One stable batch read prevents a transient
-    // generation overlap from throwing away completed validation work.
-    let classifications = native_sync_stable_read_with_retry(
-        context.diagnostics,
-        MIN_NATIVE_SYNC_POLL_INTERVAL,
-        MAX_CANONICAL_STALE_RETRIES,
-        || node.native_sync_classify_validated_blocks(&candidates),
-    )
-    .await?;
+    // active-state slice publishes. One header-locked database snapshot keeps
+    // the chain view coherent without treating unrelated writer work as busy.
+    let classifications = node.native_sync_classify_validated_blocks(&candidates)?;
     let mut eligible = Vec::with_capacity(candidates.len());
     for (validated, (parent_available, canonical)) in candidates.into_iter().zip(classifications) {
         if parent_available || canonical {
@@ -8192,59 +8120,18 @@ async fn handle_validated_blocks_inner(
         .iter()
         .map(|(validated, _)| validated.block.hash())
         .collect::<Vec<_>>();
-    let mut stored = None;
-    for attempt in 0..MAX_CANONICAL_STALE_RETRIES {
-        if attempt != 0 {
-            let canonical = native_sync_stable_read_with_retry(
-                context.diagnostics,
-                MIN_NATIVE_SYNC_POLL_INTERVAL,
-                MAX_CANONICAL_STALE_RETRIES,
-                || {
-                    node.with_stable_read(|_store, headers| {
-                        eligible
-                            .iter()
-                            .map(|(validated, _)| {
-                                headers
-                                    .canonical_hash(validated.height)
-                                    .map(|candidate| candidate == Some(validated.block.hash()))
-                                    .context("failed to refresh canonical native-sync header")
-                            })
-                            .collect::<Result<Vec<_>>>()
-                    })
-                },
-            )
-            .await?;
-            for ((_, current), refreshed) in eligible.iter_mut().zip(canonical) {
-                *current = refreshed;
-            }
-        }
-        let epoch = node.canonical_epoch();
-        let batch = eligible.clone();
-        match context
-            .writer
-            .execute_at_chain(
-                epoch.chain(),
-                "store validated native-sync body batch",
-                move |node| node.native_sync_store_validated_blocks(batch),
-            )
-            .await
-        {
-            Ok(records) => {
-                stored = Some(records);
-                break;
-            }
-            Err(error)
-                if canonical_writer_contention(&error)
-                    && attempt + 1 < MAX_CANONICAL_STALE_RETRIES =>
-            {
-                tokio::time::sleep(active_state_contention_retry_interval(attempt + 1)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    let stored = stored.ok_or_else(|| {
-        anyhow::anyhow!("validated native-sync body batch exhausted stale-epoch retries")
-    })?;
+    // The serial writer rechecks every `canonical=true` classification against
+    // its current header index. A stale `false` classification only selects
+    // the stricter parent-present validation route. Consequently active-state
+    // chain-epoch changes do not require throwing away this completed batch.
+    let stored = context
+        .writer
+        .execute(
+            None,
+            "store validated native-sync body batch",
+            move |node| node.native_sync_store_validated_blocks(eligible),
+        )
+        .await?;
     if stored.len() != expected.len()
         || stored
             .iter()
@@ -10650,7 +10537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_validated_batch_is_reconciled_to_pending_work() {
+    async fn saturated_writer_validated_batch_is_reconciled_to_pending_work() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             native_sync: NativeSyncConfig {
@@ -10668,7 +10555,7 @@ mod tests {
         service
             .native_sync_import_headers(vec![block.header.clone()])
             .expect("canonical header");
-        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let runtime = NodeRuntime::spawn(service, 1).expect("node runtime");
         let node = runtime.read();
         let writer = runtime.writer();
         let (_validation, _validation_results) =
@@ -10696,11 +10583,33 @@ mod tests {
             diagnostics: &diagnostics,
         };
 
-        let previous = node
-            .state
-            .publication_sequence
-            .fetch_add(1, Ordering::AcqRel);
-        assert_eq!(previous & 1, 0, "fixture starts from a stable generation");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking_writer = writer.clone();
+        let blocking = tokio::spawn(async move {
+            blocking_writer
+                .execute(None, "validated saturation blocker", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer blocker entered");
+        let queued_writer = writer.clone();
+        let queued = tokio::spawn(async move {
+            queued_writer
+                .execute(None, "validated saturation queued command", |_| Ok(()))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.inner.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer queue did not saturate");
+
         let result = handle_validated_blocks(
             vec![ValidatedBlock {
                 sequence: 0,
@@ -10715,11 +10624,9 @@ mod tests {
             &mut deferred_orphan_discards,
         )
         .await;
-        node.state
-            .publication_sequence
-            .store(previous, Ordering::Release);
 
-        let error = result.expect_err("overlapping stable read is reconciled");
+        let error = result.expect_err("saturated writer batch is reconciled");
+        assert!(canonical_writer_contention(&error), "{error:#}");
         assert!(!unreconciled_validation_batch(&error), "{error:#}");
         let snapshot = scheduler.snapshot();
         assert_eq!(snapshot.pending_blocks, 1);
@@ -10727,6 +10634,15 @@ mod tests {
         assert_eq!(snapshot.tracked_blocks, 1);
         assert_eq!(snapshot.validated_blocks, 0);
         assert!(!node.native_sync_has_block(&hash).expect("body lookup"));
+        release_tx.send(()).expect("release writer blocker");
+        blocking
+            .await
+            .expect("blocking writer join")
+            .expect("blocking writer command");
+        queued
+            .await
+            .expect("queued writer join")
+            .expect("queued writer command");
         runtime.shutdown().await.expect("node runtime shutdown");
     }
 
@@ -13030,7 +12946,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn validated_body_survives_preflight_contention_and_defers_post_store_refresh() {
+    async fn validated_body_reads_overlap_unrelated_writer_generations() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             native_sync: NativeSyncConfig {
@@ -13111,11 +13027,11 @@ mod tests {
 
         assert!(node.native_sync_has_block(&hash).expect("durable body"));
         assert!(!scheduler.is_tracked_block(&hash));
-        assert!(diagnostics.read().await.canonical_read_contentions >= 1);
+        assert_eq!(diagnostics.read().await.canonical_read_contentions, 0);
 
         // Once the body is durable and its reservation is complete, another
-        // writer overlap may defer derived scheduler state but must not turn
-        // the completed batch back into retry work.
+        // unrelated writer must not defer chain-scoped scheduler refreshes or
+        // turn the completed batch back into retry work.
         scheduler.set_stored_tip(None);
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -13132,18 +13048,14 @@ mod tests {
         entered_rx.await.expect("writer entered");
         refresh_scheduler_after_validated_store(&node, &mut scheduler, &diagnostics)
             .await
-            .expect("deferred post-store refresh");
+            .expect("overlapping post-store refresh");
         assert!(scheduler.stored_tip().is_none());
         assert!(!scheduler.is_tracked_block(&hash));
-        assert_eq!(diagnostics.read().await.post_store_refresh_deferrals, 1);
+        assert!(scheduler.is_tracked_block(&Network::Regtest.params().genesis_hash));
+        assert_eq!(diagnostics.read().await.post_store_refresh_deferrals, 0);
 
         release_tx.send(()).expect("release writer");
         blocked.await.expect("writer join").expect("writer command");
-        refresh_scheduler_after_validated_store(&node, &mut scheduler, &diagnostics)
-            .await
-            .expect("stable post-store refresh");
-        assert!(scheduler.is_tracked_block(&Network::Regtest.params().genesis_hash));
-        assert!(!scheduler.is_tracked_block(&hash));
         runtime.shutdown().await.expect("node runtime shutdown");
     }
 
@@ -13839,7 +13751,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn peer_block_retains_body_across_bounded_canonical_read_retry() {
+    async fn peer_block_retains_body_during_unrelated_writer_generation() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             native_sync: NativeSyncConfig {
@@ -13915,14 +13827,14 @@ mod tests {
         assert_eq!(snapshot.inflight_blocks, 0);
         assert_eq!(snapshot.tracked_blocks, 1);
         let diagnostics = diagnostics.read().await;
-        assert!(diagnostics.canonical_read_contentions >= 1);
+        assert_eq!(diagnostics.canonical_read_contentions, 0);
         assert_eq!(diagnostics.peer_block_contention_requeues, 0);
         drop(diagnostics);
         runtime.shutdown().await.expect("node runtime shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn peer_block_exhausted_contention_requeues_without_peer_timeout() {
+    async fn peer_block_admission_ignores_long_unrelated_writer_generation() {
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             native_sync: NativeSyncConfig {
@@ -13974,31 +13886,35 @@ mod tests {
         });
         entered_rx.await.expect("writer entered");
 
-        accept_peer_block(
-            peer,
-            block,
-            &node,
-            &writer,
-            &peers,
-            &validation,
-            &mut scheduler,
-            &diagnostics,
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            accept_peer_block(
+                peer,
+                block,
+                &node,
+                &writer,
+                &peers,
+                &validation,
+                &mut scheduler,
+                &diagnostics,
+            ),
         )
         .await
-        .expect("locally requeued block");
+        .expect("unrelated writer must not starve peer block admission")
+        .expect("overlapping block admission");
         release_tx.send(()).expect("release writer");
         blocked.await.expect("writer join").expect("writer command");
 
         let snapshot = scheduler.snapshot();
-        assert_eq!(snapshot.pending_blocks, 1);
+        assert_eq!(snapshot.pending_blocks, 0);
         assert_eq!(snapshot.inflight_blocks, 0);
         assert_eq!(snapshot.tracked_blocks, 1);
         assert_eq!(snapshot.peers[0].failures, 0);
         assert_eq!(snapshot.peers[0].inflight_blocks, 0);
         assert!(snapshot.peers[0].body_available);
         let diagnostics = diagnostics.read().await;
-        assert_eq!(diagnostics.canonical_read_contentions, 3);
-        assert_eq!(diagnostics.peer_block_contention_requeues, 1);
+        assert_eq!(diagnostics.canonical_read_contentions, 0);
+        assert_eq!(diagnostics.peer_block_contention_requeues, 0);
         drop(diagnostics);
         runtime.shutdown().await.expect("node runtime shutdown");
     }
