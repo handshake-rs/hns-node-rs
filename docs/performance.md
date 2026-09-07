@@ -359,13 +359,15 @@ Individual historical reads still verify their frame checksum and key.
 when exhaustive media verification is required.
 
 Pruned startup compares committed segment file bytes with the live locator
-footprint without scanning dead payloads. At 256 MiB of reclaimable frames it
-rewrites only live block/undo records into a new generation and atomically
-publishes all locators plus both manifests. Native sync repeats the bounded due
-inspection every ten minutes, serialized through the sole canonical writer, so
-long-running IBD no longer retains physically dead frames until its next
-restart. Catch-up amortizes generation rewrites with a 4 GiB dead-frame
-threshold; synchronized operation returns to 256 MiB. The offline
+footprint without scanning dead payloads. Pruned startup without active sync
+uses a 256 MiB reclaimable-frame threshold. Native active-sync startup uses the
+same 4 GiB catch-up threshold as its bounded online inspection, avoiding a
+routine generation rewrite before networking starts. Compaction rewrites only
+live block/undo records into a new generation and atomically publishes all
+locators plus both manifests. Native sync repeats the due inspection every ten
+minutes, serialized through the sole canonical writer, so long-running IBD no
+longer retains physically dead frames until its next restart. Synchronized
+operation returns to 256 MiB. The offline
 `hsrd-storage-maintenance compact` variant adds exhaustive pre/post scrubs.
 
 Page-backed name state is compacted by retained-root union rather than by

@@ -762,11 +762,13 @@ state mutation. A store with a pruning checkpoint cannot later open in
 `archive` mode.
 
 Deleting RocksDB locators does not itself shrink append-only segment files.
-When dead committed frames exceed 256 MiB, pruned startup rewrites only live
-locators into a fresh generation. New files are synced before one RocksDB batch
-publishes every replacement locator and both manifests. Recovery keeps the
-manifest-selected generation and removes either unpublished new files or
-superseded predecessors. The stopped-node
+When dead committed frames exceed 256 MiB, pruned startup without active sync
+rewrites only live locators into a fresh generation. Native active-sync startup
+and online catch-up use a 4 GiB threshold to amortize the rewrite; synchronized
+online maintenance returns to 256 MiB. New files are synced before one RocksDB
+batch publishes every replacement locator and both manifests.
+Recovery keeps the manifest-selected generation and removes either unpublished
+new files or superseded predecessors. The stopped-node
 `hsrd-storage-maintenance compact` command performs the same rewrite with full
 pre/post frame scrubs and a JSON reclamation report. It first performs a
 read-only, budget-checked plan. `compact --dry-run` reports the exact live,

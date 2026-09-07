@@ -230,6 +230,7 @@ const UNDO_PRUNING_CHECKPOINT_BODY_SIZE: usize = 4 + 4 + 32 + 8 + 4 + 32 + 8;
 const UNDO_PRUNING_CHECKPOINT_SIZE: usize = UNDO_PRUNING_CHECKPOINT_BODY_SIZE + 32;
 const MAX_UNDO_PRUNES_PER_BATCH: usize = 1_024;
 const PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES: u64 = 256 * 1024 * 1024;
+const PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD: u32 = 16;
 // Rewriting the complete authenticated name tree every sixteen segments makes
 // initial synchronization spend most of its wall time copying live pages. A
@@ -242,6 +243,14 @@ const MAX_NAME_PAGE_VALIDATION_SPILL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_NAME_PAGE_VALIDATION_RECORDS: u64 =
     maximum_name_page_validation_records(MAX_NAME_PAGE_VALIDATION_SPILL_BYTES);
 const MAX_NAME_PAGE_SEGMENTS: u64 = 1_000_000;
+
+const fn startup_payload_segment_compaction_min_dead_bytes(native_active_sync: bool) -> u64 {
+    if native_active_sync {
+        PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES
+    } else {
+        PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES
+    }
+}
 const MAX_NAME_PAGE_VALIDATION_ELAPSED: Duration = Duration::from_secs(60 * 60);
 const MAX_NAME_PAGE_COMPACTION_ELAPSED: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_NAME_PAGE_COMPACTION_CLEANUP_ELAPSED: Duration = Duration::from_secs(10 * 60);
@@ -3997,7 +4006,11 @@ impl NodeService {
         if config.undo_retention.prune_history {
             state.prune_undo_history_to_policy()?;
             if config.data_dir.is_some() {
-                state.compact_pruned_payload_segments_if_due()?;
+                state.compact_pruned_payload_segments_if_due_at(
+                    startup_payload_segment_compaction_min_dead_bytes(
+                        config.native_sync.connect_active_state,
+                    ),
+                )?;
                 let name_page_segment_threshold = if config.native_sync.connect_active_state {
                     NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD
                 } else {
@@ -12830,12 +12843,6 @@ impl NodeState {
         Ok(())
     }
 
-    fn compact_pruned_payload_segments_if_due(
-        &self,
-    ) -> Result<Option<hns_store::SegmentArchiveCompactionReport>> {
-        self.compact_pruned_payload_segments_if_due_at(PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES)
-    }
-
     fn compact_pruned_payload_segments_if_due_at(
         &self,
         minimum_reclaimable_bytes: u64,
@@ -15961,6 +15968,18 @@ mod tests {
         drop(node);
         drop(store);
         std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn native_active_sync_startup_amortizes_payload_compaction() {
+        assert_eq!(
+            startup_payload_segment_compaction_min_dead_bytes(true),
+            PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES,
+        );
+        assert_eq!(
+            startup_payload_segment_compaction_min_dead_bytes(false),
+            PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES,
+        );
     }
 
     #[test]

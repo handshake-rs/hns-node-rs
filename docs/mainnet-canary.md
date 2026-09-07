@@ -79,8 +79,10 @@ undo records exactly as HSD specifies, rejects deeper reorganizations before
 mutation, retires matching historical root pins atomically, and runs name-tree
 reclamation on the configured height interval. Existing undo-only v1 stores
 upgrade in place by deleting old raw-block locators without replaying their
-payloads. On startup, at least 256 MiB of dead append-only frames triggers a
-crash-safe generation rewrite so logical pruning also returns disk space.
+payloads. On pruned startup without active sync, at least 256 MiB of dead
+append-only frames triggers a crash-safe generation rewrite so logical pruning
+also returns disk space. Native active-sync startup amortizes that rewrite
+until 4 GiB is reclaimable; synchronized online maintenance returns to 256 MiB.
 After sixteen sealed 360-block name-page segments, startup likewise rewrites
 only the reachable union of the current and rollback roots, atomically swaps
 their locators, and deletes the superseded page generation.
