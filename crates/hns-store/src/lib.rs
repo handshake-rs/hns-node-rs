@@ -133,13 +133,37 @@ const ROCKS_BULK_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const ROCKS_BLOOM_BITS_PER_KEY: f64 = 10.0;
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_BACKGROUND_JOBS: i32 = 4;
+/// Bound aggregate memtable memory across all column families while leaving
+/// enough room for the two write-heavy UTXO families to merge immutable
+/// memtables before flushing. The node's active-state staging budget is
+/// separately bounded, so this keeps peak IBD memory predictable.
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_DB_WRITE_BUFFER_BYTES: usize = 768 * 1024 * 1024;
 /// Bound aggregate WAL retention across all column families. Without an
 /// explicit limit RocksDB derives the allowance from every column family's
-/// write buffers; a mainnet replay retained more than 4 GiB of WAL files.
+/// write buffers; a mainnet replay retained more than 4 GiB of WAL files. The
+/// ceiling must also be large enough not to force sub-memtable flushes across
+/// every dirty column family during bulk active-chain replay.
 #[cfg(feature = "rocksdb-backend")]
-pub const ROCKS_MAX_TOTAL_WAL_BYTES: u64 = 256 * 1024 * 1024;
+pub const ROCKS_MAX_TOTAL_WAL_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(feature = "rocksdb-backend")]
 const ROCKS_BULK_BLOCK_BYTES: usize = 32 * 1024;
+/// The global transaction and consensus UTXO indexes receive multiple puts
+/// and deletes for the same key ranges during IBD. Merging two larger
+/// memtables removes more of that churn before it reaches the LSM tree, while
+/// three buffers still leave one writable memtable during a paired flush.
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_UTXO_WRITE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_UTXO_MAX_WRITE_BUFFERS: i32 = 3;
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_UTXO_MIN_WRITE_BUFFERS_TO_MERGE: i32 = 2;
+/// Match the target SST size to a paired UTXO memtable flush. This reduces
+/// file count and overlap bookkeeping without creating multi-gigabyte files.
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_UTXO_TARGET_FILE_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(feature = "rocksdb-backend")]
+const ROCKS_UTXO_LEVEL_BASE_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub type ScanEntry = (Vec<u8>, Vec<u8>);
 pub type PrefixVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> Result<(), StoreError> + 'a;
@@ -4168,6 +4192,7 @@ impl RocksStore {
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
         db_options.set_max_background_jobs(ROCKS_BACKGROUND_JOBS);
+        db_options.set_db_write_buffer_size(ROCKS_DB_WRITE_BUFFER_BYTES);
         db_options.set_max_total_wal_size(ROCKS_MAX_TOTAL_WAL_BYTES);
 
         let point_cache = Cache::new_lru_cache(ROCKS_POINT_CACHE_BYTES);
@@ -4336,6 +4361,14 @@ fn rocks_column_family_options(family: ColumnFamily, cache: &rocksdb::Cache) -> 
 
     let mut options = Options::default();
     options.set_block_based_table_factory(&table);
+    if matches!(family, ColumnFamily::TxIndex | ColumnFamily::Utxo) {
+        options.set_write_buffer_size(ROCKS_UTXO_WRITE_BUFFER_BYTES);
+        options.set_max_write_buffer_number(ROCKS_UTXO_MAX_WRITE_BUFFERS);
+        options.set_min_write_buffer_number_to_merge(ROCKS_UTXO_MIN_WRITE_BUFFERS_TO_MERGE);
+        options.set_target_file_size_base(ROCKS_UTXO_TARGET_FILE_BYTES);
+        options.set_max_bytes_for_level_base(ROCKS_UTXO_LEVEL_BASE_BYTES);
+        options.set_level_compaction_dynamic_level_bytes(true);
+    }
     options
 }
 
@@ -7769,10 +7802,59 @@ mod tests {
         let log = std::fs::read_to_string(path.join("LOG")).expect("rocksdb option log");
         assert!(
             log.contains(&format!(
+                "Options.db_write_buffer_size: {ROCKS_DB_WRITE_BUFFER_BYTES}"
+            )),
+            "RocksDB did not apply the aggregate memtable cap"
+        );
+        assert!(
+            log.contains(&format!(
                 "Options.max_total_wal_size: {ROCKS_MAX_TOTAL_WAL_BYTES}"
             )),
             "RocksDB did not apply the aggregate WAL cap"
         );
+
+        let tx_index_options = log
+            .split("Options for column family [tx_index]:")
+            .nth(1)
+            .and_then(|tail| tail.split("Options for column family [utxo]:").next())
+            .expect("tx-index RocksDB options");
+        let utxo_options = log
+            .split("Options for column family [utxo]:")
+            .nth(1)
+            .and_then(|tail| tail.split("Options for column family [name_state]:").next())
+            .expect("UTXO RocksDB options");
+        for (family, options) in [("tx_index", tx_index_options), ("utxo", utxo_options)] {
+            assert!(
+                options.contains(&format!(
+                    "Options.write_buffer_size: {ROCKS_UTXO_WRITE_BUFFER_BYTES}"
+                )),
+                "{family} did not apply the larger write buffer"
+            );
+            assert!(
+                options.contains(&format!(
+                    "Options.max_write_buffer_number: {ROCKS_UTXO_MAX_WRITE_BUFFERS}"
+                )),
+                "{family} did not apply the write-buffer count"
+            );
+            assert!(
+                options.contains(&format!(
+                    "Options.min_write_buffer_number_to_merge: {ROCKS_UTXO_MIN_WRITE_BUFFERS_TO_MERGE}"
+                )),
+                "{family} did not apply paired memtable flushing"
+            );
+            assert!(
+                options.contains(&format!(
+                    "Options.target_file_size_base: {ROCKS_UTXO_TARGET_FILE_BYTES}"
+                )),
+                "{family} did not apply the larger target file size"
+            );
+            assert!(
+                options.contains(&format!(
+                    "Options.max_bytes_for_level_base: {ROCKS_UTXO_LEVEL_BASE_BYTES}"
+                )),
+                "{family} did not apply the larger level base"
+            );
+        }
         let _ = std::fs::remove_dir_all(&path);
     }
 
