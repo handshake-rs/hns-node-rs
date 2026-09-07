@@ -185,11 +185,13 @@ feedback loop and the general polling interval as a replay throughput ceiling.
 
 Direct canonical progress is limited to 288 connected blocks per atomic slice,
 the same bounded rollback horizon as HSD mainnet's retained reorganization
-window. This amortizes one ordered name-page durability barrier over the
-configured mainnet replay batch while the independent 10 ms state cadence still
-returns between slices for network work and shutdown. A real divergent
-best-work branch retains the configured reorganization bound so disconnect and
-replacement connect remain one transaction.
+window, and never exceeds `--active-state-connect-batch`. The configured value
+is a true maximum, not merely the adaptive tuner's starting point. This
+amortizes one ordered name-page durability barrier over the configured mainnet
+replay batch while the independent 10 ms state cadence still returns between
+slices for network work and shutdown. A real divergent best-work branch retains
+the configured reorganization bound so disconnect and replacement connect
+remain one transaction.
 
 The atomic staged-effect meter can reduce a direct replay slice when historical
 name activity makes the configured block count too large. After such a retry,

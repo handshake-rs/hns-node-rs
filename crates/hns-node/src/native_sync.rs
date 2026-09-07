@@ -1275,6 +1275,7 @@ type PayloadSegmentCompactionTask = JoinHandle<Result<Option<SegmentArchiveCompa
 
 #[derive(Debug)]
 struct ActiveStateBatchTuner {
+    maximum_limit: usize,
     next_limit: usize,
     successful_full_slices: usize,
 }
@@ -1287,14 +1288,16 @@ impl ActiveStateBatchTuner {
     const GROWTH_SUCCESS_STREAK: usize = 4;
 
     fn new(initial_connect_limit: usize) -> Self {
+        let maximum_limit = initial_connect_limit.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
         Self {
-            next_limit: initial_connect_limit.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE),
+            maximum_limit,
+            next_limit: maximum_limit,
             successful_full_slices: 0,
         }
     }
 
     fn record_budget_retry(&mut self, retry_connect: usize) {
-        let retry_connect = retry_connect.clamp(1, MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+        let retry_connect = retry_connect.clamp(1, self.maximum_limit);
         if retry_connect < self.next_limit {
             self.successful_full_slices = 0;
         }
@@ -1302,7 +1305,7 @@ impl ActiveStateBatchTuner {
     }
 
     fn record_success(&mut self, connected: usize) {
-        if connected < self.next_limit || self.next_limit == MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE {
+        if connected < self.next_limit || self.next_limit == self.maximum_limit {
             self.successful_full_slices = 0;
             return;
         }
@@ -1313,7 +1316,7 @@ impl ActiveStateBatchTuner {
             self.next_limit = self
                 .next_limit
                 .saturating_add(increase)
-                .min(MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE);
+                .min(self.maximum_limit);
             self.successful_full_slices = 0;
         }
     }
@@ -11003,6 +11006,25 @@ mod tests {
             tuner.record_success(7);
         }
         assert_eq!(tuner.next_limit, 8);
+    }
+
+    #[test]
+    fn active_state_batch_tuner_never_exceeds_configured_maximum() {
+        let mut tuner = ActiveStateBatchTuner::new(32);
+        for _ in 0..(ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK * 4) {
+            tuner.record_budget_retry(32);
+            tuner.record_success(32);
+        }
+        assert_eq!(tuner.maximum_limit, 32);
+        assert_eq!(tuner.next_limit, 32);
+
+        tuner.record_budget_retry(8);
+        for _ in 0..(ActiveStateBatchTuner::GROWTH_SUCCESS_STREAK * 8) {
+            let limit = tuner.next_limit;
+            tuner.record_budget_retry(limit);
+            tuner.record_success(limit);
+        }
+        assert_eq!(tuner.next_limit, 32);
     }
 
     #[test]
