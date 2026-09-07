@@ -805,10 +805,8 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
                 continue;
             }
             let coin = plan
-                .external_input_coins
-                .get(&input.previous_output)
+                .external_input_coin(&input.previous_output)
                 .cloned()
-                .flatten()
                 .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?;
             let Some(transfer) = decode_transfer(&coin.covenant)? else {
                 continue;

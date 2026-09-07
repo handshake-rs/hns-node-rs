@@ -18,7 +18,7 @@ use hns_primitives::{
     blake2b_256, Address, Block, BlockHash, BlockTransactionIds, Coin, Height, Outpoint,
     Transaction, Txid, Writer,
 };
-use hns_state::{decode_coin, encode_coin, encode_outpoint_key, BlockUndo};
+use hns_state::{decode_coin, encode_coin, encode_outpoint_key, BlockUndo, PreparedBlockUtxos};
 use hns_store::{
     ColumnFamily, PrefixScanBudget, ReadSnapshot, StoreError, WriteBatch, PREFIX_SCAN_MAX_ENTRIES,
 };
@@ -481,7 +481,12 @@ struct BlockConnectPlan<'a> {
     block_hash: BlockHash,
     transaction_ids: &'a [Txid],
     created_coins: HashMap<Outpoint, Coin>,
-    external_input_coins: HashMap<Outpoint, Option<Coin>>,
+    external_input_coins: ExternalInputCoins<'a>,
+}
+
+enum ExternalInputCoins<'a> {
+    Owned(HashMap<Outpoint, Option<Coin>>),
+    Prepared(&'a PreparedBlockUtxos),
 }
 
 impl<'a> BlockConnectPlan<'a> {
@@ -499,8 +504,38 @@ impl<'a> BlockConnectPlan<'a> {
             block_hash,
             transaction_ids,
             created_coins,
-            external_input_coins,
+            external_input_coins: ExternalInputCoins::Owned(external_input_coins),
         })
+    }
+
+    fn from_prepared(
+        analysis: &'a BlockTransactionIds<'_>,
+        height: Height,
+        prepared_utxos: &'a PreparedBlockUtxos,
+    ) -> Result<Self, IndexError> {
+        let block = analysis.block();
+        let block_hash = block.hash();
+        if !prepared_utxos.matches(block_hash, height, analysis) {
+            return Err(IndexError::Corrupt(
+                "wallet UTXOs were prepared for a different block or height",
+            ));
+        }
+        let transaction_ids = analysis.as_slice();
+        Ok(Self {
+            block_hash,
+            transaction_ids,
+            created_coins: block_created_coins_with_ids(block, height, transaction_ids)?,
+            external_input_coins: ExternalInputCoins::Prepared(prepared_utxos),
+        })
+    }
+
+    fn external_input_coin(&self, outpoint: &Outpoint) -> Option<&Coin> {
+        match &self.external_input_coins {
+            ExternalInputCoins::Owned(coins) => coins.get(outpoint).and_then(Option::as_ref),
+            ExternalInputCoins::Prepared(prepared) => {
+                prepared.coin(outpoint).and_then(Option::as_ref)
+            }
+        }
     }
 }
 
@@ -531,8 +566,49 @@ pub fn stage_connect_with_transaction_ids<B: WriteBatch, S: ReadSnapshot>(
     if !profile.enabled() {
         return Ok(());
     }
-    let block = transaction_ids.block();
     let plan = BlockConnectPlan::prepare(snapshot, transaction_ids, height)?;
+    stage_connect_with_plan(
+        snapshot,
+        batch,
+        transaction_ids.block(),
+        height,
+        profile,
+        &plan,
+    )
+}
+
+/// Stage enabled indexes using the same decoded pre-connect coins that the
+/// consensus connector will consume immediately afterward.
+pub fn stage_connect_with_transaction_ids_and_prepared_utxos<B: WriteBatch, S: ReadSnapshot>(
+    snapshot: &S,
+    batch: &mut B,
+    transaction_ids: &BlockTransactionIds<'_>,
+    height: Height,
+    profile: WalletIndexProfile,
+    prepared_utxos: &PreparedBlockUtxos,
+) -> Result<(), IndexError> {
+    if !profile.enabled() {
+        return Ok(());
+    }
+    let plan = BlockConnectPlan::from_prepared(transaction_ids, height, prepared_utxos)?;
+    stage_connect_with_plan(
+        snapshot,
+        batch,
+        transaction_ids.block(),
+        height,
+        profile,
+        &plan,
+    )
+}
+
+fn stage_connect_with_plan<B: WriteBatch, S: ReadSnapshot>(
+    snapshot: &S,
+    batch: &mut B,
+    block: &Block,
+    height: Height,
+    profile: WalletIndexProfile,
+    plan: &BlockConnectPlan<'_>,
+) -> Result<(), IndexError> {
     let mut history = BTreeMap::<(ScriptId, Txid), ScriptHistoryEntry>::new();
 
     for (transaction_position, (transaction, txid)) in block
@@ -564,10 +640,8 @@ pub fn stage_connect_with_transaction_ids<B: WriteBatch, S: ReadSnapshot>(
             let coin = match plan.created_coins.get(&input.previous_output) {
                 Some(coin) => coin.clone(),
                 None => plan
-                    .external_input_coins
-                    .get(&input.previous_output)
+                    .external_input_coin(&input.previous_output)
                     .cloned()
-                    .flatten()
                     .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?,
             };
             if profile.histories() {
@@ -618,9 +692,9 @@ pub fn stage_connect_with_transaction_ids<B: WriteBatch, S: ReadSnapshot>(
         }
     }
     if profile.wallet {
-        incoming_transfer::stage_connect_prefetched(snapshot, batch, block, height, &plan)?;
+        incoming_transfer::stage_connect_prefetched(snapshot, batch, block, height, plan)?;
     }
-    swap::stage_connect_prefetched(snapshot, batch, block, height, profile, &plan)?;
+    swap::stage_connect_prefetched(snapshot, batch, block, height, profile, plan)?;
     Ok(())
 }
 
@@ -1448,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_prefetches_inputs_once_and_skips_empty_contract_registry_scans() {
+    fn shared_connect_view_fetches_inputs_once_and_skips_empty_contract_registry_scans() {
         let store = MemoryStore::new();
         let previous = [
             Outpoint {
@@ -1480,20 +1554,32 @@ mod tests {
         }
         store.commit(seed).expect("commit input coins");
 
-        let block = block(vec![Transaction {
-            version: 0,
-            inputs: previous
-                .iter()
-                .cloned()
-                .map(|previous_output| Input {
-                    previous_output,
+        let block = block(vec![
+            Transaction {
+                version: 0,
+                inputs: vec![Input {
+                    previous_output: Outpoint::null(),
                     sequence: u32::MAX,
                     witness: Witness::default(),
-                })
-                .collect(),
-            outputs: vec![output(40, 39)],
-            locktime: 0,
-        }]);
+                }],
+                outputs: vec![output(1, 1)],
+                locktime: 0,
+            },
+            Transaction {
+                version: 0,
+                inputs: previous
+                    .iter()
+                    .cloned()
+                    .map(|previous_output| Input {
+                        previous_output,
+                        sequence: u32::MAX,
+                        witness: Witness::default(),
+                    })
+                    .collect(),
+                outputs: vec![output(40, 39)],
+                locktime: 0,
+            },
+        ]);
         let snapshot = UtxoReadCountingSnapshot {
             inner: store.snapshot().expect("snapshot"),
             point_gets: Cell::new(0),
@@ -1501,15 +1587,20 @@ mod tests {
             wallet_state_point_gets: Cell::new(0),
         };
         let mut batch = store.batch();
-        stage_connect(
+        let transaction_ids = BlockTransactionIds::new(&block);
+        let prepared_utxos =
+            hns_state::prepare_block_utxos_with_transaction_ids(&snapshot, &transaction_ids, 9)
+                .expect("prepare shared UTXOs");
+        stage_connect_with_transaction_ids_and_prepared_utxos(
             &snapshot,
             &mut batch,
-            &block,
+            &transaction_ids,
             9,
             WalletIndexProfile {
                 wallet: true,
                 ..WalletIndexProfile::default()
             },
+            &prepared_utxos,
         )
         .expect("stage wallet indexes");
 

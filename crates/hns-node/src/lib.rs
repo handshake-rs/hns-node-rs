@@ -137,14 +137,15 @@ use hns_rpc::{
 };
 use hns_state::{
     compact_name_tree_nodes_streaming,
-    connect_block_to_batch_with_services_accumulator_and_transaction_ids,
-    connect_block_to_batch_with_services_and_transaction_ids, decode_coin, decode_name_state,
+    connect_block_to_batch_with_services_accumulator_and_prepared_utxos,
+    connect_block_to_batch_with_services_and_prepared_utxos, decode_coin, decode_name_state,
     disconnect_block_to_batch, encode_outpoint_key, load_persisted_name_tree_records,
     load_stored_name_tree_commit_root, load_stored_name_tree_root,
     maximum_name_page_validation_records, migrate_name_tree_interval_accumulator_bounded,
     name_page_root_key, name_tree_snapshot_pin_key, pack_name_page_records_consuming,
     pack_reachable_name_page_records_consuming_with_limit,
     plan_name_tree_interval_accumulator_migration_bounded, prefetch_replay_utxos,
+    prepare_block_utxos_with_transaction_ids,
     reconcile_legacy_name_tree_interval_accumulator_bounded, retained_name_tree_roots_bounded,
     stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits_and_progress,
     stream_name_page_tree_with_limits_and_progress, validate_persisted_name_tree_overlays,
@@ -179,7 +180,7 @@ use hns_store::{
 use hns_wallet_index::{
     decode_index_profile, encode_index_profile, index_profile_is_current, index_profile_version,
     register_tracked_contract, retire_completed_tracked_contract,
-    retire_never_confirmed_tracked_contract, stage_connect_with_transaction_ids,
+    retire_never_confirmed_tracked_contract, stage_connect_with_transaction_ids_and_prepared_utxos,
     stage_disconnect as stage_wallet_index_disconnect, stage_prune_incoming_transfer_undo,
     validate_completed_tracked_contract_retirements, validate_tracked_contract_registry,
     INDEX_PROFILE_MODE_KEY,
@@ -11949,13 +11950,17 @@ impl NodeState {
         // Stage index writes first so the live overlay cannot hide inputs that
         // the state connector is about to spend. A later validation failure
         // discards the shared batch, so no derivative write is published alone.
+        let prepared_utxos =
+            prepare_block_utxos_with_transaction_ids(snapshot, &transaction_ids, request.height)
+                .map_err(StateConnectError)?;
         let wallet_index_started = Instant::now();
-        stage_connect_with_transaction_ids(
+        stage_connect_with_transaction_ids_and_prepared_utxos(
             snapshot,
             batch,
             &transaction_ids,
             request.height,
             self.wallet_index_profile,
+            &prepared_utxos,
         )
         .map_err(anyhow::Error::new)
         .context("failed to stage wallet indexes")?;
@@ -11972,21 +11977,23 @@ impl NodeState {
         let consensus_state_started = Instant::now();
         let state_summary = match accumulator {
             Some(accumulator) => {
-                connect_block_to_batch_with_services_accumulator_and_transaction_ids(
+                connect_block_to_batch_with_services_accumulator_and_prepared_utxos(
                     snapshot,
                     batch,
                     connect,
                     services,
                     accumulator,
                     &transaction_ids,
+                    &prepared_utxos,
                 )
             }
-            None => connect_block_to_batch_with_services_and_transaction_ids(
+            None => connect_block_to_batch_with_services_and_prepared_utxos(
                 snapshot,
                 batch,
                 connect,
                 services,
                 &transaction_ids,
+                &prepared_utxos,
             ),
         }
         .map_err(StateConnectError)?;

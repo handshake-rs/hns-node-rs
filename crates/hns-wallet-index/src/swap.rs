@@ -1607,10 +1607,8 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
             let coin = match plan.created_coins.get(&input.previous_output) {
                 Some(coin) => coin.clone(),
                 None => plan
-                    .external_input_coins
-                    .get(&input.previous_output)
+                    .external_input_coin(&input.previous_output)
                     .cloned()
-                    .flatten()
                     .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?,
             };
             let Some(registration) = matching_contract_for_output(

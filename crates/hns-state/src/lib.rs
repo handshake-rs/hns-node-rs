@@ -208,6 +208,40 @@ pub struct ConnectBlock<'a> {
     pub block: &'a Block,
 }
 
+/// One authenticated pre-connect UTXO view shared by consensus and derivative
+/// indexes for the exact same immutable block borrow.
+///
+/// Preparing this once prevents a wallet-enabled node from encoding the same
+/// outpoint keys, cloning the same snapshot values, decoding the same coins,
+/// and building two independent hash tables immediately before one atomic
+/// block connection.
+#[derive(Debug)]
+pub struct PreparedBlockUtxos {
+    block_hash: BlockHash,
+    height: Height,
+    transaction_ids: Vec<hns_primitives::Txid>,
+    coins: HashMap<Outpoint, Option<Coin>>,
+}
+
+impl PreparedBlockUtxos {
+    #[must_use]
+    pub fn matches(
+        &self,
+        block_hash: BlockHash,
+        height: Height,
+        transaction_ids: &BlockTransactionIds<'_>,
+    ) -> bool {
+        self.block_hash == block_hash
+            && self.height == height
+            && self.transaction_ids == transaction_ids.as_slice()
+    }
+
+    #[must_use]
+    pub fn coin(&self, outpoint: &Outpoint) -> Option<&Option<Coin>> {
+        self.coins.get(outpoint)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DisconnectBlock {
     pub block_hash: BlockHash,
@@ -2242,6 +2276,40 @@ pub fn connect_block_to_batch_with_services_and_transaction_ids<T: ReadSnapshot,
     }
 }
 
+/// Stage one ordinary atomic block while sharing its transaction identities
+/// and already decoded pre-connect UTXO view with derivative indexes.
+pub fn connect_block_to_batch_with_services_and_prepared_utxos<T: ReadSnapshot, B: WriteBatch>(
+    snapshot: &T,
+    batch: &mut B,
+    request: ConnectBlock<'_>,
+    services: StateServices<'_>,
+    transaction_ids: &BlockTransactionIds<'_>,
+    prepared_utxos: &PreparedBlockUtxos,
+) -> Result<StateSummary, StateError> {
+    let mut accumulator = NameTreeAccumulatorSession::default();
+    accumulator.begin_checkpoint()?;
+    let result = connect_block_to_batch_with_services_accumulator_and_prepared_utxos(
+        snapshot,
+        batch,
+        request,
+        services,
+        &mut accumulator,
+        transaction_ids,
+        prepared_utxos,
+    );
+    match result {
+        Ok(summary) => {
+            accumulator.commit_checkpoint()?;
+            accumulator.publish(batch)?;
+            Ok(summary)
+        }
+        Err(error) => {
+            accumulator.rollback_checkpoint()?;
+            Err(error)
+        }
+    }
+}
+
 /// Stage one block while retaining the decoded interval accumulator in the
 /// caller's atomic multi-block transaction. The caller brackets every block
 /// with the session checkpoint methods and publishes the final accumulator
@@ -2277,9 +2345,64 @@ pub fn connect_block_to_batch_with_services_accumulator_and_transaction_ids<
     accumulator_session: &mut NameTreeAccumulatorSession,
     transaction_ids: &BlockTransactionIds<'_>,
 ) -> Result<StateSummary, StateError> {
+    connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos(
+        snapshot,
+        batch,
+        request,
+        services,
+        accumulator_session,
+        transaction_ids,
+        None,
+    )
+}
+
+/// Stage one block while sharing both transaction identities and its decoded
+/// immutable-base UTXO view with derivative indexes in the same atomic update.
+pub fn connect_block_to_batch_with_services_accumulator_and_prepared_utxos<
+    T: ReadSnapshot,
+    B: WriteBatch,
+>(
+    snapshot: &T,
+    batch: &mut B,
+    request: ConnectBlock<'_>,
+    services: StateServices<'_>,
+    accumulator_session: &mut NameTreeAccumulatorSession,
+    transaction_ids: &BlockTransactionIds<'_>,
+    prepared_utxos: &PreparedBlockUtxos,
+) -> Result<StateSummary, StateError> {
+    connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos(
+        snapshot,
+        batch,
+        request,
+        services,
+        accumulator_session,
+        transaction_ids,
+        Some(prepared_utxos),
+    )
+}
+
+fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
+    T: ReadSnapshot,
+    B: WriteBatch,
+>(
+    snapshot: &T,
+    batch: &mut B,
+    request: ConnectBlock<'_>,
+    services: StateServices<'_>,
+    accumulator_session: &mut NameTreeAccumulatorSession,
+    transaction_ids: &BlockTransactionIds<'_>,
+    prepared_utxos: Option<&PreparedBlockUtxos>,
+) -> Result<StateSummary, StateError> {
     if !std::ptr::eq(request.block, transaction_ids.block()) {
         return Err(StateError::Codec(
             "transaction IDs were prepared for a different block borrow".to_owned(),
+        ));
+    }
+    if prepared_utxos.is_some_and(|prepared| {
+        !prepared.matches(request.block_hash, request.height, transaction_ids)
+    }) {
+        return Err(StateError::Codec(
+            "UTXOs were prepared for a different block borrow or height".to_owned(),
         ));
     }
     let route = services.historical_validation;
@@ -2328,7 +2451,15 @@ pub fn connect_block_to_batch_with_services_accumulator_and_transaction_ids<
         .transactions
         .first()
         .ok_or(StateError::MissingCoinbase)?;
-    let prefetched_utxos = prefetch_block_utxos_with_transaction_ids(snapshot, transaction_ids)?;
+    let owned_prefetched_utxos;
+    let prefetched_utxos = match prepared_utxos {
+        Some(prepared) => &prepared.coins,
+        None => {
+            owned_prefetched_utxos =
+                prefetch_block_utxos_with_transaction_ids(snapshot, transaction_ids)?;
+            &owned_prefetched_utxos
+        }
+    };
     let chain_context =
         SnapshotChainContext::new(snapshot, request.height, services.historical_validation);
     let has_claim = coinbase
@@ -2392,7 +2523,7 @@ pub fn connect_block_to_batch_with_services_accumulator_and_transaction_ids<
     {
         if transaction_index != 0 {
             let resolved = resolve_transaction_inputs(
-                &prefetched_utxos,
+                prefetched_utxos,
                 &pending_created,
                 &mut spent_outpoints,
                 transaction,
@@ -2820,6 +2951,21 @@ where
         )));
     }
     Ok(outpoints.len())
+}
+
+/// Decode the exact pre-connect UTXO set needed by one block once so all
+/// atomic state/index consumers can share it.
+pub fn prepare_block_utxos_with_transaction_ids<T: ReadSnapshot>(
+    snapshot: &T,
+    transaction_ids: &BlockTransactionIds<'_>,
+    height: Height,
+) -> Result<PreparedBlockUtxos, StateError> {
+    Ok(PreparedBlockUtxos {
+        block_hash: transaction_ids.block().hash(),
+        height,
+        transaction_ids: transaction_ids.as_slice().to_vec(),
+        coins: prefetch_block_utxos_with_transaction_ids(snapshot, transaction_ids)?,
+    })
 }
 
 #[cfg(test)]
