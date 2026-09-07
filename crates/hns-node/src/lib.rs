@@ -167,7 +167,7 @@ use hns_store::{
     FilesystemTreeUsageLimits, MetaKey, NamePageAppender, NamePageError, PrefixScanBudget,
     ReadSnapshot, ScanEntry, SegmentArchiveScrubLimits, SegmentCompactionExecutionLimits,
     SegmentCompactionLimits, StagingOverlay, Store, StoreBackend, StoreConfig, StoreError,
-    StoreHandle, StoreHandleBatch, WriteBatch, SCHEMA_VERSION,
+    StoreHandle, StoreHandleBatch, StoreHandleSnapshot, WriteBatch, SCHEMA_VERSION,
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_DURABLE_BYTES, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_ELAPSED,
     SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_RECORDS, SEGMENT_ARCHIVE_SCRUB_DEFAULT_MAX_SEGMENTS,
     STORAGE_PROFILE,
@@ -3108,6 +3108,28 @@ impl NodeReadHandle {
         }
         self.ensure_storage_operational()?;
         result.map(|value| (epoch, value))
+    }
+
+    /// Read chain data from one backend snapshot paired with the exact
+    /// resident header-index generation that published it. This narrower
+    /// guard is for active-chain work that is independent of mempool and
+    /// unrelated writer commands; it blocks a header/cache publication for
+    /// the duration of the read instead of repeatedly discarding useful work
+    /// under a process-wide seqlock.
+    pub(crate) fn with_stable_chain_read<T, F>(&self, read: F) -> Result<(CanonicalChainEpoch, T)>
+    where
+        F: FnOnce(&StoreHandleSnapshot<'_>, &StoredHeaderIndex<StoreHandle>) -> Result<T>,
+    {
+        self.ensure_storage_operational()?;
+        let result = self.headers.read_consistent_snapshot(|snapshot, headers| {
+            let epoch = CanonicalChainEpoch {
+                chain_epoch: chain_epoch_from_snapshot(snapshot)?,
+                tip: best_block_tip_from_snapshot(snapshot)?,
+            };
+            read(snapshot, headers).map(|value| (epoch, value))
+        });
+        self.ensure_storage_operational()?;
+        result
     }
 
     pub fn stable_canonical_epoch(&self) -> Result<CanonicalEpoch> {
@@ -8918,6 +8940,23 @@ impl SharedHeaderIndex {
             .read()
             .map_err(|_| ChainError::Store("shared header-index lock is poisoned".to_owned()))?;
         operation(&index)
+    }
+
+    /// Capture a backend snapshot while the resident header index is read
+    /// locked. Every chain/header publication takes the matching write lock
+    /// across its durable commit and cache update, so the two views cannot
+    /// straddle a publication. Unrelated canonical-writer work does not make
+    /// this read spuriously busy.
+    fn read_consistent_snapshot<T>(
+        &self,
+        operation: impl FnOnce(&StoreHandleSnapshot<'_>, &StoredHeaderIndex<StoreHandle>) -> Result<T>,
+    ) -> Result<T> {
+        let index = self
+            .inner
+            .read()
+            .map_err(|_| anyhow::anyhow!("shared header-index lock is poisoned"))?;
+        let snapshot = index.store().snapshot()?;
+        operation(&snapshot, &index)
     }
 
     fn read_fenced<T>(

@@ -5112,17 +5112,16 @@ impl NodeReadHandle {
                 "active-state connector batch {maximum_connect} is outside 1..={MAX_ACTIVE_STATE_CONNECT_BATCH}"
             );
         }
-        let (epoch, activation) = self.with_stable_epoch_read(|store, headers| {
-            let snapshot = store.snapshot()?;
+        let (epoch, activation) = self.with_stable_chain_read(|snapshot, headers| {
             let stored_tip = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
-                &snapshot,
+                snapshot,
                 headers,
                 stored_tip_hint,
             )?;
             let Some(stored_tip) = stored_tip else {
                 return Ok(None);
             };
-            let active_tip = best_block_tip_from_snapshot(&snapshot)?;
+            let active_tip = best_block_tip_from_snapshot(snapshot)?;
             if active_tip.as_ref() == Some(&stored_tip) {
                 return Ok(None);
             }
@@ -5168,14 +5167,14 @@ impl NodeReadHandle {
             };
 
             Self::native_sync_best_chain_activation_plan_from_snapshot(
-                &snapshot,
+                snapshot,
                 headers,
                 candidate_hash,
                 NodeReorgLimits::with_maximum_connect(maximum_connect),
             )
         })?;
         Ok(activation.map(|activation| NativeActiveStatePlan {
-            epoch: epoch.chain(),
+            epoch,
             activation,
             maximum_connect,
             planning_micros: u64::try_from(planning_started.elapsed().as_micros())
@@ -11594,6 +11593,41 @@ mod tests {
         assert!(prepared_validated_at.is_some());
         assert_eq!(prepared_evidence, serial_evidence);
         runtime.shutdown().await.expect("prepared runtime shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_state_planning_ignores_unrelated_writer_generation() {
+        let (service, _hash) = strict_stored_genesis_service();
+        let runtime = NodeRuntime::spawn(service, 8).expect("node runtime");
+        let node = runtime.read();
+        let writer = runtime.writer();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked = tokio::spawn(async move {
+            writer
+                .execute(None, "unrelated planning overlap", move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release writer");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("writer entered");
+
+        let started = StdInstant::now();
+        let plan = node
+            .native_sync_plan_stored_state_with_hint(1, None)
+            .expect("chain-scoped planning remains available")
+            .expect("stored genesis activation plan");
+        assert_eq!(plan.activation.connect.len(), 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "unrelated writer work must not starve active-state planning"
+        );
+
+        release_tx.send(()).expect("release writer");
+        blocked.await.expect("writer join").expect("writer command");
+        runtime.shutdown().await.expect("node runtime shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
