@@ -96,7 +96,6 @@ use crate::{ShakescapeRelayHandle, ShakescapeRelayHandleError};
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
 const MAX_ACTIVE_STATE_STAGED_EFFECT_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_ACTIVE_STATE_START_PEER_EVENT_BACKLOG: usize = 32;
 const PAYLOAD_SEGMENT_COMPACTION_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MAX_SERVED_HEADERS: usize = hns_p2p::MAX_HEADERS;
 const MAX_GETDATA_ITEMS: usize = 1_024;
@@ -1386,14 +1385,6 @@ fn online_payload_segment_compaction_min_dead_bytes(stage: SyncStage) -> u64 {
     } else {
         PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES
     }
-}
-
-fn active_state_supervisor_backlog_ready(
-    peer_event_backlog: usize,
-    validation_result_backlog: usize,
-) -> bool {
-    peer_event_backlog <= MAX_ACTIVE_STATE_START_PEER_EVENT_BACKLOG
-        && validation_result_backlog == 0
 }
 
 fn schedule_payload_segment_compaction(
@@ -3227,16 +3218,18 @@ impl NodeService {
                         record_warning(format!("failed to persist HNSR runtime state: {error:#}"));
                     }
                 }
+                // Peer and validator queues are independently bounded and
+                // continue draining while this task prepares a slice. Once a
+                // contiguous durable frontier exists, gating activation on
+                // those queues becoming empty lets a fast download stream
+                // starve state replay indefinitely.
                 _ = active_state_poll.tick(),
                     if native_sync_config.connect_active_state
                         && active_state_task.is_none()
                         && name_page_compaction_task.is_none()
                         && payload_segment_compaction_task.is_none()
                         && (active_state_completion.is_some()
-                            || (active_state_supervisor_backlog_ready(
-                                peer_events.len(),
-                                validated.len(),
-                            ) && active_state_work_ready(&scheduler))) =>
+                            || active_state_work_ready(&scheduler)) =>
                 {
                     if active_state_completion.is_some() {
                         let context = ActiveStateConnectionContext {
@@ -11310,20 +11303,6 @@ mod tests {
             active_state_work_ready(&scheduler),
             "a same-height divergent stored frontier still requires reorg evaluation"
         );
-    }
-
-    #[test]
-    fn active_state_start_yields_to_validated_and_high_peer_backlogs() {
-        assert!(active_state_supervisor_backlog_ready(0, 0));
-        assert!(active_state_supervisor_backlog_ready(
-            MAX_ACTIVE_STATE_START_PEER_EVENT_BACKLOG,
-            0,
-        ));
-        assert!(!active_state_supervisor_backlog_ready(
-            MAX_ACTIVE_STATE_START_PEER_EVENT_BACKLOG + 1,
-            0,
-        ));
-        assert!(!active_state_supervisor_backlog_ready(0, 1));
     }
 
     #[test]
