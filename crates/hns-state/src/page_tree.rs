@@ -23,7 +23,7 @@ use hns_store::{
 #[cfg(unix)]
 use hns_store::{
     prefetch_name_page_records_at, read_name_page_directory_at, NamePageDirectory,
-    NamePagePrefetch, PositionedNamePageReader,
+    PositionedNamePageReader,
 };
 #[cfg(not(unix))]
 use hns_store::{read_name_page_directory, read_name_page_record};
@@ -286,11 +286,11 @@ impl NamePageSegmentFiles {
 #[cfg(unix)]
 struct ReadAheadNamePage {
     directory: NamePageDirectory,
-    records: NamePagePrefetch,
+    records: BTreeMap<u16, (TreeRoot, Arc<LoadedNamePageRecord>)>,
 }
 
 #[cfg(unix)]
-type NamePageReadAheadJob = ((u32, u32), Vec<u16>);
+type NamePageReadAheadJob = ((u32, u32), Vec<(u16, TreeRoot)>);
 
 #[cfg(unix)]
 type LoadedNamePage = ((u32, u32), ReadAheadNamePage);
@@ -327,14 +327,28 @@ impl NamePageReadAheadPool {
                         Ok(receiver) => receiver.recv(),
                         Err(_) => return,
                     };
-                    let Ok(Some((page, slots))) = job else {
+                    let Ok(Some((page, requested))) = job else {
                         return;
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let file = files.file_mut(page.0)?;
                         let directory = read_name_page_directory_at(file, page.1)?;
-                        let records =
+                        let slots = requested.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
+                        let prefetched =
                             prefetch_name_page_records_at(file, page.1, &directory, &slots)?;
+                        let mut reader = PositionedNamePageReader::with_prefetched(
+                            file, page.1, &directory, prefetched,
+                        )?;
+                        let mut records = BTreeMap::new();
+                        for (slot, root) in requested {
+                            let record = reader.record(slot)?;
+                            let loaded = Arc::new(validate_loaded_name_page_record(record, root)?);
+                            if records.insert(slot, (root, loaded)).is_some() {
+                                return Err(PageTreeError::StateCodec(
+                                    "name-page read-ahead repeated a requested slot".to_owned(),
+                                ));
+                            }
+                        }
                         Ok((page, ReadAheadNamePage { directory, records }))
                     }))
                     .unwrap_or_else(|_| {
@@ -3016,26 +3030,36 @@ impl NamePageTreeReader {
             #[cfg(unix)]
             let ReadAheadNamePage {
                 directory,
-                records: prefetched_records,
+                records: mut prefetched_records,
             } = prepared_page;
             #[cfg(unix)]
             let mut files = self.files.lock().map_err(|_| PageTreeError::Poisoned)?;
             #[cfg(unix)]
             let file = files.file_mut(page_address.segment())?;
             #[cfg(unix)]
-            let mut page_reader = PositionedNamePageReader::with_prefetched(
-                file,
-                page_address.page(),
-                &directory,
-                prefetched_records,
-            )?;
+            let mut page_reader =
+                PositionedNamePageReader::new(file, page_address.page(), &directory);
             while let Some((slot, work)) = page_work.pop_last() {
                 let address = NamePageAddress::new(page_key.0, page_key.1, slot)?;
                 let loaded = match self.cached_path_record(work.root, address)? {
                     Some(loaded) => loaded,
                     None => {
                         #[cfg(unix)]
-                        let record = page_reader.record(address.slot())?;
+                        let loaded = match prefetched_records.remove(&address.slot()) {
+                            Some((expected, loaded)) => {
+                                if expected != work.root {
+                                    return Err(PageTreeError::RecordKeyMismatch {
+                                        expected: work.root,
+                                        actual: expected,
+                                    });
+                                }
+                                loaded
+                            }
+                            None => Arc::new(validate_loaded_name_page_record(
+                                page_reader.record(address.slot())?,
+                                work.root,
+                            )?),
+                        };
                         #[cfg(not(unix))]
                         let record = read_name_page_record(
                             file,
@@ -3043,6 +3067,7 @@ impl NamePageTreeReader {
                             &directory,
                             address.slot(),
                         )?;
+                        #[cfg(not(unix))]
                         let loaded = Arc::new(validate_loaded_name_page_record(record, work.root)?);
                         self.path_record_reads.fetch_add(1, Ordering::Relaxed);
                         self.path_records
@@ -4066,8 +4091,8 @@ fn read_ahead_name_page(
                 let slots = pending
                     .get(&page)
                     .expect("read-ahead candidate remains pending")
-                    .keys()
-                    .copied()
+                    .iter()
+                    .map(|(slot, work)| (*slot, work.root))
                     .collect::<Vec<_>>();
                 (page, slots)
             })
