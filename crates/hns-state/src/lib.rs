@@ -161,8 +161,11 @@ const NAME_TREE_STREAMING_CURSOR_BYTES: u64 = 3
 
 #[derive(Default)]
 struct NameStateChanges {
-    current: BTreeMap<NameHash, NameState>,
-    previous: BTreeMap<NameHash, Option<NameState>>,
+    // Consensus output is canonicalized into `name_overrides` below. These
+    // transaction-local lookup tables do not need tree ordering, so hashing
+    // keeps repeated covenant transitions and final extraction expected O(1).
+    current: HashMap<NameHash, NameState>,
+    previous: HashMap<NameHash, Option<NameState>>,
     changed: HashSet<NameHash>,
 }
 
@@ -171,7 +174,7 @@ struct NameStateChanges {
 /// from this map.
 #[derive(Clone, Debug, Default)]
 pub struct MempoolNameOverlay {
-    current: BTreeMap<NameHash, NameState>,
+    current: HashMap<NameHash, NameState>,
 }
 
 /// Candidate-local name-state updates prepared against a
@@ -179,7 +182,7 @@ pub struct MempoolNameOverlay {
 /// transaction has actually entered the mempool.
 #[derive(Clone, Debug, Default)]
 pub struct MempoolNameDelta {
-    current: BTreeMap<NameHash, NameState>,
+    current: HashMap<NameHash, NameState>,
 }
 
 impl MempoolNameOverlay {
@@ -2979,7 +2982,9 @@ fn apply_verified_claims<T: ReadSnapshot>(
                 StateError::ClaimVerification("claim output index is out of range".to_owned())
             })?;
 
-        if let Entry::Vacant(entry) = changes.current.entry(claim.name_hash) {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            changes.current.entry(claim.name_hash)
+        {
             let loaded = load_name_state(snapshot, &claim.name_hash)?;
             changes
                 .previous
@@ -3270,7 +3275,7 @@ fn apply_transaction_name_covenants<T: ReadSnapshot>(
             .ok_or_else(|| StateError::ContextualCovenant("invalid name hash".to_owned()))?;
         let name_hash = NameHash::new(bytes);
 
-        if let Entry::Vacant(entry) = changes.current.entry(name_hash) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = changes.current.entry(name_hash) {
             let loaded = load_name_state(snapshot, &name_hash)?;
             changes
                 .previous
