@@ -1128,6 +1128,12 @@ pub struct NativeSyncDiagnostics {
     /// Consensus/index staging inside the last multi-block atomic activation.
     #[serde(default)]
     pub active_state_last_block_staging_micros: u64,
+    /// Wallet-derived index construction within the last activation.
+    #[serde(default)]
+    pub active_state_last_wallet_index_micros: u64,
+    /// Contextual consensus/UTXO/name-state construction within the last activation.
+    #[serde(default)]
+    pub active_state_last_consensus_state_micros: u64,
     /// Whole-slice immutable-base UTXO cache warmup inside block staging.
     #[serde(default)]
     pub active_state_last_utxo_prefetch_micros: u64,
@@ -1232,6 +1238,8 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) planning_micros: u64,
     pub(super) state_commit_micros: u64,
     pub(super) block_staging_micros: u64,
+    pub(super) wallet_index_micros: u64,
+    pub(super) consensus_state_micros: u64,
     pub(super) utxo_prefetch_micros: u64,
     pub(super) utxos_prefetched: usize,
     pub(super) name_page_prepare_micros: u64,
@@ -5027,6 +5035,8 @@ impl NodeService {
                     planning_micros,
                     state_commit_micros,
                     block_staging_micros: reorg.timings.block_staging_micros,
+                    wallet_index_micros: reorg.timings.wallet_index_micros,
+                    consensus_state_micros: reorg.timings.consensus_state_micros,
                     utxo_prefetch_micros: reorg.timings.utxo_prefetch_micros,
                     utxos_prefetched: reorg.timings.utxos_prefetched,
                     name_page_prepare_micros: reorg.timings.name_page_prepare_micros,
@@ -8715,6 +8725,8 @@ async fn complete_stored_active_state_slice<P: ActiveStateOrphanPool>(
             state.active_state_last_planning_micros = outcome.planning_micros;
             state.active_state_last_commit_micros = outcome.state_commit_micros;
             state.active_state_last_block_staging_micros = outcome.block_staging_micros;
+            state.active_state_last_wallet_index_micros = outcome.wallet_index_micros;
+            state.active_state_last_consensus_state_micros = outcome.consensus_state_micros;
             state.active_state_last_utxo_prefetch_micros = outcome.utxo_prefetch_micros;
             state.active_state_last_utxos_prefetched = outcome.utxos_prefetched;
             state.active_state_last_name_page_prepare_micros = outcome.name_page_prepare_micros;

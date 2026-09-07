@@ -191,7 +191,7 @@ use tokio::{
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 18;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 19;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -6452,6 +6452,8 @@ struct IndexStatusUpdate {
 struct StagedConnect {
     current: StagedIndexRecord,
     pruned: Vec<IndexStatusUpdate>,
+    wallet_index_micros: u64,
+    consensus_state_micros: u64,
 }
 
 #[derive(Debug)]
@@ -6699,6 +6701,8 @@ struct NodeReorgMutation {
 #[derive(Clone, Copy, Debug, Default)]
 struct NodeReorgTimings {
     block_staging_micros: u64,
+    wallet_index_micros: u64,
+    consensus_state_micros: u64,
     utxo_prefetch_micros: u64,
     utxos_prefetched: usize,
     name_page_prepare_micros: u64,
@@ -11918,6 +11922,7 @@ impl NodeState {
         // Stage index writes first so the live overlay cannot hide inputs that
         // the state connector is about to spend. A later validation failure
         // discards the shared batch, so no derivative write is published alone.
+        let wallet_index_started = Instant::now();
         stage_wallet_index_connect(
             snapshot,
             batch,
@@ -11927,6 +11932,8 @@ impl NodeState {
         )
         .map_err(anyhow::Error::new)
         .context("failed to stage wallet indexes")?;
+        let wallet_index_micros =
+            u64::try_from(wallet_index_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         let connect = ConnectBlock {
             block_hash,
@@ -11935,6 +11942,7 @@ impl NodeState {
             block_reward: self.network.params().block_reward(request.height),
             block: &request.block,
         };
+        let consensus_state_started = Instant::now();
         let state_summary = match accumulator {
             Some(accumulator) => connect_block_to_batch_with_services_and_accumulator(
                 snapshot,
@@ -11946,6 +11954,8 @@ impl NodeState {
             None => connect_block_to_batch_with_services(snapshot, batch, connect, services),
         }
         .map_err(StateConnectError)?;
+        let consensus_state_micros =
+            u64::try_from(consensus_state_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         if state_summary.historical_validation != historical_validation {
             anyhow::bail!("state engine returned a different historical validation route");
         }
@@ -12022,6 +12032,8 @@ impl NodeState {
                 header: header_record,
             },
             pruned,
+            wallet_index_micros,
+            consensus_state_micros,
         })
     }
 
@@ -12435,6 +12447,8 @@ impl NodeState {
         let mut summary = NodeReorgSummary::default();
         let mut index_updates = Vec::new();
         let mut truncated_direct_connect_limit = None;
+        let mut wallet_index_micros = 0_u64;
+        let mut consensus_state_micros = 0_u64;
         let block_staging_started = Instant::now();
 
         for disconnect in request.disconnect {
@@ -12616,6 +12630,10 @@ impl NodeState {
                 .map_err(anyhow::Error::new)
                 .context("failed to accept name-tree accumulator checkpoint")
                 .map_err(ChainActivationFailure::Internal)?;
+            wallet_index_micros =
+                wallet_index_micros.saturating_add(staged_connect.wallet_index_micros);
+            consensus_state_micros =
+                consensus_state_micros.saturating_add(staged_connect.consensus_state_micros);
             let previous = previous_block_records.get(&hash).cloned().ok_or_else(|| {
                 ChainActivationFailure::Internal(anyhow::anyhow!(
                     "reorganization cache plan omitted block {}",
@@ -12814,6 +12832,8 @@ impl NodeState {
             truncated_direct_connect_limit,
             timings: NodeReorgTimings {
                 block_staging_micros,
+                wallet_index_micros,
+                consensus_state_micros,
                 utxo_prefetch_micros,
                 utxos_prefetched,
                 name_page_prepare_micros,
