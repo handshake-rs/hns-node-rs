@@ -40,11 +40,15 @@ const NAME_PAGE_READ_AHEAD_CACHE_PAGES: usize = 128;
 const NAME_PAGE_READ_AHEAD_WORKERS: usize = 4;
 #[cfg(unix)]
 const NAME_PAGE_READ_AHEAD_FILES_PER_WORKER: usize = 2;
-// Retain authenticated path records across consecutive activation slices so
-// their heavily overlapping immutable prefixes do not return to disk. The
-// conservative accounting below includes duplicated decoded-prefix storage
-// and hash-map/Arc overhead.
-const NAME_PAGE_PATH_RECORD_CACHE_BYTES: usize = 64 * 1024 * 1024;
+// Retain a complete recent authenticated path union across consecutive name
+// intervals so their heavily overlapping immutable prefixes do not return to
+// disk. Mainnet interval commits at mid-chain already touch more than 200,000
+// records; the former 64 MiB clock evicted that scan before the next interval
+// and produced effectively zero hits. The conservative accounting below
+// includes duplicated decoded-prefix storage and hash-map/Arc overhead. This
+// remains a hard 512 MiB bound, matching (rather than adding an unbounded
+// multiplier to) the node's default maximum atomic staging allowance.
+const NAME_PAGE_PATH_RECORD_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const NAME_PAGE_STATE_VERSION: u32 = 2;
 const LEGACY_NAME_PAGE_STATE_VERSION: u32 = 1;
 const LEGACY_NAME_PAGE_STATE_BODY_BYTES: usize = 4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4;
