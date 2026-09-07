@@ -183,6 +183,13 @@ results, and shutdown. Ordered validation completion no longer recursively
 invokes another state slice. This removes both the immediate slice-to-slice
 feedback loop and the general polling interval as a replay throughput ceiling.
 
+A new slice is admitted only when no validated result is waiting and the peer
+event receiver is at or below its 32-event low-water mark. Events may continue
+arriving during the bounded writer transaction, but a large accumulated queue
+must drain before replay can reacquire the writer. This prevents downloaded
+bodies and peer readiness from sitting behind repeated state slices while
+retaining a useful state batch whenever network work is already controlled.
+
 Direct canonical progress is limited to 288 connected blocks per atomic slice,
 the same bounded rollback horizon as HSD mainnet's retained reorganization
 window, and never exceeds `--active-state-connect-batch`. The configured value
