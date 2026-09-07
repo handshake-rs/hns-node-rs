@@ -167,7 +167,13 @@ const MIN_ADDR_TIMESTAMP: u64 = 100_000_000;
 const MAX_NATIVE_SYNC_PEERS: usize = 256;
 const MAX_NATIVE_SYNC_VALIDATION_WORKERS: usize = 128;
 const MAX_NATIVE_SYNC_VALIDATION_QUEUE: usize = 8_192;
-const MAX_VALIDATED_BODY_COMMIT_BATCH: usize = 32;
+// Fresh IBD must form transactions from the block stream, not from whichever
+// handful of worker completions happen to be ready when the supervisor wakes.
+// At the consensus maximum block size this still bounds owned validated body
+// memory below 256 MiB, while giving the copy-on-write chainstate tree enough
+// work per publication to amortize root/allocator page rewrites and fsync.
+const MAX_VALIDATED_BODY_COMMIT_BATCH: usize = 128;
+const VALIDATED_BODY_COMMIT_COALESCE: Duration = Duration::from_millis(100);
 const MAX_CANONICAL_BODY_CANDIDATE_SCAN_SLICE: usize = 256;
 const MAX_CANONICAL_STALE_RETRIES: usize = 8;
 const MAX_HEADER_DEPLOYMENT_READS: usize = 2_000_000;
@@ -2545,6 +2551,7 @@ enum NativeSupervisorEvent {
     Connection(Option<ConnectAttemptResult>),
     Peer(Option<PeerEvent>),
     Validation(Option<OrderedValidationResult>),
+    ValidationFlush,
 }
 
 impl NativeSupervisorEvent {
@@ -2553,7 +2560,7 @@ impl NativeSupervisorEvent {
             Self::Maintenance => NativeSupervisorLane::Maintenance,
             Self::Connection(_) => NativeSupervisorLane::Connection,
             Self::Peer(_) => NativeSupervisorLane::Peer,
-            Self::Validation(_) => NativeSupervisorLane::Validation,
+            Self::Validation(_) | Self::ValidationFlush => NativeSupervisorLane::Validation,
         }
     }
 }
@@ -2570,44 +2577,62 @@ async fn next_native_supervisor_event(
     connect_results: &mut mpsc::Receiver<ConnectAttemptResult>,
     peer_events: &mut mpsc::Receiver<PeerEvent>,
     validation_results: &mut mpsc::Receiver<OrderedValidationResult>,
+    validation_flush_deadline: Option<Instant>,
 ) -> NativeSupervisorEvent {
-    let event = match *next_lane {
-        NativeSupervisorLane::Maintenance => {
-            tokio::select! {
-                biased;
-                _ = poll.tick() => NativeSupervisorEvent::Maintenance,
-                result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
-                event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
-                result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
-            }
+    if validation_flush_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+        *next_lane = NativeSupervisorLane::Validation.next();
+        return NativeSupervisorEvent::ValidationFlush;
+    }
+    let validation_flush = async move {
+        match validation_flush_deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
         }
-        NativeSupervisorLane::Connection => {
-            tokio::select! {
-                biased;
-                result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
-                event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
-                result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
-                _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+    };
+    tokio::pin!(validation_flush);
+    let event = tokio::select! {
+        biased;
+        _ = &mut validation_flush => NativeSupervisorEvent::ValidationFlush,
+        event = async {
+            match *next_lane {
+                NativeSupervisorLane::Maintenance => {
+                    tokio::select! {
+                        biased;
+                        _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+                        result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
+                        event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
+                        result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
+                    }
+                }
+                NativeSupervisorLane::Connection => {
+                    tokio::select! {
+                        biased;
+                        result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
+                        event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
+                        result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
+                        _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+                    }
+                }
+                NativeSupervisorLane::Peer => {
+                    tokio::select! {
+                        biased;
+                        event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
+                        result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
+                        _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+                        result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
+                    }
+                }
+                NativeSupervisorLane::Validation => {
+                    tokio::select! {
+                        biased;
+                        result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
+                        _ = poll.tick() => NativeSupervisorEvent::Maintenance,
+                        result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
+                        event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
+                    }
+                }
             }
-        }
-        NativeSupervisorLane::Peer => {
-            tokio::select! {
-                biased;
-                event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
-                result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
-                _ = poll.tick() => NativeSupervisorEvent::Maintenance,
-                result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
-            }
-        }
-        NativeSupervisorLane::Validation => {
-            tokio::select! {
-                biased;
-                result = validation_results.recv() => NativeSupervisorEvent::Validation(result),
-                _ = poll.tick() => NativeSupervisorEvent::Maintenance,
-                result = connect_results.recv() => NativeSupervisorEvent::Connection(result),
-                event = peer_events.recv() => NativeSupervisorEvent::Peer(event),
-            }
-        }
+        } => event,
     };
     *next_lane = event.lane().next();
     event
@@ -3200,6 +3225,8 @@ impl NodeService {
         let mut consecutive_active_state_contention = 0usize;
         let mut consecutive_maintenance_busy = 0usize;
         let mut next_supervisor_lane = NativeSupervisorLane::Maintenance;
+        let mut pending_validation_results = Vec::with_capacity(MAX_VALIDATED_BODY_COMMIT_BATCH);
+        let mut validation_flush_deadline = None;
 
         loop {
             tokio::select! {
@@ -3554,6 +3581,7 @@ impl NodeService {
                     &mut connect_results_rx,
                     &mut peer_events,
                     &mut validated,
+                    validation_flush_deadline,
                 ) => match event {
                 NativeSupervisorEvent::Maintenance => {
                     if rpc_task.is_finished() {
@@ -3902,21 +3930,47 @@ impl NodeService {
                     )
                     .await;
                 }
-                NativeSupervisorEvent::Validation(result) => {
-                    let Some(result) = result else {
+                event @ NativeSupervisorEvent::Validation(_)
+                | event @ NativeSupervisorEvent::ValidationFlush => {
+                    let (result, validation_channel_closed) = match event {
+                        NativeSupervisorEvent::Validation(result) => {
+                            let closed = result.is_none();
+                            (result, closed)
+                        }
+                        NativeSupervisorEvent::ValidationFlush => (None, false),
+                        _ => unreachable!("validation match arm is exact"),
+                    };
+                    if let Some(result) = result {
+                        if pending_validation_results.is_empty() {
+                            validation_flush_deadline = Some(
+                                Instant::now() + VALIDATED_BODY_COMMIT_COALESCE,
+                            );
+                        }
+                        pending_validation_results.push(result);
+                    }
+                    while pending_validation_results.len() < MAX_VALIDATED_BODY_COMMIT_BATCH {
+                        match validated.try_recv() {
+                            Ok(result) => pending_validation_results.push(result),
+                            Err(_) => break,
+                        }
+                    }
+                    let flush_due = pending_validation_results.len()
+                        >= MAX_VALIDATED_BODY_COMMIT_BATCH
+                        || validation_channel_closed
+                        || validation_flush_deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline);
+                    if !flush_due {
+                        continue;
+                    }
+                    if pending_validation_results.is_empty() {
                         let message = "validation result channel closed".to_owned();
                         record_error(&diagnostics, message.clone()).await;
                         terminal_error = Some(anyhow::anyhow!(message));
                         break;
-                    };
-                    let mut results = Vec::with_capacity(MAX_VALIDATED_BODY_COMMIT_BATCH);
-                    results.push(result);
-                    while results.len() < MAX_VALIDATED_BODY_COMMIT_BATCH {
-                        match validated.try_recv() {
-                            Ok(result) => results.push(result),
-                            Err(_) => break,
-                        }
                     }
+                    let results = std::mem::take(&mut pending_validation_results);
+                    pending_validation_results = Vec::with_capacity(MAX_VALIDATED_BODY_COMMIT_BATCH);
+                    validation_flush_deadline = None;
                     let context = ValidationResultContext {
                         node: &node,
                         writer: &writer,
@@ -3981,6 +4035,12 @@ impl NodeService {
                         checkpoint_sequence,
                     )
                     .await;
+                    if validation_channel_closed {
+                        let message = "validation result channel closed".to_owned();
+                        record_error(&diagnostics, message.clone()).await;
+                        terminal_error = Some(anyhow::anyhow!(message));
+                        break;
+                    }
                 }
                 },
             }
@@ -9907,10 +9967,34 @@ mod tests {
                 &mut connect_rx,
                 &mut peer_rx,
                 &mut validation_rx,
+                None,
             )
             .await;
             assert_eq!(event.lane(), expected_lane);
         }
+    }
+
+    #[tokio::test]
+    async fn validated_body_deadline_preempts_other_ready_supervisor_work() {
+        let (_connect_tx, mut connect_rx) = mpsc::channel(1);
+        let (_peer_tx, mut peer_rx) = mpsc::channel(1);
+        let (_validation_tx, mut validation_rx) = mpsc::channel(1);
+        let mut poll = tokio::time::interval(Duration::from_secs(60));
+        poll.reset_at(Instant::now() - Duration::from_secs(1));
+        let mut next_lane = NativeSupervisorLane::Maintenance;
+
+        let event = next_native_supervisor_event(
+            &mut next_lane,
+            &mut poll,
+            &mut connect_rx,
+            &mut peer_rx,
+            &mut validation_rx,
+            Some(Instant::now() - Duration::from_millis(1)),
+        )
+        .await;
+
+        assert!(matches!(event, NativeSupervisorEvent::ValidationFlush));
+        assert_eq!(next_lane, NativeSupervisorLane::Maintenance);
     }
 
     #[tokio::test]
@@ -13331,8 +13415,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn split_validation_runs_share_one_32_unit_orphan_budget() {
-        const CHILDREN_PER_PARENT: Height = 20;
+    async fn split_validation_runs_share_one_bounded_orphan_budget() {
+        const CHILDREN_PER_PARENT: Height = 80;
         let mut service = NodeService::new(NodeConfig {
             network: Network::Regtest,
             native_sync: NativeSyncConfig {
@@ -13359,7 +13443,7 @@ mod tests {
             LivePeerManager::new(LivePeerConfig::for_network(Network::Regtest))
                 .expect("peer manager");
         let (validation, _validation_results) =
-            spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 64)
+            spawn_validation_pipeline(Arc::new(AcceptAllBlocks), 1, 256)
                 .expect("validation pipeline");
         let diagnostics = Arc::new(RwLock::new(NativeSyncDiagnostics::default()));
         let context = ValidationResultContext {
@@ -13387,7 +13471,7 @@ mod tests {
             usize::try_from(CHILDREN_PER_PARENT.saturating_mul(2)).expect("orphan fixture count");
         let mut orphans = OwnedOrphanPool::new(OrphanLimits {
             maximum_blocks: orphan_count,
-            maximum_bytes: 4_000_000,
+            maximum_bytes: 16_000_000,
         })
         .expect("orphan pool");
         for (ordinal, parent) in [first_hash, second_hash]
