@@ -19,7 +19,8 @@ use hns_store::{ColumnFamily, PrefixScanBudget, ReadSnapshot, WriteBatch};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    bound_checksum, validate_limit, IndexError, ScriptId, WalletIndexProfile, MAX_QUERY_BYTES,
+    bound_checksum, validate_limit, BlockConnectPlan, IndexError, ScriptId, WalletIndexProfile,
+    MAX_QUERY_BYTES,
 };
 
 const ACTIVE_PREFIX: &[u8] = b"wallet-index/v1/name-transfer/active/";
@@ -779,9 +780,9 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
     batch: &mut B,
     block: &Block,
     height: Height,
-    existing_coins: &std::collections::HashMap<Outpoint, Option<Coin>>,
+    plan: &BlockConnectPlan,
 ) -> Result<(), IndexError> {
-    let block_hash = block.hash();
+    let block_hash = plan.block_hash;
     if snapshot
         .get(ColumnFamily::WalletState, &undo_key(block_hash))?
         .is_some()
@@ -791,7 +792,8 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
         ));
     }
 
-    let (created_outpoints, created_plans) = created_live_plans(block, height)?;
+    let (created_outpoints, created_plans) =
+        created_live_plans_with_ids(block, height, block_hash, &plan.transaction_ids)?;
     let mut existing = BTreeMap::<Txid, ExistingTransactionDelta>::new();
     let mut spent_outpoints = HashSet::<Outpoint>::new();
     let mut spent_effects = Vec::new();
@@ -802,7 +804,8 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
             {
                 continue;
             }
-            let coin = existing_coins
+            let coin = plan
+                .external_input_coins
                 .get(&input.previous_output)
                 .cloned()
                 .flatten()
@@ -941,9 +944,8 @@ fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
     block: &Block,
     height: Height,
 ) -> Result<(), IndexError> {
-    let created = crate::block_created_coins(block, height)?;
-    let existing = crate::prefetch_external_input_coins(snapshot, block, &created)?;
-    stage_connect_prefetched(snapshot, batch, block, height, &existing)
+    let plan = BlockConnectPlan::prepare(snapshot, block, height)?;
+    stage_connect_prefetched(snapshot, batch, block, height, &plan)
 }
 
 /// Stage exact incoming-TRANSFER reversal for an active-tip disconnect.
@@ -1256,6 +1258,25 @@ fn created_live_plans(
     block: &Block,
     height: Height,
 ) -> Result<(HashSet<Outpoint>, BTreeMap<Txid, CreatedTransactionPlan>), IndexError> {
+    let transaction_ids = block
+        .transactions
+        .iter()
+        .map(hns_primitives::Transaction::txid)
+        .collect::<Vec<_>>();
+    created_live_plans_with_ids(block, height, block.hash(), &transaction_ids)
+}
+
+fn created_live_plans_with_ids(
+    block: &Block,
+    height: Height,
+    block_hash: BlockHash,
+    transaction_ids: &[Txid],
+) -> Result<(HashSet<Outpoint>, BTreeMap<Txid, CreatedTransactionPlan>), IndexError> {
+    if transaction_ids.len() != block.transactions.len() {
+        return Err(IndexError::Corrupt(
+            "incoming TRANSFER block plan transaction count mismatch",
+        ));
+    }
     let spent = block
         .transactions
         .iter()
@@ -1265,11 +1286,14 @@ fn created_live_plans(
         .collect::<HashSet<_>>();
     let mut all_created = HashSet::new();
     let mut plans = BTreeMap::new();
-    let block_hash = block.hash();
-    for (transaction_position, transaction) in block.transactions.iter().enumerate() {
+    for (transaction_position, (transaction, txid)) in block
+        .transactions
+        .iter()
+        .zip(transaction_ids.iter().copied())
+        .enumerate()
+    {
         let transaction_position =
             u32::try_from(transaction_position).map_err(|_| IndexError::PositionOverflow)?;
-        let txid = transaction.txid();
         let output_count =
             u32::try_from(transaction.outputs.len()).map_err(|_| IndexError::PositionOverflow)?;
         let evidence = TransferEvidence {

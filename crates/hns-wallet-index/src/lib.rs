@@ -470,6 +470,42 @@ pub enum IndexError {
     Corrupt(&'static str),
 }
 
+/// Immutable analysis shared by every derivative index for one block.
+///
+/// Transaction IDs serialize and hash the complete base transaction, while
+/// created coins clone every spendable output. Preparing both once prevents
+/// the independent history, incoming-transfer, and swap indexes from
+/// repeating that work during initial synchronization.
+struct BlockConnectPlan {
+    block_hash: BlockHash,
+    transaction_ids: Vec<Txid>,
+    created_coins: HashMap<Outpoint, Coin>,
+    external_input_coins: HashMap<Outpoint, Option<Coin>>,
+}
+
+impl BlockConnectPlan {
+    fn prepare<S: ReadSnapshot>(
+        snapshot: &S,
+        block: &Block,
+        height: Height,
+    ) -> Result<Self, IndexError> {
+        let block_hash = block.hash();
+        let transaction_ids = block
+            .transactions
+            .iter()
+            .map(Transaction::txid)
+            .collect::<Vec<_>>();
+        let created_coins = block_created_coins_with_ids(block, height, &transaction_ids)?;
+        let external_input_coins = prefetch_external_input_coins(snapshot, block, &created_coins)?;
+        Ok(Self {
+            block_hash,
+            transaction_ids,
+            created_coins,
+            external_input_coins,
+        })
+    }
+}
+
 /// Stage all enabled indexes for an active-chain block connection.
 ///
 /// `snapshot` must be the same immutable pre-connect state used by consensus
@@ -484,21 +520,23 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
     if !profile.enabled() {
         return Ok(());
     }
-    let block_hash = block.hash();
-    let created = block_created_coins(block, height)?;
-    let existing = prefetch_external_input_coins(snapshot, block, &created)?;
+    let plan = BlockConnectPlan::prepare(snapshot, block, height)?;
     let mut history = BTreeMap::<(ScriptId, Txid), ScriptHistoryEntry>::new();
 
-    for (transaction_position, transaction) in block.transactions.iter().enumerate() {
+    for (transaction_position, (transaction, txid)) in block
+        .transactions
+        .iter()
+        .zip(plan.transaction_ids.iter().copied())
+        .enumerate()
+    {
         let transaction_position =
             u32::try_from(transaction_position).map_err(|_| IndexError::PositionOverflow)?;
-        let txid = transaction.txid();
         if profile.histories() || profile.utxos() {
             stage_created_outputs(
                 batch,
                 transaction,
                 txid,
-                block_hash,
+                plan.block_hash,
                 height,
                 transaction_position,
                 profile,
@@ -511,9 +549,10 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
             }
             let input_position =
                 u32::try_from(input_position).map_err(|_| IndexError::PositionOverflow)?;
-            let coin = match created.get(&input.previous_output) {
+            let coin = match plan.created_coins.get(&input.previous_output) {
                 Some(coin) => coin.clone(),
-                None => existing
+                None => plan
+                    .external_input_coins
                     .get(&input.previous_output)
                     .cloned()
                     .flatten()
@@ -524,7 +563,7 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
                     &mut history,
                     ScriptId::from_address(&coin.address),
                     txid,
-                    block_hash,
+                    plan.block_hash,
                     height,
                     transaction_position,
                     ScriptHistoryDirection {
@@ -540,7 +579,7 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
                     &SpendingTransaction {
                         txid,
                         input_position,
-                        block_hash,
+                        block_hash: plan.block_hash,
                         height,
                     }
                     .encode(&input.previous_output),
@@ -567,9 +606,9 @@ pub fn stage_connect<B: WriteBatch, S: ReadSnapshot>(
         }
     }
     if profile.wallet {
-        incoming_transfer::stage_connect_prefetched(snapshot, batch, block, height, &existing)?;
+        incoming_transfer::stage_connect_prefetched(snapshot, batch, block, height, &plan)?;
     }
-    swap::stage_connect_prefetched(snapshot, batch, block, height, profile, &existing)?;
+    swap::stage_connect_prefetched(snapshot, batch, block, height, profile, &plan)?;
     Ok(())
 }
 
@@ -908,9 +947,36 @@ fn block_created_coins(
     block: &Block,
     height: Height,
 ) -> Result<HashMap<Outpoint, Coin>, IndexError> {
-    let mut coins = HashMap::new();
-    for (transaction_position, transaction) in block.transactions.iter().enumerate() {
-        let txid = transaction.txid();
+    let transaction_ids = block
+        .transactions
+        .iter()
+        .map(Transaction::txid)
+        .collect::<Vec<_>>();
+    block_created_coins_with_ids(block, height, &transaction_ids)
+}
+
+fn block_created_coins_with_ids(
+    block: &Block,
+    height: Height,
+    transaction_ids: &[Txid],
+) -> Result<HashMap<Outpoint, Coin>, IndexError> {
+    if transaction_ids.len() != block.transactions.len() {
+        return Err(IndexError::Corrupt(
+            "wallet block plan transaction count mismatch",
+        ));
+    }
+    let capacity = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.outputs.len())
+        .fold(0_usize, usize::saturating_add);
+    let mut coins = HashMap::with_capacity(capacity);
+    for (transaction_position, (transaction, txid)) in block
+        .transactions
+        .iter()
+        .zip(transaction_ids.iter().copied())
+        .enumerate()
+    {
         for (output_position, output) in transaction.outputs.iter().enumerate() {
             if output.is_unspendable() {
                 continue;
@@ -1095,12 +1161,17 @@ mod tests {
         inner: MemorySnapshot,
         point_gets: Cell<usize>,
         multi_gets: Cell<usize>,
+        wallet_state_point_gets: Cell<usize>,
     }
 
     impl ReadSnapshot for UtxoReadCountingSnapshot {
         fn get(&self, family: ColumnFamily, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
             if family == ColumnFamily::Utxo {
                 self.point_gets.set(self.point_gets.get() + 1);
+            }
+            if family == ColumnFamily::WalletState {
+                self.wallet_state_point_gets
+                    .set(self.wallet_state_point_gets.get() + 1);
             }
             self.inner.get(family, key)
         }
@@ -1365,7 +1436,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_prefetches_external_input_coins_in_one_storage_read() {
+    fn connect_prefetches_inputs_once_and_skips_empty_contract_registry_scans() {
         let store = MemoryStore::new();
         let previous = [
             Outpoint {
@@ -1415,6 +1486,7 @@ mod tests {
             inner: store.snapshot().expect("snapshot"),
             point_gets: Cell::new(0),
             multi_gets: Cell::new(0),
+            wallet_state_point_gets: Cell::new(0),
         };
         let mut batch = store.batch();
         stage_connect(
@@ -1431,6 +1503,9 @@ mod tests {
 
         assert_eq!(snapshot.multi_gets.get(), 1);
         assert_eq!(snapshot.point_gets.get(), 0);
+        // One fixed incoming-TRANSFER undo probe and one fixed contract-count
+        // probe are independent of the block's input/output cardinality.
+        assert_eq!(snapshot.wallet_state_point_gets.get(), 2);
     }
 
     #[test]

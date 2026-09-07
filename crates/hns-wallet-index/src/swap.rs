@@ -17,7 +17,7 @@ use hns_store::{ColumnFamily, PrefixScanBudget, ReadSnapshot, WriteBatch};
 use serde::{de::DeserializeOwned, Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use crate::{IndexError, WalletIndexProfile, MAX_QUERY_BYTES, MAX_QUERY_ENTRIES};
+use crate::{BlockConnectPlan, IndexError, WalletIndexProfile, MAX_QUERY_BYTES, MAX_QUERY_ENTRIES};
 
 mod serde_compressed_public_key {
     use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
@@ -1523,20 +1523,37 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
     block: &Block,
     height: Height,
     profile: WalletIndexProfile,
-    existing_coins: &HashMap<Outpoint, Option<Coin>>,
+    plan: &BlockConnectPlan,
 ) -> Result<(), IndexError> {
     if !profile.wallet {
         return Ok(());
     }
-    let block_hash = block.hash();
-    let created = block_created_coins(block, height)?;
+    let active_contracts = snapshot
+        .get(ColumnFamily::WalletState, REGISTRATION_COUNT_KEY)?
+        .as_deref()
+        .map(decode_registration_count)
+        .transpose()?
+        .unwrap_or(0);
+    if active_contracts == 0 {
+        return Ok(());
+    }
+    if active_contracts > MAX_TRACKED_CONTRACTS {
+        return Err(IndexError::Corrupt(
+            "tracked contract count exceeds schema bound",
+        ));
+    }
+    let block_hash = plan.block_hash;
     let mut tracked_created =
         HashMap::<Outpoint, (ContractRegistration, TrackedContractFunding)>::new();
 
-    for (transaction_position, transaction) in block.transactions.iter().enumerate() {
+    for (transaction_position, (transaction, txid)) in block
+        .transactions
+        .iter()
+        .zip(plan.transaction_ids.iter().copied())
+        .enumerate()
+    {
         let transaction_position =
             u32::try_from(transaction_position).map_err(|_| IndexError::PositionOverflow)?;
-        let txid = transaction.txid();
         for (output_position, output) in transaction.outputs.iter().enumerate() {
             if output.is_unspendable() {
                 continue;
@@ -1553,9 +1570,13 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
                 txid,
                 index: output_position,
             };
-            let coin = created.get(&outpoint).cloned().ok_or(IndexError::Corrupt(
-                "tracked funding coin was not constructed",
-            ))?;
+            let coin = plan
+                .created_coins
+                .get(&outpoint)
+                .cloned()
+                .ok_or(IndexError::Corrupt(
+                    "tracked funding coin was not constructed",
+                ))?;
             let funding = TrackedContractFunding {
                 contract_id: registration.id,
                 coin,
@@ -1571,16 +1592,22 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
         }
     }
 
-    for (transaction_position, transaction) in block.transactions.iter().enumerate() {
+    for (transaction_position, (transaction, spending_txid)) in block
+        .transactions
+        .iter()
+        .zip(plan.transaction_ids.iter().copied())
+        .enumerate()
+    {
         let transaction_position =
             u32::try_from(transaction_position).map_err(|_| IndexError::PositionOverflow)?;
         for (input_position, input) in transaction.inputs.iter().enumerate() {
             if input.previous_output.is_null() {
                 continue;
             }
-            let coin = match created.get(&input.previous_output) {
+            let coin = match plan.created_coins.get(&input.previous_output) {
                 Some(coin) => coin.clone(),
-                None => existing_coins
+                None => plan
+                    .external_input_coins
                     .get(&input.previous_output)
                     .cloned()
                     .flatten()
@@ -1620,7 +1647,7 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
             let event = TrackedContractEvent::Spend {
                 contract_id: registration.id,
                 funding: funding.clone(),
-                spending_txid: transaction.txid(),
+                spending_txid,
                 block_hash,
                 height,
                 transaction_position,
@@ -1645,9 +1672,8 @@ fn stage_connect<S: ReadSnapshot, B: WriteBatch>(
     height: Height,
     profile: WalletIndexProfile,
 ) -> Result<(), IndexError> {
-    let created = crate::block_created_coins(block, height)?;
-    let existing = crate::prefetch_external_input_coins(snapshot, block, &created)?;
-    stage_connect_prefetched(snapshot, batch, block, height, profile, &existing)
+    let plan = BlockConnectPlan::prepare(snapshot, block, height)?;
+    stage_connect_prefetched(snapshot, batch, block, height, profile, &plan)
 }
 
 pub(crate) fn stage_disconnect<S: ReadSnapshot, B: WriteBatch>(
