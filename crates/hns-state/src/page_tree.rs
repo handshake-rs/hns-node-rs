@@ -52,7 +52,12 @@ const NAME_PAGE_ROOT_RECORD_VERSION: u32 = 1;
 const NAME_PAGE_ROOT_RECORD_BODY_BYTES: usize = 4 + 32 + 8 + 8 + 4;
 const NAME_PAGE_ROOT_RECORD_BYTES: usize = NAME_PAGE_ROOT_RECORD_BODY_BYTES + 32;
 pub const NAME_PAGE_ROOT_PREFIX: &[u8] = b"name-page-root/v1/";
-const NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES: usize = 4_096;
+// A bootstrap task advances by one record per round. Keep two complete rounds
+// inside the decoded-page cache so a parent page is not evicted while its
+// children are visited. A much wider frontier improves RocksDB MultiGet batch
+// size, but page-backed generation compaction then rereads the same immutable
+// pages after every cache rotation.
+const NAME_PAGE_BOOTSTRAP_PARALLEL_SUBTREES: usize = DEFAULT_PAGE_CACHE_PAGES / 2;
 const NAME_PAGE_BOOTSTRAP_READ_BATCH: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4366,6 +4371,81 @@ mod tests {
         drop(reader);
         drop(appender);
         std::fs::remove_file(path).expect("remove page fixture");
+    }
+
+    #[test]
+    fn bootstrap_frontier_preserves_page_cache_locality() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let prefix = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-bootstrap-locality-{}-{nonce}",
+            std::process::id()
+        ));
+        let input = prefix.with_extension("input.pages");
+        let narrow_output = prefix.with_extension("narrow.pages");
+        let wide_output = prefix.with_extension("wide.pages");
+        for path in [&input, &narrow_output, &wide_output] {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let entries = (0u8..128)
+            .map(|index| {
+                let mut key = [0u8; 32];
+                key[0] = index;
+                key[31] = index.reverse_bits();
+                // Keep the value below the independently authenticated
+                // subpage record ceiling while making each record large
+                // enough that the four-page test cache is easy to exceed.
+                (NameHash::new(key), vec![index; 3_900])
+            })
+            .collect::<Vec<_>>();
+        let tree = MemoryUrkel::from_entries(entries).expect("tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("records");
+        let packed =
+            pack_name_page_records(7, 0, 0, &records, &HashMap::new()).expect("pack records");
+        assert!(packed.page_count() > 4);
+        let mut input_appender =
+            NamePageAppender::create_new(&input, 7, 0).expect("create input pages");
+        packed
+            .append(&mut input_appender)
+            .expect("append input pages");
+        drop(input_appender);
+        let locator = packed.root_locator(root).expect("root locator");
+        let store = MemoryStore::new();
+        let snapshot = store.snapshot().expect("snapshot");
+
+        let stream_with_frontier = |output: &Path, target_subtrees: usize| {
+            let reader = NamePageTreeReader::open_with_cache(&input, root, locator, 4)
+                .expect("open input pages");
+            let page_snapshot = NamePageSnapshot::new(&snapshot, &reader);
+            let mut output_appender =
+                NamePageAppender::create_new(output, 8, 0).expect("create output pages");
+            let streamed = stream_name_page_tree_with_parallelism(
+                &page_snapshot,
+                root,
+                &mut output_appender,
+                target_subtrees,
+            )
+            .expect("stream page-backed tree");
+            drop(output_appender);
+            assert_eq!(streamed.record_count, records.len() as u64);
+            reader.page_load_count().expect("page load count")
+        };
+
+        let local_loads = stream_with_frontier(&narrow_output, 2);
+        let thrashing_loads = stream_with_frontier(&wide_output, 32);
+        assert!(
+            local_loads < thrashing_loads,
+            "cache-local traversal loaded {local_loads} pages; wide traversal loaded {thrashing_loads}"
+        );
+
+        drop(snapshot);
+        for path in [input, narrow_output, wide_output] {
+            std::fs::remove_file(path).expect("remove page fixture");
+        }
     }
 
     #[test]
