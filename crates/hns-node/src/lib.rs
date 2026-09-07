@@ -142,6 +142,7 @@ use hns_state::{
     load_stored_name_tree_commit_root, load_stored_name_tree_root,
     maximum_name_page_validation_records, migrate_name_tree_interval_accumulator_bounded,
     name_page_root_key, name_tree_snapshot_pin_key, pack_name_page_records_consuming,
+    pack_reachable_name_page_records_consuming_with_limit,
     plan_name_tree_interval_accumulator_migration_bounded, prefetch_replay_utxos,
     reconcile_legacy_name_tree_interval_accumulator_bounded, retained_name_tree_roots_bounded,
     stage_remove_name_tree_snapshot_pin, stream_name_page_tree_delta_with_limits_and_progress,
@@ -154,8 +155,9 @@ use hns_state::{
     NamePageTreeReader, NamePageValidationLimits, NameTreeAccumulatorSession,
     NameTreeCompactionSummary, NameTreeIntervalMigrationLimits, NameTreeMaterializationLimits,
     NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits,
-    StateError, StateServices, StoredStateEngine, TreeRoot, NAME_PAGE_ROOT_PREFIX,
-    NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    StateError, StateServices, StoredStateEngine, TreeRoot,
+    NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
+    NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 #[cfg(test)]
 use hns_state::{
@@ -6102,8 +6104,8 @@ impl ReorgStagedEffectMeter {
         self.charge_amount(Self::name_page_output_charge(page_count))
     }
 
-    fn name_page_packing_charge(records: &BTreeMap<TreeRoot, Vec<u8>>) -> u64 {
-        u64::try_from(records.len())
+    fn name_page_packing_charge(record_count: usize) -> u64 {
+        u64::try_from(record_count)
             .unwrap_or(u64::MAX)
             .saturating_mul(REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD)
     }
@@ -6112,7 +6114,20 @@ impl ReorgStagedEffectMeter {
         &mut self,
         records: &BTreeMap<TreeRoot, Vec<u8>>,
     ) -> std::result::Result<(), StoreError> {
-        self.charge_amount(Self::name_page_packing_charge(records))
+        self.charge_name_page_packing_records(records.len())
+    }
+
+    fn charge_name_page_packing_records(
+        &mut self,
+        record_count: usize,
+    ) -> std::result::Result<(), StoreError> {
+        self.charge_amount(Self::name_page_packing_charge(record_count))
+    }
+
+    fn maximum_name_page_packing_records(&self) -> usize {
+        let remaining = self.limit.saturating_sub(self.consumed);
+        usize::try_from(remaining / REORG_NAME_PAGE_PACKING_METADATA_BYTES_PER_RECORD)
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -6338,11 +6353,11 @@ fn reorg_meter_limit_from_error(error: &anyhow::Error) -> Option<(u64, u64)> {
 /// below so pack scratch, physical page bytes, and database writes share one
 /// cumulative ceiling without duplicating `prepare_root`.
 ///
-/// `charge_name_page_packing` runs before lookup/order/visited/address maps are
-/// allocated. After planning reveals whether output is nonempty,
-/// `charge_name_page_output` reserves the one fixed-size encoded page used by
-/// the streaming appender. Both allocation boundaries reject before the newly
-/// charged representation exists.
+/// Legacy restoration charges all records before packing. Incremental replay
+/// instead derives a reachable-record ceiling from the remaining budget,
+/// enforces it while traversing, and then charges the exact retained count.
+/// After planning reveals whether output is nonempty, `charge_name_page_output`
+/// reserves the one fixed-size encoded page used by the streaming appender.
 trait NamePagePublicationBatch: WriteBatch {
     fn charge_name_page_packing(
         &mut self,
@@ -6358,6 +6373,17 @@ trait NamePagePublicationBatch: WriteBatch {
         Ok(())
     }
 
+    fn maximum_name_page_packing_records(&self) -> usize {
+        usize::MAX
+    }
+
+    fn charge_name_page_packing_records(
+        &mut self,
+        _record_count: usize,
+    ) -> std::result::Result<(), StoreError> {
+        Ok(())
+    }
+
     fn record_name_page_append(&self, _page_count: usize) {}
 }
 
@@ -6369,6 +6395,17 @@ impl<B: WriteBatch> NamePagePublicationBatch for ReorgMeteredBatch<B> {
         records: &BTreeMap<TreeRoot, Vec<u8>>,
     ) -> std::result::Result<(), StoreError> {
         self.meter.charge_name_page_packing(records)
+    }
+
+    fn maximum_name_page_packing_records(&self) -> usize {
+        self.meter.maximum_name_page_packing_records()
+    }
+
+    fn charge_name_page_packing_records(
+        &mut self,
+        record_count: usize,
+    ) -> std::result::Result<(), StoreError> {
+        self.meter.charge_name_page_packing_records(record_count)
     }
 
     fn charge_name_page_output(
@@ -7815,19 +7852,43 @@ impl NamePageStorage {
             let height = height.ok_or_else(|| {
                 anyhow::anyhow!("non-empty name-page root has no committed height")
             })?;
-            batch.charge_name_page_packing(&records)?;
             let next_page = self
                 .appender
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
-            let packed = pack_name_page_records_consuming(
+            let required_roots = std::iter::once(root)
+                .chain(snapshot_pins.iter().map(|pin| pin.root))
+                .collect::<Vec<_>>();
+            let maximum_records = batch.maximum_name_page_packing_records();
+            let packed = match pack_reachable_name_page_records_consuming_with_limit(
                 self.state.manifest.generation,
                 self.state.manifest.active_segment,
                 next_page.next_page(),
                 records,
                 &known,
-            )
-            .map_err(|error| anyhow::anyhow!("failed to pack name-page update: {error}"))?;
+                &required_roots,
+                maximum_records,
+            ) {
+                Ok(packed) => packed,
+                Err(PageTreeError::ResourceLimit {
+                    context: NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT,
+                    actual,
+                    ..
+                }) => {
+                    batch.charge_name_page_packing_records(
+                        usize::try_from(actual).unwrap_or(usize::MAX),
+                    )?;
+                    return Err(anyhow::anyhow!(
+                        "reachable name-page packing exceeded its record limit"
+                    ));
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to pack reachable name-page update: {error}"
+                    ));
+                }
+            };
+            batch.charge_name_page_packing_records(packed.record_count())?;
             let address = packed
                 .address(root)
                 .or_else(|| known.get(&root).copied())
@@ -15630,7 +15691,8 @@ mod tests {
         );
         let packing_records =
             BTreeMap::from([(TreeRoot::new(name_node_key), deferred_name_node.clone())]);
-        let packing_charge = ReorgStagedEffectMeter::name_page_packing_charge(&packing_records);
+        let packing_charge =
+            ReorgStagedEffectMeter::name_page_packing_charge(packing_records.len());
         let physical_page_charge = ReorgStagedEffectMeter::name_page_output_charge(1);
         let exact_limit = phase_one_charge
             .checked_add(packing_charge)
@@ -15854,7 +15916,7 @@ mod tests {
             "packing allowance must cover the peak planning phase plus 2x container headroom"
         );
         let records = BTreeMap::from([(TreeRoot::new([0xb1; 32]), vec![0xb2; 8 * 1024])]);
-        let charge = ReorgStagedEffectMeter::name_page_packing_charge(&records);
+        let charge = ReorgStagedEffectMeter::name_page_packing_charge(records.len());
         let limit = charge.checked_sub(1).expect("positive packing charge");
         let mut meter = ReorgStagedEffectMeter::new(limit);
         let error = meter

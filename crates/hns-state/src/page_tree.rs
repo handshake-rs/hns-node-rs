@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -54,6 +54,7 @@ const NAME_PAGE_STATE_BODY_BYTES: usize =
 const NAME_PAGE_STATE_BYTES: usize = NAME_PAGE_STATE_BODY_BYTES + 32;
 pub const NAME_PAGE_STATE_KEY: &[u8] = b"name-page-state/v1";
 pub const NAME_PAGE_SEGMENT_BLOCKS: u32 = 360;
+pub const NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT: &str = "reachable name-page packing records";
 const NAME_PAGE_ROOT_RECORD_VERSION: u32 = 1;
 const NAME_PAGE_ROOT_RECORD_BODY_BYTES: usize = 4 + 32 + 8 + 8 + 4;
 const NAME_PAGE_ROOT_RECORD_BYTES: usize = NAME_PAGE_ROOT_RECORD_BODY_BYTES + 32;
@@ -4251,6 +4252,87 @@ pub fn pack_name_page_records_consuming(
     drop(original_at_position);
     drop(position_of_original);
 
+    pack_ordered_name_page_records(generation, segment, first_page, records, known_addresses)
+}
+
+/// Pack only staged nodes reachable from the requested durable roots.
+///
+/// Multi-block replay produces immutable nodes for every intermediate working
+/// root. Only the final root and explicit rollback pins need publication;
+/// removing the rest before layout avoids permanent page-file write
+/// amplification without changing any reachable content address.
+pub fn pack_reachable_name_page_records_consuming(
+    generation: u64,
+    segment: u32,
+    first_page: u32,
+    records: BTreeMap<TreeRoot, Vec<u8>>,
+    known_addresses: &HashMap<TreeRoot, NamePageAddress>,
+    required_roots: &[TreeRoot],
+) -> Result<PackedNamePages, PageTreeError> {
+    pack_reachable_name_page_records_consuming_with_limit(
+        generation,
+        segment,
+        first_page,
+        records,
+        known_addresses,
+        required_roots,
+        usize::MAX,
+    )
+}
+
+/// Pack the reachable staged graph while bounding scratch metadata before a
+/// traversal entry is allocated. Callers can derive this record ceiling from
+/// a larger cumulative memory/effect budget.
+#[allow(clippy::too_many_arguments)]
+pub fn pack_reachable_name_page_records_consuming_with_limit(
+    generation: u64,
+    segment: u32,
+    first_page: u32,
+    mut records: BTreeMap<TreeRoot, Vec<u8>>,
+    known_addresses: &HashMap<TreeRoot, NamePageAddress>,
+    required_roots: &[TreeRoot],
+    maximum_records: usize,
+) -> Result<PackedNamePages, PageTreeError> {
+    let mut visit_states = HashMap::<TreeRoot, u8>::new();
+    let mut order = Vec::new();
+    let roots = required_roots
+        .iter()
+        .copied()
+        .filter(|root| *root != TreeRoot::ZERO)
+        .collect::<BTreeSet<_>>();
+    for root in roots {
+        if records.contains_key(&root) {
+            visit_reachable_new_record(
+                root,
+                &records,
+                known_addresses,
+                &mut visit_states,
+                &mut order,
+                maximum_records,
+            )?;
+        } else if !known_addresses.contains_key(&root) {
+            return Err(PageTreeError::MissingPackedRecord(root));
+        }
+    }
+    let mut reachable = Vec::with_capacity(order.len());
+    for root in order {
+        let canonical = records
+            .remove(&root)
+            .ok_or(PageTreeError::MissingPackedRecord(root))?;
+        reachable.push((root, canonical));
+    }
+    drop(records);
+    drop(visit_states);
+    pack_ordered_name_page_records(generation, segment, first_page, reachable, known_addresses)
+}
+
+fn pack_ordered_name_page_records(
+    generation: u64,
+    segment: u32,
+    first_page: u32,
+    records: Vec<(TreeRoot, Vec<u8>)>,
+    known_addresses: &HashMap<TreeRoot, NamePageAddress>,
+) -> Result<PackedNamePages, PageTreeError> {
     let mut addresses = HashMap::with_capacity(records.len());
     let mut children = Vec::with_capacity(records.len());
     let mut page_count = 0usize;
@@ -4309,6 +4391,66 @@ pub fn pack_name_page_records_consuming(
         addresses,
         children,
     })
+}
+
+fn visit_reachable_new_record(
+    root: TreeRoot,
+    records: &BTreeMap<TreeRoot, Vec<u8>>,
+    known_addresses: &HashMap<TreeRoot, NamePageAddress>,
+    visit_states: &mut HashMap<TreeRoot, u8>,
+    order: &mut Vec<TreeRoot>,
+    maximum_records: usize,
+) -> Result<(), PageTreeError> {
+    match visit_states.get(&root).copied() {
+        Some(2) => return Ok(()),
+        Some(1) => return Err(PageTreeError::RecordCycle(root)),
+        None => {
+            if visit_states.len() >= maximum_records {
+                return Err(PageTreeError::ResourceLimit {
+                    context: NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT,
+                    limit: u64::try_from(maximum_records).unwrap_or(u64::MAX),
+                    actual: u64::try_from(visit_states.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                });
+            }
+            visit_states.insert(root, 1);
+        }
+        Some(_) => {
+            return Err(PageTreeError::StateCodec(
+                "invalid reachable record visit state".to_owned(),
+            ))
+        }
+    }
+    let raw = records
+        .get(&root)
+        .ok_or(PageTreeError::MissingPackedRecord(root))?;
+    let record = UrkelNodeRecord::decode_ref(raw)?;
+    if record.root() != root {
+        return Err(PageTreeError::RecordKeyMismatch {
+            expected: root,
+            actual: record.root(),
+        });
+    }
+    if let UrkelNodeRecordRef::Internal { left, right, .. } = record {
+        for child in [left, right] {
+            if records.contains_key(&child) {
+                visit_reachable_new_record(
+                    child,
+                    records,
+                    known_addresses,
+                    visit_states,
+                    order,
+                    maximum_records,
+                )?;
+            } else if !known_addresses.contains_key(&child) {
+                return Err(PageTreeError::MissingChildAddress(child));
+            }
+        }
+    }
+    visit_states.insert(root, 2);
+    order.push(root);
+    Ok(())
 }
 
 fn visit_new_record_indexed(
@@ -5261,6 +5403,100 @@ mod tests {
             })
             .expect("validate consuming pack"),
             record_count
+        );
+        drop(reader);
+        std::fs::remove_file(path).expect("remove page fixture");
+    }
+
+    #[test]
+    fn reachable_pack_drops_unpublished_intermediate_graphs() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-reachable-pack-{}-{nonce}.pages",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let target = MemoryUrkel::from_entries((0u16..256).map(|index| {
+            let mut key = [0u8; 32];
+            key[..2].copy_from_slice(&index.to_be_bytes());
+            (NameHash::new(key), vec![0x51; 96])
+        }))
+        .expect("target tree");
+        let unrelated = MemoryUrkel::from_entries((0u16..64).map(|index| {
+            let mut key = [0xff; 32];
+            key[..2].copy_from_slice(&index.to_be_bytes());
+            (NameHash::new(key), vec![0xa7; 80])
+        }))
+        .expect("unrelated tree");
+        let target_root = target.root();
+        let unrelated_root = unrelated.root();
+        let mut records = target.node_records().expect("target records");
+        let target_record_count = records.len();
+        let canonical_allocations = records
+            .iter()
+            .map(|(record_root, canonical)| (*record_root, canonical.as_ptr()))
+            .collect::<HashMap<_, _>>();
+        records.extend(unrelated.node_records().expect("unrelated records"));
+        assert!(records.len() > target_record_count);
+
+        let limit_error = pack_reachable_name_page_records_consuming_with_limit(
+            29,
+            0,
+            0,
+            records.clone(),
+            &HashMap::new(),
+            &[target_root],
+            target_record_count - 1,
+        )
+        .expect_err("reachable traversal must enforce its record ceiling");
+        assert!(matches!(
+            limit_error,
+            PageTreeError::ResourceLimit {
+                context: NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT,
+                limit,
+                actual,
+            } if limit == (target_record_count - 1) as u64
+                && actual == target_record_count as u64
+        ));
+
+        let packed = pack_reachable_name_page_records_consuming(
+            29,
+            0,
+            0,
+            records,
+            &HashMap::new(),
+            &[target_root],
+        )
+        .expect("reachable pack");
+        assert_eq!(packed.record_count(), target_record_count);
+        assert!(packed.address(target_root).is_some());
+        assert!(packed.address(unrelated_root).is_none());
+        for (record_root, canonical) in &packed.records {
+            assert_eq!(
+                canonical_allocations.get(record_root).copied(),
+                Some(canonical.as_ptr()),
+                "reachable canonical payload allocation was copied"
+            );
+        }
+        let root_locator = packed.root_locator(target_root).expect("target locator");
+        let mut appender = NamePageAppender::create_new(&path, 29, 0).expect("create pages");
+        packed
+            .append_consuming_with_reserve(&mut appender, 0)
+            .expect("append reachable pack");
+        drop(appender);
+        let reader = NamePageTreeReader::open(&path, target_root, root_locator)
+            .expect("open reachable pages");
+        assert_eq!(
+            validate_record_tree(target_root, |record_root| {
+                reader
+                    .load(record_root)
+                    .map_err(|error| UrkelError::Storage(error.to_string()))
+            })
+            .expect("validate reachable pack"),
+            target_record_count
         );
         drop(reader);
         std::fs::remove_file(path).expect("remove page fixture");
