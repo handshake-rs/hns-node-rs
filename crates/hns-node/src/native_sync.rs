@@ -4659,7 +4659,7 @@ impl NodeReadHandle {
                 return Ok(true);
             }
             let snapshot = store.snapshot()?;
-            let contiguous = Self::native_sync_contiguous_body_tip_from_snapshot(
+            let contiguous = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
                 &snapshot,
                 headers,
                 stored_tip_hint,
@@ -5114,7 +5114,7 @@ impl NodeReadHandle {
         }
         let (epoch, activation) = self.with_stable_epoch_read(|store, headers| {
             let snapshot = store.snapshot()?;
-            let stored_tip = Self::native_sync_contiguous_body_tip_from_snapshot(
+            let stored_tip = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
                 &snapshot,
                 headers,
                 stored_tip_hint,
@@ -5275,10 +5275,46 @@ impl NodeReadHandle {
         })
     }
 
+    /// Advance an in-process scheduler tip without resolving its payload a
+    /// second time. The scheduler receives its initial tip only from
+    /// `native_sync_contiguous_body_tip`, which authenticates durable bytes,
+    /// and every subsequent advancement below authenticates each new body.
+    /// We still bind the hint to the current canonical header before trusting
+    /// it, so a header reorganization falls back to a fresh authenticated
+    /// scan. Durable checkpoint hints must never enter through this path.
+    fn native_sync_contiguous_body_tip_from_verified_hint(
+        &self,
+        hint: Option<&ChainTip>,
+    ) -> Result<Option<ChainTip>> {
+        self.with_stable_read(|store, headers| {
+            let snapshot = store.snapshot()?;
+            Self::native_sync_contiguous_body_tip_from_snapshot_impl(
+                &snapshot, headers, hint, false,
+            )
+        })
+    }
+
     fn native_sync_contiguous_body_tip_from_snapshot(
         snapshot: &impl ReadSnapshot,
         headers: &impl HeaderIndex,
         hint: Option<&ChainTip>,
+    ) -> Result<Option<ChainTip>> {
+        Self::native_sync_contiguous_body_tip_from_snapshot_impl(snapshot, headers, hint, true)
+    }
+
+    fn native_sync_contiguous_body_tip_from_verified_hint_snapshot(
+        snapshot: &impl ReadSnapshot,
+        headers: &impl HeaderIndex,
+        hint: Option<&ChainTip>,
+    ) -> Result<Option<ChainTip>> {
+        Self::native_sync_contiguous_body_tip_from_snapshot_impl(snapshot, headers, hint, false)
+    }
+
+    fn native_sync_contiguous_body_tip_from_snapshot_impl(
+        snapshot: &impl ReadSnapshot,
+        headers: &impl HeaderIndex,
+        hint: Option<&ChainTip>,
+        authenticate_hint: bool,
     ) -> Result<Option<ChainTip>> {
         let Some(best) = headers.best_tip().map_err(|error| {
             anyhow::anyhow!("failed to read contiguous-body header tip: {error}")
@@ -5295,7 +5331,8 @@ impl NodeReadHandle {
                     .canonical_hash(hint.height)
                     .context("failed to validate stored-tip hint")?
                     == Some(hint.hash)
-                && Self::native_sync_has_block_from_snapshot(snapshot, &hint.hash)?
+                && (!authenticate_hint
+                    || Self::native_sync_has_block_from_snapshot(snapshot, &hint.hash)?)
             {
                 current = Some(hint.clone());
                 start_height = hint.height.saturating_add(1);
@@ -5344,7 +5381,7 @@ impl NodeReadHandle {
         }
         let (contiguous, candidates) = self.with_stable_read(|store, headers| {
             let snapshot = store.snapshot()?;
-            let contiguous = Self::native_sync_contiguous_body_tip_from_snapshot(
+            let contiguous = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
                 &snapshot,
                 headers,
                 hint.as_ref(),
@@ -7977,7 +8014,8 @@ async fn refresh_scheduler_after_validated_store(
     diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
     let refresh_result = (|| -> Result<()> {
-        let stored_tip = node.native_sync_contiguous_body_tip(scheduler.stored_tip())?;
+        let stored_tip =
+            node.native_sync_contiguous_body_tip_from_verified_hint(scheduler.stored_tip())?;
         if scheduler.stored_tip() != stored_tip.as_ref() {
             scheduler.set_stored_tip(stored_tip);
         }
@@ -9602,7 +9640,44 @@ mod tests {
         Address, Coin, Covenant, CovenantKind, Input, Outpoint, Output, Transaction, Txid, Uint256,
         Witness,
     };
+    use std::cell::Cell;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct BlockReadCountingSnapshot<'a, S> {
+        inner: &'a S,
+        block_reads: Cell<usize>,
+    }
+
+    impl<'a, S> BlockReadCountingSnapshot<'a, S> {
+        fn new(inner: &'a S) -> Self {
+            Self {
+                inner,
+                block_reads: Cell::new(0),
+            }
+        }
+    }
+
+    impl<S: ReadSnapshot> ReadSnapshot for BlockReadCountingSnapshot<'_, S> {
+        fn get(
+            &self,
+            family: ColumnFamily,
+            key: &[u8],
+        ) -> std::result::Result<Option<Vec<u8>>, StoreError> {
+            if family == ColumnFamily::Blocks {
+                self.block_reads
+                    .set(self.block_reads.get().saturating_add(1));
+            }
+            self.inner.get(family, key)
+        }
+
+        fn scan_prefix(
+            &self,
+            family: ColumnFamily,
+            prefix: &[u8],
+        ) -> std::result::Result<Vec<hns_store::ScanEntry>, StoreError> {
+            self.inner.scan_prefix(family, prefix)
+        }
+    }
 
     struct RuntimeExtensionBoundaryProbe;
 
@@ -10983,6 +11058,69 @@ mod tests {
             limit,
             actual,
         }
+    }
+
+    #[test]
+    fn process_verified_stored_tip_does_not_reread_its_block_payload() {
+        let mut service = NodeService::new(NodeConfig {
+            network: Network::Regtest,
+            ..NodeConfig::default()
+        });
+        let genesis = service
+            .native_sync_ensure_genesis_header()
+            .expect("genesis header");
+        let block = linked_validator_block(1, &genesis.header);
+        let hash = block.hash();
+        service
+            .native_sync_import_headers(vec![block.header.clone()])
+            .expect("canonical header");
+        service
+            .native_sync_store_validated_blocks(vec![(
+                ValidatedBlock {
+                    sequence: 0,
+                    peer: PeerId(1),
+                    height: 1,
+                    block,
+                },
+                true,
+            )])
+            .expect("stored canonical body");
+        let header = service
+            .state
+            .chain
+            .header(&hash)
+            .expect("header lookup")
+            .expect("stored header");
+        let hint = ChainTip {
+            hash,
+            height: header.height,
+            chainwork: header.chainwork,
+        };
+        let snapshot = service.state.store.snapshot().expect("snapshot");
+
+        let verified = BlockReadCountingSnapshot::new(&snapshot);
+        assert_eq!(
+            NodeReadHandle::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
+                &verified,
+                &service.state.chain,
+                Some(&hint),
+            )
+            .expect("process-verified tip"),
+            Some(hint.clone())
+        );
+        assert_eq!(verified.block_reads.get(), 0);
+
+        let durable = BlockReadCountingSnapshot::new(&snapshot);
+        assert_eq!(
+            NodeReadHandle::native_sync_contiguous_body_tip_from_snapshot(
+                &durable,
+                &service.state.chain,
+                Some(&hint),
+            )
+            .expect("durable tip"),
+            Some(hint)
+        );
+        assert_eq!(durable.block_reads.get(), 1);
     }
 
     #[test]
