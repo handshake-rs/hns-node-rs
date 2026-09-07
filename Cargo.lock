@@ -1507,6 +1507,7 @@ version = "0.3.5"
 dependencies = [
  "fs4",
  "hns-primitives 0.3.5",
+ "hns-urkel",
  "rocksdb",
  "serde",
  "thiserror",

@@ -56,7 +56,7 @@ use hns_store::{
 use hns_urkel::{
     materialize_record_tree, prove_hsd_from_records, reachable_record_roots,
     reachable_record_roots_batched, update_record_tree, update_record_tree_batched,
-    update_record_tree_mutation_trie_prefetched, validate_record_root, validate_record_tree,
+    update_record_tree_mutation_trie_verified, validate_record_root, validate_record_tree,
     validate_record_trees_batched, validate_record_trees_batched_until, MemoryUrkel,
     NameTreeSnapshot, SortedEntryRootAccumulator, UrkelError, UrkelProof, UrkelRecordUpdate,
     URKEL_BITS,
@@ -4309,12 +4309,10 @@ fn calculate_name_tree_update<T: ReadSnapshot>(
         .collect::<Vec<_>>();
     let page_prefetched = snapshot.prefetch_name_tree_paths(*root.as_bytes(), &mutation_keys)?;
     let update = if let Some(prefetched) = page_prefetched {
-        update_record_tree_mutation_trie_prefetched(
+        update_record_tree_mutation_trie_verified(
             root,
             mutations,
-            prefetched
-                .into_iter()
-                .map(|record| (TreeRoot::new(record.root), record.canonical)),
+            prefetched.into_iter().map(|record| record.verified),
             |node_root| load_persisted_node(snapshot, node_root),
         )?
     } else if mutations.len() >= MUTATION_MULTI_GET_THRESHOLD {

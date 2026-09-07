@@ -27,7 +27,10 @@ use hns_store::{
 };
 #[cfg(not(unix))]
 use hns_store::{read_name_page_directory, read_name_page_record};
-use hns_urkel::{BitPrefix, TreeRoot, UrkelError, UrkelNodeRecord, UrkelNodeRecordRef, URKEL_BITS};
+use hns_urkel::{
+    TreeRoot, UrkelError, UrkelNodeRecord, UrkelNodeRecordRef, VerifiedUrkelPathNode,
+    VerifiedUrkelPathRecord, URKEL_BITS,
+};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_PAGE_CACHE_PAGES: usize = 512;
@@ -1884,24 +1887,13 @@ struct CachedNamePageEntry {
 
 #[derive(Clone, Debug)]
 struct LoadedNamePageRecord {
-    canonical: Arc<[u8]>,
+    verified: Arc<VerifiedUrkelPathRecord>,
     discovered: [Option<(TreeRoot, NamePageAddress)>; 2],
-    node: ValidatedNamePageNode,
 }
 
 struct CachedLoadedNamePageRecord {
     canonical: Vec<u8>,
     discovered: [Option<(TreeRoot, NamePageAddress)>; 2],
-}
-
-#[derive(Clone, Debug)]
-enum ValidatedNamePageNode {
-    Leaf,
-    Internal {
-        prefix: BitPrefix,
-        left: TreeRoot,
-        right: TreeRoot,
-    },
 }
 
 #[derive(Debug)]
@@ -2001,7 +1993,7 @@ impl NamePagePathRecordCache {
             if cached.address != address {
                 return Err(PageTreeError::AddressConflict(root));
             }
-            if cached.loaded.canonical != loaded.canonical {
+            if cached.loaded.verified != loaded.verified {
                 return Err(PageTreeError::StateCodec(
                     "name-page path cache found conflicting canonical records".to_owned(),
                 ));
@@ -2011,14 +2003,15 @@ impl NamePagePathRecordCache {
         }
 
         let accounted_bytes = loaded
-            .canonical
-            .len()
+            .verified
+            .resident_bytes()
+            .saturating_add(std::mem::size_of::<LoadedNamePageRecord>())
             .saturating_add(std::mem::size_of::<CachedNamePagePathRecord>())
             .saturating_add(std::mem::size_of::<TreeRoot>());
         if accounted_bytes > self.capacity_bytes {
             return Ok(());
         }
-        let leaf = matches!(&loaded.node, ValidatedNamePageNode::Leaf);
+        let leaf = matches!(loaded.verified.node(), VerifiedUrkelPathNode::Leaf { .. });
         while self.accounted_bytes.saturating_add(accounted_bytes) > self.capacity_bytes {
             if leaf {
                 if !self.evict_one(true) {
@@ -2110,8 +2103,9 @@ impl NamePagePathCache {
     /// Admit records from a durably committed append without reading their
     /// just-written pages back from storage.
     pub fn publish(&self, update: NamePagePathCacheUpdate) -> Result<(), PageTreeError> {
+        let mut records = self.records.lock().map_err(|_| PageTreeError::Poisoned)?;
         for (root, address, loaded) in update.records {
-            self.insert(root, address, loaded)?;
+            records.insert(root, address, loaded)?;
         }
         Ok(())
     }
@@ -2124,7 +2118,7 @@ struct NamePagePathWork {
 }
 
 /// Canonical authenticated path records sharing their page-cache allocation.
-pub type NamePagePathRecords = BTreeMap<TreeRoot, Arc<[u8]>>;
+pub type NamePagePathRecords = HashMap<TreeRoot, Arc<VerifiedUrkelPathRecord>>;
 
 struct NamePagePathTraversal<'a> {
     page_key: (u32, u32),
@@ -2569,11 +2563,8 @@ impl<S: ReadSnapshot> ReadSnapshot for NamePageSnapshot<'_, S> {
             .map(|records| {
                 records.map(|records| {
                     records
-                        .into_iter()
-                        .map(|(root, canonical)| NameTreePathRecord {
-                            root: *root.as_bytes(),
-                            canonical,
-                        })
+                        .into_values()
+                        .map(|verified| NameTreePathRecord { verified })
                         .collect()
                 })
             })
@@ -2964,7 +2955,7 @@ impl NamePageTreeReader {
         keys: &[NameHash],
     ) -> Result<Option<NamePagePathRecords>, PageTreeError> {
         if root == TreeRoot::ZERO || keys.is_empty() {
-            return Ok(Some(BTreeMap::new()));
+            return Ok(Some(NamePagePathRecords::new()));
         }
         let Some(root_address) = self
             .addresses
@@ -3127,9 +3118,9 @@ impl NamePageTreeReader {
     ) -> Result<(), PageTreeError> {
         if let Some(existing) = traversal
             .records
-            .insert(work.root, Arc::clone(&loaded.canonical))
+            .insert(work.root, Arc::clone(&loaded.verified))
         {
-            if existing != loaded.canonical {
+            if existing != loaded.verified {
                 return Err(PageTreeError::StateCodec(
                     "page path prefetch found conflicting canonical records".to_owned(),
                 ));
@@ -3137,11 +3128,11 @@ impl NamePageTreeReader {
         }
         self.insert_discovered(loaded.discovered.into_iter().flatten())?;
 
-        let ValidatedNamePageNode::Internal {
+        let VerifiedUrkelPathNode::Internal {
             prefix,
             left,
             right,
-        } = &loaded.node
+        } = loaded.verified.node()
         else {
             return Ok(());
         };
@@ -4257,29 +4248,36 @@ fn validate_loaded_name_page_record(
     record: NamePageRecord,
     expected: TreeRoot,
 ) -> Result<LoadedNamePageRecord, PageTreeError> {
+    if record.key != *expected.as_bytes() {
+        return Err(PageTreeError::RecordKeyMismatch {
+            expected,
+            actual: TreeRoot::new(record.key),
+        });
+    }
     let children = match record.children.as_slice() {
         [] => [None, None],
         [left, right] => [Some(*left), Some(*right)],
         _ => return Err(PageTreeError::ChildLocatorMismatch(expected)),
     };
-    let (discovered, decoded) =
-        validate_name_page_record_parts(record.key, children, &record.canonical, expected)?;
-    let node = match decoded {
-        UrkelNodeRecordRef::Leaf { .. } => ValidatedNamePageNode::Leaf,
-        UrkelNodeRecordRef::Internal {
-            prefix,
-            left,
-            right,
-        } => ValidatedNamePageNode::Internal {
-            prefix: prefix.to_owned(),
-            left,
-            right,
-        },
+    let verified = Arc::new(VerifiedUrkelPathRecord::decode(
+        expected,
+        Arc::from(record.canonical),
+    )?);
+    let discovered = match verified.node() {
+        VerifiedUrkelPathNode::Leaf { .. } if children != [None, None] => {
+            return Err(PageTreeError::ChildLocatorMismatch(expected));
+        }
+        VerifiedUrkelPathNode::Leaf { .. } => [None, None],
+        VerifiedUrkelPathNode::Internal { left, right, .. } => {
+            let [Some(left_address), Some(right_address)] = children else {
+                return Err(PageTreeError::ChildLocatorMismatch(expected));
+            };
+            [Some((*left, left_address)), Some((*right, right_address))]
+        }
     };
     Ok(LoadedNamePageRecord {
-        canonical: Arc::from(record.canonical),
+        verified,
         discovered,
-        node,
     })
 }
 
@@ -6279,8 +6277,8 @@ mod tests {
             .expect("physical-order path prefetch")
             .expect("page-backed root");
         let after = reader.path_page_read_count();
-        assert!(prefetched.iter().all(|(root, canonical)| {
-            records.get(root).map(Vec::as_slice) == Some(canonical.as_ref())
+        assert!(prefetched.iter().all(|(root, verified)| {
+            records.get(root).map(Vec::as_slice) == Some(verified.canonical().as_ref())
         }));
         assert_eq!(prefetched.len(), records.len());
         assert_eq!(after - before, packed.page_count() as u64);
@@ -6301,8 +6299,8 @@ mod tests {
                 .get(root)
                 .is_some_and(|again| Arc::ptr_eq(canonical, again))
         }));
-        assert!(repeated.iter().all(|(root, canonical)| {
-            records.get(root).map(Vec::as_slice) == Some(canonical.as_ref())
+        assert!(repeated.iter().all(|(root, verified)| {
+            records.get(root).map(Vec::as_slice) == Some(verified.canonical().as_ref())
         }));
         assert_eq!(repeated.len(), records.len());
         assert_eq!(reader.path_page_read_count(), after);
@@ -6328,8 +6326,8 @@ mod tests {
                 .get(root)
                 .is_some_and(|reopened| Arc::ptr_eq(canonical, reopened))
         }));
-        assert!(reopened_prefetch.iter().all(|(root, canonical)| {
-            records.get(root).map(Vec::as_slice) == Some(canonical.as_ref())
+        assert!(reopened_prefetch.iter().all(|(root, verified)| {
+            records.get(root).map(Vec::as_slice) == Some(verified.canonical().as_ref())
         }));
         assert_eq!(reopened_prefetch.len(), records.len());
         assert_eq!(reopened.path_page_read_count(), 0);
@@ -6421,8 +6419,8 @@ mod tests {
             )
             .expect("prefetch seeded paths")
             .expect("page-backed root");
-        assert!(prefetched.iter().all(|(root, canonical)| {
-            records.get(root).map(Vec::as_slice) == Some(canonical.as_ref())
+        assert!(prefetched.iter().all(|(root, verified)| {
+            records.get(root).map(Vec::as_slice) == Some(verified.canonical().as_ref())
         }));
         assert_eq!(prefetched.len(), records.len());
         let stats = reader.path_read_stats();
@@ -6465,11 +6463,17 @@ mod tests {
         let internal_bytes = update
             .records
             .iter()
-            .filter(|(_, _, loaded)| matches!(&loaded.node, ValidatedNamePageNode::Internal { .. }))
+            .filter(|(_, _, loaded)| {
+                matches!(
+                    loaded.verified.node(),
+                    VerifiedUrkelPathNode::Internal { .. }
+                )
+            })
             .map(|(_, _, loaded)| {
                 loaded
-                    .canonical
-                    .len()
+                    .verified
+                    .resident_bytes()
+                    .saturating_add(std::mem::size_of::<LoadedNamePageRecord>())
                     .saturating_add(std::mem::size_of::<CachedNamePagePathRecord>())
                     .saturating_add(std::mem::size_of::<TreeRoot>())
             })
@@ -6477,11 +6481,14 @@ mod tests {
         let leaf_bytes = update
             .records
             .iter()
-            .find(|(_, _, loaded)| matches!(&loaded.node, ValidatedNamePageNode::Leaf))
+            .find(|(_, _, loaded)| {
+                matches!(loaded.verified.node(), VerifiedUrkelPathNode::Leaf { .. })
+            })
             .map(|(_, _, loaded)| {
                 loaded
-                    .canonical
-                    .len()
+                    .verified
+                    .resident_bytes()
+                    .saturating_add(std::mem::size_of::<LoadedNamePageRecord>())
                     .saturating_add(std::mem::size_of::<CachedNamePagePathRecord>())
                     .saturating_add(std::mem::size_of::<TreeRoot>())
             })
@@ -6491,8 +6498,11 @@ mod tests {
             .records
             .iter()
             .filter_map(|(root, address, loaded)| {
-                matches!(&loaded.node, ValidatedNamePageNode::Internal { .. })
-                    .then_some((*root, *address))
+                matches!(
+                    loaded.verified.node(),
+                    VerifiedUrkelPathNode::Internal { .. }
+                )
+                .then_some((*root, *address))
             })
             .collect::<Vec<_>>();
         let leaf_count = update.records.len().saturating_sub(internal.len());

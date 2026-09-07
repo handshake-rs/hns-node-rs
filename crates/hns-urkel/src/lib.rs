@@ -976,6 +976,85 @@ impl UrkelRecordUpdate {
     }
 }
 
+/// One canonically decoded and content-hash-authenticated record from a
+/// storage-native affected-path prefetch.
+///
+/// The compact node projection deliberately omits a leaf's value: mutation
+/// trie construction needs its authenticated key and root, while the shared
+/// canonical allocation already retains the value bytes. This lets page read
+/// workers perform decoding and hashing exactly once without duplicating
+/// potentially large leaf values in the consensus worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedUrkelPathRecord {
+    root: TreeRoot,
+    canonical: Arc<[u8]>,
+    node: VerifiedUrkelPathNode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifiedUrkelPathNode {
+    Leaf {
+        key: NameHash,
+    },
+    Internal {
+        prefix: BitPrefix,
+        left: TreeRoot,
+        right: TreeRoot,
+    },
+}
+
+impl VerifiedUrkelPathRecord {
+    pub fn decode(expected: TreeRoot, canonical: Arc<[u8]>) -> Result<Self, UrkelError> {
+        let decoded = UrkelNodeRecord::decode_ref(&canonical)?;
+        let actual = decoded.root();
+        if actual != expected {
+            return Err(UrkelError::NodeHashMismatch { expected, actual });
+        }
+        let node = match decoded {
+            UrkelNodeRecordRef::Leaf { key, .. } => VerifiedUrkelPathNode::Leaf { key },
+            UrkelNodeRecordRef::Internal {
+                prefix,
+                left,
+                right,
+            } => VerifiedUrkelPathNode::Internal {
+                prefix: prefix.to_owned(),
+                left,
+                right,
+            },
+        };
+        Ok(Self {
+            root: expected,
+            canonical,
+            node,
+        })
+    }
+
+    pub const fn root(&self) -> TreeRoot {
+        self.root
+    }
+
+    pub fn canonical(&self) -> &Arc<[u8]> {
+        &self.canonical
+    }
+
+    pub const fn node(&self) -> &VerifiedUrkelPathNode {
+        &self.node
+    }
+
+    /// Exact owned payload bytes plus the fixed typed authentication record.
+    /// Container hash-table and `Arc` descriptors are accounted by their
+    /// caller because they depend on the cache representation.
+    pub fn resident_bytes(&self) -> usize {
+        let prefix_bytes = match &self.node {
+            VerifiedUrkelPathNode::Leaf { .. } => 0,
+            VerifiedUrkelPathNode::Internal { prefix, .. } => prefix.bytes().len(),
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(self.canonical.len())
+            .saturating_add(prefix_bytes)
+    }
+}
+
 /// Apply inserts/replacements (`Some(value)`) and removals (`None`) by loading
 /// only affected paths from an immutable content-addressed root. Newly built
 /// nodes are returned for atomic persistence; old nodes remain valid for
@@ -1121,11 +1200,88 @@ where
         .into_iter()
         .map(|(key, value)| RecordMutation { key, value })
         .collect::<Vec<_>>();
-    let mut context = RecordMutationContext {
-        load,
-        loaded,
-        records: BTreeMap::new(),
-    };
+    apply_record_mutation_trie(
+        root,
+        mutations,
+        RecordMutationContext {
+            load,
+            loaded,
+            records: BTreeMap::new(),
+        },
+    )
+}
+
+/// Apply one mutation trie using path records already authenticated by a
+/// storage-native read worker.
+///
+/// [`VerifiedUrkelPathRecord`] has private fields and can only be constructed
+/// by canonical decoding plus content-hash verification. Accepting that typed
+/// evidence here removes the former second decode/hash pass on the serialized
+/// consensus worker while preserving the same collision checks for newly
+/// constructed records and fallback loads.
+pub fn update_record_tree_mutation_trie_verified<F, I, P>(
+    root: TreeRoot,
+    updates: I,
+    prefetched: P,
+    load: F,
+) -> Result<UrkelRecordUpdate, UrkelError>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
+    P: IntoIterator<Item = Arc<VerifiedUrkelPathRecord>>,
+{
+    let mut mutations = BTreeMap::<NameHash, Option<Vec<u8>>>::new();
+    for (key, value) in updates {
+        if let Some(value) = value.as_ref() {
+            validate_value_size(value.len())?;
+        }
+        mutations.insert(key, value);
+    }
+    if mutations.is_empty() {
+        return Ok(UrkelRecordUpdate {
+            root,
+            records: BTreeMap::new(),
+        });
+    }
+
+    let mut loaded = AHashMap::new();
+    for record in prefetched {
+        let record_root = record.root();
+        match loaded.entry(record_root) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+            }
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get().as_ref() == record.as_ref() => {}
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(UrkelError::NodeHashCollision(record_root));
+            }
+        }
+    }
+
+    let mutations = mutations
+        .into_iter()
+        .map(|(key, value)| RecordMutation { key, value })
+        .collect::<Vec<_>>();
+    apply_record_mutation_trie(
+        root,
+        mutations,
+        VerifiedRecordMutationContext {
+            load,
+            loaded,
+            records: BTreeMap::new(),
+        },
+    )
+}
+
+fn apply_record_mutation_trie<C>(
+    root: TreeRoot,
+    mutations: Vec<RecordMutation>,
+    mut context: C,
+) -> Result<UrkelRecordUpdate, UrkelError>
+where
+    C: RecordMutationTrieContext,
+{
     let mut frontier = Vec::new();
     collect_record_mutation_frontier(
         &mut context,
@@ -1146,7 +1302,7 @@ where
     let root = build_record_mutation_frontier(&mut context, &frontier, 0)?;
     Ok(UrkelRecordUpdate {
         root,
-        records: context.records,
+        records: context.into_records(),
     })
 }
 
@@ -1154,6 +1310,58 @@ where
 struct RecordMutation {
     key: NameHash,
     value: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecordMutationNode {
+    Leaf {
+        key: NameHash,
+    },
+    Internal {
+        prefix: BitPrefix,
+        left: TreeRoot,
+        right: TreeRoot,
+    },
+}
+
+impl From<&UrkelNodeRecord> for RecordMutationNode {
+    fn from(record: &UrkelNodeRecord) -> Self {
+        match record {
+            UrkelNodeRecord::Leaf { key, .. } => Self::Leaf { key: *key },
+            UrkelNodeRecord::Internal {
+                prefix,
+                left,
+                right,
+            } => Self::Internal {
+                prefix: prefix.clone(),
+                left: *left,
+                right: *right,
+            },
+        }
+    }
+}
+
+impl From<&VerifiedUrkelPathNode> for RecordMutationNode {
+    fn from(record: &VerifiedUrkelPathNode) -> Self {
+        match record {
+            VerifiedUrkelPathNode::Leaf { key } => Self::Leaf { key: *key },
+            VerifiedUrkelPathNode::Internal {
+                prefix,
+                left,
+                right,
+            } => Self::Internal {
+                prefix: prefix.clone(),
+                left: *left,
+                right: *right,
+            },
+        }
+    }
+}
+
+trait RecordMutationTrieContext {
+    fn load_mutation_node(&mut self, root: TreeRoot) -> Result<RecordMutationNode, UrkelError>;
+    fn intern_final_node(&mut self, record: UrkelNodeRecord) -> Result<TreeRoot, UrkelError>;
+    fn into_records(self) -> BTreeMap<TreeRoot, Vec<u8>>;
 }
 
 #[derive(Debug)]
@@ -1178,8 +1386,8 @@ impl RecordMutationFrontier {
     }
 }
 
-fn collect_record_mutation_frontier<F>(
-    context: &mut RecordMutationContext<F>,
+fn collect_record_mutation_frontier<C>(
+    context: &mut C,
     root: TreeRoot,
     depth: usize,
     path_key: NameHash,
@@ -1187,7 +1395,7 @@ fn collect_record_mutation_frontier<F>(
     frontier: &mut Vec<RecordMutationFrontier>,
 ) -> Result<(), UrkelError>
 where
-    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    C: RecordMutationTrieContext,
 {
     if root == TreeRoot::ZERO {
         for mutation in mutations {
@@ -1201,15 +1409,11 @@ where
         return Ok(());
     }
 
-    let record = context.load_record(root)?;
-    match record.as_ref() {
-        UrkelNodeRecord::Leaf {
-            key: existing_key,
-            value: _,
-        } => {
+    match context.load_mutation_node(root)? {
+        RecordMutationNode::Leaf { key: existing_key } => {
             let mut existing = Some((root, None));
             for mutation in mutations {
-                if mutation.key == *existing_key {
+                if mutation.key == existing_key {
                     existing = mutation
                         .value
                         .as_ref()
@@ -1226,11 +1430,11 @@ where
                     frontier.push(RecordMutationFrontier::Existing {
                         root,
                         original_depth: depth,
-                        representative: *existing_key,
+                        representative: existing_key,
                     });
                 } else {
                     frontier.push(RecordMutationFrontier::Leaf {
-                        key: *existing_key,
+                        key: existing_key,
                         value: value
                             .expect("replacement value accompanies a constructed leaf")
                             .clone(),
@@ -1238,12 +1442,12 @@ where
                 }
             }
         }
-        UrkelNodeRecord::Internal {
+        RecordMutationNode::Internal {
             prefix,
             left,
             right,
         } => {
-            let branch_depth = checked_branch_depth(prefix, depth)?;
+            let branch_depth = checked_branch_depth(&prefix, depth)?;
             // The input comes from a BTreeMap and is ordered by the complete
             // 256-bit key. Every key matching one compressed Patricia prefix
             // is therefore one contiguous range. Retain that range as a
@@ -1281,7 +1485,7 @@ where
                 frontier.push(RecordMutationFrontier::Existing {
                     root,
                     original_depth: depth,
-                    representative: internal_record_representative(path_key, depth, prefix, 0),
+                    representative: internal_record_representative(path_key, depth, &prefix, 0),
                 });
                 return Ok(());
             }
@@ -1289,17 +1493,17 @@ where
                 .partition_point(|mutation| key_bit(mutation.key.as_bytes(), branch_depth) == 0);
             let (left_mutations, right_mutations) = matching.split_at(split);
 
-            let left_path = internal_record_representative(path_key, depth, prefix, 0);
+            let left_path = internal_record_representative(path_key, depth, &prefix, 0);
             if left_mutations.is_empty() {
                 frontier.push(RecordMutationFrontier::Existing {
-                    root: *left,
+                    root: left,
                     original_depth: branch_depth + 1,
                     representative: left_path,
                 });
             } else {
                 collect_record_mutation_frontier(
                     context,
-                    *left,
+                    left,
                     branch_depth + 1,
                     left_path,
                     left_mutations,
@@ -1307,17 +1511,17 @@ where
                 )?;
             }
 
-            let right_path = internal_record_representative(path_key, depth, prefix, 1);
+            let right_path = internal_record_representative(path_key, depth, &prefix, 1);
             if right_mutations.is_empty() {
                 frontier.push(RecordMutationFrontier::Existing {
-                    root: *right,
+                    root: right,
                     original_depth: branch_depth + 1,
                     representative: right_path,
                 });
             } else {
                 collect_record_mutation_frontier(
                     context,
-                    *right,
+                    right,
                     branch_depth + 1,
                     right_path,
                     right_mutations,
@@ -1344,13 +1548,13 @@ fn internal_record_representative(
     NameHash::new(key)
 }
 
-fn build_record_mutation_frontier<F>(
-    context: &mut RecordMutationContext<F>,
+fn build_record_mutation_frontier<C>(
+    context: &mut C,
     frontier: &[RecordMutationFrontier],
     depth: usize,
 ) -> Result<TreeRoot, UrkelError>
 where
-    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    C: RecordMutationTrieContext,
 {
     match frontier {
         [] => return Ok(TreeRoot::ZERO),
@@ -1384,24 +1588,24 @@ where
     }
     let left = build_record_mutation_frontier(context, &frontier[..split], branch_depth + 1)?;
     let right = build_record_mutation_frontier(context, &frontier[split..], branch_depth + 1)?;
-    context.intern_final(UrkelNodeRecord::Internal {
+    context.intern_final_node(UrkelNodeRecord::Internal {
         prefix: BitPrefix::from_key_range(first.as_bytes(), depth, shared),
         left,
         right,
     })
 }
 
-fn attach_record_mutation_frontier<F>(
-    context: &mut RecordMutationContext<F>,
+fn attach_record_mutation_frontier<C>(
+    context: &mut C,
     frontier: &RecordMutationFrontier,
     depth: usize,
 ) -> Result<TreeRoot, UrkelError>
 where
-    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+    C: RecordMutationTrieContext,
 {
     match frontier {
         RecordMutationFrontier::Leaf { key, value } => {
-            context.intern_final(UrkelNodeRecord::Leaf {
+            context.intern_final_node(UrkelNodeRecord::Leaf {
                 key: *key,
                 value: value.clone(),
             })
@@ -1414,20 +1618,19 @@ where
             if depth == *original_depth {
                 return Ok(*root);
             }
-            let record = context.load_record(*root)?;
-            match record.as_ref() {
-                UrkelNodeRecord::Leaf { .. } => Ok(*root),
-                UrkelNodeRecord::Internal {
+            match context.load_mutation_node(*root)? {
+                RecordMutationNode::Leaf { .. } => Ok(*root),
+                RecordMutationNode::Internal {
                     prefix,
                     left,
                     right,
                 } => {
                     let prefix =
-                        rebase_record_prefix(prefix, *representative, *original_depth, depth)?;
-                    context.intern_final(UrkelNodeRecord::Internal {
+                        rebase_record_prefix(&prefix, *representative, *original_depth, depth)?;
+                    context.intern_final_node(UrkelNodeRecord::Internal {
                         prefix,
-                        left: *left,
-                        right: *right,
+                        left,
+                        right,
                     })
                 }
             }
@@ -1856,6 +2059,81 @@ where
                 Ok((next, true))
             }
         }
+    }
+}
+
+impl<F> RecordMutationTrieContext for RecordMutationContext<F>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    fn load_mutation_node(&mut self, root: TreeRoot) -> Result<RecordMutationNode, UrkelError> {
+        self.load_record(root)
+            .map(|record| RecordMutationNode::from(record.as_ref()))
+    }
+
+    fn intern_final_node(&mut self, record: UrkelNodeRecord) -> Result<TreeRoot, UrkelError> {
+        self.intern_final(record)
+    }
+
+    fn into_records(self) -> BTreeMap<TreeRoot, Vec<u8>> {
+        self.records
+    }
+}
+
+struct VerifiedRecordMutationContext<F> {
+    load: F,
+    loaded: AHashMap<TreeRoot, Arc<VerifiedUrkelPathRecord>>,
+    records: BTreeMap<TreeRoot, Vec<u8>>,
+}
+
+impl<F> RecordMutationTrieContext for VerifiedRecordMutationContext<F>
+where
+    F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
+{
+    fn load_mutation_node(&mut self, root: TreeRoot) -> Result<RecordMutationNode, UrkelError> {
+        if root == TreeRoot::ZERO {
+            return Err(UrkelError::InvalidNode(
+                "attempted to load the empty Urkel root as a record".to_owned(),
+            ));
+        }
+        if !self.loaded.contains_key(&root) {
+            let canonical = (self.load)(root)?.ok_or(UrkelError::MissingNode(root))?;
+            let record = Arc::new(VerifiedUrkelPathRecord::decode(root, Arc::from(canonical))?);
+            self.loaded.insert(root, record);
+        }
+        self.loaded
+            .get(&root)
+            .map(|record| RecordMutationNode::from(record.node()))
+            .ok_or_else(|| {
+                UrkelError::InvalidNode(format!(
+                    "verified mutation record {root:?} disappeared from its cache"
+                ))
+            })
+    }
+
+    fn intern_final_node(&mut self, record: UrkelNodeRecord) -> Result<TreeRoot, UrkelError> {
+        let root = record.root();
+        let raw = record.encode()?;
+        if let Some(existing) = self.loaded.get(&root) {
+            if existing.canonical().as_ref() != raw {
+                return Err(UrkelError::NodeHashCollision(root));
+            }
+            return Ok(root);
+        }
+        match self.records.entry(root) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(raw);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &raw => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(UrkelError::NodeHashCollision(root));
+            }
+        }
+        Ok(root)
+    }
+
+    fn into_records(self) -> BTreeMap<TreeRoot, Vec<u8>> {
+        self.records
     }
 }
 
@@ -3925,13 +4203,30 @@ mod tests {
         .expect("sequential update");
         let actual = update_record_tree_mutation_trie_prefetched(
             tree.root(),
-            updates,
+            updates.clone(),
             records.clone(),
             |_record_root| panic!("complete prefetch must cover mutation-trie fallback loads"),
         )
         .expect("mutation-trie update");
+        let verified = records
+            .iter()
+            .map(|(root, raw)| {
+                Arc::new(
+                    VerifiedUrkelPathRecord::decode(*root, Arc::from(raw.clone()))
+                        .expect("authenticate prefetched record"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let typed = update_record_tree_mutation_trie_verified(
+            tree.root(),
+            updates,
+            verified,
+            |_record_root| panic!("complete verified prefetch must not fall back to loading"),
+        )
+        .expect("typed verified mutation-trie update");
 
         assert_eq!(actual.root(), expected.root());
+        assert_eq!(typed, actual);
         let mut merged = records;
         merged.extend(actual.records().clone());
         validate_record_tree(actual.root(), |record_root| {
@@ -3942,6 +4237,34 @@ mod tests {
             actual.records().len() < 1_500,
             "shared frontier should remain proportional to the final path union"
         );
+    }
+
+    #[test]
+    fn verified_path_record_is_compact_and_fails_closed() {
+        let leaf = UrkelNodeRecord::Leaf {
+            key: key(7),
+            value: vec![9; 8_192],
+        };
+        let root = leaf.root();
+        let canonical = Arc::<[u8]>::from(leaf.encode().expect("encode leaf"));
+        let verified =
+            VerifiedUrkelPathRecord::decode(root, Arc::clone(&canonical)).expect("verify leaf");
+        assert_eq!(verified.root(), root);
+        assert!(Arc::ptr_eq(verified.canonical(), &canonical));
+        assert!(matches!(
+            verified.node(),
+            VerifiedUrkelPathNode::Leaf { key: actual } if *actual == key(7)
+        ));
+
+        let wrong = TreeRoot::new([0x55; 32]);
+        assert!(matches!(
+            VerifiedUrkelPathRecord::decode(wrong, Arc::clone(&canonical)),
+            Err(UrkelError::NodeHashMismatch { expected, actual })
+                if expected == wrong && actual == root
+        ));
+        let mut malformed = canonical.to_vec();
+        malformed.push(0);
+        assert!(VerifiedUrkelPathRecord::decode(root, Arc::from(malformed)).is_err());
     }
 
     #[test]
