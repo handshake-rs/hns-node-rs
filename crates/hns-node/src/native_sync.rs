@@ -4648,15 +4648,20 @@ impl NodeReadHandle {
                 .iter()
                 .map(|validated| {
                     let hash = validated.block.hash();
-                    let parent_available = validated.block.header == genesis
-                        || Self::native_sync_has_block_from_snapshot(
-                            snapshot,
-                            &validated.block.header.prev_block,
-                        )?;
                     let canonical = headers
                         .canonical_hash(validated.height)
                         .map(|canonical| canonical == Some(hash))
                         .context("failed to read canonical native-sync header")?;
+                    // Canonical header ancestry is already independently
+                    // validated. Avoid decoding the preceding block body for
+                    // the overwhelmingly common IBD path; alternate branches
+                    // still have to demonstrate that their parent is durable.
+                    let parent_available = canonical
+                        || validated.block.header == genesis
+                        || Self::native_sync_has_block_from_snapshot(
+                            snapshot,
+                            &validated.block.header.prev_block,
+                        )?;
                     Ok((parent_available, canonical))
                 })
                 .collect()
@@ -4672,7 +4677,7 @@ impl NodeReadHandle {
     ) -> Result<bool> {
         let horizon = Height::try_from(self.config().native_sync.orphan_blocks)
             .context("orphan block horizon exceeds the canonical height range")?;
-        let (_, in_horizon) = self.with_stable_chain_read(|snapshot, headers| {
+        let (_, in_horizon) = self.with_stable_chain_read(|_snapshot, headers| {
             if headers
                 .canonical_hash(height)
                 .context("failed to read canonical native-sync header")?
@@ -4680,14 +4685,20 @@ impl NodeReadHandle {
             {
                 return Ok(true);
             }
-            let contiguous = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
-                snapshot,
-                headers,
-                stored_tip_hint,
-            )?;
-            let start = contiguous
-                .as_ref()
-                .map_or(0, |tip| tip.height.saturating_add(1));
+            let hint_is_canonical = match stored_tip_hint {
+                Some(tip) if tip.height <= height => {
+                    headers
+                        .canonical_hash(tip.height)
+                        .context("failed to validate stored-tip horizon hint")?
+                        == Some(tip.hash)
+                }
+                _ => false,
+            };
+            let start = if hint_is_canonical {
+                stored_tip_hint.map_or(0, |tip| tip.height.saturating_add(1))
+            } else {
+                0
+            };
             Ok(horizon != 0 && height >= start && height < start.saturating_add(horizon))
         })?;
         Ok(in_horizon)
@@ -5311,23 +5322,6 @@ impl NodeReadHandle {
         Ok(tip)
     }
 
-    /// Advance an in-process scheduler tip without resolving its payload a
-    /// second time. The scheduler receives its initial tip only from
-    /// `native_sync_contiguous_body_tip`, which authenticates durable bytes,
-    /// and every subsequent advancement below authenticates each new body.
-    /// We still bind the hint to the current canonical header before trusting
-    /// it, so a header reorganization falls back to a fresh authenticated
-    /// scan. Durable checkpoint hints must never enter through this path.
-    fn native_sync_contiguous_body_tip_from_verified_hint(
-        &self,
-        hint: Option<&ChainTip>,
-    ) -> Result<Option<ChainTip>> {
-        let (_, tip) = self.with_stable_chain_read(|snapshot, headers| {
-            Self::native_sync_contiguous_body_tip_from_snapshot_impl(snapshot, headers, hint, false)
-        })?;
-        Ok(tip)
-    }
-
     fn native_sync_contiguous_body_tip_from_snapshot(
         snapshot: &impl ReadSnapshot,
         headers: &impl HeaderIndex,
@@ -5413,41 +5407,89 @@ impl NodeReadHandle {
         if body_window == 0 {
             anyhow::bail!("orphan block horizon is zero");
         }
-        let (_, (contiguous, candidates)) = self.with_stable_chain_read(|snapshot, headers| {
-            let contiguous = Self::native_sync_contiguous_body_tip_from_verified_hint_snapshot(
-                snapshot,
-                headers,
-                hint.as_ref(),
-            )?;
-            let Some(best) = headers.best_tip().map_err(|error| {
-                anyhow::anyhow!("failed to read body-queue header tip: {error}")
-            })?
-            else {
-                return Ok((contiguous, Vec::new()));
-            };
-            let start_height = contiguous
-                .as_ref()
-                .map_or(0, |tip| tip.height.saturating_add(1));
-            // Canonical validated bodies are durable even when a lower parent
-            // body has not arrived, but this bounded horizon prevents an
-            // unbounded future-body range on disk.
-            let last_height = start_height
-                .saturating_add(body_window.saturating_sub(1))
-                .min(best.height);
-            let mut candidates = Vec::new();
-            for height in start_height..=last_height {
-                let Some(hash) = headers
-                    .canonical_hash(height)
-                    .context("failed to read canonical body target")?
+        let (_, (contiguous, candidates, authenticated)) =
+            self.with_stable_chain_read(|snapshot, headers| {
+                let Some(best) = headers.best_tip().map_err(|error| {
+                    anyhow::anyhow!("failed to read body-queue header tip: {error}")
+                })?
                 else {
-                    break;
+                    return Ok((None, Vec::new(), Vec::new()));
                 };
-                if !Self::native_sync_has_block_from_snapshot(snapshot, &hash)? {
-                    candidates.push((hash, height));
+
+                let mut authenticated = Vec::<(BlockHash, Height)>::new();
+                let mut contiguous = None;
+                let mut start_height = 0;
+                if let Some(hint) = &hint {
+                    if hint.height <= best.height
+                        && headers
+                            .canonical_hash(hint.height)
+                            .context("failed to validate stored-tip queue hint")?
+                            == Some(hint.hash)
+                    {
+                        contiguous = Some(hint.clone());
+                        start_height = hint.height.saturating_add(1);
+                    }
                 }
-            }
-            Ok((contiguous, candidates))
-        })?;
+                for height in start_height..=best.height {
+                    let Some(hash) = headers
+                        .canonical_hash(height)
+                        .context("failed to inspect canonical body frontier")?
+                    else {
+                        break;
+                    };
+                    let available = if scheduler.is_verified_stored_block(&hash, height) {
+                        true
+                    } else {
+                        let available = Self::native_sync_has_block_from_snapshot(snapshot, &hash)?;
+                        if available {
+                            authenticated.push((hash, height));
+                        }
+                        available
+                    };
+                    if !available {
+                        break;
+                    }
+                    let record = Self::native_sync_header_record_from_snapshot(snapshot, &hash)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("canonical header {} is missing", hash.to_hex())
+                        })?;
+                    contiguous = Some(ChainTip {
+                        hash,
+                        height: record.height,
+                        chainwork: record.chainwork,
+                    });
+                }
+                let start_height = contiguous
+                    .as_ref()
+                    .map_or(0, |tip| tip.height.saturating_add(1));
+                // Canonical validated bodies are durable even when a lower parent
+                // body has not arrived, but this bounded horizon prevents an
+                // unbounded future-body range on disk.
+                let last_height = start_height
+                    .saturating_add(body_window.saturating_sub(1))
+                    .min(best.height);
+                let mut candidates = Vec::new();
+                for height in start_height..=last_height {
+                    let Some(hash) = headers
+                        .canonical_hash(height)
+                        .context("failed to read canonical body target")?
+                    else {
+                        break;
+                    };
+                    if scheduler.is_verified_stored_block(&hash, height) {
+                        continue;
+                    }
+                    if Self::native_sync_has_block_from_snapshot(snapshot, &hash)? {
+                        authenticated.push((hash, height));
+                    } else {
+                        candidates.push((hash, height));
+                    }
+                }
+                Ok((contiguous, candidates, authenticated))
+            })?;
+        for (hash, height) in authenticated {
+            scheduler.remember_verified_stored_block(hash, height);
+        }
         if scheduler.stored_tip() != contiguous.as_ref() {
             scheduler.set_stored_tip(contiguous.clone());
         }
@@ -7426,7 +7468,11 @@ async fn accept_peer_block_inner(
         anyhow::bail!("peer {:?} sent known invalid block {}", peer, hash.to_hex());
     }
     if has_body {
-        scheduler.complete_block(hash);
+        let height = record
+            .as_ref()
+            .map(|record| record.height)
+            .ok_or_else(|| anyhow::anyhow!("authenticated stored body has no block index"))?;
+        scheduler.complete_block_at(hash, height);
         return Ok(());
     }
     if record.is_none() {
@@ -8016,15 +8062,7 @@ async fn refresh_scheduler_after_validated_store(
     scheduler: &mut SyncScheduler,
     diagnostics: &Arc<RwLock<NativeSyncDiagnostics>>,
 ) -> Result<()> {
-    let refresh_result = (|| -> Result<()> {
-        let stored_tip =
-            node.native_sync_contiguous_body_tip_from_verified_hint(scheduler.stored_tip())?;
-        if scheduler.stored_tip() != stored_tip.as_ref() {
-            scheduler.set_stored_tip(stored_tip);
-        }
-        node.native_sync_queue_missing_canonical_bodies(scheduler)?;
-        Ok(())
-    })();
+    let refresh_result = node.native_sync_queue_missing_canonical_bodies(scheduler);
     if let Err(error) = refresh_result {
         if !canonical_writer_busy(&error) {
             return Err(error);
@@ -8192,8 +8230,8 @@ async fn handle_validated_blocks_inner(
     {
         anyhow::bail!("durable validated-body batch result is not input-order exact");
     }
-    for hash in &expected {
-        scheduler.complete_block(*hash);
+    for record in &stored {
+        scheduler.complete_block_at(record.hash, record.height);
     }
     let stored_count = u64::try_from(stored.len()).unwrap_or(u64::MAX);
     update_diagnostics(context.diagnostics, |state| {

@@ -191,6 +191,11 @@ pub struct SyncScheduler {
     best_header: Option<ChainTip>,
     active_tip: Option<ChainTip>,
     stored_tip: Option<ChainTip>,
+    /// Canonical bodies authenticated or written by this process beyond the
+    /// contiguous stored tip. Keeping this exact height/hash window prevents a
+    /// lower missing body from forcing every later durable body to be decoded
+    /// again on each scheduler poll.
+    verified_stored: BTreeMap<Height, BlockHash>,
     target_height: Option<Height>,
     validated_blocks: u64,
     failed_blocks: u64,
@@ -215,6 +220,7 @@ impl SyncScheduler {
             best_header: None,
             active_tip: None,
             stored_tip: None,
+            verified_stored: BTreeMap::new(),
             target_height: None,
             validated_blocks: 0,
             failed_blocks: 0,
@@ -369,6 +375,23 @@ impl SyncScheduler {
     }
 
     pub fn set_stored_tip(&mut self, tip: Option<ChainTip>) {
+        let retreats_or_replaces = match (&self.stored_tip, &tip) {
+            (_, None) => true,
+            (Some(previous), Some(next)) => {
+                next.height < previous.height
+                    || (next.height == previous.height && next.hash != previous.hash)
+            }
+            (None, Some(_)) => false,
+        };
+        if retreats_or_replaces {
+            self.verified_stored.clear();
+        }
+        if let Some(tip) = &tip {
+            self.verified_stored = match tip.height.checked_add(1) {
+                Some(first_unconsumed) => self.verified_stored.split_off(&first_unconsumed),
+                None => BTreeMap::new(),
+            };
+        }
         self.stored_tip = tip;
         self.update_stage();
         self.bump_sequence();
@@ -376,6 +399,29 @@ impl SyncScheduler {
 
     pub fn stored_tip(&self) -> Option<&ChainTip> {
         self.stored_tip.as_ref()
+    }
+
+    /// Return whether this exact canonical height/hash body was authenticated
+    /// or atomically stored by the current process.
+    pub fn is_verified_stored_block(&self, hash: &BlockHash, height: Height) -> bool {
+        self.verified_stored.get(&height) == Some(hash)
+    }
+
+    /// Remember one process-verified durable body in a bounded, closest-first
+    /// frontier. Entries beyond capacity are only a performance hint and may
+    /// be authenticated from storage again when they approach the gap.
+    pub fn remember_verified_stored_block(&mut self, hash: BlockHash, height: Height) {
+        if self
+            .stored_tip
+            .as_ref()
+            .is_some_and(|tip| height <= tip.height)
+        {
+            return;
+        }
+        self.verified_stored.insert(height, hash);
+        while self.verified_stored.len() > self.limits.maximum_pending_blocks {
+            self.verified_stored.pop_last();
+        }
     }
 
     pub fn available_pending_slots(&self) -> usize {
@@ -618,6 +664,13 @@ impl SyncScheduler {
         self.validated_blocks = self.validated_blocks.saturating_add(1);
         self.update_stage();
         self.bump_sequence();
+    }
+
+    /// Complete a body and retain its exact process-verified height/hash until
+    /// the contiguous stored frontier consumes it.
+    pub fn complete_block_at(&mut self, hash: BlockHash, height: Height) {
+        self.complete_block(hash);
+        self.remember_verified_stored_block(hash, height);
     }
 
     /// Return already-reserved body work to the pending queue without
@@ -1846,6 +1899,39 @@ mod tests {
         assert_eq!(scheduler.stage(), SyncStage::BackgroundVerify);
         scheduler.set_active_tip(Some(tip(1, 5)));
         assert_eq!(scheduler.stage(), SyncStage::Synced);
+    }
+
+    #[test]
+    fn process_verified_body_cache_is_exact_bounded_and_frontier_consumed() {
+        let now = Instant::now();
+        let mut scheduler = SyncScheduler::new(
+            SyncLimits {
+                maximum_pending_blocks: 2,
+                ..SyncLimits::default()
+            },
+            now,
+        )
+        .expect("scheduler");
+        let first = BlockHash::new([1; 32]);
+        let second = BlockHash::new([2; 32]);
+        let third = BlockHash::new([3; 32]);
+
+        scheduler.remember_verified_stored_block(third, 3);
+        scheduler.remember_verified_stored_block(first, 1);
+        scheduler.remember_verified_stored_block(second, 2);
+        assert!(scheduler.is_verified_stored_block(&first, 1));
+        assert!(scheduler.is_verified_stored_block(&second, 2));
+        assert!(!scheduler.is_verified_stored_block(&third, 3));
+        assert!(!scheduler.is_verified_stored_block(&first, 2));
+
+        scheduler.set_stored_tip(Some(tip(1, 1)));
+        assert!(!scheduler.is_verified_stored_block(&first, 1));
+        assert!(scheduler.is_verified_stored_block(&second, 2));
+        scheduler.remember_verified_stored_block(first, 1);
+        assert!(!scheduler.is_verified_stored_block(&first, 1));
+
+        scheduler.set_stored_tip(Some(tip(9, 1)));
+        assert!(scheduler.verified_stored.is_empty());
     }
 
     #[test]
