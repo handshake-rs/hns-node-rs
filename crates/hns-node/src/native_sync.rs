@@ -1143,6 +1143,15 @@ pub struct NativeSyncDiagnostics {
     /// Authenticated name-page packing and append preparation in that activation.
     #[serde(default)]
     pub active_state_last_name_page_prepare_micros: u64,
+    /// Physical authenticated name pages read in that activation.
+    #[serde(default)]
+    pub active_state_last_name_page_path_pages_read: u64,
+    /// Authenticated records decoded from those physical pages.
+    #[serde(default)]
+    pub active_state_last_name_page_path_records_read: u64,
+    /// Records served by the bounded cache shared across activation slices.
+    #[serde(default)]
+    pub active_state_last_name_page_path_cache_hits: u64,
     /// Durable RocksDB publication and page-state finalization in that activation.
     #[serde(default)]
     pub active_state_last_store_publication_micros: u64,
@@ -1243,6 +1252,9 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) utxo_prefetch_micros: u64,
     pub(super) utxos_prefetched: usize,
     pub(super) name_page_prepare_micros: u64,
+    pub(super) name_page_path_pages_read: u64,
+    pub(super) name_page_path_records_read: u64,
+    pub(super) name_page_path_cache_hits: u64,
     pub(super) store_publication_micros: u64,
     pub(super) post_commit_micros: u64,
     pub(super) workload: ActiveStateWorkload,
@@ -5040,6 +5052,9 @@ impl NodeService {
                     utxo_prefetch_micros: reorg.timings.utxo_prefetch_micros,
                     utxos_prefetched: reorg.timings.utxos_prefetched,
                     name_page_prepare_micros: reorg.timings.name_page_prepare_micros,
+                    name_page_path_pages_read: reorg.timings.name_page_path_pages_read,
+                    name_page_path_records_read: reorg.timings.name_page_path_records_read,
+                    name_page_path_cache_hits: reorg.timings.name_page_path_cache_hits,
                     store_publication_micros: reorg.timings.store_publication_micros,
                     post_commit_micros,
                     workload: committed_workload,
@@ -8730,6 +8745,10 @@ async fn complete_stored_active_state_slice<P: ActiveStateOrphanPool>(
             state.active_state_last_utxo_prefetch_micros = outcome.utxo_prefetch_micros;
             state.active_state_last_utxos_prefetched = outcome.utxos_prefetched;
             state.active_state_last_name_page_prepare_micros = outcome.name_page_prepare_micros;
+            state.active_state_last_name_page_path_pages_read = outcome.name_page_path_pages_read;
+            state.active_state_last_name_page_path_records_read =
+                outcome.name_page_path_records_read;
+            state.active_state_last_name_page_path_cache_hits = outcome.name_page_path_cache_hits;
             state.active_state_last_store_publication_micros = outcome.store_publication_micros;
             state.active_state_last_post_commit_micros = outcome.post_commit_micros;
             state.active_state_last_prepared_blocks = preparation.blocks;

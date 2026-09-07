@@ -2108,6 +2108,17 @@ pub struct NamePageTreeReader {
     cache: Mutex<PageCache>,
     path_records: NamePagePathCache,
     path_page_reads: AtomicU64,
+    path_record_reads: AtomicU64,
+    path_cache_hits: AtomicU64,
+}
+
+/// Physical-I/O and shared-cache work performed while loading authenticated
+/// name-tree paths for one reader lifetime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NamePagePathReadStats {
+    pub pages: u64,
+    pub records: u64,
+    pub cache_hits: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2629,6 +2640,8 @@ impl NamePageTreeReader {
             cache: Mutex::new(PageCache::new(cache_pages)),
             path_records,
             path_page_reads: AtomicU64::new(0),
+            path_record_reads: AtomicU64::new(0),
+            path_cache_hits: AtomicU64::new(0),
         })
     }
 
@@ -2957,6 +2970,7 @@ impl NamePageTreeReader {
                         )?;
                         let loaded =
                             Arc::new(validate_loaded_name_page_record(&record, work.root)?);
+                        self.path_record_reads.fetch_add(1, Ordering::Relaxed);
                         self.path_records
                             .insert(work.root, address, Arc::clone(&loaded))?;
                         loaded
@@ -2984,7 +2998,11 @@ impl NamePageTreeReader {
         root: TreeRoot,
         address: NamePageAddress,
     ) -> Result<Option<Arc<LoadedNamePageRecord>>, PageTreeError> {
-        self.path_records.get(root, address)
+        let loaded = self.path_records.get(root, address)?;
+        if loaded.is_some() {
+            self.path_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(loaded)
     }
 
     fn consume_name_page_path_record(
@@ -3740,7 +3758,19 @@ impl NamePageTreeReader {
 
     #[cfg(test)]
     fn path_page_read_count(&self) -> u64 {
-        self.path_page_reads.load(Ordering::Relaxed)
+        self.path_read_stats().pages
+    }
+
+    /// Return monotonic counters for authenticated path loading by this
+    /// reader. These distinguish physical page/record work from hits in the
+    /// bounded cache shared across consecutive activation slices.
+    #[must_use]
+    pub fn path_read_stats(&self) -> NamePagePathReadStats {
+        NamePagePathReadStats {
+            pages: self.path_page_reads.load(Ordering::Relaxed),
+            records: self.path_record_reads.load(Ordering::Relaxed),
+            cache_hits: self.path_cache_hits.load(Ordering::Relaxed),
+        }
     }
 
     fn insert_discovered<I>(&self, discovered: I) -> Result<(), PageTreeError>

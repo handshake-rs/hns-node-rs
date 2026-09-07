@@ -193,7 +193,7 @@ use tokio::{
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 19;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 20;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -6709,6 +6709,9 @@ struct NodeReorgTimings {
     utxo_prefetch_micros: u64,
     utxos_prefetched: usize,
     name_page_prepare_micros: u64,
+    name_page_path_pages_read: u64,
+    name_page_path_records_read: u64,
+    name_page_path_cache_hits: u64,
     store_publication_micros: u64,
 }
 
@@ -11768,6 +11771,7 @@ impl NodeState {
         let publication = self.prepare_index_publication(&index_updates)?;
         drop(staged);
         let staged_nodes = overlay.take_staged_family(ColumnFamily::NameTreeNodes);
+        let path_read_stats = reader.path_read_stats();
         let known = reader.into_known_addresses().map_err(|error| {
             anyhow::anyhow!("failed to transfer traversal page addresses: {error}")
         })?;
@@ -11799,6 +11803,9 @@ impl NodeState {
         };
         timings.name_page_prepare_micros =
             u64::try_from(name_page_prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        timings.name_page_path_pages_read = path_read_stats.pages;
+        timings.name_page_path_records_read = path_read_stats.records;
+        timings.name_page_path_cache_hits = path_read_stats.cache_hits;
         drop(raw);
         let store_publication_started = Instant::now();
         let publication_result = self.commit_index_publication(publication, move |state| {
@@ -12771,14 +12778,16 @@ impl NodeState {
         } else {
             BTreeMap::new()
         };
-        let known = match page_reader {
-            Some(reader) => Some(
-                reader
+        let (known, name_page_path_read_stats) = match page_reader {
+            Some(reader) => {
+                let stats = reader.path_read_stats();
+                let known = reader
                     .into_known_addresses()
                     .map_err(anyhow::Error::new)
-                    .map_err(ChainActivationFailure::Internal)?,
-            ),
-            None => None,
+                    .map_err(ChainActivationFailure::Internal)?;
+                (Some(known), stats)
+            }
+            None => (None, hns_state::NamePagePathReadStats::default()),
         };
         let (batch, meter, operation_charges) = batch.into_parts();
         let mut batch = ReorgMeteredBatch::with_operation_charges(
@@ -12882,6 +12891,9 @@ impl NodeState {
                 utxo_prefetch_micros,
                 utxos_prefetched,
                 name_page_prepare_micros,
+                name_page_path_pages_read: name_page_path_read_stats.pages,
+                name_page_path_records_read: name_page_path_read_stats.records,
+                name_page_path_cache_hits: name_page_path_read_stats.cache_hits,
                 store_publication_micros,
             },
         })
