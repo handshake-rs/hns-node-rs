@@ -11332,7 +11332,7 @@ mod tests {
         assert_eq!(
             NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD
                 / NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
-            8,
+            4,
         );
     }
 

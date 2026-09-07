@@ -234,9 +234,11 @@ const PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES: u64 = 4 * 1024 * 1024 
 const NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD: u32 = 16;
 // Rewriting the complete authenticated name tree every sixteen segments makes
 // initial synchronization spend most of its wall time copying live pages. A
-// larger catch-up threshold still caps one generation at 46,080 blocks while
-// routine reclamation resumes as soon as native sync reaches its peer target.
-const NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD: u32 = 128;
+// larger catch-up threshold still caps one generation at 23,040 blocks while
+// avoiding the measured random-read amplification of 100+ increasingly large
+// segments. Routine reclamation resumes as soon as native sync reaches its
+// peer target.
+const NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD: u32 = 64;
 const MAX_NAME_PAGE_GENERATION_BYTES: u64 = 150_000_000_000;
 const MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES: u64 = 10_000_000_000;
 const MAX_NAME_PAGE_VALIDATION_SPILL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
