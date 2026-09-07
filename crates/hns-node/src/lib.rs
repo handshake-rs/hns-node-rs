@@ -4613,7 +4613,7 @@ impl NodeService {
             },
             mining: mutation.mining,
             truncated_direct_connect_limit: None,
-            timings: NodeReorgTimings::default(),
+            timings: mutation.timings,
         })
     }
 
@@ -6621,6 +6621,7 @@ impl PreparedNativeActivation {
 struct NodeBlockMutation {
     record: BlockIndexRecord,
     mining: DurableMiningState,
+    timings: NodeReorgTimings,
 }
 
 #[derive(Clone, Debug)]
@@ -11670,8 +11671,16 @@ impl NodeState {
         let chain_epoch = next_chain_epoch(&snapshot)?;
         let previous = load_block_index_record(&snapshot, &request.block.hash())?;
         let mut batch = self.store.batch();
+        let block_staging_started = Instant::now();
         let staged_connect =
             self.stage_connect(&snapshot, &mut batch, &request, validated, persist_raw_body)?;
+        let timings = NodeReorgTimings {
+            block_staging_micros: u64::try_from(block_staging_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX),
+            wallet_index_micros: staged_connect.wallet_index_micros,
+            consensus_state_micros: staged_connect.consensus_state_micros,
+            ..NodeReorgTimings::default()
+        };
         let record = staged_connect.current.block.clone();
         let mut index_updates = Vec::with_capacity(staged_connect.pruned.len().saturating_add(1));
         index_updates.push(IndexStatusUpdate {
@@ -11699,6 +11708,7 @@ impl NodeState {
         Ok(NodeBlockMutation {
             record,
             mining: self.durable_mining_state()?,
+            timings,
         })
     }
 
@@ -11723,8 +11733,16 @@ impl NodeState {
         let chain_epoch = next_chain_epoch(&staged)?;
         let previous = load_block_index_record(&staged, &request.block.hash())?;
         let mut batch = overlay.batch_with_deferred_name_tree_nodes(store.batch());
+        let block_staging_started = Instant::now();
         let staged_connect =
             self.stage_connect(&staged, &mut batch, &request, validated, persist_raw_body)?;
+        let mut timings = NodeReorgTimings {
+            block_staging_micros: u64::try_from(block_staging_started.elapsed().as_micros())
+                .unwrap_or(u64::MAX),
+            wallet_index_micros: staged_connect.wallet_index_micros,
+            consensus_state_micros: staged_connect.consensus_state_micros,
+            ..NodeReorgTimings::default()
+        };
         let record = staged_connect.current.block.clone();
         let mut index_updates = Vec::with_capacity(staged_connect.pruned.len().saturating_add(1));
         index_updates.push(IndexStatusUpdate {
@@ -11752,6 +11770,7 @@ impl NodeState {
             anyhow::anyhow!("failed to transfer traversal page addresses: {error}")
         })?;
         let mut inner = batch.into_inner();
+        let name_page_prepare_started = Instant::now();
         let prepared = match self
             .name_pages
             .as_mut()
@@ -11776,7 +11795,10 @@ impl NodeState {
                 return Err(error);
             }
         };
+        timings.name_page_prepare_micros =
+            u64::try_from(name_page_prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         drop(raw);
+        let store_publication_started = Instant::now();
         let publication_result = self.commit_index_publication(publication, move |state| {
             if let Err(error) = store.commit(inner) {
                 state
@@ -11799,10 +11821,13 @@ impl NodeState {
             self.rollback_uncommitted_name_page_tail_if_safe()?;
             return Err(error);
         }
+        timings.store_publication_micros =
+            u64::try_from(store_publication_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         Ok(NodeBlockMutation {
             record,
             mining: self.durable_mining_state()?,
+            timings,
         })
     }
 
@@ -12121,6 +12146,7 @@ impl NodeState {
         Ok(NodeBlockMutation {
             record,
             mining: self.durable_mining_state()?,
+            timings: NodeReorgTimings::default(),
         })
     }
 
@@ -12227,6 +12253,7 @@ impl NodeState {
         Ok(NodeBlockMutation {
             record,
             mining: self.durable_mining_state()?,
+            timings: NodeReorgTimings::default(),
         })
     }
 
