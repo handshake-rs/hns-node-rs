@@ -1126,6 +1126,15 @@ pub struct NativeSyncDiagnostics {
     pub active_state_max_slice_millis: u64,
     pub active_state_last_planning_micros: u64,
     pub active_state_last_commit_micros: u64,
+    /// Consensus/index staging inside the last multi-block atomic activation.
+    #[serde(default)]
+    pub active_state_last_block_staging_micros: u64,
+    /// Authenticated name-page packing and append preparation in that activation.
+    #[serde(default)]
+    pub active_state_last_name_page_prepare_micros: u64,
+    /// Durable RocksDB publication and page-state finalization in that activation.
+    #[serde(default)]
+    pub active_state_last_store_publication_micros: u64,
     pub active_state_last_post_commit_micros: u64,
     pub active_state_last_prepared_blocks: usize,
     pub active_state_last_preparation_micros: u64,
@@ -1217,6 +1226,9 @@ pub(super) struct ActiveStateConnectOutcome {
     pub(super) contextual_failure: Option<FailedBlockMutation>,
     pub(super) planning_micros: u64,
     pub(super) state_commit_micros: u64,
+    pub(super) block_staging_micros: u64,
+    pub(super) name_page_prepare_micros: u64,
+    pub(super) store_publication_micros: u64,
     pub(super) post_commit_micros: u64,
     pub(super) workload: ActiveStateWorkload,
 }
@@ -5046,6 +5058,9 @@ impl NodeService {
                     contextual_failure: None,
                     planning_micros,
                     state_commit_micros,
+                    block_staging_micros: reorg.timings.block_staging_micros,
+                    name_page_prepare_micros: reorg.timings.name_page_prepare_micros,
+                    store_publication_micros: reorg.timings.store_publication_micros,
                     post_commit_micros,
                     workload: committed_workload,
                 }))
@@ -8809,6 +8824,9 @@ async fn complete_stored_active_state_slice<P: ActiveStateOrphanPool>(
                 state.active_state_max_slice_millis.max(slice_millis);
             state.active_state_last_planning_micros = outcome.planning_micros;
             state.active_state_last_commit_micros = outcome.state_commit_micros;
+            state.active_state_last_block_staging_micros = outcome.block_staging_micros;
+            state.active_state_last_name_page_prepare_micros = outcome.name_page_prepare_micros;
+            state.active_state_last_store_publication_micros = outcome.store_publication_micros;
             state.active_state_last_post_commit_micros = outcome.post_commit_micros;
             state.active_state_last_prepared_blocks = preparation.blocks;
             state.active_state_last_preparation_micros = preparation.wall_micros;

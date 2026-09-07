@@ -188,7 +188,7 @@ use tokio::{
 };
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 16;
+pub const HSRD_DIAGNOSTIC_API_VERSION: u32 = 17;
 pub const HSD_ORACLE_REVISION: &str = "698e252ebc7b5c1dd0a9587e342fdd153d020ae4";
 pub const HISTORICAL_REPLAY_QUALIFICATION_HEIGHT: Height = 339_660;
 pub const HISTORICAL_REPLAY_QUALIFICATION_BLOCK: BlockHash = BlockHash::new([
@@ -4609,6 +4609,7 @@ impl NodeService {
             },
             mining: mutation.mining,
             truncated_direct_connect_limit: None,
+            timings: NodeReorgTimings::default(),
         })
     }
 
@@ -6653,6 +6654,14 @@ struct NodeReorgMutation {
     /// Set only when a direct-extension transaction committed the largest
     /// complete prefix that fit its staged-effect budget.
     truncated_direct_connect_limit: Option<usize>,
+    timings: NodeReorgTimings,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct NodeReorgTimings {
+    block_staging_micros: u64,
+    name_page_prepare_micros: u64,
+    store_publication_micros: u64,
 }
 
 #[derive(Debug)]
@@ -12251,6 +12260,7 @@ impl NodeState {
                     .durable_mining_state()
                     .map_err(ChainActivationFailure::Internal)?,
                 truncated_direct_connect_limit: None,
+                timings: NodeReorgTimings::default(),
             });
         }
         if request.connect.is_empty() {
@@ -12323,6 +12333,7 @@ impl NodeState {
         let mut summary = NodeReorgSummary::default();
         let mut index_updates = Vec::new();
         let mut truncated_direct_connect_limit = None;
+        let block_staging_started = Instant::now();
 
         for disconnect in request.disconnect {
             let previous = previous_block_records
@@ -12472,6 +12483,8 @@ impl NodeState {
                 "prepared native activation retained an unmatched proof"
             )));
         }
+        let block_staging_micros =
+            u64::try_from(block_staging_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         let final_tip = best_block_tip_from_snapshot(&staged)
             .map_err(ChainActivationFailure::Internal)?
@@ -12551,6 +12564,7 @@ impl NodeState {
             operation_charges,
         );
         drop(overlay);
+        let name_page_prepare_started = Instant::now();
         let prepared_page_state =
             if let (Some(pages), Some(known)) = (self.name_pages.as_mut(), known) {
                 match pages.prepare_root(
@@ -12575,6 +12589,8 @@ impl NodeState {
             } else {
                 None
             };
+        let name_page_prepare_micros =
+            u64::try_from(name_page_prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let (batch, mut meter, _) = batch.into_parts();
         #[cfg(test)]
         {
@@ -12585,6 +12601,7 @@ impl NodeState {
             }
         }
         drop(raw_base);
+        let store_publication_started = Instant::now();
         let publication_result = self.commit_index_publication(publication, move |state| {
             match store.commit_with_effect_budget(batch, &mut meter) {
                 Ok(()) => {}
@@ -12614,13 +12631,19 @@ impl NodeState {
             {
                 pages.commit_prepared(prepared);
             }
-            Ok(())
+            Ok(
+                u64::try_from(store_publication_started.elapsed().as_micros())
+                    .unwrap_or(u64::MAX),
+            )
         });
-        if let Err(error) = publication_result {
-            self.rollback_uncommitted_name_page_tail_if_safe()
-                .map_err(ChainActivationFailure::Internal)?;
-            return Err(ChainActivationFailure::Internal(error));
-        }
+        let store_publication_micros = match publication_result {
+            Ok(micros) => micros,
+            Err(error) => {
+                self.rollback_uncommitted_name_page_tail_if_safe()
+                    .map_err(ChainActivationFailure::Internal)?;
+                return Err(ChainActivationFailure::Internal(error));
+            }
+        };
 
         Ok(NodeReorgMutation {
             summary,
@@ -12628,6 +12651,11 @@ impl NodeState {
                 .durable_mining_state()
                 .map_err(ChainActivationFailure::Internal)?,
             truncated_direct_connect_limit,
+            timings: NodeReorgTimings {
+                block_staging_micros,
+                name_page_prepare_micros,
+                store_publication_micros,
+            },
         })
     }
 
