@@ -7338,7 +7338,7 @@ async fn accept_peer_block(
             ?peer,
             block = %hash.to_hex(),
             %error,
-            "discarded duplicate block after bounded local canonical contention"
+            "discarded unowned or duplicate block after bounded local canonical contention"
         );
     }
     Ok(())

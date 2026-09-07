@@ -648,6 +648,9 @@ impl SyncScheduler {
     /// A response which raced an earlier requeue is already pending and needs
     /// no ownership change. Tracked validator/orphan work is deliberately left
     /// alone so a duplicate response cannot resurrect independently owned work.
+    /// An untracked unsolicited or late response likewise has no reservation
+    /// to restore and is discarded without turning local contention into a
+    /// peer/runtime failure.
     pub fn requeue_block_after_local_contention(
         &mut self,
         peer: PeerId,
@@ -686,10 +689,7 @@ impl SyncScheduler {
         if self.tracked.contains(&hash) {
             return Ok(false);
         }
-        Err(SyncError::UnexpectedBlock(format!(
-            "cannot requeue untracked locally-contended block {}",
-            hash.to_hex()
-        )))
+        Ok(false)
     }
 
     /// Record an honest `notfound` response for the peer that owns the
@@ -1410,6 +1410,26 @@ mod tests {
         assert_eq!(snapshot.pending_blocks, 0);
         assert_eq!(snapshot.inflight_blocks, 0);
         assert_eq!(snapshot.tracked_blocks, 1);
+    }
+
+    #[test]
+    fn local_canonical_contention_ignores_untracked_late_response() {
+        let now = Instant::now();
+        let mut scheduler = SyncScheduler::new(SyncLimits::default(), now).expect("scheduler");
+        let peer = PeerId(1);
+        let hash = BlockHash::new([0x53; 32]);
+        scheduler
+            .register_peer(peer, SERVICE_NETWORK, 10)
+            .expect("peer");
+
+        assert!(!scheduler
+            .requeue_block_after_local_contention(peer, hash, now)
+            .expect("untracked late response"));
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_blocks, 0);
+        assert_eq!(snapshot.inflight_blocks, 0);
+        assert_eq!(snapshot.tracked_blocks, 0);
+        assert_eq!(snapshot.peers[0].failures, 0);
     }
 
     #[test]
