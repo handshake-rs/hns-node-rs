@@ -772,7 +772,13 @@ pub trait Store {
 /// Read-your-writes overlay for staging one atomic multi-step mutation against
 /// a single immutable base snapshot. The wrapped batch is committed only after
 /// every staged operation has validated successfully.
-type StagedChanges = HashMap<ColumnFamily, BTreeMap<Vec<u8>, Option<Vec<u8>>>>;
+// Active-state staging is overwhelmingly point-oriented: every UTXO, wallet
+// row, and consensus record is inserted and then resolved by exact key. Keep
+// those hot mutations in hash tables and pay for ordering only at the two
+// boundaries that require it (prefix scans and authenticated page packing).
+// This avoids maintaining a comparison tree for every intermediate write in
+// a large atomic replay slice.
+type StagedChanges = HashMap<ColumnFamily, HashMap<Vec<u8>, Option<Vec<u8>>>>;
 type SharedStagedChanges = Rc<RefCell<StagedChanges>>;
 type StagedCheckpointEntry = (ColumnFamily, Vec<u8>, Option<Option<Vec<u8>>>);
 type StagedCheckpoint = Vec<StagedCheckpointEntry>;
@@ -863,6 +869,7 @@ impl StagingOverlay {
         self.changes
             .borrow_mut()
             .remove(&family)
+            .map(|changes| changes.into_iter().collect())
             .unwrap_or_default()
     }
 }
@@ -1065,12 +1072,17 @@ impl<S: ReadSnapshot> ReadSnapshot for StagedSnapshot<'_, S> {
                 .scan_prefix_page(family, prefix, start_after, budget);
         };
 
-        let start = start_after.unwrap_or(prefix).to_vec();
+        // The overlay's point-write table is deliberately unordered. Prefix
+        // scans are uncommon control-plane operations, so materialize only
+        // matching references and sort those once for the ordered merge.
         let mut staged = changes
-            .range(start..)
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .filter(|(key, _)| start_after.is_none_or(|cursor| key.as_slice() > cursor))
-            .peekable();
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with(prefix) && start_after.is_none_or(|cursor| key.as_slice() > cursor)
+            })
+            .collect::<Vec<_>>();
+        staged.sort_unstable_by_key(|(key, _)| *key);
+        let mut staged = staged.into_iter().peekable();
         let mut base_entries = VecDeque::<ScanEntry>::new();
         let mut base_cursor = start_after.map(<[u8]>::to_vec);
         let mut base_complete = false;
@@ -4064,7 +4076,12 @@ fn compact_memory_history(history: &mut Vec<MemoryVersion>, oldest_snapshot: Opt
 }
 
 type BatchOperation = Option<Vec<u8>>;
-type BatchOperations = BTreeMap<StoreKey, BatchOperation>;
+// A batch is last-write-wins and contains at most one operation per physical
+// key before publication. RocksDB does not require key order for an atomic
+// WriteBatch, and the memory backend installs every unique key at one common
+// generation. Hashing therefore removes a second comparison-tree update from
+// the hot staging path without changing any externally observable ordering.
+type BatchOperations = HashMap<StoreKey, BatchOperation>;
 type BatchCheckpointEntry = (StoreKey, Option<BatchOperation>);
 type BatchCheckpoint = Vec<BatchCheckpointEntry>;
 
