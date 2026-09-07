@@ -40,6 +40,11 @@ const NAME_PAGE_READ_AHEAD_CACHE_PAGES: usize = 128;
 const NAME_PAGE_READ_AHEAD_WORKERS: usize = 4;
 #[cfg(unix)]
 const NAME_PAGE_READ_AHEAD_FILES_PER_WORKER: usize = 2;
+// One reader is scoped to one atomic activation slice. Retain authenticated
+// path records across the blocks in that slice so their heavily overlapping
+// immutable prefixes do not return to disk. The conservative accounting below
+// includes duplicated decoded-prefix storage and hash-map/Arc overhead.
+const NAME_PAGE_PATH_RECORD_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const NAME_PAGE_STATE_VERSION: u32 = 2;
 const LEGACY_NAME_PAGE_STATE_VERSION: u32 = 1;
 const LEGACY_NAME_PAGE_STATE_BODY_BYTES: usize = 4 + 8 + 4 + 8 + 32 + 1 + 8 + 1 + 4;
@@ -1842,6 +1847,7 @@ struct CachedNamePageEntry {
     referenced: bool,
 }
 
+#[derive(Clone, Debug)]
 struct LoadedNamePageRecord {
     canonical: Vec<u8>,
     discovered: [Option<(TreeRoot, NamePageAddress)>; 2],
@@ -1853,7 +1859,7 @@ struct CachedLoadedNamePageRecord {
     discovered: [Option<(TreeRoot, NamePageAddress)>; 2],
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ValidatedNamePageNode {
     Leaf,
     Internal {
@@ -1864,9 +1870,131 @@ enum ValidatedNamePageNode {
 }
 
 #[derive(Debug)]
+struct CachedNamePagePathRecord {
+    address: NamePageAddress,
+    loaded: Arc<LoadedNamePageRecord>,
+    accounted_bytes: usize,
+    referenced: bool,
+}
+
+#[derive(Debug)]
+struct NamePagePathRecordCache {
+    capacity_bytes: usize,
+    accounted_bytes: usize,
+    records: HashMap<TreeRoot, CachedNamePagePathRecord>,
+    clock: Vec<TreeRoot>,
+    clock_hand: usize,
+}
+
+impl NamePagePathRecordCache {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            capacity_bytes,
+            accounted_bytes: 0,
+            records: HashMap::new(),
+            clock: Vec::new(),
+            clock_hand: 0,
+        }
+    }
+
+    fn get(
+        &mut self,
+        root: TreeRoot,
+        address: NamePageAddress,
+    ) -> Result<Option<Arc<LoadedNamePageRecord>>, PageTreeError> {
+        let Some(cached) = self.records.get_mut(&root) else {
+            return Ok(None);
+        };
+        if cached.address != address {
+            return Err(PageTreeError::AddressConflict(root));
+        }
+        cached.referenced = true;
+        Ok(Some(Arc::clone(&cached.loaded)))
+    }
+
+    fn insert(
+        &mut self,
+        root: TreeRoot,
+        address: NamePageAddress,
+        loaded: Arc<LoadedNamePageRecord>,
+    ) -> Result<(), PageTreeError> {
+        if let Some(cached) = self.records.get_mut(&root) {
+            if cached.address != address {
+                return Err(PageTreeError::AddressConflict(root));
+            }
+            if cached.loaded.canonical != loaded.canonical {
+                return Err(PageTreeError::StateCodec(
+                    "name-page path cache found conflicting canonical records".to_owned(),
+                ));
+            }
+            cached.referenced = true;
+            return Ok(());
+        }
+
+        let accounted_bytes = loaded
+            .canonical
+            .len()
+            .saturating_mul(2)
+            .saturating_add(std::mem::size_of::<CachedNamePagePathRecord>())
+            .saturating_add(std::mem::size_of::<TreeRoot>());
+        if accounted_bytes > self.capacity_bytes {
+            return Ok(());
+        }
+        while self.accounted_bytes.saturating_add(accounted_bytes) > self.capacity_bytes {
+            let candidate = self.clock[self.clock_hand];
+            let referenced = self
+                .records
+                .get_mut(&candidate)
+                .map(|record| std::mem::replace(&mut record.referenced, false))
+                .unwrap_or(false);
+            if referenced {
+                self.clock_hand = (self.clock_hand + 1) % self.clock.len();
+                continue;
+            }
+            if let Some(evicted) = self.records.remove(&candidate) {
+                self.accounted_bytes = self.accounted_bytes.saturating_sub(evicted.accounted_bytes);
+            }
+            self.clock[self.clock_hand] = root;
+            self.clock_hand = (self.clock_hand + 1) % self.clock.len();
+            self.records.insert(
+                root,
+                CachedNamePagePathRecord {
+                    address,
+                    loaded,
+                    accounted_bytes,
+                    referenced: true,
+                },
+            );
+            self.accounted_bytes = self.accounted_bytes.saturating_add(accounted_bytes);
+            return Ok(());
+        }
+
+        self.clock.push(root);
+        self.records.insert(
+            root,
+            CachedNamePagePathRecord {
+                address,
+                loaded,
+                accounted_bytes,
+                referenced: true,
+            },
+        );
+        self.accounted_bytes = self.accounted_bytes.saturating_add(accounted_bytes);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct NamePagePathWork {
     root: TreeRoot,
     traversals: Vec<(NameHash, usize)>,
+}
+
+struct NamePagePathTraversal<'a> {
+    page_key: (u32, u32),
+    page_work: &'a mut BTreeMap<u16, NamePagePathWork>,
+    pending: &'a mut BTreeMap<(u32, u32), BTreeMap<u16, NamePagePathWork>>,
+    records: &'a mut BTreeMap<TreeRoot, Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -1945,6 +2073,7 @@ pub struct NamePageTreeReader {
     root_segment: u32,
     addresses: Mutex<HashMap<TreeRoot, NamePageAddress>>,
     cache: Mutex<PageCache>,
+    path_records: Mutex<NamePagePathRecordCache>,
     path_page_reads: AtomicU64,
 }
 
@@ -2420,6 +2549,9 @@ impl NamePageTreeReader {
             root_segment: address.segment(),
             addresses: Mutex::new(addresses),
             cache: Mutex::new(PageCache::new(cache_pages)),
+            path_records: Mutex::new(NamePagePathRecordCache::new(
+                NAME_PAGE_PATH_RECORD_CACHE_BYTES,
+            )),
             path_page_reads: AtomicU64::new(0),
         })
     }
@@ -2667,6 +2799,41 @@ impl NamePageTreeReader {
 
         while let Some(page_key) = pending.last_key_value().map(|(page, _)| *page) {
             let page_address = NamePageAddress::new(page_key.0, page_key.1, 0)?;
+            let (_, mut page_work) = pending.pop_last().expect("pending page exists");
+
+            // Newly appended trees preserve most paths from one block to the
+            // next. Consume the longest cached physical suffix before issuing
+            // any read. Cached internal nodes can enqueue still-earlier work,
+            // including another record in this page.
+            while let Some((slot, work)) = page_work.pop_last() {
+                let address = NamePageAddress::new(page_key.0, page_key.1, slot)?;
+                let Some(loaded) = self.cached_path_record(work.root, address)? else {
+                    page_work.insert(slot, work);
+                    break;
+                };
+                self.consume_name_page_path_record(
+                    address,
+                    work,
+                    loaded.as_ref(),
+                    &mut NamePagePathTraversal {
+                        page_key,
+                        page_work: &mut page_work,
+                        pending: &mut pending,
+                        records: &mut records,
+                    },
+                )?;
+            }
+            if page_work.is_empty() {
+                continue;
+            }
+
+            // Put the unresolved suffix back so the existing bounded
+            // read-ahead planner can coalesce its slots with older pages.
+            if pending.insert(page_key, page_work).is_some() {
+                return Err(PageTreeError::StateCodec(
+                    "name-page path prefetch duplicated its current page".to_owned(),
+                ));
+            }
             #[cfg(unix)]
             let prepared_page =
                 read_ahead_name_page(&read_ahead_pool, &pending, &mut page_read_ahead, page_key)?;
@@ -2700,66 +2867,111 @@ impl NamePageTreeReader {
             )?;
             while let Some((slot, work)) = page_work.pop_last() {
                 let address = NamePageAddress::new(page_key.0, page_key.1, slot)?;
-                #[cfg(unix)]
-                let record = page_reader.record(address.slot())?;
-                #[cfg(not(unix))]
-                let record =
-                    read_name_page_record(file, page_address.page(), &directory, address.slot())?;
-                let loaded = validate_loaded_name_page_record(&record, work.root)?;
-                if let Some(existing) = records.insert(work.root, loaded.canonical.clone()) {
-                    if existing != loaded.canonical {
-                        return Err(PageTreeError::StateCodec(
-                            "page path prefetch found conflicting canonical records".to_owned(),
-                        ));
-                    }
-                }
-                self.insert_discovered(loaded.discovered.into_iter().flatten())?;
-
-                let ValidatedNamePageNode::Internal {
-                    prefix,
-                    left,
-                    right,
-                } = loaded.node
-                else {
-                    continue;
-                };
-                let [Some((discovered_left, left_address)), Some((discovered_right, right_address))] =
-                    loaded.discovered
-                else {
-                    return Err(PageTreeError::ChildLocatorMismatch(work.root));
-                };
-                if discovered_left != left || discovered_right != right {
-                    return Err(PageTreeError::ChildLocatorMismatch(work.root));
-                }
-                for (key, depth) in work.traversals {
-                    if !prefix.matches_key(key.as_bytes(), depth) {
-                        continue;
-                    }
-                    let branch_depth = page_branch_depth(&prefix, depth)?;
-                    let (child, child_address) = if key_bit_at(key.as_bytes(), branch_depth) == 0 {
-                        (left, left_address)
-                    } else {
-                        (right, right_address)
-                    };
-                    if child_address >= address {
-                        return Err(PageTreeError::ChildLocatorMismatch(work.root));
-                    }
-                    let traversal = std::iter::once((key, branch_depth + 1));
-                    if (child_address.segment(), child_address.page()) == page_key {
-                        insert_name_page_slot_work(
-                            &mut page_work,
-                            child,
-                            child_address,
-                            traversal,
+                let loaded = match self.cached_path_record(work.root, address)? {
+                    Some(loaded) => loaded,
+                    None => {
+                        #[cfg(unix)]
+                        let record = page_reader.record(address.slot())?;
+                        #[cfg(not(unix))]
+                        let record = read_name_page_record(
+                            file,
+                            page_address.page(),
+                            &directory,
+                            address.slot(),
                         )?;
-                    } else {
-                        insert_name_page_path_work(&mut pending, child, child_address, traversal)?;
+                        let loaded =
+                            Arc::new(validate_loaded_name_page_record(&record, work.root)?);
+                        self.path_records
+                            .lock()
+                            .map_err(|_| PageTreeError::Poisoned)?
+                            .insert(work.root, address, Arc::clone(&loaded))?;
+                        loaded
                     }
-                }
+                };
+                self.consume_name_page_path_record(
+                    address,
+                    work,
+                    loaded.as_ref(),
+                    &mut NamePagePathTraversal {
+                        page_key,
+                        page_work: &mut page_work,
+                        pending: &mut pending,
+                        records: &mut records,
+                    },
+                )?;
             }
         }
 
         Ok(Some(records))
+    }
+
+    fn cached_path_record(
+        &self,
+        root: TreeRoot,
+        address: NamePageAddress,
+    ) -> Result<Option<Arc<LoadedNamePageRecord>>, PageTreeError> {
+        self.path_records
+            .lock()
+            .map_err(|_| PageTreeError::Poisoned)?
+            .get(root, address)
+    }
+
+    fn consume_name_page_path_record(
+        &self,
+        address: NamePageAddress,
+        work: NamePagePathWork,
+        loaded: &LoadedNamePageRecord,
+        traversal: &mut NamePagePathTraversal<'_>,
+    ) -> Result<(), PageTreeError> {
+        if let Some(existing) = traversal
+            .records
+            .insert(work.root, loaded.canonical.clone())
+        {
+            if existing != loaded.canonical {
+                return Err(PageTreeError::StateCodec(
+                    "page path prefetch found conflicting canonical records".to_owned(),
+                ));
+            }
+        }
+        self.insert_discovered(loaded.discovered.into_iter().flatten())?;
+
+        let ValidatedNamePageNode::Internal {
+            prefix,
+            left,
+            right,
+        } = &loaded.node
+        else {
+            return Ok(());
+        };
+        let [Some((discovered_left, left_address)), Some((discovered_right, right_address))] =
+            loaded.discovered
+        else {
+            return Err(PageTreeError::ChildLocatorMismatch(work.root));
+        };
+        if discovered_left != *left || discovered_right != *right {
+            return Err(PageTreeError::ChildLocatorMismatch(work.root));
+        }
+        for (key, depth) in work.traversals {
+            if !prefix.matches_key(key.as_bytes(), depth) {
+                continue;
+            }
+            let branch_depth = page_branch_depth(prefix, depth)?;
+            let (child, child_address) = if key_bit_at(key.as_bytes(), branch_depth) == 0 {
+                (*left, left_address)
+            } else {
+                (*right, right_address)
+            };
+            if child_address >= address {
+                return Err(PageTreeError::ChildLocatorMismatch(work.root));
+            }
+            let next = std::iter::once((key, branch_depth + 1));
+            if (child_address.segment(), child_address.page()) == traversal.page_key {
+                insert_name_page_slot_work(traversal.page_work, child, child_address, next)?;
+            } else {
+                insert_name_page_path_work(traversal.pending, child, child_address, next)?;
+            }
+        }
+        Ok(())
     }
 
     /// Rewrite one authenticated tree by physical source address rather than
@@ -5550,6 +5762,20 @@ mod tests {
         let after = reader.path_page_read_count();
         assert_eq!(prefetched, records);
         assert_eq!(after - before, packed.page_count() as u64);
+
+        // An activation slice applies several consecutive blocks against one
+        // immutable base reader. The second block must be able to reuse every
+        // authenticated path record from the first without reading its pages
+        // again.
+        let repeated = reader
+            .prefetch_paths(
+                root,
+                &entries.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            )
+            .expect("repeat physical-order path prefetch")
+            .expect("page-backed root");
+        assert_eq!(repeated, records);
+        assert_eq!(reader.path_page_read_count(), after);
         drop(reader);
 
         let reader =
