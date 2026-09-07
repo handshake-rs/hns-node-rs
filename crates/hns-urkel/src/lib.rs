@@ -1035,7 +1035,7 @@ where
 /// Apply mutations from a storage-native prefetched path union. The fallback
 /// loader is retained for uncommon compression siblings that are not on an
 /// affected key path.
-pub fn update_record_tree_prefetched<F, I, P>(
+pub fn update_record_tree_prefetched<F, I, P, R>(
     root: TreeRoot,
     updates: I,
     prefetched: P,
@@ -1044,16 +1044,18 @@ pub fn update_record_tree_prefetched<F, I, P>(
 where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
     I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
-    P: IntoIterator<Item = (TreeRoot, Vec<u8>)>,
+    P: IntoIterator<Item = (TreeRoot, R)>,
+    R: AsRef<[u8]>,
 {
     let mut loaded = AHashMap::new();
     for (record_root, raw) in prefetched {
-        let record = decode_verified_record(record_root, &raw)?;
+        let record = Arc::new(decode_verified_record(record_root, raw.as_ref())?);
         match loaded.entry(record_root) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(record);
             }
-            std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &record => {}
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get().as_ref() == record.as_ref() => {}
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(UrkelError::NodeHashCollision(record_root));
             }
@@ -1074,7 +1076,7 @@ where
 /// Duplicate keys retain the ordinary sequential API's last-write-wins
 /// behavior. The result is history-independent and byte-identical at the root
 /// to applying the same final key/value map with [`update_record_tree`].
-pub fn update_record_tree_mutation_trie_prefetched<F, I, P>(
+pub fn update_record_tree_mutation_trie_prefetched<F, I, P, R>(
     root: TreeRoot,
     updates: I,
     prefetched: P,
@@ -1083,7 +1085,8 @@ pub fn update_record_tree_mutation_trie_prefetched<F, I, P>(
 where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
     I: IntoIterator<Item = (NameHash, Option<Vec<u8>>)>,
-    P: IntoIterator<Item = (TreeRoot, Vec<u8>)>,
+    P: IntoIterator<Item = (TreeRoot, R)>,
+    R: AsRef<[u8]>,
 {
     let mut mutations = BTreeMap::<NameHash, Option<Vec<u8>>>::new();
     for (key, value) in updates {
@@ -1101,12 +1104,13 @@ where
 
     let mut loaded = AHashMap::new();
     for (record_root, raw) in prefetched {
-        let record = decode_verified_record(record_root, &raw)?;
+        let record = Arc::new(decode_verified_record(record_root, raw.as_ref())?);
         match loaded.entry(record_root) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(record);
             }
-            std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &record => {}
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get().as_ref() == record.as_ref() => {}
             std::collections::hash_map::Entry::Occupied(_) => {
                 return Err(UrkelError::NodeHashCollision(record_root));
             }
@@ -1198,18 +1202,18 @@ where
     }
 
     let record = context.load_record(root)?;
-    match record {
+    match record.as_ref() {
         UrkelNodeRecord::Leaf {
             key: existing_key,
-            value: existing_value,
+            value: _,
         } => {
-            let mut existing = Some((root, existing_value));
+            let mut existing = Some((root, None));
             for mutation in mutations {
-                if mutation.key == existing_key {
+                if mutation.key == *existing_key {
                     existing = mutation
                         .value
                         .as_ref()
-                        .map(|value| (TreeRoot::ZERO, value.clone()));
+                        .map(|value| (TreeRoot::ZERO, Some(value)));
                 } else if let Some(value) = mutation.value.as_ref() {
                     frontier.push(RecordMutationFrontier::Leaf {
                         key: mutation.key,
@@ -1222,12 +1226,14 @@ where
                     frontier.push(RecordMutationFrontier::Existing {
                         root,
                         original_depth: depth,
-                        representative: existing_key,
+                        representative: *existing_key,
                     });
                 } else {
                     frontier.push(RecordMutationFrontier::Leaf {
-                        key: existing_key,
-                        value,
+                        key: *existing_key,
+                        value: value
+                            .expect("replacement value accompanies a constructed leaf")
+                            .clone(),
                     });
                 }
             }
@@ -1237,7 +1243,7 @@ where
             left,
             right,
         } => {
-            let branch_depth = checked_branch_depth(&prefix, depth)?;
+            let branch_depth = checked_branch_depth(prefix, depth)?;
             // The input comes from a BTreeMap and is ordered by the complete
             // 256-bit key. Every key matching one compressed Patricia prefix
             // is therefore one contiguous range. Retain that range as a
@@ -1275,7 +1281,7 @@ where
                 frontier.push(RecordMutationFrontier::Existing {
                     root,
                     original_depth: depth,
-                    representative: internal_record_representative(path_key, depth, &prefix, 0),
+                    representative: internal_record_representative(path_key, depth, prefix, 0),
                 });
                 return Ok(());
             }
@@ -1283,17 +1289,17 @@ where
                 .partition_point(|mutation| key_bit(mutation.key.as_bytes(), branch_depth) == 0);
             let (left_mutations, right_mutations) = matching.split_at(split);
 
-            let left_path = internal_record_representative(path_key, depth, &prefix, 0);
+            let left_path = internal_record_representative(path_key, depth, prefix, 0);
             if left_mutations.is_empty() {
                 frontier.push(RecordMutationFrontier::Existing {
-                    root: left,
+                    root: *left,
                     original_depth: branch_depth + 1,
                     representative: left_path,
                 });
             } else {
                 collect_record_mutation_frontier(
                     context,
-                    left,
+                    *left,
                     branch_depth + 1,
                     left_path,
                     left_mutations,
@@ -1301,17 +1307,17 @@ where
                 )?;
             }
 
-            let right_path = internal_record_representative(path_key, depth, &prefix, 1);
+            let right_path = internal_record_representative(path_key, depth, prefix, 1);
             if right_mutations.is_empty() {
                 frontier.push(RecordMutationFrontier::Existing {
-                    root: right,
+                    root: *right,
                     original_depth: branch_depth + 1,
                     representative: right_path,
                 });
             } else {
                 collect_record_mutation_frontier(
                     context,
-                    right,
+                    *right,
                     branch_depth + 1,
                     right_path,
                     right_mutations,
@@ -1408,7 +1414,8 @@ where
             if depth == *original_depth {
                 return Ok(*root);
             }
-            match context.load_record(*root)? {
+            let record = context.load_record(*root)?;
+            match record.as_ref() {
                 UrkelNodeRecord::Leaf { .. } => Ok(*root),
                 UrkelNodeRecord::Internal {
                     prefix,
@@ -1416,11 +1423,11 @@ where
                     right,
                 } => {
                     let prefix =
-                        rebase_record_prefix(&prefix, *representative, *original_depth, depth)?;
+                        rebase_record_prefix(prefix, *representative, *original_depth, depth)?;
                     context.intern_final(UrkelNodeRecord::Internal {
                         prefix,
-                        left,
-                        right,
+                        left: *left,
+                        right: *right,
                     })
                 }
             }
@@ -1478,7 +1485,7 @@ fn apply_record_updates<F, I>(
     root: TreeRoot,
     updates: I,
     load: F,
-    loaded: AHashMap<TreeRoot, UrkelNodeRecord>,
+    loaded: AHashMap<TreeRoot, Arc<UrkelNodeRecord>>,
 ) -> Result<UrkelRecordUpdate, UrkelError>
 where
     F: FnMut(TreeRoot) -> Result<Option<Vec<u8>>, UrkelError>,
@@ -1516,7 +1523,7 @@ fn prefetch_record_paths<F>(
     keys: &[NameHash],
     batch_size: usize,
     load_many: &mut F,
-) -> Result<AHashMap<TreeRoot, UrkelNodeRecord>, UrkelError>
+) -> Result<AHashMap<TreeRoot, Arc<UrkelNodeRecord>>, UrkelError>
 where
     F: FnMut(&[TreeRoot]) -> Result<Vec<Option<Vec<u8>>>, UrkelError>,
 {
@@ -1546,7 +1553,10 @@ where
             }
             for (record_root, value) in chunk.iter().copied().zip(values) {
                 let raw = value.ok_or(UrkelError::MissingNode(record_root))?;
-                loaded.insert(record_root, decode_verified_record(record_root, &raw)?);
+                loaded.insert(
+                    record_root,
+                    Arc::new(decode_verified_record(record_root, &raw)?),
+                );
             }
         }
 
@@ -1561,7 +1571,7 @@ where
                 prefix,
                 left,
                 right,
-            } = record
+            } = record.as_ref()
             else {
                 continue;
             };
@@ -1585,7 +1595,7 @@ where
 
 struct RecordMutationContext<F> {
     load: F,
-    loaded: AHashMap<TreeRoot, UrkelNodeRecord>,
+    loaded: AHashMap<TreeRoot, Arc<UrkelNodeRecord>>,
     records: BTreeMap<TreeRoot, Vec<u8>>,
 }
 
@@ -1605,7 +1615,7 @@ where
                     "constructed urkel record {root:?} is missing from the mutation cache"
                 ))
             })?;
-            if let UrkelNodeRecord::Internal { left, right, .. } = record {
+            if let UrkelNodeRecord::Internal { left, right, .. } = record.as_ref() {
                 pending.push(*left);
                 pending.push(*right);
             }
@@ -1615,17 +1625,17 @@ where
         Ok(())
     }
 
-    fn load_record(&mut self, root: TreeRoot) -> Result<UrkelNodeRecord, UrkelError> {
+    fn load_record(&mut self, root: TreeRoot) -> Result<Arc<UrkelNodeRecord>, UrkelError> {
         if root == TreeRoot::ZERO {
             return Err(UrkelError::InvalidNode(
                 "attempted to load the empty Urkel root as a record".to_owned(),
             ));
         }
         if let Some(record) = self.loaded.get(&root) {
-            return Ok(record.clone());
+            return Ok(Arc::clone(record));
         }
-        let record = load_verified_record(root, &mut self.load)?;
-        self.loaded.insert(root, record.clone());
+        let record = Arc::new(load_verified_record(root, &mut self.load)?);
+        self.loaded.insert(root, Arc::clone(&record));
         Ok(record)
     }
 
@@ -1641,7 +1651,7 @@ where
                 return Err(UrkelError::NodeHashCollision(root));
             }
         }
-        self.loaded.insert(root, record);
+        self.loaded.insert(root, Arc::new(record));
         Ok(root)
     }
 
@@ -1649,7 +1659,7 @@ where
         let root = record.root();
         let raw = record.encode()?;
         if let Some(existing) = self.loaded.get(&root) {
-            if existing != &record {
+            if existing.as_ref() != &record {
                 return Err(UrkelError::NodeHashCollision(root));
             }
             return Ok(root);
@@ -1663,7 +1673,7 @@ where
                 return Err(UrkelError::NodeHashCollision(root));
             }
         }
-        self.loaded.insert(root, record);
+        self.loaded.insert(root, Arc::new(record));
         Ok(root)
     }
 
@@ -1679,7 +1689,7 @@ where
             return Ok((root, true));
         }
 
-        match self.load_record(root)? {
+        match self.load_record(root)?.as_ref().clone() {
             UrkelNodeRecord::Leaf {
                 key: existing_key,
                 value: existing_value,
@@ -1783,7 +1793,7 @@ where
             return Ok((root, false));
         }
 
-        match self.load_record(root)? {
+        match self.load_record(root)?.as_ref().clone() {
             UrkelNodeRecord::Leaf {
                 key: existing_key, ..
             } => {
@@ -1814,7 +1824,7 @@ where
 
                 let sibling = if branch == 0 { right } else { left };
                 if next_child == TreeRoot::ZERO {
-                    return match self.load_record(sibling)? {
+                    return match self.load_record(sibling)?.as_ref().clone() {
                         UrkelNodeRecord::Leaf { .. } => Ok((sibling, true)),
                         UrkelNodeRecord::Internal {
                             prefix: sibling_prefix,

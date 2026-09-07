@@ -44,10 +44,12 @@ const NAME_PAGE_READ_AHEAD_FILES_PER_WORKER: usize = 2;
 // intervals so their heavily overlapping immutable prefixes do not return to
 // disk. Mainnet interval commits at mid-chain already touch more than 200,000
 // records; the former 64 MiB clock evicted that scan before the next interval
-// and produced effectively zero hits. The conservative accounting below
-// includes duplicated decoded-prefix storage and hash-map/Arc overhead. This
-// remains a hard 512 MiB bound, matching (rather than adding an unbounded
-// multiplier to) the node's default maximum atomic staging allowance.
+// and produced effectively zero hits. Canonical bytes are shared end-to-end
+// with path consumers, so the cache accounts one backing allocation plus its
+// decoded-prefix/hash-map/Arc overhead rather than reserving space for a full
+// duplicate path union. This remains a hard 512 MiB bound, matching (rather
+// than adding an unbounded multiplier to) the node's default maximum atomic
+// staging allowance.
 const NAME_PAGE_PATH_RECORD_CACHE_BYTES: usize = 512 * 1024 * 1024;
 const NAME_PAGE_STATE_VERSION: u32 = 2;
 const LEGACY_NAME_PAGE_STATE_VERSION: u32 = 1;
@@ -1785,7 +1787,7 @@ where
             }
             for (record, address) in builder.into_records().into_iter().zip(actual) {
                 let root = TreeRoot::new(record.key);
-                let loaded = Arc::new(validate_loaded_name_page_record(&record, root)?);
+                let loaded = Arc::new(validate_loaded_name_page_record(record, root)?);
                 cache_records.push((root, address, loaded));
             }
             *appended_pages = appended_pages
@@ -1868,7 +1870,7 @@ struct CachedNamePageEntry {
 
 #[derive(Clone, Debug)]
 struct LoadedNamePageRecord {
-    canonical: Vec<u8>,
+    canonical: Arc<[u8]>,
     discovered: [Option<(TreeRoot, NamePageAddress)>; 2],
     node: ValidatedNamePageNode,
 }
@@ -1953,7 +1955,6 @@ impl NamePagePathRecordCache {
         let accounted_bytes = loaded
             .canonical
             .len()
-            .saturating_mul(2)
             .saturating_add(std::mem::size_of::<CachedNamePagePathRecord>())
             .saturating_add(std::mem::size_of::<TreeRoot>());
         if accounted_bytes > self.capacity_bytes {
@@ -2070,11 +2071,14 @@ struct NamePagePathWork {
     traversals: Vec<(NameHash, usize)>,
 }
 
+/// Canonical authenticated path records sharing their page-cache allocation.
+pub type NamePagePathRecords = BTreeMap<TreeRoot, Arc<[u8]>>;
+
 struct NamePagePathTraversal<'a> {
     page_key: (u32, u32),
     page_work: &'a mut BTreeMap<u16, NamePagePathWork>,
     pending: &'a mut BTreeMap<(u32, u32), BTreeMap<u16, NamePagePathWork>>,
-    records: &'a mut BTreeMap<TreeRoot, Vec<u8>>,
+    records: &'a mut NamePagePathRecords,
 }
 
 #[derive(Debug)]
@@ -2872,7 +2876,7 @@ impl NamePageTreeReader {
                     }
                     let address = NamePageAddress::new(segment, page_number, slot)?;
                     let loaded = validate_loaded_name_page_record(
-                        &NamePageRecord {
+                        NamePageRecord {
                             key: raw.key,
                             children: raw.children.into_iter().flatten().collect(),
                             canonical: raw.canonical.to_vec(),
@@ -2906,7 +2910,7 @@ impl NamePageTreeReader {
         &self,
         root: TreeRoot,
         keys: &[NameHash],
-    ) -> Result<Option<BTreeMap<TreeRoot, Vec<u8>>>, PageTreeError> {
+    ) -> Result<Option<NamePagePathRecords>, PageTreeError> {
         if root == TreeRoot::ZERO || keys.is_empty() {
             return Ok(Some(BTreeMap::new()));
         }
@@ -2927,7 +2931,7 @@ impl NamePageTreeReader {
             root_address,
             keys.iter().copied().map(|key| (key, 0usize)),
         )?;
-        let mut records = BTreeMap::<TreeRoot, Vec<u8>>::new();
+        let mut records = NamePagePathRecords::new();
         #[cfg(unix)]
         let read_ahead_pool = NamePageReadAheadPool::new(self.segments.clone());
         #[cfg(unix)]
@@ -3015,8 +3019,7 @@ impl NamePageTreeReader {
                             &directory,
                             address.slot(),
                         )?;
-                        let loaded =
-                            Arc::new(validate_loaded_name_page_record(&record, work.root)?);
+                        let loaded = Arc::new(validate_loaded_name_page_record(record, work.root)?);
                         self.path_record_reads.fetch_add(1, Ordering::Relaxed);
                         self.path_records
                             .insert(work.root, address, Arc::clone(&loaded))?;
@@ -3061,7 +3064,7 @@ impl NamePageTreeReader {
     ) -> Result<(), PageTreeError> {
         if let Some(existing) = traversal
             .records
-            .insert(work.root, loaded.canonical.clone())
+            .insert(work.root, Arc::clone(&loaded.canonical))
         {
             if existing != loaded.canonical {
                 return Err(PageTreeError::StateCodec(
@@ -4188,7 +4191,7 @@ fn read_cached_name_page_record(
 }
 
 fn validate_loaded_name_page_record(
-    record: &NamePageRecord,
+    record: NamePageRecord,
     expected: TreeRoot,
 ) -> Result<LoadedNamePageRecord, PageTreeError> {
     let children = match record.children.as_slice() {
@@ -4211,7 +4214,7 @@ fn validate_loaded_name_page_record(
         },
     };
     Ok(LoadedNamePageRecord {
-        canonical: record.canonical.clone(),
+        canonical: Arc::from(record.canonical),
         discovered,
         node,
     })
@@ -6213,7 +6216,10 @@ mod tests {
             .expect("physical-order path prefetch")
             .expect("page-backed root");
         let after = reader.path_page_read_count();
-        assert_eq!(prefetched, records);
+        assert!(prefetched.iter().all(|(root, canonical)| {
+            records.get(root).map(Vec::as_slice) == Some(canonical.as_ref())
+        }));
+        assert_eq!(prefetched.len(), records.len());
         assert_eq!(after - before, packed.page_count() as u64);
 
         // An activation slice applies several consecutive blocks against one
@@ -6227,7 +6233,15 @@ mod tests {
             )
             .expect("repeat physical-order path prefetch")
             .expect("page-backed root");
-        assert_eq!(repeated, records);
+        assert!(prefetched.iter().all(|(root, canonical)| {
+            repeated
+                .get(root)
+                .is_some_and(|again| Arc::ptr_eq(canonical, again))
+        }));
+        assert!(repeated.iter().all(|(root, canonical)| {
+            records.get(root).map(Vec::as_slice) == Some(canonical.as_ref())
+        }));
+        assert_eq!(repeated.len(), records.len());
         assert_eq!(reader.path_page_read_count(), after);
         drop(reader);
 
@@ -6246,7 +6260,15 @@ mod tests {
             )
             .expect("reopened physical-order path prefetch")
             .expect("page-backed root");
-        assert_eq!(reopened_prefetch, records);
+        assert!(prefetched.iter().all(|(root, canonical)| {
+            reopened_prefetch
+                .get(root)
+                .is_some_and(|reopened| Arc::ptr_eq(canonical, reopened))
+        }));
+        assert!(reopened_prefetch.iter().all(|(root, canonical)| {
+            records.get(root).map(Vec::as_slice) == Some(canonical.as_ref())
+        }));
+        assert_eq!(reopened_prefetch.len(), records.len());
         assert_eq!(reopened.path_page_read_count(), 0);
         drop(reopened);
 
@@ -6336,7 +6358,10 @@ mod tests {
             )
             .expect("prefetch seeded paths")
             .expect("page-backed root");
-        assert_eq!(prefetched, records);
+        assert!(prefetched.iter().all(|(root, canonical)| {
+            records.get(root).map(Vec::as_slice) == Some(canonical.as_ref())
+        }));
+        assert_eq!(prefetched.len(), records.len());
         let stats = reader.path_read_stats();
         assert_eq!(stats.pages, 0);
         assert_eq!(stats.records, 0);

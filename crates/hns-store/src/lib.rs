@@ -583,7 +583,12 @@ impl ColumnFamily {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NameTreePathRecord {
     pub root: [u8; 32],
-    pub canonical: Vec<u8>,
+    /// Immutable canonical bytes shared with the authenticated page cache.
+    ///
+    /// A name-interval update can traverse hundreds of thousands of records.
+    /// Sharing their backing allocations avoids copying the complete path
+    /// union merely to cross the storage/state crate boundary.
+    pub canonical: Arc<[u8]>,
 }
 
 pub trait ReadSnapshot {
