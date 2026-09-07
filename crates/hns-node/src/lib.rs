@@ -152,14 +152,14 @@ use hns_state::{
     validate_persisted_name_tree_root, validate_persisted_name_trees,
     verify_name_tree_interval_state_bounded, verify_stored_name_tree_root_metadata_binding,
     visit_name_tree_snapshot_pins_bounded, AirdropCoinbaseIssuanceVerifier, BlockUndo,
-    ConnectBlock, DisconnectBlock, NamePagePathCache, NamePagePhysicalStreamPhase,
-    NamePageRootLocator, NamePageRootRecord, NamePageSnapshot, NamePageState, NamePageStreamLimits,
-    NamePageTreeReader, NamePageValidationLimits, NameTreeAccumulatorSession,
-    NameTreeCompactionSummary, NameTreeIntervalMigrationLimits, NameTreeMaterializationLimits,
-    NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits, PageTreeError, RetainedNameTreeRootLimits,
-    StateError, StateServices, StoredStateEngine, TreeRoot,
-    NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT, NAME_PAGE_ROOT_PREFIX, NAME_PAGE_SEGMENT_BLOCKS,
-    NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
+    ConnectBlock, DisconnectBlock, NamePagePathCache, NamePagePathCacheUpdate,
+    NamePagePhysicalStreamPhase, NamePageRootLocator, NamePageRootRecord, NamePageSnapshot,
+    NamePageState, NamePageStreamLimits, NamePageTreeReader, NamePageValidationLimits,
+    NameTreeAccumulatorSession, NameTreeCompactionSummary, NameTreeIntervalMigrationLimits,
+    NameTreeMaterializationLimits, NameTreeSnapshotPin, NameTreeSnapshotPinScanLimits,
+    PageTreeError, RetainedNameTreeRootLimits, StateError, StateServices, StoredStateEngine,
+    TreeRoot, NAME_PAGE_REACHABLE_PACKING_RECORDS_CONTEXT, NAME_PAGE_ROOT_PREFIX,
+    NAME_PAGE_SEGMENT_BLOCKS, NAME_PAGE_STATE_KEY, NAME_TREE_SNAPSHOT_PIN_PREFIX,
 };
 #[cfg(test)]
 use hns_state::{
@@ -6726,6 +6726,7 @@ struct NamePageStorage {
     committed_generation_bytes: u64,
     generation_bytes: u64,
     path_cache: NamePagePathCache,
+    pending_path_cache_update: Option<NamePagePathCacheUpdate>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7066,6 +7067,7 @@ impl NamePageStorage {
     /// committed manifest and truncates only bytes it proves unpublished.
     fn fence_after_commit_attempt(&mut self) {
         self.appender.take();
+        self.pending_path_cache_update.take();
         self.reopen_required = true;
     }
 
@@ -7163,6 +7165,7 @@ impl NamePageStorage {
                 committed_generation_bytes: generation_bytes,
                 generation_bytes,
                 path_cache: NamePagePathCache::default(),
+                pending_path_cache_update: None,
             });
         }
 
@@ -7261,6 +7264,7 @@ impl NamePageStorage {
             committed_generation_bytes: generation_bytes,
             generation_bytes,
             path_cache: NamePagePathCache::default(),
+            pending_path_cache_update: None,
         })
     }
 
@@ -7666,6 +7670,7 @@ impl NamePageStorage {
         self.file_path = file_path;
         self.state = next;
         self.path_cache = NamePagePathCache::default();
+        self.pending_path_cache_update = None;
         self.appender = Some(appender);
         tracing::info!(
             phase = "cleaning-old-generation",
@@ -7739,6 +7744,9 @@ impl NamePageStorage {
         target: NamePageRootTarget,
     ) -> Result<NamePageState> {
         self.ensure_open()?;
+        if self.pending_path_cache_update.is_some() {
+            anyhow::bail!("a prior name-page cache update is still awaiting publication");
+        }
         let NamePageRootTarget { root, height } = target;
         let mut records = BTreeMap::new();
         for (key, value) in staged_nodes {
@@ -7829,14 +7837,15 @@ impl NamePageStorage {
                         .appender
                         .as_mut()
                         .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
-                    let manifest = packed
-                        .append_consuming_with_reserve(
+                    let (manifest, cache_update) = packed
+                        .append_consuming_with_reserve_and_cache_update(
                             appender,
                             MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
                         )
                         .map_err(|error| {
                             anyhow::anyhow!("failed to append restored legacy root: {error}")
                         })?;
+                    self.pending_path_cache_update = Some(cache_update);
                     batch.record_name_page_append(page_count);
                     self.generation_bytes = next_generation_bytes;
                     next = NamePageState {
@@ -7946,12 +7955,13 @@ impl NamePageStorage {
                 .appender
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("name-page appender is unavailable"))?;
-            let manifest = packed
-                .append_consuming_with_reserve(
+            let (manifest, cache_update) = packed
+                .append_consuming_with_reserve_and_cache_update(
                     appender,
                     MINIMUM_PRODUCTION_FILESYSTEM_RESERVE_BYTES,
                 )
                 .map_err(|error| anyhow::anyhow!("failed to append name-page update: {error}"))?;
+            self.pending_path_cache_update = Some(cache_update);
             batch.record_name_page_append(page_count);
             self.generation_bytes = next_generation_bytes;
             next = NamePageState {
@@ -8023,10 +8033,23 @@ impl NamePageStorage {
     fn commit_prepared(&mut self, prepared: NamePageState) {
         self.state = prepared;
         self.committed_generation_bytes = self.generation_bytes;
+        if let Some(update) = self.pending_path_cache_update.take() {
+            if let Err(error) = self.path_cache.publish(update) {
+                // The durable page publication is already authoritative. A
+                // cache failure cannot roll it back, so discard the
+                // non-authoritative cache and continue from disk.
+                tracing::warn!(
+                    error = %error,
+                    "discarded name-page path cache after post-commit admission failure"
+                );
+                self.path_cache = NamePagePathCache::default();
+            }
+        }
     }
 
     fn rollback_uncommitted_tail(&mut self) -> Result<()> {
         self.ensure_open()?;
+        self.pending_path_cache_update.take();
         self.appender.take();
         let rollback: Result<()> = (|| {
             remove_unpublished_name_page_segments(

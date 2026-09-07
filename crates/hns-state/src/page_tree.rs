@@ -1702,6 +1702,7 @@ impl PackedNamePages {
             appender,
             reserve_bytes,
         )
+        .map(|(manifest, _)| manifest)
     }
 
     /// Append while moving canonical nodes into one page builder at a time.
@@ -1710,6 +1711,17 @@ impl PackedNamePages {
         appender: &mut NamePageAppender,
         reserve_bytes: u64,
     ) -> Result<SegmentManifest, PageTreeError> {
+        self.append_consuming_with_reserve_and_cache_update(appender, reserve_bytes)
+            .map(|(manifest, _)| manifest)
+    }
+
+    /// Append while retaining already-authenticated canonical records for
+    /// post-commit admission to the shared path cache.
+    pub fn append_consuming_with_reserve_and_cache_update(
+        self,
+        appender: &mut NamePageAppender,
+        reserve_bytes: u64,
+    ) -> Result<(SegmentManifest, NamePagePathCacheUpdate), PageTreeError> {
         let Self {
             generation,
             segment,
@@ -1745,7 +1757,7 @@ fn append_packed_name_page_records<I>(
     order: I,
     appender: &mut NamePageAppender,
     reserve_bytes: u64,
-) -> Result<SegmentManifest, PageTreeError>
+) -> Result<(SegmentManifest, NamePagePathCacheUpdate), PageTreeError>
 where
     I: IntoIterator<Item = (TreeRoot, Vec<u8>, Option<[NamePageAddress; 2]>)>,
 {
@@ -1758,22 +1770,30 @@ where
 
     let mut appended_pages = 0usize;
     let mut builder = NamePageBuilder::new(segment, first_page)?;
-    let flush = |builder: &NamePageBuilder,
-                 appender: &mut NamePageAppender,
-                 appended_pages: &mut usize|
-     -> Result<(), PageTreeError> {
-        let actual = appender.append_with_reserve(builder.records(), reserve_bytes)?;
-        for (record, address) in builder.records().iter().zip(actual) {
-            let root = TreeRoot::new(record.key);
-            if addresses.get(&root).copied() != Some(address) {
-                return Err(PageTreeError::AppenderPosition);
+    let flush =
+        |builder: NamePageBuilder,
+         appender: &mut NamePageAppender,
+         appended_pages: &mut usize,
+         cache_records: &mut Vec<(TreeRoot, NamePageAddress, Arc<LoadedNamePageRecord>)>|
+         -> Result<(), PageTreeError> {
+            let actual = appender.append_with_reserve(builder.records(), reserve_bytes)?;
+            for (record, address) in builder.records().iter().zip(actual.iter().copied()) {
+                let root = TreeRoot::new(record.key);
+                if addresses.get(&root).copied() != Some(address) {
+                    return Err(PageTreeError::AppenderPosition);
+                }
             }
-        }
-        *appended_pages = appended_pages
-            .checked_add(1)
-            .ok_or(PageTreeError::OffsetOverflow)?;
-        Ok(())
-    };
+            for (record, address) in builder.into_records().into_iter().zip(actual) {
+                let root = TreeRoot::new(record.key);
+                let loaded = Arc::new(validate_loaded_name_page_record(&record, root)?);
+                cache_records.push((root, address, loaded));
+            }
+            *appended_pages = appended_pages
+                .checked_add(1)
+                .ok_or(PageTreeError::OffsetOverflow)?;
+            Ok(())
+        };
+    let mut cache_records = Vec::new();
 
     for (root, canonical, planned_children) in order {
         let decoded = UrkelNodeRecord::decode_ref(&canonical)?;
@@ -1805,7 +1825,7 @@ where
                     break;
                 }
                 NamePagePush::Full(returned) => {
-                    flush(&builder, appender, &mut appended_pages)?;
+                    flush(builder, appender, &mut appended_pages, &mut cache_records)?;
                     builder = NamePageBuilder::new(segment, appender.next_page())?;
                     record = returned;
                 }
@@ -1813,12 +1833,18 @@ where
         }
     }
     if !builder.is_empty() {
-        flush(&builder, appender, &mut appended_pages)?;
+        flush(builder, appender, &mut appended_pages, &mut cache_records)?;
     }
     if appended_pages != expected_pages {
         return Err(PageTreeError::AppenderPosition);
     }
-    appender.sync_data().map_err(PageTreeError::from)
+    let manifest = appender.sync_data().map_err(PageTreeError::from)?;
+    Ok((
+        manifest,
+        NamePagePathCacheUpdate {
+            records: cache_records,
+        },
+    ))
 }
 
 #[derive(Debug)]
@@ -1986,6 +2012,14 @@ pub struct NamePagePathCache {
     records: Arc<Mutex<NamePagePathRecordCache>>,
 }
 
+/// Authenticated records whose physical addresses were verified during one
+/// successful page append. The owning node publishes this opaque update only
+/// after the matching durable manifest transaction commits.
+#[derive(Debug, Default)]
+pub struct NamePagePathCacheUpdate {
+    records: Vec<(TreeRoot, NamePageAddress, Arc<LoadedNamePageRecord>)>,
+}
+
 impl Default for NamePagePathCache {
     fn default() -> Self {
         Self {
@@ -2018,6 +2052,15 @@ impl NamePagePathCache {
             .lock()
             .map_err(|_| PageTreeError::Poisoned)?
             .insert(root, address, loaded)
+    }
+
+    /// Admit records from a durably committed append without reading their
+    /// just-written pages back from storage.
+    pub fn publish(&self, update: NamePagePathCacheUpdate) -> Result<(), PageTreeError> {
+        for (root, address, loaded) in update.records {
+            self.insert(root, address, loaded)?;
+        }
+        Ok(())
     }
 }
 
@@ -6240,6 +6283,66 @@ mod tests {
 
         drop(reader);
         drop(appender);
+        std::fs::remove_file(path).expect("remove page fixture");
+    }
+
+    #[test]
+    fn committed_append_seeds_shared_paths_without_reading_back_pages() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "hsrd-name-pages-seeded-cache-{}-{nonce}.pages",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let entries = (0u8..64)
+            .map(|index| {
+                let mut key = [0u8; 32];
+                key[0] = index;
+                key[31] = index.reverse_bits();
+                (NameHash::new(key), vec![index; 128])
+            })
+            .collect::<Vec<_>>();
+        let tree = MemoryUrkel::from_entries(entries.clone()).expect("tree");
+        let root = tree.root();
+        let records = tree.node_records().expect("records");
+        let packed =
+            pack_name_page_records(41, 0, 0, &records, &HashMap::new()).expect("pack records");
+        let root_locator = packed.root_locator(root).expect("root locator");
+        let mut appender = NamePageAppender::create_new(&path, 41, 0).expect("create pages");
+        let (_, update) = packed
+            .append_consuming_with_reserve_and_cache_update(&mut appender, 0)
+            .expect("append pages");
+        drop(appender);
+
+        let path_records = NamePagePathCache::default();
+        path_records.publish(update).expect("publish cache update");
+        let source = NamePageSegmentSource::Explicit(Arc::new(BTreeMap::from([(0, path.clone())])));
+        let reader = NamePageTreeReader::open_source_with_caches(
+            source,
+            root,
+            root_locator,
+            1,
+            path_records,
+        )
+        .expect("reader");
+        let prefetched = reader
+            .prefetch_paths(
+                root,
+                &entries.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            )
+            .expect("prefetch seeded paths")
+            .expect("page-backed root");
+        assert_eq!(prefetched, records);
+        let stats = reader.path_read_stats();
+        assert_eq!(stats.pages, 0);
+        assert_eq!(stats.records, 0);
+        assert!(stats.cache_hits >= records.len() as u64);
+
+        drop(reader);
         std::fs::remove_file(path).expect("remove page fixture");
     }
 
