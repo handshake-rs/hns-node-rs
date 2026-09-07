@@ -4437,10 +4437,21 @@ impl ReadSnapshot for RocksSnapshot<'_> {
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Vec<u8>>>, StoreError> {
         let cf = RocksStore::cf(self.db, family)?;
-        self.snapshot
-            .multi_get_cf(keys.iter().map(|key| (cf, *key)))
+        let mut options = rocksdb::ReadOptions::default();
+        options.set_snapshot(&self.snapshot);
+        self.db
+            // RocksDB's batched path groups point lookups by block-based SST
+            // internals. This is materially cheaper than the compatibility
+            // MultiGet C API for the tens of thousands of UTXOs resolved by
+            // one active-state replay slice. Callers do not promise sorted
+            // keys, and the API preserves input order when sorting internally.
+            .batched_multi_get_cf_opt(cf, keys.iter(), false, &options)
             .into_iter()
-            .map(|value| value.map_err(|error| StoreError::Backend(error.to_string())))
+            .map(|value| {
+                value
+                    .map(|value| value.map(|value| value.as_ref().to_vec()))
+                    .map_err(|error| StoreError::Backend(error.to_string()))
+            })
             .collect()
     }
 
