@@ -221,6 +221,7 @@ pub struct PreparedBlockUtxos {
     height: Height,
     transaction_ids: Vec<hns_primitives::Txid>,
     coins: HashMap<Outpoint, Option<Coin>>,
+    created_coins: HashMap<Outpoint, Coin>,
 }
 
 impl PreparedBlockUtxos {
@@ -239,6 +240,14 @@ impl PreparedBlockUtxos {
     #[must_use]
     pub fn coin(&self, outpoint: &Outpoint) -> Option<&Option<Coin>> {
         self.coins.get(outpoint)
+    }
+
+    /// Return the canonical coin constructed for one spendable output of the
+    /// prepared block. Derivative indexes and consensus share this allocation
+    /// instead of cloning the output address and covenant independently.
+    #[must_use]
+    pub fn created_coin(&self, outpoint: &Outpoint) -> Option<&Coin> {
+        self.created_coins.get(outpoint)
     }
 }
 
@@ -2452,12 +2461,21 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
         .first()
         .ok_or(StateError::MissingCoinbase)?;
     let owned_prefetched_utxos;
+    let owned_created_coins;
     let prefetched_utxos = match prepared_utxos {
         Some(prepared) => &prepared.coins,
         None => {
             owned_prefetched_utxos =
                 prefetch_block_utxos_with_transaction_ids(snapshot, transaction_ids)?;
             &owned_prefetched_utxos
+        }
+    };
+    let prepared_created_coins = match prepared_utxos {
+        Some(prepared) => &prepared.created_coins,
+        None => {
+            owned_created_coins =
+                block_created_coins_with_transaction_ids(transaction_ids, request.height)?;
+            &owned_created_coins
         }
     };
     let chain_context =
@@ -2629,20 +2647,15 @@ fn connect_block_to_batch_with_services_accumulator_transaction_ids_and_utxos<
                 return Err(StateError::DuplicateCoin(outpoint));
             }
 
-            let coin = Coin {
-                outpoint: outpoint.clone(),
-                value: output.value,
-                height: request.height,
-                coinbase: transaction_index == 0,
-                address: output.address.clone(),
-                covenant: output.covenant.clone(),
-            };
+            let coin = prepared_created_coins.get(&outpoint).ok_or_else(|| {
+                StateError::Codec("prepared output coin is missing from its block view".to_owned())
+            })?;
             batch.put(
                 ColumnFamily::Utxo,
                 &encode_outpoint_key(&outpoint),
-                &encode_coin(&coin),
+                &encode_coin(coin),
             )?;
-            pending_created.insert(outpoint.clone(), coin);
+            pending_created.insert(outpoint.clone(), coin.clone());
             created_coins.push(outpoint);
         }
     }
@@ -2965,7 +2978,59 @@ pub fn prepare_block_utxos_with_transaction_ids<T: ReadSnapshot>(
         height,
         transaction_ids: transaction_ids.as_slice().to_vec(),
         coins: prefetch_block_utxos_with_transaction_ids(snapshot, transaction_ids)?,
+        created_coins: block_created_coins_with_transaction_ids(transaction_ids, height)?,
     })
+}
+
+fn block_created_coins_with_transaction_ids(
+    transaction_ids: &BlockTransactionIds<'_>,
+    height: Height,
+) -> Result<HashMap<Outpoint, Coin>, StateError> {
+    let block = transaction_ids.block();
+    if transaction_ids.as_slice().len() != block.transactions.len() {
+        return Err(StateError::Codec(
+            "prepared block transaction count mismatch".to_owned(),
+        ));
+    }
+    let capacity = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.outputs.len())
+        .fold(0_usize, usize::saturating_add);
+    let mut coins = HashMap::with_capacity(capacity);
+    for (transaction_position, (transaction, txid)) in block
+        .transactions
+        .iter()
+        .zip(transaction_ids.as_slice().iter().copied())
+        .enumerate()
+    {
+        for (output_position, output) in transaction.outputs.iter().enumerate() {
+            if output.is_unspendable() {
+                continue;
+            }
+            let index = u32::try_from(output_position).map_err(|_| {
+                StateError::Codec(format!("output index {output_position} exceeds u32"))
+            })?;
+            let outpoint = Outpoint { txid, index };
+            if coins
+                .insert(
+                    outpoint.clone(),
+                    Coin {
+                        outpoint: outpoint.clone(),
+                        value: output.value,
+                        height,
+                        coinbase: transaction_position == 0,
+                        address: output.address.clone(),
+                        covenant: output.covenant.clone(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(StateError::DuplicateCoin(outpoint));
+            }
+        }
+    }
+    Ok(coins)
 }
 
 #[cfg(test)]

@@ -1571,8 +1571,7 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
                 index: output_position,
             };
             let coin = plan
-                .created_coins
-                .get(&outpoint)
+                .created_coin(&outpoint)
                 .cloned()
                 .ok_or(IndexError::Corrupt(
                     "tracked funding coin was not constructed",
@@ -1604,11 +1603,10 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
             if input.previous_output.is_null() {
                 continue;
             }
-            let coin = match plan.created_coins.get(&input.previous_output) {
-                Some(coin) => coin.clone(),
+            let coin = match plan.created_coin(&input.previous_output) {
+                Some(coin) => coin,
                 None => plan
                     .external_input_coin(&input.previous_output)
-                    .cloned()
                     .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?,
             };
             let Some(registration) = matching_contract_for_output(
@@ -1625,7 +1623,7 @@ pub(crate) fn stage_connect_prefetched<S: ReadSnapshot, B: WriteBatch>(
             let funding = if let Some((created_registration, funding)) =
                 tracked_created.get(&input.previous_output)
             {
-                if created_registration.id != registration.id || funding.coin != coin {
+                if created_registration.id != registration.id || &funding.coin != coin {
                     return Err(IndexError::Corrupt(
                         "same-block tracked funding disagrees with descriptor selection",
                     ));

@@ -806,7 +806,6 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
             }
             let coin = plan
                 .external_input_coin(&input.previous_output)
-                .cloned()
                 .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?;
             let Some(transfer) = decode_transfer(&coin.covenant)? else {
                 continue;
@@ -835,7 +834,7 @@ pub(super) fn stage_connect_prefetched<B: WriteBatch, S: ReadSnapshot>(
                     entry.insert(ExistingTransactionDelta { evidence, state })
                 }
             };
-            let entry = entry_from_coin(&coin, &transfer, &delta.evidence);
+            let entry = entry_from_coin(coin, &transfer, &delta.evidence);
             entry.validate_evidence(&delta.evidence)?;
             let key = entry.key()?;
             let value =

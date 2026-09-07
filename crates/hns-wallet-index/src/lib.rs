@@ -480,8 +480,13 @@ pub enum IndexError {
 struct BlockConnectPlan<'a> {
     block_hash: BlockHash,
     transaction_ids: &'a [Txid],
-    created_coins: HashMap<Outpoint, Coin>,
+    created_coins: BlockCreatedCoins<'a>,
     external_input_coins: ExternalInputCoins<'a>,
+}
+
+enum BlockCreatedCoins<'a> {
+    Owned(HashMap<Outpoint, Coin>),
+    Prepared(&'a PreparedBlockUtxos),
 }
 
 enum ExternalInputCoins<'a> {
@@ -503,7 +508,7 @@ impl<'a> BlockConnectPlan<'a> {
         Ok(Self {
             block_hash,
             transaction_ids,
-            created_coins,
+            created_coins: BlockCreatedCoins::Owned(created_coins),
             external_input_coins: ExternalInputCoins::Owned(external_input_coins),
         })
     }
@@ -524,9 +529,16 @@ impl<'a> BlockConnectPlan<'a> {
         Ok(Self {
             block_hash,
             transaction_ids,
-            created_coins: block_created_coins_with_ids(block, height, transaction_ids)?,
+            created_coins: BlockCreatedCoins::Prepared(prepared_utxos),
             external_input_coins: ExternalInputCoins::Prepared(prepared_utxos),
         })
+    }
+
+    fn created_coin(&self, outpoint: &Outpoint) -> Option<&Coin> {
+        match &self.created_coins {
+            BlockCreatedCoins::Owned(coins) => coins.get(outpoint),
+            BlockCreatedCoins::Prepared(prepared) => prepared.created_coin(outpoint),
+        }
     }
 
     fn external_input_coin(&self, outpoint: &Outpoint) -> Option<&Coin> {
@@ -628,6 +640,7 @@ fn stage_connect_with_plan<B: WriteBatch, S: ReadSnapshot>(
                 height,
                 transaction_position,
                 profile,
+                plan,
                 &mut history,
             )?;
         }
@@ -637,11 +650,10 @@ fn stage_connect_with_plan<B: WriteBatch, S: ReadSnapshot>(
             }
             let input_position =
                 u32::try_from(input_position).map_err(|_| IndexError::PositionOverflow)?;
-            let coin = match plan.created_coins.get(&input.previous_output) {
-                Some(coin) => coin.clone(),
+            let coin = match plan.created_coin(&input.previous_output) {
+                Some(coin) => coin,
                 None => plan
                     .external_input_coin(&input.previous_output)
-                    .cloned()
                     .ok_or_else(|| IndexError::MissingInputCoin(input.previous_output.clone()))?,
             };
             if profile.histories() {
@@ -963,6 +975,7 @@ fn stage_created_outputs<B: WriteBatch>(
     height: Height,
     transaction_position: u32,
     profile: WalletIndexProfile,
+    plan: &BlockConnectPlan<'_>,
     history: &mut BTreeMap<(ScriptId, Txid), ScriptHistoryEntry>,
 ) -> Result<(), IndexError> {
     for (output_position, output) in transaction.outputs.iter().enumerate() {
@@ -975,7 +988,10 @@ fn stage_created_outputs<B: WriteBatch>(
             txid,
             index: output_position,
         };
-        let script = ScriptId::from_address(&output.address);
+        let coin = plan
+            .created_coin(&outpoint)
+            .ok_or(IndexError::Corrupt("wallet output coin was not prepared"))?;
+        let script = ScriptId::from_address(&coin.address);
         if profile.histories() {
             record_history(
                 history,
@@ -991,18 +1007,10 @@ fn stage_created_outputs<B: WriteBatch>(
             );
         }
         if profile.utxos() {
-            let coin = Coin {
-                outpoint: outpoint.clone(),
-                value: output.value,
-                height,
-                coinbase: transaction_position == 0,
-                address: output.address.clone(),
-                covenant: output.covenant.clone(),
-            };
             batch.put(
                 ColumnFamily::WalletState,
                 &utxo_key(script, &outpoint),
-                &encode_utxo_value(script, &coin),
+                &encode_utxo_value(script, coin),
             )?;
         }
     }
