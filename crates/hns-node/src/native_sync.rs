@@ -1277,6 +1277,28 @@ struct NativeActiveStatePlan {
     planning_micros: u64,
 }
 
+/// Keep an interval-committing block out of a larger direct replay slice.
+///
+/// The boundary block materializes the complete affected authenticated path
+/// union into the page store. That indivisible publication can consume most of
+/// the staged-effect allowance independently of adjacent blocks. Planning the
+/// prefix before it, then the boundary alone, avoids preparing and discarding
+/// geometrically smaller multi-block retries. Actual reorganizations remain
+/// untouched because their disconnect/connect transition must stay atomic.
+fn isolate_direct_name_tree_commit(mut activation: NodeReorg, tree_interval: Height) -> NodeReorg {
+    if !activation.disconnect.is_empty() || activation.connect.len() <= 1 || tree_interval == 0 {
+        return activation;
+    }
+    if let Some(boundary) = activation
+        .connect
+        .iter()
+        .position(|request| request.height() != 0 && request.height().is_multiple_of(tree_interval))
+    {
+        activation.connect.truncate(boundary.max(1));
+    }
+    activation
+}
+
 #[derive(Debug)]
 struct NativeActiveStatePreparationInput {
     ordinal: usize,
@@ -4919,6 +4941,10 @@ impl NodeService {
         else {
             return Ok(None);
         };
+        let activation = isolate_direct_name_tree_commit(
+            activation,
+            self.config.network.params().names.tree_interval,
+        );
         let planning_micros =
             u64::try_from(planning_started.elapsed().as_micros()).unwrap_or(u64::MAX);
 
@@ -5183,9 +5209,10 @@ impl NodeReadHandle {
                 NodeReorgLimits::with_maximum_connect(maximum_connect),
             )
         })?;
+        let tree_interval = self.network().params().names.tree_interval;
         Ok(activation.map(|activation| NativeActiveStatePlan {
             epoch,
-            activation,
+            activation: isolate_direct_name_tree_commit(activation, tree_interval),
             maximum_connect,
             planning_micros: u64::try_from(planning_started.elapsed().as_micros())
                 .unwrap_or(u64::MAX),
@@ -11143,6 +11170,57 @@ mod tests {
             tuner.record_success(limit);
         }
         assert_eq!(tuner.next_limit, 32);
+    }
+
+    #[test]
+    fn direct_replay_planning_isolates_name_tree_commit_boundaries() {
+        let activation = |start: Height, count: Height| NodeReorg {
+            disconnect: Vec::new(),
+            connect: (start..start.saturating_add(count))
+                .map(|height| {
+                    NodeBlockImport::from_peer(validator_coinbase_block(height, 1), height)
+                })
+                .collect(),
+        };
+        let heights = |activation: &NodeReorg| {
+            activation
+                .connect
+                .iter()
+                .map(NodeBlockImport::height)
+                .collect::<Vec<_>>()
+        };
+
+        // Finish the prefix before an interval boundary without paying to
+        // prepare the boundary block in a batch that cannot commit atomically.
+        let prefix = isolate_direct_name_tree_commit(activation(35, 10), 36);
+        assert_eq!(heights(&prefix), vec![35]);
+
+        // Once the interval boundary is first, retain exactly that indivisible
+        // block. The next planner pass can resume with an ordinary direct slice.
+        let boundary = isolate_direct_name_tree_commit(activation(36, 10), 36);
+        assert_eq!(heights(&boundary), vec![36]);
+        let ordinary = isolate_direct_name_tree_commit(activation(37, 10), 36);
+        assert_eq!(heights(&ordinary), (37..47).collect::<Vec<_>>());
+
+        // Genesis cannot publish changes accumulated by an earlier interval,
+        // so it is not a reason to shorten initial validation of a stored chain.
+        let genesis = isolate_direct_name_tree_commit(activation(0, 2), 36);
+        assert_eq!(heights(&genesis), vec![0, 1]);
+
+        // A real reorganization is an atomic disconnect/connect transition and
+        // must never be shortened by this direct-catch-up optimization.
+        let mut reorganization = activation(35, 10);
+        reorganization
+            .disconnect
+            .push(super::super::NodeBlockDisconnect {
+                block_hash: BlockHash::new([7; 32]),
+                height: 34,
+            });
+        let reorganization = isolate_direct_name_tree_commit(reorganization, 36);
+        assert_eq!(heights(&reorganization), (35..45).collect::<Vec<_>>());
+
+        let disabled = isolate_direct_name_tree_commit(activation(35, 10), 0);
+        assert_eq!(heights(&disabled), (35..45).collect::<Vec<_>>());
     }
 
     #[test]

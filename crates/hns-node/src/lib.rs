@@ -309,10 +309,12 @@ const MAX_REORG_STAGED_EFFECT_BYTES: u64 = 256 * 1024 * 1024;
 // logical copy. This also leaves deterministic headroom for allocator and
 // backend write-batch framing without depending on a particular target ABI.
 const REORG_STAGED_OPERATION_FRAMING_BYTES: u64 = 128;
-// During state staging, the write's source encoding coexists with the backend
-// batch and the read-your-writes overlay. Deferred name nodes omit the backend
-// copy, and consuming page publication transfers that overlay allocation into
-// its ordered pack without cloning the canonical bytes.
+// During state staging, the write's source encoding coexists with the
+// read-your-writes overlay. The production replay path now defers backend-batch
+// materialization until staged reads finish, but retaining the prior three-copy
+// allowance deliberately keeps the atomic bound conservative while reducing
+// actual peak ownership. Consuming page publication transfers deferred name
+// nodes into its ordered pack without cloning the canonical bytes.
 const REORG_STAGING_OPERATION_COPIES: u64 = 3;
 // After the overlay has been consumed, page publication retains one backend
 // copy while the source encoding is submitted to it.
@@ -23139,7 +23141,7 @@ mod tests {
     }
 
     #[test]
-    fn native_active_state_direct_progress_yields_between_bounded_atomic_slices() {
+    fn native_active_state_direct_progress_yields_at_name_tree_boundaries() {
         let mut node = NodeService::new(active_state_native_config());
         let mut previous = BlockHash::ZERO;
         let mut records = Vec::new();
@@ -23156,33 +23158,31 @@ mod tests {
             records.push(record);
         }
 
-        let first = node
-            .native_sync_connect_stored_state(320)
-            .expect("first direct connector slice");
-        assert_eq!(
-            first.connected,
-            native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE
-        );
-        assert_eq!(first.disconnected, 0);
-        assert_eq!(
-            node.state()
-                .best_block_tip()
-                .expect("active tip")
-                .expect("first slice tip")
-                .hash,
-            records[native_sync::MAX_ACTIVE_STATE_DIRECT_CONNECT_SLICE - 1].hash
-        );
-
-        let second = node
-            .native_sync_connect_stored_state(320)
-            .expect("second direct connector slice");
-        assert_eq!(second.connected, 32);
-        assert_eq!(second.disconnected, 0);
+        let tree_interval = Network::Regtest.params().names.tree_interval;
+        let mut connected = 0usize;
+        while connected < records.len() {
+            let outcome = node
+                .native_sync_connect_stored_state(320)
+                .expect("direct connector slice");
+            assert!(outcome.connected > 0);
+            assert_eq!(outcome.disconnected, 0);
+            let first_height = Height::try_from(connected).expect("fixture height");
+            let last_height =
+                Height::try_from(connected + outcome.connected - 1).expect("fixture height");
+            if first_height != 0 && first_height.is_multiple_of(tree_interval) {
+                assert_eq!(outcome.connected, 1, "boundary must be isolated");
+            } else if let Some(boundary) = (first_height..=last_height)
+                .find(|height| *height != 0 && height.is_multiple_of(tree_interval))
+            {
+                panic!("slice crossed interval boundary {boundary}");
+            }
+            connected += outcome.connected;
+        }
         assert_eq!(
             node.state()
                 .best_block_tip()
                 .expect("active tip")
-                .expect("second slice tip")
+                .expect("final slice tip")
                 .hash,
             records.last().expect("stored tip").hash
         );
