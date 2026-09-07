@@ -193,10 +193,19 @@ replacement connect remain one transaction.
 
 The atomic staged-effect meter can reduce a direct replay slice when historical
 name activity makes the configured block count too large. After such a retry,
-the adaptive batcher now requires sixteen consecutive full slices before
-probing a larger limit. This keeps the batch near its demonstrated capacity
-instead of immediately oscillating from one block to two and discarding the
-oversized attempt on every following slice.
+the adaptive batcher requires four consecutive full slices before increasing
+its candidate by 50%. A miss still halves repeatedly to a complete prefix that
+fits. This bounded additive-increase/multiplicative-decrease policy recovers
+quickly from an unusually expensive name-state block without probing a larger
+transaction on every following slice.
+
+`--active-state-staged-effect-mib` may raise the straight-line replay meter
+from its 256 MiB default to at most 1024 MiB on a memory-qualified host. The
+larger slice amortizes authenticated page traversal and one synchronous commit.
+It never applies to a branch that disconnects active blocks: actual
+reorganizations retain the fixed 256 MiB production ceiling. The configured
+byte budget is published in `gethsrdstatus` so deployment evidence identifies
+the exact resource envelope being measured.
 
 The state path removes redundant reads at several levels:
 
@@ -343,7 +352,11 @@ when exhaustive media verification is required.
 Pruned startup compares committed segment file bytes with the live locator
 footprint without scanning dead payloads. At 256 MiB of reclaimable frames it
 rewrites only live block/undo records into a new generation and atomically
-publishes all locators plus both manifests. The offline
+publishes all locators plus both manifests. Native sync repeats the bounded due
+inspection every ten minutes, serialized through the sole canonical writer, so
+long-running IBD no longer retains physically dead frames until its next
+restart. Catch-up amortizes generation rewrites with a 4 GiB dead-frame
+threshold; synchronized operation returns to 256 MiB. The offline
 `hsrd-storage-maintenance compact` variant adds exhaustive pre/post scrubs.
 
 Page-backed name state is compacted by retained-root union rather than by

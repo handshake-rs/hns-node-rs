@@ -50,7 +50,10 @@ use hns_rpc::{
 };
 #[cfg(all(test, feature = "rocksdb-backend"))]
 use hns_store::mark_clean_shutdown;
-use hns_store::{ColumnFamily, ReadSnapshot, Store, StoreError, StoreHandle, WriteBatch};
+use hns_store::{
+    ColumnFamily, ReadSnapshot, SegmentArchiveCompactionReport, Store, StoreError, StoreHandle,
+    WriteBatch,
+};
 use hns_sync::{
     spawn_validation_pipeline,
     validation::{spawn_ordered_work_pipeline, OrderedWorkError},
@@ -81,7 +84,8 @@ use super::{
     PreparedNativeActivation, ReorgStagedEffectMeter, RpcAuthorizationHeader, RpcLimits,
     RpcReadContext, RpcRuntimeLimits, ShutdownSignal, StatelessBodyValidation,
     HSRD_DIAGNOSTIC_API_VERSION, MAX_CANONICAL_WRITER_QUEUE_CAPACITY,
-    NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD, NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
+    MAX_REORG_STAGED_EFFECT_BYTES, NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD,
+    NAME_PAGE_COMPACTION_SEGMENT_THRESHOLD,
 };
 use super::{wallet_rpc, WalletBackend};
 use crate::peer_bans::{
@@ -91,6 +95,9 @@ use crate::peer_bans::{
 use crate::{ShakescapeRelayHandle, ShakescapeRelayHandleError};
 
 const MAX_LOCATOR_ENTRIES: usize = 32;
+const MAX_ACTIVE_STATE_STAGED_EFFECT_BYTES: u64 = 1024 * 1024 * 1024;
+const PAYLOAD_SEGMENT_COMPACTION_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_SERVED_HEADERS: usize = hns_p2p::MAX_HEADERS;
 const MAX_GETDATA_ITEMS: usize = 1_024;
 const LOCAL_ORPHAN_PEER: PeerId = PeerId(0);
@@ -776,6 +783,10 @@ pub struct NativeSyncConfig {
     pub headers_only: bool,
     pub connect_active_state: bool,
     pub active_state_connect_batch: usize,
+    /// Maximum cumulative atomic-write effect admitted for one straight-line
+    /// native-sync replay slice. Actual reorganizations retain the stricter
+    /// production reorg ceiling regardless of this operator setting.
+    pub active_state_staged_effect_bytes: u64,
     pub listen: Option<SocketAddr>,
     /// Externally reachable raw-TCP socket announced through ordinary ADDR
     /// packets. It may differ from `listen` when a port forwarder terminates
@@ -831,6 +842,7 @@ impl Default for NativeSyncConfig {
             headers_only: false,
             connect_active_state: false,
             active_state_connect_batch: 288,
+            active_state_staged_effect_bytes: MAX_REORG_STAGED_EFFECT_BYTES,
             listen: None,
             advertise: None,
             connect: Vec::new(),
@@ -895,6 +907,16 @@ impl NativeSyncConfig {
             anyhow::bail!(
                 "active-state connector batch {} must be within 1..={MAX_ACTIVE_STATE_CONNECT_BATCH}",
                 self.active_state_connect_batch
+            );
+        }
+        if self.active_state_staged_effect_bytes < MAX_REORG_STAGED_EFFECT_BYTES
+            || self.active_state_staged_effect_bytes > MAX_ACTIVE_STATE_STAGED_EFFECT_BYTES
+        {
+            anyhow::bail!(
+                "active-state staged-effect budget {} must be within {}..={}",
+                self.active_state_staged_effect_bytes,
+                MAX_REORG_STAGED_EFFECT_BYTES,
+                MAX_ACTIVE_STATE_STAGED_EFFECT_BYTES,
             );
         }
         let has_discovery_endpoint =
@@ -1249,6 +1271,7 @@ struct NativeActiveStateSliceResult {
 }
 
 type NamePageCompactionTask = JoinHandle<Result<Option<NamePageCompactionReport>>>;
+type PayloadSegmentCompactionTask = JoinHandle<Result<Option<SegmentArchiveCompactionReport>>>;
 
 #[derive(Debug)]
 struct ActiveStateBatchTuner {
@@ -1257,7 +1280,11 @@ struct ActiveStateBatchTuner {
 }
 
 impl ActiveStateBatchTuner {
-    const GROWTH_SUCCESS_STREAK: usize = 16;
+    // A budget miss already halves to the largest viable prefix. Require a
+    // short success streak before probing again, then recover geometrically;
+    // linear 12.5% growth left IBD at one-to-four blocks per durable commit
+    // for minutes after one unusually expensive name-state block.
+    const GROWTH_SUCCESS_STREAK: usize = 4;
 
     fn new(initial_connect_limit: usize) -> Self {
         Self {
@@ -1282,7 +1309,7 @@ impl ActiveStateBatchTuner {
 
         self.successful_full_slices = self.successful_full_slices.saturating_add(1);
         if self.successful_full_slices >= Self::GROWTH_SUCCESS_STREAK {
-            let increase = (self.next_limit / 8).max(1);
+            let increase = (self.next_limit / 2).max(1);
             self.next_limit = self
                 .next_limit
                 .saturating_add(increase)
@@ -1336,6 +1363,44 @@ fn online_name_page_compaction_segment_threshold(stage: SyncStage) -> u32 {
     } else {
         NAME_PAGE_CATCH_UP_COMPACTION_SEGMENT_THRESHOLD
     }
+}
+
+fn online_payload_segment_compaction_min_dead_bytes(stage: SyncStage) -> u64 {
+    if stage == SyncStage::Synced {
+        super::PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES
+    } else {
+        PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES
+    }
+}
+
+fn schedule_payload_segment_compaction(
+    writer: &CanonicalStateWriter,
+    scheduler: &SyncScheduler,
+    task: &mut Option<PayloadSegmentCompactionTask>,
+) -> bool {
+    if task.is_some() {
+        return false;
+    }
+
+    let minimum_reclaimable_bytes =
+        online_payload_segment_compaction_min_dead_bytes(scheduler.stage());
+    let sync_stage = scheduler.stage();
+    let writer = writer.clone();
+    *task = Some(tokio::spawn(async move {
+        writer
+            .execute(None, "compact pruned payload segments", move |service| {
+                service
+                    .state
+                    .compact_pruned_payload_segments_if_due_at(minimum_reclaimable_bytes)
+            })
+            .await
+    }));
+    tracing::debug!(
+        minimum_reclaimable_bytes,
+        ?sync_stage,
+        "scheduled bounded pruned payload-segment maintenance"
+    );
+    true
 }
 
 struct ActiveStateWorkerPermit {
@@ -3086,6 +3151,10 @@ impl NodeService {
         let mut active_state_poll = tokio::time::interval(MIN_NATIVE_SYNC_POLL_INTERVAL);
         active_state_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         active_state_poll.tick().await;
+        let mut payload_segment_compaction_poll =
+            tokio::time::interval(PAYLOAD_SEGMENT_COMPACTION_INTERVAL);
+        payload_segment_compaction_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        payload_segment_compaction_poll.tick().await;
         let mut peer_state_flush = tokio::time::interval(ADDRESS_BOOK_FLUSH_INTERVAL);
         peer_state_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         peer_state_flush.tick().await;
@@ -3097,6 +3166,7 @@ impl NodeService {
         let mut active_state_task: Option<JoinHandle<Result<NativeActiveStateSliceResult>>> = None;
         let mut active_state_completion: Option<NativeActiveStateSliceResult> = None;
         let mut name_page_compaction_task: Option<NamePageCompactionTask> = None;
+        let mut payload_segment_compaction_task: Option<PayloadSegmentCompactionTask> = None;
         let mut consecutive_active_state_contention = 0usize;
         let mut consecutive_maintenance_busy = 0usize;
         let mut next_supervisor_lane = NativeSupervisorLane::Maintenance;
@@ -3138,6 +3208,7 @@ impl NodeService {
                     if native_sync_config.connect_active_state
                         && active_state_task.is_none()
                         && name_page_compaction_task.is_none()
+                        && payload_segment_compaction_task.is_none()
                         && (active_state_completion.is_some()
                             || active_state_work_ready(&scheduler)) =>
                 {
@@ -3380,6 +3451,68 @@ impl NodeService {
                         }
                     }
                 }
+                result = async {
+                    payload_segment_compaction_task
+                        .as_mut()
+                        .expect("payload-segment compaction task select guard")
+                        .await
+                }, if payload_segment_compaction_task.is_some() => {
+                    let _finished = payload_segment_compaction_task
+                        .take()
+                        .expect("completed payload-segment compaction task remains present");
+                    match result {
+                        Ok(Ok(Some(report))) => {
+                            tracing::info!(
+                                previous_block_generation = report.previous_block_generation,
+                                previous_undo_generation = report.previous_undo_generation,
+                                generation = report.generation,
+                                live_records = report.live_records,
+                                reclaimed_frame_bytes = report.reclaimed_frame_bytes,
+                                "online pruned payload-segment compaction completed"
+                            );
+                            active_state_poll.reset_after(MIN_NATIVE_SYNC_POLL_INTERVAL);
+                        }
+                        Ok(Ok(None)) => {
+                            tracing::debug!(
+                                "online payload-segment maintenance found no due rewrite"
+                            );
+                        }
+                        Ok(Err(error)) if canonical_writer_shutting_down(&error) => {
+                            tracing::debug!(
+                                %error,
+                                "payload-segment maintenance stopped during shutdown"
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            let error = error.context(
+                                "online pruned payload-segment compaction failed",
+                            );
+                            record_error(&diagnostics, format!("{error:#}")).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
+                        Err(error) => {
+                            let error = anyhow::Error::new(error)
+                                .context("online payload-segment compaction task failed");
+                            record_error(&diagnostics, format!("{error:#}")).await;
+                            terminal_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                _ = payload_segment_compaction_poll.tick(),
+                    if native_sync_config.connect_active_state
+                        && active_state_task.is_none()
+                        && active_state_completion.is_none()
+                        && name_page_compaction_task.is_none()
+                        && payload_segment_compaction_task.is_none() =>
+                {
+                    schedule_payload_segment_compaction(
+                        &writer,
+                        &scheduler,
+                        &mut payload_segment_compaction_task,
+                    );
+                }
                 event = next_native_supervisor_event(
                     &mut next_supervisor_lane,
                     &mut poll,
@@ -3412,6 +3545,7 @@ impl NodeService {
                     }
                     if active_state_task.is_none()
                         && active_state_completion.is_none()
+                        && payload_segment_compaction_task.is_none()
                     {
                         match schedule_name_page_compaction_if_due(
                             &node,
@@ -4847,7 +4981,15 @@ impl NodeService {
                 .expect("one-block direct activation checked above");
             self.apply_prepared_stored_direct_extension(request, prepared)
         } else {
-            self.apply_reorg_classified_prepared(activation, prepared)
+            let limits = if is_reorg {
+                NodeReorgLimits::with_maximum_connect(maximum_connect)
+            } else {
+                NodeReorgLimits::with_maximum_connect_and_staged_effect_bytes(
+                    maximum_connect,
+                    self.config.native_sync.active_state_staged_effect_bytes,
+                )
+            };
+            self.apply_reorg_classified_prepared_with_limits(activation, prepared, limits)
         };
         let state_commit_micros =
             u64::try_from(state_commit_started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -11010,6 +11152,28 @@ mod tests {
     }
 
     #[test]
+    fn payload_compaction_amortizes_rewrites_during_catch_up() {
+        for stage in [
+            SyncStage::Idle,
+            SyncStage::Headers,
+            SyncStage::Blocks,
+            SyncStage::Validating,
+            SyncStage::SnapshotImport,
+            SyncStage::BackgroundVerify,
+        ] {
+            assert_eq!(
+                online_payload_segment_compaction_min_dead_bytes(stage),
+                PAYLOAD_SEGMENT_CATCH_UP_COMPACTION_MIN_DEAD_BYTES,
+                "{stage:?} must amortize payload generation rewrites",
+            );
+        }
+        assert_eq!(
+            online_payload_segment_compaction_min_dead_bytes(SyncStage::Synced),
+            crate::PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES,
+        );
+    }
+
+    #[test]
     fn brontide_identity_is_restart_durable_and_private() {
         let path = std::env::temp_dir().join(format!(
             "hsrd-brontide-identity-{}-{}",
@@ -13756,6 +13920,30 @@ mod tests {
             ..zero_connector_batch
         };
         assert!(oversized_connector_batch
+            .validate(AuthorityMode::Native, Network::Regtest)
+            .is_err());
+
+        let valid = NativeSyncConfig {
+            enabled: true,
+            connect: vec![peer],
+            maximum_outbound: 1,
+            ..NativeSyncConfig::default()
+        };
+        valid
+            .validate(AuthorityMode::Native, Network::Regtest)
+            .expect("default active-state effect budget");
+        let undersized_effect_budget = NativeSyncConfig {
+            active_state_staged_effect_bytes: MAX_REORG_STAGED_EFFECT_BYTES - 1,
+            ..valid.clone()
+        };
+        assert!(undersized_effect_budget
+            .validate(AuthorityMode::Native, Network::Regtest)
+            .is_err());
+        let oversized_effect_budget = NativeSyncConfig {
+            active_state_staged_effect_bytes: MAX_ACTIVE_STATE_STAGED_EFFECT_BYTES + 1,
+            ..valid
+        };
+        assert!(oversized_effect_budget
             .validate(AuthorityMode::Native, Network::Regtest)
             .is_err());
     }

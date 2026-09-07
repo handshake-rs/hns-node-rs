@@ -189,6 +189,11 @@ struct Cli {
     #[arg(long, default_value_t = 288)]
     active_state_connect_batch: usize,
 
+    /// Straight-line native-sync atomic-effect budget in MiB. Actual chain
+    /// reorganizations always retain the stricter 256 MiB production limit.
+    #[arg(long, default_value_t = 256)]
+    active_state_staged_effect_mib: u64,
+
     /// Bind an inbound Handshake P2P listener (Brontide on public networks).
     #[arg(long)]
     p2p_listen: Option<SocketAddr>,
@@ -421,6 +426,12 @@ impl Cli {
                     && !self.native_sync_headers_only
                     && !self.native_sync_observe_only,
                 active_state_connect_batch: self.active_state_connect_batch,
+                active_state_staged_effect_bytes: self
+                    .active_state_staged_effect_mib
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("active-state staged-effect MiB value overflow")
+                    })?,
                 listen: self.p2p_listen,
                 advertise: self.p2p_advertise.or_else(|| {
                     self.shakescape_mobile_rendezvous
@@ -811,6 +822,8 @@ async fn main() -> anyhow::Result<()> {
             native_sync = config.native_sync.enabled,
             native_sync_headers_only = config.native_sync.headers_only,
             native_sync_active_state = config.native_sync.connect_active_state,
+            active_state_connect_batch = config.native_sync.active_state_connect_batch,
+            active_state_staged_effect_bytes = config.native_sync.active_state_staged_effect_bytes,
             hip76_requester_override = ?config.native_sync.hip76_requester_override,
             odoh_requester_capable = config.native_sync.odoh_requester,
             odoh_requester_override = ?config.native_sync.odoh_requester_override,
@@ -889,6 +902,10 @@ mod tests {
         assert_eq!(default.native_sync.hnsr_opaque_relay_override, None);
         assert!(default.native_sync.hnsr_relay_address.is_none());
         assert!(default.native_sync.listen.is_none());
+        assert_eq!(
+            default.native_sync.active_state_staged_effect_bytes,
+            256 * 1024 * 1024
+        );
 
         let disabled = Cli::try_parse_from([
             "hsrd",
@@ -927,6 +944,35 @@ mod tests {
         assert_eq!(reenabled.native_sync.odoh_requester_override, Some(true));
         assert_eq!(reenabled.native_sync.hnsr_requester_override, Some(true));
         assert_eq!(reenabled.native_sync.hnsr_opaque_relay_override, Some(true));
+    }
+
+    #[test]
+    fn active_state_staged_effect_mib_is_checked_and_converted() {
+        let tuned = Cli::try_parse_from(["hsrd", "--active-state-staged-effect-mib", "512"])
+            .expect("tuned CLI")
+            .into_config()
+            .expect("tuned config");
+        assert_eq!(
+            tuned.native_sync.active_state_staged_effect_bytes,
+            512 * 1024 * 1024
+        );
+        validate_node_config(&tuned).expect("bounded tuned effect budget");
+
+        let oversized = Cli::try_parse_from(["hsrd", "--active-state-staged-effect-mib", "1025"])
+            .expect("oversized value parses")
+            .into_config()
+            .expect("oversized value converts");
+        assert!(validate_node_config(&oversized).is_err());
+
+        let overflow = Cli::try_parse_from([
+            "hsrd",
+            "--active-state-staged-effect-mib",
+            &u64::MAX.to_string(),
+        ])
+        .expect("overflowing value parses")
+        .into_config()
+        .expect_err("overflowing MiB conversion fails");
+        assert!(overflow.to_string().contains("overflow"));
     }
 
     #[test]

@@ -4535,13 +4535,14 @@ impl NodeService {
     /// yet been published to mining or reconciled with the mempool; callers
     /// must preserve the existing commit -> mining publication -> mempool
     /// reconciliation -> template-clear sequence in the same writer closure.
-    pub(crate) fn apply_reorg_classified_prepared(
+    pub(crate) fn apply_reorg_classified_prepared_with_limits(
         &mut self,
         request: NodeReorg,
         prepared: PreparedNativeActivation,
+        limits: NodeReorgLimits,
     ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
         self.state
-            .apply_reorg_classified_prepared(request, prepared)
+            .apply_reorg_classified_with_limits_and_prepared(request, limits, Some(prepared))
     }
 
     /// Commit one already-stored canonical successor through the same atomic
@@ -4897,6 +4898,10 @@ impl NodeService {
             failed_block_count,
             active_state_sync_enabled: self.config.native_sync.connect_active_state,
             active_state_connect_batch: self.config.native_sync.active_state_connect_batch,
+            active_state_staged_effect_bytes: self
+                .config
+                .native_sync
+                .active_state_staged_effect_bytes,
             pending_best_chain_activation,
             staged_chain_tip: durable.snapshot.is_some(),
             authoritative_mining_tip: self.mining_events.snapshot().is_some(),
@@ -5930,6 +5935,17 @@ impl NodeReorgLimits {
     const fn with_maximum_connect(maximum_connect: usize) -> Self {
         Self {
             maximum_connect,
+            ..Self::PRODUCTION
+        }
+    }
+
+    const fn with_maximum_connect_and_staged_effect_bytes(
+        maximum_connect: usize,
+        maximum_staged_effect_bytes: u64,
+    ) -> Self {
+        Self {
+            maximum_connect,
+            maximum_staged_effect_bytes,
             ..Self::PRODUCTION
         }
     }
@@ -12140,18 +12156,6 @@ impl NodeState {
             .map_err(ChainActivationFailure::into_anyhow)
     }
 
-    fn apply_reorg_classified_prepared(
-        &mut self,
-        request: NodeReorg,
-        prepared: PreparedNativeActivation,
-    ) -> std::result::Result<NodeReorgMutation, ChainActivationFailure> {
-        self.apply_reorg_classified_with_limits_and_prepared(
-            request,
-            NodeReorgLimits::PRODUCTION,
-            Some(prepared),
-        )
-    }
-
     fn apply_reorg_classified_with_limits(
         &mut self,
         request: NodeReorg,
@@ -12826,7 +12830,19 @@ impl NodeState {
         Ok(())
     }
 
-    fn compact_pruned_payload_segments_if_due(&self) -> Result<()> {
+    fn compact_pruned_payload_segments_if_due(
+        &self,
+    ) -> Result<Option<hns_store::SegmentArchiveCompactionReport>> {
+        self.compact_pruned_payload_segments_if_due_at(PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES)
+    }
+
+    fn compact_pruned_payload_segments_if_due_at(
+        &self,
+        minimum_reclaimable_bytes: u64,
+    ) -> Result<Option<hns_store::SegmentArchiveCompactionReport>> {
+        if minimum_reclaimable_bytes == 0 {
+            anyhow::bail!("payload-segment compaction threshold must be non-zero");
+        }
         self.ensure_storage_operational()?;
         let limits = SegmentCompactionLimits {
             max_live_frame_bytes: MAX_NAME_PAGE_GENERATION_BYTES,
@@ -12852,13 +12868,13 @@ impl NodeState {
                         error = %error,
                         "deferred payload-segment compaction behind a durable production safety fence"
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
                 return Err(error).context("failed to inspect pruned payload segments");
             }
         };
-        if plan.reclaimable_frame_bytes < PAYLOAD_SEGMENT_COMPACTION_MIN_DEAD_BYTES {
-            return Ok(());
+        if plan.reclaimable_frame_bytes < minimum_reclaimable_bytes {
+            return Ok(None);
         }
         let report = match self
             .store
@@ -12875,7 +12891,7 @@ impl NodeState {
                         error = %error,
                         "deferred payload-segment compaction behind a durable production safety fence"
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
                 return Err(error).context("failed to compact pruned payload segments");
             }
@@ -12888,7 +12904,7 @@ impl NodeState {
             reclaimed_frame_bytes = report.reclaimed_frame_bytes,
             "compacted pruned block/undo payload segments"
         );
-        Ok(())
+        Ok(Some(report))
     }
 
     fn compact_pruned_name_pages_if_due(&mut self) -> Result<Option<NamePageCompactionReport>> {
@@ -22733,6 +22749,10 @@ mod tests {
         let status = &rpc.snapshot().node_status;
         assert!(status.active_state_sync_enabled);
         assert_eq!(status.active_state_connect_batch, 288);
+        assert_eq!(
+            status.active_state_staged_effect_bytes,
+            MAX_REORG_STAGED_EFFECT_BYTES
+        );
         assert_eq!(status.active_state_resulting_root_height, Some(1));
         assert_eq!(
             status

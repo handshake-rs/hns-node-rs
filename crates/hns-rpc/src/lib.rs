@@ -454,6 +454,7 @@ pub struct RpcNodeStatus {
     pub failed_block_count: usize,
     pub active_state_sync_enabled: bool,
     pub active_state_connect_batch: usize,
+    pub active_state_staged_effect_bytes: u64,
     pub pending_best_chain_activation: bool,
     pub staged_chain_tip: bool,
     pub authoritative_mining_tip: bool,
