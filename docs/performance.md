@@ -358,6 +358,14 @@ Individual historical reads still verify their frame checksum and key.
 `hsrd-storage-maintenance inventory` is the explicit offline O(archive) scrub
 when exhaustive media verification is required.
 
+A matching atomic clean-shutdown checkpoint also avoids repeating consensus
+validation over every resident header and the complete block/header/height
+cross-index scan. Startup still reconstructs and structurally validates the
+resident header graph, verifies the retained reorganization suffix including
+block and undo payloads, and validates current and pinned authenticated name
+roots. A stale, missing, unreadable, or unclean checkpoint runs the exhaustive
+audits before networking or authority becomes available.
+
 Pruned startup compares committed segment file bytes with the live locator
 footprint without scanning dead payloads. Pruned startup without active sync
 uses a 256 MiB reclaimable-frame threshold. Native active-sync startup uses the

@@ -9539,9 +9539,6 @@ impl NodeState {
             }
         }
         .map_err(|error| anyhow::anyhow!("failed to initialize header index: {error}"))?;
-        if validation == StartupIndexValidation::Strict {
-            chain.validate_network_consensus(network)?;
-        }
         let blocks = StoredBlockIndex::new(store.clone())
             .map_err(|error| anyhow::anyhow!("failed to initialize block index: {error}"))?;
         let state_engine =
@@ -9566,6 +9563,13 @@ impl NodeState {
             checkpoint,
             validation == StartupIndexValidation::Strict,
         )?;
+        // The clean marker and checkpoint are published atomically only after
+        // the writer has stopped. A matching checkpoint authorizes the
+        // bounded durable audit above; otherwise revalidate consensus over the
+        // complete reconstructed header graph before returning the state.
+        if validation == StartupIndexValidation::Strict && audit == StartupAuditKind::Exhaustive {
+            state.chain.validate_network_consensus(network)?;
+        }
         Ok((state, audit))
     }
 
@@ -9602,9 +9606,6 @@ impl NodeState {
             Some(reader) => NodeReadSnapshot::Pages(NamePageSnapshot::new(&raw_snapshot, reader)),
             None => NodeReadSnapshot::Base(&raw_snapshot),
         };
-        if validate_all_indexes {
-            validate_durable_block_index_bindings(&snapshot)?;
-        }
         let checkpoint_matches = checkpoint
             .map(|checkpoint| {
                 StartupAuditCheckpoint::capture(&snapshot, self.network)
@@ -9612,6 +9613,9 @@ impl NodeState {
             })
             .transpose()?
             .unwrap_or(false);
+        if validate_all_indexes && !checkpoint_matches {
+            validate_durable_block_index_bindings(&snapshot)?;
+        }
         if let Some(checkpoint) = load_name_tree_compaction_checkpoint(&snapshot)? {
             let record = load_block_index_record(&snapshot, &checkpoint.tip)?.ok_or_else(|| {
                 anyhow::anyhow!(
