@@ -20,6 +20,19 @@ All wallet indexes are optional and are not consensus or mining inputs.
 service may enable the independent flags to control disk amplification.
 `WalletIndexProfile` is also available to embedded callers.
 
+This global restoration/query profile is neither a wallet nor a requirement
+for `--shakescape-mobile-rendezvous`. It has no wallet identity, seed,
+birthday, or ownership registry. An operator may compose the independent
+capabilities deliberately, but the default rendezvous profile leaves the
+global index disabled. The selective co-located-wallet design instead gives
+the wallet durable encrypted state and registers only its public watch
+material. A new account binds to the latest verified creation tip; an imported
+account binds to an explicit backup/user birthday. A mnemonic alone contains
+no creation timestamp, so an import without a birthday requires a genesis
+scan. That selective registration path is distinct from the existing global
+index documented below and must not be claimed until its node/wallet protocol
+and recovery scan are implemented and qualified.
+
 The script identity is BLAKE2b-256 over the canonical Handshake output address
 encoding. This is an exact transaction-script descriptor, not a human address
 string and not an explorer heuristic.

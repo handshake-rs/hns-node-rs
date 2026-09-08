@@ -103,8 +103,8 @@ struct Cli {
     #[arg(long = "spender-index")]
     spender_index: bool,
 
-    /// Maintain the complete restoration profile; this also enables the
-    /// transaction, script-history, spender, and script-UTXO indexes.
+    /// Maintain the global wallet-query/restoration index; this is not a
+    /// wallet and also enables transaction, history, spender, and UTXO rows.
     #[arg(long = "wallet-index")]
     wallet_index: bool,
 

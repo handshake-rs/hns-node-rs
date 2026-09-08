@@ -1,0 +1,75 @@
+[Unit]
+Description=hsrd mainnet pruned mobile rendezvous node (%i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+AssertPathIsMountPoint=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9
+AssertPathIsReadWrite=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9
+AssertPathExists=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/shakescape-rendezvous-%i.env
+
+[Service]
+Type=simple
+WorkingDirectory=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-rendezvous-v1
+EnvironmentFile=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/shakescape-rendezvous-%i.env
+ExecStartPre=/usr/bin/sha256sum --check --strict --status /media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i.sha256
+ExecStart=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i \
+  --network mainnet \
+  --data-dir /media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-rendezvous-v1 \
+  --rpc-bind 127.0.0.1:12037 \
+  --rpc-authorization-header-file /media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/mainnet-pruned-wallet-v1.authorization \
+  --rpc-max-request-bytes 65536 \
+  --rpc-max-concurrent-requests 32 \
+  --rpc-execution-timeout-ms 5000 \
+  --rpc-max-collection-entries 50000 \
+  --authority-mode native \
+  --storage-durability sync \
+  --storage-mode pruned \
+  --native-sync \
+  --p2p-listen 0.0.0.0:12038 \
+  --p2p-advertise ${HSRD_HNSR_RELAY_ADDRESS} \
+  --p2p-discovery \
+  --maximum-known-addresses 4096 \
+  --maximum-inbound 64 \
+  --maximum-outbound 8 \
+  --active-state-connect-batch 288 \
+  --active-state-staged-effect-mib 512 \
+  --validation-queue 512 \
+  --orphan-blocks 1024 \
+  --orphan-bytes 67108864 \
+  --native-sync-poll-ms 50 \
+  --no-hip76-requester \
+  --no-odoh-requester \
+  --no-hnsr-requester \
+  --hnsr-relay-address ${HSRD_HNSR_RELAY_ADDRESS} \
+  --shakescape-mobile-rendezvous \
+  --log-filter info
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=600
+KillSignal=SIGTERM
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/mainnet-pruned-rendezvous-v1
+ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i
+ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/bin/hsrd-%i.sha256
+ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/mainnet-pruned-wallet-v1.authorization
+ReadOnlyPaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/hsrd/secrets/shakescape-rendezvous-%i.env
+InaccessiblePaths=/media/den/64d4d61b-c06f-44ec-9f28-ab6fd78e43f9/Backups
+
+[Install]
+WantedBy=default.target
