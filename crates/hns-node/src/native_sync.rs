@@ -170,10 +170,11 @@ const MAX_NATIVE_SYNC_VALIDATION_QUEUE: usize = 8_192;
 // Fresh IBD must form transactions from the block stream, not from whichever
 // handful of worker completions happen to be ready when the supervisor wakes.
 // At the consensus maximum block size this still bounds owned validated body
-// memory below 256 MiB, while giving the copy-on-write chainstate tree enough
-// work per publication to amortize root/allocator page rewrites and fsync.
+// memory below 256 MiB, while giving the segment archive and RocksDB WAL enough
+// work per publication to amortize their independent durability barriers.
 const MAX_VALIDATED_BODY_COMMIT_BATCH: usize = 128;
-const VALIDATED_BODY_COMMIT_COALESCE: Duration = Duration::from_millis(100);
+const IBD_VALIDATED_BODY_COMMIT_COALESCE: Duration = Duration::from_millis(500);
+const TIP_VALIDATED_BODY_COMMIT_COALESCE: Duration = Duration::from_millis(25);
 const MAX_CANONICAL_BODY_CANDIDATE_SCAN_SLICE: usize = 256;
 const MAX_CANONICAL_STALE_RETRIES: usize = 8;
 const MAX_HEADER_DEPLOYMENT_READS: usize = 2_000_000;
@@ -1283,24 +1284,36 @@ struct NativeActiveStatePlan {
     planning_micros: u64,
 }
 
-/// Keep an interval-committing block out of a larger direct replay slice.
+/// Bound direct replay to at most one interval-committing block.
 ///
-/// The boundary block materializes the complete affected authenticated path
-/// union into the page store. That indivisible publication can consume most of
-/// the staged-effect allowance independently of adjacent blocks. Planning the
-/// prefix before it, then the boundary alone, avoids preparing and discarding
-/// geometrically smaller multi-block retries. Actual reorganizations remain
-/// untouched because their disconnect/connect transition must stay atomic.
+/// Finish a prefix before its first boundary. When a slice starts at the
+/// boundary, retain the following non-boundary blocks in the same atomic
+/// publication: they extend the new interval accumulator without another page
+/// materialization. This halves the durability transactions required by
+/// sequential IBD while keeping two page-materializing boundaries out of one
+/// transaction. Actual reorganizations remain untouched because their
+/// disconnect/connect transition must stay atomic.
 fn isolate_direct_name_tree_commit(mut activation: NodeReorg, tree_interval: Height) -> NodeReorg {
     if !activation.disconnect.is_empty() || activation.connect.len() <= 1 || tree_interval == 0 {
         return activation;
     }
-    if let Some(boundary) = activation
+    let mut boundaries = activation
         .connect
         .iter()
-        .position(|request| request.height() != 0 && request.height().is_multiple_of(tree_interval))
-    {
-        activation.connect.truncate(boundary.max(1));
+        .enumerate()
+        .filter_map(|(position, request)| {
+            (request.height() != 0 && request.height().is_multiple_of(tree_interval))
+                .then_some(position)
+        });
+    if let Some(first_boundary) = boundaries.next() {
+        let truncate_at = if first_boundary == 0 {
+            boundaries.next()
+        } else {
+            Some(first_boundary)
+        };
+        if let Some(truncate_at) = truncate_at {
+            activation.connect.truncate(truncate_at.max(1));
+        }
     }
     activation
 }
@@ -3942,9 +3955,15 @@ impl NodeService {
                     };
                     if let Some(result) = result {
                         if pending_validation_results.is_empty() {
-                            validation_flush_deadline = Some(
-                                Instant::now() + VALIDATED_BODY_COMMIT_COALESCE,
-                            );
+                            let coalesce = if matches!(
+                                scheduler.stage(),
+                                SyncStage::Headers | SyncStage::Blocks | SyncStage::Validating
+                            ) {
+                                IBD_VALIDATED_BODY_COMMIT_COALESCE
+                            } else {
+                                TIP_VALIDATED_BODY_COMMIT_COALESCE
+                            };
+                            validation_flush_deadline = Some(Instant::now() + coalesce);
                         }
                         pending_validation_results.push(result);
                     }
@@ -11420,7 +11439,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_replay_planning_isolates_name_tree_commit_boundaries() {
+    fn direct_replay_planning_groups_one_name_tree_commit_interval() {
         let activation = |start: Height, count: Height| NodeReorg {
             disconnect: Vec::new(),
             connect: (start..start.saturating_add(count))
@@ -11442,10 +11461,13 @@ mod tests {
         let prefix = isolate_direct_name_tree_commit(activation(35, 10), 36);
         assert_eq!(heights(&prefix), vec![35]);
 
-        // Once the interval boundary is first, retain exactly that indivisible
-        // block. The next planner pass can resume with an ordinary direct slice.
+        // Once the interval boundary is first, retain the following ordinary
+        // blocks in the same transaction. They update the new interval's
+        // accumulator without requiring another page-tree materialization.
         let boundary = isolate_direct_name_tree_commit(activation(36, 10), 36);
-        assert_eq!(heights(&boundary), vec![36]);
+        assert_eq!(heights(&boundary), (36..46).collect::<Vec<_>>());
+        let two_boundaries = isolate_direct_name_tree_commit(activation(36, 50), 36);
+        assert_eq!(heights(&two_boundaries), (36..72).collect::<Vec<_>>());
         let ordinary = isolate_direct_name_tree_commit(activation(37, 10), 36);
         assert_eq!(heights(&ordinary), (37..47).collect::<Vec<_>>());
 
