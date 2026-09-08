@@ -36,8 +36,8 @@ use crate::{
     },
     shakescape::{
         extension_packet, is_extension_packet_type, is_registry_hello_packet, ShakescapeAction,
-        ShakescapeCoordinator, ShakescapeNameMarketInbound, ShakescapePeerDiagnostics,
-        ShakescapePeerPhase, ShakescapeRuntimeMetrics,
+        ShakescapeCoordinator, ShakescapeCrossChainInbound, ShakescapeNameMarketInbound,
+        ShakescapePeerDiagnostics, ShakescapePeerPhase, ShakescapeRuntimeMetrics,
     },
     wire::{
         AsyncFrameReader, AsyncFrameWriter, Frame, NetworkMagic, Packet, PacketType, VersionPacket,
@@ -381,6 +381,11 @@ pub enum PeerEvent {
         provenance: ShakescapePeerProvenance,
         request_id: u64,
         message: hns_marketplace_protocol::NameMarketMessage,
+    },
+    ShakescapeCrossChain {
+        provenance: ShakescapePeerProvenance,
+        request_id: u64,
+        message: hns_marketplace_protocol::CrossChainMessage,
     },
 }
 
@@ -1334,7 +1339,8 @@ where
         if is_extension_packet_type(frame.packet_type) {
             shakescape.expire(Instant::now());
             let action = shakescape.receive_extension(&frame.payload);
-            let name_market = admit_shakescape_action(&mut shakescape, action, &control_tx);
+            let (name_market, cross_chain) =
+                admit_shakescape_action(&mut shakescape, action, &control_tx);
             let revoked = synchronize_hip76_with_shakescape(&shakescape, &mut hip76);
             if shakescape.diagnostics().phase != ShakescapePeerPhase::Negotiated {
                 odoh
@@ -1374,6 +1380,23 @@ where
             }) = name_market
             {
                 let _ = events.try_send(PeerEvent::ShakescapeNameMarket {
+                    provenance: ShakescapePeerProvenance {
+                        peer: id,
+                        address: provenance.address,
+                        direction,
+                        transport,
+                        authenticated_remote_static,
+                    },
+                    request_id,
+                    message,
+                });
+            }
+            if let Some(ShakescapeCrossChainInbound {
+                request_id,
+                message,
+            }) = cross_chain
+            {
+                let _ = events.try_send(PeerEvent::ShakescapeCrossChain {
                     provenance: ShakescapePeerProvenance {
                         peer: id,
                         address: provenance.address,
@@ -2152,11 +2175,15 @@ fn admit_shakescape_action(
     shakescape: &mut ShakescapeCoordinator,
     action: ShakescapeAction,
     control_tx: &mpsc::Sender<Arc<Packet>>,
-) -> Option<ShakescapeNameMarketInbound> {
+) -> (
+    Option<ShakescapeNameMarketInbound>,
+    Option<ShakescapeCrossChainInbound>,
+) {
     let ShakescapeAction {
         response_payload,
         outbound_message,
         name_market,
+        cross_chain,
     } = action;
     match (response_payload, outbound_message) {
         (Some(payload), Some(message)) => {
@@ -2178,7 +2205,7 @@ fn admit_shakescape_action(
             shakescape.outbound_rejected();
         }
     }
-    name_market
+    (name_market, cross_chain)
 }
 
 enum PeerWriterOutbound {

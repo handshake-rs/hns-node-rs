@@ -33,13 +33,13 @@ pub use mining_engine::{
 };
 pub use native_sync::{NativeSyncConfig, NativeSyncDiagnostics};
 pub use shakescape_market::{
-    ShakescapeNameMarketAdmission, ShakescapeNameMarketDispatch, ShakescapeNameMarketEvent,
-    ShakescapeNameMarketEventKind, ShakescapeNameMarketEventPage, ShakescapeNameMarketSend,
-    ShakescapeNameMarketSnapshotPage, ShakescapeNameMarketSnapshotRecord,
-    ShakescapeRelayAcceptanceSigner, ShakescapeRelayAcceptanceSignerError, ShakescapeRelayHandle,
-    ShakescapeRelayHandleError, MAX_SHAKESCAPE_NAME_MARKET_EVENTS,
-    MAX_SHAKESCAPE_NAME_MARKET_EVENT_PAGE, MAX_SHAKESCAPE_NAME_MARKET_RECORDS,
-    MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE,
+    ShakescapeCrossChainDispatch, ShakescapeCrossChainSend, ShakescapeNameMarketAdmission,
+    ShakescapeNameMarketDispatch, ShakescapeNameMarketEvent, ShakescapeNameMarketEventKind,
+    ShakescapeNameMarketEventPage, ShakescapeNameMarketSend, ShakescapeNameMarketSnapshotPage,
+    ShakescapeNameMarketSnapshotRecord, ShakescapeRelayAcceptanceSigner,
+    ShakescapeRelayAcceptanceSignerError, ShakescapeRelayHandle, ShakescapeRelayHandleError,
+    MAX_SHAKESCAPE_NAME_MARKET_EVENTS, MAX_SHAKESCAPE_NAME_MARKET_EVENT_PAGE,
+    MAX_SHAKESCAPE_NAME_MARKET_RECORDS, MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE,
 };
 pub use wallet_backend::{
     ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence,
@@ -1697,9 +1697,18 @@ pub fn validate_node_config(config: &NodeConfig) -> Result<()> {
             || !config
                 .shakescape_relay_roles
                 .contains(ShakescapeRelayKind::NameMarket)
+            || !config
+                .shakescape_relay_roles
+                .contains(ShakescapeRelayKind::CrossChainMarket)
+            || !config
+                .shakescape_relay_roles
+                .contains(ShakescapeRelayKind::Rendezvous)
+            || !config
+                .shakescape_relay_roles
+                .contains(ShakescapeRelayKind::SwapStatus)
         {
             anyhow::bail!(
-                "Shakescape mobile rendezvous requires an absolute persistent data directory, native sync with an inbound P2P listener and public ADDR advertisement, a valid public HNSR relay address, an explicitly enabled opaque relay, and the typed name-market relay"
+                "Shakescape mobile rendezvous requires an absolute persistent data directory, native sync with an inbound P2P listener and public ADDR advertisement, a valid public HNSR relay address, an explicitly enabled opaque relay, and the typed name-market, cross-chain, rendezvous, and swap-status relays"
             );
         }
     }

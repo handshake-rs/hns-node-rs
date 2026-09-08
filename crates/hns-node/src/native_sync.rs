@@ -6741,6 +6741,7 @@ async fn handle_peer_event(
             direction,
             reason,
         } => {
+            shakescape_relay.cross_chain_peer_disconnected(peer)?;
             scheduler.remove_peer(peer);
             served_getaddr.remove(&peer);
             compact_peers.remove(&peer);
@@ -6823,6 +6824,50 @@ async fn handle_peer_event(
                         peer = ?provenance.peer,
                         %reason,
                         "rejected malformed Shakescape name-market message"
+                    );
+                }
+                Err(error) => return Err(anyhow::anyhow!(error)),
+            }
+        }
+        PeerEvent::ShakescapeCrossChain {
+            provenance,
+            request_id,
+            message,
+        } => {
+            match shakescape_relay.receive_cross_chain(
+                provenance.peer,
+                request_id,
+                message,
+                unix_time(),
+            ) {
+                Ok(dispatch) => {
+                    for send in dispatch.sends {
+                        if let Err(error) = peers
+                            .send_shakescape_cross_chain(send.peer, send.request_id, &send.message)
+                            .await
+                        {
+                            tracing::debug!(
+                                peer = ?send.peer,
+                                %error,
+                                "Shakescape cross-chain message was not delivered"
+                            );
+                        }
+                    }
+                }
+                Err(ShakescapeRelayHandleError::CrossChain(reason)) => {
+                    let peer_identity = shakescape_peer_identity(node.network(), provenance)?;
+                    let _ = shakescape_relay.penalize_malformed(peer_identity, unix_time());
+                    tracing::debug!(
+                        peer = ?provenance.peer,
+                        %reason,
+                        "rejected malformed or uncorrelated Shakescape cross-chain message"
+                    );
+                }
+                Err(ShakescapeRelayHandleError::RoleDisabled(role)) => {
+                    tracing::trace!(
+                        peer = ?provenance.peer,
+                        ?role,
+                        "ignored Shakescape message for a disabled local relay role"
                     );
                 }
                 Err(error) => return Err(anyhow::anyhow!(error)),

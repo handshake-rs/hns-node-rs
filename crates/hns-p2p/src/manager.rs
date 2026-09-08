@@ -12,7 +12,7 @@ use std::{
 
 use hns_consensus::Network;
 use hns_hnsr_protocol::{HNS_NODE_V1, HNS_WEB_V1};
-use hns_marketplace_protocol::{NameMarketMessage, ShakescapeRegistryVersion};
+use hns_marketplace_protocol::{CrossChainMessage, NameMarketMessage, ShakescapeRegistryVersion};
 use hns_p2p_experimental::{
     ExperimentalWireProfile, HnsrPolicy, ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION,
     ODOH_PACKET, ODOH_SERVICE, REGISTRY_NEGOTIATION_PROTOCOL_ID, SHAKESCAPE_EXTENSION_SERVICE,
@@ -1032,6 +1032,46 @@ impl LivePeerManager {
         ) {
             return Err(P2pError::Protocol(
                 "peer lacks exact Shakescape V1 name-market admission".to_owned(),
+            ));
+        }
+        handle
+            .send_critical(
+                Arc::new(extension_packet(payload)),
+                self.config.critical_broadcast_timeout,
+            )
+            .await
+    }
+
+    /// Send one canonical direct HNS/BTC message to an exactly negotiated
+    /// Shakescape peer. The node only supplies transport and routing; signed
+    /// offers and bilateral settlement messages retain their own authority.
+    pub async fn send_shakescape_cross_chain(
+        &self,
+        peer: PeerId,
+        request_id: u64,
+        message: &CrossChainMessage,
+    ) -> Result<(), P2pError> {
+        let handle = self
+            .peers
+            .read()
+            .await
+            .get(&peer)
+            .cloned()
+            .ok_or(P2pError::PeerUnavailable(peer))?;
+        let payload = message.encode_envelope(request_id).map_err(|error| {
+            P2pError::Protocol(format!(
+                "canonical Shakescape cross-chain encoding failed: {error}"
+            ))
+        })?;
+        let snapshot = handle.snapshot().await;
+        if !exact_name_market_admission(
+            &snapshot,
+            self.config.network,
+            self.config.allow_public_plaintext_shakescape,
+            payload.len(),
+        ) {
+            return Err(P2pError::Protocol(
+                "peer lacks exact Shakescape V1 transport admission".to_owned(),
             ));
         }
         handle

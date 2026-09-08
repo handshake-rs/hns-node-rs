@@ -410,10 +410,10 @@ impl Cli {
             wallet_index: self.wallet_index,
             shakescape_relay_roles: ShakescapeRelayRoles::new(
                 self.shakescape_name_market_relay || self.shakescape_mobile_rendezvous,
-                self.shakescape_cross_chain_relay,
+                self.shakescape_cross_chain_relay || self.shakescape_mobile_rendezvous,
                 self.shakescape_price_relay,
-                self.shakescape_rendezvous_relay,
-                self.shakescape_swap_status_relay,
+                self.shakescape_rendezvous_relay || self.shakescape_mobile_rendezvous,
+                self.shakescape_swap_status_relay || self.shakescape_mobile_rendezvous,
             ),
             shakescape_mobile_rendezvous: self.shakescape_mobile_rendezvous,
             shakescape_name_market_acceptance_signer,
@@ -984,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn mobile_rendezvous_composes_only_the_implemented_public_services() {
+    fn mobile_rendezvous_composes_the_complete_implemented_swap_services() {
         let config = Cli::try_parse_from([
             "hsrd",
             "--data-dir",
@@ -1003,9 +1003,15 @@ mod tests {
         assert!(config
             .shakescape_relay_roles
             .contains(hns_node::ShakescapeRelayKind::NameMarket));
-        assert!(!config
+        assert!(config
+            .shakescape_relay_roles
+            .contains(hns_node::ShakescapeRelayKind::CrossChainMarket));
+        assert!(config
             .shakescape_relay_roles
             .contains(hns_node::ShakescapeRelayKind::Rendezvous));
+        assert!(config
+            .shakescape_relay_roles
+            .contains(hns_node::ShakescapeRelayKind::SwapStatus));
         assert_eq!(
             config.native_sync.advertise,
             Some("8.8.8.8:12038".parse().expect("advertised listener"))

@@ -6,9 +6,10 @@ use std::{
 };
 
 use hns_marketplace_protocol::{
-    sign_shakescape_publication_acceptance, NameMarketHello, NameMarketMessage,
-    ShakescapePublicationAcceptanceExpectation, ShakescapePublicationAcceptancePolicy,
-    ShakescapePublicationMessageKind, ShakescapeRegistryVersion, MAX_NAME_OFFERS_PER_MESSAGE,
+    sign_shakescape_publication_acceptance, CrossChainMessage, DirectOffer, DirectOfferTake,
+    NameMarketHello, NameMarketMessage, ShakescapePublicationAcceptanceExpectation,
+    ShakescapePublicationAcceptancePolicy, ShakescapePublicationMessageKind,
+    ShakescapeRegistryVersion, SwapSessionHello, MAX_NAME_OFFERS_PER_MESSAGE,
     MAX_SHAKESCAPE_MARKET_PAYLOAD,
 };
 use hns_p2p::PeerId;
@@ -35,6 +36,10 @@ pub const MAX_SHAKESCAPE_NAME_MARKET_SNAPSHOT_PAGE: usize = 256;
 /// Maximum correlated peer requests retained at once.
 const MAX_SHAKESCAPE_NAME_MARKET_PENDING_REQUESTS: usize = 1_024;
 const SHAKESCAPE_NAME_MARKET_REQUEST_LIFETIME_SECONDS: u64 = 15;
+const MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS: usize = 4_096;
+const MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS: usize = 1_024;
+const MAX_SHAKESCAPE_CROSS_CHAIN_PENDING_REQUESTS: usize = 4_096;
+const SHAKESCAPE_CROSS_CHAIN_REQUEST_LIFETIME_SECONDS: u64 = 15;
 const LOCAL_WALLET_RELAY_PEER: [u8; 32] = [0x57; 32];
 const NAME_MARKET_IDENTITY_DOMAIN: &[u8] = b"hns-node/shakescape-name-market-identity/v1";
 const SHAKESCAPE_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-shakescape-outbox-envelope-v1\0";
@@ -212,6 +217,21 @@ pub struct ShakescapeNameMarketDispatch {
     pub admissions: Vec<ShakescapeNameMarketAdmission>,
 }
 
+/// One exactly targeted cross-chain send. Bilateral session material is never
+/// broadcast to unrelated board peers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShakescapeCrossChainSend {
+    pub peer: PeerId,
+    pub request_id: u64,
+    pub message: CrossChainMessage,
+}
+
+/// Bounded transport effects from one cross-chain board/session message.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShakescapeCrossChainDispatch {
+    pub sends: Vec<ShakescapeCrossChainSend>,
+}
+
 #[derive(Clone, Debug)]
 enum NameMarketRecordState {
     Active { listing: FixedPriceListing },
@@ -272,10 +292,66 @@ impl ShakescapeNameMarketState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct CrossChainOfferRecord {
+    offer: DirectOffer,
+    owner: Option<PeerId>,
+}
+
+#[derive(Clone, Debug)]
+struct CrossChainSessionRoute {
+    offer_id: [u8; 32],
+    maker: PeerId,
+    taker: PeerId,
+    take: DirectOfferTake,
+    hello: Option<SwapSessionHello>,
+}
+
+#[derive(Debug)]
+struct ShakescapeCrossChainState {
+    network_magic: u32,
+    network_genesis: [u8; 32],
+    offers: BTreeMap<[u8; 32], CrossChainOfferRecord>,
+    sessions: BTreeMap<[u8; 32], CrossChainSessionRoute>,
+    peers: BTreeSet<PeerId>,
+    pending: HashMap<(PeerId, u64), ([u8; 32], u64)>,
+    next_request_id: u64,
+}
+
+impl ShakescapeCrossChainState {
+    fn new(network_magic: u32, network_genesis: [u8; 32]) -> Self {
+        Self {
+            network_magic,
+            network_genesis,
+            offers: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            peers: BTreeSet::new(),
+            pending: HashMap::new(),
+            next_request_id: 1,
+        }
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let request_id = self.next_request_id.max(1);
+        self.next_request_id = request_id.checked_add(1).unwrap_or(1);
+        request_id
+    }
+
+    fn expire(&mut self, now: u64) {
+        self.pending.retain(|_, (_, expires_at)| *expires_at > now);
+        self.offers
+            .retain(|_, record| record.offer.header.expires_at > now);
+        self.sessions.retain(|_, route| {
+            self.offers.contains_key(&route.offer_id) && route.take.header.expires_at > now
+        });
+    }
+}
+
 #[derive(Debug)]
 struct ShakescapeRelayService {
     relay: RelayStore,
     name_market: ShakescapeNameMarketState,
+    cross_chain: ShakescapeCrossChainState,
     acceptance_signer: Option<ShakescapeRelayAcceptanceSigner>,
 }
 
@@ -308,6 +384,13 @@ pub enum ShakescapeRelayHandleError {
     /// Typed name-market semantics or correlation rejected the message.
     #[error("Shakescape name-market message rejected: {0}")]
     NameMarket(&'static str),
+    /// Typed HNS/BTC board routing or bilateral correlation rejected a message.
+    #[error("Shakescape cross-chain message rejected: {0}")]
+    CrossChain(&'static str),
+    /// The message is valid for a relay role this node did not enable. This is
+    /// local policy, not peer misbehavior, and must never affect peer score.
+    #[error("Shakescape relay role is disabled: {0:?}")]
+    RoleDisabled(RelayKind),
 }
 
 impl ShakescapeRelayHandle {
@@ -328,6 +411,7 @@ impl ShakescapeRelayHandle {
             inner: Arc::new(Mutex::new(ShakescapeRelayService {
                 relay: RelayStore::new(roles, limits)?,
                 name_market: ShakescapeNameMarketState::new(network_magic, network_genesis),
+                cross_chain: ShakescapeCrossChainState::new(network_magic, network_genesis),
                 acceptance_signer,
             })),
         })
@@ -694,6 +778,332 @@ impl ShakescapeRelayHandle {
         Ok(dispatch)
     }
 
+    /// Consume one canonical direct HNS/BTC message. Board inventory is shared
+    /// among admitted peers, while take/proposal/hello/status traffic is routed
+    /// only across the maker/taker pair established by the signed offer take.
+    pub fn receive_cross_chain(
+        &self,
+        peer: PeerId,
+        request_id: u64,
+        message: CrossChainMessage,
+        now: u64,
+    ) -> Result<ShakescapeCrossChainDispatch, ShakescapeRelayHandleError> {
+        let mut service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        let required_role = match &message {
+            CrossChainMessage::DirectOfferInventory(_)
+            | CrossChainMessage::GetDirectOffer(_)
+            | CrossChainMessage::DirectOffer(_)
+            | CrossChainMessage::CancelDirectOffer(_) => RelayKind::CrossChainMarket,
+            CrossChainMessage::TakeDirectOffer(_)
+            | CrossChainMessage::SwapSessionProposal(_)
+            | CrossChainMessage::SwapSessionHello(_) => RelayKind::Rendezvous,
+            CrossChainMessage::SwapFundingStatus(_)
+            | CrossChainMessage::SwapRedeemStatus(_)
+            | CrossChainMessage::SwapRefundStatus(_)
+            | CrossChainMessage::SwapWatchReady(_) => RelayKind::SwapStatus,
+        };
+        if !service.relay.status(now).roles.contains(required_role) {
+            return Err(ShakescapeRelayHandleError::RoleDisabled(required_role));
+        }
+        let state = &mut service.cross_chain;
+        state.expire(now);
+        state.peers.insert(peer);
+        let mut dispatch = ShakescapeCrossChainDispatch::default();
+        match message {
+            CrossChainMessage::DirectOfferInventory(offer_ids) => {
+                let active = cross_chain_inventory(state, now);
+                dispatch.sends.push(ShakescapeCrossChainSend {
+                    peer,
+                    request_id,
+                    message: CrossChainMessage::DirectOfferInventory(active),
+                });
+                for offer_id in offer_ids {
+                    let needs_owner = state
+                        .offers
+                        .get(&offer_id)
+                        .is_none_or(|record| record.owner.is_none());
+                    if !needs_owner {
+                        continue;
+                    }
+                    if state.pending.len() >= MAX_SHAKESCAPE_CROSS_CHAIN_PENDING_REQUESTS {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "cross-chain offer request capacity reached",
+                        ));
+                    }
+                    let request_id = state.next_request_id();
+                    state.pending.insert(
+                        (peer, request_id),
+                        (
+                            offer_id,
+                            now.saturating_add(SHAKESCAPE_CROSS_CHAIN_REQUEST_LIFETIME_SECONDS),
+                        ),
+                    );
+                    dispatch.sends.push(ShakescapeCrossChainSend {
+                        peer,
+                        request_id,
+                        message: CrossChainMessage::GetDirectOffer(offer_id),
+                    });
+                }
+            }
+            CrossChainMessage::GetDirectOffer(offer_id) => {
+                if let Some(record) = state
+                    .offers
+                    .get(&offer_id)
+                    .filter(|record| record.offer.header.expires_at > now)
+                {
+                    dispatch.sends.push(ShakescapeCrossChainSend {
+                        peer,
+                        request_id,
+                        message: CrossChainMessage::DirectOffer(record.offer.clone()),
+                    });
+                }
+            }
+            CrossChainMessage::DirectOffer(offer) => {
+                let expected = state.pending.remove(&(peer, request_id)).ok_or(
+                    ShakescapeRelayHandleError::CrossChain("uncorrelated direct offer"),
+                )?;
+                if expected.0 != offer.offer_id {
+                    return Err(ShakescapeRelayHandleError::CrossChain(
+                        "direct offer does not match its request",
+                    ));
+                }
+                validate_cross_chain_offer(state, &offer, now)?;
+                if !state.offers.contains_key(&offer.offer_id)
+                    && state.offers.len() >= MAX_SHAKESCAPE_CROSS_CHAIN_OFFERS
+                {
+                    return Err(ShakescapeRelayHandleError::CrossChain(
+                        "cross-chain offer capacity reached",
+                    ));
+                }
+                let offer_id = offer.offer_id;
+                state.offers.insert(
+                    offer_id,
+                    CrossChainOfferRecord {
+                        offer,
+                        owner: Some(peer),
+                    },
+                );
+                for target in state.peers.iter().copied().filter(|target| *target != peer) {
+                    dispatch.sends.push(ShakescapeCrossChainSend {
+                        peer: target,
+                        request_id,
+                        message: CrossChainMessage::DirectOfferInventory(vec![offer_id]),
+                    });
+                }
+            }
+            CrossChainMessage::CancelDirectOffer(cancellation) => {
+                let record = state.offers.get(&cancellation.offer_id).ok_or(
+                    ShakescapeRelayHandleError::CrossChain("unknown direct offer cancellation"),
+                )?;
+                if record.owner != Some(peer) {
+                    return Err(ShakescapeRelayHandleError::CrossChain(
+                        "direct offer cancellation came from a non-owner peer",
+                    ));
+                }
+                cancellation
+                    .verify_for_offer(&record.offer, record.offer.header.network, now)
+                    .map_err(|_| {
+                        ShakescapeRelayHandleError::CrossChain("invalid direct offer cancellation")
+                    })?;
+                state.offers.remove(&cancellation.offer_id);
+                state
+                    .sessions
+                    .retain(|_, route| route.offer_id != cancellation.offer_id);
+                for target in state.peers.iter().copied().filter(|target| *target != peer) {
+                    dispatch.sends.push(ShakescapeCrossChainSend {
+                        peer: target,
+                        request_id,
+                        message: CrossChainMessage::CancelDirectOffer(cancellation.clone()),
+                    });
+                }
+            }
+            CrossChainMessage::TakeDirectOffer(take) => {
+                let record = state.offers.get(&take.offer_id).ok_or(
+                    ShakescapeRelayHandleError::CrossChain("take targets an unknown direct offer"),
+                )?;
+                let maker = record.owner.ok_or(ShakescapeRelayHandleError::CrossChain(
+                    "direct offer owner is currently unavailable",
+                ))?;
+                if maker == peer {
+                    return Err(ShakescapeRelayHandleError::CrossChain(
+                        "direct offer owner cannot take its own offer",
+                    ));
+                }
+                take.verify_for_offer(&record.offer, record.offer.header.network, now)
+                    .map_err(|_| {
+                        ShakescapeRelayHandleError::CrossChain("invalid direct offer take")
+                    })?;
+                if let Some(route) = state.sessions.get(&take.swap_session_id) {
+                    if route.maker != maker || route.taker != peer || route.take != take {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "swap session route conflicts with an existing take",
+                        ));
+                    }
+                } else {
+                    if state.sessions.len() >= MAX_SHAKESCAPE_CROSS_CHAIN_SESSIONS {
+                        return Err(ShakescapeRelayHandleError::CrossChain(
+                            "cross-chain session capacity reached",
+                        ));
+                    }
+                    state.sessions.insert(
+                        take.swap_session_id,
+                        CrossChainSessionRoute {
+                            offer_id: take.offer_id,
+                            maker,
+                            taker: peer,
+                            take: take.clone(),
+                            hello: None,
+                        },
+                    );
+                }
+                dispatch.sends.push(ShakescapeCrossChainSend {
+                    peer: maker,
+                    request_id,
+                    message: CrossChainMessage::TakeDirectOffer(take),
+                });
+            }
+            CrossChainMessage::SwapSessionProposal(proposal) => {
+                let session_id = proposal.terms().swap_session_id;
+                let route = state.sessions.get(&session_id).cloned().ok_or(
+                    ShakescapeRelayHandleError::CrossChain("unknown swap proposal session"),
+                )?;
+                if peer != route.maker {
+                    return Err(ShakescapeRelayHandleError::CrossChain(
+                        "swap proposal came from the non-maker peer",
+                    ));
+                }
+                let offer = &state
+                    .offers
+                    .get(&route.offer_id)
+                    .ok_or(ShakescapeRelayHandleError::CrossChain(
+                        "swap proposal offer is unavailable",
+                    ))?
+                    .offer;
+                proposal
+                    .verify_for_direct_offer(offer, &route.take, offer.header.network, now)
+                    .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid swap proposal"))?;
+                dispatch.sends.push(ShakescapeCrossChainSend {
+                    peer: route.taker,
+                    request_id,
+                    message: CrossChainMessage::SwapSessionProposal(proposal),
+                });
+            }
+            CrossChainMessage::SwapSessionHello(hello) => {
+                let route = state.sessions.get(&hello.swap_session_id).cloned().ok_or(
+                    ShakescapeRelayHandleError::CrossChain("unknown swap hello session"),
+                )?;
+                if peer != route.taker {
+                    return Err(ShakescapeRelayHandleError::CrossChain(
+                        "swap hello came from the non-taker peer",
+                    ));
+                }
+                let offer = &state
+                    .offers
+                    .get(&route.offer_id)
+                    .ok_or(ShakescapeRelayHandleError::CrossChain(
+                        "swap hello offer is unavailable",
+                    ))?
+                    .offer;
+                hello
+                    .verify_for_direct_offer(offer, &route.take, offer.header.network, now)
+                    .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid swap hello"))?;
+                state
+                    .sessions
+                    .get_mut(&hello.swap_session_id)
+                    .expect("validated session route remains present")
+                    .hello = Some(hello.clone());
+                dispatch.sends.push(ShakescapeCrossChainSend {
+                    peer: route.maker,
+                    request_id,
+                    message: CrossChainMessage::SwapSessionHello(hello),
+                });
+            }
+            CrossChainMessage::SwapFundingStatus(status) => {
+                let target = validate_cross_chain_status_route(
+                    state,
+                    peer,
+                    status.swap_session_id,
+                    |hello| status.verify_for_session(hello, hello.header.network, now),
+                )?;
+                dispatch.sends.push(ShakescapeCrossChainSend {
+                    peer: target,
+                    request_id,
+                    message: CrossChainMessage::SwapFundingStatus(status),
+                });
+            }
+            CrossChainMessage::SwapRedeemStatus(status) => {
+                let target = validate_cross_chain_status_route(
+                    state,
+                    peer,
+                    status.swap_session_id,
+                    |hello| status.verify_for_session(hello, hello.header.network, now),
+                )?;
+                dispatch.sends.push(ShakescapeCrossChainSend {
+                    peer: target,
+                    request_id,
+                    message: CrossChainMessage::SwapRedeemStatus(status),
+                });
+            }
+            CrossChainMessage::SwapRefundStatus(status) => {
+                let target = validate_cross_chain_status_route(
+                    state,
+                    peer,
+                    status.swap_session_id,
+                    |hello| status.verify_for_session(hello, hello.header.network, now),
+                )?;
+                dispatch.sends.push(ShakescapeCrossChainSend {
+                    peer: target,
+                    request_id,
+                    message: CrossChainMessage::SwapRefundStatus(status),
+                });
+            }
+            CrossChainMessage::SwapWatchReady(status) => {
+                let target = validate_cross_chain_status_route(
+                    state,
+                    peer,
+                    status.swap_session_id,
+                    |hello| status.verify_for_session(hello, hello.header.network, now),
+                )?;
+                dispatch.sends.push(ShakescapeCrossChainSend {
+                    peer: target,
+                    request_id,
+                    message: CrossChainMessage::SwapWatchReady(status),
+                });
+            }
+        }
+        Ok(dispatch)
+    }
+
+    /// Retire volatile routes for a closed transport. Signed offers remain
+    /// cached until expiry, but must be re-proven by a full offer response
+    /// before a replacement connection can receive a take.
+    pub fn cross_chain_peer_disconnected(
+        &self,
+        peer: PeerId,
+    ) -> Result<(), ShakescapeRelayHandleError> {
+        let mut service = self
+            .inner
+            .lock()
+            .map_err(|_| ShakescapeRelayHandleError::LockPoisoned)?;
+        let state = &mut service.cross_chain;
+        state.peers.remove(&peer);
+        state
+            .pending
+            .retain(|(pending_peer, _), _| *pending_peer != peer);
+        for record in state.offers.values_mut() {
+            if record.owner == Some(peer) {
+                record.owner = None;
+            }
+        }
+        state
+            .sessions
+            .retain(|_, route| route.maker != peer && route.taker != peer);
+        Ok(())
+    }
+
     /// Read one bounded, monotonic process-local event page for an
     /// authenticated wallet consumer.
     pub fn name_market_events(
@@ -815,6 +1225,72 @@ impl ShakescapeRelayHandle {
             records,
         })
     }
+}
+
+fn cross_chain_inventory(state: &ShakescapeCrossChainState, now: u64) -> Vec<[u8; 32]> {
+    state
+        .offers
+        .iter()
+        .filter(|(_, record)| {
+            record.offer.header.expires_at > now
+                && record
+                    .owner
+                    .is_some_and(|owner| state.peers.contains(&owner))
+        })
+        .map(|(offer_id, _)| *offer_id)
+        .collect()
+}
+
+fn validate_cross_chain_offer(
+    state: &ShakescapeCrossChainState,
+    offer: &DirectOffer,
+    now: u64,
+) -> Result<(), ShakescapeRelayHandleError> {
+    if offer.header.network.hns_magic != state.network_magic
+        || offer.header.network.hns_genesis.as_bytes() != &state.network_genesis
+    {
+        return Err(ShakescapeRelayHandleError::CrossChain(
+            "direct offer is bound to another Handshake network",
+        ));
+    }
+    offer
+        .verify_at(offer.header.network, now)
+        .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid direct offer"))
+}
+
+fn validate_cross_chain_status_route<F>(
+    state: &ShakescapeCrossChainState,
+    peer: PeerId,
+    session_id: [u8; 32],
+    verify: F,
+) -> Result<PeerId, ShakescapeRelayHandleError>
+where
+    F: FnOnce(&SwapSessionHello) -> hns_marketplace_protocol::Result<()>,
+{
+    let route = state
+        .sessions
+        .get(&session_id)
+        .ok_or(ShakescapeRelayHandleError::CrossChain(
+            "unknown cross-chain status session",
+        ))?;
+    let target = if peer == route.maker {
+        route.taker
+    } else if peer == route.taker {
+        route.maker
+    } else {
+        return Err(ShakescapeRelayHandleError::CrossChain(
+            "cross-chain status came from an unrelated peer",
+        ));
+    };
+    let hello = route
+        .hello
+        .as_ref()
+        .ok_or(ShakescapeRelayHandleError::CrossChain(
+            "cross-chain status preceded the signed hello",
+        ))?;
+    verify(hello)
+        .map_err(|_| ShakescapeRelayHandleError::CrossChain("invalid cross-chain status"))?;
+    Ok(target)
 }
 
 fn validate_handoff_expectation(
@@ -1209,4 +1685,193 @@ fn append_event(
         envelope_bytes,
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod cross_chain_tests {
+    use hns_marketplace_protocol::{
+        AssetAmount, AssetId, ChainId, DirectOffer, DirectOfferTake, MarketPair, NetworkBinding,
+        SignedObjectHeader, MARKETPLACE_PROTOCOL_VERSION,
+    };
+    use hns_protocol_primitives::BlockHash;
+
+    use super::*;
+
+    const NOW: u64 = 1_000;
+    const MAGIC: u32 = 0x5b6e_f2d3;
+    const GENESIS: [u8; 32] = [1; 32];
+
+    fn public_key(secret: [u8; 32]) -> [u8; 33] {
+        SigningKey::from_bytes((&secret).into())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap()
+    }
+
+    fn network() -> NetworkBinding {
+        NetworkBinding {
+            hns_magic: MAGIC,
+            hns_genesis: BlockHash::new(GENESIS),
+            counterchain: ChainId::BITCOIN,
+            counterchain_network: 1,
+            counterchain_genesis: [2; 32],
+        }
+    }
+
+    fn header(sequence: u64, created_at: u64, expires_at: u64) -> SignedObjectHeader {
+        SignedObjectHeader {
+            version: MARKETPLACE_PROTOCOL_VERSION,
+            network: network(),
+            pair: MarketPair::HNS_BTC,
+            signer_public_key: [0; 33],
+            sequence,
+            created_at,
+            expires_at,
+        }
+    }
+
+    fn offer() -> DirectOffer {
+        let mut offer = DirectOffer {
+            header: header(1, NOW - 10, NOW + 600),
+            offer_id: [0; 32],
+            swap_session_id: [3; 32],
+            maker_settlement_public_key: public_key([9; 32]),
+            offered_asset: AssetId::HNS,
+            offered_amount: AssetAmount::new(10_000_000),
+            received_asset: AssetId::BTC,
+            received_amount: AssetAmount::new(2_000),
+            signature: [0; 64],
+        };
+        offer.sign(&[7; 32]).unwrap();
+        offer
+    }
+
+    fn take(offer: &DirectOffer) -> DirectOfferTake {
+        let mut take = DirectOfferTake {
+            header: header(2, NOW, NOW + 500),
+            offer_id: offer.offer_id,
+            swap_session_id: offer.swap_session_id,
+            taker_settlement_public_key: public_key([11; 32]),
+            signature: [0; 64],
+        };
+        take.sign(&[10; 32]).unwrap();
+        take
+    }
+
+    #[test]
+    fn rendezvous_routes_a_verified_take_only_to_the_offer_owner() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let maker = PeerId(1);
+        let taker = PeerId(2);
+        let observer = PeerId(3);
+        for peer in [taker, observer] {
+            relay
+                .receive_cross_chain(
+                    peer,
+                    1,
+                    CrossChainMessage::DirectOfferInventory(Vec::new()),
+                    NOW,
+                )
+                .unwrap();
+        }
+
+        let offer = offer();
+        let requested = relay
+            .receive_cross_chain(
+                maker,
+                2,
+                CrossChainMessage::DirectOfferInventory(vec![offer.offer_id]),
+                NOW,
+            )
+            .unwrap();
+        let request_id = requested
+            .sends
+            .iter()
+            .find_map(|send| match send.message {
+                CrossChainMessage::GetDirectOffer(id) if id == offer.offer_id => {
+                    Some(send.request_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let announced = relay
+            .receive_cross_chain(
+                maker,
+                request_id,
+                CrossChainMessage::DirectOffer(offer.clone()),
+                NOW,
+            )
+            .unwrap();
+        assert!(announced.sends.iter().any(|send| send.peer == taker));
+        assert!(announced.sends.iter().any(|send| send.peer == observer));
+
+        let routed = relay
+            .receive_cross_chain(
+                taker,
+                9,
+                CrossChainMessage::TakeDirectOffer(take(&offer)),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(routed.sends.len(), 1);
+        assert_eq!(routed.sends[0].peer, maker);
+        assert!(!routed.sends.iter().any(|send| send.peer == observer));
+    }
+
+    #[test]
+    fn disconnected_maker_must_reprove_the_full_offer_before_receiving_takes() {
+        let relay = ShakescapeRelayHandle::new(
+            RelayRoles::ALL,
+            RelayLimits::default(),
+            MAGIC,
+            GENESIS,
+            None,
+        )
+        .unwrap();
+        let maker = PeerId(1);
+        let taker = PeerId(2);
+        let offer = offer();
+        let requested = relay
+            .receive_cross_chain(
+                maker,
+                1,
+                CrossChainMessage::DirectOfferInventory(vec![offer.offer_id]),
+                NOW,
+            )
+            .unwrap();
+        let request_id = requested
+            .sends
+            .iter()
+            .find(|send| matches!(send.message, CrossChainMessage::GetDirectOffer(_)))
+            .unwrap()
+            .request_id;
+        relay
+            .receive_cross_chain(
+                maker,
+                request_id,
+                CrossChainMessage::DirectOffer(offer.clone()),
+                NOW,
+            )
+            .unwrap();
+        relay.cross_chain_peer_disconnected(maker).unwrap();
+        let error = relay
+            .receive_cross_chain(
+                taker,
+                3,
+                CrossChainMessage::TakeDirectOffer(take(&offer)),
+                NOW,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ShakescapeRelayHandleError::CrossChain(_)));
+    }
 }

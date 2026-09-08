@@ -15,7 +15,8 @@ use std::{
 use hns_consensus::Network as ConsensusNetwork;
 use hns_dns_relay_protocol::MAX_DNS_RELAY_RESPONSE_PAYLOAD_SIZE;
 use hns_marketplace_protocol::{
-    NameMarketHello, NameMarketMessage, ShakescapeRegistryVersion, MAX_SHAKESCAPE_MARKET_PAYLOAD,
+    CrossChainMessage, NameMarketHello, NameMarketMessage, ShakescapeRegistryVersion,
+    MAX_SHAKESCAPE_MARKET_PAYLOAD,
 };
 use hns_p2p_experimental::{
     EnvelopeError, ExperimentalWireProfile, KnownMessage, NegotiatedRegistry, NegotiationError,
@@ -422,6 +423,7 @@ pub(crate) struct ShakescapeAction {
     pub response_payload: Option<Vec<u8>>,
     pub outbound_message: Option<ShakescapeOutboundMessage>,
     pub name_market: Option<ShakescapeNameMarketInbound>,
+    pub cross_chain: Option<ShakescapeCrossChainInbound>,
 }
 
 /// One canonical name-market message admitted under the exact V2 registry.
@@ -429,6 +431,16 @@ pub(crate) struct ShakescapeAction {
 pub(crate) struct ShakescapeNameMarketInbound {
     pub request_id: u64,
     pub message: NameMarketMessage,
+}
+
+/// One canonical direct HNS/BTC message admitted after exact peer-level
+/// Shakescape negotiation. Cross-chain messages deliberately remain outside
+/// the name-market registry offer set: both mobile peers pin the same base
+/// registry and then validate every signed bilateral object independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ShakescapeCrossChainInbound {
+    pub request_id: u64,
+    pub message: CrossChainMessage,
 }
 
 #[derive(Debug)]
@@ -552,6 +564,7 @@ impl ShakescapeCoordinator {
             response_payload: Some(response_payload),
             outbound_message: Some(ShakescapeOutboundMessage::Hello),
             name_market: None,
+            cross_chain: None,
         }
     }
 
@@ -630,6 +643,9 @@ impl ShakescapeCoordinator {
             ProtocolDisposition::Known(message) if is_name_market_message(message) => {
                 self.receive_name_market(payload)
             }
+            ProtocolDisposition::Known(message) if is_cross_chain_message(message) => {
+                self.receive_cross_chain(payload)
+            }
             ProtocolDisposition::Known(_) => {
                 self.reject_subprotocol(ShakescapeDisableReason::UnsupportedProtocol);
                 ShakescapeAction::default()
@@ -674,6 +690,38 @@ impl ShakescapeCoordinator {
         }
         ShakescapeAction {
             name_market: Some(ShakescapeNameMarketInbound {
+                request_id,
+                message,
+            }),
+            ..ShakescapeAction::default()
+        }
+    }
+
+    fn receive_cross_chain(&mut self, payload: &[u8]) -> ShakescapeAction {
+        let Some(negotiated) = self.negotiated.as_ref() else {
+            self.disable(ShakescapeDisableReason::UnexpectedMessage);
+            return ShakescapeAction::default();
+        };
+        if self.diagnostics.phase != ShakescapePeerPhase::Negotiated
+            || negotiated.registry_version != SHAKESCAPE_V1_REGISTRY_VERSION
+            || negotiated.fingerprint != SHAKESCAPE_V1_REGISTRY_FINGERPRINT
+            || !negotiated
+                .protocols
+                .contains(&(ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION))
+            || payload.len() > usize::try_from(self.local_hello.maximum_receive_size).unwrap_or(0)
+        {
+            self.reject_subprotocol(ShakescapeDisableReason::UnsupportedProtocol);
+            return ShakescapeAction::default();
+        }
+        let (request_id, message) = match CrossChainMessage::decode_envelope(payload) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.reject_subprotocol(ShakescapeDisableReason::MalformedEnvelope);
+                return ShakescapeAction::default();
+            }
+        };
+        ShakescapeAction {
+            cross_chain: Some(ShakescapeCrossChainInbound {
                 request_id,
                 message,
             }),
@@ -734,6 +782,7 @@ impl ShakescapeCoordinator {
             response_payload: Some(response_payload),
             outbound_message: Some(ShakescapeOutboundMessage::HelloAck),
             name_market: None,
+            cross_chain: None,
         }
     }
 
@@ -779,6 +828,7 @@ impl ShakescapeCoordinator {
                         response_payload: Some(payload),
                         outbound_message: Some(ShakescapeOutboundMessage::NameMarket),
                         name_market: None,
+                        cross_chain: None,
                     },
                     Err(_) => {
                         self.disable(ShakescapeDisableReason::LocalEncodingFailure);
@@ -856,6 +906,23 @@ fn is_name_market_message(message: KnownMessage) -> bool {
             | KnownMessage::GetOffer
             | KnownMessage::Offer
             | KnownMessage::OfferTombstone
+    )
+}
+
+fn is_cross_chain_message(message: KnownMessage) -> bool {
+    matches!(
+        message,
+        KnownMessage::DirectOfferInventory
+            | KnownMessage::GetDirectOffer
+            | KnownMessage::DirectOffer
+            | KnownMessage::CancelDirectOffer
+            | KnownMessage::TakeDirectOffer
+            | KnownMessage::SwapSessionHello
+            | KnownMessage::SwapFundingStatus
+            | KnownMessage::SwapRedeemStatus
+            | KnownMessage::SwapRefundStatus
+            | KnownMessage::SwapSessionProposal
+            | KnownMessage::SwapWatchReady
     )
 }
 
@@ -1152,6 +1219,19 @@ mod tests {
                 ..ShakescapeProcessTotals::default()
             }
         );
+
+        let cross_chain = CrossChainMessage::DirectOfferInventory(Vec::new())
+            .encode_envelope(19)
+            .expect("canonical cross-chain inventory");
+        let cross_chain_action = outbound.receive_extension(&cross_chain);
+        assert_eq!(
+            cross_chain_action.cross_chain,
+            Some(ShakescapeCrossChainInbound {
+                request_id: 19,
+                message: CrossChainMessage::DirectOfferInventory(Vec::new()),
+            })
+        );
+        assert_eq!(outbound.diagnostics.phase, ShakescapePeerPhase::Negotiated);
 
         let unknown_subprotocol = ShakescapeExtensionEnvelope {
             registry_version: SHAKESCAPE_V1_REGISTRY_VERSION,
