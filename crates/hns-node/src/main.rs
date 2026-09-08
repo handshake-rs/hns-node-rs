@@ -204,6 +204,12 @@ struct Cli {
     #[arg(long)]
     p2p_advertise: Option<SocketAddr>,
 
+    /// Accept keyless standard Handshake framing on the inbound listener for
+    /// direct Shakescape peers. This does not advertise the listener through
+    /// ADDR and is therefore suitable for operator-provided private overlays.
+    #[arg(long = "p2p-accept-keyless-shakescape")]
+    p2p_accept_keyless_shakescape: bool,
+
     /// Connect to a peer. Public networks require KEYHEX@IP:PORT; may be repeated.
     #[arg(long = "connect")]
     p2p_connect: Vec<P2pConnectArg>,
@@ -438,6 +444,7 @@ impl Cli {
                         .then_some(self.hnsr_relay_address)
                         .flatten()
                 }),
+                accept_keyless_shakescape: self.p2p_accept_keyless_shakescape,
                 connect,
                 connect_keys,
                 discovery: p2p_discovery,
@@ -824,6 +831,7 @@ async fn main() -> anyhow::Result<()> {
             native_sync_active_state = config.native_sync.connect_active_state,
             active_state_connect_batch = config.native_sync.active_state_connect_batch,
             active_state_staged_effect_bytes = config.native_sync.active_state_staged_effect_bytes,
+            p2p_accept_keyless_shakescape = config.native_sync.accept_keyless_shakescape,
             hip76_requester_override = ?config.native_sync.hip76_requester_override,
             odoh_requester_capable = config.native_sync.odoh_requester,
             odoh_requester_override = ?config.native_sync.odoh_requester_override,
@@ -1099,6 +1107,25 @@ mod tests {
         assert!(native.native_sync.enabled);
         assert!(native.native_sync.headers_only);
         assert!(!native.native_sync.connect_active_state);
+    }
+
+    #[test]
+    fn keyless_shakescape_ingress_does_not_imply_addr_advertisement() {
+        let config = Cli::try_parse_from([
+            "hsrd",
+            "--native-sync",
+            "--p2p-listen",
+            "0.0.0.0:12048",
+            "--p2p-accept-keyless-shakescape",
+            "--shakescape-name-market-relay",
+        ])
+        .expect("private-overlay Shakescape CLI")
+        .into_config()
+        .expect("private-overlay Shakescape config");
+
+        assert!(config.native_sync.accept_keyless_shakescape);
+        assert_eq!(config.native_sync.advertise, None);
+        validate_node_config(&config).expect("keyless private-overlay ingress validates");
     }
 
     #[test]

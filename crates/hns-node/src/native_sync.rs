@@ -801,6 +801,10 @@ pub struct NativeSyncConfig {
     /// packets. It may differ from `listen` when a port forwarder terminates
     /// the public socket without terminating Brontide.
     pub advertise: Option<SocketAddr>,
+    /// Accept exact standard Handshake framing alongside Brontide on the
+    /// inbound listener. This is intentionally independent of `advertise` so
+    /// private overlay ingress does not need to be published as a public ADDR.
+    pub accept_keyless_shakescape: bool,
     pub connect: Vec<SocketAddr>,
     /// Authenticated remote static keys for configured public-network peers.
     pub connect_keys: BTreeMap<SocketAddr, [u8; 33]>,
@@ -854,6 +858,7 @@ impl Default for NativeSyncConfig {
             active_state_staged_effect_bytes: MAX_REORG_STAGED_EFFECT_BYTES,
             listen: None,
             advertise: None,
+            accept_keyless_shakescape: false,
             connect: Vec::new(),
             connect_keys: BTreeMap::new(),
             discovery: false,
@@ -903,6 +908,9 @@ impl NativeSyncConfig {
             hns_p2p::validate_hnsr_relay_address(network, address).map_err(|error| {
                 anyhow::anyhow!("invalid advertised HNS P2P address {address}: {error}")
             })?;
+        }
+        if self.accept_keyless_shakescape && self.listen.is_none() {
+            anyhow::bail!("accepting keyless Shakescape peers requires an inbound P2P listener");
         }
         if !matches!(
             authority_mode,
@@ -2973,7 +2981,8 @@ impl NodeService {
         }
         peer_config.maximum_inbound = native_sync_config.maximum_inbound;
         peer_config.maximum_outbound = native_sync_config.maximum_outbound;
-        peer_config.allow_public_plaintext_shakescape = native_sync_config.advertise.is_some();
+        peer_config.allow_public_plaintext_shakescape =
+            native_sync_config.advertise.is_some() || native_sync_config.accept_keyless_shakescape;
         peer_config.ban_score = HSD_BAN_SCORE;
         peer_config.ban_time = Duration::from_secs(HSD_BAN_TIME_SECONDS);
         peer_config.hip76_requester_policy_override =
@@ -3289,7 +3298,8 @@ impl NodeService {
                 .with_context(|| format!("failed to bind HNS P2P listener on {address}"))?;
             let peers = peers.clone();
             let mut shutdown = shutdown_rx.clone();
-            let keyless_compatible = native_sync_config.advertise.is_some();
+            let keyless_compatible = native_sync_config.advertise.is_some()
+                || native_sync_config.accept_keyless_shakescape;
             Some(tokio::spawn(async move {
                 let stop = async move {
                     let _ = shutdown.changed().await;
@@ -12598,6 +12608,24 @@ mod tests {
         public
             .validate(AuthorityMode::Native, Network::Mainnet)
             .expect("public forwarded listener is valid");
+
+        let keyless_without_listener = NativeSyncConfig {
+            enabled: true,
+            accept_keyless_shakescape: true,
+            discovery: true,
+            ..NativeSyncConfig::default()
+        };
+        assert!(keyless_without_listener
+            .validate(AuthorityMode::Native, Network::Mainnet)
+            .is_err());
+
+        let keyless_private_overlay = NativeSyncConfig {
+            listen: Some("0.0.0.0:12048".parse().expect("listener")),
+            ..keyless_without_listener
+        };
+        keyless_private_overlay
+            .validate(AuthorityMode::Native, Network::Mainnet)
+            .expect("keyless ingress is independent of public ADDR advertisement");
     }
 
     #[test]
